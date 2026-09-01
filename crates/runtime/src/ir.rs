@@ -8777,6 +8777,38 @@ impl Vm {
                     self.stack.push(callee);
                     return self.do_call_fast(agent, 0, false);
                 }
+                // The dense-array fast path: a dense Array's elements are
+                // own data properties at the buffer positions, so the
+                // argument list pushes straight onto the stack — no per-call
+                // Vec, no `length`/`[[Get]]` round trip. A hole, a length
+                // past the buffer end, or a non-uint32 length falls back to
+                // `create_list_from_array_like` (whose own fast paths and
+                // the spec [[Get]] loop keep those shapes exact). The borrow
+                // never spans the call: the truncate/push/extend run no user
+                // code, and the elements are copied out before
+                // `do_call_fast` (a re-entrant callee may mutate the array).
+                if let ValueKind::Object(obj) = arg_array.kind()
+                    && let crux::object::ObjectKind::Array(slots) = &obj.kind
+                    && slots.dense.get()
+                {
+                    let length = slots.length.get() as usize;
+                    let fit = {
+                        let elements = slots.elements.borrow();
+                        elements.len() >= length && elements[..length].iter().all(Option::is_some)
+                    };
+                    if fit {
+                        self.stack.truncate(arg_start - 2);
+                        self.stack.push(args[0]);
+                        self.stack.push(callee);
+                        {
+                            let elements = slots.elements.borrow();
+                            for element in elements[..length].iter() {
+                                self.stack.push(element.unwrap());
+                            }
+                        }
+                        return self.do_call_fast(agent, length, false);
+                    }
+                }
                 // The list lives in a local the stack scan cannot see only
                 // until the extend below roots the values on the scanned
                 // stack; `create_list_from_array_like` suppresses stress for

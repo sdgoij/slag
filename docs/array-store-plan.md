@@ -1,5 +1,20 @@
 # Array-store plan: the buildString shape and dense elements
 
+**Status: RESOLVED (2026-09-01)** — Slice 1a was reverted by measurement
+(the HashMap memo stays; a direct-mapped table must cover the ~10k working
+set to avoid thrash, and the constant-key experiment's win was the
+cache-hot `key.clone()`, not the memo). Slice 1b (the
+`store_chain_clean` verdict cache) and Item 2 (dense elements) landed in
+`2ff893e` — the plan below is the design record; the current tree is the
+source of truth. Measured (release, current tree): `buildString shape`
+JIT ~600-700ms → ~42-52ms, interp ~740-840ms → ~180-200ms; the RegExp
+property-escape sweep cluster is 469/0/0/0 (was the sweep's slowest
+"hang" cluster).
+Remaining deferred follow-ups from the plan: re-densify after a spill
+(explicitly "skip in v1") and the `offset_of!` true-inline JIT store
+(Phase C — the helper-call store already beats the ≤100ms target, so
+this is optional).
+
 Scope: close the gap on the `test262` harness's `buildString`
 (`test262/harness/regExpUtils.js`) — the fill-reset array-store loop that
 historically made the RegExp property-escape fixtures the sweep's slowest

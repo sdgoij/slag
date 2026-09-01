@@ -2432,6 +2432,24 @@ allocates a per-call `Vec` for the general path — the dense fast path
 avoids the per-element key/Get machinery, not the allocation; inlining
 the dense element pushes onto the stack is a listed follow-up.)
 
+**Dense-array argument list** (2026-09-01): the listed follow-up landed.
+`do_call_apply`'s `Apply` arm now recognizes a dense Array argArray and
+pushes its elements straight onto the value stack — no per-call `Vec`
+allocation, no `length` property path / `ToLength` round trip, no
+`[[Get]]`-loop element reads. The gate is exact: a hole, a length past
+the buffer end, or a non-Array falls back to
+`create_list_from_array_like` (whose own fast paths and the spec `[[Get]]`
+loop keep those shapes unchanged), and the buffer borrow never spans the
+call (a re-entrant callee may mutate the argument array). Measured on the
+`apply leaf call` row (200K, release, A/B medians): **interp ~101ms →
+~57ms, jit ~98ms → ~50ms (~1.8x / ~1.9x)** — the JIT's `call_apply` helper
+inherits it automatically. Spec-exact: the new
+`apply_dense_array_fast_path_preserves_spec_semantics` test (holes,
+partially-filled arrays, re-entrant mutation, 10k-element arrays,
+array-likes, getters) plus the Function/prototype/apply+call fixture
+clusters clean under `--gc-stress --jitless`; full sweep (JIT default and
+`--jitless`) at 0 fail / 0 crash / 0 hang.
+
 ### The interpreter's `LoadIdent` global fast path, mirroring the JIT's Cut 36 probe (measured 2026-09-01)
 
 The `--jit-bench` `global read` row (a 1M `s += g` loop inside a function)

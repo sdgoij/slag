@@ -1056,6 +1056,86 @@ mod tests {
     }
 
     #[test]
+    fn apply_dense_array_fast_path_preserves_spec_semantics() {
+        // The `CallApply` handler's dense fast path pushes a dense Array's
+        // elements straight onto the stack (no per-call Vec, no
+        // length/`[[Get]]` round trip). It must fire ONLY on a dense Array
+        // with every element present — a hole, a length past the buffer, a
+        // non-Array, or a getter falls back to the general paths, which are
+        // unchanged.
+        assert_eq!(
+            value(
+                "var f = function (a, b, c) { return a * 100 + b * 10 + c; }; \
+                 f.apply(null, [1, 2, 3])"
+            ),
+            Value::Number(123.0)
+        );
+        // A 9-arg leaf (the bench shape: argc exceeds FAST_CALL_MAX_ARGS
+        // only in the RESULTING call, which the general path also makes).
+        assert_eq!(
+            value(
+                "var f = function (a, b, c, d, e, g, h, k, m) { return a + 1; }; \
+                 f.apply(null, [1, 2, 3, 4, 5, 6, 7, 8, 9])"
+            ),
+            Value::Number(2.0)
+        );
+        // A hole in the array becomes an undefined argument (join renders
+        // it empty), and a length past the buffer end stays undefined.
+        assert_eq!(
+            value(
+                "var f = function (a, b, c) { return [a, b, c].join('|'); }; \
+                 f.apply(null, [1, , 3])"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("1||3")))
+        );
+        assert_eq!(
+            value(
+                "var f = function (a, b, c) { return [a, b, c].join('|'); }; \
+                 f.apply(null, new Array(3))"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("||")))
+        );
+        // A re-entrant callee mutating the argument array must not trip the
+        // buffer borrow (the fast path copies the elements out before the
+        // call).
+        assert_eq!(
+            value(
+                "var a = [1, 2, 3]; var f = function () { a.push(99); return a.length; }; \
+                 f.apply(null, a)"
+            ),
+            Value::Number(4.0)
+        );
+        // A 10k-element array (the buildString harness shape) forwards every
+        // element.
+        assert_eq!(
+            value(
+                "var big = []; for (var i = 0; i < 10000; i++) { big[i] = i; } \
+                 var sum = function () { var s = 0; for (var i = 0; i < arguments.length; i++) { s += arguments[i]; } return s; }; \
+                 sum.apply(null, big)"
+            ),
+            Value::Number(49995000.0)
+        );
+        // Non-Array array-likes and getters still route through the general
+        // path unchanged.
+        assert_eq!(
+            value(
+                "var f = function (a, b, c) { return a + b + c; }; \
+                 f.apply(null, { length: 3, 0: 7, 1: 8, 2: 9 })"
+            ),
+            Value::Number(24.0)
+        );
+        assert_eq!(
+            value(
+                "var f = function (a) { return a; }; \
+                 var seen = 0; \
+                 var r = f.apply(null, { length: 1, get 0() { seen = 1; return 9; } }); \
+                 r + seen"
+            ),
+            Value::Number(10.0)
+        );
+    }
+
+    #[test]
     fn certified_body_global_read_fast_path_stays_spec_exact() {
         // The `LoadIdent` fast path (Cut 36 mirror): a certified body whose
         // env chain is exactly the global env serves a warmed global-value
