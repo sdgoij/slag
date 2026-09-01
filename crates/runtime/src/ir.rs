@@ -8339,7 +8339,7 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
-                    let value = self.leaf_operand_value(value)?;
+                    let value = self.leaf_operand_value(agent, value)?;
                     self.assign_member(
                         agent,
                         object,
@@ -8355,8 +8355,8 @@ impl Vm {
                     // load would have clobbered it). Shares the fast-array
                     // and property-key machinery with the step path.
                     let object = self.acc;
-                    let key = self.leaf_operand_value(key)?;
-                    let value = self.leaf_operand_value(value)?;
+                    let key = self.leaf_operand_value(agent, key)?;
+                    let value = self.leaf_operand_value(agent, value)?;
                     self.assign_computed_plain(agent, object, key, value)?;
                 }
                 LeafOp::GetMemberName { name } => {
@@ -8365,7 +8365,7 @@ impl Vm {
                 }
                 LeafOp::GetMemberComputed { key } => {
                     let object = self.acc;
-                    let key = self.leaf_operand_value(key)?;
+                    let key = self.leaf_operand_value(agent, key)?;
                     self.acc = self.get_member_computed(agent, object, key)?;
                 }
                 LeafOp::GetMemberNameLocal {
@@ -8401,7 +8401,7 @@ impl Vm {
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    let key = self.leaf_operand_value(key)?;
+                    let key = self.leaf_operand_value(agent, key)?;
                     self.acc = self.get_member_computed(agent, object, key)?;
                 }
                 LeafOp::PushAcc => self.stack.push(self.acc),
@@ -8470,7 +8470,11 @@ impl Vm {
     /// Load a register operand to a value for a store op, mirroring the
     /// `LoadReg`/`LoadContext`/`LoadPerIter`/`LoadConst` ops' semantics
     /// (including the TDZ and context-transparent-env walks).
-    fn leaf_operand_value(&self, operand: &RegOperand) -> Result<Value, JsError> {
+    fn leaf_operand_value(
+        &mut self,
+        agent: &mut Agent,
+        operand: &RegOperand,
+    ) -> Result<Value, JsError> {
         match operand {
             RegOperand::Acc => Ok(self.acc),
             RegOperand::Reg { slot, tdz } => {
@@ -8482,6 +8486,24 @@ impl Vm {
                     ));
                 }
                 Ok(value)
+            }
+            RegOperand::PostInc { slot, tdz, op } => {
+                // A post-increment key: read the slot, write the update back,
+                // yield the OLD value — exactly what the `UpdateLocal` step
+                // (postfix) computes, with the same TDZ check. The write-back
+                // runs before the store machinery's nullish check, matching
+                // JS evaluation order (`l++` fully evaluates before the
+                // [[Set]] throws on a nullish receiver).
+                let old = *self.frame_get(*slot);
+                if *tdz && old.is_uninitialized() {
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    ));
+                }
+                let (old_numeric, new) = update_value(agent, op, &old)?;
+                *self.frame_get_mut(*slot) = new;
+                Ok(old_numeric)
             }
             RegOperand::Ctx { index } => {
                 let mut env = self.body_context_env();
@@ -8515,12 +8537,11 @@ impl Vm {
                 ErrorKind::SyntaxError,
                 "spilled register operand cannot be re-loaded".into(),
             )),
-            // The lowering rejects a counter as a store key/value (it would
-            // need a stack pop, which the operand loader cannot express).
-            RegOperand::Counter => Err(JsError::new(
-                ErrorKind::SyntaxError,
-                "counter register operand cannot be re-loaded".into(),
-            )),
+            // The counter was pushed onto the value stack at `RunRegBody`
+            // entry; a store's key/value operand pops it (mirroring
+            // `LeafOp::LoadCounter`). At most one read per body, so the pop
+            // is always the counter.
+            RegOperand::Counter => Ok(self.pop()),
         }
     }
 
@@ -16823,6 +16844,17 @@ pub enum RegOperand {
         slot: usize,
         tdz: bool,
     },
+    /// A post-increment/--decrement key (`a[l++] = v`): loading the operand
+    /// reads the slot, writes the update back, and yields the OLD value —
+    /// exactly what `Step::UpdateLocal` with `prefix: false` computes. Only
+    /// the computed member store consumes it (any other position — a read
+    /// key, a binary operand, a plain store value — keeps the body on the
+    /// step path, where the `UpdateLocal` step's ordering is preserved).
+    PostInc {
+        slot: usize,
+        tdz: bool,
+        op: UpdateOp,
+    },
     Ctx {
         index: usize,
     },
@@ -16858,6 +16890,9 @@ fn load_operand(ops: &mut Vec<LeafOp>, operand: RegOperand) -> bool {
             ops.push(LeafOp::LoadReg { slot, tdz });
             true
         }
+        // A post-increment is only a member-store key (its write-back cannot
+        // be a general load — `x = l++` stays on the step path).
+        RegOperand::PostInc { .. } => false,
         RegOperand::Ctx { index } => {
             ops.push(LeafOp::LoadContext { index });
             true
@@ -16985,7 +17020,10 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                                 // A computed, spilled, or counter right
                                 // operand cannot be held while the left
                                 // operand loads into the accumulator.
-                                RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter => {
+                                RegOperand::Acc
+                                | RegOperand::Spilled
+                                | RegOperand::Counter
+                                | RegOperand::PostInc { .. } => {
                                     return None;
                                 }
                             }
@@ -17017,6 +17055,23 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 }
                 stack.push(RegOperand::Acc);
             }
+            Step::UpdateLocal { slot, op, prefix } => {
+                // A post-increment key (`a[l++] = v`): the operand loads the
+                // slot and writes the update back at load time. A prefix
+                // form (`++l`) yields the new value — no register shape; a
+                // statement-position update (`a[l] = i; l++;`) leaves the
+                // operand unconsumed, so the end-of-body stack check keeps
+                // it on the step path (the write-back must not be lost).
+                if *prefix {
+                    return None;
+                }
+                let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
+                stack.push(RegOperand::PostInc {
+                    slot: *slot,
+                    tdz,
+                    op: *op,
+                });
+            }
             Step::StoreLocal { slot } | Step::FusedStoreLocal { slot } => {
                 let value = stack.pop()?;
                 if !load_operand(&mut ops, value) {
@@ -17047,9 +17102,16 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 // the binary ops' right operand.
                 let value = stack.pop()?;
                 let object = stack.pop()?;
+                // A `PostInc` value would run the write-back after the
+                // nullish check, inverting the step path's order (`l++`
+                // evaluates before [[Set]] throws on a nullish receiver) —
+                // keep it on the step path.
                 if matches!(
                     value,
-                    RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
+                    RegOperand::Acc
+                        | RegOperand::Spilled
+                        | RegOperand::Counter
+                        | RegOperand::PostInc { .. }
                 ) {
                     return None;
                 }
@@ -17068,13 +17130,15 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
                 let value = stack.pop()?;
                 let key = stack.pop()?;
                 let object = stack.pop()?;
-                if matches!(
-                    key,
-                    RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
-                ) || matches!(
-                    value,
-                    RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
-                ) {
+                // A computed key or value (`Acc`) cannot be held while the
+                // object load overwrites the accumulator. A `Counter` (the
+                // single per-body loop-counter read, pushed at `RunRegBody`
+                // entry) and a `PostInc` key (the write-back happens at load
+                // time, before the store's nullish check — matching JS
+                // evaluation order) are direct operands.
+                if matches!(key, RegOperand::Acc | RegOperand::Spilled)
+                    || matches!(value, RegOperand::Acc | RegOperand::Spilled)
+                {
                     return None;
                 }
                 if !load_operand(&mut ops, object) {

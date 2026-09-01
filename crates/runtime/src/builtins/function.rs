@@ -1129,6 +1129,55 @@ mod tests {
     }
 
     #[test]
+    fn register_post_inc_member_store_stays_spec_exact() {
+        // The per-op floor shape `a[l++] = i` lowers to a register body
+        // (LoadReg + StoreMemberComputed with a PostInc key and the loop
+        // counter as the value): the key is the OLD `l`, the slot is
+        // written back at load time, and the counter reads the loop value.
+        assert_eq!(
+            value(
+                "var a = []; var l = 0; for (var i = 0; i < 5; i++) { a[l++] = i; } \
+                 a.join(',') + '|' + l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("0,1,2,3,4|5")))
+        );
+        // The value reads the slot AFTER the post-increment (`a[l++] = l`:
+        // the operand load order — key first, then value — matches JS).
+        assert_eq!(
+            value(
+                "var a = []; var l = 0; for (var i = 0; i < 3; i++) { a[l++] = l; } \
+                 a.join(',')"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("1,2,3")))
+        );
+        // A non-Number `l` coerces through the general update machinery
+        // (ToNumeric) inside the operand load.
+        assert_eq!(
+            value(
+                "var a = []; var l = '0'; for (var i = 0; i < 3; i++) { a[l++] = i; } \
+                 a.join(',') + '|' + typeof l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("0,1,2|number")))
+        );
+        // A statement-position update (`a[l] = i; l++;`) and a prefix form
+        // (`a[++l] = i`) stay on the step path — the write-back survives.
+        assert_eq!(
+            value(
+                "var a = []; var l = 0; for (var i = 0; i < 3; i++) { a[l] = i; l++; } \
+                 a.join(',') + '|' + l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("0,1,2|3")))
+        );
+        assert_eq!(
+            value(
+                "var a = []; var l = 0; for (var i = 0; i < 3; i++) { a[++l] = i; } \
+                 a.join(',') + '|' + l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8(",0,1,2|3")))
+        );
+    }
+
+    #[test]
     fn fused_fast_binding_limit_loop_stays_spec_exact() {
         // The fused relational loop test with a fast-binding limit (`i < n`
         // where `n` is a frame slot): the head re-reads the limit every

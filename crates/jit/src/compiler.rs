@@ -5045,6 +5045,50 @@ impl<'a> Lowerer<'a> {
             }
             RegOperand::Const(value) => self.const_bits(value, step, op_index, field),
             RegOperand::Counter => Ok(self.counter_bits()),
+            RegOperand::PostInc { slot, tdz, op } => {
+                // A post-increment key: read the slot, write the update back,
+                // yield the old value — the same fast/slow shape as
+                // `emit_update` (the f64 add inlines; a non-number falls to
+                // `UpdateValueSlow`). The write-back lands before the store
+                // machinery runs, matching the interpreter's load ordering.
+                let old = self.load_slot(*slot);
+                if *tdz {
+                    self.emit_tdz_check(old)?;
+                }
+                let is_num = self.is_double(old);
+                let num = self
+                    .builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), old);
+                let delta = if matches!(op, UpdateOp::Increment) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let delta_c = self.builder.ins().f64const(delta);
+                let new_num = self.builder.ins().fadd(num, delta_c);
+                let new_bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), new_num);
+                let new_fast = self.canon(new_bits);
+                let new_var = self.builder.declare_var(types::I64);
+                self.builder.def_var(new_var, new_fast);
+                let merge = self.builder.create_block();
+                let slow = self.builder.create_block();
+                self.builder.ins().brif(is_num, merge, &[], slow, &[]);
+                self.builder.switch_to_block(slow);
+                let inc_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let new_slow =
+                    self.call_slow(self.sig_update, Helper::UpdateValueSlow, &[inc_imm, old])?;
+                self.builder.def_var(new_var, new_slow);
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
+                let new_value = self.builder.use_var(new_var);
+                self.store_slot(*slot, new_value);
+                Ok(old)
+            }
             RegOperand::Ctx { index } => {
                 // A captured binding as a member key/value: the depth-0
                 // context read through the slow path.

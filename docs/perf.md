@@ -2463,10 +2463,51 @@ full `Get` per read (~133ns/read).
 
 Measured: **`global read` interp 157.6ms → ~49ms (~3.2x)** — parity with
 reading a local in the same loop shape — with the JIT row unchanged
-(~6.4ms); no regressions on the other rows. The remaining ~49ms is the
+(~6.4ms); no regressions on the other rows. The remaining ~49ms was the
 row's general step-loop floor (the `i < n` limit is a slot, not a
-literal, so the fused head does not apply) — part of the interpreter
-per-op floor lever.
+literal, so the fused head did not apply); the fast-binding-limit fusion
+(`RelLimit`, committed 2026-09-01) later closed that part — the row
+measures ~21.6ms now — and the post-inc store slice below trims the
+store shapes.
+
+### Register-encoded post-increment computed stores (measured 2026-09-01)
+
+The `indexed store` per-op floor (`a[l++] = i`, ~48ns/op) decomposed to
+~7 step dispatches per iteration plus the store machinery; the body would
+not lower to a register body because `l++` (a postfix `UpdateLocal`) had
+no register form and the loop counter could not serve as a store value.
+The register model now covers the shape:
+
+- **`RegOperand::PostInc { slot, tdz, op }`** — a post-increment member
+  key: loading the operand reads the slot (TDZ-checked), writes the
+  update back through the shared `update_value` coercion (a non-Number
+  `l` goes through ToNumeric), and yields the OLD value — the postfix
+  `UpdateLocal` semantics, with the write-back landing before the
+  store's nullish check (JS evaluation order). The lowering emits it
+  from `Step::UpdateLocal` (`prefix: false`), and only the computed
+  member store consumes it — a statement-position update
+  (`a[l] = i; l++;`), a prefix form, a read key, or a binary operand
+  keeps the body on the step path (where the ordering is preserved).
+- **The loop counter as a store key/value** — `leaf_operand_value` is now
+  `&mut self` and pops the counter (pushed once at `RunRegBody` entry;
+  the single-read guard is unchanged), so `a[l++] = i`'s value reads the
+  loop counter directly instead of round-tripping through the value
+  stack.
+- **The JIT mirrors the operand** — `leaf_operand`'s `PostInc` arm emits
+  the `emit_update` fast/slow shape (inline f64 add + `UpdateValueSlow`
+  fallback) and writes the slot back, so a compiled body containing the
+  shape keeps compiling (no bail regression under the default JIT).
+
+The body `a[l++] = i` compiles to `RunRegBody { LoadReg a;
+StoreMemberComputed { key: PostInc(l), value: Counter } }` — one dispatch
+instead of seven steps. Measured (release `--bench`, medians of 3):
+**`indexed store` 47.2ms → ~42.7ms (~10%)**, the 5M-iteration post-inc
+probe 246ms → ~222ms (~5.6ns/op saved). The `buildString shape` row (a
+`l++` store plus an `if (l === 10000)` guard) stays on the step path —
+the register lowering is whole-body and rejects the guard's branch; a
+per-statement register-run segmentation is a listed follow-up. Spec-exact:
+`register_post_inc_member_store_stays_spec_exact` plus the full sweep
+(JIT default) at 0 fail / 0 crash / 0 hang.
 
 ## Deferred milestones
 
