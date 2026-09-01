@@ -12,7 +12,9 @@ use crux::object::{JsObject, ObjectKind, TypedArraySlots};
 use crux::ops::same_value_zero;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
-use crux::typed_array::{AtomicOp, ElementType, decode_element, encode_element};
+use crux::typed_array::{
+    AtomicOp, ElementType, MAX_ELEMENT_SIZE, decode_element, encode_element_into,
+};
 use crux::value::{Value, ValueKind};
 
 use std::collections::{HashMap, VecDeque};
@@ -157,9 +159,8 @@ fn write_element(slots: &TypedArraySlots, offset: usize, value: &Value) -> Resul
 /// The native-order integer the element's bytes encode (the raw word the
 /// Atomics operations read-modify-write).
 fn element_raw(element_type: ElementType, value: &Value) -> Result<u64, JsError> {
-    let bytes = encode_element(element_type, value)?;
-    let mut buf = [0u8; 8];
-    buf[..bytes.len()].copy_from_slice(&bytes);
+    let mut buf = [0u8; MAX_ELEMENT_SIZE];
+    encode_element_into(element_type, value, &mut buf)?;
     Ok(u64::from_ne_bytes(buf))
 }
 

@@ -1030,11 +1030,12 @@ fn fill(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     // element, so encode once and write the buffer directly. The old loop
     // built a decimal key string and parsed it back per element (plus a
     // fresh encode Vec each write) — measured ~680ms on an 800k fill.
-    let bytes = crux::typed_array::encode_element(slots.element_type, &value)?;
+    let mut bytes = [0u8; crux::typed_array::MAX_ELEMENT_SIZE];
+    let size = crux::typed_array::encode_element_into(slots.element_type, &value, &mut bytes)?;
     if let ValueKind::Object(obj) = this.kind()
         && let crux::object::ObjectKind::IntegerIndexed(slots) = &obj.kind
     {
-        obj.typed_array_fill_encoded(slots, k, final_index, &bytes)?;
+        obj.typed_array_fill_encoded(slots, k, final_index, &bytes[..size])?;
         return Ok(*this);
     }
     for k in k..final_index {

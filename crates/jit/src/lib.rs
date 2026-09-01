@@ -428,6 +428,7 @@ fn runtime_helpers() -> JitHelpers {
         destructure_close_all: Some(rt.destructure_close_all),
         create_arguments: Some(rt.create_arguments),
         typeof_top: Some(rt.typeof_top),
+        typed_array_length: Some(rt.typed_array_length),
         get_super_base: Some(rt.get_super_base),
         this_value: Some(rt.this_value),
         get_super_name: Some(rt.get_super_name),
@@ -627,6 +628,7 @@ mod tests {
             destructure_close_all: Some(helpers::test_destructure_close_all),
             create_arguments: Some(helpers::test_create_arguments),
             typeof_top: Some(helpers::test_typeof_top),
+            typed_array_length: Some(helpers::test_typed_array_length),
             get_super_base: Some(helpers::test_get_super_base),
             this_value: Some(helpers::test_this_value),
             get_super_name: Some(helpers::test_get_super_name),
@@ -1572,6 +1574,25 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(3.0));
         assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_typed_array_length_probe_serves_compiled_reads() {
+        // A loop reading `ta.length` per iteration compiles, and the
+        // compiled `GetMemberName`-with-length probe serves the slots length
+        // with no `get_member_name` round-trip. A plain-object receiver
+        // misses the probe (the sentinel) and falls back to the member-cell
+        // probe / helper — behavior unchanged.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(x) { var s = 0; for (var i = 0; i < 1000; i++) { s += x.length; } return s; } \
+                     f({ length: 5 }); f(new Uint8Array(7));",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(7000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]

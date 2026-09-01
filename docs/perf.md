@@ -2312,15 +2312,49 @@ measure 19.5ms / 51.5ms under the default JIT.
   properties; the full sweep is green. The JIT `view.length` helper
   (below) is now safe to build.
 
-Remaining typed-array levers, in order of expected value:
+Remaining levers (the two typed-array rows below are closed — see the
+next section), in order of expected value:
 
 | lever | current gap vs node | where |
 |---|---|---|
-| `encode_element` stack-buffer variant — the per-element `Vec<u8>` remains in the JIT store row and `typed_array_element_set`; a `[u8; 8]` write-into variant cuts most of the rest | write ~50x | `crux/src/typed_array.rs` + `runtime/src/jit.rs` |
-| JIT `view.length` helper — now unblocked (the own-`length` divergence is fixed): probe IntegerIndexed + length atom → slots length (NaN sentinel → slow) so the compiled loop stops FFI-round-tripping per read | length ~20x | `runtime/src/jit.rs` + `jit/src/compiler.rs` |
 | GC slot-arena allocation (GC-5's remaining lever) — `Gc::new` heavier than `Rc::new`; recovers the construct-churn / string-concat ~2x regressions | 2x | `docs/gc-plan.md` |
 | interpreter per-op floor — the 0.7µs bare-loop iteration is ~100x off mainstream; the floor section calls the VM core a real but secondary target | ~100x | `runtime/src/ir.rs` |
 | the apply floor — see the vector-call/apply section below: the builtin round-trip + per-call arg-list build leave apply-to-leaf at ~1µs/call | ~10x on a 1-elem apply | `runtime/src/builtins/function.rs` |
+
+### Typed-array element encode and the compiled length probe (measured 2026-09-01)
+
+The two remaining typed-array levers are closed; the typed-array rows are
+now the closest to node in the whole suite.
+
+- **The per-element encode no longer allocates.** `encode_element`'s
+  fresh `Vec<u8>` per write is replaced by `encode_element_into` — a
+  stack `[u8; 8]` buffer (the largest element is 8 bytes) returning the
+  used length — used by every per-element write path
+  (`typed_array_element_set`, `typed_array_set`, the index define),
+  plus Atomics' `element_raw` and `fill`'s encode-once. The JIT store
+  helper inherits it through `typed_array_element_set`. A/B on the
+  `--jit-bench` rows: the JIT write row **51.5ms → ~30ms (~42%)** and
+  the interpreter write row **~92ms → ~73ms (~20%)** (3 runs each,
+  stable).
+- **The compiled `view.length` read serves the slots directly.** A new
+  `typed_array_length` helper (the four-file mirror: a pure
+  `(ctx, object)` probe returning the slots length for an IntegerIndexed
+  receiver or the canonical-NaN sentinel) fronts the compiled
+  `GetMemberName`-with-`length` site before the member-cell probe — a
+  hit skips the `get_member_name` FFI round-trip. The probe is exact for
+  the same receivers the interpreter's fast path serves (the
+  own-`length` shadow is handled on the interpreter side); every other
+  receiver falls through to the member-cell probe / helper unchanged
+  (`{ length: 5 }` reads, string `.length`, etc.). The helper is
+  whitelisted as leaf-eligibility-neutral (pure, `emit_raw_call`).
+  Measured: the JIT length row **19.5ms → ~11.3ms (~42%)** (3 runs,
+  stable); the interpreter row is unchanged (its own fast path already
+  served the slots).
+
+With these, the table's earlier gaps collapse: the JIT length row is
+~11x vs node (was ~56x per the older table) and the JIT write row ~30x
+(was ~90x); both rows are the closest to node in the suite alongside
+buildString.
 
 ### Vector-call leaf-inline and the apply/call leaf fast path (measured 2026-09-01)
 

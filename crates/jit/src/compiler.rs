@@ -42,10 +42,11 @@ use runtime::ir::{
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JitCallContext, LEAF_CALL_CACHE_ENTRIES,
-    LeafCallSiteCache, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
-    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
-    VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
-    VM_FOR_OF_STACK_LEN_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    LeafCallSiteCache, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL,
+    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
+    VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
+    VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_PENDING_LEN_OFFSET,
+    VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -1108,6 +1109,15 @@ impl<'a> Lowerer<'a> {
         self.builder.def_var(self.sp_var, next);
     }
 
+    /// The interned "length" atom, cached once: the typed-array length probe
+    /// applies to `GetMemberName` sites whose name is exactly `length` (the
+    /// interpreter's fast path uses the same atom).
+    fn length_atom() -> crux::AtomId {
+        use std::sync::OnceLock;
+        static LENGTH: OnceLock<crux::AtomId> = OnceLock::new();
+        *LENGTH.get_or_init(|| crux::string::intern_utf8("length"))
+    }
+
     /// The Cut 38 member-value cell probe, shared by the step path's
     /// `GetMemberName` and the register body's `GetMemberName`/
     /// `GetMemberNameLocal` (the fast-loop shape): check `object` is a
@@ -1136,6 +1146,25 @@ impl<'a> Lowerer<'a> {
         let probe = self.builder.create_block();
         let slow = self.builder.create_block();
         let merge = self.builder.create_block();
+        // The typed-array length probe: only the `length` atom needs it. A
+        // helper returns the slots length for an IntegerIndexed receiver or
+        // the canonical-NaN sentinel; a hit serves the value with no
+        // `get_member_name` call (the interpreter's `get_member_name` fast
+        // path serves the same slots length, gated on the own-`length`
+        // shadow — the probe is exact for the same receivers). Any other
+        // receiver falls into the member-cell probe below.
+        if name == Self::length_atom() {
+            let len = self.emit_raw_call(self.sig_bool, Helper::TypedArrayLength, &[object])?;
+            let sentinel = self
+                .builder
+                .ins()
+                .iconst(types::I64, TYPED_ARRAY_LENGTH_SENTINEL as i64);
+            let hit = self.builder.ins().icmp(IntCC::NotEqual, len, sentinel);
+            self.builder.def_var(value_var, len);
+            let len_miss = self.builder.create_block();
+            self.builder.ins().brif(hit, merge, &[], len_miss, &[]);
+            self.builder.switch_to_block(len_miss);
+        }
         let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
         let is_obj = self
             .builder

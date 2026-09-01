@@ -2033,9 +2033,10 @@ impl JsObject {
                 "TypedArray buffer is immutable".into(),
             ));
         }
-        let bytes = crate::typed_array::encode_element(slots.element_type, &value)?;
+        let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
+        let size = crate::typed_array::encode_element_into(slots.element_type, &value, &mut bytes)?;
         if typed_array_valid_index(slots, index as f64) {
-            write_element_bytes(slots, index as f64, &bytes)?;
+            write_element_bytes(slots, index as f64, &bytes[..size])?;
         }
         Ok(true)
     }
@@ -3918,8 +3919,10 @@ fn typed_array_define_own_property(
             return Ok(false);
         }
         if let Some(value) = &desc.value {
-            let bytes = crate::typed_array::encode_element(slots.element_type, value)?;
-            write_element_bytes(slots, index, &bytes)?;
+            let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
+            let size =
+                crate::typed_array::encode_element_into(slots.element_type, value, &mut bytes)?;
+            write_element_bytes(slots, index, &bytes[..size])?;
         }
         return Ok(true);
     }
@@ -3980,9 +3983,11 @@ fn typed_array_set(
                     "TypedArray buffer is immutable".into(),
                 ));
             }
-            let bytes = crate::typed_array::encode_element(slots.element_type, &value)?;
+            let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
+            let size =
+                crate::typed_array::encode_element_into(slots.element_type, &value, &mut bytes)?;
             if typed_array_valid_index(slots, index) {
-                write_element_bytes(slots, index, &bytes)?;
+                write_element_bytes(slots, index, &bytes[..size])?;
             }
             return Ok(true);
         }

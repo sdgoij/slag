@@ -744,59 +744,119 @@ pub fn f16_from_f64(x: f64) -> u16 {
     }
 }
 
+/// The largest element size (Float64 / BigInt64 / BigUint64).
+pub const MAX_ELEMENT_SIZE: usize = 8;
+
 /// Convert a Number value into the element bytes of `element_type`
-/// (spec SetValueInBuffer with ToNumber + the element conversion, 25.2.4.2).
-fn encode_number(element_type: ElementType, number: f64) -> Result<Vec<u8>, JsError> {
-    let bytes = match element_type {
-        ElementType::Int8 => (wrap_signed(number, 8) as i8).to_ne_bytes().to_vec(),
-        ElementType::Uint8 => (wrap_signed(number, 8) as u8).to_ne_bytes().to_vec(),
-        ElementType::Uint8Clamped => to_uint8_clamp(number).to_ne_bytes().to_vec(),
-        ElementType::Int16 => (wrap_signed(number, 16) as i16).to_ne_bytes().to_vec(),
-        ElementType::Uint16 => (wrap_signed(number, 16) as u16).to_ne_bytes().to_vec(),
-        ElementType::Int32 => (wrap_signed(number, 32) as i32).to_ne_bytes().to_vec(),
-        ElementType::Uint32 => (wrap_signed(number, 32) as u32).to_ne_bytes().to_vec(),
-        ElementType::Float16 => f16_from_f64(number).to_ne_bytes().to_vec(),
-        ElementType::Float32 => (number as f32).to_ne_bytes().to_vec(),
-        ElementType::Float64 => number.to_ne_bytes().to_vec(),
-        ElementType::BigInt64 | ElementType::BigUint64 => {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "BigInt element type requires a BigInt value".into(),
-            ));
+/// (spec SetValueInBuffer with ToNumber + the element conversion, 25.2.4.2),
+/// writing them into `out[..size]` and returning `size`. No allocation — the
+/// per-element write paths (`typed_array_element_set`, the JIT store helper)
+/// previously paid a fresh `Vec<u8>` per element.
+fn encode_number_into(
+    element_type: ElementType,
+    number: f64,
+    out: &mut [u8; MAX_ELEMENT_SIZE],
+) -> Result<usize, JsError> {
+    match element_type {
+        ElementType::Int8 => {
+            out[0] = wrap_signed(number, 8) as i8 as u8;
+            Ok(1)
         }
-    };
-    Ok(bytes)
+        ElementType::Uint8 => {
+            out[0] = wrap_signed(number, 8) as u8;
+            Ok(1)
+        }
+        ElementType::Uint8Clamped => {
+            out[0] = to_uint8_clamp(number);
+            Ok(1)
+        }
+        ElementType::Int16 => {
+            out[..2].copy_from_slice(&(wrap_signed(number, 16) as i16).to_ne_bytes());
+            Ok(2)
+        }
+        ElementType::Uint16 => {
+            out[..2].copy_from_slice(&(wrap_signed(number, 16) as u16).to_ne_bytes());
+            Ok(2)
+        }
+        ElementType::Int32 => {
+            out[..4].copy_from_slice(&(wrap_signed(number, 32) as i32).to_ne_bytes());
+            Ok(4)
+        }
+        ElementType::Uint32 => {
+            out[..4].copy_from_slice(&(wrap_signed(number, 32) as u32).to_ne_bytes());
+            Ok(4)
+        }
+        ElementType::Float16 => {
+            out[..2].copy_from_slice(&f16_from_f64(number).to_ne_bytes());
+            Ok(2)
+        }
+        ElementType::Float32 => {
+            out[..4].copy_from_slice(&(number as f32).to_ne_bytes());
+            Ok(4)
+        }
+        ElementType::Float64 => {
+            out[..8].copy_from_slice(&number.to_ne_bytes());
+            Ok(8)
+        }
+        ElementType::BigInt64 | ElementType::BigUint64 => Err(JsError::new(
+            ErrorKind::TypeError,
+            "BigInt element type requires a BigInt value".into(),
+        )),
+    }
 }
 
 /// Convert a BigInt value into the element bytes of a BigInt64/BigUint64
-/// element (spec ToBigInt64/ToBigUint64, 25.2.4.3).
-fn encode_bigint(element_type: ElementType, bigint: &BigInt) -> Result<Vec<u8>, JsError> {
-    let bytes = match element_type {
-        ElementType::BigInt64 => bigint.0.to_i64().unwrap_or(0).to_ne_bytes().to_vec(),
-        ElementType::BigUint64 => bigint.0.to_u64().unwrap_or(0).to_ne_bytes().to_vec(),
-        _ => {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "Number element type requires a Number value".into(),
-            ));
+/// element (spec ToBigInt64/ToBigUint64, 25.2.4.3), writing them into
+/// `out[..8]` and returning 8.
+fn encode_bigint_into(
+    element_type: ElementType,
+    bigint: &BigInt,
+    out: &mut [u8; MAX_ELEMENT_SIZE],
+) -> Result<usize, JsError> {
+    match element_type {
+        ElementType::BigInt64 => {
+            out.copy_from_slice(&bigint.0.to_i64().unwrap_or(0).to_ne_bytes());
+            Ok(8)
         }
-    };
-    Ok(bytes)
+        ElementType::BigUint64 => {
+            out.copy_from_slice(&bigint.0.to_u64().unwrap_or(0).to_ne_bytes());
+            Ok(8)
+        }
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "Number element type requires a Number value".into(),
+        )),
+    }
 }
 
 /// The bytes a language value encodes to for `element_type`: a BigInt
 /// content type coerces with ToBigInt*, anything else with ToNumber.
-/// spec 25.2.4.2 (TypedArray [[Set]] element conversion).
-pub fn encode_element(element_type: ElementType, value: &Value) -> Result<Vec<u8>, JsError> {
+/// spec 25.2.4.2 (TypedArray [[Set]] element conversion). Writes into
+/// `out[..size]` and returns `size` — the allocation-free form every
+/// per-element write path uses.
+pub fn encode_element_into(
+    element_type: ElementType,
+    value: &Value,
+    out: &mut [u8; MAX_ELEMENT_SIZE],
+) -> Result<usize, JsError> {
     if matches!(element_type, ElementType::BigInt64 | ElementType::BigUint64) {
         let bigint = match element_type {
             ElementType::BigInt64 => to_big_int64(value)?,
             _ => to_big_uint64(value)?,
         };
-        encode_bigint(element_type, &bigint)
+        encode_bigint_into(element_type, &bigint, out)
     } else {
-        encode_number(element_type, to_number(value)?)
+        encode_number_into(element_type, to_number(value)?, out)
     }
+}
+
+/// The allocated form of [`encode_element_into`] — kept for the callers
+/// that need an owned buffer (DataView's endianness swap, `fill`'s
+/// encode-once) rather than a stack slice.
+pub fn encode_element(element_type: ElementType, value: &Value) -> Result<Vec<u8>, JsError> {
+    let mut out = [0u8; MAX_ELEMENT_SIZE];
+    let size = encode_element_into(element_type, value, &mut out)?;
+    Ok(out[..size].to_vec())
 }
 
 /// The language value stored in the element bytes at `offset` (spec

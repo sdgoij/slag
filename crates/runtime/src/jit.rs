@@ -779,6 +779,12 @@ pub struct JitSlowPaths {
     /// `Step::TypeofTop` (Cut 60): compute the `typeof` string of the value
     /// (pops it) and return it. Never errors.
     pub typeof_top: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// A compiled `GetMemberName` with the `length` atom: the slots length of
+    /// an IntegerIndexed receiver, or the canonical-NaN sentinel otherwise
+    /// (the machine code falls back to the member-cell probe /
+    /// `get_member_name`). Pure — no user code, no Vm mutation — so it never
+    /// sets the pending byte.
+    pub typed_array_length: extern "C" fn(ctx: *mut c_void, object: u64) -> u64,
     /// `Step::GetSuperBase` (Cut 61): the this-binding check + the base (the
     /// home object's [[Prototype]] for a certified body, the env walk
     /// otherwise).
@@ -928,6 +934,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     destructure_close_all,
     create_arguments,
     typeof_top,
+    typed_array_length,
     get_super_base,
     this_value,
     get_super_name,
@@ -3520,6 +3527,31 @@ extern "C" fn typeof_top(ctx: *mut c_void, value: u64) -> u64 {
     .bits()
 }
 
+/// The typed-array length probe: the slots length of an IntegerIndexed
+/// receiver (spec 25.2.3.2 — the value the `%TypedArray%.prototype.length`
+/// accessor serves; the own-`length` shadowing is handled by the interpreter
+/// side, so a probe hit here is exact), or the canonical-NaN sentinel for
+/// any other receiver. The compiled `GetMemberName` with the `length` atom
+/// compares against the sentinel and falls back to the member-cell probe /
+/// `get_member_name` helper on a miss. Pure: `typed_array_effective_length`
+/// reads only the slots + shared buffer (no user code, no Vm mutation), so
+/// the call never sets the pending byte.
+extern "C" fn typed_array_length(_ctx: *mut c_void, object: u64) -> u64 {
+    let ValueKind::Object(obj) = Value::from_bits(object).kind() else {
+        return TYPED_ARRAY_LENGTH_SENTINEL;
+    };
+    if let crux::object::ObjectKind::IntegerIndexed(slots) = &obj.kind {
+        return Value::Number(crux::object::typed_array_effective_length(slots) as f64).bits();
+    }
+    TYPED_ARRAY_LENGTH_SENTINEL
+}
+
+/// The probe's miss sentinel: the canonical quiet-NaN value (`Value` boxes a
+/// NaN with the reserved-tag bits to this pattern; a length is never NaN, so
+/// the compiled comparison is exact). Shared with the compiler via
+/// `JitHelpers`-independent constants below.
+pub const TYPED_ARRAY_LENGTH_SENTINEL: u64 = 0x7FF9_0000_0000_0000;
+
 // ----- Cut 61: super property access -----
 
 /// `Step::GetSuperBase` (Cut 61): the this-binding check, then the base —
@@ -4612,6 +4644,10 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.concat_str_const as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.push_const as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.load_const as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.create_arguments as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.typeof_top as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.typed_array_length as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.get_super_base as usize, 0);
     }
 
     #[test]
@@ -4765,6 +4801,59 @@ mod tests {
                 Value::Number(1.0).bits()
             ),
             0
+        );
+    }
+
+    #[test]
+    fn typed_array_length_probe_serves_slots_or_the_sentinel() {
+        // The compiled `GetMemberName`-with-length fast path: the helper
+        // returns the slots length for an IntegerIndexed receiver and the
+        // canonical-NaN sentinel for everything else (a length is never NaN,
+        // so the machine code's equality test is exact). Pure — no ctx.
+        let ctx = std::ptr::null_mut();
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+
+        let array = agent.run_script("new Uint8Array(7)").unwrap();
+        assert_eq!(
+            typed_array_length(ctx, array.bits()),
+            Value::Number(7.0).bits()
+        );
+        // A subarray's length is its element count, not the buffer's.
+        let sub = agent
+            .run_script("new Uint8Array(new ArrayBuffer(16), 4, 3)")
+            .unwrap();
+        assert_eq!(
+            typed_array_length(ctx, sub.bits()),
+            Value::Number(3.0).bits()
+        );
+        // A detached view reads 0 (spec 25.2.3.1), matching the accessor.
+        assert_eq!(
+            typed_array_length(
+                ctx,
+                agent
+                    .run_script("(function(){ var b = new ArrayBuffer(4); var t = new Uint8Array(b); b.transfer(); return t; })()")
+                    .unwrap()
+                    .bits()
+            ),
+            Value::Number(0.0).bits()
+        );
+        // Non-typed-array receivers miss to the sentinel (the fallback
+        // `get_member_name` serves ordinary objects and strings).
+        assert_eq!(
+            typed_array_length(ctx, agent.run_script("({ length: 3 })").unwrap().bits()),
+            TYPED_ARRAY_LENGTH_SENTINEL
+        );
+        assert_eq!(
+            typed_array_length(
+                ctx,
+                Value::String(Handle::new(JsString::from_utf8("abc"))).bits()
+            ),
+            TYPED_ARRAY_LENGTH_SENTINEL
+        );
+        assert_eq!(
+            typed_array_length(ctx, Value::Undefined.bits()),
+            TYPED_ARRAY_LENGTH_SENTINEL
         );
     }
 

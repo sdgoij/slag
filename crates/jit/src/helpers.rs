@@ -124,6 +124,7 @@ pub enum Helper {
     DestructureCloseAll,
     CreateArguments,
     TypeofTop,
+    TypedArrayLength,
     GetSuperBase,
     ThisValue,
     GetSuperName,
@@ -244,6 +245,7 @@ impl Helper {
             Helper::DestructureCloseAll => "destructure_close_all",
             Helper::CreateArguments => "create_arguments",
             Helper::TypeofTop => "typeof_top",
+            Helper::TypedArrayLength => "typed_array_length",
             Helper::GetSuperBase => "get_super_base",
             Helper::ThisValue => "this_value",
             Helper::GetSuperName => "get_super_name",
@@ -287,6 +289,7 @@ impl Helper {
                 | Helper::StorePerIter
                 | Helper::PopVarReference
                 | Helper::TypeofTop
+                | Helper::TypedArrayLength
         )
     }
 }
@@ -610,6 +613,12 @@ pub struct JitHelpers {
     /// `Step::TypeofTop` (Cut 60): the `typeof` string of a value operand;
     /// never errors.
     pub typeof_top: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
+    /// A compiled `GetMemberName` with the `length` atom on an IntegerIndexed
+    /// receiver: the slots length, or a NaN sentinel when the receiver is not
+    /// a typed array (the machine code falls back to the member-cell probe /
+    /// `get_member_name`). Never errors, never disturbs the leaf-eligibility
+    /// state.
+    pub typed_array_length: Option<extern "C" fn(vm: *mut c_void, object: u64) -> u64>,
     /// Super property steps (Cut 61): `GetSuperBase`/`ThisValue` (the base
     /// and receiver), `GetSuperName`/`GetSuperComputed`/`GetSuperComputedKeep`
     /// (reads), `AssignSuperName`/`AssignSuperComputed`/`UpdateSuperName`/
@@ -747,6 +756,7 @@ impl JitHelpers {
             destructure_close_all: None,
             create_arguments: None,
             typeof_top: None,
+            typed_array_length: None,
             get_super_base: None,
             this_value: None,
             get_super_name: None,
@@ -880,6 +890,7 @@ impl JitHelpers {
             Helper::DestructureCloseAll => self.destructure_close_all.map(|f| f as usize as u64),
             Helper::CreateArguments => self.create_arguments.map(|f| f as usize as u64),
             Helper::TypeofTop => self.typeof_top.map(|f| f as usize as u64),
+            Helper::TypedArrayLength => self.typed_array_length.map(|f| f as usize as u64),
             Helper::GetSuperBase => self.get_super_base.map(|f| f as usize as u64),
             Helper::ThisValue => self.this_value.map(|f| f as usize as u64),
             Helper::GetSuperName => self.get_super_name.map(|f| f as usize as u64),
@@ -1504,6 +1515,12 @@ pub extern "C" fn test_typeof_top(_vm: *mut c_void, _value: u64) -> u64 {
     Value::String(crux::Handle::new(crux::JsString::from_utf8("function"))).bits()
 }
 
+/// The typed-array length probe double: the canonical-NaN sentinel (the
+/// scaffold never reads a real typed array).
+pub extern "C" fn test_typed_array_length(_vm: *mut c_void, _object: u64) -> u64 {
+    Value::Number(f64::NAN).bits()
+}
+
 /// Cut 61 super doubles: reads return marker values, writes/updates return
 /// the assigned/updated value, `DeleteSuper` returns 0 (the scaffolds never
 /// hit the error path), and the reference resolutions complete with
@@ -1651,6 +1668,7 @@ mod tests {
             Helper::AssignMemberName,
             Helper::AssignMemberComputed,
             Helper::FastArrayElementWrite,
+            Helper::TypedArrayLength,
         ] {
             assert!(none.get(h).is_none(), "{} should be None", h.name());
         }
@@ -1676,6 +1694,7 @@ mod tests {
             Helper::FastArrayElementWrite.name(),
             "fast_array_element_write"
         );
+        assert_eq!(Helper::TypedArrayLength.name(), "typed_array_length");
     }
 
     #[test]
