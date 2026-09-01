@@ -1641,16 +1641,35 @@ extern "C" fn fast_array_element_write(
     let ValueKind::Object(obj) = object.kind() else {
         return 0;
     };
-    if !matches!(obj.kind, crux::object::ObjectKind::Array(_)) {
-        return 0;
-    }
     let ValueKind::Number(number) = Value::from_bits(key).kind() else {
         return 0;
     };
     if number.fract() != 0.0 || !(0.0..4294967295.0).contains(&number) {
         return 0;
     }
-    match obj.array_element_write(number as u64, Value::from_bits(value)) {
+    let value = Value::from_bits(value);
+    // A typed array stores by numeric index through `typed_array_element_set`
+    // (IntegerIndexedElementSet — the same path `assign_computed_plain`
+    // takes), skipping the key-string conversion the general helper would
+    // do. Only a PRIMITIVE value is accepted: the element coercion
+    // (ToNumber/ToBigInt) of an object can run user code (toPrimitive), and
+    // the helper must not set the pending byte. The fallback re-runs the
+    // coercion and throws the identical TypeError for a wrong content type
+    // (BigInt on a Number array, ...) — nothing observable ran on the fast
+    // attempt, so re-running is safe.
+    if let crux::object::ObjectKind::IntegerIndexed(slots) = &obj.kind {
+        if matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
+            return 0;
+        }
+        return match obj.typed_array_element_set(slots, number as u64, value) {
+            Ok(true) => 1,
+            _ => 0,
+        };
+    }
+    if !matches!(obj.kind, crux::object::ObjectKind::Array(_)) {
+        return 0;
+    }
+    match obj.array_element_write(number as u64, value) {
         Ok(Some(())) => 1,
         _ => 0,
     }
@@ -4522,6 +4541,8 @@ pub(crate) fn run_jit_resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crux::handle::Handle;
+    use crux::string::JsString;
 
     #[test]
     fn the_slow_path_table_is_complete() {
@@ -4615,6 +4636,135 @@ mod tests {
         assert_eq!(
             ASSIGN_OPS[AssignOp::NullishAssign as usize],
             AssignOp::NullishAssign
+        );
+    }
+
+    #[test]
+    fn fast_array_element_write_stores_typed_array_elements() {
+        // The JIT's inline store helper handles IntegerIndexed receivers
+        // (previously only plain Arrays): a canonical Number index stores
+        // through `typed_array_element_set`. Only primitive values are
+        // accepted — an Object/Function value would run user code in the
+        // coercion, which the helper must not do (0 falls back to the full
+        // `assign_member_computed` helper that runs it on the VM).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let ctx = std::ptr::null_mut();
+
+        let number_array = agent.run_script("new Uint8Array(4)").unwrap();
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                number_array.bits(),
+                Value::Number(1.0).bits(),
+                Value::Number(42.0).bits()
+            ),
+            1
+        );
+        let ValueKind::Object(number_obj) = number_array.kind() else {
+            panic!("typed array is not an object");
+        };
+        let crux::object::ObjectKind::IntegerIndexed(slots) = &number_obj.kind else {
+            panic!("not an IntegerIndexed object");
+        };
+        assert_eq!(
+            number_obj.typed_array_element_get(slots, 1).unwrap(),
+            Value::Number(42.0)
+        );
+        // A string value coerces through ToNumber without user code.
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                number_array.bits(),
+                Value::Number(2.0).bits(),
+                Value::String(Handle::new(JsString::from_utf8("7"))).bits()
+            ),
+            1
+        );
+        assert_eq!(
+            number_obj.typed_array_element_get(slots, 2).unwrap(),
+            Value::Number(7.0)
+        );
+        // A BigInt on a Number array and an Object value fall back (the
+        // fallback re-runs the coercion and throws/coerces on the VM).
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                number_array.bits(),
+                Value::Number(3.0).bits(),
+                Value::BigInt(Handle::new(crux::BigInt::from(1u64))).bits()
+            ),
+            0
+        );
+        let object_value = agent.run_script("({})").unwrap();
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                number_array.bits(),
+                Value::Number(0.0).bits(),
+                object_value.bits()
+            ),
+            0
+        );
+        // A BigInt array stores a BigInt value; a Number value falls back.
+        let bigint_array = agent.run_script("new BigInt64Array(2)").unwrap();
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                bigint_array.bits(),
+                Value::Number(0.0).bits(),
+                Value::BigInt(Handle::new(crux::BigInt::from(5u64))).bits()
+            ),
+            1
+        );
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                bigint_array.bits(),
+                Value::Number(1.0).bits(),
+                Value::Number(3.0).bits()
+            ),
+            0
+        );
+        // An out-of-bounds canonical index is a spec no-op that reports
+        // success (10.4.7.6), matching `assign_computed_plain`.
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                number_array.bits(),
+                Value::Number(99.0).bits(),
+                Value::Number(1.0).bits()
+            ),
+            1
+        );
+        // A non-integer / negative / non-Number key and a non-object
+        // receiver still fall back.
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                number_array.bits(),
+                Value::Number(1.5).bits(),
+                Value::Number(1.0).bits()
+            ),
+            0
+        );
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                number_array.bits(),
+                Value::Number(-1.0).bits(),
+                Value::Number(1.0).bits()
+            ),
+            0
+        );
+        assert_eq!(
+            fast_array_element_write(
+                ctx,
+                Value::Number(1.0).bits(),
+                Value::Number(0.0).bits(),
+                Value::Number(1.0).bits()
+            ),
+            0
         );
     }
 

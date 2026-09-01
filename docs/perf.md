@@ -2264,6 +2264,58 @@ Node v24.12.0 comparison (same machine, interleaved 7-rep medians):
 | typed-array element write (800k) | ~1ms | 90ms | 90ms | ~90x |
 | typed-array native `fill` (800k) | <1ms | 680ms | 680ms | ~680x |
 
+### Typed-array fill fast path, the JIT inline typed-array store, and the remaining typed-array picture (measured 2026-09-01)
+
+The typed-array rows above were the largest remaining gaps; two fixes closed
+most of them, and the CLI's `--jit-bench` gained permanent rows (typed-array
+write / typed-array length) so the floors stay visible. Note the table's
+56ms/90ms columns for the length/write rows were the INTERPRETER numbers —
+the hoisted-array probes compile (see the probe-artifact bullet above) and
+measure 19.5ms / 51.5ms under the default JIT.
+
+- **`fill` encodes once and writes the buffer directly.** The old loop ran
+  `set_property(this, &key(k), value)` per element: a decimal-string
+  `JsString` allocation, a `canonical_index` parse back to an index, and a
+  fresh `encode_element` `Vec` per write. The builtin already coerces the
+  value exactly once (spec 25.2.3.9 step 4) and re-validates the view after
+  the coercion (steps 12-13), so the new path encodes once and writes the
+  same bytes per element — `JsObject::typed_array_fill_encoded`, no
+  per-element key, parse, or allocation. Measured in the release unit
+  harness (5 fills of 800k, ~1.97ms each): **~680ms → ~2ms (~340x)**, i.e.
+  the ~680x row is now ~2x vs node.
+- **The JIT's inline store helper now handles typed arrays.**
+  `fast_array_element_write` (the compiled `o[i] = v` fast path) previously
+  covered only plain Arrays; typed arrays fell through to the general
+  `assign_member_computed` helper — a second FFI call plus re-checks per
+  element. It now stores through `typed_array_element_set` for
+  `IntegerIndexed` receivers, gated on PRIMITIVE values only: an
+  Object/Function value's element coercion (ToNumber/ToBigInt) can run
+  `toPrimitive` user code, which the helper's "never sets the pending byte"
+  contract forbids, so those return 0 and the fallback runs the identical
+  coercion on the VM (nothing observable ran on the fast attempt, so
+  re-running is safe; the wrong-content-type TypeError is thrown by the
+  fallback). A/B on the new bench row (3 runs each, alternating order): the
+  JIT write row dropped **~59ms → ~51.5ms (~13%)**, non-overlapping spreads.
+- **Discovered divergence gating the `length` fast path.** A typed array
+  CAN carry an own `length` data property — `Object.defineProperty(ta,
+  'length', {value: 1})` succeeds via OrdinaryDefineOwnProperty — and it
+  must shadow the prototype accessor (node reads 1). The interpreter's
+  `get_member_name` typed-array shortcut returns the slots length first, so
+  slag reads 4: a pre-existing divergence test262 does not cover (sweep
+  green). A JIT `view.length` helper must not replicate it; fix the
+  interpreter corner first (the shortcut should skip when the typed array
+  has own properties).
+
+Remaining typed-array levers, in order of expected value:
+
+| lever | current gap vs node | where |
+|---|---|---|
+| `encode_element` stack-buffer variant — the per-element `Vec<u8>` remains in the JIT store row and `typed_array_element_set`; a `[u8; 8]` write-into variant cuts most of the rest | write ~50x | `crux/src/typed_array.rs` + `runtime/src/jit.rs` |
+| JIT `view.length` helper — after the own-`length` divergence fix above, probe IntegerIndexed + length atom → slots length (NaN sentinel → slow) so the compiled loop stops FFI-round-tripping per read | length ~20x | `runtime/src/jit.rs` + `jit/src/compiler.rs` |
+| GC slot-arena allocation (GC-5's remaining lever) — `Gc::new` heavier than `Rc::new`; recovers the construct-churn / string-concat ~2x regressions | 2x | `docs/gc-plan.md` |
+| interpreter per-op floor — the 0.7µs bare-loop iteration is ~100x off mainstream; the floor section calls the VM core a real but secondary target | ~100x | `runtime/src/ir.rs` |
+| vector-call leaf inline + `.apply` builtin fast path | — | `docs/jit-report.md` §7 item 7 |
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

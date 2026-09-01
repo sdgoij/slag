@@ -2040,6 +2040,28 @@ impl JsObject {
         Ok(true)
     }
 
+    /// The `fill` builtin's fast path (spec 25.2.3.9 step 14): write the
+    /// pre-encoded element `bytes` to every element in `start..end`. The
+    /// caller coerced the value once and validated the view (live, in
+    /// bounds, writable) after the coercion, so the writes need no
+    /// per-element re-encode, key-string conversion, or index check.
+    pub fn typed_array_fill_encoded(
+        &self,
+        slots: &TypedArraySlots,
+        start: u64,
+        end: u64,
+        bytes: &[u8],
+    ) -> Result<(), JsError> {
+        let element_size = slots.element_type.size();
+        let base = slots.byte_offset;
+        for index in start..end {
+            slots
+                .buffer
+                .write(base + index as usize * element_size, bytes)?;
+        }
+        Ok(())
+    }
+
     /// Parse-free own-property check for a canonical array index, used by
     /// `array_element_write`'s prototype-chain walk. The generic
     /// `get_own_property_key` re-parses the index string through the
