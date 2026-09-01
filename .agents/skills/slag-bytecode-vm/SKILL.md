@@ -653,6 +653,33 @@ accepts `Small` operands alongside `Flat` — a `Small` + `Small` of total
 same `JsString::concat`, so a string-representation change shows up in
 both paths — measure both when A/B-ing.
 
+## 17. A nested closure's `this` bails the ENCLOSING body's scope certification
+
+`closure_expr_allows` (ir.rs, reached from `analyze_scope` via
+`collect_captures`) rejects `ExprKind::This` (and `Super`/`Class`/
+`PrivateIn`/`TaggedTemplate`/`MetaProperty`/`ImportCall`) inside ANY
+nested closure — including a NON-arrow nested function whose `this` is
+its own binding. So `function outer() { function C(x) { this.x = x; } ... }`
+fails `collect_captures` → `analyze_scope` returns `None` → the WHOLE
+outer body drops to the env-machinery path. The rejection is correct for
+arrows (their `this` is lexical — it observes the enclosing body's
+`this`), but a non-arrow nested function's `this` is its own and does not
+need to bail the enclosing body. If you relax it, the sweep is the
+backstop (a wrong certification here can read the wrong `this`).
+
+Two consequences that look like separate bugs are the same gate:
+
+- The body never reaches the JIT at all: `scope = None` → `ordinary_call`
+  skips `run_compiled_body` (see the slag-jit skill's scope gate) — the
+  JIT cache never sees the body, so "doesn't JIT with no lookup" is a
+  scope failure, not an `emit_step` failure.
+- The env path resolves loop `var`s through the environment chain per
+  iteration. The construct-churn micro-bench measured ~5x slower in the
+  function-wrapped form (107ms vs 21.5ms flat) purely from this: the
+  timed body contained a nested `function C(x) { this.x = x }`,
+  uncertified the whole body, and every `var n/i/o` access paid the env
+  walk.
+
 ## The JIT back edge cannot target the function's entry block
 
 Cranelift verifies a jump to the function's ENTRY block with "invalid

@@ -36,6 +36,16 @@ use crate::expr::{get_iterator, iterator_close, iterator_step};
 use crate::flow::Completion;
 use crate::function::EcmaFunction;
 
+/// Which `Function.prototype` method a `Step::CallApply` site recognized: the
+/// compiler matches the member-call's property name; the handler compares the
+/// resolved function against the realm's intrinsic and calls the receiver
+/// directly on a match (see the step).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyKind {
+    Apply,
+    Call,
+}
+
 /// One resumable-function instruction.
 #[derive(Debug, Clone)]
 pub enum Step {
@@ -335,6 +345,21 @@ pub enum Step {
     CallFast {
         argc: u8,
         direct_eval: bool,
+    },
+    /// Call-site recognition of `Function.prototype.apply`/`call` (perf.md
+    /// "remaining apply floor"): a member call `f.apply(x, arr)` /
+    /// `f.call(x, ...)` compiles to the normal member read — a shadowed
+    /// `apply`/`call` resolves onto the stack and is called normally — plus
+    /// this step. The handler checks the resolved function against the realm's
+    /// intrinsic; on a match it calls `f` directly with the `this` argument
+    /// and the `CreateListFromArrayLike` element reads, all on this Vm
+    /// (skipping the builtin dispatch, the per-call argument-list `Vec`, and
+    /// the pooled-Vm take/return), and falls back to the general call of the
+    /// resolved function otherwise. Stack: `[..., f, apply/call, thisArg,
+    /// arg1..argN]` — the `CallFast` layout, `argc` = N+1.
+    CallApply {
+        argc: u8,
+        kind: ApplyKind,
     },
     /// Cut 35 slice 2: a plain global-named callee called with an undefined
     /// receiver (`f(x)` with `f` a declared script global, no `with`): the
@@ -5094,6 +5119,9 @@ impl Vm {
                 Step::CallFast { argc, direct_eval } => {
                     self.do_call_fast(agent, *argc as usize, *direct_eval)?;
                 }
+                Step::CallApply { argc, kind } => {
+                    self.do_call_apply(agent, *argc as usize, *kind)?;
+                }
                 Step::TailCallFast { argc, direct_eval } => {
                     return self.tail_call_fast(agent, *argc as usize, *direct_eval, body);
                 }
@@ -8437,6 +8465,89 @@ impl Vm {
             2,
             LeafCacheSite::None,
         )
+    }
+
+    /// The `Step::CallApply` handler: the member read already resolved the
+    /// `apply`/`call` function (a shadowed one is called with the original
+    /// argument list — the fallback is exactly `CallFast`); when it IS the
+    /// realm's intrinsic, the call runs on this Vm: the `this` argument and
+    /// the `CreateListFromArrayLike` element reads replace the argument
+    /// region, and `do_call_fast` leaf-inlines a certified callee with no
+    /// builtin dispatch and no pooled-Vm round trip. Stack:
+    /// `[..., f, apply/call, thisArg, arg1..argN]` (the `CallFast` layout,
+    /// `argc` = N+1).
+    pub(crate) fn do_call_apply(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        kind: ApplyKind,
+    ) -> Result<(), JsError> {
+        let n = self.stack.len();
+        let arg_start = n - argc;
+        let resolved = self.stack[arg_start - 1];
+        let callee = self.stack[arg_start - 2];
+        let realm = agent.current_realm()?;
+        let intrinsic = match kind {
+            ApplyKind::Apply => realm.intrinsics.apply_builtin(),
+            ApplyKind::Call => realm.intrinsics.call_builtin(),
+        };
+        if Some(resolved) != intrinsic {
+            // A shadowed apply/call: run the resolved function with the
+            // original argument list, exactly as `CallFast` would.
+            return self.do_call_fast(agent, argc, false);
+        }
+        // The intrinsic's own step-1 IsCallable check runs before any
+        // argument-list user code (spec 20.2.3.2 / 20.2.3.4 step 1).
+        if !is_callable(&callee) {
+            let what = match kind {
+                ApplyKind::Apply => "Apply",
+                ApplyKind::Call => "Call",
+            };
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                format!("{what} must be called on a function"),
+            ));
+        }
+        // The argument region is copied out before the region is rebuilt (a
+        // truncate would otherwise alias the borrow); `FAST_CALL_MAX_ARGS`
+        // caps the fast form, so the small buffer always fits.
+        let mut args = [Value::Undefined; FAST_CALL_MAX_ARGS];
+        args[..argc].copy_from_slice(&self.stack[arg_start..n]);
+        match kind {
+            ApplyKind::Call => {
+                // `f.call(thisArg, a, b, ...)`: `this` is args[0], the
+                // direct call's arguments are the rest (spec 20.2.3.4
+                // steps 5-6).
+                let rest = if argc > 1 { &args[1..argc] } else { &args[..0] };
+                self.stack.truncate(arg_start - 2);
+                self.stack.push(args[0]);
+                self.stack.push(callee);
+                self.stack.extend_from_slice(rest);
+                self.do_call_fast(agent, argc.saturating_sub(1), false)
+            }
+            ApplyKind::Apply => {
+                let arg_array = if argc >= 2 { args[1] } else { Value::Undefined };
+                if matches!(arg_array.kind(), ValueKind::Undefined | ValueKind::Null) {
+                    // spec 20.2.3.2 step 2: a nullish argArray calls with
+                    // no arguments.
+                    self.stack.truncate(arg_start - 2);
+                    self.stack.push(args[0]);
+                    self.stack.push(callee);
+                    return self.do_call_fast(agent, 0, false);
+                }
+                // The list lives in a local the stack scan cannot see only
+                // until the extend below roots the values on the scanned
+                // stack; `create_list_from_array_like` suppresses stress for
+                // the build itself (mirroring the apply builtin).
+                let arg_list =
+                    crate::builtins::function::create_list_from_array_like(agent, &arg_array)?;
+                self.stack.truncate(arg_start - 2);
+                self.stack.push(args[0]);
+                self.stack.push(callee);
+                self.stack.extend_from_slice(&arg_list);
+                self.do_call_fast(agent, arg_list.len(), false)
+            }
+        }
     }
 
     /// The `TailCallFast` handler (proper tail calls): the callee/args are on
@@ -15542,6 +15653,9 @@ impl Compiler {
                 return Ok(());
             }
             // obj.m(args)
+            if self.try_compile_apply_call(member, call, tail)? {
+                return Ok(());
+            }
             self.compile_expr(&member.object)?;
             self.emit(Step::Dup);
             if member.optional {
@@ -15828,6 +15942,63 @@ impl Compiler {
             self.compile_call_args_guarded(&call.args, direct_eval)?;
         }
         Ok(())
+    }
+
+    /// Call-site recognition of `Function.prototype.apply`/`call` (perf.md
+    /// "remaining apply floor"): `f.apply(x, arr)` / `f.call(x, ...)`
+    /// compiles to the normal member read — a shadowed `apply`/`call`
+    /// resolves onto the stack and is called normally — plus `Step::CallApply`,
+    /// whose handler calls `f` directly when the resolved function is the
+    /// realm's intrinsic (skipping the builtin dispatch, the per-call
+    /// argument-list build, and the pooled-Vm round trip) and falls back to
+    /// the general call otherwise. Only the fast form takes the step: all
+    /// plain expressions, at most `FAST_CALL_MAX_ARGS` total arguments, no
+    /// optional chain anywhere (an upstream `?.` guard would need the
+    /// short-circuited argument skip), no tail position (a proper tail call
+    /// of the resolved function would need a tail step), and an object
+    /// without an internal optional chain.
+    fn try_compile_apply_call(
+        &mut self,
+        member: &syntax::ast::MemberExpr,
+        call: &syntax::ast::CallExpr,
+        tail: bool,
+    ) -> Result<bool, JsError> {
+        let kind = match &member.property {
+            MemberProperty::Name(name) if crux::lookup(*name) == JsString::from_utf8("apply") => {
+                ApplyKind::Apply
+            }
+            MemberProperty::Name(name) if crux::lookup(*name) == JsString::from_utf8("call") => {
+                ApplyKind::Call
+            }
+            _ => return Ok(false),
+        };
+        if tail
+            || member.optional
+            || call.optional
+            || self.chain_depth != 0
+            || call.args.len() > FAST_CALL_MAX_ARGS
+            || !call.args.iter().all(|a| matches!(a, Argument::Expr(_)))
+            || expr_may_short_circuit(&member.object)
+        {
+            return Ok(false);
+        }
+        // `[..., f]` then `Dup` + the member read: `[..., f, apply/call]`
+        // exactly as the general member call, so the resolved function (and
+        // a shadowing own/prototype `apply`) is whatever the spec's GetValue
+        // produces — the step compares it against the intrinsic.
+        self.compile_expr(&member.object)?;
+        self.emit(Step::Dup);
+        self.compile_member_property_guarded(member)?;
+        for argument in &call.args {
+            if let Argument::Expr(expr) = argument {
+                self.compile_expr(expr)?;
+            }
+        }
+        self.emit(Step::CallApply {
+            argc: call.args.len() as u8,
+            kind,
+        });
+        Ok(true)
     }
 
     /// The optional-call tail: nullish callee → *undefined* (no argument

@@ -402,6 +402,14 @@ fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
             "var n = 0; for (var i = 0; i < 1_000_000; i++) { n += i * 2; } n",
         ),
         (
+            "bare loop",
+            "var n = 0; for (var i = 0; i < 1_000_000; i++) { n += 1; } n",
+        ),
+        (
+            "indexed store",
+            "var a = []; var l = 0; for (var i = 0; i < 1_000_000; i++) { a[l++] = i; } l",
+        ),
+        (
             "property access",
             "var o = { a: 1, b: 2 }; var n = 0; for (var i = 0; i < 1_000_000; i++) { n += o.a + o.b; } n",
         ),

@@ -511,3 +511,57 @@ Traps that cost debugging time:
   bodies; the e2e tests that need a resumable body promoted drive it
   ≥17 times (a script loop calling the async fn 17×, or 6 generator
   instances).
+
+## 18. The certification path: scope gate vs emit_step gate
+
+The compile decision has TWO independent gates, and the failure mode tells
+you which one tripped (verified 2026-09-01 on the `--bench` micro rows):
+
+- **The scope gate runs BEFORE the JIT is ever consulted.** `run_jit_body`
+  is reached only from `run_compiled_body`, which `ordinary_call` takes
+  only when `ir.scope.is_some()` (function.rs) — plus the leaf paths
+  (`run_jit_leaf`/`try_jit_leaf`). A body with `scope = None` (the
+  env-machinery path) NEVER reaches `lookup_info`: the cache never sees
+  it, `jit_info` stays 0, and there is no sticky "1" mark. Symptom: a
+  body that doesn't speed up AND produces no cache lookup at all is a
+  scope-certification failure, not an `emit_step` failure.
+- **The emit_step gate.** A body with `scope.is_some()` that reaches the
+  JIT bails when any step has no `emit_step` arm (or needs a missing
+  helper). `lookup_info` marks it sticky-1 ("known non-compilable"), so
+  the next call skips the cache too.
+
+The gates are independent: a body can pass scope and fail emit_step
+(`new` in a certified body), or fail scope and never be seen at all.
+
+**`Step::Construct` is un-lowered.** A certified body containing `new`
+reaches the JIT and bails: `Construct` has no `emit_step` arm AND no
+`step_name` entry, so the catch-all reports the misleading literal name
+`"unsupported step"`. The interpreter's fast construct path is the
+construct-inline leaf cache (`run_leaf_construct`, `construct_inline` on
+`LeafEntry`); the JIT never grew the arm (`NewTarget` IS lowered — the
+Construct CALL is the gap).
+
+**The catch-all name is only as good as `step_name`'s coverage.** When
+adding a step arm, add its `step_name` entry in the same change — handled
+steps without an entry (member reads, Push/Pop, FastLoopHead, ...) would
+print the fallback if their arm ever moved, and a genuinely un-lowered
+step should identify itself.
+
+**Compiling a body is not the same as making it faster.** The JIT leaf
+call (`run_jit_leaf`: probe + `jit_roots` buffer + `JitCallContext` setup
++ machine-code call) can cost MORE than the interpreter's in-place
+`run_inline_leaf` for a tiny (≤4-step) leaf. Measured: a 1M-iteration
+`n = f(n)` loop with a small captured arrow (`(y) => x + y`, a 4-step
+leaf) compiled fine and ran ~25% SLOWER than the interpreter (41.6 vs
+33ms on the closure-capture row) — the per-iteration leaf-call overhead
+dominated the compiled loop's gains. Judge JIT wins by shape, not by "it
+compiled"; the interpreter's leaf-inline dispatch is a fast baseline for
+micro-leaves. The per-iteration machinery
+(`EnterPerIteration`/`PerIteration`/`UpdatePerIteration`/`CreateArrow`)
+IS lowered; loops whose hot call targets a dynamic callee (`fns[j & 15]()`)
+stay ~par because `call_slow` dominates regardless of compilation.
+
+**Investigation recipe:** temporarily print in `JitCache::lookup` (first
+visit: step count, `has_loop`, `scope`, `leaf`) and in `JitEngine::compile`
+(the `Unsupported` error). No first-visit print for the body → scope gate;
+a print + bail → emit_step gate, and the error names the step.

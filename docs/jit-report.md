@@ -500,9 +500,14 @@ two are fixed (2026-08-31) and the whole cluster now passes clean:
    runs the general `call_inner`" gap is closed.
    `Function.prototype.apply`/`call` to a certified leaf run the same leaf
    machinery (`try_leaf_call` on a pooled Vm — see the implemented table);
-   the remaining apply floor is the builtin round-trip + per-call arg-list
-   build (~1µs/call), which a future call-site `.apply`-recognition slice
-   (inlining `f.apply(a, arr)` as a spread call) would cut. A computed
+   the remaining apply floor (the builtin round-trip + per-call arg-list
+   build, ~1µs/call) is now **done** (2026-09-01): the compiler recognizes
+   `f.apply(x, arr)` / `f.call(x, ...)` member calls and emits the new
+   `Step::CallApply`, which the JIT lowers through the `call_apply` slow-path
+   helper — the resolved function is checked against the realm's intrinsic
+   and the call runs directly on the Vm (leaf-inline included), with the
+   shadowed/array-like/general cases falling back to the interpreter's
+   `do_call_apply` exactly. A computed
    callee (`getF()(n-1)`) still pays the per-iteration `tail_call` helper
    round-trip.
 8. ~~**String concat**~~ — **done** (Cut 67): a string of at most 16 code

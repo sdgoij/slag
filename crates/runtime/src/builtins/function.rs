@@ -574,7 +574,10 @@ fn function_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError>
 }
 
 /// CreateListFromArrayLike (spec 7.3.19): `length` then indexed `Get`s.
-fn create_list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<Value>, JsError> {
+pub(crate) fn create_list_from_array_like(
+    agent: &mut Agent,
+    value: &Value,
+) -> Result<Vec<Value>, JsError> {
     if !matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -985,6 +988,70 @@ mod tests {
         assert_eq!(
             value("Function('this.touched = true; return this;').call('s').touched"),
             Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn apply_call_compiled_step_preserves_shadowing_and_order() {
+        // The compiler recognizes `f.apply(x, arr)` / `f.call(x, ...)`
+        // member calls (perf.md "remaining apply floor") and emits the
+        // `CallApply` step: the member read still resolves a shadowed
+        // `apply`/`call`, and the intrinsic's is-callable check still runs
+        // before any argument-list user code.
+        assert_eq!(
+            value(
+                "var f = function (a, b, c) { return this.x + a + b + c; }; \
+                 var o = { x: 10 }; var arr = [1, 2, 3]; \
+                 f.apply(o, arr) + f.call(o, 1, 2, 3)"
+            ),
+            Value::Number(32.0)
+        );
+        // A shadowed `apply` on the receiver wins (the resolved function is
+        // called with the original argument list).
+        assert_eq!(
+            value(
+                "var g = function () { return 'real'; }; \
+                 var h = g; \
+                 Object.defineProperty(h, 'apply', { value: function () { return 'shadow'; } }); \
+                 g.apply(null, [])"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("shadow")))
+        );
+        // The is-callable check runs before the argArray is read: a
+        // non-callable receiver throws with the getter unrun.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        assert!(
+            agent
+                .run_script(
+                    "var ran = false; \
+                 try { (5).apply(null, { get 0() { ran = true; return 1; } }); } \
+                 catch (e) { if (!(e instanceof TypeError) || ran) throw e; }"
+                )
+                .is_ok()
+        );
+        // An array-like (not an Array) still forwards its elements, and a
+        // getter element runs at call time.
+        assert_eq!(
+            value(
+                "var f = function (a, b) { return a + b; }; \
+                 f.apply(null, { length: 2, 0: 7, 1: 8 })"
+            ),
+            Value::Number(15.0)
+        );
+        assert_eq!(
+            value(
+                "var f = function (a) { return a; }; \
+                 var seen = 0; \
+                 var r = f.apply(null, { length: 1, get 0() { seen = 1; return 9; } }); \
+                 r + seen"
+            ),
+            Value::Number(10.0)
+        );
+        // `f.apply()` / `f.call()` (no arguments) forward nothing.
+        assert_eq!(
+            value("var f = function () { return arguments.length; }; f.apply() + f.call()"),
+            Value::Number(0.0)
         );
     }
 

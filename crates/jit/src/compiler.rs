@@ -37,8 +37,8 @@ use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
-    CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberValueCell, RegOperand,
-    ScopeInfo, Step, is_compound_assign,
+    ApplyKind, CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberValueCell,
+    RegOperand, ScopeInfo, Step, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JitCallContext, LEAF_CALL_CACHE_ENTRIES,
@@ -193,6 +193,11 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             // The call pops `this` + callee + `argc` args and pushes the
             // result.
             Step::CallFast { argc, .. } => {
+                depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
+            }
+            // The compiled apply/call step pops the same region and pushes
+            // the result.
+            Step::CallApply { argc, .. } => {
                 depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
             }
             // The vector form (Cut 49): `ArgsPush`/`ArgsSpread` consume the
@@ -443,6 +448,7 @@ fn rel_cc(op: BinaryOp) -> Result<FloatCC, Unsupported> {
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Call { .. } | Step::CallFast { .. } => "Call",
+        Step::CallApply { .. } => "CallApply",
         Step::CallFastGlobal { .. }
         | Step::CallFastSlot { .. }
         | Step::CallFastGlobalStore { .. }
@@ -614,6 +620,9 @@ struct Lowerer<'a> {
     /// passes the flag through; the compiler never emits one — direct eval
     /// always takes the vector form — but the step is then fully lowered).
     sig_call_slow: SigRef,
+    /// The `(vm, resolved, callee, argc, args_ptr, kind) -> value` signature
+    /// of `call_apply` (the compiled `Step::CallApply`).
+    sig_call_apply: SigRef,
     sig_assign: SigRef,
     /// The `(vm, step_index) -> value` signature: the closure/RegExp helpers
     /// read their step's payload back out of the running body instead of
@@ -705,6 +714,7 @@ impl<'a> Lowerer<'a> {
         let sig_set_comp = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_call = builder.import_signature(helper_sig(&[types::I64; 5], conv));
         let sig_call_slow = builder.import_signature(helper_sig(&[types::I64; 6], conv));
+        let sig_call_apply = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_assign = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_step = builder.import_signature(helper_sig(&[types::I64; 2], conv));
         let sig_tail = builder.import_signature(helper_sig(&[types::I64; 6], conv));
@@ -797,6 +807,7 @@ impl<'a> Lowerer<'a> {
             sig_set_comp,
             sig_call,
             sig_call_slow,
+            sig_call_apply,
             sig_assign,
             sig_step,
             sig_tail,
@@ -2804,6 +2815,61 @@ impl<'a> Lowerer<'a> {
                     *direct_eval,
                     true,
                 )?;
+            }
+            Step::CallApply { argc, kind } => {
+                // `[..., f, apply/call, thisArg, a1..aN]` — the `CallFast`
+                // layout with `argc` = N+1. The slow path passes the
+                // argument region (the `thisArg` first) by pointer; the
+                // helper runs the interpreter's `do_call_apply` — the
+                // intrinsic check, the direct call of `f` on this Vm
+                // (leaf-inline included), or the general fallback call of
+                // the resolved function.
+                let argc_usize = *argc as usize;
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(sp, -((argc_usize as i64) * 8));
+                let resolved_ptr = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(sp, -(((argc_usize + 1) as i64) * 8));
+                let callee_ptr = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(sp, -(((argc_usize + 2) as i64) * 8));
+                let resolved = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    resolved_ptr,
+                    Offset32::new(0),
+                );
+                let callee = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    callee_ptr,
+                    Offset32::new(0),
+                );
+                let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
+                let kind_imm = self.builder.ins().iconst(
+                    types::I64,
+                    match kind {
+                        ApplyKind::Apply => 0,
+                        ApplyKind::Call => 1,
+                    },
+                );
+                let pre_call_sp = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(sp, -(((argc_usize + 2) as i64) * 8));
+                let result = self.call_slow(
+                    self.sig_call_apply,
+                    Helper::CallApply,
+                    &[resolved, callee, argc_imm, args_ptr, kind_imm],
+                )?;
+                self.builder.def_var(self.sp_var, pre_call_sp);
+                self.push(result);
+                self.fall_through(index);
             }
             Step::CallFastSlot { slot, argc } => {
                 // `[..., a1..aN]` — the fused slot call (`do_call_fast_slot`

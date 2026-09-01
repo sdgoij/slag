@@ -369,6 +369,7 @@ fn runtime_helpers() -> JitHelpers {
         args_push: Some(rt.args_push),
         args_spread: Some(rt.args_spread),
         call_vector: Some(rt.call_vector),
+        call_apply: Some(rt.call_apply),
         tail_call_vector: Some(rt.tail_call_vector),
         tail_call_self_vector: Some(rt.tail_call_self_vector),
         array_begin: Some(rt.array_begin),
@@ -481,7 +482,7 @@ unsafe extern "C" fn jit_cache_drop(cache: *mut c_void) {
 mod tests {
     use super::*;
     use crux::Value;
-    use runtime::ir::{CompiledBody, ScopeInfo, Step};
+    use runtime::ir::{ApplyKind, CompiledBody, ScopeInfo, Step};
 
     /// A certified-style scope for the hand-built test bodies: 2 slots, both
     /// `var`-like (no TDZ), nothing captured.
@@ -569,6 +570,7 @@ mod tests {
             args_push: Some(helpers::test_args_push),
             args_spread: Some(helpers::test_args_spread),
             call_vector: Some(helpers::test_call_vector),
+            call_apply: Some(helpers::test_call_apply),
             tail_call_vector: Some(helpers::test_tail_call_vector),
             tail_call_self_vector: Some(helpers::test_tail_call_self_vector),
             array_begin: Some(helpers::test_array_begin),
@@ -1087,6 +1089,32 @@ mod tests {
         );
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         assert_eq!(run(&compiled, 0), Value::Number(54.0).bits());
+    }
+
+    #[test]
+    fn apply_call_step_lowers_and_runs_the_helper() {
+        // The compiled `Step::CallApply` (perf.md "remaining apply floor")
+        // lowers to the `call_apply` helper: `[f, apply/call, thisArg,
+        // a1..aN]` on the work stack, the argument region passed by pointer.
+        // The test double sums the argument region (the `thisArg` first), so
+        // `[1, 2]` returns 3.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(7.0)), // f
+                Step::Push(Value::Number(8.0)), // the resolved apply
+                Step::Push(Value::Number(1.0)), // thisArg
+                Step::Push(Value::Number(2.0)), // argArray
+                Step::CallApply {
+                    argc: 2,
+                    kind: ApplyKind::Apply,
+                },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(3.0).bits());
     }
 
     #[test]

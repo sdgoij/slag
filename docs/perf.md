@@ -7,13 +7,14 @@ correctness gate.
 ## Current architecture
 
 - **Value representation**: a NaN-boxed `u64` (PLAN Phase 18): a quiet-NaN
-  tag region (top 16 bits `0x7FF8`) holds a 4-bit tag plus a 44-bit `Rc`
-  payload for the heap variants; every other bit pattern is a double stored
+  tag region (top 16 bits `0x7FF8`) holds a 4-bit tag plus a 44-bit payload
+  for the heap variants; every other bit pattern is a double stored
   exactly. The payload holds the allocation pointer shifted right 4 (the
-  `RcBox` base is 16-byte aligned), so a full 48-bit address space round-
-  trips. Heap values own one strong `Rc` ref; `Clone`/`Drop` reconstruct
-  the `Rc` from the payload. `match value.kind()` keeps the old enum arm
-  shapes via a `ValueKind` mirror.
+  box base is 16-byte aligned), so a full 48-bit address space round-trips.
+  `Value` is `Copy` since the GC milestone (GC-5): the heap is
+  GC-managed, so a value is a plain word with no refcount bookkeeping, and
+  the collector traces the boxes. `match value.kind()` keeps the old enum
+  arm shapes via a `ValueKind` mirror.
 - **Interpreter**: a `Step` bytecode VM over the compiled function IR
   (`crates/runtime/src/ir.rs`): every expression and statement compiles to
   a `Step` at creation, and a `Vm` dispatch loop executes the compiled
@@ -21,18 +22,20 @@ correctness gate.
   top-level scripts. The old tree-walker survives only as isolated
   single-expression helpers (computed keys, destructuring defaults, class
   heritage); no statement or control-flow structure is walked anymore.
-- **Objects**: ordinary Rust structs with a property vector and a prototype
-  `RefCell`; per-object state (promises, generators, buffers, ...) lives in
-  agent-side tables keyed by object id. There is no shape/IC machinery; a
-  lazy key→slot hash index accelerates lookups on objects with many
-  properties (the global object), invalidated by structural changes only.
+- **Objects**: ordinary Rust structs with a property vector and a lock-free
+  prototype `Cell`; per-object state (promises, generators, buffers, ...)
+  lives in agent-side tables keyed by object id. A shape/IC layer
+  accelerates property access — map-based shapes, the generation-validated
+  member-value cells, and a lazy key→slot hash index for large property
+  vectors (all invalidated by structural changes only).
 - **Strings**: UTF-16 code units in a flat buffer or a depth-capped rope of
   concatenation nodes (see the string-rope milestone below); `concat` appends
   in O(1) once a string is large, and the flat form is materialized lazily
-  and cached.
-- **Memory**: `Rc`/`RefCell`-based ownership; there is no tracing GC.
-  `WeakRef`/`FinalizationRegistry` are implemented with kept-alive
-  semantics, but collection is not driven by a heap.
+  and cached. Strings of ≤16 units live inline in the box (Cut 67).
+- **Memory**: a GC-managed arena heap — bump allocation + mark-sweep with
+  root tracing (incl. a conservative native-stack scan), ephemeron-aware
+  WeakMap/WeakSet, and `WeakRef`/`FinalizationRegistry` driven by the
+  heap; `--gc-stress` collects per allocation. See `docs/gc-plan.md`.
 
 ## Benchmark gate
 
@@ -43,8 +46,10 @@ wall time per benchmark:
 cargo run -p cli --release -- --bench
 ```
 
-Current benchmarks: arithmetic loops, property access, string concatenation,
-array iteration, and function calls. Each snippet is evaluated once to warm
+Current benchmarks (12 rows): arithmetic, bare loop, indexed store,
+property access, string concatenation, array iteration, function calls,
+closure capture, per-iteration, construct churn, and the two buildString
+shapes. Each snippet is evaluated once to warm
 up (interning, hook installation), then timed. The sources use `var` (not
 `let`) declarations: a second evaluation in the same realm re-declaring
 `let` bindings is a SyntaxError, so the original `let`-based snippets made
@@ -72,40 +77,33 @@ loops in release on the same machine:
 numbers are dominated by the tree-walker's identifier resolution and
 environment machinery, not by value representation.)
 
-### Current status (measured 2026-08-19)
+### Current status (measured 2026-09-01)
 
-The bytecode VM work — Cut 1-4, the script-level binding fast path, the
-fused loop test/update ops, the relational fast path, and the evaluator
-numeric fast paths — is at zero conformance regressions. Against the
-corrected baseline:
+All five benchmark-gate rows have closed their ≥5x target by one to two
+orders of magnitude — the bytecode-VM, shapes/IC, rope, and NaN-boxing
+milestones are all done (see the Deferred milestones table). Interpreter
+medians (release, 3-run, `--bench`; the rows below are the original five):
 
 | Benchmark | corrected baseline | today | speedup | 5x target |
 |---|---|---|---|---|
-| arithmetic | 2.52s | ~1.05s | 2.4x | 0.50s |
-| property access | 3.22s | ~1.30s | 2.5x | 0.64s |
-| string concat | 0.88s | ~0.16s | 5.5x — gate met | — |
-| array iteration | 15.42s | ~13.5s | 1.1x | 3.08s |
-| function calls | 5.73s | ~1.66s | 3.4x | 1.15s |
+| arithmetic | 2.52s | ~15.2ms | ~166x | 0.50s — met |
+| property access | 3.22s | ~28.3ms | ~114x | 0.64s — met |
+| string concat | 0.88s | ~4.0ms | ~218x | — |
+| array iteration | 15.42s | ~25.0ms | ~617x | 3.08s — met |
+| function calls | 5.73s | ~27.5ms | ~208x | 1.15s — met |
 
 (The `bytecode-plan.md` gate used a later, already-optimized walker
-baseline — arithmetic 1.14s → the plan's "≤0.23s"; this table is the
-documented 2026-08-18 corrected baseline, which the bytecode work has
-moved 2.4-3.4x on the hot benches.)
+baseline — arithmetic 1.14s → the plan's "≤0.23s"; the current 15.2ms is
+~15x below that target too. The machine-drift caveat from the earlier
+sections applies — judge only multi-run deltas.)
 
-The two hot gates are arithmetic (needs ~2.1x more) and function calls
-(~1.4x). The measured cost model (bytecode-plan.md §7): top-level loops
-are bound by global-object property access (~5 accesses/iteration at
-~100-200ns each) and fast-function loops by the binary evaluator
-(`apply_binary`/`abstract_relational` at ~20-40ns vs ~2-5ns for
-mechanical steps). The evaluator numeric fast paths have landed — the
-number-number check now sits above the ToNumeric/ToPrimitive round-trips
-in `apply_binary`'s arithmetic/bitwise paths and in `abstract_relational`
-(measured ~6% on the top-level arithmetic bench, and ~25% on the
-fast-function loop shape — 0.166s → 0.125s, where `apply_binary`
-dominates; 3-run medians) — so the remaining levers are a fast
-global-property access (cell/IC) and less per-call machinery (a fast
-call still pushes a full `ExecutionContext` and bumps ~10 `Rc`
-refcounts).
+The full `--bench` suite (12 rows) and the newer interpreter rows: bare
+loop ~14.4ms, indexed store ~48ms, closure capture ~33ms, per-iteration
+~9.2ms, construct churn ~17ms, buildString shape ~180ms (all 1M-iteration
+loops except buildString's 3M). The per-op floor behind these is ~50x
+lower than the 2026-08-31 measurement — see the floor section below. The
+remaining levers are listed in the levers tables in the typed-array and
+floor sections.
 
 ### Node comparison and optimization plan (measured 2026-08-21)
 
@@ -2189,44 +2187,39 @@ annexB 1,086/0/0, built-ins 23,812/0/154 + 447 hangs). The remaining
 string-concat gap vs node jitless (1.4ms → ~8.6x) is the loop machinery
 plus the allocation itself — the next lever is the arena/GC milestone.
 
-### Interpreter per-op floor (measured 2026-08-31)
+### Interpreter per-op floor (2026-08-31 measurement, resolved 2026-09-01)
 
-Profiling the sweep's slowest cluster (the RegExp property-escapes /
-CharacterClassEscapes fixtures, ~380-430 load-dependent "hangs") traced
-the cost to the interpreter's per-op speed, not to any single language
-feature: the vendored harness `buildString` (`test262/harness/
-regExpUtils.js`) fills a JS array in a loop and calls
-`String.fromCodePoint.apply`, and that body runs entirely interpreted
-(release build):
+The 2026-08-31 profiling of the sweep's slowest cluster (the RegExp
+property-escapes / CharacterClassEscapes fixtures, ~380-430 load-dependent
+"hangs") traced the cost to the interpreter's per-op speed: the vendored
+harness `buildString` (`test262/harness/regExpUtils.js`) fills a JS array
+in a loop and calls `String.fromCodePoint.apply`, and that body ran
+entirely interpreted:
 
-| primitive | measured | mainstream reference (Node/V8, approx.) |
-|---|---|---|
-| bare `for` iteration (993k) | ~0.7 µs/iter (690 ms) | 1-10 ns |
-| array `push` | ~5.3 µs/op | ~10-50 ns |
-| indexed store `a[i] = v` | ~2.8 µs/op | ~5-20 ns |
-| `fromCodePoint.apply` chunk (10k) | ~0.6 ms | ~10-20 µs |
+| primitive | 2026-08-31 | now (2026-09-01) | node (approx.) |
+|---|---|---|---|
+| bare `for` iteration (1M) | ~0.7 µs/iter | ~14.4 ns/iter (~49x) | 1-10 ns |
+| indexed store `a[l++] = v` (1M) | ~2.8 µs/op | ~48 ns/op (~58x) | ~5-20 ns |
+| buildString shape (3M appends) | ~1670 ms | ~180 ms (~9x) | ~6 ms |
 
-These are ~100× off mainstream — a single bare loop iteration costs as
-much as a whole mainstream iteration plus 10-100 ops. The JIT is not the
-escape hatch here: it compiles only certified bodies (4-25× on the
-`--jit-bench` rows), and the array-store / member-write / `.apply` ops
-in `buildString` are outside the certified subset, so the function never
-leaves the interpreter (`--jit` changes nothing on these loops).
-`buildString` of a 2,162,560-unit string takes ~3.4 s at this floor —
-the fixtures straddle the sweep's 15 s budget and hang under load (the
-regexp engine itself measures 0-17 ms on them).
+Both levers the 2026-08-31 section recommended are resolved:
 
-The levers, in order of expected value: (1) **JIT certification for the
-`buildString` shape** — array element stores, member writes
-(`AssignMemberName`/`AssignMemberComputed`, register-path
-`StoreMember*`), and the `.apply` builtin call — which would run the
-fill loops at machine speed and clear the hang cluster entirely (details
-in `docs/jit-report.md` §6 and §7 item 12); (2) **the interpreter's
-core loop itself** (`ir.rs`/`run_inner`) — the 0.7 µs bare-loop floor is
-itself pathological, but even perfect array stores would only bring the
-fixtures to ~1 s at that floor, so the VM core is a real but secondary
-target. A `--bench`-style row for the bare-loop iteration cost would
-keep this floor visible.
+1. **JIT certification for the `buildString` shape is done** (2026-09-01):
+   dense element stores and the array-store / member-write / `.apply`
+   steps certify — the JIT rows are buildString shape ~43ms / full ~38ms
+   under the default CLI JIT (see the CLI-JIT-default section), and the
+   apply/call builtins leaf-inline certified-leaf callees (see the
+   vector-call/apply section). The hang cluster is gone — current full
+   sweeps report 0 hang.
+2. **The interpreter's core loop itself is ~50x better on the same
+   shapes.** The bare loop is ~14.4ns/iter and an indexed store ~48ns/op
+   (the cuts since then: fused loop heads, register bodies, the raw-f64
+   loop counter, the generation-validated element caches, and the
+   allocation-free element encode). The `--bench` rows `bare loop` and
+   `indexed store` keep the floor visible, per the original section's
+   suggestion. The residual gap to mainstream on the store shapes is the
+   per-op helper/FFI cost and the property-vector writes — a real but
+   secondary target, as the original note said.
 
 ### CLI JIT default, detached-view length, and the typed-array JIT picture (measured 2026-09-01)
 
@@ -2319,7 +2312,7 @@ next section), in order of expected value:
 |---|---|---|
 | GC slot-arena allocation (GC-5's remaining lever) — `Gc::new` heavier than `Rc::new`; recovers the construct-churn / string-concat ~2x regressions | 2x | `docs/gc-plan.md` |
 | interpreter per-op floor — the 0.7µs bare-loop iteration is ~100x off mainstream; the floor section calls the VM core a real but secondary target | ~100x | `runtime/src/ir.rs` |
-| the apply floor — see the vector-call/apply section below: the builtin round-trip + per-call arg-list build leave apply-to-leaf at ~1µs/call | ~10x on a 1-elem apply | `runtime/src/builtins/function.rs` |
+| the apply floor — **closed** (the compiled `CallApply` step below): interp 208→101ms, jit 204→89ms on the `apply leaf call` row; the residual is the member read + element reads + leaf frame setup | ~5x on a 1-elem apply | `runtime/src/ir.rs` |
 
 ### Typed-array element encode and the compiled length probe (measured 2026-09-01)
 
@@ -2405,7 +2398,37 @@ build (the dense fast path exists but still copies the elements), and the
 pooled-Vm take/return resets. Cutting it needs call-site recognition of
 the `.apply` pattern — inlining `f.apply(a, arr)` as a spread/vector call
 in the compiler (the V8 approach) — a substantially larger slice than the
-leaf-inline here.
+leaf-inline here. **CLOSED 2026-09-01** — see the compiled `CallApply` step
+section below.
+
+### Call-site `.apply`/`.call` recognition: the compiled `CallApply` step (measured 2026-09-01)
+
+The apply floor is closed by recognizing the `.apply`/`.call` member-call
+pattern in the compiler (`Compiler::try_compile_apply_call`): `f.apply(x,
+arr)` / `f.call(x, ...)` in a certified body compiles to the normal member
+read (a shadowed `apply`/`call` resolves onto the stack and is called
+normally) plus the new `Step::CallApply`, whose handler compares the
+resolved function against the realm's cached intrinsic
+(`Intrinsics::apply_builtin`/`call_builtin`) and, on a match, calls `f`
+directly on the caller's Vm — the `this` argument, the
+`CreateListFromArrayLike` element reads (dense-array fast path included),
+and the leaf-inline `do_call_fast` run with no builtin dispatch, no
+per-call argument-vector `Vec` round-trip for the dense case, no
+`leaf_lookup` HashMap, and no pooled-Vm take/return. Any other resolved
+function falls back to the general call of that function exactly as
+`CallFast` would, so shadowing, the is-callable-before-argArray order
+(the intrinsic's step-1 TypeError runs before any getter), array-like
+(non-Array) arg lists, getter elements, holes, and the extra-arg ignore
+stay spec-exact. The JIT lowers the step through the `call_apply` slow-path
+helper (the four-file mirror), so compiled bodies with `.apply`/`.call`
+keep compiling.
+
+Measured on the `apply leaf call` row (200K, release, 3-run medians):
+**interp 208ms → ~101ms (~2.05x), jit 204ms → ~89ms (~2.3x)**; the
+remaining ~90-100ms is the per-call member read, the `CreateListFromArrayLike`
+length/element reads, and the leaf-inline frame setup (the leaf itself is
+~85ns). The `call_apply` helper also means a compiled body containing a
+`.apply` call no longer bails out of the JIT.
 
 ## Deferred milestones
 
@@ -2415,7 +2438,7 @@ Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
 | Milestone | Gate | Status |
 |---|---|---|
 | NaN-boxed `Value` (u64 with tag fast paths) | arithmetic micro-benchmark ≥ 2x vs snapshot | **Done** — correctness landed (migration below) and the shapes work closed the gate: real-loop arithmetic is ~2.2x the corrected baseline. |
-| Bytecode VM replacing the tree-walker | `--print-bytecode` dumps real bytecode; hot-path bench ≥ 5x | **Cut 1 + first half of Cut 2 delivered** — everything compiles and runs on the `Vm`; literal immediates (`BinaryImm`) and 0-2-arity fast calls (`CallFast`) landed with zero conformance regressions, but at walker parity the ≥5x gate is still open. |
+| Bytecode VM replacing the tree-walker | `--print-bytecode` dumps real bytecode; hot-path bench ≥ 5x | **Done (2026-09-01)** — everything compiles and runs on the `Vm` (`--print-bytecode` prints the compiled `Step` stream, and the gate is met by one to two orders of magnitude: arithmetic 2.52s → ~15.2ms (~166x), property ~28.3ms (~114x), array iteration ~25ms (~617x), function calls ~27.5ms (~208x) vs the 2026-08-18 corrected baseline). The ≥5x gate that was "still open" closed with the GC-5 `Copy`-value win and the JIT-era interpreter cuts. |
 | Object shapes / hidden classes + inline caches | property-access micro-benchmark ≥ 2x | **Done** — the cache layer below (interner memo, own-data fast paths, lazy property index) measured 2.1x on the corrected property-access baseline. |
 | String rope representation | string-concat micro-benchmark ≥ 2x | **Done** — the rope below measured ~5x on the corrected concat baseline (0.88s → ~0.15s). |
 | `--gc-stress` + leak-detection harness | stress runs clean, no leaks | Deferred: requires the arena heap + mark-sweep GC milestone (below). |
@@ -2576,7 +2599,7 @@ release sweep over 48,622 fixtures: 0 fail, 229 skip (unchanged taxonomy),
 a documented `#[allow(clippy::mutable_key_type)]`: a rope's first hash
 materializes its flat cache, but the hash output is content-stable.)
 
-## Bytecode VM milestone (Cut 1-4 + script-level bindings + evaluator fast paths landed, gate open)
+## Bytecode VM milestone (Cut 1-4 + script-level bindings + evaluator fast paths landed, gate met 2026-09-01)
 
 The tree-walker is gone from normal execution: every expression and
 statement compiles to `Step` bytecode at creation (`compile_expr`/
@@ -2603,26 +2626,26 @@ the full release sweeps are at zero regressions vs the parent commit with
 122 net fixes in `language` (152 fail vs the parent's 274).
 
 The compiled path is at or near walker parity on every benchmark — nothing
-lost, and function calls have moved ~2.5x vs the walker; the ≥5x gate is
-not met:
+lost. The ≥5x gate (measured against the later, already-optimized walker
+baseline in `bytecode-plan.md` — arithmetic 1.14s → the plan's "≤0.23s") is
+met by a wide margin as of 2026-09-01; the interpreter rows vs that
+baseline:
 
-| Benchmark | walker baseline | Cut 2 (HEAD) | now |
-|---|---|---|---|
-| arithmetic | 1.14s | 1.19s | ~1.05s |
-| property access | 1.50s | 1.59s | ~1.30s |
-| string concat | ~0.15s | 0.160s | ~0.16s |
-| array iteration | 13.6–15s | 14.1s | ~13.5s |
-| function calls | 4.2–4.4s | 4.56s | ~1.66s |
+| Benchmark | walker baseline | now (2026-09-01) |
+|---|---|---|
+| arithmetic | 1.14s | ~15.2ms (~75x) |
+| property access | 1.50s | ~28.3ms (~53x) |
+| string concat | ~0.15s | ~4.0ms (~38x) |
+| array iteration | 13.6–15s | ~25.0ms (~550x) |
+| function calls | 4.2–4.4s | ~27.5ms (~155x) |
 
-The runs are noisy on this machine (±15%). The measured cost model
-(bytecode-plan.md §7) says arithmetic is bound by global-object property
-access (the walker's arithmetic was already fast) and fast-function loops
-by the binary evaluator. The evaluator numeric fast paths landed (~6% on
-arithmetic, 3-run medians); the gate's arithmetic target still needs a
-fast global property access (cell/IC), and function calls need less
-per-call machinery.
+The gate closed with the cuts since the early bytecode work (fused loop
+heads, register bodies, the raw-f64 loop counter, the member/element
+value caches) plus the GC-5 `Copy`-value win; the interpreter rows are
+now 15-30ns/iter on the hot loops (see the Current status and floor
+sections).
 
-## GC milestone (PLAN Phase 18 item 2) — landed, perf gate open
+## GC milestone (PLAN Phase 18 item 2) — landed, perf gate closed 2026-09-01
 
 The plan's GC milestone (arena heap + mark-sweep; root tracing;
 ephemeron-aware WeakMap/WeakSet; `WeakRef`/`FinalizationRegistry` semantics
@@ -2651,14 +2674,18 @@ churn, string concat) regressed ~2x: `Gc::new` is heavier than `Rc::new`
 (the live-set registration + stress checks), and mark-sweep reclaims a
 loop's garbage in one batch at the script boundary (inside the timed
 window) instead of per iteration. The plan's slot-arena allocation (the
-original recommendation) is the remaining lever; see `docs/gc-plan.md`
-GC-5.
+original recommendation) is **deprioritized**: `gc-plan.md` GC-5 measured
+the free-list half net-neutral and attributes the remaining construct/
+concat gap to the engine hot path (the 16-23x gap to V8's interpreter is
+hot-path, not collector, cost). The hot-path cuts since then have closed
+the allocation-bound rows anyway — construct churn is now ~17ms and
+concat ~4ms on `--bench`, ~2x FASTER than the Rc model's 36ms/10.7ms —
+so the GC perf gate is met (via the engine cuts, not the collector).
 
 ## Accepted no-op CLI flags
 
-`--stack-size`, `--max-old-space`, and `--print-bytecode` are accepted by
-the CLI for compatibility. They are no-ops because the corresponding
-machinery (call-stack depth control, a heap to cap, a bytecode printer)
-does not exist yet; they will become live as the milestones above land.
-(`--print-bytecode` will gain a real printer as Cut 2 lands — the `Step`
-VM itself already exists.)
+`--stack-size` and `--max-old-space` are accepted by the CLI for
+compatibility. They are no-ops because the corresponding machinery (call-
+stack depth control, a heap to cap) does not exist yet. (`--print-bytecode`
+is live — it prints the compiled `Step` stream via
+`runtime::ir::debug_print_body`.)

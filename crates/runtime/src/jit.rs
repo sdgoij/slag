@@ -391,6 +391,20 @@ pub struct JitSlowPaths {
         args: *mut u64,
         direct_eval: u64,
     ) -> u64,
+    /// The compiled `Step::CallApply` (perf.md "remaining apply floor"):
+    /// `args` points at the JIT buffer's argument region (`argc` slots, the
+    /// `thisArg` first); `kind` is 0 for `apply`, 1 for `call`. Runs
+    /// `Vm::do_call_apply` — the intrinsic check, the direct call of the
+    /// receiver on this Vm (leaf-inline included), or the general fallback
+    /// call of the resolved function.
+    pub call_apply: extern "C" fn(
+        ctx: *mut c_void,
+        resolved: u64,
+        callee: u64,
+        argc: u64,
+        args: *mut u64,
+        kind: u64,
+    ) -> u64,
     /// Cut 37: the compiled leaf-call probe — validates the callee (a
     /// certified, environment-free, this-less leaf whose body has compiled
     /// machine code) and that the inline frame + working area fit above the
@@ -842,6 +856,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     set_member_name,
     set_member_computed,
     call_slow,
+    call_apply,
     leaf_call_probe,
     get_global,
     set_global,
@@ -1215,6 +1230,59 @@ extern "C" fn call_slow(
                         JsError::new(
                             ErrorKind::TypeError,
                             "the JIT call produced no result".into(),
+                        ),
+                    );
+                }
+            };
+            debug_assert_eq!(vm.stack.len(), entry_len);
+            result.bits()
+        }
+        Err(error) => {
+            vm.stack.truncate(entry_len);
+            slow_error(ctx, error)
+        }
+    }
+}
+
+extern "C" fn call_apply(
+    ctx: *mut c_void,
+    resolved: u64,
+    callee: u64,
+    argc: u64,
+    args: *mut u64,
+    kind: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let argc = argc as usize;
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let entry_len = vm.stack.len();
+    // The `[f, apply/call, thisArg, arg1..argN]` layout `do_call_apply`
+    // expects, pushed from the JIT buffer (see `call_slow` — the buffer is
+    // stable for the synchronous helper).
+    vm.stack.push(Value::from_bits(callee));
+    vm.stack.push(Value::from_bits(resolved));
+    for i in 0..argc {
+        // SAFETY: the JIT passes a pointer into its own (live) stack buffer
+        // with `argc` slots.
+        vm.stack.push(Value::from_bits(unsafe { *args.add(i) }));
+    }
+    let kind = if kind == 0 {
+        crate::ir::ApplyKind::Apply
+    } else {
+        crate::ir::ApplyKind::Call
+    };
+    match vm.do_call_apply(agent, argc, kind) {
+        Ok(()) => {
+            let result = match vm.stack.pop() {
+                Some(value) => value,
+                None => {
+                    vm.stack.truncate(entry_len);
+                    return slow_error(
+                        ctx,
+                        JsError::new(
+                            ErrorKind::TypeError,
+                            "the JIT apply call produced no result".into(),
                         ),
                     );
                 }

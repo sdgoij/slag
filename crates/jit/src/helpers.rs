@@ -65,6 +65,11 @@ pub enum Helper {
     ArgsPush,
     ArgsSpread,
     CallVector,
+    /// The compiled `Step::CallApply` (a member call whose property name is
+    /// `apply`/`call`): runs the interpreter's `do_call_apply` — the
+    /// intrinsic check and, on a match, the direct call of the receiver with
+    /// the `this` argument and the `CreateListFromArrayLike` element reads.
+    CallApply,
     TailCallVector,
     TailCallSelfVector,
     ArrayBegin,
@@ -186,6 +191,7 @@ impl Helper {
             Helper::ArgsPush => "args_push",
             Helper::ArgsSpread => "args_spread",
             Helper::CallVector => "call_vector",
+            Helper::CallApply => "call_apply",
             Helper::TailCallVector => "tail_call_vector",
             Helper::TailCallSelfVector => "tail_call_self_vector",
             Helper::ArrayBegin => "array_begin",
@@ -488,6 +494,22 @@ pub struct JitHelpers {
     pub args_spread: Option<extern "C" fn(vm: *mut c_void, iterable: u64) -> u64>,
     pub call_vector:
         Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
+    /// The compiled `Step::CallApply` (perf.md "remaining apply floor"):
+    /// `args` points at the JIT buffer's argument region (`argc` slots, the
+    /// `thisArg` first); `kind` is 0 for `apply`, 1 for `call`. Runs the
+    /// interpreter's `do_call_apply` — the intrinsic check, the direct call
+    /// of the receiver on this Vm (leaf-inline included), or the general
+    /// fallback call of the resolved function.
+    pub call_apply: Option<
+        extern "C" fn(
+            vm: *mut c_void,
+            resolved: u64,
+            callee: u64,
+            argc: u64,
+            args: *mut u64,
+            kind: u64,
+        ) -> u64,
+    >,
     pub tail_call_vector:
         Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
     /// Cut 51: the vector-form self-tail-call (`Step::TailCallSelfVector`,
@@ -697,6 +719,7 @@ impl JitHelpers {
             args_push: None,
             args_spread: None,
             call_vector: None,
+            call_apply: None,
             tail_call_vector: None,
             tail_call_self_vector: None,
             array_begin: None,
@@ -821,6 +844,7 @@ impl JitHelpers {
             Helper::ArgsPush => self.args_push.map(|f| f as usize as u64),
             Helper::ArgsSpread => self.args_spread.map(|f| f as usize as u64),
             Helper::CallVector => self.call_vector.map(|f| f as usize as u64),
+            Helper::CallApply => self.call_apply.map(|f| f as usize as u64),
             Helper::TailCallVector => self.tail_call_vector.map(|f| f as usize as u64),
             Helper::TailCallSelfVector => self.tail_call_self_vector.map(|f| f as usize as u64),
             Helper::ArrayBegin => self.array_begin.map(|f| f as usize as u64),
@@ -1641,6 +1665,27 @@ pub(crate) extern "C" fn test_leaf_call_probe(
     0
 }
 
+/// Sums the argument region (the `thisArg` first), mirroring
+/// `test_call_slow`'s ABI proof for the `CallApply` lowering.
+#[cfg(test)]
+pub(crate) extern "C" fn test_call_apply(
+    _vm: *mut c_void,
+    _resolved: u64,
+    _callee: u64,
+    argc: u64,
+    args: *mut u64,
+    _kind: u64,
+) -> u64 {
+    let mut sum = 0.0;
+    for i in 0..argc {
+        // SAFETY: the test harness passes a buffer with `argc` slots.
+        sum += Value::from_bits(unsafe { *args.add(i as usize) })
+            .as_number()
+            .unwrap_or(0.0);
+    }
+    Value::Number(sum).bits()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1659,6 +1704,7 @@ mod tests {
             Helper::SetMemberName,
             Helper::SetMemberComputed,
             Helper::CallSlow,
+            Helper::CallApply,
             Helper::GetGlobal,
             Helper::SetGlobal,
             Helper::LoadIdent,
@@ -1679,6 +1725,7 @@ mod tests {
         assert_eq!(Helper::BinarySlow.name(), "binary_slow");
         assert_eq!(Helper::TdzError.name(), "tdz_error");
         assert_eq!(Helper::CallSlow.name(), "call_slow");
+        assert_eq!(Helper::CallApply.name(), "call_apply");
         assert_eq!(Helper::GetGlobal.name(), "get_global");
         assert_eq!(Helper::SetGlobal.name(), "set_global");
         assert_eq!(Helper::LoadIdent.name(), "load_ident");

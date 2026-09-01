@@ -67,6 +67,13 @@ pub struct Intrinsics {
     /// JsString per call. A fixed array indexed by [`function_prototype_index`]
     /// keeps the read a plain borrow + load (no hashing at all).
     function_prototypes: RefCell<[Option<Value>; FN_PROTO_COUNT]>,
+    /// The realm's %Function.prototype.apply% / %Function.prototype.call%
+    /// builtins, cached after the first resolution: the compiled `CallApply`
+    /// step compares the member-read result against these per call, and the
+    /// values are stable for the realm's life (the intrinsics table is
+    /// populated at bootstrap and never reassigned).
+    apply_builtin: RefCell<Option<Value>>,
+    call_builtin: RefCell<Option<Value>>,
 }
 
 /// The number of cached function-creation prototype intrinsics.
@@ -100,6 +107,8 @@ impl Trace for Intrinsics {
             }
             Err(_) => crux::heap::note_aborted_trace(),
         }
+        self.apply_builtin.trace(visit);
+        self.call_builtin.trace(visit);
     }
 }
 
@@ -134,6 +143,28 @@ impl Intrinsics {
         }
         let value = self.get(name)?;
         self.function_prototypes.borrow_mut()[index] = Some(value);
+        Some(value)
+    }
+
+    /// The realm's %Function.prototype.apply% builtin, cached after the first
+    /// resolution (see the struct field).
+    pub fn apply_builtin(&self) -> Option<Value> {
+        if let Some(value) = self.apply_builtin.borrow().as_ref() {
+            return Some(*value);
+        }
+        let value = self.get("%Function.prototype.apply%")?;
+        *self.apply_builtin.borrow_mut() = Some(value);
+        Some(value)
+    }
+
+    /// The realm's %Function.prototype.call% builtin, cached after the first
+    /// resolution (see the struct field).
+    pub fn call_builtin(&self) -> Option<Value> {
+        if let Some(value) = self.call_builtin.borrow().as_ref() {
+            return Some(*value);
+        }
+        let value = self.get("%Function.prototype.call%")?;
+        *self.call_builtin.borrow_mut() = Some(value);
         Some(value)
     }
 
