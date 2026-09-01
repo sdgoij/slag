@@ -47,9 +47,9 @@ JavaScriptCore C-API bindings.
   installed only when the `--jit` flag is given. The Unicode property
   tables are generated at compile time from the pinned corpus fixtures,
   so they can never drift from what the tests assert.
-- **Embeddable** — `runtime::Context` with `JsValue`/`JsObject` handle
-  types and `HostCallbacks` for host integration, plus a drop-in
-  JavaScriptCore C API (`crates/jsc`).
+- **Embeddable** — the `slag` crate exposes the Rust embedding API
+  (`Context`, `JsValue`/`JsObject`, `HostCallbacks`, optional Cranelift JIT
+  hook), plus a drop-in JavaScriptCore C API (`crates/jsc`).
 
 ## Quick start
 
@@ -76,11 +76,15 @@ for compatibility (no-ops for now).
 
 ## Embedding
 
-`Context` is the entry point — a fresh agent, realm, and host globals
-(`console`, timers, `Math.random` override) per instance.
+The `slag` crate is the Rust embedding API — a single dependency for
+`Context` (a fresh agent, realm, and host globals per instance), the
+`JsValue`/`JsObject` handle types, `HostCallbacks`, and (with the `jit`
+feature) the Cranelift JIT hook. A full walkthrough lives in
+`crates/slag/examples/embed.rs` (`cargo run -p slag --example embed`; add
+`--features slag/jit` for the JIT).
 
 ```rust
-use runtime::embed::Context;
+use slag::{Context, JsValue};
 
 let mut context = Context::new()?;
 

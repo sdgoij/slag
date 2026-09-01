@@ -1,0 +1,19 @@
+[package]
+name = "slag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crux = { path = "../crux" }
+runtime = { path = "../runtime" }
+jit = { path = "../jit", optional = true }
+
+[features]
+default = []
+# The Cranelift JIT hook (`install_jit`); off by default so embedders who do
+# not need it avoid the Cranelift dependency tree.
+jit = ["dep:jit"]
+# Pass-throughs of the runtime's own optional surfaces.
+workers = ["runtime/workers"]
+fs = ["runtime/fs"]
