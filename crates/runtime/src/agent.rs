@@ -144,6 +144,15 @@ pub struct Agent {
     /// cells at fixed offsets; `MemberValueCell::empty()`'s impossible id
     /// never validates.
     pub(crate) member_value_cells: Box<[crate::ir::MemberValueCell; crate::ir::MEMBER_CELLS]>,
+    /// The prototype-chain read cache (2026-09-01): (receiver id, name,
+    /// receiver generation, the resolved chain value, the walked links' (id,
+    /// generation)) — a hit returns the value with no property-vector borrow
+    /// or chain walk (a method read like `f.apply` / `arr.push` — the
+    /// property lives on a prototype, so the own-property member cells never
+    /// serve it). The VALUE is traced; the link ids are `Copy` handles (no
+    /// trace edge, mirroring `prototype`). Boxed per the Cut 27 lesson.
+    pub(crate) member_chain_cells:
+        Box<[Option<crate::ir::MemberChainCell>; crate::ir::MEMBER_CELLS]>,
     /// The fronting array-element value cache (Cut 35 slice 13): (id, index,
     /// generation, value) — a hit returns the element with no
     /// property-vector borrow. Boxed per the Cut 27 lesson.
@@ -668,6 +677,7 @@ impl Agent {
             member_value_cells: Box::new(std::array::from_fn(|_| {
                 crate::ir::MemberValueCell::empty()
             })),
+            member_chain_cells: Box::new(std::array::from_fn(|_| None)),
             array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
             array_length_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],
@@ -1040,6 +1050,9 @@ impl Agent {
         // The IC value caches hold Values; the index-only caches re-resolve
         // from the (traced) objects and need no tracing.
         for cell in self.member_value_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.member_chain_cells.iter().flatten() {
             cell.trace(visit);
         }
         for cell in self.array_element_value_cells.iter() {

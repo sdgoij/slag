@@ -1181,6 +1181,77 @@ mod tests {
     }
 
     #[test]
+    fn chain_member_cache_stays_spec_exact_under_invalidation() {
+        // The prototype-chain read cache serves `f.apply`/`arr.push`-style
+        // method reads (the property lives on a prototype, so the
+        // own-property member cells never serve them) by re-validating the
+        // walked links' (id, generation). Every mutation that could change
+        // the resolved value must invalidate: an own property appearing on
+        // the receiver, a link's own mutation, a proto replacement, and an
+        // accessor anywhere in the resolution must never be cached.
+        assert_eq!(
+            value(
+                "var o = {}; var r = o.toString; \
+                 Object.defineProperty(o, 'toString', { value: function () { return 'own'; } }); \
+                 o.toString()"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("own")))
+        );
+        assert_eq!(
+            value(
+                "var o = {}; var before = o.toString; \
+                 Object.defineProperty(Object.prototype, 'toString', { value: function () { return 'patched'; } }); \
+                 var r = o.toString(); \
+                 Object.defineProperty(Object.prototype, 'toString', { value: before, configurable: true }); \
+                 r + '|' + (o.toString === before)"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("patched|true")))
+        );
+        // An own accessor on the receiver runs per read (never cached).
+        assert_eq!(
+            value(
+                "var count = 0; var o = {}; \
+                 Object.defineProperty(o, 'hasOwnProperty', { get: function () { count++; return Object.prototype.hasOwnProperty; } }); \
+                 o.hasOwnProperty; o.hasOwnProperty; count"
+            ),
+            Value::Number(2.0)
+        );
+        // A getter on a prototype link runs per read (never cached).
+        assert_eq!(
+            value(
+                "var count = 0; var p = {}; \
+                 Object.defineProperty(p, 'greet', { get: function () { count++; return 'hi'; } }); \
+                 var o = Object.create(p); o.greet; o.greet; count"
+            ),
+            Value::Number(2.0)
+        );
+        // A two-link chain read, then a proto replacement on the receiver.
+        assert_eq!(
+            value(
+                "var p1 = {}; var p2 = { deep: function () { return 'deep'; } }; \
+                 Object.setPrototypeOf(p1, p2); var o = Object.create(p1); \
+                 var a = o.deep(); \
+                 Object.setPrototypeOf(o, null); var b = o.deep; \
+                 Object.setPrototypeOf(o, Object.prototype); \
+                 a + '|' + (b === undefined)"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("deep|true")))
+        );
+        // Mutating Function.prototype.apply invalidates the apply-path cache.
+        assert_eq!(
+            value(
+                "var f = function (a, b) { return a + b; }; var arr = [1, 2]; \
+                 var real = Function.prototype.apply; \
+                 Object.defineProperty(Function.prototype, 'apply', { value: function () { return 'patched'; } }); \
+                 var r = f.apply(null, arr); \
+                 Object.defineProperty(Function.prototype, 'apply', { value: real, configurable: true }); \
+                 r + '|' + f.apply(null, arr)"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("patched|3")))
+        );
+    }
+
+    #[test]
     fn certified_body_global_read_fast_path_stays_spec_exact() {
         // The `LoadIdent` fast path (Cut 36 mirror): a certified body whose
         // env chain is exactly the global env serves a warmed global-value

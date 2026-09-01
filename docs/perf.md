@@ -2466,6 +2466,25 @@ switched to 17 to keep their coverage. Spec-exact: the new
 `wide_fast_form_calls_stay_spec_exact` test plus the full sweep (JIT
 default and `--jitless`) at 0 fail / 0 crash / 0 hang.
 
+**Prototype-chain member-read cache** (2026-09-01): the remaining
+member-read cost of the apply path — `f.apply`'s `apply` lives on
+`Function.prototype`, so the own-property member cells never serve it and
+every read paid the full prototype walk. A new agent-level
+`member_chain_cells` cache stores the resolved chain value for
+`(receiver, name)`, re-validated by the receiver's generation and each
+walked link's (id, generation) (an own property on the receiver, a link's
+mutation, or a proto replacement bumps a generation; links below the
+found one cannot shadow its own data property, and accessors are never
+cached). This serves every method read (`f.apply`, `arr.push`, `o.m()`),
+not just the apply path. Measured on the `apply leaf call` row (200K,
+A/B): **interp ~57ms → ~20ms, jit ~52ms → ~18ms (~2.8x / ~2.9x)** — the
+interpreter's member read and the JIT's `GetMemberName` slow helper both
+hit the cache. Spec-exact: the new
+`chain_member_cache_stays_spec_exact_under_invalidation` test (own-prop
+shadowing, link redefinition, accessors run per read, proto replacement,
+`Function.prototype.apply` patching) plus the full sweep (JIT default
+and `--jitless`) at 0 fail / 0 crash / 0 hang.
+
 ### The interpreter's `LoadIdent` global fast path, mirroring the JIT's Cut 36 probe (measured 2026-09-01)
 
 The `--jit-bench` `global read` row (a 1M `s += g` loop inside a function)

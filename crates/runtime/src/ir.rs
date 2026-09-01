@@ -1730,6 +1730,32 @@ impl MemberValueCell {
     }
 }
 
+/// The prototype-chain read cache (2026-09-01): the resolved value of
+/// `(receiver id, name)` found on the prototype chain, re-validated by
+/// the receiver's generation (an own property appearing on the receiver
+/// bumps it) and each cached link's (id, generation) (a link's own
+/// mutation or a proto replacement bumps a generation). Deeper links
+/// than the found one cannot shadow its own data property, so the probe
+/// never walks past the cached links. `links[0]` is the receiver's
+/// prototype; `link_count` is 1 when the property is on the first link,
+/// 2 when on the second. `#[repr(C)]` all-scalar for a future compiled
+/// probe (`offset_of!`).
+#[derive(Clone)]
+pub struct MemberChainCell {
+    pub id: u64,
+    pub name: crux::AtomId,
+    pub generation: u32,
+    pub value: Value,
+    pub link_count: u8,
+    pub links: [(u64, u32); 2],
+}
+
+impl Trace for MemberChainCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.value.trace(visit);
+    }
+}
+
 /// Part B, B5.2: map-keyed member cache entry — maps (map_id, name) to a
 /// field offset for the in_fields fast path. The map's shape is immutable,
 /// so a map_id + name match pins the descriptor (and its offset) exactly.
@@ -3286,6 +3312,97 @@ impl Vm {
                 Some(value)
             }
             _ => None,
+        }
+    }
+
+    /// The direct-mapped cache index for (object id, name) chain reads.
+    fn member_chain_index(object_id: u64, name: crux::AtomId) -> usize {
+        (object_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
+    }
+
+    /// The cached prototype-chain member read: returns the value when the
+    /// receiver's id/name/generation and every cached link's (id,
+    /// generation) still match — an own property appearing on the receiver,
+    /// a link's own mutation (a new value, a define, a delete), or a proto
+    /// replacement anywhere above the found link bumps a generation and
+    /// misses. Links below the found one cannot shadow its own data
+    /// property, so the probe never walks past the cached links. `None`
+    /// falls back to the full Get (which then re-resolves).
+    fn member_chain_get(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
+        let object = Self::cell_object(object)?;
+        let index = Self::member_chain_index(object.id(), name);
+        let cell = agent.member_chain_cells[index].as_ref()?;
+        if cell.id != object.id() || cell.name != name || cell.generation != object.generation() {
+            return None;
+        }
+        let mut link = object.get_prototype_of().ok().flatten();
+        for (expected_id, expected_gen) in cell.links.iter().take(cell.link_count as usize) {
+            let current = link?;
+            if current.id() != *expected_id || current.generation() != *expected_gen {
+                return None;
+            }
+            link = current.get_prototype_of().ok().flatten();
+        }
+        Some(cell.value)
+    }
+
+    /// Record a prototype-chain read for `(object, name)` resolved to
+    /// `value` by the full Get: walk up to two plain prototype links, cache
+    /// (receiver generation, the links' (id, generation) up to the link
+    /// holding the own DATA property) so a later read re-validates instead
+    /// of re-walking. An own property on the RECEIVER (a data own prop
+    /// would have hit `member_cell_get`; an accessor must not cache the
+    /// getter's value), an accessor on a link (the [[Get]] stops there),
+    /// a non-plain link, a property deeper than two links, or a miss
+    /// records nothing.
+    fn resolve_chain_cell(agent: &mut Agent, object: &Value, name: crux::AtomId, value: Value) {
+        let Some(object) = Self::cell_object(object) else {
+            return;
+        };
+        if object.has_own_property_atom(name) {
+            return;
+        }
+        let key = PropertyKey::String(name);
+        let mut links = [(0u64, 0u32); 2];
+        let mut count = 0usize;
+        let mut link = object.get_prototype_of().ok().flatten();
+        while count < 2 {
+            let Some(current) = link else {
+                return;
+            };
+            if !matches!(
+                current.kind,
+                crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
+            ) {
+                return;
+            }
+            links[count] = (current.id(), current.generation());
+            count += 1;
+            if let Some(slot) = current.property_slot(&key) {
+                let props = current.properties.borrow();
+                match props
+                    .get(slot)
+                    .map(|(stored, property)| (stored, &property.kind))
+                {
+                    // The property found on this link: a data prop caches,
+                    // an accessor does not (the read runs the getter).
+                    Some((stored, crux::object::PropertyKind::Data { .. })) if *stored == key => {
+                        let index = Self::member_chain_index(object.id(), name);
+                        agent.member_chain_cells[index] = Some(MemberChainCell {
+                            id: object.id(),
+                            name,
+                            generation: object.generation(),
+                            value,
+                            link_count: count as u8,
+                            links,
+                        });
+                        return;
+                    }
+                    Some(_) => return,
+                    None => {}
+                }
+            }
+            link = current.get_prototype_of().ok().flatten();
         }
     }
 
@@ -7562,9 +7679,17 @@ impl Vm {
         match Self::member_cell_get(agent, &object, name) {
             Some(value) => Ok(value),
             None => {
+                // A prototype-chain read (a method like `f.apply`/`arr.push`
+                // — the property lives on a prototype, so the own-property
+                // cells never serve it): the chain cache re-validates the
+                // walked links instead of re-walking them.
+                if let Some(value) = Self::member_chain_get(agent, &object, name) {
+                    return Ok(value);
+                }
                 let value =
                     crate::context::get_property(agent, &object, &crux::lookup(name), object)?;
                 Self::resolve_member_cell(agent, &object, name);
+                Self::resolve_chain_cell(agent, &object, name, value);
                 Ok(value)
             }
         }
