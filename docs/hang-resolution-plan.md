@@ -114,28 +114,25 @@ expanding scope silently.
 
 ## Resolution (measured 2026-09-01)
 
-Full sweep on the committed tree (`all`, release, JIT by default, 15s
-deadline, `--jobs 8 --batch 32`): **48,622 total, 48,460 pass, 0 fail,
-0 crash, 4 hang, 158 skip.**
+Full sweep on the committed tree + the Temporal fix (`all`, release, JIT by
+default, 15s deadline, `--jobs 8 --batch 32`): **48,622 total, 48,464
+pass, 0 fail, 0 crash, 0 hang, 158 skip** — a fully clean sweep; the only
+non-runnable fixtures are the out-of-scope skips.
 
-- **All RegExp and copyWithin hangs are resolved.** The 287-hang union
-  (280 property-escapes + 3 copyWithin + 4 Temporal, measured 2026-08-31)
-  is down to the four deferred Temporal fixtures below. Item 1's commit
-  and the typed-array fast paths cleared the entire non-Temporal hang
-  set.
-- **The remaining 4 hangs are the deferred Temporal cluster, unchanged**
-  (`Temporal/PlainDate|PlainDateTime/{since,until}/argument-string-limits.js`)
-  — out of scope per this plan; Temporal is a partially-implemented area.
-- **The one sweep failure found on the committed tree is fixed.**
-  `Object/defineProperty/redefine-length-with-various-values-and-configurable-true.js`
-  (a TypeError expected on `configurable: true` length redefines) failed
-  because the dense `array_set_length` grow/shrink fast paths short-
-  circuited without running ValidateAndApplyPropertyDescriptor, so the
-  non-configurable length invariant was bypassed. Both fast paths now
-  carry a compatibility guard (configurable/enumerable/accessor requests
-  fall through to the generic define, which throws); regression test in
-  `runtime/src/builtins/object.rs`. Re-sweep: 0 fail / 0 crash.
+- **All RegExp, copyWithin, decodeURI, and TypedArray hangs are resolved**
+  by the dense-elements/typed-array/regexp work, and the deferred Temporal
+  cluster by the closed-form date-difference fix below. The 287-hang union
+  (measured 2026-08-31) is now zero.
+- **The Temporal cluster fix:** `iso::calendar_date_until` computed a pure
+  day difference (largest unit Day) by iterating once per day — ~100M
+  iterations for edge-of-range dates (~12s, crossing the sweep's 15s
+  deadline; the four `argument-string-limits` fixtures). The all-zero
+  years/months/weeks case now uses the closed-form epoch-day difference
+  (`iso_date_to_epoch_days`), making the fixtures ~9ms. The remaining
+  unit loops (Year/Month/Week) keep their bounded day iteration.
+- **The one failure on the committed tree is fixed** (dense `array_set_length`
+  skipped the non-configurable-length validation; see the regression test
+  in `runtime/src/builtins/object.rs`).
 
-Item 4's acceptance gate is fully met: zero failures vs the baseline's
-0-fail claim, and every previously-hanging non-Temporal fixture is out of
-the hang union.
+Item 4's acceptance gate is fully met: zero failures and zero hangs vs the
+baseline's 0-fail / 458-hang (README) numbers.

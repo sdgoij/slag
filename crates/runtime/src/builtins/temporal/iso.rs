@@ -1364,10 +1364,19 @@ pub fn calendar_date_until(
         }
     }
     let mut days = 0i64;
-    let mut candidate = sign;
-    while !iso_date_surpasses(sign, one, two, years, months, weeks, candidate) {
-        days = candidate;
-        candidate += sign;
+    if years == 0 && months == 0 && weeks == 0 {
+        // Pure day difference (largest_unit == Day): closed form. The
+        // day-by-day loop is O(days) — ~100M iterations for the
+        // edge-of-range dates (the argument-string-limits fixtures),
+        // which took ~12s and crossed the sweep's 15s deadline.
+        days = iso_date_to_epoch_days(two.0, two.1 - 1, two.2)
+            - iso_date_to_epoch_days(one.0, one.1 - 1, one.2);
+    } else {
+        let mut candidate = sign;
+        while !iso_date_surpasses(sign, one, two, years, months, weeks, candidate) {
+            days = candidate;
+            candidate += sign;
+        }
     }
     (years, months, weeks, days)
 }

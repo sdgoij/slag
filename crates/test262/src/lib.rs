@@ -12692,6 +12692,20 @@ var $DONE = function (error) {
     }
 
     #[test]
+    fn debug_temporal_since_fixture() {
+        let Some(base) = fixture_root(Area::Builtins) else {
+            return;
+        };
+        let path = base.join("Temporal/PlainDate/prototype/since/argument-string-limits.js");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let (fm, body) = parse_fixture(&source).unwrap();
+        let specifier = format!("./{}", path.file_name().unwrap().to_string_lossy());
+        let result = run_one(body, Mode::Sloppy, &fm, path.parent().unwrap(), &specifier);
+        eprintln!("RESULT: {result:?}");
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn debug_atomics_fixture() {
         let Some(base) = fixture_root(Area::Builtins) else {
             return;
