@@ -260,7 +260,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("Intl.DurationFormat"),
         Some(placeholder("Intl.DurationFormat")),
-        function_proto
+        function_proto,
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
@@ -284,7 +284,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             length,
             placeholder(name),
             None,
-            function_proto
+            function_proto,
         )?;
         realm.intrinsics.define(key, Value::Function(func));
         proto.define_property(
@@ -330,7 +330,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("supportedLocalesOf"),
         None,
-        function_proto
+        function_proto,
     )?;
     realm
         .intrinsics

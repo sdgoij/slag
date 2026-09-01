@@ -63,12 +63,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         1,
         placeholder("Intl.getCanonicalLocales"),
         None,
-        function_proto
+        function_proto,
     )?;
-    realm.intrinsics.define(
-        GET_CANONICAL_LOCALES,
-        Value::Function(get_canonical),
-    );
+    realm
+        .intrinsics
+        .define(GET_CANONICAL_LOCALES, Value::Function(get_canonical));
     intl.define_property(
         &JsString::from_utf8("getCanonicalLocales"),
         &PropertyDescriptor {
@@ -269,12 +268,7 @@ pub fn canonicalize_locale_list(
         process(agent, *locales)?;
     } else {
         let object = to_object(agent, locales)?;
-        let length_value = get_property(
-            agent,
-            &object,
-            &JsString::from_utf8("length"),
-            object,
-        )?;
+        let length_value = get_property(agent, &object, &JsString::from_utf8("length"), object)?;
         let length = crux::convert::to_length(crux::convert::to_number(&length_value)?) as usize;
         let object_ref = as_object(&object)
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Invalid locales value".into()))?;

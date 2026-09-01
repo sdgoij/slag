@@ -746,7 +746,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("Intl.Collator"),
         Some(placeholder("Intl.Collator")),
-        function_proto
+        function_proto,
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
@@ -764,7 +764,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("resolvedOptions"),
         None,
-        function_proto
+        function_proto,
     )?;
     realm
         .intrinsics
@@ -786,12 +786,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("compare getter"),
         None,
-        function_proto
+        function_proto,
     )?;
-    realm.intrinsics.define(
-        COLLATOR_COMPARE_GETTER,
-        Value::Function(compare_getter),
-    );
+    realm
+        .intrinsics
+        .define(COLLATOR_COMPARE_GETTER, Value::Function(compare_getter));
     proto.define_property(
         &JsString::from_utf8("compare"),
         &PropertyDescriptor {
@@ -834,12 +833,11 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("supportedLocalesOf"),
         None,
-        function_proto
+        function_proto,
     )?;
-    realm.intrinsics.define(
-        COLLATOR_SUPPORTED_LOCALES_OF,
-        Value::Function(supported),
-    );
+    realm
+        .intrinsics
+        .define(COLLATOR_SUPPORTED_LOCALES_OF, Value::Function(supported));
     ctor.define_property(
         &JsString::from_utf8("supportedLocalesOf"),
         &PropertyDescriptor {
@@ -852,9 +850,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         },
     )?;
     realm.intrinsics.define(COLLATOR_PROTO, proto_value);
-    realm
-        .intrinsics
-        .define(COLLATOR, Value::Function(ctor));
+    realm.intrinsics.define(COLLATOR, Value::Function(ctor));
     if let Some(obj) = as_object(intl_value) {
         obj.define_property(
             &JsString::from_utf8("Collator"),

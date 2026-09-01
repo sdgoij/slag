@@ -740,8 +740,7 @@ fn serialize_json_property(
         }
     }
     if let Some(replacer_function) = &state.replacer_function {
-        value =
-            crate::function::call(agent, replacer_function, *holder, &[str(key), value])?;
+        value = crate::function::call(agent, replacer_function, *holder, &[str(key), value])?;
     }
     if let ValueKind::Object(obj) = value.kind() {
         if is_raw_json(agent, &value) {

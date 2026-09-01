@@ -212,9 +212,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     let iterator_ctor_value = Value::Function(iterator_ctor);
-    realm
-        .intrinsics
-        .define(ITERATOR, iterator_ctor_value);
+    realm.intrinsics.define(ITERATOR, iterator_ctor_value);
     if let Some(function_proto) = realm
         .intrinsics
         .get("%Function.prototype%")
@@ -1771,8 +1769,7 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 *index += 1;
                 // GetIteratorDirect (spec 7.4.1): call the open method and
                 // require an object iterator with a callable next.
-                let iterator =
-                    crate::function::call(agent, &item.open_method, item.iterable, &[])?;
+                let iterator = crate::function::call(agent, &item.open_method, item.iterable, &[])?;
                 if !matches!(
                     iterator.kind(),
                     ValueKind::Object(_) | ValueKind::Function(_)
@@ -1782,12 +1779,7 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                         "Iterator must be an object".into(),
                     ));
                 }
-                let next = get_property(
-                    agent,
-                    &iterator,
-                    &JsString::from_utf8("next"),
-                    iterator,
-                )?;
+                let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
                 if !is_callable(&next) {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -1996,12 +1988,7 @@ fn get_iterator_flattenable(
             "Iterator must be an object".into(),
         ));
     }
-    let next = get_property(
-        agent,
-        &iterator,
-        &JsString::from_utf8("next"),
-        iterator,
-    )?;
+    let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
     if !is_callable(&next) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -2287,12 +2274,7 @@ fn zip_options(
             ));
         }
     };
-    let mode_value = get_property(
-        agent,
-        &options,
-        &JsString::from_utf8("mode"),
-        options,
-    )?;
+    let mode_value = get_property(agent, &options, &JsString::from_utf8("mode"), options)?;
     let mode = match mode_value.kind() {
         ValueKind::Undefined => ZipMode::Shortest,
         ValueKind::String(text) if text.to_string_lossy() == "shortest" => ZipMode::Shortest,
@@ -2306,12 +2288,7 @@ fn zip_options(
         }
     };
     let padding = if mode == ZipMode::Longest {
-        let padding = get_property(
-            agent,
-            &options,
-            &JsString::from_utf8("padding"),
-            options,
-        )?;
+        let padding = get_property(agent, &options, &JsString::from_utf8("padding"), options)?;
         if !matches!(
             padding.kind(),
             ValueKind::Undefined | ValueKind::Object(_) | ValueKind::Function(_)

@@ -65,9 +65,7 @@ fn statics(
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -96,9 +94,7 @@ fn proto_methods(
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -127,9 +123,7 @@ fn proto_getters(
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -2580,8 +2574,7 @@ fn read_zoned_fields(agent: &mut Agent, bag: &Value) -> Result<ZonedFields, JsEr
         "timeZone",
         "year",
     ] {
-        let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
+        let value = crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -2670,8 +2663,7 @@ fn read_zoned_with_fields(
         "second",
         "year",
     ] {
-        let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
+        let value = crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -3443,8 +3435,7 @@ fn read_partial_time_fields(agent: &mut Agent, bag: &Value) -> Result<[Option<i6
         "nanosecond",
         "second",
     ] {
-        let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
+        let value = crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -3507,8 +3498,7 @@ fn read_date_time_fields(
         "second",
         "year",
     ] {
-        let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
+        let value = crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -4727,10 +4717,7 @@ fn zoned_get_time_zone_transition(
     }
     let direction = if let ValueKind::String(text) = &direction.kind() {
         let obj = crux::object::JsObject::ordinary_object_create(None);
-        obj.create_data_property_or_throw(
-            &JsString::from_utf8("direction"),
-            Value::String(*text),
-        )?;
+        obj.create_data_property_or_throw(&JsString::from_utf8("direction"), Value::String(*text))?;
         Value::Object(obj)
     } else {
         super::get_options_object(&direction)?
@@ -5129,8 +5116,7 @@ pub(super) fn read_era_fields(
     let mut era: Option<String> = None;
     let mut era_year: Option<i64> = None;
     for key in ["era", "eraYear"] {
-        let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
+        let value = crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -5233,8 +5219,7 @@ fn read_partial_era_fields(
     let mut era = None;
     let mut era_year = None;
     for key in ["era", "eraYear"] {
-        let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
+        let value = crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -5298,8 +5283,7 @@ fn prepare_partial_date_fields(
     let mut month_code = None;
     let mut day = None;
     for key in ["day", "month", "monthCode", "year"] {
-        let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
+        let value = crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -5337,24 +5321,16 @@ fn reject_temporal_like_object(agent: &mut Agent, item: &Value) -> Result<(), Js
                 "with() does not support a calendar or timeZone property".into(),
             ));
         }
-        let calendar = crate::context::get_property(
-            agent,
-            item,
-            &JsString::from_utf8("calendar"),
-            *item,
-        )?;
+        let calendar =
+            crate::context::get_property(agent, item, &JsString::from_utf8("calendar"), *item)?;
         if !matches!(calendar.kind(), ValueKind::Undefined) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "with() does not support a calendar property".into(),
             ));
         }
-        let time_zone = crate::context::get_property(
-            agent,
-            item,
-            &JsString::from_utf8("timeZone"),
-            *item,
-        )?;
+        let time_zone =
+            crate::context::get_property(agent, item, &JsString::from_utf8("timeZone"), *item)?;
         if !matches!(time_zone.kind(), ValueKind::Undefined) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -5716,12 +5692,8 @@ fn plain_date_to_zoned_date_time(
 ) -> Result<Value, JsError> {
     let [y, m, d, ..] = require_date(agent, this)?;
     let (tz, time) = if matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
-        let time_zone_like = crate::context::get_property(
-            agent,
-            &item,
-            &JsString::from_utf8("timeZone"),
-            item,
-        )?;
+        let time_zone_like =
+            crate::context::get_property(agent, &item, &JsString::from_utf8("timeZone"), item)?;
         if matches!(time_zone_like.kind(), ValueKind::Undefined) {
             let tz = super::instant::to_temporal_time_zone_identifier(agent, &item)?;
             (tz, None)
@@ -6180,8 +6152,7 @@ fn read_year_month_fields(
     let mut month_code = None;
     let mut year = None;
     for key in ["month", "monthCode", "year"] {
-        let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
+        let value = crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -6216,8 +6187,7 @@ fn read_month_day_fields(
     let mut month_code = None;
     let mut year = None;
     for key in ["day", "month", "monthCode", "year"] {
-        let value =
-            crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
+        let value = crate::context::get_property(agent, bag, &JsString::from_utf8(key), *bag)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -6793,8 +6763,7 @@ fn plain_year_month_to_plain_date(
             "argument should be an object".into(),
         ));
     }
-    let value =
-        crate::context::get_property(agent, &item, &JsString::from_utf8("day"), item)?;
+    let value = crate::context::get_property(agent, &item, &JsString::from_utf8("day"), item)?;
     let day = match value.kind() {
         ValueKind::Undefined => {
             return Err(JsError::new(ErrorKind::TypeError, "day is required".into()));
@@ -6944,8 +6913,7 @@ fn plain_month_day_to_plain_date(
         ));
     }
     let calendar = super::temporal_calendar_id(agent, this);
-    let value =
-        crate::context::get_property(agent, &item, &JsString::from_utf8("year"), item)?;
+    let value = crate::context::get_property(agent, &item, &JsString::from_utf8("year"), item)?;
     let year = match value.kind() {
         ValueKind::Undefined => None,
         _ => Some(super::to_integer_with_truncation(agent, &value)?),

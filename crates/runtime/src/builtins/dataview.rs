@@ -242,11 +242,7 @@ fn get_byte_length(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
     let object = require_data_view(agent, this)?;
     let (buffer_object, byte_length, byte_offset) = {
         let state = state(agent, object.id()).expect("registered data view");
-        (
-            state.buffer_object,
-            state.byte_length,
-            state.byte_offset,
-        )
+        (state.buffer_object, state.byte_length, state.byte_offset)
     };
     let buffer_id = as_object(&buffer_object)
         .map(|object| object.id())
@@ -281,11 +277,7 @@ fn get_byte_offset(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
     let object = require_data_view(agent, this)?;
     let (buffer_object, byte_length, byte_offset) = {
         let state = state(agent, object.id()).expect("registered data view");
-        (
-            state.buffer_object,
-            state.byte_length,
-            state.byte_offset,
-        )
+        (state.buffer_object, state.byte_length, state.byte_offset)
     };
     let buffer_id = as_object(&buffer_object)
         .map(|object| object.id())
@@ -326,11 +318,7 @@ fn view_state(agent: &Agent, this: &Value) -> Result<(u64, usize, Option<usize>)
     let object = require_data_view(agent, this)?;
     let (buffer_object, byte_length, byte_offset) = {
         let state = state(agent, object.id()).expect("registered data view");
-        (
-            state.buffer_object,
-            state.byte_length,
-            state.byte_offset,
-        )
+        (state.buffer_object, state.byte_length, state.byte_offset)
     };
     let buffer_id = as_object(&buffer_object)
         .map(|object| object.id())
@@ -485,9 +473,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let dv_ctor_value = Value::Function(dv_ctor);
     realm.intrinsics.define(DATA_VIEW, dv_ctor_value);
-    realm
-        .intrinsics
-        .define(DATA_VIEW_PROTO, dv_proto_value);
+    realm.intrinsics.define(DATA_VIEW_PROTO, dv_proto_value);
     dv_ctor.define_property(
         &JsString::from_utf8("prototype"),
         &PropertyDescriptor {

@@ -13,6 +13,9 @@ mod derived_regexp_tables {
     include!(concat!(env!("OUT_DIR"), "/derived_regexp_tables.rs"));
 }
 pub mod tz;
+// The generated IANA tzdata table carries its own compact layout; rustfmt
+// must never reflow the 180k-line file.
+#[rustfmt::skip]
 pub mod tz_data;
 
 /// `WhiteSpace` (spec 11.2): TAB, VT, FF, SP, NBSP, ZWNBSP, and the

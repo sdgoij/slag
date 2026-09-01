@@ -615,7 +615,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             length,
             body,
             None,
-            function_proto
+            function_proto,
         )?;
         math.define_property(
             &JsString::from_utf8(name),

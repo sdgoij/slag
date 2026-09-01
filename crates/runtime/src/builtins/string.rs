@@ -526,12 +526,7 @@ fn match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     // its @@matchAll property; it is coerced by RegExpCreate instead.
     if matches!(regexp.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         if is_regexp(agent, &regexp)? {
-            let flags = get_property(
-                agent,
-                &regexp,
-                &JsString::from_utf8("flags"),
-                regexp,
-            )?;
+            let flags = get_property(agent, &regexp, &JsString::from_utf8("flags"), regexp)?;
             require_object_coercible(&flags)?;
             let flag_text = crate::context::to_string(agent, &flags)?;
             if !flag_text.as_slice().contains(&(b'g' as u16)) {
@@ -696,12 +691,7 @@ fn replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
         ValueKind::Object(_) | ValueKind::Function(_)
     ) && let Some(replacer) = crate::expr::get_method(agent, &search_value, "@@replace")?
     {
-        return crate::function::call(
-            agent,
-            &replacer,
-            search_value,
-            &[*this, replace_value],
-        );
+        return crate::function::call(agent, &replacer, search_value, &[*this, replace_value]);
     }
     let string = crate::context::to_string(agent, this)?;
     let search_string = crate::context::to_string(agent, &search_value)?;
@@ -773,12 +763,7 @@ fn replace_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             }
         }
         if let Some(replacer) = crate::expr::get_method(agent, &search_value, "@@replace")? {
-            return crate::function::call(
-                agent,
-                &replacer,
-                search_value,
-                &[*this, replace_value],
-            );
+            return crate::function::call(agent, &replacer, search_value, &[*this, replace_value]);
         }
     }
     let string = crate::context::to_string(agent, this)?;
@@ -1686,9 +1671,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let string_ctor_value = Value::Function(string_ctor);
 
     realm.intrinsics.define(STRING, string_ctor_value);
-    realm
-        .intrinsics
-        .define(STRING_PROTO, string_proto_value);
+    realm.intrinsics.define(STRING_PROTO, string_proto_value);
 
     string_ctor.define_property(
         &JsString::from_utf8("prototype"),

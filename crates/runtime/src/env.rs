@@ -520,10 +520,7 @@ impl DeclarativeEnv {
     /// context): `None` is the TDZ marker (a `let`/`const` binding that has
     /// not been initialized).
     pub fn slot_value(&self, index: usize) -> Option<Value> {
-        self.bindings
-            .borrow()
-            .get(index)
-            .and_then(|(_, b)| b.value)
+        self.bindings.borrow().get(index).and_then(|(_, b)| b.value)
     }
 
     /// Whether the binding at `index` is mutable: the static context-chain

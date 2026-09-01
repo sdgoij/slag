@@ -66,9 +66,7 @@ pub fn install(
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -93,9 +91,7 @@ pub fn install(
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -129,9 +125,7 @@ pub fn install(
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -664,12 +658,8 @@ fn to_string_impl(agent: &mut Agent, this: &Value, options: &Value) -> Result<Va
     let rounding_mode = get_rounding_mode(agent, &resolved, RoundingMode::Trunc)?;
     let smallest_unit = get_temporal_unit(agent, &resolved, "smallestUnit", None)?;
     // spec 8.3.11: the timeZone property is read before validation.
-    let time_zone = crate::context::get_property(
-        agent,
-        &resolved,
-        &JsString::from_utf8("timeZone"),
-        resolved,
-    )?;
+    let time_zone =
+        crate::context::get_property(agent, &resolved, &JsString::from_utf8("timeZone"), resolved)?;
     let time_zone = if matches!(time_zone.kind(), ValueKind::Undefined) {
         None
     } else {

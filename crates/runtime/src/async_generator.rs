@@ -180,9 +180,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             .and_then(|v| crate::context::as_object(&v)),
     )?;
     proto.define_property_key(
-        &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("asyncIterator")
-        ),
+        &crux::property::PropertyKey::Symbol(crux::symbol::well_known("asyncIterator")),
         &PropertyDescriptor {
             value: Some(Value::Function(async_iterator_method)),
             writable: Some(true),
@@ -197,9 +195,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // (AsyncGeneratorPrototype/Symbol.toStringTag.js reads the
     // double-getPrototypeOf chain).
     proto.define_property_key(
-        &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag")
-        ),
+        &crux::property::PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "AsyncGenerator",

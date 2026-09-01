@@ -48,9 +48,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     )?;
     let ctor_value = Value::Function(ctor);
 
-    realm
-        .intrinsics
-        .define(ABSTRACT_MODULE_SOURCE, ctor_value);
+    realm.intrinsics.define(ABSTRACT_MODULE_SOURCE, ctor_value);
     realm
         .intrinsics
         .define(ABSTRACT_MODULE_SOURCE_PROTO, proto_value);
@@ -106,9 +104,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     proto.define_property_key(
-        &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag")
-        ),
+        &crux::property::PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: None,
             writable: None,

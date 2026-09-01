@@ -87,7 +87,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             *length,
             placeholder(name),
             None,
-            function_proto
+            function_proto,
         )?;
         realm.intrinsics.define(key, Value::Function(func));
         locale_proto.define_property(
@@ -124,11 +124,9 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             0,
             placeholder(name),
             None,
-            function_proto
+            function_proto,
         )?;
-        realm
-            .intrinsics
-            .define(key, Value::Function(getter));
+        realm.intrinsics.define(key, Value::Function(getter));
         locale_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {

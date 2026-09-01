@@ -428,11 +428,7 @@ pub fn set(
     let Some(trap) = value_get_method(&handler, &trap_key("set"))? else {
         return value_set(&target, key, value, receiver, false);
     };
-    let result = value_call(
-        &trap,
-        handler,
-        &[target, key_value(key), value, receiver],
-    )?;
+    let result = value_call(&trap, handler, &[target, key_value(key), value, receiver])?;
     if !crate::convert::to_boolean(&result) {
         return Ok(false);
     }
@@ -608,11 +604,7 @@ fn create_list_from_array_like(value: &Value) -> Result<Vec<PropertyKey>, JsErro
     let length = length_of_array_like(value)?;
     let mut list = Vec::with_capacity(length as usize);
     for index in 0..length {
-        let element = value_get(
-            value,
-            &PropertyKey::from_utf8(&index.to_string()),
-            *value,
-        )?;
+        let element = value_get(value, &PropertyKey::from_utf8(&index.to_string()), *value)?;
         let key = if element.is_string() || element.is_symbol() {
             crate::convert::to_property_key(&element)?
         } else {
@@ -735,12 +727,9 @@ mod tests {
                 &key("get"),
                 builtin("get", move |this, args| {
                     assert_eq!(args.len(), 3);
-                    recorder.borrow_mut().push((
-                        *this,
-                        args[0],
-                        args[1],
-                        args[2],
-                    ));
+                    recorder
+                        .borrow_mut()
+                        .push((*this, args[0], args[1], args[2]));
                     Ok(Value::Number(99.0))
                 }),
             )

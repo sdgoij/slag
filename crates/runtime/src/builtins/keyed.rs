@@ -453,12 +453,7 @@ fn map_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         }
         index += 1;
         if let Some((key, value)) = entry {
-            crate::function::call(
-                agent,
-                &callback,
-                this_arg,
-                &[value, key, *this],
-            )?;
+            crate::function::call(agent, &callback, this_arg, &[value, key, *this])?;
         }
     }
     Ok(Value::Undefined)
@@ -645,12 +640,7 @@ fn set_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         }
         index += 1;
         if let Some(value) = entry {
-            crate::function::call(
-                agent,
-                &callback,
-                this_arg,
-                &[value, value, *this],
-            )?;
+            crate::function::call(agent, &callback, this_arg, &[value, value, *this])?;
         }
     }
     Ok(Value::Undefined)
@@ -679,10 +669,9 @@ fn create_set_iterator(
         SetIterationKind::KeyValue => 0u8,
         SetIterationKind::Value => 1u8,
     };
-    agent.set_iter_data.insert(
-        iterator.id(),
-        RefCell::new((Some(*set), 0usize, kind_code)),
-    );
+    agent
+        .set_iter_data
+        .insert(iterator.id(), RefCell::new((Some(*set), 0usize, kind_code)));
     Ok(Value::Object(iterator))
 }
 
@@ -1863,9 +1852,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             "%Set.prototype.values% missing".into(),
         )
     })?;
-    realm
-        .intrinsics
-        .define("%Set.prototype.keys%", values_func);
+    realm.intrinsics.define("%Set.prototype.keys%", values_func);
     set_proto.define_property(
         &JsString::from_utf8("keys"),
         &PropertyDescriptor {
@@ -1978,9 +1965,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     let weak_map_ctor_value = Value::Function(weak_map_ctor);
-    realm
-        .intrinsics
-        .define(WEAK_MAP, weak_map_ctor_value);
+    realm.intrinsics.define(WEAK_MAP, weak_map_ctor_value);
     realm
         .intrinsics
         .define(WEAK_MAP_PROTO, weak_map_proto_value);
@@ -2058,9 +2043,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     let weak_set_ctor_value = Value::Function(weak_set_ctor);
-    realm
-        .intrinsics
-        .define(WEAK_SET, weak_set_ctor_value);
+    realm.intrinsics.define(WEAK_SET, weak_set_ctor_value);
     realm
         .intrinsics
         .define(WEAK_SET_PROTO, weak_set_proto_value);

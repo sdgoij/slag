@@ -127,7 +127,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("Intl.ListFormat"),
         Some(placeholder("Intl.ListFormat")),
-        function_proto
+        function_proto,
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
@@ -151,7 +151,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             *length,
             placeholder(name),
             None,
-            function_proto
+            function_proto,
         )?;
         realm.intrinsics.define(key, Value::Function(func));
         proto.define_property(
@@ -197,7 +197,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("supportedLocalesOf"),
         None,
-        function_proto
+        function_proto,
     )?;
     realm
         .intrinsics
@@ -214,9 +214,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         },
     )?;
     realm.intrinsics.define(LIST_FORMAT_PROTO, proto_value);
-    realm
-        .intrinsics
-        .define(LIST_FORMAT, Value::Function(ctor));
+    realm.intrinsics.define(LIST_FORMAT, Value::Function(ctor));
     if let Some(obj) = as_object(intl_value) {
         obj.define_property(
             &JsString::from_utf8("ListFormat"),

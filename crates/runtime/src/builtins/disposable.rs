@@ -559,14 +559,7 @@ fn use_value(
             "value is not disposable".into(),
         ));
     }
-    add_resource(
-        agent,
-        id,
-        value,
-        method,
-        is_async,
-        DisposalCall::Receiver,
-    )?;
+    add_resource(agent, id, value, method, is_async, DisposalCall::Receiver)?;
     Ok(value)
 }
 
@@ -1025,13 +1018,7 @@ pub fn make_suppressed_error(
         .intrinsics
         .get("%SuppressedError%")
         .and_then(|ctor| {
-            crate::context::get_property(
-                agent,
-                &ctor,
-                &JsString::from_utf8("prototype"),
-                ctor,
-            )
-            .ok()
+            crate::context::get_property(agent, &ctor, &JsString::from_utf8("prototype"), ctor).ok()
         })
         .and_then(|value| as_object(&value));
     let object = JsObject::ordinary_object_create(proto);

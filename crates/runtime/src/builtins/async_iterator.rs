@@ -467,19 +467,15 @@ fn async_dispose(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Val
     let promise = capability.promise;
     // spec 27.1.4.6 step 3: GetMethod(return) — a throwing `return` getter
     // rejects the promise (IfAbruptRejectPromise), never throws synchronously.
-    let return_method = match crate::context::get_property(
-        agent,
-        this,
-        &JsString::from_utf8("return"),
-        *this,
-    ) {
-        Ok(method) => method,
-        Err(error) => {
-            let rejection = crate::promise::error_value(agent, &error);
-            crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
-            return Ok(promise);
-        }
-    };
+    let return_method =
+        match crate::context::get_property(agent, this, &JsString::from_utf8("return"), *this) {
+            Ok(method) => method,
+            Err(error) => {
+                let rejection = crate::promise::error_value(agent, &error);
+                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+                return Ok(promise);
+            }
+        };
     let return_method = match return_method.kind() {
         ValueKind::Undefined | ValueKind::Null => None,
         _ if is_callable(&return_method) => Some(return_method),
@@ -541,8 +537,7 @@ fn get_async_iterator_direct(
             "AsyncIterator method called on a non-object".into(),
         ));
     }
-    let next =
-        crate::context::get_property(agent, this, &JsString::from_utf8("next"), *this)?;
+    let next = crate::context::get_property(agent, this, &JsString::from_utf8("next"), *this)?;
     if !is_callable(&next) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -748,14 +743,9 @@ fn continue_flat_inner(agent: &mut Agent, object_id: u64, result: Value) -> Resu
             "Iterator result is not an object".into(),
         ));
     }
-    let done =
-        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result)?;
-    let value = crate::context::get_property(
-        agent,
-        &result,
-        &JsString::from_utf8("value"),
-        result,
-    )?;
+    let done = crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result)?;
+    let value =
+        crate::context::get_property(agent, &result, &JsString::from_utf8("value"), result)?;
     let capability = agent
         .async_iterator_pending
         .get(&object_id)
@@ -862,8 +852,7 @@ fn async_helper_method(
                     record.iterator,
                 )?;
                 if is_callable(&return_method) {
-                    let result =
-                        crate::function::call(agent, &return_method, record.iterator, &[]);
+                    let result = crate::function::call(agent, &return_method, record.iterator, &[]);
                     match result {
                         Ok(result) => {
                             let promise = promise_resolve(agent, &promise_ctor, result)?;
@@ -1002,14 +991,9 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
             "Iterator result is not an object".into(),
         ));
     }
-    let done =
-        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result)?;
-    let value = crate::context::get_property(
-        agent,
-        &result,
-        &JsString::from_utf8("value"),
-        result,
-    )?;
+    let done = crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result)?;
+    let value =
+        crate::context::get_property(agent, &result, &JsString::from_utf8("value"), result)?;
     let capability = agent
         .async_iterator_pending
         .get(&object_id)
@@ -1042,9 +1026,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
             })?;
         let state = state.borrow();
         let mode = match &state.mode {
-            HelperMode::Map { mapper } => HelperMode::Map {
-                mapper: *mapper,
-            },
+            HelperMode::Map { mapper } => HelperMode::Map { mapper: *mapper },
             HelperMode::Filter { filterer } => HelperMode::Filter {
                 filterer: *filterer,
             },
@@ -1152,8 +1134,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
         HelperMode::Drop { remaining } => {
             if *remaining > 0.0 {
                 *remaining -= 1.0;
-                let result =
-                    crate::function::call(agent, &record.next, record.iterator, &[])?;
+                let result = crate::function::call(agent, &record.next, record.iterator, &[])?;
                 let promise_ctor = agent
                     .current_realm()?
                     .intrinsics
@@ -1193,8 +1174,7 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
                 let iter_method = get_method(agent, &mapped, "@@asyncIterator")?;
                 match iter_method {
                     Some(method) => {
-                        let inner_value =
-                            crate::function::call(agent, &method, mapped, &[])?;
+                        let inner_value = crate::function::call(agent, &method, mapped, &[])?;
                         if !matches!(inner_value.kind(), ValueKind::Object(_)) {
                             return Err(JsError::new(
                                 ErrorKind::TypeError,
@@ -1473,14 +1453,9 @@ fn continue_eager(agent: &mut Agent, driver_id: u64, result: Value) -> Result<Va
             "Iterator result is not an object".into(),
         ));
     }
-    let done =
-        crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result)?;
-    let value = crate::context::get_property(
-        agent,
-        &result,
-        &JsString::from_utf8("value"),
-        result,
-    )?;
+    let done = crate::context::get_property(agent, &result, &JsString::from_utf8("done"), result)?;
+    let value =
+        crate::context::get_property(agent, &result, &JsString::from_utf8("value"), result)?;
     let (mut mode, capability) = {
         let driver = agent
             .async_iterator_eager

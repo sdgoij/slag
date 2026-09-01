@@ -792,12 +792,7 @@ fn initialize(
     } else {
         locale
     };
-    let time_zone_value = get_property(
-        agent,
-        &options,
-        &JsString::from_utf8("timeZone"),
-        options,
-    )?;
+    let time_zone_value = get_property(agent, &options, &JsString::from_utf8("timeZone"), options)?;
     let time_zone = if time_zone_value.is_undefined() {
         "UTC".to_string()
     } else {
@@ -2141,7 +2136,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("Intl.DateTimeFormat"),
         Some(placeholder("Intl.DateTimeFormat")),
-        function_proto
+        function_proto,
     )?;
     proto.define_property(
         &JsString::from_utf8("constructor"),
@@ -2166,7 +2161,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
             *length,
             placeholder(name),
             None,
-            function_proto
+            function_proto,
         )?;
         realm.intrinsics.define(key, Value::Function(func));
         proto.define_property(
@@ -2187,7 +2182,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         0,
         placeholder("format getter"),
         None,
-        function_proto
+        function_proto,
     )?;
     realm
         .intrinsics
@@ -2234,7 +2229,7 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         1,
         placeholder("supportedLocalesOf"),
         None,
-        function_proto
+        function_proto,
     )?;
     realm
         .intrinsics
@@ -2303,7 +2298,7 @@ fn unwrap_date_time_format(agent: &mut Agent, this: &Value) -> Result<Value, JsE
             agent,
             &Value::Object(obj),
             &PropertyKey::Symbol(fallback_symbol(agent)?),
-            Value::Object(obj)
+            Value::Object(obj),
         ) && as_object(&inner).is_some()
         {
             return Ok(inner);

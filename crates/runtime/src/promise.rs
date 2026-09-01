@@ -295,12 +295,8 @@ pub fn resolve_promise(
     let Some(_object) = object else {
         return fulfill_promise(agent, promise, resolution);
     };
-    let then = crate::context::get_property(
-        agent,
-        &resolution,
-        &JsString::from_utf8("then"),
-        resolution,
-    );
+    let then =
+        crate::context::get_property(agent, &resolution, &JsString::from_utf8("then"), resolution);
     let then = match then {
         Ok(then) => then,
         Err(error) => {
@@ -457,12 +453,7 @@ pub fn perform_promise_then(
 /// PromiseResolve (spec 27.2.4.5.1): the static `Promise.resolve` core.
 pub fn promise_resolve(agent: &mut Agent, constructor: &Value, x: Value) -> Result<Value, JsError> {
     if is_promise(agent, &x) {
-        let ctor = crate::context::get_property(
-            agent,
-            &x,
-            &JsString::from_utf8("constructor"),
-            x,
-        )?;
+        let ctor = crate::context::get_property(agent, &x, &JsString::from_utf8("constructor"), x)?;
         if crux::ops::same_value(&ctor, constructor) {
             return Ok(x);
         }

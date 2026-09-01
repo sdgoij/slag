@@ -7,6 +7,9 @@ pub mod calendar;
 pub mod duration;
 pub mod instant;
 pub mod iso;
+// The generated lunar tables (scratch/emit_icu4x_tables.py) carry their own
+// compact layout; rustfmt must never reflow the file.
+#[rustfmt::skip]
 pub mod lunar_tables;
 pub mod shell;
 
@@ -109,9 +112,7 @@ pub fn install_constructor(
     let ctor_value = Value::Function(ctor);
 
     realm.intrinsics.define(intrinsic, ctor_value);
-    realm
-        .intrinsics
-        .define(proto_intrinsic, proto_value);
+    realm.intrinsics.define(proto_intrinsic, proto_value);
 
     ctor.define_property(
         &JsString::from_utf8("prototype"),
@@ -138,9 +139,7 @@ pub fn install_constructor(
 
     // `[@@toStringTag]` is a non-writable data property (spec 7.3.2).
     proto.define_property_key(
-        &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag")
-        ),
+        &crux::property::PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(tag)))),
             writable: Some(false),
@@ -375,8 +374,7 @@ pub fn get_option(
     values: &[&str],
     default: Option<&str>,
 ) -> Result<Option<String>, JsError> {
-    let value =
-        crate::context::get_property(agent, options, &JsString::from_utf8(key), *options)?;
+    let value = crate::context::get_property(agent, options, &JsString::from_utf8(key), *options)?;
     if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(default.map(str::to_string));
     }
@@ -1167,8 +1165,7 @@ fn read_duration_fields(agent: &mut Agent, item: &Value) -> Result<[Option<f64>;
     let mut result = [None; 10];
     let mut any = false;
     for (key, idx) in keys {
-        let value =
-            crate::context::get_property(agent, item, &JsString::from_utf8(key), *item)?;
+        let value = crate::context::get_property(agent, item, &JsString::from_utf8(key), *item)?;
         if !matches!(value.kind(), ValueKind::Undefined) {
             any = true;
             result[idx] = Some(to_integer_if_integral(agent, &value)?);
@@ -1262,12 +1259,8 @@ pub enum RelativeTo {
 
 /// spec 13.19 GetTemporalRelativeToOption.
 pub fn get_temporal_relative_to(agent: &mut Agent, options: &Value) -> Result<RelativeTo, JsError> {
-    let value = crate::context::get_property(
-        agent,
-        options,
-        &JsString::from_utf8("relativeTo"),
-        *options,
-    )?;
+    let value =
+        crate::context::get_property(agent, options, &JsString::from_utf8("relativeTo"), *options)?;
     if matches!(value.kind(), ValueKind::Undefined) {
         return Ok(RelativeTo::None);
     }
@@ -1357,8 +1350,7 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
         "timeZone",
         "year",
     ] {
-        let value =
-            crate::context::get_property(agent, item, &JsString::from_utf8(key), *item)?;
+        let value = crate::context::get_property(agent, item, &JsString::from_utf8(key), *item)?;
         if matches!(value.kind(), ValueKind::Undefined) {
             continue;
         }
@@ -1618,9 +1610,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // Temporal[@@toStringTag] = "Temporal" (spec 1.1.1): a non-writable
     // data property.
     temporal.define_property_key(
-        &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag")
-        ),
+        &crux::property::PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8("Temporal")))),
             writable: Some(false),
@@ -1695,9 +1685,7 @@ fn install_now(temporal: &Handle<JsObject>, realm: &Handle<Realm>) -> Result<(),
     )?;
     // Temporal.Now[@@toStringTag] = "Temporal.Now" (spec 2.1.1).
     now.define_property_key(
-        &crux::property::PropertyKey::Symbol(
-            crux::symbol::well_known("toStringTag")
-        ),
+        &crux::property::PropertyKey::Symbol(crux::symbol::well_known("toStringTag")),
         &PropertyDescriptor {
             value: Some(Value::String(Handle::new(JsString::from_utf8(
                 "Temporal.Now",

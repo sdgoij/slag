@@ -60,9 +60,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let proxy_ctor_value = Value::Function(proxy_ctor);
 
     realm.intrinsics.define(PROXY, proxy_ctor_value);
-    realm
-        .intrinsics
-        .define(PROXY_PROTO, proxy_proto_value);
+    realm.intrinsics.define(PROXY_PROTO, proxy_proto_value);
 
     // spec 26.2.1: the Proxy constructor has no `prototype` property; the
     // %Proxy.prototype% intrinsic still exists (with its own constructor

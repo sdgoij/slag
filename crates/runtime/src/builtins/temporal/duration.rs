@@ -73,9 +73,7 @@ pub fn install(
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -111,9 +109,7 @@ pub fn install(
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -147,9 +143,7 @@ pub fn install(
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(intrinsic, Value::Function(func));
+        realm.intrinsics.define(intrinsic, Value::Function(func));
         proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -675,10 +669,7 @@ fn total(agent: &mut Agent, this: &Value, total_of: &Value) -> Result<Value, JsE
     }
     let total_of = if let ValueKind::String(text) = total_of.kind() {
         let obj = crux::object::JsObject::ordinary_object_create(None);
-        obj.create_data_property_or_throw(
-            &JsString::from_utf8("unit"),
-            Value::String(text),
-        )?;
+        obj.create_data_property_or_throw(&JsString::from_utf8("unit"), Value::String(text))?;
         Value::Object(obj)
     } else {
         get_options_object(total_of)?

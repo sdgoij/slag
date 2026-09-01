@@ -100,9 +100,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let error_ctor_value = Value::Function(error_ctor);
 
     realm.intrinsics.define(ERROR, error_ctor_value);
-    realm
-        .intrinsics
-        .define(ERROR_PROTO, error_proto_value);
+    realm.intrinsics.define(ERROR_PROTO, error_proto_value);
 
     error_ctor.define_property(
         &JsString::from_utf8("prototype"),
@@ -503,12 +501,8 @@ fn install_cause(
     if !options_object.has_property(&JsString::from_utf8("cause"))? {
         return Ok(());
     }
-    let cause = crate::context::get_property(
-        agent,
-        options,
-        &JsString::from_utf8("cause"),
-        *options,
-    )?;
+    let cause =
+        crate::context::get_property(agent, options, &JsString::from_utf8("cause"), *options)?;
     object.define_property(
         &JsString::from_utf8("cause"),
         &PropertyDescriptor {
@@ -641,12 +635,8 @@ fn list_to_array(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
     }
     if let Some(method) = crate::expr::get_method(agent, value, "@@iterator")? {
         let iterator = crate::function::call(agent, &method, *value, &[])?;
-        let next = crate::context::get_property(
-            agent,
-            &iterator,
-            &JsString::from_utf8("next"),
-            iterator,
-        )?;
+        let next =
+            crate::context::get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
         if !crux::value::is_callable(&next) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -697,8 +687,7 @@ fn error_prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, J
             "Error.prototype.toString requires an object".into(),
         ));
     }
-    let name =
-        crate::context::get_property(agent, this, &JsString::from_utf8("name"), *this)?;
+    let name = crate::context::get_property(agent, this, &JsString::from_utf8("name"), *this)?;
     let name = match name.kind() {
         ValueKind::Undefined => "Error".to_string(),
         _ => to_string(&name)?.to_string_lossy(),

@@ -83,9 +83,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let symbol_ctor_value = Value::Function(symbol_ctor);
 
     realm.intrinsics.define(SYMBOL, symbol_ctor_value);
-    realm
-        .intrinsics
-        .define(SYMBOL_PROTO, symbol_proto_value);
+    realm.intrinsics.define(SYMBOL_PROTO, symbol_proto_value);
 
     // 20.4.2.11: Symbol.prototype is non-writable and non-configurable.
     symbol_ctor.define_property(
@@ -129,9 +127,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(key, Value::Function(method));
+        realm.intrinsics.define(key, Value::Function(method));
         symbol_ctor.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -157,9 +153,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             None,
             None,
         )?;
-        realm
-            .intrinsics
-            .define(key, Value::Function(method));
+        realm.intrinsics.define(key, Value::Function(method));
         symbol_proto.define_property(
             &JsString::from_utf8(name),
             &PropertyDescriptor {
@@ -181,10 +175,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
         None,
     )?;
-    realm.intrinsics.define(
-        PROTO_DESCRIPTION,
-        Value::Function(description_getter),
-    );
+    realm
+        .intrinsics
+        .define(PROTO_DESCRIPTION, Value::Function(description_getter));
     symbol_proto.define_property(
         &JsString::from_utf8("description"),
         &PropertyDescriptor {

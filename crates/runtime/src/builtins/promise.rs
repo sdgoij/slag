@@ -184,9 +184,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let promise_ctor_value = Value::Function(promise_ctor);
 
     realm.intrinsics.define(PROMISE, promise_ctor_value);
-    realm
-        .intrinsics
-        .define(PROMISE_PROTO, promise_proto_value);
+    realm.intrinsics.define(PROMISE_PROTO, promise_proto_value);
 
     promise_ctor.define_property(
         &JsString::from_utf8("prototype"),
@@ -479,12 +477,7 @@ fn promise_constructor(
             is_handled: false,
         }),
     );
-    let result = crate::function::call(
-        agent,
-        &executor,
-        Value::Undefined,
-        &[resolve, reject],
-    );
+    let result = crate::function::call(agent, &executor, Value::Undefined, &[resolve, reject]);
     if let Err(error) = result {
         let rejection = error_value(agent, &error);
         crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
@@ -536,14 +529,8 @@ fn promise_then(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
 /// Promise.prototype.catch (spec 27.2.5.5).
 fn promise_catch(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let on_rejected = args.first().cloned().unwrap_or(Value::Undefined);
-    let method =
-        crate::context::get_property(agent, this, &JsString::from_utf8(THEN), *this)?;
-    crate::function::call(
-        agent,
-        &method,
-        *this,
-        &[Value::Undefined, on_rejected],
-    )
+    let method = crate::context::get_property(agent, this, &JsString::from_utf8(THEN), *this)?;
+    crate::function::call(agent, &method, *this, &[Value::Undefined, on_rejected])
 }
 
 /// Promise.prototype.finally (spec 27.2.5.3).
@@ -593,8 +580,7 @@ fn promise_finally_method(
     } else {
         (on_finally, on_finally)
     };
-    let method =
-        crate::context::get_property(agent, this, &JsString::from_utf8(THEN), *this)?;
+    let method = crate::context::get_property(agent, this, &JsString::from_utf8(THEN), *this)?;
     crate::function::call(agent, &method, *this, &[then_finally, catch_finally])
 }
 
@@ -616,8 +602,7 @@ fn dispatch_finally(
         FinallyState::ValueThunk { value } => return Ok(*value),
         FinallyState::Thrower { reason } => {
             return Err(
-                JsError::new(ErrorKind::TypeError, "Uncaught rejection".into())
-                    .with_value(*reason),
+                JsError::new(ErrorKind::TypeError, "Uncaught rejection".into()).with_value(*reason),
             );
         }
     };
@@ -640,8 +625,7 @@ fn dispatch_finally(
     agent
         .promise_finally
         .insert(thunk.id(), Rc::new(RefCell::new(thunk_state)));
-    let then =
-        crate::context::get_property(agent, &promise, &JsString::from_utf8(THEN), promise)?;
+    let then = crate::context::get_property(agent, &promise, &JsString::from_utf8(THEN), promise)?;
     crate::function::call(agent, &then, promise, &[Value::Function(thunk)])
 }
 
@@ -800,18 +784,17 @@ fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         // fulfilled element still counts down correctly (spec step 6.m
         // precedes step 6.n).
         *remaining.borrow_mut() += 1;
-        let next_promise =
-            match crate::function::call(agent, &promise_resolve_fn, *this, &[next]) {
-                Ok(promise) => promise,
-                Err(error) => {
-                    // [[Done]] is still false: IteratorClose (the throw
-                    // completion wins), then reject (spec step 8.a).
-                    let _ = crate::expr::iterator_close_throw(agent, &iterator);
-                    let rejection = error_value(agent, &error);
-                    crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
-                    return Ok(capability.promise);
-                }
-            };
+        let next_promise = match crate::function::call(agent, &promise_resolve_fn, *this, &[next]) {
+            Ok(promise) => promise,
+            Err(error) => {
+                // [[Done]] is still false: IteratorClose (the throw
+                // completion wins), then reject (spec step 8.a).
+                let _ = crate::expr::iterator_close_throw(agent, &iterator);
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+                return Ok(capability.promise);
+            }
+        };
         let closure = Function::create_builtin(
             Some(JsString::from_utf8("")),
             1,
@@ -933,16 +916,15 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
         };
         results.borrow_mut().push(Value::Undefined);
         *remaining.borrow_mut() += 1;
-        let next_promise =
-            match crate::function::call(agent, &promise_resolve_fn, *this, &[next]) {
-                Ok(promise) => promise,
-                Err(error) => {
-                    let _ = crate::expr::iterator_close_throw(agent, &iterator);
-                    let rejection = error_value(agent, &error);
-                    crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
-                    return Ok(capability.promise);
-                }
-            };
+        let next_promise = match crate::function::call(agent, &promise_resolve_fn, *this, &[next]) {
+            Ok(promise) => promise,
+            Err(error) => {
+                let _ = crate::expr::iterator_close_throw(agent, &iterator);
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+                return Ok(capability.promise);
+            }
+        };
         let mut handlers = Vec::new();
         for fulfilled in [true, false] {
             let closure = Function::create_builtin(
@@ -1085,16 +1067,15 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         };
         errors.borrow_mut().push(Value::Undefined);
         *remaining.borrow_mut() += 1;
-        let next_promise =
-            match crate::function::call(agent, &promise_resolve_fn, *this, &[next]) {
-                Ok(promise) => promise,
-                Err(error) => {
-                    let _ = crate::expr::iterator_close_throw(agent, &iterator);
-                    let rejection = error_value(agent, &error);
-                    crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
-                    return Ok(capability.promise);
-                }
-            };
+        let next_promise = match crate::function::call(agent, &promise_resolve_fn, *this, &[next]) {
+            Ok(promise) => promise,
+            Err(error) => {
+                let _ = crate::expr::iterator_close_throw(agent, &iterator);
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+                return Ok(capability.promise);
+            }
+        };
         let closure = Function::create_builtin(
             Some(JsString::from_utf8("")),
             1,
@@ -1196,22 +1177,18 @@ fn promise_race(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                 return Ok(capability.promise);
             }
         };
-        let next_promise =
-            match crate::function::call(agent, &promise_resolve_fn, *this, &[next]) {
-                Ok(promise) => promise,
-                Err(error) => {
-                    let _ = crate::expr::iterator_close_throw(agent, &iterator);
-                    let rejection = error_value(agent, &error);
-                    crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
-                    return Ok(capability.promise);
-                }
-            };
-        if let Err(error) = invoke_then(
-            agent,
-            &next_promise,
-            Some(capability.resolve),
-            Some(reject),
-        ) {
+        let next_promise = match crate::function::call(agent, &promise_resolve_fn, *this, &[next]) {
+            Ok(promise) => promise,
+            Err(error) => {
+                let _ = crate::expr::iterator_close_throw(agent, &iterator);
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+                return Ok(capability.promise);
+            }
+        };
+        if let Err(error) =
+            invoke_then(agent, &next_promise, Some(capability.resolve), Some(reject))
+        {
             let _ = crate::expr::iterator_close_throw(agent, &iterator);
             let rejection = error_value(agent, &error);
             crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
@@ -1326,8 +1303,7 @@ fn species_constructor(agent: &mut Agent, promise: &Value) -> Result<Value, JsEr
     // spec 7.3.21 step 4: read @@species from the constructor (the
     // well-known symbol is shared, so the intrinsic table is not consulted).
     let species_key = PropertyKey::Symbol(crux::symbol::well_known("species"));
-    let species =
-        crate::context::get_property_key(agent, &constructor, &species_key, constructor)?;
+    let species = crate::context::get_property_key(agent, &constructor, &species_key, constructor)?;
     // spec steps 5-7: undefined/null fall back to the default; anything else
     // must be a constructor.
     if matches!(species.kind(), ValueKind::Undefined | ValueKind::Null) {
@@ -1413,10 +1389,7 @@ mod tests {
                 let result = crux::object::JsObject::ordinary_object_create(None);
                 if i < values_clone.len() {
                     index.set(i + 1);
-                    result.create_data_property(
-                        &JsString::from_utf8("value"),
-                        values_clone[i],
-                    )?;
+                    result.create_data_property(&JsString::from_utf8("value"), values_clone[i])?;
                     result.create_data_property(
                         &JsString::from_utf8("done"),
                         Value::Boolean(false),
@@ -1440,9 +1413,7 @@ mod tests {
         let iterator_for_method = iterator;
         iterable
             .define_property_key(
-                &crux::property::PropertyKey::Symbol(
-                    crux::symbol::well_known("iterator")
-                ),
+                &crux::property::PropertyKey::Symbol(crux::symbol::well_known("iterator")),
                 &crux::property::PropertyDescriptor::data(Value::Function(
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),

@@ -163,9 +163,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let bigint_ctor_value = Value::Function(bigint_ctor);
 
     realm.intrinsics.define(BIGINT, bigint_ctor_value);
-    realm
-        .intrinsics
-        .define(BIGINT_PROTO, bigint_proto_value);
+    realm.intrinsics.define(BIGINT_PROTO, bigint_proto_value);
 
     bigint_ctor.define_property(
         &JsString::from_utf8("prototype"),

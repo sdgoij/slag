@@ -105,9 +105,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         None,
     )?;
     let weak_ref_ctor_value = Value::Function(weak_ref_ctor);
-    realm
-        .intrinsics
-        .define(WEAK_REF, weak_ref_ctor_value);
+    realm.intrinsics.define(WEAK_REF, weak_ref_ctor_value);
     realm
         .intrinsics
         .define(WEAK_REF_PROTO, weak_ref_proto_value);
