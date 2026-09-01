@@ -2654,6 +2654,69 @@ script-completion table's segmented shapes; the full sweep (JIT default
 and `--jitless`) at 0 fail / 0 crash / 0 hang, and the `statements/for*`
 cluster clean under `--gc-stress --jitless`.
 
+### Node comparison on the `--jit-bench` suite, JIT and JITless (measured 2026-09-02)
+
+The 2026-08-21 Node comparison predates the bytecode-VM migration and the
+Cranelift JIT; re-measured against node v24.12.0 on the same machine and
+session, in both JIT (default) and interpreter-only (`--jitless`, V8's
+Ignition bytecode interpreter) modes, over the full `--jit-bench` suite
+(12 rows). Harness: `scratch/jit_bench/node_bench.js`, running the exact
+sources. Slag columns are the best of 3 `--jit-bench` process runs (each
+mode = one warmup eval + one timed eval in a fresh context); Node columns
+are the best (steady-state) round of 3 warmup calls + 5 timed calls. All
+four modes agree on every row's completion value (spot-checked
+`buildString full` → 2162678 in all four).
+
+| Benchmark | slag interp | slag jit | node jitless | node jit | interp gap | jit gap |
+|---|---|---|---|---|---|---|
+| arithmetic | 26.2 | 3.3 | 10.2 | 0.58 | 2.6x | 5.7x |
+| property read | 54.5 | 6.9 | 12.4 | 0.32 | 4.4x | 21.8x |
+| string concat | 10.6 | 2.7 | 1.5 | 0.53 | 7.1x | 5.0x |
+| function calls | 6.3 | 1.9 | 1.9 | 0.06 | 3.3x | 32x |
+| global read | 23.2 | 3.8 | 7.8 | 0.32 | 3.0x | 12.1x |
+| compound assign | 19.7 | 2.5 | 1.6 | 0.06 | 12.6x | 41.5x |
+| buildString shape | 180.1 | 54.2 | 53.1 | 8.2 | 3.4x | 6.6x |
+| buildString full | 86.9 | 32.3 | 26.2 | 10.2 | 3.3x | 3.2x |
+| typed-array write | 75.0 | 30.2 | 13.6 | 0.29 | 5.5x | 103x |
+| typed-array length | 59.3 | 11.4 | 16.9 | 0.47 | 3.5x | 24.3x |
+| vector leaf call | 45.0 | 29.7 | 9.5 | 0.12 | 4.8x | 258x |
+| apply leaf call | 20.4 | 18.3 | 6.1 | 2.16 | 3.4x | 8.5x |
+
+(Gaps are slag ÷ node — how many times faster Node is. Times are ms.)
+
+- **Interpreter vs interpreter is the closest picture.** Slag's
+  interpreter trails V8's `--jitless` Ignition by a median ~3.4x (range
+  2.6x–12.6x) — same order of magnitude for a young step-loop VM. The
+  outliers are `compound assign` (12.6x) and `string concat` (7.1x), the
+  shapes where V8's interpreter keeps a fast-path edge Slag's step loop
+  lacks.
+- **JIT vs JIT is the big gap.** Slag's Cranelift JIT trails V8's
+  TurboFan/Sparkplug by a median ~17x (3.2x–258x). The worst rows are the
+  whole-loop-specialization shapes: `vector leaf call` (258x — V8 inlines
+  the 33-arg leaf into the loop and eliminates the dead args; Slag runs
+  its per-iteration leaf-inline probe + register protocol), `typed-array
+  write` (103x — no bounds-check-elided store loop), `compound assign`
+  (41.5x) and `function calls` (32x). The narrowest are the
+  inlined-arithmetic shapes — `buildString full` (3.2x), `string concat`
+  (5.0x), `arithmetic` (5.7x) — where Slag's JIT keeps the hot
+  counter/accumulator register-resident, closest to TurboFan's output.
+- **Slag's JIT roughly matches Node's interpreter-only mode** — parity or
+  better on 6 of 12 rows (`arithmetic` 3.1x faster, `global read` 2.0x,
+  `property read` 1.8x, `typed-array length` 1.5x, and parity on
+  `function calls`/`buildString shape`), trailing 1.2x–3.1x on the rest.
+  This is the realistic "JIT vs a modern interpreter" read.
+- **JIT efficiency over each engine's own interpreter**: Slag 1.1x–8.0x
+  (median ~3.7x); Node 2.6x–82x (median ~25x) — V8's tier-up buys ~7x
+  more, because its interpreter is already fast and TurboFan specializes
+  aggressively (hidden classes, inline caches, callee inlining).
+
+Methodology note: Slag's jit column is slightly pessimistic — the timed
+eval re-parses the snippet and pays a fresh Cranelift compile (~1ms per
+tiny body, see `bench_once`) — while Node is at full tier-up after 3
+warmup calls, so the true JIT gaps are a bit smaller than shown. These
+are micro-benchmarks of the JIT's supported subset, not a workload
+comparison.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
