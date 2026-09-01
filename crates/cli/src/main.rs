@@ -505,6 +505,14 @@ fn run_jit_benchmarks() -> Result<(), u8> {
             "typed-array length",
             "function bench(ta) { var s = 0; for (var k = 0; k < ta.length; k++) { s += ta.length; } return s; } bench(new Uint8Array(800000));",
         ),
+        (
+            "vector leaf call",
+            "function bench(f) { var s = 0; for (var i = 0; i < 200000; i++) { s += f(i, 2, 3, 4, 5, 6, 7, 8, 9); } return s; } bench(function (a, b, c, d, e, g, h, k, l) { return a + 1; });",
+        ),
+        (
+            "apply leaf call",
+            "function bench(f) { var s = 0; var arr = [1, 2, 3, 4, 5, 6, 7, 8, 9]; for (var i = 0; i < 200000; i++) { s += f.apply(null, arr); } return s; } bench(function (a, b, c, d, e, g, h, k, l) { return a + 1; });",
+        ),
     ];
     println!("slag {VERSION} JIT vs interpreter micro-benchmarks");
     println!("(ratio < 1 means the JIT is faster; ~1 means the body did not JIT)");

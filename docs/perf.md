@@ -2296,25 +2296,82 @@ measure 19.5ms / 51.5ms under the default JIT.
   re-running is safe; the wrong-content-type TypeError is thrown by the
   fallback). A/B on the new bench row (3 runs each, alternating order): the
   JIT write row dropped **~59ms → ~51.5ms (~13%)**, non-overlapping spreads.
-- **Discovered divergence gating the `length` fast path.** A typed array
-  CAN carry an own `length` data property — `Object.defineProperty(ta,
-  'length', {value: 1})` succeeds via OrdinaryDefineOwnProperty — and it
-  must shadow the prototype accessor (node reads 1). The interpreter's
-  `get_member_name` typed-array shortcut returns the slots length first, so
-  slag reads 4: a pre-existing divergence test262 does not cover (sweep
-  green). A JIT `view.length` helper must not replicate it; fix the
-  interpreter corner first (the shortcut should skip when the typed array
-  has own properties).
+- **The own-`length` divergence is fixed** (2026-09-01, `58b6763`): a
+  typed array CAN carry an own `length` data property —
+  `Object.defineProperty(ta, 'length', {value: 1})` succeeds via
+  OrdinaryDefineOwnProperty — and it must shadow the prototype accessor
+  (node reads 1), but the interpreter's `get_member_name` typed-array
+  shortcut returned the slots length first (slag read 4). The shortcut is
+  now gated on the absence of an own `length`
+  (`JsObject::has_own_property_atom` — a parse-free vector scan, usually
+  empty; measured ~6% on the JIT length row, within noise), falling
+  through to OrdinaryGet when one exists; a configurable delete restores
+  the accessor. Every read path shares the helper, so the JIT is covered
+  transitively. Verified against node v24.12.0; unit tests cover
+  data/accessor shadowing, redefine, delete, and unrelated own
+  properties; the full sweep is green. The JIT `view.length` helper
+  (below) is now safe to build.
 
 Remaining typed-array levers, in order of expected value:
 
 | lever | current gap vs node | where |
 |---|---|---|
 | `encode_element` stack-buffer variant — the per-element `Vec<u8>` remains in the JIT store row and `typed_array_element_set`; a `[u8; 8]` write-into variant cuts most of the rest | write ~50x | `crux/src/typed_array.rs` + `runtime/src/jit.rs` |
-| JIT `view.length` helper — after the own-`length` divergence fix above, probe IntegerIndexed + length atom → slots length (NaN sentinel → slow) so the compiled loop stops FFI-round-tripping per read | length ~20x | `runtime/src/jit.rs` + `jit/src/compiler.rs` |
+| JIT `view.length` helper — now unblocked (the own-`length` divergence is fixed): probe IntegerIndexed + length atom → slots length (NaN sentinel → slow) so the compiled loop stops FFI-round-tripping per read | length ~20x | `runtime/src/jit.rs` + `jit/src/compiler.rs` |
 | GC slot-arena allocation (GC-5's remaining lever) — `Gc::new` heavier than `Rc::new`; recovers the construct-churn / string-concat ~2x regressions | 2x | `docs/gc-plan.md` |
 | interpreter per-op floor — the 0.7µs bare-loop iteration is ~100x off mainstream; the floor section calls the VM core a real but secondary target | ~100x | `runtime/src/ir.rs` |
-| vector-call leaf inline + `.apply` builtin fast path | — | `docs/jit-report.md` §7 item 7 |
+| the apply floor — see the vector-call/apply section below: the builtin round-trip + per-call arg-list build leave apply-to-leaf at ~1µs/call | ~10x on a 1-elem apply | `runtime/src/builtins/function.rs` |
+
+### Vector-call leaf-inline and the apply/call leaf fast path (measured 2026-09-01)
+
+The last call-step gap from `docs/jit-report.md` §7 item 7 — "a vector
+call to a certified LEAF still runs the general `call_inner`" — is closed,
+and `Function.prototype.apply`/`call` gained the same leaf fast path. New
+`--jit-bench` rows: `vector leaf call` (9-arg leaf, 200K) and
+`apply leaf call`.
+
+- **The interpreter's vector-form call (`Step::Call` — the ≥9-arg or
+  spread form) now leaf-inlines.** `do_call` rebuilt the fast-form layout
+  on the value stack and routed through `do_call_fast`, the same shared
+  core the JIT's `call_vector` helper already used (Cut 50): a
+  certified-leaf callee runs inline on the caller's Vm — no
+  execution-context push, no fresh-Vm round trip. The JIT side was
+  already there; the interpreter's `do_call` was the remaining
+  general-`call_inner` gap. Direct eval, the callable check, and the
+  general path all come from the shared core unchanged (the old handler's
+  special cases deleted). Measured on the new row: **interp 53.2ms →
+  21.3ms (2.5x)**, within 1.25x of the JIT's ~17ms.
+- **`f.apply(this, arr)` / `f.call(this, …)` to a certified leaf run the
+  leaf machinery.** The builtins previously built the arg list and went
+  through `crate::function::call` → `ordinary_call` (the general path —
+  fresh Vm + execution-context push). New `try_leaf_call` runs a
+  certified-leaf callee through `do_call_fast` on a POOLED Vm —
+  register-op (or JIT machine-code) body execution with no context push.
+  It mirrors `fast_call_core`'s leaf gate: a single realm, an EcmaScript
+  function, and a `leaf_lookup` hit — which only ever caches
+  `leaf_inline` bodies (`set_compiled` excludes class constructors and
+  class-field initializers), so `C.apply(null, [])` still throws the
+  "must be called with new" TypeError through the general path. Design
+  notes: it deliberately does NOT route through the running Vm (the
+  caller's `&mut Vm` and an args slice into its stack are live across the
+  native-handler call — mutating it through a raw pointer would be UB),
+  and the pooled Vm is registered as an `ACTIVE_RUNS` entry for the whole
+  leaf window (`with_leaf_run`) so a budget collection inside the body
+  traces its stack exactly like `run_inner` (verified under
+  `--gc-stress`). Measured (A/B, 3 runs each, alternating order): **interp
+  235ms → 208ms (~11%), jit 223ms → 204ms (~8.5%)** on the new row;
+  apply-to-leaf is also ~100ms faster than apply-to-a-non-leaf (315ms),
+  i.e. the callee dispatch is the saved part.
+
+**Remaining apply floor (follow up later).** The apply row is still ~1µs
+per call (208ms/200K) with the leaf callee itself only ~85ns — the floor
+is the builtin round-trip, not the callee: reaching `apply` through the
+general call machinery, `create_list_from_array_like`'s per-call `Vec`
+build (the dense fast path exists but still copies the elements), and the
+pooled-Vm take/return resets. Cutting it needs call-site recognition of
+the `.apply` pattern — inlining `f.apply(a, arr)` as a spread/vector call
+in the compiler (the V8 approach) — a substantially larger slice than the
+leaf-inline here.
 
 ## Deferred milestones
 

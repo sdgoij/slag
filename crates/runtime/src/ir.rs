@@ -2136,6 +2136,27 @@ pub(crate) fn with_jit_run<T>(
     result
 }
 
+/// Root a pooled Vm running a leaf body for the duration of `f` (GC-2):
+/// the builtins' leaf fast path (`apply`/`call`) runs a certified leaf on
+/// a Vm taken from the pool — a buffer its `stack` holds that the precise
+/// tracer cannot see — so a budget collection inside the body must trace
+/// it exactly like `run_inner` would. `vm`/`body` are raw pointers (the
+/// caller owns both for the call; `body` is the leaf's `Rc<CompiledBody>`).
+pub(crate) fn with_leaf_run<T>(vm: *mut Vm, body: *const CompiledBody, f: impl FnOnce() -> T) -> T {
+    ACTIVE_RUNS.with(|stack| {
+        stack.borrow_mut().push(ActiveRun {
+            vm,
+            body,
+            jit_buffer: None,
+        });
+    });
+    let result = f();
+    ACTIVE_RUNS.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+    result
+}
+
 /// The resumable VM state. Saved across suspension by the driver.
 #[derive(Debug)]
 pub struct Vm {
@@ -7602,27 +7623,17 @@ impl Vm {
         // cannot be swept out from under the callee.
         let _stress = StressSuppress::new();
         let args = self.args.split_off(base);
-        if is_eval_function(agent, &callee)? {
-            let source = args.first().cloned().unwrap_or(Value::Undefined);
-            // The `eval` builtin (spec 18.2.1 step 1): a non-string argument
-            // is returned unchanged — only a primitive string is parsed.
-            if !matches!(source.kind(), ValueKind::String(_)) {
-                self.stack.push(source);
-                return Ok(());
-            }
-            let source = crux::convert::to_string(&source)?;
-            let result = crate::script::perform_eval(agent, &source, self.strict, direct_eval)?;
-            self.stack.push(result);
-            return Ok(());
-        }
-        if !is_callable(&callee) {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                format!("{} is not a function", crux::value::type_of(&callee)),
-            ));
-        }
-        let result = crate::function::call_inner(agent, &callee, this, &args)?;
-        self.stack.push(result);
+        let argc = args.len();
+        // Rebuild the fast-form layout and route through the shared core
+        // (mirroring the JIT's `call_vector` helper): a certified-leaf
+        // callee runs inline on this Vm — no execution-context push, no
+        // fresh-Vm round trip. `do_call_fast` handles direct eval, the
+        // callable check, and the general call, replacing the call site
+        // with the result.
+        self.stack.push(this);
+        self.stack.push(callee);
+        self.stack.extend(args);
+        self.do_call_fast(agent, argc, direct_eval)?;
         Ok(())
     }
 

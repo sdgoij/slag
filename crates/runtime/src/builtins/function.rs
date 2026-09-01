@@ -391,7 +391,10 @@ fn apply(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let arg_array = args.get(1).cloned().unwrap_or(Value::Undefined);
     if matches!(arg_array.kind(), ValueKind::Undefined | ValueKind::Null) {
-        return crate::function::call(agent, &func, this_arg, &[]);
+        return match try_leaf_call(agent, &func, this_arg, &[]) {
+            Some(result) => result,
+            None => crate::function::call(agent, &func, this_arg, &[]),
+        };
     }
     // GC-2: the collected argument list sits in a local Vec the stack scan
     // cannot see while the callee (user code) allocates — suppress
@@ -399,7 +402,10 @@ fn apply(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     // out from under the callee's parameter binding.
     let _stress = crate::ir::StressSuppress::new();
     let arg_list = create_list_from_array_like(agent, &arg_array)?;
-    crate::function::call(agent, &func, this_arg, &arg_list)
+    match try_leaf_call(agent, &func, this_arg, &arg_list) {
+        Some(result) => result,
+        None => crate::function::call(agent, &func, this_arg, &arg_list),
+    }
 }
 
 /// Function.prototype.call (spec 20.2.3.4).
@@ -413,7 +419,70 @@ fn call_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     }
     let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let rest = args.get(1..).unwrap_or(&[]);
-    crate::function::call(agent, &func, this_arg, rest)
+    match try_leaf_call(agent, &func, this_arg, rest) {
+        Some(result) => result,
+        None => crate::function::call(agent, &func, this_arg, rest),
+    }
+}
+
+/// The apply/call builtins' leaf fast path: a certified-leaf callee runs
+/// through the leaf machinery on a pooled Vm — the register-op (or JIT)
+/// body execution with no execution-context push, mirroring how the
+/// vector-call steps route a `f(...args)` call through `do_call_fast`.
+/// `None` when the callee is not a leaf-inlineable ES function (the
+/// caller falls back to the general `crate::function::call`).
+fn try_leaf_call(
+    agent: &mut Agent,
+    func: &Value,
+    this_arg: Value,
+    arg_list: &[Value],
+) -> Option<Result<Value, JsError>> {
+    // Mirror `fast_call_core`'s leaf gate: a single realm (the leaf runs
+    // with the current realm), an EcmaScript function, and a warm leaf
+    // cache entry. `leaf_lookup` may populate the cache, so clone the
+    // entry fields before the agent is reborrowed by the run below.
+    if agent.realm_count.get() != 1 {
+        return None;
+    }
+    let ValueKind::Function(function) = func.kind() else {
+        return None;
+    };
+    if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
+        return None;
+    }
+    let entry = agent.leaf_lookup(function.id())?;
+    let entry = crate::ir::LeafEntry {
+        ir: entry.ir.clone(),
+        strict: entry.strict,
+        environment: entry.environment,
+        construct_inline: false,
+    };
+    let Ok(context) = agent.running_context() else {
+        return None;
+    };
+    let env = context.lexical_environment;
+    let mut vm = agent.take_vm(env, entry.strict);
+    // GC-2: the leaf's arguments and result live on this pooled Vm's
+    // stack, which the precise tracer cannot see — register the Vm as an
+    // active run for the whole leaf window (the pushes and the body), so
+    // a budget collection inside the body traces it exactly like
+    // `run_inner`.
+    let result = crate::ir::with_leaf_run(&mut vm, std::rc::Rc::as_ptr(&entry.ir), || {
+        vm.stack.push(this_arg);
+        vm.stack.push(*func);
+        vm.stack.extend_from_slice(arg_list);
+        vm.do_call_fast(agent, arg_list.len(), false)
+    })
+    .and_then(|()| {
+        vm.stack.pop().ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "the leaf call produced no result".into(),
+            )
+        })
+    });
+    agent.return_vm(vm);
+    Some(result)
 }
 
 /// Function.prototype.bind (spec 20.2.3.3).
@@ -655,6 +724,67 @@ mod tests {
         // apply with a non-object argArray is a TypeError.
         errors("(function () {}).apply(null, 'x')");
         errors("Function.prototype.call.call(1)");
+    }
+
+    #[test]
+    fn apply_call_leaf_fast_path_preserves_semantics() {
+        // A certified-leaf callee takes the leaf fast path (apply/call
+        // route through `do_call_fast` on a pooled Vm): the leaf body's
+        // frame binds the argument list exactly like the general call,
+        // including the beyond-`FAST_CALL_MAX_ARGS` count (the vector
+        // form's Vec fallback).
+        assert_eq!(
+            value(
+                "(function (a, b, c, d, e, g, h, k, l) { return a + b + c + d + e + g + h + k + l; }).apply(null, [1, 2, 3, 4, 5, 6, 7, 8, 9])"
+            ),
+            Value::Number(45.0)
+        );
+        assert_eq!(
+            value(
+                "(function (a, b, c, d, e, g, h, k, l) { return a + b + c + d + e + g + h + k + l; }).call(null, 1, 2, 3, 4, 5, 6, 7, 8, 9)"
+            ),
+            Value::Number(45.0)
+        );
+        // Missing arguments stay `undefined` (spec 10.2.11), matching the
+        // general call.
+        assert_eq!(
+            value("(function (a, b) { return a + (b === undefined ? 100 : b); }).apply(null, [1])"),
+            Value::Number(101.0)
+        );
+        // A capturing leaf reads its closure environment through the
+        // fast-path body context.
+        assert_eq!(
+            value(
+                "(function () { var x = 5; return (function (a) { return a + x; }).apply(null, [7]); })()"
+            ),
+            Value::Number(12.0)
+        );
+        // `this` binds through OrdinaryCallBindThis on the leaf path.
+        assert_eq!(
+            value("(function () { return this.x; }).call({ x: 7 })"),
+            Value::Number(7.0)
+        );
+        assert_eq!(
+            value("(function () { 'use strict'; return this; }).apply(3) === 3"),
+            Value::Boolean(true)
+        );
+        // A throwing leaf propagates the error.
+        errors("(function () { throw new RangeError('boom'); }).apply(null, [])");
+        errors("(function (a) { return a.missing.deep; }).apply(null, [null])");
+        // The vector-form call (`f(...)` / ≥9 plain args) takes the same
+        // leaf-inline path on the interpreter.
+        assert_eq!(
+            value(
+                "(function (a, b, c, d, e, g, h, k, l) { return a + l; })(1, 2, 3, 4, 5, 6, 7, 8, 9)"
+            ),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            value(
+                "var f = function (a, b, c, d, e, g, h, k, l) { return a * l; }; f(...[1, 2, 3, 4, 5, 6, 7, 8, 9])"
+            ),
+            Value::Number(9.0)
+        );
     }
 
     #[test]
