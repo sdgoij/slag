@@ -2488,11 +2488,14 @@ The register model now covers the shape:
   member store consumes it — a statement-position update
   (`a[l] = i; l++;`), a prefix form, a read key, or a binary operand
   keeps the body on the step path (where the ordering is preserved).
-- **The loop counter as a store key/value** — `leaf_operand_value` is now
-  `&mut self` and pops the counter (pushed once at `RunRegBody` entry;
-  the single-read guard is unchanged), so `a[l++] = i`'s value reads the
-  loop counter directly instead of round-tripping through the value
-  stack.
+- **The loop counter as a store key/value** — a `RegOperand::Counter`
+  key or value resolves from the dedicated `Vm::loop_counter` field at
+  load time (mirroring `LeafOp::LoadCounter` and the JIT's
+  `counter_bits`). Since Cut 35 slice 21 the register path never pushes
+  the counter onto the value stack at run entry, so the operand must
+  not pop one — the slice-16-style pop read a stale stack slot /
+  `undefined` in the interpreter (the JIT was already reading the
+  field). The single-read guard is unchanged.
 - **The JIT mirrors the operand** — `leaf_operand`'s `PostInc` arm emits
   the `emit_update` fast/slow shape (inline f64 add + `UpdateValueSlow`
   fallback) and writes the slot back, so a compiled body containing the
@@ -2508,6 +2511,53 @@ the register lowering is whole-body and rejects the guard's branch; a
 per-statement register-run segmentation is a listed follow-up. Spec-exact:
 `register_post_inc_member_store_stays_spec_exact` plus the full sweep
 (JIT default) at 0 fail / 0 crash / 0 hang.
+
+### Per-statement register-run segmentation (measured 2026-09-01)
+
+The post-inc lowering was whole-body: a loop body containing any
+control-flow statement (an `if`, a break) rejected the entire body back
+onto the step path, leaving the `buildString shape` row (the `l++` store
+plus an `if (l === 10000)` guard) unlowered. The compiler now segments
+the body's compiled steps into maximal straight-line runs
+(`lower_leaf_ops_segmented`): each run lowers via the shared per-step
+`lower_step` (the whole-body `lower_leaf_ops` became a wrapper over it)
+and is replaced with its own `Step::RunRegBody`, with the branch and
+completion steps between runs staying on the step path
+(`apply_register_runs` re-bases the labels and fixups recorded from the
+body start, and a label landing strictly inside a run keeps the whole
+body unsegmented).
+
+Three soundness constraints the segmentation must honor:
+
+- **The list wrappers stay paired on the step path** — a run must never
+  absorb a `ListBegin`/`ListEnd`: an absorbed `ListBegin` with a
+  step-path `ListEnd` pops the ENCLOSING block's completion entry
+  (nested loops in blocks restored a stale value into the script
+  completion). The run commits at the statement boundary before a
+  wrapper and the wrapper executes on the step path.
+- **A run must not start at a `SetCompletion`** — absorbing a
+  statement's `SetCompletion` without the statement's value-producing
+  steps leaves the statement's result on the stack: a one-slot
+  per-iteration drift in the compiled path, which pre-allocates its
+  working area from `max_stack_usage` (the JIT crashed on
+  `o[i] = i; b['x'] = i` with a Vec-corruption panic).
+- **The register ops' literal values are traced** — a member store's
+  `Const` key string lives in the `RunRegBody` ops; `Step::trace`
+  missed them, so the per-allocation collector swept the box mid-run
+  and the key read back as garbage under `--gc-stress`
+  (`Step::RunRegBody` now walks the ops via `trace_leaf_op_heaps`).
+
+Measured (release `--bench`, medians of 3, A/B against the post-inc
+tree): **`buildString shape` ~193.8ms → ~181.9ms (~6%)** — the `l++`
+store runs as a two-op register body while the guard `if` (condition,
+branch, nested block) runs on the step path. The `indexed store` row is
+unchanged (~45ms under load). Spec-exact: new tests
+`segmented_loop_body_keeps_list_wrappers_balanced`,
+`register_counter_member_operands_stays_spec_exact`, and
+`register_run_ops_are_rooted_under_gc_stress` plus the JIT
+script-completion table's segmented shapes; the full sweep (JIT default
+and `--jitless`) at 0 fail / 0 crash / 0 hang, and the `statements/for*`
+cluster clean under `--gc-stress --jitless`.
 
 ## Deferred milestones
 

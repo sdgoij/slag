@@ -1178,6 +1178,123 @@ mod tests {
     }
 
     #[test]
+    fn register_counter_member_operands_stay_spec_exact() {
+        // The register loop body's counter serves as a member store's value
+        // or key (`a[l++] = i`, `b[j] = j * 10`). Since Cut 35 slice 21 the
+        // counter lives in the dedicated `loop_counter` field, so the
+        // operand reads the field directly — the committed slice-16 entry
+        // pop regressed this in the interpreter (it popped a stale value /
+        // undefined off the value stack). These shapes are certified
+        // scripts, so they run the interpreter's register executor.
+        assert_eq!(
+            value(
+                "var a = []; var l = 0; for (var i = 0; i < 5; i++) { a[l++] = i; } \
+                 l"
+            ),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            value(
+                "var a = []; var l = 0; for (var i = 0; i < 5; i++) { a[l++] = i; } \
+                 a[0] + a[1] + a[2] + a[3] + a[4]"
+            ),
+            Value::Number(10.0)
+        );
+        // A plain slot key with the counter as the value.
+        assert_eq!(
+            value(
+                "var a = []; var m = 0; for (var i = 0; i < 3; i++) { a[m] = i; m += 1; } \
+                 a[0] + a[1] + a[2]"
+            ),
+            Value::Number(3.0)
+        );
+        // The counter as a computed read key.
+        assert_eq!(
+            value(
+                "var a = [10, 20, 30]; var s = 0; for (var i = 0; i < 3; i++) { s += a[i]; } \
+                 s"
+            ),
+            Value::Number(60.0)
+        );
+    }
+
+    #[test]
+    fn segmented_loop_body_keeps_list_wrappers_balanced() {
+        // `lower_leaf_ops_segmented` splits a loop body into register runs
+        // around control-flow statements. The `ListBegin`/`ListEnd` that
+        // wrap the body (and each block) must stay on the step path — an
+        // absorbed `ListBegin` with a step-path `ListEnd` would pop the
+        // ENCLOSING block's completion entry. The engine's established
+        // completion model: a control statement (`for`/`if`) normalizes its
+        // empty completion to `Normal(undefined)` (NormalizeCompletion sets
+        // the register non-empty), so the enclosing block's ListEnd does
+        // NOT restore the running value — each shape below must complete
+        // undefined, exactly like the non-segmented equivalent. The last
+        // shape is the corruption probe: the buggy segmentation restored
+        // the pre-block value `1` here (the loop body's step-path ListEnd
+        // popped the enclosing block's entry on the first iteration).
+        assert_eq!(
+            value("var a = []; var l = 0; 1; { for (var i = 0; i < 2; i++) { a[l++] = i; } }"),
+            Value::Undefined
+        );
+        assert_eq!(
+            value("var a = []; var l = 0; { 1; { for (var i = 0; i < 2; i++) { a[l++] = i; } } }"),
+            Value::Undefined
+        );
+        assert_eq!(
+            value("var a = []; var l = 0; { for (var i = 0; i < 2; i++) { a[l++] = i; } }"),
+            Value::Undefined
+        );
+        assert_eq!(
+            value(
+                "var a = []; var l = 0; 1; \
+                 { for (var i = 0; i < 2; i++) { a[l++] = i; if (i === 1) { } } }"
+            ),
+            Value::Undefined
+        );
+        // The buildString shape: a register store followed by a guard `if`
+        // (with a nested block) stays spec-exact.
+        assert_eq!(
+            value(
+                "var a = []; var l = 0; var c = 0; \
+                 for (var i = 0; i < 20; i++) { a[l++] = i; if (l === 10) { c++; a.length = l = 0; } } \
+                 c + a.length + l"
+            ),
+            Value::Number(2.0)
+        );
+        // The same loop without the array reset: `l` rewinds to 0 at 5, so
+        // the second chunk overwrites indices 0-4 (35 = 5+6+7+8+9) and the
+        // final `l` is 0.
+        assert_eq!(
+            value(
+                "var a = []; var l = 0; \
+                 for (var i = 0; i < 10; i++) { a[l++] = i; if (l === 5) { l = 0; } } \
+                 a[0] + a[1] + a[2] + a[3] + a[4] + l"
+            ),
+            Value::Number(35.0)
+        );
+    }
+
+    #[test]
+    fn register_run_ops_are_rooted_under_gc_stress() {
+        // The register ops' literal values (a member store's `Const` key) are
+        // traced with the compiled body — an unrooted box is swept by the
+        // per-allocation collector mid-run and the key reads back as garbage
+        // (the `b['x'] = i` shape's store landed on a recycled string).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.set_gc_stress(true);
+        let value = agent
+            .run_script(
+                "function f(n) { var o = {}; var b = []; \
+                 for (var i = 0; i < n; i++) { o[i] = i; b['x'] = i; } \
+                 return o[n - 1] + b.x; } f(1000)",
+            )
+            .unwrap_or_else(|e| panic!("gc-stress: {:?} {e}", e.kind));
+        assert_eq!(value.as_number(), Some(1998.0));
+    }
+
+    #[test]
     fn fused_fast_binding_limit_loop_stays_spec_exact() {
         // The fused relational loop test with a fast-binding limit (`i < n`
         // where `n` is a frame slot): the head re-reads the limit every

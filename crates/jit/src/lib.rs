@@ -3942,6 +3942,33 @@ mod tests {
                 Some(3.0),
                 1,
             ),
+            // A segmented loop body (register run + step-path `if`) inside
+            // a block: the loop body's `ListBegin`/`ListEnd` stay on the
+            // step path (the register run must not absorb one), and the
+            // completion matches the non-segmented model (a control
+            // statement normalizes its empty completion to undefined, so
+            // the block's ListEnd does not restore the pre-block value).
+            (
+                "var a = []; var l = 0; 1; { for (var i = 0; i < 2; i++) { a[l++] = i; } }",
+                None,
+                1,
+            ),
+            (
+                "var a = []; var l = 0; { 1; { for (var i = 0; i < 2; i++) { a[l++] = i; } } }",
+                None,
+                1,
+            ),
+            (
+                "var a = []; var l = 0; { for (var i = 0; i < 2; i++) { a[l++] = i; } }",
+                None,
+                1,
+            ),
+            (
+                "var a = []; var l = 0; 1; \
+                 { for (var i = 0; i < 2; i++) { a[l++] = i; if (i === 1) { } } }",
+                None,
+                1,
+            ),
         ];
         for (source, expected, min_compiled) in cases {
             let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("runs"));

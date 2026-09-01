@@ -1017,8 +1017,41 @@ impl Trace for Step {
                     }
                 }
             }
+            // The register ops carry literal values (a `LoadConst`/`BinConst`
+            // constant, a member store/read's `Const` key or value) that the
+            // body must root — an unrooted box is collected under --gc-stress
+            // mid-run (the `b['x'] = i` shape's key string read back as
+            // garbage).
+            Step::RunRegBody { ops } => {
+                for op in ops.iter() {
+                    trace_leaf_op_heaps(op, visit);
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// Trace a register op's literal heap values (the bodies' `RegOperand::Const`
+/// and `LoadConst`/`BinConst` constants — see [`Step::trace`]'s `RunRegBody`
+/// arm).
+fn trace_leaf_op_heaps(op: &LeafOp, visit: &mut dyn FnMut(GcAny)) {
+    let operand = |operand: &RegOperand, visit: &mut dyn FnMut(GcAny)| {
+        if let RegOperand::Const(value) = operand {
+            value.trace(visit);
+        }
+    };
+    match op {
+        LeafOp::LoadConst(value) | LeafOp::BinConst { value, .. } => value.trace(visit),
+        LeafOp::StoreMemberName { value, .. } => operand(value, visit),
+        LeafOp::StoreMemberComputed { key, value } => {
+            operand(key, visit);
+            operand(value, visit);
+        }
+        LeafOp::GetMemberComputed { key, .. } | LeafOp::GetMemberComputedLocal { key, .. } => {
+            operand(key, visit);
+        }
+        _ => {}
     }
 }
 
@@ -1041,9 +1074,9 @@ pub enum LeafOp {
     LoadContext { index: usize },
     /// acc = the leaf's per-iteration slot (depth-0 `LoadPerIteration`).
     LoadPerIter { index: usize },
-    /// acc = the accumulator-loop counter (Cut 35 slice 16: a body's
-    /// `Step::PushAcc` read lowered to a pop — `RunRegBody` pushed the
-    /// saved counter onto the value stack at entry).
+    /// acc = the accumulator-loop counter (Cut 35 slice 16/21: a body's
+    /// `Step::PushAcc` read lowers to a direct read of the dedicated
+    /// `Vm::loop_counter` field — no entry push since slice 21).
     LoadCounter,
     /// acc = value.
     LoadConst(Value),
@@ -8537,11 +8570,12 @@ impl Vm {
                 ErrorKind::SyntaxError,
                 "spilled register operand cannot be re-loaded".into(),
             )),
-            // The counter was pushed onto the value stack at `RunRegBody`
-            // entry; a store's key/value operand pops it (mirroring
-            // `LeafOp::LoadCounter`). At most one read per body, so the pop
-            // is always the counter.
-            RegOperand::Counter => Ok(self.pop()),
+            // The loop counter lives in the dedicated `loop_counter` field
+            // (Cut 35 slice 21: no entry push — the field IS the storage, so
+            // the operand reads it directly, mirroring `LeafOp::LoadCounter`
+            // and the JIT's `counter_bits`). The single-read guard keeps the
+            // shadow stack at most one `Counter`.
+            RegOperand::Counter => Ok(Value::Number(self.loop_counter)),
         }
     }
 
@@ -13201,6 +13235,92 @@ impl Compiler {
         Ok(())
     }
 
+    /// The step index a `Fixup` patches (the first field of every variant).
+    fn fixup_index(fixup: &mut Fixup) -> &mut usize {
+        match fixup {
+            Fixup::Jump(index, _)
+            | Fixup::JumpIfFalse(index, _)
+            | Fixup::JumpIfTrue(index, _)
+            | Fixup::JumpIfFalseKeep(index, _)
+            | Fixup::JumpIfTrueKeep(index, _)
+            | Fixup::JumpIfNullishKeep(index, _)
+            | Fixup::JumpIfNotNullishKeep(index, _) => index,
+            Fixup::ForOfBoundary(index, _, _) => index,
+            Fixup::AsyncForOfBoundary(index, _, _) => index,
+            Fixup::JumpIfRelImm { index, .. } => index,
+            Fixup::JumpIfRelGlobalImm { index, .. } => index,
+            Fixup::JumpIfRelLimit { index, .. } => index,
+            Fixup::FastLoopHead(index, _, _) => index,
+            Fixup::Break(index, _) => index,
+            Fixup::Continue(index, _) => index,
+            Fixup::JumpIfChainShort(index, _) => index,
+            Fixup::Exit(index, _) => index,
+            Fixup::ForInNext(index, _) => index,
+            Fixup::ForOfNext(index, _) => index,
+            Fixup::ForOfNextBindLocal(index, _) => index,
+            Fixup::DestructureUndef(index, _) => index,
+            Fixup::AsyncForOfNext(index, _) => index,
+            Fixup::SwitchTest(index, _) => index,
+            Fixup::YieldStarNext(index, _) => index,
+            Fixup::YieldStarResume(index, _, _, _) => index,
+            Fixup::AsyncYieldStarNext(index, _) => index,
+            Fixup::AsyncYieldStarInspect(index, _) => index,
+            Fixup::AsyncYieldStarResume(index, _, _, _) => index,
+        }
+    }
+
+    /// Replace the segmented straight-line runs of a compiled body (offsets
+    /// into `steps[base..]`) with `RunRegBody` steps and re-base the labels
+    /// and the fixups recorded from `base` onward (the collapse shifts the
+    /// remaining steps). A label placed strictly inside a run would lose its
+    /// target to the collapse, so the body stays unsegmented then.
+    fn apply_register_runs(
+        &mut self,
+        base: usize,
+        body_fixups: usize,
+        runs: Vec<(usize, usize, Box<[LeafOp]>)>,
+    ) {
+        if runs.is_empty() {
+            return;
+        }
+        let runs: Vec<(usize, usize, Box<[LeafOp]>)> = runs
+            .into_iter()
+            .map(|(start, end, ops)| (start + base, end + base, ops))
+            .collect();
+        // A jump target (a label) strictly inside a run cannot be patched to
+        // the middle of a register body — keep the whole body on the step
+        // path.
+        if self.labels.values().any(|&label| {
+            runs.iter()
+                .any(|(start, end, _)| *start < label && label < *end)
+        }) {
+            return;
+        }
+        // The number of steps each run absorbs, and the cumulative absorbed
+        // count before a position (runs are disjoint, in order).
+        let absorbed_at = |pos: usize| {
+            runs.iter()
+                .filter(|(_, end, _)| *end <= pos)
+                .map(|(start, end, _)| end - start - 1)
+                .sum::<usize>()
+        };
+        // Collapse each run from the end backwards (the earlier offsets stay
+        // valid during the splices).
+        for (start, end, ops) in runs.iter().rev() {
+            let step = Step::RunRegBody { ops: ops.clone() };
+            self.steps.splice(*start..*end, std::iter::once(step));
+        }
+        // Re-base the labels (step indices) and the body's fixup step
+        // indices by the absorbed count before each.
+        for label in self.labels.values_mut() {
+            *label -= absorbed_at(*label);
+        }
+        for fixup in &mut self.fixups[body_fixups..] {
+            let index = Self::fixup_index(fixup);
+            *index -= absorbed_at(*index);
+        }
+    }
+
     fn compile_for(
         &mut self,
         init: Option<&ForInit>,
@@ -13479,17 +13599,13 @@ impl Compiler {
                         // Cut 35 slice 9: a body that lowers to register ops
                         // runs on the register executor in one dispatch
                         // (`RunRegBody` saves/restores the accumulator
-                        // counter). `lower_leaf_ops` rejects any jump/
-                        // env/control step, so a break/continue/with/etc.
-                        // keeps the step path.
-                        if let Some(ops) = self
-                            .scope
-                            .as_ref()
-                            .and_then(|scope| lower_leaf_ops(&self.steps[body_steps..], scope))
-                        {
-                            self.steps.truncate(body_steps);
-                            self.fixups.truncate(body_fixups);
-                            self.emit(Step::RunRegBody { ops });
+                        // counter). `lower_leaf_ops_segmented` splits the
+                        // body into maximal straight-line runs, so a
+                        // control-flow statement (an `if`, a break) keeps
+                        // the surrounding statements on the register path.
+                        if let Some(scope) = self.scope.as_ref() {
+                            let runs = lower_leaf_ops_segmented(&self.steps[body_steps..], scope);
+                            self.apply_register_runs(body_steps, body_fixups, runs);
                         }
                         self.acc_binding = saved;
                         self.place(continue_label);
@@ -13730,21 +13846,13 @@ impl Compiler {
         self.compile_statement(body)?;
         // Cut 35 slice 9: a body that lowers to register ops runs on the
         // register executor in one dispatch (`RunRegBody` saves/restores
-        // the enclosing accumulator-loop counter). `lower_leaf_ops` rejects
-        // any jump/env/control step, so a break/continue/etc. keeps the
-        // step path.
-        if let Some(ops) = self
-            .scope
-            .as_ref()
-            .and_then(|scope| lower_leaf_ops(&self.steps[body_steps..], scope))
-        {
-            // Cut 35 slice 16: a body that reads the counter (a `PushAcc`)
-            // lowers to a `LoadCounter` that reads the dedicated
-            // `loop_counter` field directly (no entry push since Cut 35
-            // slice 21).
-            self.steps.truncate(body_steps);
-            self.fixups.truncate(body_fixups);
-            self.emit(Step::RunRegBody { ops });
+        // the enclosing accumulator-loop counter). `lower_leaf_ops_segmented`
+        // splits the body into maximal straight-line runs, so a
+        // control-flow statement (an `if`, a break/continue) keeps the
+        // surrounding statements on the register path.
+        if let Some(scope) = self.scope.as_ref() {
+            let runs = lower_leaf_ops_segmented(&self.steps[body_steps..], scope);
+            self.apply_register_runs(body_steps, body_fixups, runs);
         }
         self.place(continue_label);
         if lexical && captured {
@@ -16836,9 +16944,10 @@ pub enum RegOperand {
     /// slice 10): it is consumed by `BinAccPop`'s pop, not by any load.
     Spilled,
     /// The accumulator-loop counter (Cut 35 slice 16): the body read it
-    /// via `Step::PushAcc`; `RunRegBody` pushed it onto the value stack at
-    /// entry, and a `LoadCounter` pops it. At most one read per body (the
-    /// counter is pushed once).
+    /// via `Step::PushAcc`; a `LoadCounter` (or a member op's operand
+    /// resolution) reads the dedicated `Vm::loop_counter` field directly —
+    /// no stack round-trip since slice 21. At most one read per run (the
+    /// lowering allows a single `PushAcc` per `RunRegBody`).
     Counter,
     Reg {
         slot: usize,
@@ -16908,7 +17017,7 @@ fn load_operand(ops: &mut Vec<LeafOp>, operand: RegOperand) -> bool {
         // A spilled value sits on the value stack; only `BinAccPop` can
         // bring it back.
         RegOperand::Spilled => false,
-        // The counter was pushed by `RunRegBody`; `LoadCounter` pops it.
+        // The counter lives in the dedicated field; `LoadCounter` reads it.
         RegOperand::Counter => {
             ops.push(LeafOp::LoadCounter);
             true
@@ -16935,310 +17044,419 @@ fn spill_live_acc(ops: &mut Vec<LeafOp>, stack: &mut [RegOperand]) {
 /// statement stores feeding a final `return`, and the per-iteration/context
 /// reads of the closure bench. The `tdz` bits are precomputed from the scope
 /// layout so the executor skips the check for plain `var`/param slots.
+/// Lower one step into a register-op stream. `index`/`total` locate the
+/// step for the `Return`-is-last rule, `scope` resolves the TDZ flags.
+/// Returns `None` (the step stays on the step path) when the step has no
+/// register form. The state may be partially mutated on rejection — the
+/// callers discard it (the whole body, or the uncommitted run tail).
+fn lower_step(
+    step: &Step,
+    index: usize,
+    total: usize,
+    scope: &ScopeInfo,
+    ops: &mut Vec<LeafOp>,
+    stack: &mut Vec<RegOperand>,
+    counter_reads: &mut usize,
+) -> Option<()> {
+    match step {
+        Step::Push(value) => stack.push(RegOperand::Const(*value)),
+        Step::PushAcc => {
+            if *counter_reads > 0 {
+                return None;
+            }
+            *counter_reads += 1;
+            stack.push(RegOperand::Counter);
+        }
+        Step::LoadLocal { slot } => {
+            let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
+            stack.push(RegOperand::Reg { slot: *slot, tdz });
+        }
+        Step::LoadContextSlot { depth: 0, index } => {
+            stack.push(RegOperand::Ctx { index: *index });
+        }
+        Step::LoadPerIteration { depth: 0, index } => {
+            stack.push(RegOperand::PerIter { index: *index });
+        }
+        Step::Binary(op) => {
+            let right = stack.pop()?;
+            let left = stack.pop()?;
+            if matches!(right, RegOperand::Acc) {
+                // The right operand is the accumulator's live value. A
+                // spilled left operand combines by popping it back
+                // (`BinAccPop`); a frame-slot left operand reads the
+                // slot at the combine (`BinLeftReg`) — safe only for
+                // `tdz=false` slots, since the slot is read after the
+                // accumulator value was computed (a member read's
+                // getters cannot reach the body's own frame slots, and
+                // the accepted shapes write no slot between the load
+                // and the combine). Anything else (a second computed
+                // value, a captured/constant left) cannot be held.
+                match left {
+                    RegOperand::Spilled => ops.push(LeafOp::BinAccPop { op: *op }),
+                    RegOperand::Reg { slot, tdz: false } => {
+                        ops.push(LeafOp::BinLeftReg { op: *op, slot })
+                    }
+                    _ => return None,
+                }
+                stack.push(RegOperand::Acc);
+            } else {
+                match (left, right) {
+                    // Cut 35 slice 14: a captured left with a
+                    // frame-slot right fuses into one op (the
+                    // `(y) => x + y` leaf: `LoadContext` + `BinReg` —
+                    // the env walk and the slot read have no side
+                    // effects between them, so the order is unchanged).
+                    (RegOperand::Ctx { index }, RegOperand::Reg { slot, tdz }) => {
+                        ops.push(LeafOp::BinCtxReg {
+                            op: *op,
+                            index,
+                            slot,
+                            tdz,
+                        });
+                        stack.push(RegOperand::Acc);
+                    }
+                    (left, right) => {
+                        if !load_operand(ops, left) {
+                            return None;
+                        }
+                        match right {
+                            RegOperand::Reg { slot, tdz } => {
+                                ops.push(LeafOp::BinReg { op: *op, slot, tdz });
+                            }
+                            RegOperand::Ctx { index } => {
+                                ops.push(LeafOp::BinContext { op: *op, index });
+                            }
+                            RegOperand::PerIter { index } => {
+                                ops.push(LeafOp::BinPerIter { op: *op, index });
+                            }
+                            RegOperand::Const(value) => {
+                                ops.push(LeafOp::BinConst { op: *op, value });
+                            }
+                            // A computed, spilled, or counter right
+                            // operand cannot be held while the left
+                            // operand loads into the accumulator.
+                            RegOperand::Acc
+                            | RegOperand::Spilled
+                            | RegOperand::Counter
+                            | RegOperand::PostInc { .. } => {
+                                return None;
+                            }
+                        }
+                        stack.push(RegOperand::Acc);
+                    }
+                }
+            }
+        }
+        Step::BinaryImm { op, imm } => {
+            let left = stack.pop()?;
+            match left {
+                RegOperand::Reg { slot, tdz } => {
+                    // Cut 35 slice 14: a frame-slot left fuses into the
+                    // immediate binary (the `return x + 1` leaf: one
+                    // dispatch, skipping the load).
+                    ops.push(LeafOp::BinImmLocal {
+                        op: *op,
+                        slot,
+                        tdz,
+                        imm: *imm,
+                    });
+                }
+                left => {
+                    if !load_operand(ops, left) {
+                        return None;
+                    }
+                    ops.push(LeafOp::BinImm { op: *op, imm: *imm });
+                }
+            }
+            stack.push(RegOperand::Acc);
+        }
+        Step::UpdateLocal { slot, op, prefix } => {
+            // A post-increment key (`a[l++] = v`): the operand loads the
+            // slot and writes the update back at load time. A prefix
+            // form (`++l`) yields the new value — no register shape; a
+            // statement-position update (`a[l] = i; l++;`) leaves the
+            // operand unconsumed, so the end-of-body stack check keeps
+            // it on the step path (the write-back must not be lost).
+            if *prefix {
+                return None;
+            }
+            let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
+            stack.push(RegOperand::PostInc {
+                slot: *slot,
+                tdz,
+                op: *op,
+            });
+        }
+        Step::StoreLocal { slot } | Step::FusedStoreLocal { slot } => {
+            let value = stack.pop()?;
+            if !load_operand(ops, value) {
+                return None;
+            }
+            let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
+            ops.push(LeafOp::StoreReg { slot: *slot, tdz });
+        }
+        Step::InitLocal { slot } => {
+            let value = stack.pop()?;
+            if !load_operand(ops, value) {
+                return None;
+            }
+            ops.push(LeafOp::StoreReg {
+                slot: *slot,
+                tdz: false,
+            });
+        }
+        Step::AssignMemberName {
+            name,
+            op: AssignOp::Assign,
+        } => {
+            // `this.x = x` / `o.x = v` (plain `=` only; compound stays on
+            // the step path): the object is the accumulator, the value a
+            // direct operand. A computed value (`Acc` — from a binary
+            // like `this.y = a + b`) cannot be held while the object
+            // load overwrites the accumulator — the same restriction as
+            // the binary ops' right operand.
+            let value = stack.pop()?;
+            let object = stack.pop()?;
+            // A `PostInc` value would run the write-back after the
+            // nullish check, inverting the step path's order (`l++`
+            // evaluates before [[Set]] throws on a nullish receiver) —
+            // keep it on the step path.
+            if matches!(
+                value,
+                RegOperand::Acc
+                    | RegOperand::Spilled
+                    | RegOperand::Counter
+                    | RegOperand::PostInc { .. }
+            ) {
+                return None;
+            }
+            if !load_operand(ops, object) {
+                return None;
+            }
+            ops.push(LeafOp::StoreMemberName { name: *name, value });
+        }
+        Step::AssignMemberComputed {
+            op: AssignOp::Assign,
+        } => {
+            // `o[k] = v` (plain `=` only; compound stays on the step
+            // path): the object is the accumulator, the key and value
+            // direct operands. A computed key or value (`Acc`) cannot be
+            // held while the object load overwrites the accumulator.
+            let value = stack.pop()?;
+            let key = stack.pop()?;
+            let object = stack.pop()?;
+            // A computed key or value (`Acc`) cannot be held while the
+            // object load overwrites the accumulator. A `Counter` (the
+            // single per-run loop-counter read, resolved from the dedicated
+            // field) and a `PostInc` key (the write-back happens at load
+            // time, before the store's nullish check — matching JS
+            // evaluation order) are direct operands.
+            if matches!(key, RegOperand::Acc | RegOperand::Spilled)
+                || matches!(value, RegOperand::Acc | RegOperand::Spilled)
+            {
+                return None;
+            }
+            if !load_operand(ops, object) {
+                return None;
+            }
+            ops.push(LeafOp::StoreMemberComputed { key, value });
+        }
+        Step::GetMemberName { name } => {
+            // `o.x` (in value position): a frame-slot object fuses the
+            // load into the read (`GetMemberNameLocal`, one dispatch);
+            // any other object loads into the accumulator first. A live
+            // accumulator below the object (the `o.a + o.b` shape) is
+            // spilled so the read can overwrite it.
+            let object = stack.pop()?;
+            match object {
+                RegOperand::Reg { slot, tdz } => {
+                    spill_live_acc(ops, stack);
+                    ops.push(LeafOp::GetMemberNameLocal {
+                        object_slot: slot,
+                        tdz,
+                        name: *name,
+                    });
+                }
+                object => {
+                    if !matches!(object, RegOperand::Acc) {
+                        spill_live_acc(ops, stack);
+                    }
+                    if !load_operand(ops, object) {
+                        return None;
+                    }
+                    ops.push(LeafOp::GetMemberName { name: *name });
+                }
+            }
+            stack.push(RegOperand::Acc);
+        }
+        Step::GetMemberComputed => {
+            // `o[k]`: a frame-slot object fuses the load into the read
+            // (`GetMemberComputedLocal`, one dispatch). Any other object
+            // loads into the accumulator first, so a computed key cannot
+            // be held then; a spilled key cannot be re-read; and a live
+            // accumulator below the object is spilled before the load.
+            // (An `Acc` key is rejected even in the fused form: with a
+            // live accumulator below it, the spill would push the key,
+            // not the live value.)
+            let key = stack.pop()?;
+            let object = stack.pop()?;
+            if matches!(
+                key,
+                RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
+            ) {
+                return None;
+            }
+            match object {
+                RegOperand::Reg { slot, tdz } => {
+                    spill_live_acc(ops, stack);
+                    ops.push(LeafOp::GetMemberComputedLocal {
+                        object_slot: slot,
+                        tdz,
+                        key,
+                    });
+                }
+                object => {
+                    if !matches!(object, RegOperand::Acc) {
+                        spill_live_acc(ops, stack);
+                    }
+                    if !load_operand(ops, object) {
+                        return None;
+                    }
+                    ops.push(LeafOp::GetMemberComputed { key });
+                }
+            }
+            stack.push(RegOperand::Acc);
+        }
+        // A statement's completion is only read at the body's end, where
+        // the register path's `Empty` maps identically to the step path's
+        // `Normal` for leaf calls and constructs — nothing to emit. The
+        // statement-list and reset/normalize wrappers (a block body, a
+        // loop body) carry no values, so they are skipped too.
+        Step::SetCompletion
+        | Step::ListBegin
+        | Step::ListEnd
+        | Step::ResetCompletion
+        | Step::NormalizeCompletion => {}
+        Step::Return => {
+            // A leaf body's `return` is its last statement; dead code
+            // after it (hoisted-var initializers) keeps the step path.
+            if index + 1 != total {
+                return None;
+            }
+            let value = stack.pop()?;
+            if !load_operand(ops, value) {
+                return None;
+            }
+            ops.push(LeafOp::ReturnAcc);
+            if !stack.is_empty() {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Segment a step slice into maximal straight-line register runs. Each run
+/// starts at an empty shadow stack and closes at the last statement
+/// boundary (a `SetCompletion`, or the slice end) where the shadow is empty
+/// and a meaningful op was emitted — a non-lowerable step (a jump, an env
+/// step, a prefix update, a statement-position update whose write-back is
+/// never consumed) closes the run at the previous boundary and stays on the
+/// step path. The list wrappers (`ListBegin`/`ListEnd`) are never absorbed
+/// into a run: they push/pop the completion state on the step path, so a
+/// run absorbing the `ListBegin` while the step path runs its `ListEnd`
+/// would pop the ENCLOSING list's entry. Returns the `(start, end, ops)`
+/// runs (offsets into `steps`, in order) to replace with `Step::RunRegBody`;
+/// the remaining steps run on the step path.
+fn lower_leaf_ops_segmented(
+    steps: &[Step],
+    scope: &ScopeInfo,
+) -> Vec<(usize, usize, Box<[LeafOp]>)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < steps.len() {
+        // A leading list wrapper or `SetCompletion` stays on the step path
+        // (see the inner loop) — a run never spans a list wrapper, and a run
+        // must not absorb a `SetCompletion` whose statement's steps are NOT
+        // in the run (the statement's value would stay on the stack — a
+        // per-iteration drift in the compiled path, which pre-allocates its
+        // working area from `max_stack_usage`).
+        if matches!(
+            steps[i],
+            Step::ListBegin | Step::ListEnd | Step::SetCompletion
+        ) {
+            i += 1;
+            continue;
+        }
+        let mut ops = Vec::new();
+        let mut stack: Vec<RegOperand> = Vec::new();
+        // Cut 35 slice 16/21: at most one counter read per run (the counter
+        // lives in the dedicated field; the single-read guard keeps the
+        // shadow stack at most one `Counter`).
+        let mut counter_reads = 0;
+        let run_start = i;
+        // The last (exclusive end, ops length) where the run is committed:
+        // the shadow is empty, a meaningful op exists, and the boundary is a
+        // statement end.
+        let mut commit: Option<(usize, usize)> = None;
+        while i < steps.len() {
+            // `ListBegin` pushes the completion state and `ListEnd` pops it
+            // on the step path — a run must end before one so the pair
+            // stays balanced (the register path discards the completion it
+            // would restore, so a step-path `ListEnd` must still pop what
+            // its step-path `ListBegin` pushed).
+            if matches!(steps[i], Step::ListBegin | Step::ListEnd) {
+                break;
+            }
+            if lower_step(
+                &steps[i],
+                i,
+                steps.len(),
+                scope,
+                &mut ops,
+                &mut stack,
+                &mut counter_reads,
+            )
+            .is_none()
+            {
+                break;
+            }
+            if stack.is_empty()
+                && !ops.is_empty()
+                && (i == steps.len() - 1 || matches!(steps[i], Step::SetCompletion))
+            {
+                commit = Some((i + 1, ops.len()));
+            }
+            i += 1;
+        }
+        if let Some((end, ops_len)) = commit {
+            runs.push((run_start, end, ops[..ops_len].to_vec().into_boxed_slice()));
+            i = end;
+        } else {
+            i = run_start + 1;
+        }
+    }
+    runs
+}
+
 fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
     let mut ops = Vec::new();
     let mut stack: Vec<RegOperand> = Vec::new();
-    // Cut 35 slice 16: at most one accumulator-loop counter read per body
-    // (`RunRegBody` pushes the counter once; a second `LoadCounter` would
-    // pop past it).
+    // Cut 35 slice 16/21: at most one accumulator-loop counter read per
+    // body (the counter lives in the dedicated field; a second `PushAcc`
+    // would push a second `Counter` onto the shadow stack).
     let mut counter_reads = 0;
     for (index, step) in steps.iter().enumerate() {
-        match step {
-            Step::Push(value) => stack.push(RegOperand::Const(*value)),
-            Step::PushAcc => {
-                if counter_reads > 0 {
-                    return None;
-                }
-                counter_reads += 1;
-                stack.push(RegOperand::Counter);
-            }
-            Step::LoadLocal { slot } => {
-                let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
-                stack.push(RegOperand::Reg { slot: *slot, tdz });
-            }
-            Step::LoadContextSlot { depth: 0, index } => {
-                stack.push(RegOperand::Ctx { index: *index });
-            }
-            Step::LoadPerIteration { depth: 0, index } => {
-                stack.push(RegOperand::PerIter { index: *index });
-            }
-            Step::Binary(op) => {
-                let right = stack.pop()?;
-                let left = stack.pop()?;
-                if matches!(right, RegOperand::Acc) {
-                    // The right operand is the accumulator's live value. A
-                    // spilled left operand combines by popping it back
-                    // (`BinAccPop`); a frame-slot left operand reads the
-                    // slot at the combine (`BinLeftReg`) — safe only for
-                    // `tdz=false` slots, since the slot is read after the
-                    // accumulator value was computed (a member read's
-                    // getters cannot reach the body's own frame slots, and
-                    // the accepted shapes write no slot between the load
-                    // and the combine). Anything else (a second computed
-                    // value, a captured/constant left) cannot be held.
-                    match left {
-                        RegOperand::Spilled => ops.push(LeafOp::BinAccPop { op: *op }),
-                        RegOperand::Reg { slot, tdz: false } => {
-                            ops.push(LeafOp::BinLeftReg { op: *op, slot })
-                        }
-                        _ => return None,
-                    }
-                    stack.push(RegOperand::Acc);
-                } else {
-                    match (left, right) {
-                        // Cut 35 slice 14: a captured left with a
-                        // frame-slot right fuses into one op (the
-                        // `(y) => x + y` leaf: `LoadContext` + `BinReg` —
-                        // the env walk and the slot read have no side
-                        // effects between them, so the order is unchanged).
-                        (RegOperand::Ctx { index }, RegOperand::Reg { slot, tdz }) => {
-                            ops.push(LeafOp::BinCtxReg {
-                                op: *op,
-                                index,
-                                slot,
-                                tdz,
-                            });
-                            stack.push(RegOperand::Acc);
-                        }
-                        (left, right) => {
-                            if !load_operand(&mut ops, left) {
-                                return None;
-                            }
-                            match right {
-                                RegOperand::Reg { slot, tdz } => {
-                                    ops.push(LeafOp::BinReg { op: *op, slot, tdz });
-                                }
-                                RegOperand::Ctx { index } => {
-                                    ops.push(LeafOp::BinContext { op: *op, index });
-                                }
-                                RegOperand::PerIter { index } => {
-                                    ops.push(LeafOp::BinPerIter { op: *op, index });
-                                }
-                                RegOperand::Const(value) => {
-                                    ops.push(LeafOp::BinConst { op: *op, value });
-                                }
-                                // A computed, spilled, or counter right
-                                // operand cannot be held while the left
-                                // operand loads into the accumulator.
-                                RegOperand::Acc
-                                | RegOperand::Spilled
-                                | RegOperand::Counter
-                                | RegOperand::PostInc { .. } => {
-                                    return None;
-                                }
-                            }
-                            stack.push(RegOperand::Acc);
-                        }
-                    }
-                }
-            }
-            Step::BinaryImm { op, imm } => {
-                let left = stack.pop()?;
-                match left {
-                    RegOperand::Reg { slot, tdz } => {
-                        // Cut 35 slice 14: a frame-slot left fuses into the
-                        // immediate binary (the `return x + 1` leaf: one
-                        // dispatch, skipping the load).
-                        ops.push(LeafOp::BinImmLocal {
-                            op: *op,
-                            slot,
-                            tdz,
-                            imm: *imm,
-                        });
-                    }
-                    left => {
-                        if !load_operand(&mut ops, left) {
-                            return None;
-                        }
-                        ops.push(LeafOp::BinImm { op: *op, imm: *imm });
-                    }
-                }
-                stack.push(RegOperand::Acc);
-            }
-            Step::UpdateLocal { slot, op, prefix } => {
-                // A post-increment key (`a[l++] = v`): the operand loads the
-                // slot and writes the update back at load time. A prefix
-                // form (`++l`) yields the new value — no register shape; a
-                // statement-position update (`a[l] = i; l++;`) leaves the
-                // operand unconsumed, so the end-of-body stack check keeps
-                // it on the step path (the write-back must not be lost).
-                if *prefix {
-                    return None;
-                }
-                let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
-                stack.push(RegOperand::PostInc {
-                    slot: *slot,
-                    tdz,
-                    op: *op,
-                });
-            }
-            Step::StoreLocal { slot } | Step::FusedStoreLocal { slot } => {
-                let value = stack.pop()?;
-                if !load_operand(&mut ops, value) {
-                    return None;
-                }
-                let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
-                ops.push(LeafOp::StoreReg { slot: *slot, tdz });
-            }
-            Step::InitLocal { slot } => {
-                let value = stack.pop()?;
-                if !load_operand(&mut ops, value) {
-                    return None;
-                }
-                ops.push(LeafOp::StoreReg {
-                    slot: *slot,
-                    tdz: false,
-                });
-            }
-            Step::AssignMemberName {
-                name,
-                op: AssignOp::Assign,
-            } => {
-                // `this.x = x` / `o.x = v` (plain `=` only; compound stays on
-                // the step path): the object is the accumulator, the value a
-                // direct operand. A computed value (`Acc` — from a binary
-                // like `this.y = a + b`) cannot be held while the object
-                // load overwrites the accumulator — the same restriction as
-                // the binary ops' right operand.
-                let value = stack.pop()?;
-                let object = stack.pop()?;
-                // A `PostInc` value would run the write-back after the
-                // nullish check, inverting the step path's order (`l++`
-                // evaluates before [[Set]] throws on a nullish receiver) —
-                // keep it on the step path.
-                if matches!(
-                    value,
-                    RegOperand::Acc
-                        | RegOperand::Spilled
-                        | RegOperand::Counter
-                        | RegOperand::PostInc { .. }
-                ) {
-                    return None;
-                }
-                if !load_operand(&mut ops, object) {
-                    return None;
-                }
-                ops.push(LeafOp::StoreMemberName { name: *name, value });
-            }
-            Step::AssignMemberComputed {
-                op: AssignOp::Assign,
-            } => {
-                // `o[k] = v` (plain `=` only; compound stays on the step
-                // path): the object is the accumulator, the key and value
-                // direct operands. A computed key or value (`Acc`) cannot be
-                // held while the object load overwrites the accumulator.
-                let value = stack.pop()?;
-                let key = stack.pop()?;
-                let object = stack.pop()?;
-                // A computed key or value (`Acc`) cannot be held while the
-                // object load overwrites the accumulator. A `Counter` (the
-                // single per-body loop-counter read, pushed at `RunRegBody`
-                // entry) and a `PostInc` key (the write-back happens at load
-                // time, before the store's nullish check — matching JS
-                // evaluation order) are direct operands.
-                if matches!(key, RegOperand::Acc | RegOperand::Spilled)
-                    || matches!(value, RegOperand::Acc | RegOperand::Spilled)
-                {
-                    return None;
-                }
-                if !load_operand(&mut ops, object) {
-                    return None;
-                }
-                ops.push(LeafOp::StoreMemberComputed { key, value });
-            }
-            Step::GetMemberName { name } => {
-                // `o.x` (in value position): a frame-slot object fuses the
-                // load into the read (`GetMemberNameLocal`, one dispatch);
-                // any other object loads into the accumulator first. A live
-                // accumulator below the object (the `o.a + o.b` shape) is
-                // spilled so the read can overwrite it.
-                let object = stack.pop()?;
-                match object {
-                    RegOperand::Reg { slot, tdz } => {
-                        spill_live_acc(&mut ops, &mut stack);
-                        ops.push(LeafOp::GetMemberNameLocal {
-                            object_slot: slot,
-                            tdz,
-                            name: *name,
-                        });
-                    }
-                    object => {
-                        if !matches!(object, RegOperand::Acc) {
-                            spill_live_acc(&mut ops, &mut stack);
-                        }
-                        if !load_operand(&mut ops, object) {
-                            return None;
-                        }
-                        ops.push(LeafOp::GetMemberName { name: *name });
-                    }
-                }
-                stack.push(RegOperand::Acc);
-            }
-            Step::GetMemberComputed => {
-                // `o[k]`: a frame-slot object fuses the load into the read
-                // (`GetMemberComputedLocal`, one dispatch). Any other object
-                // loads into the accumulator first, so a computed key cannot
-                // be held then; a spilled key cannot be re-read; and a live
-                // accumulator below the object is spilled before the load.
-                // (An `Acc` key is rejected even in the fused form: with a
-                // live accumulator below it, the spill would push the key,
-                // not the live value.)
-                let key = stack.pop()?;
-                let object = stack.pop()?;
-                if matches!(
-                    key,
-                    RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
-                ) {
-                    return None;
-                }
-                match object {
-                    RegOperand::Reg { slot, tdz } => {
-                        spill_live_acc(&mut ops, &mut stack);
-                        ops.push(LeafOp::GetMemberComputedLocal {
-                            object_slot: slot,
-                            tdz,
-                            key,
-                        });
-                    }
-                    object => {
-                        if !matches!(object, RegOperand::Acc) {
-                            spill_live_acc(&mut ops, &mut stack);
-                        }
-                        if !load_operand(&mut ops, object) {
-                            return None;
-                        }
-                        ops.push(LeafOp::GetMemberComputed { key });
-                    }
-                }
-                stack.push(RegOperand::Acc);
-            }
-            // A statement's completion is only read at the body's end, where
-            // the register path's `Empty` maps identically to the step path's
-            // `Normal` for leaf calls and constructs — nothing to emit. The
-            // statement-list and reset/normalize wrappers (a block body, a
-            // loop body) carry no values, so they are skipped too.
-            Step::SetCompletion
-            | Step::ListBegin
-            | Step::ListEnd
-            | Step::ResetCompletion
-            | Step::NormalizeCompletion => {}
-            Step::Return => {
-                // A leaf body's `return` is its last statement; dead code
-                // after it (hoisted-var initializers) keeps the step path.
-                if index + 1 != steps.len() {
-                    return None;
-                }
-                let value = stack.pop()?;
-                if !load_operand(&mut ops, value) {
-                    return None;
-                }
-                ops.push(LeafOp::ReturnAcc);
-                if !stack.is_empty() {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
+        lower_step(
+            step,
+            index,
+            steps.len(),
+            scope,
+            &mut ops,
+            &mut stack,
+            &mut counter_reads,
+        )?;
     }
     match ops.last() {
         // A `return` body completes `Return`; a fall-off body (statement
