@@ -1625,21 +1625,21 @@ mod tests {
 
     #[test]
     fn installed_jit_runs_a_vector_self_tail_call() {
-        // Cut 51: a self-tail-call with 17 plain arguments (beyond the fast
+        // Cut 51: a self-tail-call with 33 plain arguments (beyond the fast
         // form's `FAST_CALL_MAX_ARGS` cap) compiles to the vector self-jump
         // — the whole recursive chain runs in ONE machine-code invocation
         // with a bounded native stack.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
-                    "\"use strict\"; (function f(n, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s) { \
-                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s) : \
-                     a + b + c + d + e + g + h + i + j + k + l + m + o + p + q + r + s; \
-                     }(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17));",
+                    "\"use strict\"; (function f(n, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I) { \
+                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I) : \
+                     a + b + c + d + e + g + h + i + j + k + l + m + o + p + q + r + s + t + u + v + w + x + y + z + A + B + C + D + E + F + G + H + I; \
+                     }(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33));",
                 )
                 .expect("runs")
         });
-        assert_eq!(value.as_number(), Some(153.0));
+        assert_eq!(value.as_number(), Some(561.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 
@@ -1763,19 +1763,19 @@ mod tests {
     #[test]
     fn installed_jit_runs_a_declared_vector_self_tail_call() {
         // Cut 51: the checked vector form — a top-level declaration's own
-        // name, 17 plain arguments; the identity check takes the self jump
+        // name, 33 plain arguments; the identity check takes the self jump
         // and the whole chain runs in one machine-code invocation.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
-                    "\"use strict\"; function f(n, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s) { \
-                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s) : \
-                     a + b + c + d + e + g + h + i + j + k + l + m + o + p + q + r + s; \
-                     } f(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17);",
+                    "\"use strict\"; function f(n, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I) { \
+                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I) : \
+                     a + b + c + d + e + g + h + i + j + k + l + m + o + p + q + r + s + t + u + v + w + x + y + z + A + B + C + D + E + F + G + H + I; \
+                     } f(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33);",
                 )
                 .expect("runs")
         });
-        assert_eq!(value.as_number(), Some(153.0));
+        assert_eq!(value.as_number(), Some(561.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 
@@ -2122,14 +2122,14 @@ mod tests {
             agent
                 .run_script(
                     "\"use strict\";\n\
-                     function g(n, a, b, c, d, e, h, k, m, o, p, q, r, s, t, u, v, w) { \
-                       if (n === 0) { return a + b + c + d + e + h + k + m + o + p + q + r + s + t + u + v + w; } \
-                       return g(n - 1, a + 1, b, c, d, e, h, k, m, o, p, q, r, s, t, u, v, w); }\
-                     g(100000, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);",
+                     function g(n, a, b, c, d, e, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I) { \
+                       if (n === 0) { return a + b + c + d + e + h + i + j + k + l + m + o + p + q + r + s + t + u + v + w + x + y + z + A + B + C + D + E + F + G + H + I; } \
+                       return g(n - 1, a + 1, b, c, d, e, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I); }\
+                     g(100000, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);",
                 )
                 .expect("runs")
         });
-        assert_eq!(value.as_number(), Some(100136.0));
+        assert_eq!(value.as_number(), Some(100496.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

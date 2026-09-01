@@ -11517,9 +11517,10 @@ enum Fixup {
 /// `Call`/`TailCall`). The `argc` field is `u8`, and the JIT's in-frame leaf
 /// probe handles any count that fits the working buffer; the two `[Value;
 /// FAST_CALL_MAX_ARGS]` stack buffers (`do_call_apply`, `run_inline_leaf`)
-/// grow with it, so the cap is a stack-size tradeoff (16 is the common
-/// wider-arg leaf ceiling — a 9-arg call is the `--jit-bench` vector row).
-const FAST_CALL_MAX_ARGS: usize = 16;
+/// grow with it, so the cap is a stack-size tradeoff (32 is the common
+/// wider-arg leaf ceiling — the 33-arg `--jit-bench` vector row sits just
+/// above it).
+const FAST_CALL_MAX_ARGS: usize = 32;
 
 #[derive(Debug)]
 enum Scope {

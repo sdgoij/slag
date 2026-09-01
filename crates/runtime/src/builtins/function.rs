@@ -733,9 +733,9 @@ mod tests {
     fn apply_call_leaf_fast_path_preserves_semantics() {
         // A certified-leaf callee takes the leaf fast path (apply/call
         // route through `do_call_fast` on a pooled Vm): the leaf body's
-        // frame binds the argument list exactly like the general call,
-        // including the beyond-`FAST_CALL_MAX_ARGS` count (the vector
-        // form's Vec fallback).
+        // frame binds the argument list exactly like the general call
+        // (a spread argArray still routes through the vector form, whose
+        // beyond-`FAST_CALL_MAX_ARGS` count falls back to a Vec).
         assert_eq!(
             value(
                 "(function (a, b, c, d, e, g, h, k, l) { return a + b + c + d + e + g + h + k + l; }).apply(null, [1, 2, 3, 4, 5, 6, 7, 8, 9])"
@@ -774,8 +774,8 @@ mod tests {
         // A throwing leaf propagates the error.
         errors("(function () { throw new RangeError('boom'); }).apply(null, [])");
         errors("(function (a) { return a.missing.deep; }).apply(null, [null])");
-        // The vector-form call (`f(...)` / ≥9 plain args) takes the same
-        // leaf-inline path on the interpreter.
+        // The vector-form call (`f(...)`) takes the same leaf-inline path
+        // on the interpreter.
         assert_eq!(
             value(
                 "(function (a, b, c, d, e, g, h, k, l) { return a + l; })(1, 2, 3, 4, 5, 6, 7, 8, 9)"
@@ -1070,8 +1070,7 @@ mod tests {
             ),
             Value::Number(123.0)
         );
-        // A 9-arg leaf (the bench shape: argc exceeds FAST_CALL_MAX_ARGS
-        // only in the RESULTING call, which the general path also makes).
+        // A 9-arg leaf (the bench shape).
         assert_eq!(
             value(
                 "var f = function (a, b, c, d, e, g, h, k, m) { return a + 1; }; \
@@ -1137,10 +1136,11 @@ mod tests {
 
     #[test]
     fn wide_fast_form_calls_stay_spec_exact() {
-        // `FAST_CALL_MAX_ARGS` covers plain calls up to 16 arguments (the
-        // 9-arg `--jit-bench` vector row moved to the fast form): the fast
-        // `[this, callee, a1..aN]` layout passes every argument, a 17+-arg
-        // call still takes the vector form, and a spread stays vector.
+        // `FAST_CALL_MAX_ARGS` covers plain calls up to 32 arguments (the
+        // `--jit-bench` vector row moved to 33 args to stay on the vector
+        // form): the fast `[this, callee, a1..aN]` layout passes every
+        // argument, a 33+-arg call still takes the vector form, and a
+        // spread stays vector.
         assert_eq!(
             value(
                 "var f = function (a, b, c, d, e, g, h, k, l) { return a + b + c + d + e + g + h + k + l; }; \
@@ -1159,11 +1159,11 @@ mod tests {
         // The vector form above the cap.
         assert_eq!(
             value(
-                "var f = function (a, b, c, d, e, g, h, k, l, m, n, o, p, q, r, t, u) { \
-                   return a + b + c + d + e + g + h + k + l + m + n + o + p + q + r + t + u; }; \
-                 f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)"
+                "var f = function (a, b, c, d, e, g, h, k, l, m, n, o, p, q, r, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I, J, K) { \
+                   return a + b + c + d + e + g + h + k + l + m + n + o + p + q + r + t + u + v + w + x + y + z + A + B + C + D + E + F + G + H + I + J + K; }; \
+                 f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33)"
             ),
-            Value::Number(153.0)
+            Value::Number(561.0)
         );
         // Missing args stay undefined and the arguments object sees every
         // fast-form argument.

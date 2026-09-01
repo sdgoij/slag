@@ -2466,6 +2466,19 @@ switched to 17 to keep their coverage. Spec-exact: the new
 `wide_fast_form_calls_stay_spec_exact` test plus the full sweep (JIT
 default and `--jitless`) at 0 fail / 0 crash / 0 hang.
 
+**Fast-argument cap raised to 32** (2026-09-02): `FAST_CALL_MAX_ARGS` 16 →
+32 — plain calls with 17-32 arguments now take the fast form too. The
+remaining `vector leaf call` row's 17-arg shape (200K, release, A/B):
+**interp ~28.8ms → ~17.0ms, jit ~21.4ms → ~2.8ms (7.6x)** — the 17-arg
+leaf now runs fully in machine code (the vector form's JIT path ran 18
+helper calls per iteration: `ArgsBase` + 16×`ArgsPush` + `Call`). The
+row was bumped to 33 args so the vector form stays benchmarked (interp
+~44-48ms, jit ~31-32ms); the vector-form JIT tests that used 17-arg
+shapes switched to 33 to keep their coverage. Spec-exact: the
+`wide_fast_form_calls_stay_spec_exact` test now covers the 33-arg
+vector boundary, plus the full sweep (JIT default and `--jitless`) at 0
+fail / 0 crash / 0 hang.
+
 **Prototype-chain member-read cache** (2026-09-01): the remaining
 member-read cost of the apply path — `f.apply`'s `apply` lives on
 `Function.prototype`, so the own-property member cells never serve it and
@@ -2484,6 +2497,35 @@ hit the cache. Spec-exact: the new
 shadowing, link redefinition, accessors run per read, proto replacement,
 `Function.prototype.apply` patching) plus the full sweep (JIT default
 and `--jitless`) at 0 fail / 0 crash / 0 hang.
+
+**The JIT inline prototype-chain probe was implemented and reverted
+(measured regression, 2026-09-01).** The natural follow-up to the cache
+above — the JIT's `emit_member_cell_read` still called the
+`GetMemberName` helper for chain reads (`f.apply`), so a compiled probe
+was added to its slow path: a Function receiver hops through
+`crux::Function.object` to the receiver JsObject, the cell's (id, name,
+receiver generation, link_count) is validated, and the cached links'
+(id, generation) are walked against the LIVE `prototype` fields — a hit
+serves the cached value with no helper call, a miss falls through to
+`GetMemberName` exactly. Soundness mirrors the interpreter (receiver
+generation covers own-property changes; each link's generation covers
+its mutation or a proto replacement; accessors are never cached). A/B
+vs the committed cache (HEAD `2b787ff`, same machine, interleaved 20M
+runs): the probe is **~5-10% SLOWER than the helper** on pure chain
+reads — `o.m` on a prototype 424-440ms → 469-486ms; `f.apply`
+620-638ms → 681-716ms — and the call-dominated `apply leaf call` row
+(200K) did not move (jit ~18.3ms → ~19.0ms, within noise but trending
+worse). The helper's ~13-16 L1 loads are better scheduled by LLVM than
+the raw Cranelift probe, and the call overhead is tiny, so an inline
+probe that duplicates the validation cannot win. Reverted; the
+interp-side cache served inside the helper remains the win. Traps for a
+future attempt: (1) `JsObject` and `MemberChainCell` are repr(Rust),
+NOT `#[repr(C)]` despite the doc comments — `JsObject.id` sits at
+offset 24 and `crux::Function.object` at 96 — `offset_of!`/`size_of!`
+kept the probe consistent, but a stable ABI needs `repr(C)` first; (2)
+to win, a probe must CUT the per-read validation (the link-generation
+walk is the irreducible ~4 loads, the cell fields ~6-9 more), not
+duplicate the helper.
 
 ### The interpreter's `LoadIdent` global fast path, mirroring the JIT's Cut 36 probe (measured 2026-09-01)
 
