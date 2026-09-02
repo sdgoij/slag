@@ -369,12 +369,30 @@ member read of `.apply` (a separate step) plus the per-iteration fill
 copy — the next slice is inlining the member read / skipping the fill on
 a generation-validated repeat.
 
-**Known pre-existing JIT bug (not from this slice, reproduced at
-HEAD):** a compiled body that throws a call error (a non-function
-callee, or a callee body that throws) into its OWN catch inside a loop,
-many iterations (≈200+), panics "a pending JIT error is present" — the
-covered-error dispatch loses the ctx error. Unrelated to M10; noted for
-the try-machinery owner.
+**Known pre-existing JIT bug (reproduced at HEAD, FIXED 2026-09-02):**
+a compiled body that throws a call error (a non-function callee, or a
+callee body that throws) into its OWN catch inside a loop, many
+iterations (≈200+), panicked "a pending JIT error is present" — the
+covered-error dispatch lost the ctx error. Root cause: a helper error
+inside a try leaves the erroring step's operands on the working stack
+(the interpreter's covered error keeps them on its growing Vec — an
+invisible leak, confirmed by instrumentation); the JIT's FIXED buffer
+mirrored the leak, so the machine sp drifted +operands per iteration
+until the writes overran the buffer and corrupted the ctx (measured: sp
++16 bytes per iteration; the ctx sat ~1880 bytes above buf_end, hit
+after ~125 iterations). Fix (Cut 70, JIT): the compiled `EnterTry` saves
+the working-sp per handler, and each catch/finally entry step resets the
+sp to it — the catch/finally regions never read try-body values, so
+resuming at the try-entry depth is unobservable and bounds the buffer.
+Gated off suspension bodies (a resume restores the working region into a
+fresh buffer, so a pre-suspension sp is stale — the async-rejection e2e
+caught that). Validation: 100K-iteration catch/finally loops pass (two
+new e2e tests), the 201-fixture language/statements+expressions try
+cluster passes, and the full language (23721/0/0/0) and built-ins
+(23657 pass / 0 fail / 0 crash / 0 hang) sweeps are at their baselines.
+The interpreter's equivalent Vec-growth leak is documented but
+unchanged (bounded per call; a hot catch loop grows the stack until the
+call returns).
 
 ## 5. Sequencing
 

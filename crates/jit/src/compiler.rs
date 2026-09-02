@@ -599,6 +599,15 @@ struct Lowerer<'a> {
     back_targets: HashSet<usize>,
     frame_var: Variable,
     sp_var: Variable,
+    /// Cut 70: one variable per handler, holding the working-sp at the
+    /// handler's `EnterTry` — a covered error (or a finally route) resumes
+    /// the catch/finally there, discarding the erroring step's dead
+    /// operands (see `emit_step`'s entry reset and the `EnterTry` save).
+    handler_sp_vars: Vec<Variable>,
+    /// Cut 70: handler-entry step index (a `catch.start` or `finally`
+    /// start) → handler index — the dispatch-only blocks whose code must
+    /// reset the working-sp to the saved try-entry sp first.
+    handler_entry_steps: std::collections::HashMap<usize, usize>,
     /// Cut 46: the working-stack base the body started with — the `sp_var`
     /// value at entry, saved so a self-tail-call back edge can reset the
     /// working stack to the fresh-run base before re-entering the body.
@@ -710,6 +719,19 @@ impl<'a> Lowerer<'a> {
         let mut builder = FunctionBuilder::new(func, fctx);
         let frame_var = builder.declare_var(types::I64);
         let sp_var = builder.declare_var(types::I64);
+        // Cut 70: per-handler try-entry sp snapshots (see the struct field).
+        let handler_sp_vars: Vec<Variable> = (0..body.handlers.len())
+            .map(|_| builder.declare_var(types::I64))
+            .collect();
+        let mut handler_entry_steps = std::collections::HashMap::new();
+        for (index, handler) in body.handlers.iter().enumerate() {
+            if let Some(catch) = handler.catch {
+                handler_entry_steps.insert(catch.start, index);
+            }
+            if let Some(finally) = handler.finally {
+                handler_entry_steps.insert(finally, index);
+            }
+        }
         let entry_sp_var = builder.declare_var(types::I64);
         let vm_var = builder.declare_var(types::I64);
         let counter_var = builder.declare_var(types::F64);
@@ -804,6 +826,8 @@ impl<'a> Lowerer<'a> {
             reentry_block: None,
             frame_var,
             sp_var,
+            handler_sp_vars,
+            handler_entry_steps,
             entry_sp_var,
             vm_var,
             counter_var,
@@ -2350,6 +2374,23 @@ impl<'a> Lowerer<'a> {
         // interpreter's ip for this step (the loop-top increment means a
         // step's error/transfer is attributed to `index + 1`).
         self.current_step = index;
+        // Cut 70: a catch/finally entry step resumes at the handler's
+        // try-entry sp (saved at `EnterTry`). A helper error inside the try
+        // leaves the erroring step's operands on the working stack — the
+        // interpreter's covered error keeps them on its growing Vec (an
+        // invisible leak), but the JIT's fixed buffer would overflow as a
+        // hot catch/finally loop drifts +operands per iteration. The catch
+        // and finally regions never read values from the try body, so
+        // resuming at the entry depth is unobservable and bounds the buffer.
+        // Skipped for suspension bodies: a resume restores the working
+        // region into a FRESH buffer, so a pre-suspension try-entry sp (and
+        // every other absolute sp) is stale after the resume.
+        if !self.has_suspension
+            && let Some(handler) = self.handler_entry_steps.get(&index)
+        {
+            let entry = self.builder.use_var(self.handler_sp_vars[*handler]);
+            self.builder.def_var(self.sp_var, entry);
+        }
         match step {
             Step::Push(value) => {
                 let bits = match self.const_value(value) {
@@ -3882,6 +3923,11 @@ impl<'a> Lowerer<'a> {
                 )?;
             }
             Step::EnterTry { handler } => {
+                // Cut 70: snapshot the working-sp at the try entry — a
+                // covered error resumes the catch/finally at this depth
+                // (see the reset at the handler-entry steps).
+                let sp = self.builder.use_var(self.sp_var);
+                self.builder.def_var(self.handler_sp_vars[*handler], sp);
                 let handler_imm = self.builder.ins().iconst(types::I64, *handler as i64);
                 let _res = self.call_slow(self.sig_bool, Helper::EnterTry, &[handler_imm])?;
                 self.fall_through(index);

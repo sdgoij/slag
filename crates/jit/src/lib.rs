@@ -2034,7 +2034,7 @@ mod tests {
                     "var o = {}; Object.setPrototypeOf(o, Function.prototype);\n\
                      function run() {\n\
                        var message = '';\n\
-                       for (var i = 0; i < 5; i++) {\n\
+                       for (var i = 0; i < 5000; i++) {\n\
                          try { o.call(1, 2); } catch (e) { message = e.message; }\n\
                        }\n\
                        return message === 'Call must be called on a function' ? 1 : 0;\n\
@@ -2045,6 +2045,60 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(1.0));
         assert!(compiled >= 1, "{compiled} bodies (run) must compile");
+    }
+
+    #[test]
+    fn installed_jit_caught_call_error_in_a_loop_does_not_drift_the_working_sp() {
+        // Cut 70: a compiled body whose loop throws a call error into its
+        // OWN catch every iteration used to leave the erroring step's
+        // operands on the working stack — the machine sp drifted +operands
+        // per iteration until it overran the fixed buffer and corrupted the
+        // ctx (the "a pending JIT error is present" panic after ~100-200
+        // iterations; reproduced at HEAD). The catch entry now resumes at
+        // the handler's try-entry sp. 100K caught throws must run clean.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function g() { throw 'x'; }\n\
+                     function run() {\n\
+                       var message = '';\n\
+                       for (var i = 0; i < 100000; i++) {\n\
+                         try { g(); } catch (e) { message = e; }\n\
+                       }\n\
+                       return message === 'x' ? 1 : 0;\n\
+                     }\n\
+                     run();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 2, "{compiled} bodies (run + g) must compile");
+    }
+
+    #[test]
+    fn installed_jit_finally_continue_swallowing_loop_errors_does_not_drift() {
+        // Cut 70: the finally-entry reset — a `continue` in a finally
+        // overrides the per-iteration throw (spec 14.15.4 step 8), so the
+        // loop runs with an error routed through the finally every
+        // iteration. Without the reset the erroring operands drifted the sp
+        // the same way the catch shape does.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function g() { throw 'x'; }\n\
+                     function run() {\n\
+                       var count = 0;\n\
+                       for (var i = 0; i < 100000; i++) {\n\
+                         try { g(); } finally { count++; continue; }\n\
+                       }\n\
+                       return count === 100000 ? 1 : 0;\n\
+                     }\n\
+                     run();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 2, "{compiled} bodies (run + g) must compile");
     }
 
     #[test]
