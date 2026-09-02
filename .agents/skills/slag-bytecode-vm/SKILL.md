@@ -525,6 +525,20 @@ restores too).
   Unlabeled breaks/continues stay acc-safe (they land at the loop's own
   end/continue steps, before/at the sync). This is the compile-side
   counterpart of the section-7 leaf exclusion for `Break`/`Continue`.
+- **The M6 hoist's body-read redirect (slice 3) has two hard gates.**
+  A hoisted `for (…; K <op> RECV.length; …)` loop's fast copy lowers
+  body reads of `RECV.length` to `LoadLocal` of the hidden hoist slot
+  (`Compiler.hoisted_length`, set around the fast copy's `compile_for`;
+  `compile_member` → `try_hoisted_length_read`). (1) Match the receiver
+  by RESOLVED binding slot, never by name — a block `let`/`var`
+  shadowing the name resolves to a different slot and must keep the
+  member read. (2) The redirect must be OFF while compiling the
+  guard-miss fallback copy — its hidden slot was never initialized, so
+  a redirected read there would serve garbage. Nested hoists inside the
+  fast copy save/restore the field (the outer redirect resumes after).
+  The redirect is sound only because the probe verified the
+  IntegerIndexed/no-own-`length` receiver and the slice-2 purity (no
+  calls, no RECV writes) makes the length loop-invariant.
 
 ## 13. The loop counter is a raw f64 — the acc-path gates admit only Numbers (Cut 35 slice 22)
 

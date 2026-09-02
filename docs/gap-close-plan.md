@@ -475,6 +475,35 @@ Body-read hoisting (length row 3.2→2.0ms, the last 1.2ms) is M6 slice
 the loop's guard having passed. Validation for each slice: clippy +
 workspace tests + JIT/jitless built-ins sweeps + differential scripts.
 
+**M6 slice 3 status (2026-09-02):** body-read hoisting landed. While
+compiling a hoisted loop's FAST copy (the guard-probe-hit path), a
+member read of the guard-probed receiver's `length` lowers to a plain
+`LoadLocal` of the hidden hoist slot: a new `Compiler` field
+(`hoisted_length: Option<(recv_slot, hoist_slot)>`, set around the fast
+copy's `compile_for`, save/restored so a nested hoist re-establishes
+its own redirect) and a `compile_member` hook
+(`try_hoisted_length_read`) that matches the receiver by RESOLVED slot
+— a shadowing declaration of the name (a block `let`/`var` rebinding)
+resolves to a different slot and keeps the member path, and the
+guard-miss fallback copy compiles with the field `None` (its hidden
+slot is never initialized, so its reads re-run the member machinery).
+The redirect is exact: the probe verified the IntegerIndexed /
+no-own-`length` receiver and the slice-2 body purity (no calls, no RECV
+writes) makes the length loop-invariant, so the per-iteration member
+read and the slot agree. Measured (`--jit-bench`, min-of-3, 800K):
+typed-array length 3.19→**2.02ms** jit (the plan's 2.0ms full-hoist
+ceiling — the last 1.2ms) and 25.3→**16.4ms** interp (the step-level
+transform is shared); the typed-array write row is unchanged (12.4ms —
+its body has no length reads). Validation: clippy clean,
+`cargo test --workspace` green, JIT + jitless language (23721/0/0/0)
+and built-ins (23657/0/0/0) sweeps match baseline (one language-jitless
+batch flake — a computed-property-name fixture with no loop that cannot
+reach the hoist path — passed standalone and did not reproduce on
+re-run); a 10-case differential (row/init reads, own-`length` shadow
+fallback, nested conditionals, Float64, zero-length, alias receiver,
+break body, update reads, element reads) agrees between JIT and the
+interpreter.
+
 ### M7 — Loop unrolling + register quality
 
 `compound assign`'s 41.5x is largely V8 keeping `o` in a register across

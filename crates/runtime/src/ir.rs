@@ -11756,6 +11756,14 @@ struct Compiler {
     /// (the original eligible member shape) must not re-hoist. Nested loops
     /// inside that copy are also suppressed, which is merely conservative.
     hoist_suppressed: bool,
+    /// Gap-close M6 slice 3: while the FAST copy of a hoisted
+    /// `for (…; K <op> RECV.length; …)` loop is being compiled — `(recv_slot,
+    /// hoist_slot)` — the receiver slot the guard probed and the hidden slot
+    /// holding the hoisted length. Body reads of `RECV.length` then lower to
+    /// a plain `LoadLocal` of the hidden slot (the probe hit + the body
+    /// purity make the length loop-invariant). `None` on the guard-miss
+    /// fallback copy, whose hidden slot was never initialized.
+    hoisted_length: Option<(usize, usize)>,
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -13773,8 +13781,15 @@ impl Compiler {
             },
         };
         let done_label = self.new_label();
-        // Fast copy: the fused canonical loop against the hoisted limit.
+        // Fast copy: the fused canonical loop against the hoisted limit, with
+        // the body's `RECV.length` reads lowered to the hidden slot (gap-close
+        // M6 slice 3 — the probe hit + body purity make the length
+        // loop-invariant). Save/restore so a nested hoisted loop inside this
+        // copy re-establishes its own redirect and the outer one resumes.
+        let saved = self.hoisted_length;
+        self.hoisted_length = Some((recv_slot, hoist_slot));
         self.compile_for(init, Some(&fake_test), update, body)?;
+        self.hoisted_length = saved;
         self.jump(done_label);
         // Fallback copy: the original per-iteration member test. Suppress the
         // re-hoist (the test is the same eligible shape) — the suppression
@@ -16365,7 +16380,47 @@ impl Compiler {
         Ok(())
     }
 
+    /// Gap-close M6 slice 3: whether a member read compiles to the hoisted
+    /// length. Inside the fast copy of a hoisted `for (…; K <op> RECV.length;
+    /// …)` loop, a `RECV.length` read whose receiver resolves to the exact
+    /// slot the guard probed lowers to a plain `LoadLocal` of the hidden
+    /// slot — the probe verified the IntegerIndexed/no-own-`length` receiver
+    /// and the loop's body purity (no calls, no RECV writes) makes the length
+    /// loop-invariant, so the per-iteration member read and the slot agree.
+    /// Emits the load and returns true; false leaves the member path to run
+    /// (a shadowing declaration of the name resolves to a different slot and
+    /// must keep the member read).
+    fn try_hoisted_length_read(&mut self, member: &syntax::ast::MemberExpr) -> bool {
+        let Some((recv_slot, hoist_slot)) = self.hoisted_length else {
+            return false;
+        };
+        if member.optional || matches!(member.object.kind, ExprKind::Super) {
+            return false;
+        }
+        let syntax::ast::MemberProperty::Name(prop) = &member.property else {
+            return false;
+        };
+        if *prop != Self::length_atom() {
+            return false;
+        }
+        let mut object = &member.object;
+        while let ExprKind::Paren(inner) = &object.kind {
+            object = inner;
+        }
+        let ExprKind::Ident(name) = &object.kind else {
+            return false;
+        };
+        if !matches!(self.binding(*name), BindingLoc::Slot(slot) if slot == recv_slot) {
+            return false;
+        }
+        self.emit(Step::LoadLocal { slot: hoist_slot });
+        true
+    }
+
     fn compile_member(&mut self, member: &syntax::ast::MemberExpr) -> Result<(), JsError> {
+        if self.try_hoisted_length_read(member) {
+            return Ok(());
+        }
         if matches!(member.object.kind, ExprKind::Super) {
             self.emit(Step::GetSuperBase);
             match &member.property {
