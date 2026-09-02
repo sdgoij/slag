@@ -378,6 +378,93 @@ cheapening. Validation: clippy clean (incl. the workers cfg), `cargo test
 detached/auto/resizable/byte-offset/subarray/SAB length reads and the
 store edge cases) agree between JIT and the interpreter.
 
+**M6 slice 2 design + decomposition (2026-09-02, measured ceilings):**
+the remaining ~8ns/iter is the two loop-invariant `ta.length` reads
+still re-executing per iteration. The full hoist's prize, measured by
+source-hoisting the length into a var (which turns the general loop
+into the fused canonical loop with a `RelLimit::Slot` limit):
+
+| probe (jit, min-of-3) | row | per-iter |
+|---|---|---|
+| `for k < ta.length: s += ta.length` (the row) | 6.6ms | 8.2ns |
+| guard hoisted (`n = ta.length`), body reads `n` | 2.0ms | 2.5ns |
+| guard hoisted, body reads `ta.length` | 3.2ms | 4.0ns |
+| write row (guard only; body = `ta[k] = k & 255`) | 15.5ms | — |
+| write row, guard hoisted | 12.4ms | — |
+
+So the ceiling: length row 6.6→2.0ms (full hoist) or →3.2ms (guard
+only); write row 15.5→12.4ms (guard only — its body has no length
+reads). Design for the slice: a runtime-guarded once-per-loop hoist of
+the loop TEST only (guard-only; body reads stay per-iteration — exact),
+for certified `for (var K = INIT; K <op> RECV.length; K++)` loops where
+RECV is a frame-slot binding never assigned in the loop and the
+body/update are "length-pure" (no explicit calls — nothing can detach/
+resize/define-`length` — and no member access except `RECV.length`
+reads and `RECV[expr] = v` element stores, which cannot change the
+accessor-served length; other receivers could alias RECV through a
+global, so they are excluded).
+
+Emission shape (per hoisted loop): a guard evaluates `RECV.length` ONCE
+via the probe semantics (IntegerIndexed + no own `length` — the exact
+fixed FFI probe / slice-1 machine gate) into a NEW lazily-allocated
+hidden frame slot (`Compiler.scope` is OWNED — `frame_size`/`tdz_store`
+can grow mid-compile before any call runs, so no pre-scan is needed; a
+synthetic `\0`-prefixed AtomId maps to the slot so the fast loop's
+synthetic `K <op> HIDDEN` test resolves `RelLimit::Slot` and takes the
+existing fused canonical loop). On a probe MISS (any other receiver,
+an own-`length` shadow, auto/detached views) the loop re-runs as the
+general per-iteration loop (unchanged semantics). The fast + general
+loops are separate emissions (their bottoms differ); bodies compile
+identically in both (body member reads re-resolve exactly). A new
+label-fixup step (`TypedArrayLengthHoist { target }`, the
+`JumpIfRelLimit` pattern: Step variant + Fixup + interpreter arm +
+JIT emit arm via the existing `TypedArrayLength` FFI + sentinel) pops
+the receiver and pushes the length on a probe hit.
+
+**M6 slice 2 status (2026-09-02):** the guard-only hoist landed for
+certified `for (var K = INIT; K <op> RECV.length; K++)` loops (the
+emission shape above: `Step::TypedArrayLengthHoist` guard + hidden
+hoist slot via `alloc_hoist_slot`, the synthetic `\0hoist<N>` binding
+resolving `RelLimit::Slot`, and two `compile_for` copies; the step's
+interpreter arm mirrors the FFI probe, its JIT arm lowers through the
+`TypedArrayLength` FFI + sentinel). One soundness bug was found and
+fixed during differential testing: the fast copy probes RECV BEFORE
+the head init runs, so a head initializer that plainly assigns RECV
+(`for (var k = (ta = other, 0); k < ta.length; …)` with ta/other
+frame-slot bindings) left the guard's hoisted length stale — the
+general loop's first test reads the post-init length, the hoisted copy
+never re-reads it; `hoistable_length_loop` now scans the head
+declarator initializers with `collect_assigned_expr` alongside the
+body and update. Measured (jit, min-of-3, 800K): typed-array length
+6.6→**3.19ms** (interp 56.3→25.3 — the step-level transform is
+shared) and typed-array write 15.6→**12.47ms** (interp 74.1→42.6) —
+both rows at the guard-only ceilings in the table above. Validation:
+clippy clean, `cargo test --workspace` green, JIT + jitless language
+(23721/0/0/0) and built-ins (23657/0/0/0) sweeps match baseline; the
+16-case differential (canonical length/write rows, own-`length`
+shadow, impure head init, head/update RECV reassigns, break/continue
+bodies, member-left/`<=`/`>=` forms, alias reads, nested loops,
+Float64, zero-length) agrees between JIT and the interpreter with
+hand-traced results.
+
+Two PRE-EXISTING compiler bugs surfaced in the differential (both
+reproduce on clean HEAD, outside M6's scope, tracked as follow-ups):
+(1) the fused canonical loop's `break`/`continue` corruption — a fused
+body with a `break` corrupts the machine state (blank output /
+"Construct without an argument boundary"), `continue` hangs — which is
+why the slice's body purity rejects out-of-body transfers (the hoist
+must not fire on such bodies); (2) `var`-head counter loops that read
+array elements with a non-canonical test shape (`for (var k = ta.length
+- 1; k >= 0; k--) s += ta[k]` and `for (var k = 0; ta.length > k; k++)
+s += ta[k]`) return 0 in both modes — the accumulator-counter
+certification misfires on those shapes.
+
+Body-read hoisting (length row 3.2→2.0ms, the last 1.2ms) is M6 slice
+3: compile member reads of `RECV.length` in the fast body as
+`LoadLocal(HIDDEN)` — a compile-time hook in the member path gated on
+the loop's guard having passed. Validation for each slice: clippy +
+workspace tests + JIT/jitless built-ins sweeps + differential scripts.
+
 ### M7 — Loop unrolling + register quality
 
 `compound assign`'s 41.5x is largely V8 keeping `o` in a register across

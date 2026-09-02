@@ -21,8 +21,8 @@ use crux::value::{Value, ValueKind, is_callable};
 use syntax::ast::{
     Argument, ArrayBindingElement, ArrayElement, ArrowBody, AssignOp, BinaryOp, BindingElement,
     BindingPattern, Block, Class, ClassElement, ClassElementName, Expr, ExprKind, ForBinding,
-    ForInit, Function, LogicalOp, MemberProperty, ObjectLiteral, ObjectProperty, PropertyName,
-    Stmt, StmtKind, SwitchCase, UnaryOp, UpdateOp, VarDeclKind, VarDeclarator,
+    ForInit, Function, LogicalOp, MemberExpr, MemberProperty, ObjectLiteral, ObjectProperty,
+    PropertyName, Stmt, StmtKind, SwitchCase, UnaryOp, UpdateOp, VarDeclKind, VarDeclarator,
 };
 
 use crate::agent::Agent;
@@ -763,6 +763,18 @@ pub enum Step {
         op: BinaryOp,
         slot: usize,
         limit: RelLimit,
+        target: usize,
+    },
+    /// Gap-close M6 slice 2: the hoisted-loop guard. Pops the receiver (a
+    /// TypedArray-length candidate the compiler pushed); when it is an
+    /// IntegerIndexed object with no own `length` — the exact typed-array
+    /// probe — pushes `Number(effective_length)` and falls through (the
+    /// compiler stores it in a hidden frame slot and runs the loop against
+    /// that hoisted limit: a call-free body cannot detach/resize/redefine
+    /// the view, so the length is loop-invariant); otherwise jumps to
+    /// `target`, the compiler's general per-iteration loop (unchanged
+    /// semantics). Mirror of the runtime `typed_array_length` FFI probe.
+    TypedArrayLengthHoist {
         target: usize,
     },
     // ----- top-level fast path (script-level bindings) -----
@@ -6658,6 +6670,31 @@ impl Vm {
                     limit,
                     target,
                 } => self.jump_if_rel_limit(agent, *op, *slot, *limit, *target)?,
+                Step::TypedArrayLengthHoist { target } => {
+                    // Gap-close M6 slice 2: pop the receiver; a probe-hit
+                    // typed array (IntegerIndexed, no own `length`) pushes
+                    // its effective length — the value the compiler stores
+                    // in the hidden hoist slot; anything else jumps to the
+                    // general per-iteration loop. Mirror of the runtime
+                    // `typed_array_length` FFI probe; no user code runs.
+                    let Some(receiver) = self.stack.pop() else {
+                        return Err(JsError::new(
+                            ErrorKind::SyntaxError,
+                            "Value stack underflow".into(),
+                        ));
+                    };
+                    if let ValueKind::Object(object_ref) = receiver.kind()
+                        && let crux::object::ObjectKind::IntegerIndexed(slots) = &object_ref.kind
+                        && !object_ref.has_own_property_atom(Self::length_atom())
+                    {
+                        self.stack
+                            .push(Value::Number(
+                                crux::object::typed_array_effective_length(slots) as f64,
+                            ));
+                    } else {
+                        self.ip = *target;
+                    }
+                }
                 Step::FastLoopHead {
                     var,
                     op,
@@ -11515,6 +11552,13 @@ enum Fixup {
     /// The fused canonical loop head's jump targets (Cut 15): both labels
     /// resolve at compile end like the jump fixups.
     FastLoopHead(usize, usize, usize),
+    /// The hoisted-loop guard (`Step::TypedArrayLengthHoist`): the step's
+    /// `target` resolves at compile end (the general per-iteration loop's
+    /// entry).
+    TypedArrayLengthHoist {
+        index: usize,
+        label: usize,
+    },
     Break(usize, usize),
     Continue(usize, usize),
     JumpIfChainShort(usize, usize),
@@ -11707,6 +11751,11 @@ struct Compiler {
     /// Populated during compilation and returned alongside the compiled
     /// body for store-cache pre-warming in `construct_this_object`.
     this_writes: (usize, [crux::AtomId; 4]),
+    /// Gap-close M6 slice 2: while the fallback copy of a hoisted
+    /// `for (…; K <op> RECV.length; …)` loop is being compiled, its own test
+    /// (the original eligible member shape) must not re-hoist. Nested loops
+    /// inside that copy are also suppressed, which is merely conservative.
+    hoist_suppressed: bool,
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -12717,6 +12766,11 @@ impl Compiler {
                         *target = self.labels[&label];
                     }
                 }
+                Fixup::TypedArrayLengthHoist { index, label } => {
+                    if let Step::TypedArrayLengthHoist { target } = &mut self.steps[index] {
+                        *target = self.labels[&label];
+                    }
+                }
                 Fixup::FastLoopHead(index, body_label, after_label) => {
                     if let Step::FastLoopHead {
                         body_start, after, ..
@@ -13437,6 +13491,7 @@ impl Compiler {
             Fixup::JumpIfRelGlobalImm { index, .. } => index,
             Fixup::JumpIfRelLimit { index, .. } => index,
             Fixup::FastLoopHead(index, _, _) => index,
+            Fixup::TypedArrayLengthHoist { index, .. } => index,
             Fixup::Break(index, _) => index,
             Fixup::Continue(index, _) => index,
             Fixup::JumpIfChainShort(index, _) => index,
@@ -13507,6 +13562,233 @@ impl Compiler {
         }
     }
 
+    /// The interned "length" atom, cached once (the hoist eligibility check
+    /// runs per `for` compile).
+    fn length_atom() -> crux::AtomId {
+        use std::sync::OnceLock;
+        static LENGTH: OnceLock<crux::AtomId> = OnceLock::new();
+        *LENGTH.get_or_init(|| crux::string::intern_utf8("length"))
+    }
+
+    /// Reserve a fresh hidden frame slot beyond the named bindings (gap-close
+    /// M6 slice 2): `Compiler.scope` is owned, and the frame is sized from
+    /// `ScopeInfo::frame_size` only when a compiled body runs, so growing it
+    /// mid-compile is sound (the slot initializes `undefined`; hidden slots
+    /// never carry the TDZ marker and never appear in leaf bodies).
+    fn alloc_hoist_slot(&mut self) -> usize {
+        let scope = self
+            .scope
+            .as_mut()
+            .expect("a hoist requires a certified body");
+        let slot = scope.frame_size;
+        scope.frame_size += 1;
+        scope.tdz_store.push(false);
+        slot
+    }
+
+    /// Whether the loop qualifies for the typed-array `length`-limit hoist
+    /// (gap-close M6 slice 2): a certified `for (var …; K <op> RECV.length;
+    /// K++)` where RECV is a frame slot that the loop never assigns and the
+    /// body + update are "length-pure" (no calls — nothing can detach/
+    /// resize/define-`length` the view — and member access only as
+    /// `RECV.length` reads or `RECV[expr] = v` stores, which cannot change
+    /// the accessor-served length). Returns the receiver's frame slot.
+    fn hoistable_length_loop(
+        &self,
+        init: Option<&ForInit>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+    ) -> Option<usize> {
+        let length_atom = Self::length_atom();
+        // A `var` head (a lexical head's per-iteration env machinery would
+        // need duplicating across the two loop copies; keep to the common
+        // shape).
+        let head_names: Vec<crux::AtomId> = match init {
+            Some(ForInit::VarDecl {
+                kind: VarDeclKind::Var,
+                decls,
+            }) => decls
+                .iter()
+                .filter_map(|decl| match &decl.pattern {
+                    BindingPattern::Ident(name) => Some(*name),
+                    _ => None,
+                })
+                .collect(),
+            _ => return None,
+        };
+        if head_names.is_empty() {
+            return None;
+        }
+        // The test: `K <op> RECV.length` (a name-keyed, non-optional member
+        // read of the `length` atom — the only property whose read the guard
+        // probes).
+        let (_, left, right) = match test {
+            Some(Expr {
+                kind: ExprKind::Binary { op, left, right },
+                ..
+            }) if matches!(
+                op,
+                BinaryOp::LessThan
+                    | BinaryOp::LessEqual
+                    | BinaryOp::GreaterThan
+                    | BinaryOp::GreaterEqual
+            ) =>
+            {
+                (op, left, right)
+            }
+            _ => return None,
+        };
+        let ExprKind::Ident(counter) = &left.kind else {
+            return None;
+        };
+        let ExprKind::Member(MemberExpr {
+            object,
+            property: MemberProperty::Name(prop),
+            optional: false,
+            ..
+        }) = &right.kind
+        else {
+            return None;
+        };
+        if *prop != length_atom {
+            return None;
+        }
+        let ExprKind::Ident(recv_name) = &object.kind else {
+            return None;
+        };
+        if *recv_name == *counter || head_names.contains(recv_name) {
+            return None;
+        }
+        // The head init runs AFTER the guard in the fast copy, so a call
+        // there could mutate RECV — its initializer expressions must be pure
+        // too.
+        let head_pure = match init {
+            Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
+                matches!(&decl.pattern, BindingPattern::Ident(_))
+                    && decl
+                        .init
+                        .as_ref()
+                        .is_none_or(|init| expr_is_hoist_pure(init, *recv_name, length_atom))
+            }),
+            _ => false,
+        };
+        if !head_pure {
+            return None;
+        }
+        // RECV must be a frame slot; the counter must not be the accumulator
+        // of an enclosing loop (the recursion below compiles the head twice,
+        // and an acc-path counter is a per-body singleton).
+        let BindingLoc::Slot(recv_slot) = self.binding(*recv_name) else {
+            return None;
+        };
+        if self.acc_binding.is_some() {
+            return None;
+        }
+        // RECV is never assigned in the body, update, or head initializers
+        // (a head re-declaration of RECV was excluded above; a head init
+        // that writes RECV would leave the guard's hoisted length stale —
+        // the fast copy probes RECV BEFORE the head init runs, so the scan
+        // must cover those initializers too).
+        let mut assigned = HashSet::new();
+        collect_assigned_stmt(body, &mut assigned);
+        if let Some(update) = update {
+            collect_assigned_expr(update, &mut assigned);
+        }
+        if let Some(ForInit::VarDecl { decls, .. }) = init {
+            for decl in decls {
+                if let Some(init) = &decl.init {
+                    collect_assigned_expr(init, &mut assigned);
+                }
+            }
+        }
+        if assigned.contains(recv_name) {
+            return None;
+        }
+        // Body + update are length-pure.
+        if !stmt_is_hoist_pure(body, *recv_name, length_atom)
+            || update.is_some_and(|update| !expr_is_hoist_pure(update, *recv_name, length_atom))
+        {
+            return None;
+        }
+        Some(recv_slot)
+    }
+
+    /// Emit the hoisted loop (gap-close M6 slice 2): a once-per-loop guard
+    /// probes `RECV.length` (the exact typed-array probe — an IntegerIndexed
+    /// object with no own `length`); on a hit the length lands in a fresh
+    /// hidden frame slot and the SAME for-loop re-compiles with its test
+    /// limit read from that slot (the existing fused canonical loop —
+    /// `RelLimit::Slot`), on a miss it re-compiles unchanged as the general
+    /// per-iteration loop (only one of the two copies ever runs). Both copies
+    /// re-emit the head init, so each starts its counter fresh; the body
+    /// compiles identically in both (its `RECV.length` reads re-resolve
+    /// exactly each iteration).
+    fn compile_hoisted_length_for(
+        &mut self,
+        init: Option<&ForInit>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+        recv_slot: usize,
+    ) -> Result<(), JsError> {
+        self.emit(Step::ResetCompletion);
+        // The guard: pop RECV, push its effective length on a probe hit.
+        self.emit(Step::LoadLocal { slot: recv_slot });
+        let miss_label = self.new_label();
+        let guard_index = self.steps.len();
+        self.emit(Step::TypedArrayLengthHoist { target: 0 });
+        self.fixups.push(Fixup::TypedArrayLengthHoist {
+            index: guard_index,
+            label: miss_label,
+        });
+        // Stash the hoisted length in a fresh hidden slot.
+        let hoist_slot = self.alloc_hoist_slot();
+        self.emit(Step::InitLocal { slot: hoist_slot });
+        // Bind a synthetic (NUL-prefixed — impossible in source) name to the
+        // hidden slot so the fast copy's test `K <op> HIDDEN` resolves
+        // `RelLimit::Slot` and takes the fused canonical loop.
+        let hoist_name = crux::intern_utf8(&format!("\u{0}hoist{hoist_slot}"));
+        self.scope
+            .as_mut()
+            .expect("a hoist requires a certified body")
+            .slots
+            .insert(hoist_name, hoist_slot);
+        let Some(Expr {
+            span,
+            kind: ExprKind::Binary { op, left, .. },
+        }) = test
+        else {
+            unreachable!("hoistable_length_loop requires a test")
+        };
+        let fake_test = Expr {
+            span: *span,
+            kind: ExprKind::Binary {
+                op: *op,
+                left: left.clone(),
+                right: Box::new(Expr {
+                    span: *span,
+                    kind: ExprKind::Ident(hoist_name),
+                }),
+            },
+        };
+        let done_label = self.new_label();
+        // Fast copy: the fused canonical loop against the hoisted limit.
+        self.compile_for(init, Some(&fake_test), update, body)?;
+        self.jump(done_label);
+        // Fallback copy: the original per-iteration member test. Suppress the
+        // re-hoist (the test is the same eligible shape) — the suppression
+        // also covers any nested loops in this copy, which is merely
+        // conservative.
+        self.place(miss_label);
+        let saved = self.hoist_suppressed;
+        self.hoist_suppressed = true;
+        self.compile_for(init, test, update, body)?;
+        self.hoist_suppressed = saved;
+        self.place(done_label);
+        Ok(())
+    }
+
     fn compile_for(
         &mut self,
         init: Option<&ForInit>,
@@ -13514,6 +13796,16 @@ impl Compiler {
         update: Option<&Expr>,
         body: &Stmt,
     ) -> Result<(), JsError> {
+        // Gap-close M6 slice 2: hoist a certified loop's typed-array
+        // `length` test limit. The hoist needs its own emission (a guard +
+        // two loop copies), so the eligible shape returns before the normal
+        // path. `hoist_suppressed` stops the fallback loop's own re-hoist
+        // (its test is the original member shape).
+        if !self.hoist_suppressed
+            && let Some(recv_slot) = self.hoistable_length_loop(init, test, update, body)
+        {
+            return self.compile_hoisted_length_for(init, test, update, body, recv_slot);
+        }
         self.emit(Step::ResetCompletion);
         let mut has_loop_env = false;
         let mut per_iteration: Vec<JsString> = Vec::new();
@@ -16872,6 +17164,7 @@ fn step_targets(step: &Step) -> Vec<usize> {
         | Step::JumpIfGtGlobalImm { target, .. }
         | Step::JumpIfGeGlobalImm { target, .. }
         | Step::JumpIfRelLimit { target, .. } => vec![*target],
+        Step::TypedArrayLengthHoist { target } => vec![*target],
         Step::FastLoopHead {
             body_start, after, ..
         } => vec![*body_start, *after],
@@ -19975,6 +20268,185 @@ fn collect_assigned_expr(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) {
         | ExprKind::Await(_)
         | ExprKind::MetaProperty { .. }
         | ExprKind::ImportCall { .. } => {}
+    }
+}
+
+// ---- Gap-close M6 slice 2: the hoisted-loop purity walkers ----
+//
+// A loop whose `RECV.length` test limit is hoisted needs its body + update
+// to be "length-pure": nothing may run user code (a call, a getter/setter
+// via a member access — anything that could detach/resize/redefine the
+// view) and the only member access allowed is a `RECV.length` READ or a
+// `RECV[expr] = v` STORE (element writes and own-prop defines cannot change
+// the accessor-served length; other receivers could alias RECV through a
+// global, so they are excluded entirely).
+
+/// Whether `expr` may appear in a hoisted loop's body (see the module note).
+fn expr_is_hoist_pure(expr: &Expr, recv: crux::AtomId, length_atom: crux::AtomId) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::This => true,
+        ExprKind::Paren(inner) => expr_is_hoist_pure(inner, recv, length_atom),
+        ExprKind::Unary { op, operand } => {
+            !matches!(op, UnaryOp::Delete) && expr_is_hoist_pure(operand, recv, length_atom)
+        }
+        ExprKind::Update { target, .. } => {
+            // A bare `++`/`--` on a binding; an update of RECV is already
+            // rejected by the assigned scan.
+            matches!(&target.kind, ExprKind::Ident(_))
+                && expr_is_hoist_pure(target, recv, length_atom)
+        }
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            expr_is_hoist_pure(left, recv, length_atom)
+                && expr_is_hoist_pure(right, recv, length_atom)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_is_hoist_pure(test, recv, length_atom)
+                && expr_is_hoist_pure(consequent, recv, length_atom)
+                && expr_is_hoist_pure(alternate, recv, length_atom)
+        }
+        ExprKind::Sequence(exprs) => exprs
+            .iter()
+            .all(|e| expr_is_hoist_pure(e, recv, length_atom)),
+        ExprKind::Template(template) => template
+            .exprs
+            .iter()
+            .all(|e| expr_is_hoist_pure(e, recv, length_atom)),
+        ExprKind::Assign {
+            op, target, value, ..
+        } => {
+            let target_ok = match &target.kind {
+                // A binding assignment (RECV itself excluded by the assigned
+                // scan); compound forms read/write the binding, which is
+                // fine.
+                ExprKind::Ident(_) => expr_is_hoist_pure(target, recv, length_atom),
+                // The allowed element store: `RECV[expr] = v` (plain assign
+                // only — the compound form's read runs through the general
+                // member rule). For canonical keys this is the pure
+                // IntegerIndexedElementSet write; a non-canonical key defines
+                // an own property (or no-ops), which cannot change the
+                // accessor-served length. Only the key is recursed — the
+                // member expression itself is the special-cased target.
+                ExprKind::Member(MemberExpr {
+                    object,
+                    property: MemberProperty::Computed(key),
+                    optional: false,
+                    ..
+                }) if matches!(op, AssignOp::Assign) => {
+                    matches!(&object.kind, ExprKind::Ident(name) if *name == recv)
+                        && expr_is_hoist_pure(key, recv, length_atom)
+                }
+                _ => false,
+            };
+            target_ok && expr_is_hoist_pure(value, recv, length_atom)
+        }
+        ExprKind::Member(MemberExpr {
+            object,
+            property: MemberProperty::Name(prop),
+            optional: false,
+            ..
+        }) => {
+            // The allowed read: `RECV.length` (probe-served — no accessor
+            // invocation, exact). Any other member access is rejected.
+            *prop == length_atom
+                && matches!(&object.kind, ExprKind::Ident(name) if *name == recv)
+                && expr_is_hoist_pure(object, recv, length_atom)
+        }
+        ExprKind::Call(_)
+        | ExprKind::New(_)
+        | ExprKind::Member(_)
+        | ExprKind::Array(_)
+        | ExprKind::Object(_)
+        | ExprKind::Function(_)
+        | ExprKind::Class(_)
+        | ExprKind::Arrow { .. }
+        | ExprKind::TaggedTemplate { .. }
+        | ExprKind::PrivateIn { .. }
+        | ExprKind::Super
+        | ExprKind::Yield { .. }
+        | ExprKind::Await(_)
+        | ExprKind::MetaProperty { .. }
+        | ExprKind::ImportCall { .. } => false,
+    }
+}
+
+/// Whether `stmt` may appear in a hoisted loop's body (see the module note).
+fn stmt_is_hoist_pure(stmt: &Stmt, recv: crux::AtomId, length_atom: crux::AtomId) -> bool {
+    match &stmt.kind {
+        // Break/continue/return/throw exit the hoisted loop's fused copy —
+        // the JIT's fused canonical loop has pre-existing control-transfer
+        // bugs (break/continue in a fused body corrupt the machine state),
+        // so only bodies whose control flow stays inside (if/while/for with
+        // no out-of-body transfer) hoist.
+        StmtKind::Empty | StmtKind::Debugger => true,
+        StmtKind::Block(block) => block
+            .stmts
+            .iter()
+            .all(|s| stmt_is_hoist_pure(s, recv, length_atom)),
+        StmtKind::Expr(expr) => expr_is_hoist_pure(expr, recv, length_atom),
+        StmtKind::VarDecl { decls, .. } => decls.iter().all(|decl| {
+            matches!(&decl.pattern, BindingPattern::Ident(_))
+                && decl
+                    .init
+                    .as_ref()
+                    .is_none_or(|init| expr_is_hoist_pure(init, recv, length_atom))
+        }),
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_is_hoist_pure(test, recv, length_atom)
+                && stmt_is_hoist_pure(consequent, recv, length_atom)
+                && alternate
+                    .as_ref()
+                    .is_none_or(|a| stmt_is_hoist_pure(a, recv, length_atom))
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            expr_is_hoist_pure(test, recv, length_atom)
+                && stmt_is_hoist_pure(body, recv, length_atom)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let init_ok = match init {
+                None => true,
+                Some(ForInit::Expr(expr)) => expr_is_hoist_pure(expr, recv, length_atom),
+                Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
+                    matches!(&decl.pattern, BindingPattern::Ident(_))
+                        && decl
+                            .init
+                            .as_ref()
+                            .is_none_or(|init| expr_is_hoist_pure(init, recv, length_atom))
+                }),
+            };
+            init_ok
+                && test
+                    .as_ref()
+                    .is_none_or(|t| expr_is_hoist_pure(t, recv, length_atom))
+                && update
+                    .as_ref()
+                    .is_none_or(|u| expr_is_hoist_pure(u, recv, length_atom))
+                && stmt_is_hoist_pure(body, recv, length_atom)
+        }
+        StmtKind::Labeled { .. } => false,
+        StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Return(_) | StmtKind::Throw(_) => {
+            false
+        }
+        StmtKind::FunctionDecl(_)
+        | StmtKind::ClassDecl(_)
+        | StmtKind::UsingDecl { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::With { .. }
+        | StmtKind::ForIn { .. }
+        | StmtKind::ForOf { .. } => false,
     }
 }
 

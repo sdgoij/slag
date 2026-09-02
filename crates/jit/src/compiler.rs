@@ -127,6 +127,9 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::Binary(_) | Step::BinaryImm { .. } => depth = depth.saturating_sub(1),
             // The test pops; the keep variants leave the value.
             Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => depth = depth.saturating_sub(1),
+            // The hoist guard pops the receiver and pushes the length back on
+            // a probe hit (net 0); the miss jumps to a fresh evaluation.
+            Step::TypedArrayLengthHoist { .. } => {}
             // A store consumes the value; `UpdateLocal` pushes its result.
             Step::StoreLocal { .. } | Step::FusedStoreLocal { .. } | Step::InitLocal { .. } => {
                 depth = depth.saturating_sub(1)
@@ -539,6 +542,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::SaveCompletion
         | Step::RestoreCompletion => "Completion",
         Step::JumpIfRelLimit { .. } => "JumpIfRelLimit",
+        Step::TypedArrayLengthHoist { .. } => "TypedArrayLengthHoist",
         Step::LoadPerIteration { .. }
         | Step::StorePerIteration { .. }
         | Step::UpdatePerIteration { .. } => "Per-iteration",
@@ -567,6 +571,7 @@ fn step_targets(step: &Step) -> Vec<usize> {
         | Step::JumpIfGtGlobalImm { target, .. }
         | Step::JumpIfGeGlobalImm { target, .. }
         | Step::JumpIfRelLimit { target, .. } => vec![*target],
+        Step::TypedArrayLengthHoist { target } => vec![*target],
         Step::FastLoopHead {
             body_start, after, ..
         } => vec![*body_start, *after],
@@ -2991,6 +2996,27 @@ impl<'a> Lowerer<'a> {
             Step::Jump(target) => {
                 let block = self.ensure_block(*target);
                 self.builder.ins().jump(block, &[]);
+            }
+            Step::TypedArrayLengthHoist { target } => {
+                // The hoisted-loop guard (gap-close M6 slice 2): pop the
+                // receiver, probe its typed-array length; on a probe hit
+                // push the length and fall through (the next step stores it
+                // in the hidden hoist slot), else jump to the general
+                // per-iteration loop (nothing pushed there).
+                let object = self.pop();
+                let len = self.emit_raw_call(self.sig_bool, Helper::TypedArrayLength, &[object])?;
+                let sentinel = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, TYPED_ARRAY_LENGTH_SENTINEL as i64);
+                let hit = self.builder.ins().icmp(IntCC::NotEqual, len, sentinel);
+                let hit_block = self.builder.create_block();
+                let miss = self.ensure_block(*target);
+                self.builder.ins().brif(hit, hit_block, &[], miss, &[]);
+                self.builder.switch_to_block(hit_block);
+                self.push(len);
+                self.fall_through(index);
+                self.builder.seal_block(hit_block);
             }
             Step::JumpIfFalse(target) => {
                 let bits = self.pop();
