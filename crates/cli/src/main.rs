@@ -476,6 +476,10 @@ fn run_jit_benchmarks() -> Result<(), u8> {
             "function bench() { var n = 0; for (var i = 0; i < 1_000_000; i++) { n += i * 2; } return n; } bench();",
         ),
         (
+            "bare loop",
+            "function bench() { var n = 0; for (var i = 0; i < 1_000_000; i++) { n += 1; } return n; } bench();",
+        ),
+        (
             "property read",
             "function bench(o) { var n = 0; for (var i = 0; i < 1_000_000; i++) { n += o.a + o.b; } return n; } bench({ a: 1, b: 2 });",
         ),

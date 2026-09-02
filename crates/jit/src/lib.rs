@@ -347,6 +347,7 @@ fn runtime_helpers() -> JitHelpers {
         assign_member_name: Some(rt.assign_member_name),
         assign_member_computed: Some(rt.assign_member_computed),
         fast_array_element_write: Some(rt.fast_array_element_write),
+        dense_array_append: Some(rt.dense_array_append),
         set_member_slot: Some(rt.set_member_slot),
         load_context: Some(rt.load_context),
         store_context: Some(rt.store_context),
@@ -548,6 +549,7 @@ mod tests {
             assign_member_name: Some(helpers::test_assign_member_name),
             assign_member_computed: Some(helpers::test_assign_member_computed),
             fast_array_element_write: Some(helpers::test_fast_array_element_write),
+            dense_array_append: Some(helpers::test_dense_array_append),
             set_member_slot: Some(helpers::test_set_member_slot),
             load_context: Some(helpers::test_load_context),
             store_context: Some(helpers::test_store_context),
@@ -4218,23 +4220,23 @@ mod tests {
     #[test]
     fn installed_jit_dense_array_element_write_fast_path() {
         // The inline dense-array store: `a[a.length] = i` in a compiled
-        // loop must route through `fast_array_element_write` (the counting
-        // wrapper proves the machine code called it ~n times) and store
-        // every element. The fallback shapes — a non-Array receiver or a
-        // non-canonical-index key — must still land through the full
-        // `assign_member_computed` helper.
-        static FAST_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        extern "C" fn counting_fast_write(
+        // loop must route through `dense_array_append` (the M1 C append
+        // gate — the counting wrapper proves the machine code called it
+        // ~n times) and store every element. The fallback shapes — a
+        // non-Array receiver or a non-canonical-index key — still land
+        // through `fast_array_element_write`/`assign_member_computed`.
+        static APPEND_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_append(
             ctx: *mut c_void,
             object: u64,
-            key: u64,
+            index: u64,
             value: u64,
         ) -> u64 {
-            FAST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (runtime::jit::JIT_SLOW_PATHS.fast_array_element_write)(ctx, object, key, value)
+            APPEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.dense_array_append)(ctx, object, index, value)
         }
         let mut helpers = runtime_helpers();
-        helpers.fast_array_element_write = Some(counting_fast_write);
+        helpers.dense_array_append = Some(counting_append);
 
         extern "C" fn noop_drop(_cache: *mut c_void) {}
         let mut agent = runtime::Agent::new();
@@ -4263,10 +4265,58 @@ mod tests {
         // 0 + 999 + 1000 + 5 + 7 = 2011.
         assert_eq!(value.as_number(), Some(2011.0));
         assert!(compiled >= 1, "{compiled} bodies");
-        let calls = FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let calls = APPEND_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             calls >= 900,
-            "the compiled fill loop must take the inline store most of the time ({calls} fast calls)"
+            "the compiled fill loop must take the inline append most of the time ({calls} appends)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_register_store_member_computed_takes_the_inline_append() {
+        // The M1 C register-path gate: `a[l++] = i` lowers to a register
+        // body (`StoreMemberComputed { key: PostInc(l), value: Counter }`)
+        // whose compiled store must route through `dense_array_append`
+        // (the counting wrapper proves the machine code called it ~n
+        // times) and store every element.
+        static APPEND_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_append(
+            ctx: *mut c_void,
+            object: u64,
+            index: u64,
+            value: u64,
+        ) -> u64 {
+            APPEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.dense_array_append)(ctx, object, index, value)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.dense_array_append = Some(counting_append);
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent
+            .run_script(
+                "function fill(n) { var a = []; var l = 0; for (var i = 0; i < n; i++) { a[l++] = i; } return a[0] + a[n - 1] + a.length; }\n\
+                 fill(1000);",
+            )
+            .expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        // 0 + 999 + 1000 = 1999.
+        assert_eq!(value.as_number(), Some(1999.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+        let calls = APPEND_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls >= 900,
+            "the compiled register store must take the inline append most of the time ({calls} appends)"
         );
     }
 

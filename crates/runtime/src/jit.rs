@@ -481,6 +481,18 @@ pub struct JitSlowPaths {
     /// of `assign_computed_plain`, so the slow path is correct on 0.
     pub fast_array_element_write:
         extern "C" fn(ctx: *mut c_void, object: u64, key: u64, value: u64) -> u64,
+    /// The JIT-inline dense-array append (gap-close M1 C): the compiled
+    /// gate has verified the receiver is a dense Array (`array_dense` set)
+    /// and the key is a canonical index Number equal to `slots.length` —
+    /// this helper runs the remaining stateful append (extensibility, the
+    /// chain-clean verdict, the buffer push, the length write + mirror,
+    /// the generation bump) through the shared `array_element_write`
+    /// machinery. Returns 1 on a stored append, 0 to fall back (the slow
+    /// path re-runs everything correctly — nothing observable ran on the
+    /// fast attempt). Never sets the pending byte: the chain walk bails on
+    /// any non-plain link, so no trap or getter can run.
+    pub dense_array_append:
+        extern "C" fn(ctx: *mut c_void, object: u64, index: u64, value: u64) -> u64,
     /// The capture-context read (`LoadContextSlot`): `depth` is the static
     /// context-chain depth, `index` the binding's context slot. Returns the
     /// value (a TDZ marker throws the ReferenceError).
@@ -868,6 +880,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     assign_member_name,
     assign_member_computed,
     fast_array_element_write,
+    dense_array_append,
     set_member_slot,
     load_context,
     store_context,
@@ -1745,6 +1758,29 @@ extern "C" fn fast_array_element_write(
         return 0;
     }
     match obj.array_element_write(number as u64, value) {
+        Ok(Some(())) => 1,
+        _ => 0,
+    }
+}
+
+extern "C" fn dense_array_append(_ctx: *mut c_void, object: u64, index: u64, value: u64) -> u64 {
+    // The JIT-inline dense append (gap-close M1 C): the compiled gate
+    // verified the receiver is a dense Array and the key a canonical index
+    // Number equal to `slots.length`; re-verify the dense gate cheaply,
+    // then delegate the append (extensibility, chain-clean, buffer push,
+    // length write + mirror, generation bump) to the shared
+    // `array_element_write` — index == length takes its append branch, and
+    // any deviation returns 0 (the caller re-runs the full [[Set]]
+    // machinery; nothing observable ran on the fast attempt, so the
+    // fallback is correct). Never sets the pending byte.
+    let object = Value::from_bits(object);
+    let ValueKind::Object(obj) = object.kind() else {
+        return 0;
+    };
+    if obj.array_dense.get().is_none() {
+        return 0;
+    }
+    match obj.array_element_write(index, Value::from_bits(value)) {
         Ok(Some(())) => 1,
         _ => 0,
     }

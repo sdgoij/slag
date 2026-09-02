@@ -1278,6 +1278,139 @@ impl<'a> Lowerer<'a> {
         Ok(self.builder.use_var(value_var))
     }
 
+    /// The inline dense-array append gate (gap-close M1 C), shared by the
+    /// step `AssignMemberComputed` and the register `StoreMemberComputed`
+    /// emissions: verify the receiver is a dense Array (`array_dense`), the
+    /// key a canonical index Number equal to `slots.length`, then run the
+    /// stateful append through the narrow `dense_array_append` helper. A
+    /// stored append jumps to `merge`; any gate failure or a helper 0 jumps
+    /// to `legacy` (the caller emits its fallback there). The gate blocks
+    /// are created and sealed; on return the current block is the sealed
+    /// `append` block — the caller then emits `legacy` and switches to
+    /// `merge` (both created by the caller; their predecessors are the
+    /// gate's exits plus the caller's legacy fall-through, so they seal at
+    /// `seal_all_blocks`).
+    fn emit_dense_array_append_inline(
+        &mut self,
+        object: ClifValue,
+        key: ClifValue,
+        value: ClifValue,
+        legacy: Block,
+        merge: Block,
+    ) -> Result<(), Unsupported> {
+        let inline = self.builder.create_block();
+        let probe = self.builder.create_block();
+        let key_check = self.builder.create_block();
+        let key_ok_check = self.builder.create_block();
+        let len_check = self.builder.create_block();
+        let append = self.builder.create_block();
+        let idx_var = self.builder.declare_var(types::I64);
+        self.builder.ins().jump(inline, &[]);
+        // Object tag: heap prefix + Object tag.
+        self.builder.switch_to_block(inline);
+        let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
+        let is_obj = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+        let tag = self.builder.ins().ushr_imm_u(object, 44);
+        let tag = self.builder.ins().band_imm_u(tag, 0xF);
+        let tag_obj = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
+        let obj_ok = self.builder.ins().band(is_obj, tag_obj);
+        self.builder.ins().brif(obj_ok, probe, &[], legacy, &[]);
+        self.builder.seal_block(inline);
+        // The dense gate: the object's `array_dense` cell (the ArraySlots
+        // box base, or 0 when not a dense Array).
+        self.builder.switch_to_block(probe);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let slots_base = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+        );
+        let slots_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+        self.builder
+            .ins()
+            .brif(slots_ok, key_check, &[], legacy, &[]);
+        self.builder.seal_block(probe);
+        // The key must be a double BEFORE the float math — `fcvt_to_uint`
+        // on a NaN-boxed heap value's bits (a string key) can trap in the
+        // lowering, so the is-double gate is its own block.
+        self.builder.switch_to_block(key_check);
+        let is_double = self.is_double(key);
+        self.builder
+            .ins()
+            .brif(is_double, key_ok_check, &[], legacy, &[]);
+        self.builder.seal_block(key_check);
+        // The canonical-index checks: no fraction, 0 <= n < 2^32-1.
+        self.builder.switch_to_block(key_ok_check);
+        let num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), key);
+        let zero = self.builder.ins().f64const(0.0);
+        let max = self.builder.ins().f64const(4294967295.0);
+        let ge0 = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::GreaterThanOrEqual, num, zero);
+        let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
+        let idx = self.builder.ins().fcvt_to_uint(types::I64, num);
+        let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
+        let integral = self.builder.ins().fcmp(FloatCC::Equal, back, num);
+        let in_range = self.builder.ins().band(ge0, lt_max);
+        let key_ok = self.builder.ins().band(in_range, integral);
+        self.builder.def_var(idx_var, idx);
+        self.builder.ins().brif(key_ok, len_check, &[], legacy, &[]);
+        self.builder.seal_block(key_ok_check);
+        // The append gate: index == slots.length (the key is the canonical
+        // dense-append position; updates, hole-fills, and grows fall
+        // through to the caller's legacy path).
+        self.builder.switch_to_block(len_check);
+        let slots_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let length = self.builder.ins().load(
+            types::F64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+        );
+        let idx = self.builder.use_var(idx_var);
+        let idx_f = self.builder.ins().fcvt_from_uint(types::F64, idx);
+        let append_ok = self.builder.ins().fcmp(FloatCC::Equal, idx_f, length);
+        self.builder.ins().brif(append_ok, append, &[], legacy, &[]);
+        self.builder.seal_block(len_check);
+        // The narrow append helper (raw — it cannot set the pending byte).
+        self.builder.switch_to_block(append);
+        let idx = self.builder.use_var(idx_var);
+        let ok = self.emit_raw_call(
+            self.sig_binary,
+            Helper::DenseArrayAppend,
+            &[object, idx, value],
+        )?;
+        let hit = self.builder.ins().icmp_imm_u(IntCC::Equal, ok, 1);
+        self.builder.ins().brif(hit, merge, &[], legacy, &[]);
+        self.builder.seal_block(append);
+        Ok(())
+    }
+
     /// Cut 36: the direct-mapped global-value fast-cell read (the inline
     /// `LoadGlobal` kernel): validate the cell's name and captured version
     /// against the global object's LIVE identity/generation (re-read from
@@ -2767,22 +2900,25 @@ impl<'a> Lowerer<'a> {
                     None => self.builder.ins().iconst(types::I64, self.undef_bits),
                 };
                 if !is_compound_assign(op) {
-                    // The inline dense-array store: a direct
-                    // `fast_array_element_write` call (a plain Array receiver
-                    // with a canonical index Number key) that never errors
-                    // and returns 1 on a stored element; any other shape
-                    // falls back to the full `assign_member_computed`
-                    // helper. The helper mirrors `assign_computed_plain`'s
-                    // fast path exactly, so the fallback re-runs the checks
-                    // and the [[Set]] machinery correctly. The raw call is
-                    // enough — the helper cannot set the pending byte (its
-                    // chain walk bails on anything but a plain
-                    // Ordinary/Array link, so no trap or getter runs).
-                    let fast = self.builder.create_block();
+                    // The inline dense-array append (gap-close M1 C): gate
+                    // on the receiver being a dense Array (`array_dense`),
+                    // the key a canonical index Number equal to
+                    // `slots.length`, then run the stateful append through
+                    // the narrow `dense_array_append` helper (extensibility,
+                    // chain-clean, push, length + mirror, generation). The
+                    // typed-array / in-place-update / hole-fill / spill
+                    // shapes fall through to `fast_array_element_write`, and
+                    // anything else to `assign_member_computed` — the
+                    // fallback re-runs the checks and the [[Set]] machinery
+                    // correctly (nothing observable ran on the fast paths).
+                    let legacy = self.builder.create_block();
                     let fallback = self.builder.create_block();
                     let merge = self.builder.create_block();
-                    self.builder.ins().jump(fast, &[]);
-                    self.builder.switch_to_block(fast);
+                    self.emit_dense_array_append_inline(object, key, value, legacy, merge)?;
+                    // The legacy helper: typed arrays, in-place updates,
+                    // hole-fills, spilled/non-dense arrays, and non-canonical
+                    // keys (the pre-existing inline dense-array store).
+                    self.builder.switch_to_block(legacy);
                     let ok = self.emit_raw_call(
                         self.sig_binary,
                         Helper::FastArrayElementWrite,
@@ -2790,7 +2926,7 @@ impl<'a> Lowerer<'a> {
                     )?;
                     let hit = self.builder.ins().icmp_imm_u(IntCC::Equal, ok, 1);
                     self.builder.ins().brif(hit, merge, &[], fallback, &[]);
-                    self.builder.seal_block(fast);
+                    self.builder.seal_block(legacy);
                     self.builder.switch_to_block(fallback);
                     self.call_slow(
                         self.sig_assign,
@@ -2798,7 +2934,7 @@ impl<'a> Lowerer<'a> {
                         &[op_imm, object, key, old_imm, value],
                     )?;
                     // The slow path's stored value is the RHS for a plain
-                    // `=` — the merge below pushes `value` for BOTH paths, so
+                    // `=` — the merge below pushes `value` for ALL paths, so
                     // the fallback must not push its result too (an extra
                     // slot would leave the working stack one deeper than
                     // `max_stack_usage` accounts and overrun the buffer).
@@ -4965,11 +5101,22 @@ impl<'a> Lowerer<'a> {
                 let object = self.builder.use_var(self.acc_var);
                 let key = self.leaf_operand(step, op_index, 3, key)?;
                 let value = self.leaf_operand(step, op_index, 4, value)?;
+                // The inline dense-array append gate (shared with the step
+                // path, gap-close M1 C); the legacy path is the full
+                // `SetMemberComputed` slow call (the register executor
+                // discards the store's result, so no push/merge value).
+                let legacy = self.builder.create_block();
+                let merge = self.builder.create_block();
+                self.emit_dense_array_append_inline(object, key, value, legacy, merge)?;
+                self.builder.switch_to_block(legacy);
                 self.call_slow(
                     self.sig_set_comp,
                     Helper::SetMemberComputed,
                     &[object, key, value],
                 )?;
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(legacy);
+                self.builder.switch_to_block(merge);
             }
             LeafOp::GetMemberName { name } => {
                 let object = self.builder.use_var(self.acc_var);

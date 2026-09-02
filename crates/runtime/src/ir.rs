@@ -3207,8 +3207,11 @@ impl Vm {
     /// a descriptor of `name`, then read from `in_fields` at the assigned
     /// offset. Returns `None` if not in the map (falls through to
     /// `member_cell_get`'s existing path).
-    fn member_cell_get_map(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
-        let object = Self::cell_object(object)?;
+    fn member_cell_get_map(
+        agent: &mut Agent,
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+    ) -> Option<Value> {
         let map = object.map.get()?;
         let map_id = map.id();
         // The direct-mapped cache probe: (map_id, name) → field offset. The
@@ -3257,15 +3260,19 @@ impl Vm {
     /// generation matches the cached read (every own-property mutation path
     /// bumps the generation, including `set_key`'s in-place value update).
     fn member_cell_get(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
-        // Part B, B5.2: map-based fast path first.
-        if let Some(value) = Self::member_cell_get_map(agent, object, name) {
-            return Some(value);
-        }
+        // The generation-validated value cell first: the warm read path is
+        // a pure (id, name, generation) compare — no map read, no in-fields
+        // access, no per-read cache write. The map probe below warms the
+        // cell on its hit, so a hot loop's second read is served here (this
+        // also matches the JIT's inline probe order).
         let object = Self::cell_object(object)?;
         let index = Self::member_cell_index(object.id(), name);
         let cell = &agent.member_value_cells[index];
         if cell.id == object.id() && cell.name == name && cell.generation == object.generation() {
             return Some(cell.value);
+        }
+        if let Some(value) = Self::member_cell_get_map(agent, &object, name) {
+            return Some(value);
         }
         let slot = match agent.member_cells[index] {
             Some((cached_id, cached_name, slot))

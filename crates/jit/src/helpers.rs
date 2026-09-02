@@ -43,6 +43,7 @@ pub enum Helper {
     AssignMemberName,
     AssignMemberComputed,
     FastArrayElementWrite,
+    DenseArrayAppend,
     SetMemberSlot,
     LoadContext,
     StoreContext,
@@ -169,6 +170,7 @@ impl Helper {
             Helper::AssignMemberName => "assign_member_name",
             Helper::AssignMemberComputed => "assign_member_computed",
             Helper::FastArrayElementWrite => "fast_array_element_write",
+            Helper::DenseArrayAppend => "dense_array_append",
             Helper::SetMemberSlot => "set_member_slot",
             Helper::LoadContext => "load_context",
             Helper::StoreContext => "store_context",
@@ -411,6 +413,11 @@ pub struct JitHelpers {
     /// errors.
     pub fast_array_element_write:
         Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, value: u64) -> u64>,
+    /// The JIT-inline dense-array append (gap-close M1 C): the compiled
+    /// gate verified the receiver/key/append shape; the helper runs the
+    /// stateful append and returns 1/0. Never errors.
+    pub dense_array_append:
+        Option<extern "C" fn(vm: *mut c_void, object: u64, index: u64, value: u64) -> u64>,
     /// The capture-context read (`LoadContextSlot`): `depth` is the static
     /// context-chain depth, `index` the binding's context slot. Returns the
     /// value.
@@ -697,6 +704,7 @@ impl JitHelpers {
             assign_member_name: None,
             assign_member_computed: None,
             fast_array_element_write: None,
+            dense_array_append: None,
             set_member_slot: None,
             load_context: None,
             store_context: None,
@@ -822,6 +830,7 @@ impl JitHelpers {
             Helper::FastArrayElementWrite => {
                 self.fast_array_element_write.map(|f| f as usize as u64)
             }
+            Helper::DenseArrayAppend => self.dense_array_append.map(|f| f as usize as u64),
             Helper::SetMemberSlot => self.set_member_slot.map(|f| f as usize as u64),
             Helper::LoadContext => self.load_context.map(|f| f as usize as u64),
             Helper::StoreContext => self.store_context.map(|f| f as usize as u64),
@@ -1077,6 +1086,15 @@ pub extern "C" fn test_fast_array_element_write(
     _vm: *mut c_void,
     _object: u64,
     _key: u64,
+    _value: u64,
+) -> u64 {
+    1
+}
+
+pub extern "C" fn test_dense_array_append(
+    _vm: *mut c_void,
+    _object: u64,
+    _index: u64,
     _value: u64,
 ) -> u64 {
     1
@@ -1714,6 +1732,7 @@ mod tests {
             Helper::AssignMemberName,
             Helper::AssignMemberComputed,
             Helper::FastArrayElementWrite,
+            Helper::DenseArrayAppend,
             Helper::TypedArrayLength,
         ] {
             assert!(none.get(h).is_none(), "{} should be None", h.name());
@@ -1741,6 +1760,7 @@ mod tests {
             Helper::FastArrayElementWrite.name(),
             "fast_array_element_write"
         );
+        assert_eq!(Helper::DenseArrayAppend.name(), "dense_array_append");
         assert_eq!(Helper::TypedArrayLength.name(), "typed_array_length");
     }
 

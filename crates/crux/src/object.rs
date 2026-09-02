@@ -641,6 +641,11 @@ pub struct JsObject {
     /// its global-value cells.
     pub id: u64,
     pub kind: ObjectKind,
+    /// The dense-buffer handle when this object is a dense Array (the JIT's
+    /// inline element-store gate): set at array creation, cleared on spill. A
+    /// lock-free `Cell` mirroring `kind`/`slots.dense` so the JIT can read
+    /// it via `offset_of!` without matching the `ObjectKind` enum's layout.
+    pub array_dense: Cell<Option<Handle<ArraySlots>>>,
     /// [[Prototype]]; `None` when the prototype is *null*. A lock-free
     /// `Cell` (the handle is `Copy`): `get_prototype_of` runs on every
     /// member read/store and prototype-chain walk, and the RefCell borrow
@@ -800,6 +805,7 @@ impl JsObject {
         Self {
             id: next_object_id(),
             kind: ObjectKind::Ordinary,
+            array_dense: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(map)),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1048,6 +1054,7 @@ impl JsObject {
         let object = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::IsHTMLDDA,
+            array_dense: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1078,13 +1085,15 @@ impl JsObject {
                 "Invalid array length".into(),
             ));
         }
+        let slots = Handle::new(ArraySlots {
+            elements: RefCell::new(Vec::new()),
+            length: Cell::new(length),
+            dense: Cell::new(true),
+        });
         let array = Handle::new(Self {
             id: next_object_id(),
-            kind: ObjectKind::Array(Handle::new(ArraySlots {
-                elements: RefCell::new(Vec::new()),
-                length: Cell::new(length),
-                dense: Cell::new(true),
-            })),
+            kind: ObjectKind::Array(slots),
+            array_dense: Cell::new(Some(slots)),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1120,6 +1129,7 @@ impl JsObject {
         let string = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::String(Handle::new(value)),
+            array_dense: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1153,6 +1163,7 @@ impl JsObject {
         let proxy = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::Proxy(Handle::new(slots)),
+            array_dense: Cell::new(None),
             prototype: Cell::new(None),
             map: Cell::new(Some(canonical_empty_map(None))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1180,6 +1191,7 @@ impl JsObject {
         let object = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::IntegerIndexed(Handle::new(slots)),
+            array_dense: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1289,6 +1301,7 @@ impl JsObject {
                 exports,
                 deferred,
             })),
+            array_dense: Cell::new(None),
             prototype: Cell::new(None),
             map: Cell::new(Some(canonical_empty_map(None))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1343,6 +1356,7 @@ impl JsObject {
                 parameter_map: Some(map),
                 env: None,
             })),
+            array_dense: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1441,6 +1455,7 @@ impl JsObject {
                 parameter_map: None,
                 env: None,
             })),
+            array_dense: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1975,6 +1990,7 @@ impl JsObject {
         }
         let elements = std::mem::take(&mut *slots.elements.borrow_mut());
         slots.dense.set(false);
+        self.array_dense.set(None);
         let mut props = self.properties.borrow_mut();
         // props holds `length` + string/symbol props; rebuild with the
         // elements inserted in ascending index order after `length`.
