@@ -1194,14 +1194,24 @@ impl<'a> Lowerer<'a> {
         let probe = self.builder.create_block();
         let slow = self.builder.create_block();
         let merge = self.builder.create_block();
-        // The typed-array length probe: only the `length` atom needs it. A
-        // helper returns the slots length for an IntegerIndexed receiver or
-        // the canonical-NaN sentinel; a hit serves the value with no
-        // `get_member_name` call (the interpreter's `get_member_name` fast
-        // path serves the same slots length, gated on the own-`length`
-        // shadow — the probe is exact for the same receivers). Any other
-        // receiver falls into the member-cell probe below.
+        // The typed-array length probe: only the `length` atom needs it. The
+        // machine read (gap-close M6) serves a fixed, live, writable-buffer
+        // IntegerIndexed receiver's length straight from the slots; a helper
+        // covers every other receiver (and the shadowed/auto/detached/
+        // resizable shapes), returning the slots length for an
+        // IntegerIndexed receiver or the canonical-NaN sentinel. A hit
+        // serves the value with no `get_member_name` call (the
+        // interpreter's `get_member_name` fast path serves the same slots
+        // length, gated on the own-`length` shadow — the probe is exact for
+        // the same receivers). Any other receiver falls into the
+        // member-cell probe below.
         if name == Self::length_atom() {
+            // The machine length read first (M6); its misses land here, the
+            // exact FFI probe (which also covers the receivers whose
+            // `typed_array` mirror an own-`length` define cleared).
+            let ffi = self.builder.create_block();
+            self.emit_typed_array_length_inline(object, value_var, ffi, merge)?;
+            self.builder.switch_to_block(ffi);
             let len = self.emit_raw_call(self.sig_bool, Helper::TypedArrayLength, &[object])?;
             let sentinel = self
                 .builder
@@ -1211,6 +1221,7 @@ impl<'a> Lowerer<'a> {
             self.builder.def_var(value_var, len);
             let len_miss = self.builder.create_block();
             self.builder.ins().brif(hit, merge, &[], len_miss, &[]);
+            self.builder.seal_block(ffi);
             self.builder.switch_to_block(len_miss);
         }
         let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
@@ -1311,6 +1322,145 @@ impl<'a> Lowerer<'a> {
         self.builder.seal_block(merge);
         self.builder.switch_to_block(merge);
         Ok(self.builder.use_var(value_var))
+    }
+
+    /// The machine typed-array length read (gap-close M6), shared by every
+    /// compiled `GetMemberName` site whose name is `length` (the step and
+    /// register paths both lower through [`Self::emit_member_cell_read`]):
+    /// gate the receiver to an Integer-Indexed object over a fixed, live,
+    /// writable buffer (the `typed_array` mirror — cleared when an own
+    /// `length` shadows the accessor, so the gate implies the accessor
+    /// semantics), then serve `slots.array_length` as a Number straight
+    /// from the box — no per-read FFI probe. The gates re-read the live
+    /// buffer geometry every read, so a helper that detaches or resizes the
+    /// buffer between reads is picked up (the mirror + fixed-view checks are
+    /// exact for the same receivers the interpreter's `get_member_name`
+    /// shortcut serves). Any gate failure jumps to `miss` — the caller's
+    /// exact FFI probe (`typed_array_length`), which covers the auto/
+    /// detached/resizable/own-length-shadow receivers. The internal blocks
+    /// are created and sealed here; on return the current block is the
+    /// sealed hit block (it defined `value_var` and jumped to `merge`).
+    ///
+    /// Emitted only in the single-agent build (`crux::typed_array::WORKERS`
+    /// false): under `workers` the block layout is cfg'd and the read would
+    /// need atomics, so the probe collapses to the miss jump.
+    fn emit_typed_array_length_inline(
+        &mut self,
+        object: ClifValue,
+        value_var: Variable,
+        miss: Block,
+        merge: Block,
+    ) -> Result<(), Unsupported> {
+        if crux::typed_array::WORKERS {
+            self.builder.ins().jump(miss, &[]);
+            return Ok(());
+        }
+        let inline = self.builder.create_block();
+        let mirror = self.builder.create_block();
+        let state = self.builder.create_block();
+        let hit = self.builder.create_block();
+        self.builder.ins().jump(inline, &[]);
+        // Object tag: heap prefix + Object tag (same gate as the inline
+        // element store — the receiver may be a plain value).
+        self.builder.switch_to_block(inline);
+        let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
+        let is_heap = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+        let tag = self.builder.ins().ushr_imm_u(object, 44);
+        let tag = self.builder.ins().band_imm_u(tag, 0xF);
+        let tag_obj = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
+        let obj_ok = self.builder.ins().band(is_heap, tag_obj);
+        self.builder.ins().brif(obj_ok, mirror, &[], miss, &[]);
+        self.builder.seal_block(inline);
+        // The typed-array gate: the object's `typed_array` cell (the slots
+        // box base, or 0 when the object is not Integer-Indexed — or an own
+        // `length` define cleared it).
+        self.builder.switch_to_block(mirror);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let slots_base = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, typed_array) as i32),
+        );
+        let slots_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+        self.builder.ins().brif(slots_ok, state, &[], miss, &[]);
+        self.builder.seal_block(mirror);
+        // The fixed-view gate: not a length-tracking (auto) view over a
+        // detached or resizable buffer — the effective length of such views
+        // tracks the live buffer, so the FFI probe computes it.
+        self.builder.switch_to_block(state);
+        let slots_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let auto_len = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, auto_length) as i32),
+        );
+        const STATE_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
+            + std::mem::offset_of!(crux::typed_array::SharedBuffer, state);
+        let state_addr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(STATE_OFFSET as i32),
+        );
+        let detached = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            state_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, detached) as i32),
+        );
+        let resizable = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            state_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, resizable) as i32),
+        );
+        let arr_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, array_length) as i32),
+        );
+        let auto_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, auto_len, 0);
+        let det_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, detached, 0);
+        let res_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, resizable, 0);
+        let fixed = self.builder.ins().band(auto_ok, det_ok);
+        let fixed = self.builder.ins().band(fixed, res_ok);
+        self.builder.ins().brif(fixed, hit, &[], miss, &[]);
+        self.builder.seal_block(state);
+        // The value: `array_length` as a Number (a small non-negative f64,
+        // whose bits are the raw NaN-boxed Number — no reserved-tag form).
+        self.builder.switch_to_block(hit);
+        let len_f = self.builder.ins().fcvt_from_uint(types::F64, arr_len);
+        let len_bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), len_f);
+        self.builder.def_var(value_var, len_bits);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(hit);
+        Ok(())
     }
 
     /// The inline dense-array append gate (gap-close M1 C), shared by the
@@ -1600,10 +1750,11 @@ impl<'a> Lowerer<'a> {
             slots_ptr,
             Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, byte_offset) as i32),
         );
-        let clear = self.builder.ins().band_imm_u(detached, 1);
-        let clear = self.builder.ins().band(clear, immutable);
-        let clear = self.builder.ins().band(clear, resizable);
-        let clear_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, clear, 0);
+        let det_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, detached, 0);
+        let imm_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, immutable, 0);
+        let res_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, resizable, 0);
+        let clear_ok = self.builder.ins().band(det_ok, imm_ok);
+        let clear_ok = self.builder.ins().band(clear_ok, res_ok);
         let has_data = self.builder.ins().icmp_imm_u(IntCC::NotEqual, data, 0);
         let geom_ok = self.builder.ins().band(is_u8, clear_ok);
         let geom_ok = self.builder.ins().band(geom_ok, has_data);

@@ -3960,6 +3960,14 @@ fn typed_array_define_own_property(
         }
         return Ok(true);
     }
+    // An own `length` shadows the prototype accessor (spec OrdinaryGet),
+    // but the JIT's `typed_array` mirror drives the machine length read +
+    // element-store gates under the accessor semantics — clear it when a
+    // length define lands so those gates miss to the exact helpers (the
+    // mirror is never restored, which is merely conservative).
+    if key == &PropertyKey::from_utf8("length") {
+        obj.typed_array.set(None);
+    }
     obj.ordinary_define_own_property(key, desc)
 }
 

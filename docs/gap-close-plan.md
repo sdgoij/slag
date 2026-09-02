@@ -347,6 +347,37 @@ a frame-slot or machine-local).
   JIT); the soundness rule is "no write to the receiver and no call in
   the body".
 
+**M6 slice 1 status (2026-09-02):** the machine typed-array length read
+landed (`emit_typed_array_length_inline`, in `emit_member_cell_read` —
+every compiled `GetMemberName` whose name is `length` now probes the
+receiver's `typed_array` mirror + fixed-view state first and serves
+`slots.array_length` straight from the box, ~2ns, instead of the ~5ns
+FFI `typed_array_length` round trip; the FFI probe still covers the
+auto/detached/resizable/own-length-shadow misses). Two real bugs were
+found and fixed along the way: (1) the FFI probe ignored an own
+`length` data property shadowing the %TypedArray%.prototype accessor —
+a JIT-compiled `ta.length` read on a defineProperty'd typed array
+returned the slots length (e.g. 8) where the interpreter returned the
+own value (3); the probe now gates on `has_own_property_atom` like the
+interpreter's shortcut, and defining an own `length` clears the
+`typed_array` mirror (`typed_array_define_own_property`) so the machine
+read/store gates miss to the exact helpers thereafter. (2) both the M5c
+store gate and the new read gate AND-ed the block flags together
+(`(detached & immutable & resizable) == 0` — only missed when ALL were
+set), so detached/auto/immutable views slipped through to the machine
+paths; both gates now miss when ANY flag is set. Measured (jit, min-of-3,
+800K): typed-array length 10.2→**6.6ms** (ratio 0.18→0.12); typed-array
+write 16.8→**15.5ms** (its per-iteration guard read is the same probe).
+The residual ~8ns/iter (two ~2ns reads + the general-loop test/dispatch
+overhead) is the actual hoisting work — the reads are loop-invariant and
+still re-execute per iteration; that needs the pre-head temp + certified-
+loop rewrite (the "high effort" slice above), not more read-side
+cheapening. Validation: clippy clean (incl. the workers cfg), `cargo test
+--workspace` green, JIT built-ins (23657/0/0/0) + jitless built-ins
+(23657/0/0/0) sweeps match baseline; differential scripts (shadowed/
+detached/auto/resizable/byte-offset/subarray/SAB length reads and the
+store edge cases) agree between JIT and the interpreter.
+
 ### M7 — Loop unrolling + register quality
 
 `compound assign`'s 41.5x is largely V8 keeping `o` in a register across

@@ -3716,10 +3716,25 @@ extern "C" fn typed_array_length(_ctx: *mut c_void, object: u64) -> u64 {
     let ValueKind::Object(obj) = Value::from_bits(object).kind() else {
         return TYPED_ARRAY_LENGTH_SENTINEL;
     };
-    if let crux::object::ObjectKind::IntegerIndexed(slots) = &obj.kind {
+    if let crux::object::ObjectKind::IntegerIndexed(slots) = &obj.kind
+        // An own `length` data property shadows the %TypedArray%.prototype
+        // accessor (spec OrdinaryGet — a define-created own property wins),
+        // so the probe must miss and let the general read serve the own
+        // value — the mirror of the interpreter's `get_member_name`
+        // shortcut gate (a plain, usually empty own-property scan).
+        && !obj.has_own_property_atom(length_atom())
+    {
         return Value::Number(crux::object::typed_array_effective_length(slots) as f64).bits();
     }
     TYPED_ARRAY_LENGTH_SENTINEL
+}
+
+/// The interned "length" atom, cached once (the length probe runs every
+/// iteration of a byte-copy loop, so it must not re-intern per read).
+fn length_atom() -> crux::AtomId {
+    use std::sync::OnceLock;
+    static LENGTH: OnceLock<crux::AtomId> = OnceLock::new();
+    *LENGTH.get_or_init(|| crux::string::intern_utf8("length"))
 }
 
 /// The probe's miss sentinel: the canonical quiet-NaN value (`Value` boxes a
