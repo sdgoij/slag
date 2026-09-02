@@ -276,6 +276,60 @@ pattern; the encode is already allocation-free).
 - **Risk:** medium — the soundness argument is guard-identity + call-free
   body; the `encode_element_into` primitive-only gate already exists.
 
+**Decomposition (2026-09-02, 800K stores, the row's own shape):** the
+row is `bench(new Uint8Array(800000))` with `ta.length` re-read per
+iteration. Three temporary `--jit-bench` rows isolated the per-iteration
+costs (jit, min-of-3):
+
+| probe | jit | per-iter |
+|---|---|---|
+| `ta[k] = k & 255` reading `ta.length` in the test (the row) | ~30ms | 37.5ns |
+| same with the length hoisted (`var n = ta.length`) | ~26ms | 32.8ns |
+| hoisted length, no store (`s += k`) | ~2.0ms | 2.5ns |
+
+So: the certified counter loop + `k & 255` + `s += k` floor is ~2.5ns/iter;
+per-iteration `ta.length` (the compiled `typed_array_length` probe — an
+FFI per iteration, M6 LICM territory) is ~5ns/iter; and the STORE is
+~30ns/iter — the machine dense-append gate (fails fast for a typed
+array) + the `fast_array_element_write` FFI round trip + inside
+`typed_array_element_set`: the immutable-buffer check, the
+`encode_element_into` element-type dispatch + Number→bytes conversion,
+`typed_array_valid_index`, and the `SharedBuffer` write. The row is
+~99x vs node's 0.29ms, and the plan's ~8ms target needs the store at
+~10ns/iter — a real machine-code inline (M5c), not a cheaper helper
+restructure (the FFI + checks floor is ~20ns/iter). M5c is the
+UB-sensitive inline the M1 C note warned about (reading the
+`TypedArraySlots`/`SharedBuffer` internals — resizable buffers realloc
+their storage, so the data pointer must be re-validated against the live
+buffer per store) and is its own session.
+
+**M5c status (2026-09-02):** the machine-code inline landed
+(`emit_typed_array_store_inline`, shared by the step `AssignMemberComputed`
+and the register `StoreMemberComputed` emissions): gate the receiver to a
+fixed-length `Uint8Array` over a live, writable, non-resizable buffer (the
+`JsObject.typed_array` mirror → `TypedArraySlots`, the shared per-buffer
+`BlockState` box for the byte base + the detached/immutable/resizable
+flags), the key to a canonical in-range index, the value to an integral
+[0, 255] Number; then write the byte straight into the block. Any gate
+failure falls back to the existing helper (nothing observable ran — the
+write is a pure byte store and the accepted value is a Number). The gate
+re-reads the live geometry per store (a helper that detaches/freezes/
+resizes between stores is picked up); the data base is mirrored in
+`BlockState` (`SharedBuffer::state` — an offset-visible raw box address,
+since the `Rc`/`Arc` box layout is not `offset_of!`-expressible across
+crates) and updated on resize; the whole probe is cfg-collapsed to the
+legacy jump under the `workers` feature (`crux::typed_array::WORKERS` —
+the plain machine write would need atomics there). Measured (jit,
+min-of-3, 800K stores): the row 26.0→**16.8ms** (~57x vs node, ratio
+0.37→0.23); the hoisted-length variant 13.3→**12.4ms**. The per-store
+probe is ~13ns/iter — the remaining cost is the per-store re-derivation
+of the slots/buffer geometry + the per-iteration `ta.length` probe, both
+loop-invariant work for M6 (LICM), not the FFI/encode/checks the inline
+replaced (the fallback still measures ~21.5ns/iter for the same shape).
+Validation: clippy clean, `cargo test --workspace` green, JIT language
+(23721/0/0/0) + JIT built-ins (23657/0/0/0) + jitless built-ins
+(23657/0/0/0) sweeps match baseline.
+
 ### M6 — JIT: loop-invariant code motion
 
 The mechanism behind three wide rows (property read 21.8x, global read

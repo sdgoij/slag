@@ -646,6 +646,14 @@ pub struct JsObject {
     /// lock-free `Cell` mirroring `kind`/`slots.dense` so the JIT can read
     /// it via `offset_of!` without matching the `ObjectKind` enum's layout.
     pub array_dense: Cell<Option<Handle<ArraySlots>>>,
+    /// The TypedArray slots handle when this object is an Integer-Indexed
+    /// exotic (the JIT's inline element-store gate, gap-close M5c): set at
+    /// typed-array creation, never cleared (a TypedArray never changes
+    /// kind). A lock-free `Cell` mirroring `kind` so the JIT can read the
+    /// slots via `offset_of!` without matching the `ObjectKind` enum's
+    /// layout; the authoritative reference stays in `kind` (the GC traces
+    /// it), so the mirror adds no liveness edge.
+    pub typed_array: Cell<Option<Handle<TypedArraySlots>>>,
     /// [[Prototype]]; `None` when the prototype is *null*. A lock-free
     /// `Cell` (the handle is `Copy`): `get_prototype_of` runs on every
     /// member read/store and prototype-chain walk, and the RefCell borrow
@@ -806,6 +814,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Ordinary,
             array_dense: Cell::new(None),
+            typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(map)),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1055,6 +1064,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::IsHTMLDDA,
             array_dense: Cell::new(None),
+            typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1094,6 +1104,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Array(slots),
             array_dense: Cell::new(Some(slots)),
+            typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1130,6 +1141,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::String(Handle::new(value)),
             array_dense: Cell::new(None),
+            typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1164,6 +1176,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Proxy(Handle::new(slots)),
             array_dense: Cell::new(None),
+            typed_array: Cell::new(None),
             prototype: Cell::new(None),
             map: Cell::new(Some(canonical_empty_map(None))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1188,10 +1201,12 @@ impl JsObject {
         slots: TypedArraySlots,
         prototype: Option<Handle<JsObject>>,
     ) -> Result<Handle<JsObject>, JsError> {
+        let slots_handle = Handle::new(slots);
         let object = Handle::new(Self {
             id: next_object_id(),
-            kind: ObjectKind::IntegerIndexed(Handle::new(slots)),
+            kind: ObjectKind::IntegerIndexed(slots_handle),
             array_dense: Cell::new(None),
+            typed_array: Cell::new(Some(slots_handle)),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1302,6 +1317,7 @@ impl JsObject {
                 deferred,
             })),
             array_dense: Cell::new(None),
+            typed_array: Cell::new(None),
             prototype: Cell::new(None),
             map: Cell::new(Some(canonical_empty_map(None))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1357,6 +1373,7 @@ impl JsObject {
                 env: None,
             })),
             array_dense: Cell::new(None),
+            typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
@@ -1456,6 +1473,7 @@ impl JsObject {
                 env: None,
             })),
             array_dense: Cell::new(None),
+            typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
             in_fields: [const { Cell::new(None) }; INLINE_FIELDS],

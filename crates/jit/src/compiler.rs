@@ -1446,6 +1446,247 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// The machine typed-array element store (gap-close M5c), shared by the
+    /// step `AssignMemberComputed` and the register `StoreMemberComputed`
+    /// emissions: gate the receiver to a fixed-length `Uint8Array` over a
+    /// live, writable, non-resizable buffer, the key to a canonical index
+    /// Number below `slots.array_length`, and the value to an integral
+    /// Number in [0, 255]; then write the byte straight into the block at
+    /// `data + byte_offset + index`.
+    ///
+    /// The gate re-reads the live buffer geometry (the byte base and the
+    /// detached/immutable/resizable flags) from the shared `BlockState` box
+    /// on every store, so a helper that detaches, freezes, or resizes the
+    /// buffer between stores is picked up; the machine write is a pure byte
+    /// store (no coercion ran — the value is a Number, and the write never
+    /// runs user code), so a gate failure can always fall back to `legacy`
+    /// (the caller re-runs the full IntegerIndexedElementSet and nothing
+    /// observable happened on the fast attempt).
+    ///
+    /// Emitted only in the single-agent build (`crux::typed_array::WORKERS`
+    /// false): under `workers` the block layout is cfg'd and the write would
+    /// need atomics, so the whole probe collapses to the legacy jump. The
+    /// internal blocks are created and sealed here; on return the current
+    /// block is the sealed `store` block — the caller emits `legacy` and
+    /// switches to `merge` (both created by the caller; their predecessors
+    /// are this gate's exits plus the caller's other paths, so they seal at
+    /// `seal_all_blocks`).
+    fn emit_typed_array_store_inline(
+        &mut self,
+        object: ClifValue,
+        key: ClifValue,
+        value: ClifValue,
+        legacy: Block,
+        merge: Block,
+    ) -> Result<(), Unsupported> {
+        if crux::typed_array::WORKERS {
+            self.builder.ins().jump(legacy, &[]);
+            return Ok(());
+        }
+        let tag = self.builder.create_block();
+        let probe = self.builder.create_block();
+        let loads = self.builder.create_block();
+        let key_range = self.builder.create_block();
+        let val_range = self.builder.create_block();
+        let ints = self.builder.create_block();
+        let store = self.builder.create_block();
+        self.builder.ins().jump(tag, &[]);
+        // Object tag: heap prefix + Object tag (same gate as the dense
+        // append — the object here may be a plain value).
+        self.builder.switch_to_block(tag);
+        let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
+        let is_heap = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+        let tag_bits = self.builder.ins().ushr_imm_u(object, 44);
+        let tag_bits = self.builder.ins().band_imm_u(tag_bits, 0xF);
+        let tag_obj =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, tag_bits, crux::TAG_OBJECT as i64);
+        let obj_ok = self.builder.ins().band(is_heap, tag_obj);
+        self.builder.ins().brif(obj_ok, probe, &[], legacy, &[]);
+        self.builder.seal_block(tag);
+        // The typed-array gate: the object's `typed_array` cell (the slots
+        // box base, or 0 when the object is not Integer-Indexed).
+        self.builder.switch_to_block(probe);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let slots_base = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, typed_array) as i32),
+        );
+        let slots_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+        self.builder.ins().brif(slots_ok, loads, &[], legacy, &[]);
+        self.builder.seal_block(probe);
+        // The geometry block: all the per-store loads issue together, right
+        // after the slots pointer is known, so their latencies overlap the
+        // key/value gates below. The element type (Uint8 only — a
+        // byte-valued Number writes its own byte), the buffer geometry from
+        // the shared BlockState box (the live data base; not
+        // detached/immutable/resizable — a helper that detaches, freezes, or
+        // resizes the buffer mid-run is picked up here), the view's fixed
+        // length, and the byte offset.
+        self.builder.switch_to_block(loads);
+        let slots_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let etype = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, element_type) as i32),
+        );
+        let is_u8 = self.builder.ins().icmp_imm_u(
+            IntCC::Equal,
+            etype,
+            crux::typed_array::ElementType::Uint8 as u8 as i64,
+        );
+        const STATE_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
+            + std::mem::offset_of!(crux::typed_array::SharedBuffer, state);
+        let state_addr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(STATE_OFFSET as i32),
+        );
+        let data = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            state_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, data) as i32),
+        );
+        let detached = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            state_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, detached) as i32),
+        );
+        let immutable = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            state_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, immutable) as i32),
+        );
+        let resizable = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            state_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, resizable) as i32),
+        );
+        let arr_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, array_length) as i32),
+        );
+        let byte_offset = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, byte_offset) as i32),
+        );
+        let clear = self.builder.ins().band_imm_u(detached, 1);
+        let clear = self.builder.ins().band(clear, immutable);
+        let clear = self.builder.ins().band(clear, resizable);
+        let clear_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, clear, 0);
+        let has_data = self.builder.ins().icmp_imm_u(IntCC::NotEqual, data, 0);
+        let geom_ok = self.builder.ins().band(is_u8, clear_ok);
+        let geom_ok = self.builder.ins().band(geom_ok, has_data);
+        self.builder
+            .ins()
+            .brif(geom_ok, key_range, &[], legacy, &[]);
+        self.builder.seal_block(loads);
+        // The key must be a real double in the canonical index range BEFORE
+        // any float-to-int conversion: the conversion would trap on the
+        // NaN-boxed bits of a heap value (a string key), so the range gate
+        // (which only a real f64 can pass — a heap value's bits decode as
+        // NaN) runs first, in its own block, before the fcvt in `ints`.
+        self.builder.switch_to_block(key_range);
+        let num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), key);
+        let zero = self.builder.ins().f64const(0.0);
+        let max = self.builder.ins().f64const(4294967295.0);
+        let ge0 = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::GreaterThanOrEqual, num, zero);
+        let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
+        let key_rng = self.builder.ins().band(ge0, lt_max);
+        self.builder
+            .ins()
+            .brif(key_rng, val_range, &[], legacy, &[]);
+        self.builder.seal_block(key_range);
+        // The value must be a real f64 in [0, 255] (a byte-valued Number).
+        // Object/Function/String values would run user code or a conversion
+        // in the coercion — the legacy helper performs those with the exact
+        // observable behavior. The range gate doubles as the is-double gate:
+        // non-double bits decode as NaN, which fails the range.
+        self.builder.switch_to_block(val_range);
+        let vnum = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), value);
+        let v255 = self.builder.ins().f64const(255.0);
+        let vge0 = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::GreaterThanOrEqual, vnum, zero);
+        let vle255 = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::LessThanOrEqual, vnum, v255);
+        let vrange = self.builder.ins().band(vge0, vle255);
+        self.builder.ins().brif(vrange, ints, &[], legacy, &[]);
+        self.builder.seal_block(val_range);
+        // The conversions + the final combine: the key/value integrality
+        // round trips (they reject 3.5 etc. — the conversions are trap-free
+        // here, the range gates already passed) and the index-vs-fixed-
+        // length bound.
+        self.builder.switch_to_block(ints);
+        let idx = self.builder.ins().fcvt_to_uint(types::I64, num);
+        let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
+        let key_int = self.builder.ins().fcmp(FloatCC::Equal, back, num);
+        let vbyte = self.builder.ins().fcvt_to_uint(types::I64, vnum);
+        let vback = self.builder.ins().fcvt_from_uint(types::F64, vbyte);
+        let val_int = self.builder.ins().fcmp(FloatCC::Equal, vback, vnum);
+        let len_ok = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, idx, arr_len);
+        let ok = self.builder.ins().band(key_int, val_int);
+        let ok = self.builder.ins().band(ok, len_ok);
+        self.builder.ins().brif(ok, store, &[], legacy, &[]);
+        self.builder.seal_block(ints);
+        // The store: one byte at data + byte_offset + index.
+        self.builder.switch_to_block(store);
+        let base = self.builder.ins().iadd(data, byte_offset);
+        let addr = self.builder.ins().iadd(base, idx);
+        let byte = self.builder.ins().ireduce(types::I8, vbyte);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), byte, addr, Offset32::new(0));
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(store);
+        Ok(())
+    }
+
     /// Cut 36: the direct-mapped global-value fast-cell read (the inline
     /// `LoadGlobal` kernel): validate the cell's name and captured version
     /// against the global object's LIVE identity/generation (re-read from
@@ -2980,19 +3221,27 @@ impl<'a> Lowerer<'a> {
                     // `slots.length`, then run the stateful append through
                     // the narrow `dense_array_append` helper (extensibility,
                     // chain-clean, push, length + mirror, generation). The
-                    // typed-array / in-place-update / hole-fill / spill
-                    // shapes fall through to `fast_array_element_write`, and
-                    // anything else to `assign_member_computed` — the
-                    // fallback re-runs the checks and the [[Set]] machinery
-                    // correctly (nothing observable ran on the fast paths).
-                    let legacy = self.builder.create_block();
+                    // in-place-update / hole-fill / spill shapes and the
+                    // typed-array stores fall through to the inline typed
+                    // gate / `fast_array_element_write`, and anything else to
+                    // `assign_member_computed` — the fallback re-runs the
+                    // checks and the [[Set]] machinery correctly (nothing
+                    // observable ran on the fast paths).
+                    let ta_gate = self.builder.create_block();
+                    let fast = self.builder.create_block();
                     let fallback = self.builder.create_block();
                     let merge = self.builder.create_block();
-                    self.emit_dense_array_append_inline(object, key, value, legacy, merge)?;
+                    self.emit_dense_array_append_inline(object, key, value, ta_gate, merge)?;
+                    // The machine typed-array store (gap-close M5c): a fixed
+                    // Uint8Array element store with a byte-valued Number key
+                    // + value writes the byte straight into the block; the
+                    // other typed-array shapes fall to the legacy helper.
+                    self.builder.switch_to_block(ta_gate);
+                    self.emit_typed_array_store_inline(object, key, value, fast, merge)?;
                     // The legacy helper: typed arrays, in-place updates,
                     // hole-fills, spilled/non-dense arrays, and non-canonical
-                    // keys (the pre-existing inline dense-array store).
-                    self.builder.switch_to_block(legacy);
+                    // keys (the pre-existing inline element-store fast path).
+                    self.builder.switch_to_block(fast);
                     let ok = self.emit_raw_call(
                         self.sig_binary,
                         Helper::FastArrayElementWrite,
@@ -3000,7 +3249,7 @@ impl<'a> Lowerer<'a> {
                     )?;
                     let hit = self.builder.ins().icmp_imm_u(IntCC::Equal, ok, 1);
                     self.builder.ins().brif(hit, merge, &[], fallback, &[]);
-                    self.builder.seal_block(legacy);
+                    self.builder.seal_block(fast);
                     self.builder.switch_to_block(fallback);
                     self.call_slow(
                         self.sig_assign,
@@ -5302,20 +5551,24 @@ impl<'a> Lowerer<'a> {
                 let key = self.leaf_operand(step, op_index, 3, key)?;
                 let value = self.leaf_operand(step, op_index, 4, value)?;
                 // The inline dense-array append gate (shared with the step
-                // path, gap-close M1 C); the legacy path is the full
+                // path, gap-close M1 C), then the machine typed-array store
+                // (gap-close M5c); the remaining path is the full
                 // `SetMemberComputed` slow call (the register executor
                 // discards the store's result, so no push/merge value).
-                let legacy = self.builder.create_block();
+                let ta_gate = self.builder.create_block();
+                let slow = self.builder.create_block();
                 let merge = self.builder.create_block();
-                self.emit_dense_array_append_inline(object, key, value, legacy, merge)?;
-                self.builder.switch_to_block(legacy);
+                self.emit_dense_array_append_inline(object, key, value, ta_gate, merge)?;
+                self.builder.switch_to_block(ta_gate);
+                self.emit_typed_array_store_inline(object, key, value, slow, merge)?;
+                self.builder.switch_to_block(slow);
                 self.call_slow(
                     self.sig_set_comp,
                     Helper::SetMemberComputed,
                     &[object, key, value],
                 )?;
                 self.builder.ins().jump(merge, &[]);
-                self.builder.seal_block(legacy);
+                self.builder.seal_block(slow);
                 self.builder.switch_to_block(merge);
             }
             LeafOp::GetMemberName { name } => {
