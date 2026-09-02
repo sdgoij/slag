@@ -156,6 +156,18 @@ for-of/destructure state calls a leaf:
   decide its leaf safety explicitly — the default for anything touching
   `agent.running_context()` or `try_stack`/`pending`/`for_of_*`/
   `for_in_stack`/`destructure_*`/`env_stack` is exclusion.
+- **`Break`/`Continue` are excluded from leaves (2026-09-02).** The
+  COMPILED (JIT) leaf run of a certified body whose fast/general loop
+  contains a transfer OUT of the loop corrupted the CALLER when the leaf
+  was inlined onto its Vm: the statement after the call blanked output,
+  called the wrong function, or panicked with an args-boundary underflow.
+  The interpreter's in-place leaf routes breaks through
+  `control_transfer` correctly (the "leaf's own Break/Continue are safe"
+  reasoning below holds for `run_leaf_body`, not the machine code's
+  loop-exit path), so the fix was to reject the steps in `steps_are_leaf`
+  outright — such bodies run the general path (their own frame/buffer),
+  which is exact. A switch's breaks never reach a leaf (the switch steps
+  are excluded anyway).
 - **`can_inline_leaf` guards the call site, not the body**: the caller's
   stacks must be EMPTY and the env chain at rest — `try_stack`, `pending`,
   `for_of_stack`, `for_of_boundaries`, `for_in_stack`,
@@ -500,6 +512,19 @@ restores too).
   `FastLoopBind`/`FastLoopStore` are emitted with the SLOT/Global var (they
   move the counter between the field and the binding); `Counter` appears
   only in `FastLoopHead`.
+- **Labeled transfers OUT of the loop are not acc-safe (2026-09-02).**
+  The acc path syncs the counter to its binding with a single
+  `FastLoopStore` at the loop's END step, so a `break`/`continue` to a
+  label OUTSIDE the body (the loop's own label or an enclosing label)
+  jumps past the sync — the binding then keeps its pre-loop value,
+  observable after the transfer (`outer: for (var i = 0; i < n; i++) {
+  ... break outer; }` leaves i = 0). `compile_for`'s acc decision now
+  also requires `acc_body_label_transfers_inside(body)` (every labeled
+  transfer in the body must target a label declared INSIDE it) and falls
+  back to the slot path, whose head writes the binding every iteration.
+  Unlabeled breaks/continues stay acc-safe (they land at the loop's own
+  end/continue steps, before/at the sync). This is the compile-side
+  counterpart of the section-7 leaf exclusion for `Break`/`Continue`.
 
 ## 13. The loop counter is a raw f64 — the acc-path gates admit only Numbers (Cut 35 slice 22)
 

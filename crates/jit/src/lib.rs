@@ -1826,6 +1826,65 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_labeled_break_out_of_an_acc_loop_syncs_the_counter() {
+        // Cut 17 acc-path + the Break leaf exclusion: a labeled
+        // `break`/`continue` to a label outside the loop body jumps past the
+        // acc path's single end-step `FastLoopStore`, so such bodies now
+        // fall back to the slot path (whose head writes the binding every
+        // iteration) — after `break outer`, i must be 5, not the pre-loop 0.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { var s = 0; outer: for (var i = 0; i < 10; i++) { s += i; if (i === 5) break outer; } return s * 100 + i; }\n\
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_number(),
+            Some(1505.0),
+            "f() completion was {value:?}"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+
+        // The labeled-`continue` variant: an inner var-head loop jumps to
+        // an enclosing loop's continue, skipping the inner loop's own end
+        // step — j must be 2 (its value when the continue fired).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function g() { var s = 0; outer: for (var i = 2; i >= 0; i--) { for (var j = 0; j < 10; j++) { if (j === 2) continue outer; s++; } } return s * 10 + j; }\n\
+                     g();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(62.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_break_out_of_a_fast_loop_does_not_corrupt_the_caller() {
+        // The Break leaf exclusion: a leaf-inlined compiled run of a body
+        // with a break out of a fast loop left the caller's Vm inconsistent
+        // (the counter's single end-step sync was skipped on the break
+        // dispatch path) — the call after the leaf returned wrong / blank
+        // output. Such bodies now run the general path (their own
+        // frame/buffer), which is exact: the plain-break loop returns its
+        // sum and a later call is unaffected.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function q() { var s = 0; for (var i = 0; i < 10; i++) { if (i === 5) break; s += i; } return s; }\n\
+                     function after() { return 7; }\n\
+                     q() * 100 + after();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1007.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_runs_a_loop_with_member_calls() {
         // The general path: `f`'s body contains a plain `CallFast` (a loop
         // calling `o.f(i)`), so it is certified but not a leaf — it runs

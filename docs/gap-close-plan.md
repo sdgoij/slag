@@ -447,17 +447,27 @@ bodies, member-left/`<=`/`>=` forms, alias reads, nested loops,
 Float64, zero-length) agrees between JIT and the interpreter with
 hand-traced results.
 
-Two PRE-EXISTING compiler bugs surfaced in the differential (both
-reproduce on clean HEAD, outside M6's scope, tracked as follow-ups):
-(1) the fused canonical loop's `break`/`continue` corruption — a fused
-body with a `break` corrupts the machine state (blank output /
-"Construct without an argument boundary"), `continue` hangs — which is
-why the slice's body purity rejects out-of-body transfers (the hoist
-must not fire on such bodies); (2) `var`-head counter loops that read
-array elements with a non-canonical test shape (`for (var k = ta.length
-- 1; k >= 0; k--) s += ta[k]` and `for (var k = 0; ta.length > k; k++)
-s += ta[k]`) return 0 in both modes — the accumulator-counter
-certification misfires on those shapes.
+Both follow-up bugs were investigated and FIXED (2026-09-02): (1) the
+JIT leaf-inlined run of a certified body whose fast/general loop
+contains a `break`/`continue` out of the loop corrupted the CALLER (the
+call after the leaf returned blank output / hit wrong functions — the
+machine-state symptom the slice's body purity had avoided, reached by
+the plain fused loop) — `steps_are_leaf` now excludes `Break`/
+`Continue`, so such bodies run the general path with their own
+frame/buffer, which is exact; (2) the acc path syncs its counter to the
+binding with a single `FastLoopStore` at the loop's END step, and a
+labeled `break`/`continue` to a label OUTSIDE the body jumps past that
+step — the binding then keeps its pre-loop value, observable after the
+transfer (`outer: for (var k = 0; k < n; k++) { ... break outer; }`
+leaves k = 0) — the acc decision now rejects bodies whose labeled
+transfers leave the loop (`acc_body_label_transfers_inside`), falling
+back to the slot path, whose head writes the binding every iteration.
+The doc's original "Bug 2" — element-read counter loops with a
+non-canonical test shape (`k >= 0`, `ta.length > k`) returning 0 in
+both modes — was a differential ARTIFACT, not a defect: those
+differential cases summed a ZERO-FILLED `new Uint8Array(1000)`, so 0
+was correct; with a filled array both shapes compute correctly in JIT
+and jitless.
 
 Body-read hoisting (length row 3.2→2.0ms, the last 1.2ms) is M6 slice
 3: compile member reads of `RECV.length` in the fast body as

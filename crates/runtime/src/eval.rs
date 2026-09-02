@@ -4493,6 +4493,52 @@ mod tests {
     }
 
     #[test]
+    fn acc_path_labeled_transfers_out_sync_the_counter_binding() {
+        // Cut 17 acc-path: the counter lives in `loop_counter` and the
+        // compiler syncs it back to the binding with a single
+        // `FastLoopStore` at the loop's END step. A labeled break/continue
+        // to a label declared OUTSIDE the loop body (the loop's own label
+        // or an enclosing label) jumps past that step, which used to leave
+        // the binding at its pre-loop value (0) — observable after the
+        // transfer. Such bodies now fall back to the slot path (the head
+        // writes the binding every iteration), so the exit values are
+        // correct: s = 15 with i = 5.
+        assert_eq!(
+            run("function f() { var s = 0; outer: for (var i = 0; i < 10; i++) { s += i; if (i === 5) break outer; } return s * 100 + i; } f()")
+                .unwrap(),
+            Value::Number(1505.0)
+        );
+        // Labeled `continue` to an enclosing loop from an inner var-head
+        // loop: the inner counter j = 2 when the continue fires.
+        assert_eq!(
+            run("function g() { var s = 0; outer: for (var i = 2; i >= 0; i--) { for (var j = 0; j < 10; j++) { if (j === 2) continue outer; s++; } } return s * 10 + j; } g()")
+                .unwrap(),
+            Value::Number(62.0)
+        );
+        // A label wrapping a BLOCK around the loop: `break outer` skips the
+        // loop's own end entirely.
+        assert_eq!(
+            run("function h() { var s = 0; outer: { for (var i = 0; i < 10; i++) { s += i; if (i === 5) break outer; } } return s * 100 + i; } h()")
+                .unwrap(),
+            Value::Number(1505.0)
+        );
+        // A labeled transfer to a label declared INSIDE the body stays on
+        // the fast path and is exact (the break lands before the end step).
+        assert_eq!(
+            run("function k() { var s = 0; for (var i = 0; i < 10; i++) { lab: { if (i === 5) break lab; s += i; } } return s; } k()")
+                .unwrap(),
+            Value::Number(40.0)
+        );
+        // `continue` to the loop's OWN label also leaves the binding
+        // correct on every exit (the acc gate rejects it conservatively).
+        assert_eq!(
+            run("function m() { var s = 0; outer: for (var i = 0; i < 10; i++) { if (i === 5) continue outer; s += i; } return s * 100 + i; } m()")
+                .unwrap(),
+            Value::Number(4010.0)
+        );
+    }
+
+    #[test]
     fn cut4_fused_test_coerces_and_skips_compound() {
         // The fused comparison keeps the general abstract semantics: a
         // string slot value coerces numerically against the Number literal.

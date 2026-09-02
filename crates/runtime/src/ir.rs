@@ -14061,6 +14061,13 @@ impl Compiler {
                         // path handles non-Number counters).
                         && for_init_counter_number(init, name)
                         && self.acc_body_safe(body, name)
+                        // The acc path syncs the counter to the binding only
+                        // at the loop's end step, so a body that can
+                        // transfer to a label outside the loop (a labeled
+                        // break/continue to an enclosing label — past that
+                        // step) must stay on the slot path, whose head
+                        // writes the binding every iteration.
+                        && acc_body_label_transfers_inside(body)
                     {
                         // The counter prologue loads the binding (just
                         // written by the loop init) into the accumulator
@@ -17321,6 +17328,22 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 // `UpdatePerIteration` target its own captured per-iteration
                 // env through `lexical_env`, which the inline run sets; the
                 // env-CREATING steps above stay excluded.
+                // `Break`/`Continue` (gap-close M6 follow-up): a leaf's
+                // compiled run keeps the fused-loop counter in machine state
+                // synced to the binding by a single `FastLoopStore` at the
+                // loop's end step, and a transfer out of the loop — a `break`
+                // to the loop end or a labeled `break`/`continue` to an
+                // enclosing label — jumps the machine code past that step
+                // mid-run, leaving the caller's Vm inconsistent when the body
+                // is leaf-inlined (the JIT leaf run of such a body corrupted
+                // the caller: blank output / wrong calls after the leaf
+                // returned). A switch's breaks never reach a leaf (the
+                // switch steps are excluded below); the leaf-eligible
+                // transfers all exit the body's own loop or label, so such
+                // bodies run the general path (their own frame/buffer),
+                // which is exact.
+                | Step::Break { .. }
+                | Step::Continue { .. }
                 // Iterator machinery: protocol calls plus the for-of/for-in
                 // stacks the caller's break/return/throw paths close.
                 | Step::ForInBegin
@@ -21802,6 +21825,49 @@ fn acc_stmt_safe(stmt: &Stmt, name: crux::AtomId) -> bool {
         | StmtKind::ForIn { .. }
         | StmtKind::UsingDecl { .. } => false,
     }
+}
+
+/// Whether every labeled `break`/`continue` in an accumulator-path loop body
+/// targets a label declared INSIDE the body. The acc path keeps the counter
+/// in the `loop_counter` field and syncs it back to the binding with a
+/// single `FastLoopStore` at the loop's END step; a labeled transfer to a
+/// label outside the body (the loop's own label or an enclosing label) jumps
+/// past that step, leaving the binding with its pre-loop value — observable
+/// after the transfer. Unlabeled transfers always target the innermost
+/// breakable construct inside the body or the loop itself, so they land at
+/// or before the end step and are safe. Nested function bodies are not
+/// walked: their breaks/continues can never reach this loop (an early error
+/// if they cross a function boundary).
+fn acc_body_label_transfers_inside(body: &Stmt) -> bool {
+    fn walk(stmt: &Stmt, enclosing: &HashSet<crux::AtomId>) -> bool {
+        match &stmt.kind {
+            StmtKind::Block(block) => block.stmts.iter().all(|s| walk(s, enclosing)),
+            StmtKind::Labeled { label, body } => {
+                let mut labels = enclosing.clone();
+                labels.insert(*label);
+                walk(body, &labels)
+            }
+            StmtKind::If {
+                consequent,
+                alternate,
+                ..
+            } => {
+                walk(consequent, enclosing)
+                    && alternate.as_deref().is_none_or(|s| walk(s, enclosing))
+            }
+            StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => walk(body, enclosing),
+            StmtKind::For { body, .. } | StmtKind::ForOf { body, .. } => walk(body, enclosing),
+            StmtKind::Break(Some(label)) | StmtKind::Continue(Some(label)) => {
+                enclosing.contains(label)
+            }
+            StmtKind::Break(None) | StmtKind::Continue(None) => true,
+            // Function/class declarations and the remaining statement kinds
+            // hold no transfers that can reach this loop (or are rejected
+            // from acc bodies by `acc_stmt_safe` anyway), so they are safe.
+            _ => true,
+        }
+    }
+    walk(body, &HashSet::new())
 }
 
 /// Whether an expression subtree uses the loop counter safely for the
