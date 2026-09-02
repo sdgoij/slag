@@ -11517,17 +11517,20 @@ enum Fixup {
     AsyncYieldStarResume(usize, usize, usize, usize),
 }
 
-/// Cut 50: the largest plain-argument count compiled as the fast
+/// Cut 50/M2: the largest plain-argument count compiled as the fast
 /// `CallFast`/`TailCallFast` form (`[this, callee, a1..aN]` on the stack,
 /// no argument-vector machinery). More arguments — or any spread — take the
 /// vector form (`ArgsBase`/`ArgsPush`/`ArgsSpread` + the vector
 /// `Call`/`TailCall`). The `argc` field is `u8`, and the JIT's in-frame leaf
 /// probe handles any count that fits the working buffer; the two `[Value;
 /// FAST_CALL_MAX_ARGS]` stack buffers (`do_call_apply`, `run_inline_leaf`)
-/// grow with it, so the cap is a stack-size tradeoff (32 is the common
-/// wider-arg leaf ceiling — the 33-arg `--jit-bench` vector row sits just
-/// above it).
-const FAST_CALL_MAX_ARGS: usize = 32;
+/// grow with it, so the cap is a stack-size tradeoff. 64 was measured
+/// (gap-close M2, 2026-09-02): the 33-arg wide call at the fast form runs
+/// ~29x faster in the JIT and ~1.9x faster interpreted than the vector form
+/// (jit 1ms vs 29ms, interp 22ms vs 42ms per 200K — the vector form's
+/// `ArgsBase`/`ArgsPush` per-arg protocol and the `split_off` rebuild were
+/// the cost). 65+ plain args still take the vector form.
+const FAST_CALL_MAX_ARGS: usize = 64;
 
 #[derive(Debug)]
 enum Scope {

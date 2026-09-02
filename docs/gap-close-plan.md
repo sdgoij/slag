@@ -163,6 +163,23 @@ always takes this path).
 - **Risk:** low-medium — the interpreter already builds this exact
   layout; the change is where it is built.
 
+**Status (2026-09-02): the fast-argument cap was raised 32 → 64 (the
+8→16→32 pattern), delivering the measured win.** Isolated A/B (200K
+calls, same loop shape): the 32-arg fast form runs ~29x faster than the
+33-arg vector form in the JIT (1ms vs 29ms) and ~1.9x interpreted (22ms
+vs 42ms) — the vector form's `ArgsBase`/`ArgsPush` per-arg protocol
+(~35 FFI calls per call in the JIT) and the `split_off` rebuild were the
+cost. With the cap at 64, the 33-arg row takes the one-step fast form:
+**`vector leaf call` (renamed `wide leaf call`) interp 42→21ms (2.1x),
+jit 29→3.2ms (9x)**, no other row moved. The two `[Value;
+FAST_CALL_MAX_ARGS]` buffers (`do_call_apply`, `run_inline_leaf`) grow to
+512B each. Tests updated: `wide_fast_form_calls_stay_spec_exact` gained
+33-arg (fast) and 65-arg (vector) cases, and the two vector e2e tests
+(self tail call, tail-call chain) moved to 65 args so they still exercise
+the vector machinery above the cap. Clippy clean, workspace tests green.
+The remaining slow shape is a 65+-arg plain call (still the vector
+form) — the in-stack-vector follow-up if it matters.
+
 ### M3 — Single fused member-read probe (interp)
 
 `member_cell_get` probes the map fast path (`member_cell_get_map`), then

@@ -1136,11 +1136,10 @@ mod tests {
 
     #[test]
     fn wide_fast_form_calls_stay_spec_exact() {
-        // `FAST_CALL_MAX_ARGS` covers plain calls up to 32 arguments (the
-        // `--jit-bench` vector row moved to 33 args to stay on the vector
-        // form): the fast `[this, callee, a1..aN]` layout passes every
-        // argument, a 33+-arg call still takes the vector form, and a
-        // spread stays vector.
+        // `FAST_CALL_MAX_ARGS` covers plain calls up to 64 arguments
+        // (gap-close M2): the fast `[this, callee, a1..aN]` layout passes
+        // every argument, a 65+-arg call or a spread stays on the vector
+        // form.
         assert_eq!(
             value(
                 "var f = function (a, b, c, d, e, g, h, k, l) { return a + b + c + d + e + g + h + k + l; }; \
@@ -1156,7 +1155,7 @@ mod tests {
             ),
             Value::Number(136.0)
         );
-        // The vector form above the cap.
+        // The fast form at width (33 args — inside the cap since M2).
         assert_eq!(
             value(
                 "var f = function (a, b, c, d, e, g, h, k, l, m, n, o, p, q, r, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I, J, K) { \
@@ -1164,6 +1163,13 @@ mod tests {
                  f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33)"
             ),
             Value::Number(561.0)
+        );
+        // The vector form above the cap (65 plain args).
+        assert_eq!(
+            value(
+                "var f = function (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12) { return a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s + t + u + v + w + x + y + z + A + B + C + D + E + F + G + H + I + J + K + L + M + N + O + P + Q + R + S + T + U + V + W + X + Y + Z + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12; }; f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65)"
+            ),
+            Value::Number(2145.0)
         );
         // Missing args stay undefined and the arguments object sees every
         // fast-form argument.

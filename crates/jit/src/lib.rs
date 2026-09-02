@@ -1627,21 +1627,17 @@ mod tests {
 
     #[test]
     fn installed_jit_runs_a_vector_self_tail_call() {
-        // Cut 51: a self-tail-call with 33 plain arguments (beyond the fast
-        // form's `FAST_CALL_MAX_ARGS` cap) compiles to the vector self-jump
-        // — the whole recursive chain runs in ONE machine-code invocation
-        // with a bounded native stack.
+        // Cut 51/M2: a self-tail-call with 65 plain arguments (beyond the
+        // fast form's `FAST_CALL_MAX_ARGS` cap of 64) compiles to the
+        // vector self-jump — the whole recursive chain runs in ONE
+        // machine-code invocation with a bounded native stack.
         let (value, compiled) = with_jit_agent(|agent| {
-            agent
-                .run_script(
-                    "\"use strict\"; (function f(n, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I) { \
-                     return n ? f(n - 1, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I) : \
-                     a + b + c + d + e + g + h + i + j + k + l + m + o + p + q + r + s + t + u + v + w + x + y + z + A + B + C + D + E + F + G + H + I; \
-                     }(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33));",
-                )
-                .expect("runs")
+            agent.run_script(
+                "\"use strict\"; (function f(n, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14) { return n ? f(n - 1, a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14) : a + b + c + d + e + g + h + i + j + k + l + m + o + p + q + r + s + t + u + v + w + x + y + z + A + B + C + D + E + F + G + H + I + J + K + L + M + N + O + P + Q + R + S + T + U + V + W + X + Y + Z + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14; }(50000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65));",
+            )
+            .expect("runs")
         });
-        assert_eq!(value.as_number(), Some(561.0));
+        assert_eq!(value.as_number(), Some(2145.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 
@@ -2118,20 +2114,16 @@ mod tests {
 
     #[test]
     fn installed_jit_runs_a_vector_tail_call_chain() {
-        // Cut 49: a >`FAST_CALL_MAX_ARGS` tail call compiles through the
-        // vector `TailCall` — the 100K-deep chain runs with bounded stack.
+        // Cut 49/M2: a >`FAST_CALL_MAX_ARGS` (64) tail call compiles through
+        // the vector `TailCall` — the 100K-deep chain runs with bounded
+        // stack.
         let (value, compiled) = with_jit_agent(|agent| {
-            agent
-                .run_script(
-                    "\"use strict\";\n\
-                     function g(n, a, b, c, d, e, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I) { \
-                       if (n === 0) { return a + b + c + d + e + h + i + j + k + l + m + o + p + q + r + s + t + u + v + w + x + y + z + A + B + C + D + E + F + G + H + I; } \
-                       return g(n - 1, a + 1, b, c, d, e, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I); }\
-                     g(100000, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);",
-                )
-                .expect("runs")
+            agent.run_script(
+                "\"use strict\"; function g(n, a, b, c, d, e, f, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13) { if (n === 0) { return a + b + c + d + e + f + h + i + j + k + l + m + o + p + q + r + s + t + u + v + w + x + y + z + A + B + C + D + E + F + G + H + I + J + K + L + M + N + O + P + Q + R + S + T + U + V + W + X + Y + Z + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13; } return g(n - 1, a + 1, b, c, d, e, f, h, i, j, k, l, m, o, p, q, r, s, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13); } g(100000, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63);",
+            )
+            .expect("runs")
         });
-        assert_eq!(value.as_number(), Some(100496.0));
+        assert_eq!(value.as_number(), Some(102016.0));
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

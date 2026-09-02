@@ -518,7 +518,7 @@ fn run_jit_benchmarks() -> Result<(), u8> {
             "function bench(ta) { var s = 0; for (var k = 0; k < ta.length; k++) { s += ta.length; } return s; } bench(new Uint8Array(800000));",
         ),
         (
-            "vector leaf call",
+            "wide leaf call",
             "function bench(f) { var s = 0; for (var i = 0; i < 200000; i++) { s += f(i, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33); } return s; } bench(function (a, b, c, d, e, g, h, k, l, m, n, o, p, q, r, t, u, v, w, x, y, z, A, B, C, D, E, F, G, H, I, J, K) { return a + 1; });",
         ),
         (
