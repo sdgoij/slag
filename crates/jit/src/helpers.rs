@@ -71,6 +71,10 @@ pub enum Helper {
     /// intrinsic check and, on a match, the direct call of the receiver with
     /// the `this` argument and the `CreateListFromArrayLike` element reads.
     CallApply,
+    /// M10: the compiled `CallApply` fast path's dense-`argArray` element
+    /// fill — copies the array's elements into the JIT buffer at the passed
+    /// address and returns the element count (`u64::MAX` = not fast).
+    ApplyArgsFill,
     TailCallVector,
     TailCallSelfVector,
     ArrayBegin,
@@ -194,6 +198,7 @@ impl Helper {
             Helper::ArgsSpread => "args_spread",
             Helper::CallVector => "call_vector",
             Helper::CallApply => "call_apply",
+            Helper::ApplyArgsFill => "apply_args_fill",
             Helper::TailCallVector => "tail_call_vector",
             Helper::TailCallSelfVector => "tail_call_self_vector",
             Helper::ArrayBegin => "array_begin",
@@ -288,6 +293,7 @@ impl Helper {
             self,
             Helper::TdzError
                 | Helper::LeafCallProbe
+                | Helper::ApplyArgsFill
                 | Helper::ToBooleanSlow
                 | Helper::ConcatStrings
                 | Helper::LoadContext
@@ -517,6 +523,11 @@ pub struct JitHelpers {
             kind: u64,
         ) -> u64,
     >,
+    /// M10: the compiled `CallApply` fast path's dense-`argArray` element
+    /// fill (see `Helper::ApplyArgsFill`): copies the element bits into the
+    /// JIT buffer at `dest` and returns the element count, or `u64::MAX`
+    /// when the array is not fast (nothing written).
+    pub apply_args_fill: Option<extern "C" fn(vm: *mut c_void, arg_array: u64, dest: u64) -> u64>,
     pub tail_call_vector:
         Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
     /// Cut 51: the vector-form self-tail-call (`Step::TailCallSelfVector`,
@@ -728,6 +739,7 @@ impl JitHelpers {
             args_spread: None,
             call_vector: None,
             call_apply: None,
+            apply_args_fill: None,
             tail_call_vector: None,
             tail_call_self_vector: None,
             array_begin: None,
@@ -854,6 +866,7 @@ impl JitHelpers {
             Helper::ArgsSpread => self.args_spread.map(|f| f as usize as u64),
             Helper::CallVector => self.call_vector.map(|f| f as usize as u64),
             Helper::CallApply => self.call_apply.map(|f| f as usize as u64),
+            Helper::ApplyArgsFill => self.apply_args_fill.map(|f| f as usize as u64),
             Helper::TailCallVector => self.tail_call_vector.map(|f| f as usize as u64),
             Helper::TailCallSelfVector => self.tail_call_self_vector.map(|f| f as usize as u64),
             Helper::ArrayBegin => self.array_begin.map(|f| f as usize as u64),
@@ -1702,6 +1715,21 @@ pub(crate) extern "C" fn test_call_apply(
             .unwrap_or(0.0);
     }
     Value::Number(sum).bits()
+}
+
+/// The `apply_args_fill` ABI proof: writes `n` elements (1..=n) to `dest`
+/// when the `arg_array` argument is the number `n` and returns `n` — the
+/// compiled `CallApply` fast path's dense-fill test double never runs
+/// against a real array, so the count/pointer convention is what matters.
+#[cfg(test)]
+pub(crate) extern "C" fn test_apply_args_fill(_vm: *mut c_void, arg_array: u64, dest: u64) -> u64 {
+    let count = Value::from_bits(arg_array).as_number().unwrap_or(0.0) as usize;
+    let dest = dest as *mut u64;
+    for i in 0..count {
+        // SAFETY: the test harness passes a buffer with `count` slots.
+        unsafe { *dest.add(i) = Value::Number((i + 1) as f64).bits() };
+    }
+    count as u64
 }
 
 #[cfg(test)]

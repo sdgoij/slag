@@ -1426,6 +1426,11 @@ pub struct CompiledBody {
     /// internal iterations, so a pure call-count threshold would never
     /// promote them.
     pub has_loop: bool,
+    /// M10: whether the body contains a `Step::CallApply` site. The JIT's
+    /// per-run context snapshots the realm's `apply`/`call` intrinsic bits
+    /// only for such bodies (the snapshot costs a realm + intrinsics read
+    /// per run, which every other compiled run would otherwise pay).
+    pub has_call_apply: bool,
 }
 
 impl Trace for CompiledBody {
@@ -9906,6 +9911,14 @@ impl Vm {
             let current = agent.running_context()?.lexical_environment;
             matches!(&*current, EnvRecord::Global(_)) && current.outer().is_none()
         };
+        // M10: a leaf body can contain a `CallApply` site (the step is not
+        // call-excluded), so the compiled site needs the realm's intrinsic
+        // bits when the leaf has one; a leaf without one skips the read.
+        let (apply_builtin_bits, call_builtin_bits) = if ir.has_call_apply {
+            crate::jit::call_apply_intrinsic_bits(agent)
+        } else {
+            (0, 0)
+        };
         let mut ctx = crate::jit::JitCallContext {
             pending: false,
             error: None,
@@ -9923,6 +9936,8 @@ impl Vm {
             body: std::rc::Rc::as_ptr(ir),
             tail: false,
             current_function: 0,
+            apply_builtin_bits,
+            call_builtin_bits,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -16902,6 +16917,15 @@ pub(crate) fn body_has_loop(steps: &[Step]) -> bool {
     false
 }
 
+/// Whether the body contains a `Step::CallApply` site (M10): the JIT's
+/// per-run context snapshots the realm's `apply`/`call` intrinsic bits
+/// only for bodies with one.
+pub(crate) fn body_has_call_apply(steps: &[Step]) -> bool {
+    steps
+        .iter()
+        .any(|step| matches!(step, Step::CallApply { .. }))
+}
+
 /// Cut 25: whether `step` is safe to run on the CALLER's Vm (a certified
 /// body whose every step allows it is a *leaf* — see [`CompiledBody::leaf`]).
 /// Every step that re-enters the VM with a fresh frame (calls/constructs),
@@ -17751,6 +17775,7 @@ pub fn compile_body(
         None
     };
     let has_loop = body_has_loop(&compiler.steps);
+    let has_call_apply = body_has_call_apply(&compiler.steps);
     Ok((
         CompiledBody {
             steps: compiler.steps,
@@ -17766,6 +17791,7 @@ pub fn compile_body(
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             has_loop,
+            has_call_apply,
         },
         compiler.this_writes,
     ))
@@ -17826,6 +17852,7 @@ pub fn compile_statements(
     }
     compiler.resolve();
     let has_loop = body_has_loop(&compiler.steps);
+    let has_call_apply = body_has_call_apply(&compiler.steps);
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
@@ -17842,6 +17869,7 @@ pub fn compile_statements(
         jit_info: std::cell::Cell::new(0),
         jit_calls: std::cell::Cell::new(0),
         has_loop,
+        has_call_apply,
     })
 }
 

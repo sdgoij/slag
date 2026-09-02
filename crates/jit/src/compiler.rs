@@ -41,8 +41,8 @@ use runtime::ir::{
     RegOperand, RelLimit, ScopeInfo, Step, is_compound_assign,
 };
 use runtime::jit::{
-    AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JitCallContext, LEAF_CALL_CACHE_ENTRIES,
-    LeafCallSiteCache, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL,
+    AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JIT_APPLY_MAX_ARGS, JitCallContext,
+    LEAF_CALL_CACHE_ENTRIES, LeafCallSiteCache, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL,
     VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
     VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
     VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_PENDING_LEN_OFFSET,
@@ -196,8 +196,14 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
                 depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
             }
             // The compiled apply/call step pops the same region and pushes
-            // the result.
+            // the result. M10: the intrinsic fast path additionally copies a
+            // dense `argArray`'s elements (up to `JIT_APPLY_MAX_ARGS` slots)
+            // above the current stack top before the in-frame leaf run —
+            // reserve the room or the copy always bails to the slow path
+            // (the leaf's own frame/work fit in the slack beyond the
+            // reserve, and the probe rejects a larger leaf).
             Step::CallApply { argc, .. } => {
+                max = max.max(depth + JIT_APPLY_MAX_ARGS);
                 depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
             }
             // The vector form (Cut 49): `ArgsPush`/`ArgsSpread` consume the
@@ -625,6 +631,9 @@ struct Lowerer<'a> {
     /// The `(vm, resolved, callee, argc, args_ptr, kind) -> value` signature
     /// of `call_apply` (the compiled `Step::CallApply`).
     sig_call_apply: SigRef,
+    /// M10: the `(vm, arg_array, dest) -> count` signature of the compiled
+    /// `CallApply` fast path's dense-element fill (`apply_args_fill`).
+    sig_apply_args: SigRef,
     sig_assign: SigRef,
     /// The `(vm, step_index) -> value` signature: the closure/RegExp helpers
     /// read their step's payload back out of the running body instead of
@@ -717,6 +726,7 @@ impl<'a> Lowerer<'a> {
         let sig_call = builder.import_signature(helper_sig(&[types::I64; 5], conv));
         let sig_call_slow = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_call_apply = builder.import_signature(helper_sig(&[types::I64; 6], conv));
+        let sig_apply_args = builder.import_signature(helper_sig(&[types::I64; 3], conv));
         let sig_assign = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_step = builder.import_signature(helper_sig(&[types::I64; 2], conv));
         let sig_tail = builder.import_signature(helper_sig(&[types::I64; 6], conv));
@@ -810,6 +820,7 @@ impl<'a> Lowerer<'a> {
             sig_call,
             sig_call_slow,
             sig_call_apply,
+            sig_apply_args,
             sig_assign,
             sig_step,
             sig_tail,
@@ -1878,12 +1889,11 @@ impl<'a> Lowerer<'a> {
         callee: ClifValue,
         this: ClifValue,
         args_ptr: ClifValue,
-        argc: usize,
+        argc: ClifValue,
         pre_call_sp: ClifValue,
         direct_eval: bool,
         emit_fall_through: bool,
     ) -> Result<(), Unsupported> {
-        let argc_imm = self.builder.ins().iconst(types::I64, argc as i64);
         let ctx = self.vm();
         let cache = self
             .builder
@@ -2022,10 +2032,11 @@ impl<'a> Lowerer<'a> {
             ),
         );
         let fs_eq_ar = self.builder.ins().icmp(IntCC::Equal, frame_size, arity);
+        let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
         let argc_ge_fs =
             self.builder
                 .ins()
-                .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, frame_size, argc as i64);
+                .icmp(IntCC::UnsignedLessThanOrEqual, frame_size_64, argc);
         let aliased = self.builder.ins().band(fs_eq_ar, argc_ge_fs);
         let room = self.builder.create_block();
         self.builder
@@ -2042,7 +2053,8 @@ impl<'a> Lowerer<'a> {
             ctx,
             Offset32::new(std::mem::offset_of!(JitCallContext, buf_end) as i32),
         );
-        let args_top = self.builder.ins().iadd_imm_s(args_ptr, (argc as i64) * 8);
+        let argc_bytes = self.builder.ins().imul_imm_s(argc, 8);
+        let args_top = self.builder.ins().iadd(args_ptr, argc_bytes);
         let stack_bytes = self.builder.ins().imul_imm_s(stack_usage, 8);
         let top_needed = self.builder.ins().iadd(args_top, stack_bytes);
         let fits = self
@@ -2063,7 +2075,7 @@ impl<'a> Lowerer<'a> {
         let probe = self.call_slow(
             self.sig_call,
             Helper::LeafCallProbe,
-            &[callee, args_ptr, argc_imm, site_imm],
+            &[callee, args_ptr, argc, site_imm],
         )?;
         let hit = self.builder.ins().icmp_imm_u(IntCC::NotEqual, probe, 0);
         let inline2 = self.builder.create_block();
@@ -2089,10 +2101,11 @@ impl<'a> Lowerer<'a> {
         );
         let sp = self.builder.use_var(self.sp_var);
         let fs_eq_ar = self.builder.ins().icmp(IntCC::Equal, frame_size, arity);
+        let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
         let argc_ge_fs =
             self.builder
                 .ins()
-                .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, frame_size, argc as i64);
+                .icmp(IntCC::UnsignedLessThanOrEqual, frame_size_64, argc);
         let aliased = self.builder.ins().band(fs_eq_ar, argc_ge_fs);
         let frame_ptr = self.builder.ins().select(aliased, args_ptr, sp);
         let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
@@ -2110,7 +2123,7 @@ impl<'a> Lowerer<'a> {
         let res = self.call_slow(
             self.sig_call_slow,
             Helper::CallSlow,
-            &[callee, this, argc_imm, args_ptr, direct_eval_imm],
+            &[callee, this, argc, args_ptr, direct_eval_imm],
         )?;
         self.builder.def_var(self.sp_var, pre_call_sp);
         self.push(res);
@@ -2272,6 +2285,26 @@ impl<'a> Lowerer<'a> {
             .ins()
             .icmp_imm_u(IntCC::Equal, tag, crux::TAG_STRING as i64);
         self.builder.ins().band(is_heap, is_str)
+    }
+
+    /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF ==
+    /// TAG_FUNCTION` — the function check (M10: the compiled `CallApply`
+    /// fast path's callee gate — a non-function receiver must keep the slow
+    /// path's exact `do_call_apply` TypeError). Same discipline as
+    /// `is_string` (the heap-prefix test first).
+    fn is_function(&mut self, bits: ClifValue) -> ClifValue {
+        let is_heap = self.builder.ins().band_imm_u(bits, crux::TAG_MASK as i64);
+        let is_heap = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+        let tag = self.builder.ins().ushr_imm_u(bits, 44);
+        let tag = self.builder.ins().band_imm_u(tag, 0xF);
+        let is_fn = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_FUNCTION as i64);
+        self.builder.ins().band(is_heap, is_fn)
     }
 
     /// I8 bool → I64 0/1 (cranelift 0.134's `bint` is `uextend`).
@@ -2979,25 +3012,30 @@ impl<'a> Lowerer<'a> {
                     this_ptr,
                     Offset32::new(0),
                 );
+                let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
                 self.emit_call(
                     index,
                     callee,
                     this,
                     args_ptr,
-                    *argc as usize,
+                    argc_imm,
                     this_ptr,
                     *direct_eval,
                     true,
                 )?;
             }
             Step::CallApply { argc, kind } => {
-                // `[..., f, apply/call, thisArg, a1..aN]` — the `CallFast`
-                // layout with `argc` = N+1. The slow path passes the
-                // argument region (the `thisArg` first) by pointer; the
-                // helper runs the interpreter's `do_call_apply` — the
-                // intrinsic check, the direct call of `f` on this Vm
-                // (leaf-inline included), or the general fallback call of
-                // the resolved function.
+                // M10: `[..., f, apply/call, thisArg, a1..aN]` — the `CallFast`
+                // layout with `argc` = N+1. When the member read resolved the
+                // realm's intrinsic `apply`/`call` (compared against the ctx's
+                // per-run snapshot) and the receiver `f` is a Function, the
+                // machine code rebuilds the direct-call layout and routes into
+                // the `emit_call` leaf machinery — skipping the `call_apply`
+                // slow-path round trip, the vm.stack rebuild, and the
+                // helper's re-checks. Everything else falls back to the
+                // `call_apply` helper (the interpreter's `do_call_apply` — a
+                // shadowed `apply`/`call` or a non-function receiver keeps
+                // its exact behavior).
                 let argc_usize = *argc as usize;
                 let sp = self.builder.use_var(self.sp_var);
                 let args_ptr = self
@@ -3024,6 +3062,133 @@ impl<'a> Lowerer<'a> {
                     callee_ptr,
                     Offset32::new(0),
                 );
+                let pre_call_sp = callee_ptr;
+                let ctx = self.vm();
+                let intrinsic_offset = match kind {
+                    ApplyKind::Apply => {
+                        std::mem::offset_of!(JitCallContext, apply_builtin_bits)
+                    }
+                    ApplyKind::Call => std::mem::offset_of!(JitCallContext, call_builtin_bits),
+                };
+                let intrinsic = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(intrinsic_offset as i32),
+                );
+                let is_intrinsic = self.builder.ins().icmp(IntCC::Equal, resolved, intrinsic);
+                let is_fn = self.is_function(callee);
+                let gate = self.builder.ins().band(is_intrinsic, is_fn);
+                let fast = self.builder.create_block();
+                let slow = self.builder.create_block();
+                self.builder.ins().brif(gate, fast, &[], slow, &[]);
+                // The fast path: `this` for the direct call is the
+                // `thisArg` (args[0]; `undefined` when the site has no
+                // arguments — `do_call_apply` reads the default).
+                self.builder.switch_to_block(fast);
+                let this = if argc_usize == 0 {
+                    self.builder.ins().iconst(types::I64, self.undef_bits)
+                } else {
+                    self.builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        args_ptr,
+                        Offset32::new(0),
+                    )
+                };
+                match kind {
+                    ApplyKind::Call => {
+                        // `f.call(thisArg, a1..aN)`: `this` is args[0], the
+                        // direct call's arguments are a1..aN, already
+                        // contiguous above it — no copy, just the region
+                        // shift.
+                        if argc_usize == 0 {
+                            let zero = self.builder.ins().iconst(types::I64, 0);
+                            self.emit_call(
+                                index,
+                                callee,
+                                this,
+                                sp,
+                                zero,
+                                pre_call_sp,
+                                false,
+                                true,
+                            )?;
+                        } else {
+                            let args_ptr_new = self.builder.ins().iadd_imm_s(args_ptr, 8);
+                            let argc_new = self
+                                .builder
+                                .ins()
+                                .iconst(types::I64, (argc_usize - 1) as i64);
+                            self.emit_call(
+                                index,
+                                callee,
+                                this,
+                                args_ptr_new,
+                                argc_new,
+                                pre_call_sp,
+                                false,
+                                true,
+                            )?;
+                        }
+                    }
+                    ApplyKind::Apply => {
+                        // `f.apply(thisArg, argArray)`: the direct arguments
+                        // come from argArray (args[1]; `undefined` when the
+                        // site has fewer than two). A nullish argArray is an
+                        // empty argument list; a dense Array's elements are
+                        // copied to the buffer top by the fill helper (the
+                        // one heap read the machine code cannot do inline);
+                        // any other shape falls back to the slow path (no
+                        // writes on the reject).
+                        let arg_array = if argc_usize >= 2 {
+                            let ptr = self.builder.ins().iadd_imm_s(args_ptr, 8);
+                            self.builder.ins().load(
+                                types::I64,
+                                MemFlagsData::new(),
+                                ptr,
+                                Offset32::new(0),
+                            )
+                        } else {
+                            self.builder.ins().iconst(types::I64, self.undef_bits)
+                        };
+                        let nullish = self.emit_nullish(arg_array);
+                        let zero = self.builder.create_block();
+                        let fill = self.builder.create_block();
+                        self.builder.ins().brif(nullish, zero, &[], fill, &[]);
+                        self.builder.switch_to_block(zero);
+                        let zero_argc = self.builder.ins().iconst(types::I64, 0);
+                        self.emit_call(
+                            index,
+                            callee,
+                            this,
+                            sp,
+                            zero_argc,
+                            pre_call_sp,
+                            false,
+                            true,
+                        )?;
+                        self.builder.switch_to_block(fill);
+                        let count = self.call_slow(
+                            self.sig_apply_args,
+                            Helper::ApplyArgsFill,
+                            &[arg_array, sp],
+                        )?;
+                        let not_fast =
+                            self.builder
+                                .ins()
+                                .icmp_imm_u(IntCC::Equal, count, u64::MAX as i64);
+                        let filled = self.builder.create_block();
+                        self.builder.ins().brif(not_fast, slow, &[], filled, &[]);
+                        self.builder.seal_block(fill);
+                        self.builder.switch_to_block(filled);
+                        self.emit_call(index, callee, this, sp, count, pre_call_sp, false, true)?;
+                    }
+                }
+                // The slow path: the `call_apply` helper with the original
+                // region (the fast path never wrote it — the fill rejects
+                // before any write).
+                self.builder.switch_to_block(slow);
                 let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
                 let kind_imm = self.builder.ins().iconst(
                     types::I64,
@@ -3032,10 +3197,6 @@ impl<'a> Lowerer<'a> {
                         ApplyKind::Call => 1,
                     },
                 );
-                let pre_call_sp = self
-                    .builder
-                    .ins()
-                    .iadd_imm_s(sp, -(((argc_usize + 2) as i64) * 8));
                 let result = self.call_slow(
                     self.sig_call_apply,
                     Helper::CallApply,
@@ -3044,6 +3205,7 @@ impl<'a> Lowerer<'a> {
                 self.builder.def_var(self.sp_var, pre_call_sp);
                 self.push(result);
                 self.fall_through(index);
+                self.builder.seal_block(slow);
             }
             Step::CallFastSlot { slot, argc } => {
                 // `[..., a1..aN]` — the fused slot call (`do_call_fast_slot`
@@ -3054,15 +3216,9 @@ impl<'a> Lowerer<'a> {
                 let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
                 let callee = self.load_slot(*slot);
                 let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
                 self.emit_call(
-                    index,
-                    callee,
-                    this,
-                    args_ptr,
-                    *argc as usize,
-                    args_ptr,
-                    false,
-                    true,
+                    index, callee, this, args_ptr, argc_imm, args_ptr, false, true,
                 )?;
             }
             Step::CallFastGlobal {
@@ -3080,12 +3236,13 @@ impl<'a> Lowerer<'a> {
                 let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
                 let callee = self.emit_global_read(*name)?;
                 let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
                 self.emit_call(
                     index,
                     callee,
                     this,
                     args_ptr,
-                    *argc as usize,
+                    argc_imm,
                     args_ptr,
                     *direct_eval,
                     true,
@@ -3125,15 +3282,12 @@ impl<'a> Lowerer<'a> {
                     _ => unreachable!("the or-pattern matched a fused store"),
                 };
                 let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                let argc_imm = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, arg_slots.len() as i64);
                 self.emit_call(
-                    index,
-                    callee,
-                    this,
-                    args_ptr,
-                    arg_slots.len(),
-                    args_ptr,
-                    false,
-                    false,
+                    index, callee, this, args_ptr, argc_imm, args_ptr, false, false,
                 )?;
                 let result = self.pop();
                 if self.slot_is_lexical(*store_slot) {

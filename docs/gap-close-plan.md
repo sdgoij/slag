@@ -319,6 +319,63 @@ bump arena + the small-string path (Cut 67) cuts the alloc + `Rc` bump.
   path still copies; inline the known `.apply` into a vector call (the
   M4 + M2 combination): apply interp 20.4→~12ms.
 
+**M10 decomposition (2026-09-02, 200K jit):** direct leaf call 5ns/call;
+recognized `.call` (fixed args) 70ns; recognized `.apply` with a dense
+9-element array 85ns (the element handling adds only ~1.7ns/element via
+the dense fast path); an UNRECOGNIZED apply shape (`g = f.apply` hoisted,
+then `g.call(f, null, arr)`) 840ns — so the compiled `CallApply`
+recognition already buys ~10x, and the residual ~70-80ns is the FIXED
+machinery: the member read of `.apply`/`.call` (a Function.prototype
+chain read), the `call_slow(CallApply)` round trip, the argument-region
+copy + `[thisArg, f, rest...]` layout rebuild, and `do_call_fast`. The
+interp apply steady-state (the harness-fix numbers) is ~102ns/call vs
+the direct ~50ns.
+
+**Next-slice design (the JIT inlines the recognized shape):** for a
+compiled `CallApply` whose member read resolved the realm's intrinsic
+(compare `resolved` against the intrinsic's cached identity — the
+compiler already knows the pattern; the fallback is the current slow
+path), rebuild the fast layout in machine code (drop the resolved
+`apply`/`call`, move `thisArg` before `f`) and route into the
+`emit_call` leaf-inline machinery — skipping the `call_slow` round trip
+and the helper's re-checks. The dense-`arr` apply then extends the
+leaf-inline probe to read the array's buffer directly. This is the
+~70ns → ~15-20ns slice; it is a compiler+runtime slice of its own
+session.
+
+**Status (2026-09-02): slice 1 LANDED — the compiled intrinsic fast
+path.** The `Step::CallApply` arm now compares the member-read result
+against the realm's intrinsic bits (`JitCallContext` snapshots
+`apply_builtin`/`call_builtin` per run, gated on a new
+`CompiledBody::has_call_apply` flag — leaf/resume ctxs included, since a
+leaf body can contain the step) plus a Function-tag receiver gate, then
+rebuilds the direct-call layout in machine code: `.call` (fixed args) is
+a pure region shift, `.apply` routes a nullish argArray to a zero-arg
+call and copies a dense Array's elements to the buffer top via a new
+`apply_args_fill` helper (the one heap read the machine code cannot do;
+rejects — nothing written — on non-dense/too-long/no-room shapes), and
+both route into `emit_call` (which now takes a runtime `argc` value).
+The fallback (shadowed `apply`/`call`, non-Function receiver, non-dense
+argArray) is the unchanged `call_apply` slow path — `do_call_apply`'s
+exact TypeError for a non-callable receiver is preserved by the
+Function gate. Measured: **apply leaf call jit 16.5 → ~7.0ms** (4 runs;
+interp unchanged ~20.8). Validation: 5 new e2e tests (counting wrappers
+prove the dense fill runs per iteration with zero `call_apply` calls,
+`.call` needs no helpers at all, a shadowed `apply` runs the slow path
+per iteration, the non-Function receiver keeps `do_call_apply`'s
+message, and the nullish/empty/array-like shapes stay correct), clippy
+clean, workspace tests green. The residual ~35ns/call on the row is the
+member read of `.apply` (a separate step) plus the per-iteration fill
+copy — the next slice is inlining the member read / skipping the fill on
+a generation-validated repeat.
+
+**Known pre-existing JIT bug (not from this slice, reproduced at
+HEAD):** a compiled body that throws a call error (a non-function
+callee, or a callee body that throws) into its OWN catch inside a loop,
+many iterations (≈200+), panics "a pending JIT error is present" — the
+covered-error dispatch loses the ctx error. Unrelated to M10; noted for
+the try-machinery owner.
+
 ## 5. Sequencing
 
 1. **Week 1:** M0 profile → M1 Phase A (dense-elements hot paths) → M2

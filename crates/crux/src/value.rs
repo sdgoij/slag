@@ -45,7 +45,9 @@ const TAG_SYMBOL: u64 = 6;
 /// The Object tag (public for the JIT crate's inline member-cell probe — the
 /// NaN-boxing layout is frozen).
 pub const TAG_OBJECT: u64 = 7;
-const TAG_FUNCTION: u64 = 8;
+/// The Function tag (public for the JIT crate's compiled `CallApply` fast
+/// path — the NaN-boxing layout is frozen).
+pub const TAG_FUNCTION: u64 = 8;
 /// The frame-slot TDZ marker (tag 9 in the reserved range): a `let`-like
 /// binding before its `InitLocal`. It lives only in VM frames; every frame
 /// access checks it before the value can reach user-visible ops, so it never

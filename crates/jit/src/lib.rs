@@ -371,6 +371,7 @@ fn runtime_helpers() -> JitHelpers {
         args_spread: Some(rt.args_spread),
         call_vector: Some(rt.call_vector),
         call_apply: Some(rt.call_apply),
+        apply_args_fill: Some(rt.apply_args_fill),
         tail_call_vector: Some(rt.tail_call_vector),
         tail_call_self_vector: Some(rt.tail_call_self_vector),
         array_begin: Some(rt.array_begin),
@@ -522,6 +523,7 @@ mod tests {
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             has_loop: false,
+            has_call_apply: false,
         }
     }
 
@@ -573,6 +575,7 @@ mod tests {
             args_spread: Some(helpers::test_args_spread),
             call_vector: Some(helpers::test_call_vector),
             call_apply: Some(helpers::test_call_apply),
+            apply_args_fill: Some(helpers::test_apply_args_fill),
             tail_call_vector: Some(helpers::test_tail_call_vector),
             tail_call_self_vector: Some(helpers::test_tail_call_self_vector),
             array_begin: Some(helpers::test_array_begin),
@@ -682,6 +685,8 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
+            apply_builtin_bits: 0,
+            call_builtin_bits: 0,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1028,6 +1033,8 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
+            apply_builtin_bits: 0,
+            call_builtin_bits: 0,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1269,6 +1276,8 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: Value::Number(5.0).bits(),
+            apply_builtin_bits: 0,
+            call_builtin_bits: 0,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1352,6 +1361,8 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
+            apply_builtin_bits: 0,
+            call_builtin_bits: 0,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1831,6 +1842,241 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(5050.0));
         assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_apply_intrinsic_takes_the_dense_fast_path() {
+        // M10: a loop calling `add.apply(null, arr)` with a dense array and
+        // a leaf receiver — the compiled `CallApply` site recognizes the
+        // realm's intrinsic (the ctx's per-run snapshot), the
+        // `apply_args_fill` helper copies the elements into the working
+        // buffer, and the leaf runs in-frame. The counting wrappers prove
+        // the shape: the fill runs once per iteration and the `call_apply`
+        // slow path never does.
+        static FILL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static SLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_apply_args_fill(ctx: *mut c_void, arg_array: u64, dest: u64) -> u64 {
+            FILL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.apply_args_fill)(ctx, arg_array, dest)
+        }
+        extern "C" fn counting_call_apply(
+            ctx: *mut c_void,
+            resolved: u64,
+            callee: u64,
+            argc: u64,
+            args: *mut u64,
+            kind: u64,
+        ) -> u64 {
+            SLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.call_apply)(ctx, resolved, callee, argc, args, kind)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.apply_args_fill = Some(counting_apply_args_fill);
+        helpers.call_apply = Some(counting_call_apply);
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent
+            .run_script(
+                "function add(a, b, c, d, e) { return a + b + c + d + e; }\n\
+                 function run() {\n\
+                   var s = 0; var arr = [1, 2, 3, 4, 5];\n\
+                   for (var i = 0; i < 1000; i++) { s += add.apply(null, arr); }\n\
+                   return s;\n\
+                 }\n\
+                 run();",
+            )
+            .expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value.as_number(), Some(15000.0));
+        assert!(compiled >= 2, "{compiled} bodies (run + add) must compile");
+        let fills = FILL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fills, 1000, "the dense fill runs per iteration");
+        let slows = SLOW_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(slows, 0, "the intrinsic fast path never hits `call_apply`");
+    }
+
+    #[test]
+    fn installed_jit_call_intrinsic_needs_no_helpers() {
+        // M10: `add.call(null, 1, 2, 3)` with fixed arguments — the direct
+        // args are already contiguous on the working stack, so the fast path
+        // is pure machine code: no `apply_args_fill` (no array) and no
+        // `call_apply` round trip.
+        static FILL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static SLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_apply_args_fill(ctx: *mut c_void, arg_array: u64, dest: u64) -> u64 {
+            FILL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.apply_args_fill)(ctx, arg_array, dest)
+        }
+        extern "C" fn counting_call_apply(
+            ctx: *mut c_void,
+            resolved: u64,
+            callee: u64,
+            argc: u64,
+            args: *mut u64,
+            kind: u64,
+        ) -> u64 {
+            SLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.call_apply)(ctx, resolved, callee, argc, args, kind)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.apply_args_fill = Some(counting_apply_args_fill);
+        helpers.call_apply = Some(counting_call_apply);
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent
+            .run_script(
+                "function add(a, b, c) { return a + b + c; }\n\
+                 function run() {\n\
+                   var s = 0;\n\
+                   for (var i = 0; i < 1000; i++) { s += add.call(null, 1, 2, 3); }\n\
+                   return s;\n\
+                 }\n\
+                 run();",
+            )
+            .expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value.as_number(), Some(6000.0));
+        assert!(compiled >= 2, "{compiled} bodies (run + add) must compile");
+        let fills = FILL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fills, 0, "a fixed-arg `.call` copies no array elements");
+        let slows = SLOW_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(slows, 0, "the intrinsic fast path never hits `call_apply`");
+    }
+
+    #[test]
+    fn installed_jit_shadowed_apply_falls_back_to_the_slow_path() {
+        // M10: an own `apply` property shadows the intrinsic — the compiled
+        // site's identity check fails every iteration and the `call_apply`
+        // slow path runs the resolved function with the original argument
+        // list (`this` = the receiver `o`, args = `[null, arr]`).
+        static FILL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static SLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_apply_args_fill(ctx: *mut c_void, arg_array: u64, dest: u64) -> u64 {
+            FILL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.apply_args_fill)(ctx, arg_array, dest)
+        }
+        extern "C" fn counting_call_apply(
+            ctx: *mut c_void,
+            resolved: u64,
+            callee: u64,
+            argc: u64,
+            args: *mut u64,
+            kind: u64,
+        ) -> u64 {
+            SLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.call_apply)(ctx, resolved, callee, argc, args, kind)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.apply_args_fill = Some(counting_apply_args_fill);
+        helpers.call_apply = Some(counting_call_apply);
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent
+            .run_script(
+                "var o = { apply: function (t, a) { return 42; } };\n\
+                 function run() {\n\
+                   var s = 0; var arr = [1, 2, 3];\n\
+                   for (var i = 0; i < 1000; i++) { s += o.apply(null, arr); }\n\
+                   return s;\n\
+                 }\n\
+                 run();",
+            )
+            .expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value.as_number(), Some(42000.0));
+        assert!(compiled >= 1, "{compiled} bodies (run) must compile");
+        let slows = SLOW_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            slows, 1000,
+            "a shadowed apply runs `call_apply` per iteration"
+        );
+        let fills = FILL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fills, 0, "a shadowed apply copies no dense elements");
+    }
+
+    #[test]
+    fn installed_jit_non_function_call_receiver_keeps_the_type_error() {
+        // M10: the fast path is gated on the receiver being a Function — a
+        // plain object with %Function.prototype% in its chain resolves the
+        // intrinsic `call` but is not callable, so the site must fall to
+        // `do_call_apply`'s exact TypeError (not the ordinary call's
+        // "is not a function" message).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var o = {}; Object.setPrototypeOf(o, Function.prototype);\n\
+                     function run() {\n\
+                       var message = '';\n\
+                       for (var i = 0; i < 5; i++) {\n\
+                         try { o.call(1, 2); } catch (e) { message = e.message; }\n\
+                       }\n\
+                       return message === 'Call must be called on a function' ? 1 : 0;\n\
+                     }\n\
+                     run();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 1, "{compiled} bodies (run) must compile");
+    }
+
+    #[test]
+    fn installed_jit_apply_nullish_arraylike_and_empty_shapes() {
+        // M10: the intrinsic fast path's arg-list shapes — a nullish
+        // argArray (0 args), an empty dense array (0 args), and an
+        // array-like object (the `create_list_from_array_like` slow path),
+        // plus a no-argument `.call()` (this defaults to undefined).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function first(x, y) { return y === undefined ? 41 : x; }\n\
+                     function run() {\n\
+                       var s = 0;\n\
+                       for (var i = 0; i < 100; i++) {\n\
+                         s += first.apply(null);\n\
+                         s += first.apply(null, []);\n\
+                         s += first.apply(null, { length: 2, 0: 7, 1: 8 });\n\
+                         s += first.call(null, 9, 10);\n\
+                         s += first.call();\n\
+                       }\n\
+                       return s;\n\
+                     }\n\
+                     run();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(13900.0));
+        assert!(
+            compiled >= 2,
+            "{compiled} bodies (run + first) must compile"
+        );
     }
 
     #[test]

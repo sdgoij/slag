@@ -164,6 +164,14 @@ impl LeafCallSiteCache {
 /// `site` field check still gates every reuse.
 pub const LEAF_CALL_CACHE_ENTRIES: usize = 4;
 
+/// M10: the compiled `Step::CallApply` fast path inlines a dense
+/// `argArray`'s elements only up to this count (the fast-form cap): the
+/// element copy and the in-frame leaf would overflow the caller's working
+/// buffer above it, so longer arrays fall back to the `call_apply` slow
+/// path. The compiler reserves the same number of slots in the body's
+/// `max_stack_usage` so the copy has room.
+pub const JIT_APPLY_MAX_ARGS: usize = 64;
+
 /// Cut 65: the field offsets of the interpreter's completion register
 /// (`Vm::completion` / `Vm::completion_is_empty`) — the compiled script-path
 /// completion steps write the register directly (a certified script's
@@ -267,6 +275,17 @@ pub struct JitCallContext {
     /// reassigned to a different closure). `0` when no function is running
     /// (a body that can contain the check always runs with one).
     pub current_function: u64,
+    /// M10: the running realm's %Function.prototype.apply%/%call% intrinsic
+    /// bits at ctx setup — the compiled `Step::CallApply` fast path compares
+    /// the member-read result against them to recognize the intrinsic (then
+    /// rebuilds the call layout in machine code instead of the `call_apply`
+    /// slow-path round trip). 0 when the body has no `CallApply` site or no
+    /// realm/intrinsic is current (the identity check then never matches and
+    /// the site falls back to the slow path). The intrinsics are stable for
+    /// the realm's life and a certified body's own statements never switch
+    /// realms, so a per-run snapshot is sound.
+    pub apply_builtin_bits: u64,
+    pub call_builtin_bits: u64,
     /// Cut 55: a control-transfer dispatch that completed the body (a
     /// `return` reaching the end of the finally chain) carries the body's
     /// result value here — the dispatch helpers signal `DISPATCH_DONE` and
@@ -405,6 +424,13 @@ pub struct JitSlowPaths {
         args: *mut u64,
         kind: u64,
     ) -> u64,
+    /// M10: the compiled `CallApply` fast path's dense-`argArray` element
+    /// fill (see [`apply_args_fill`]): `arg_array` is the `apply` argument
+    /// array value; `dest` is the JIT buffer address the elements are
+    /// written at. Returns the element count, or `u64::MAX` when the array
+    /// is not a dense fast Array / is too long / has no room (the call site
+    /// then falls back to `call_apply` — nothing was written).
+    pub apply_args_fill: extern "C" fn(ctx: *mut c_void, arg_array: u64, dest: u64) -> u64,
     /// Cut 37: the compiled leaf-call probe — validates the callee (a
     /// certified, environment-free, this-less leaf whose body has compiled
     /// machine code) and that the inline frame + working area fit above the
@@ -869,6 +895,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     set_member_computed,
     call_slow,
     call_apply,
+    apply_args_fill,
     leaf_call_probe,
     get_global,
     set_global,
@@ -1308,6 +1335,51 @@ extern "C" fn call_apply(
             slow_error(ctx, error)
         }
     }
+}
+
+/// M10: the compiled `Step::CallApply` fast path's dense-`argArray` element
+/// fill — the one remaining heap read (the array's element buffer) the
+/// machine code cannot do inline. When `arg_array` is a dense Array whose
+/// whole `[0, length)` range is present, copies its element bits into the
+/// JIT buffer at `dest` and returns the element count; `u64::MAX` when the
+/// array is not a dense fast Array, is longer than `JIT_APPLY_MAX_ARGS`, or
+/// would not fit before the buffer's end. Nothing is written on the reject
+/// paths, so the caller's fallback (`call_apply` with the untouched region)
+/// stays safe. Mirrors `do_call_apply`'s dense fast path (the machine code
+/// is suspended for the synchronous helper, so the buffer is stable, and
+/// the array itself roots the copied values).
+extern "C" fn apply_args_fill(ctx: *mut c_void, arg_array: u64, dest: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let arg_array = Value::from_bits(arg_array);
+    let ValueKind::Object(obj) = arg_array.kind() else {
+        return u64::MAX;
+    };
+    let crux::object::ObjectKind::Array(slots) = &obj.kind else {
+        return u64::MAX;
+    };
+    if !slots.dense.get() {
+        return u64::MAX;
+    }
+    let length = slots.length.get() as usize;
+    if length > JIT_APPLY_MAX_ARGS {
+        return u64::MAX;
+    }
+    let capacity = ((ctx.buf_end as usize).saturating_sub(dest as usize)) / 8;
+    if length > capacity {
+        return u64::MAX;
+    }
+    let elements = slots.elements.borrow();
+    // The whole range must be present before any write: a hole discovered
+    // mid-copy must not leave a partial region the slow path would read.
+    if elements.len() < length || !elements[..length].iter().all(Option::is_some) {
+        return u64::MAX;
+    }
+    let dest = dest as *mut u64;
+    for (index, element) in elements[..length].iter().enumerate() {
+        // SAFETY: the capacity check above guarantees `length` slots fit.
+        unsafe { *dest.add(index) = element.unwrap().bits() };
+    }
+    length as u64
 }
 
 extern "C" fn leaf_call_probe(
@@ -4343,6 +4415,31 @@ pub(crate) enum JitRunOutcome {
 /// private buffer, rooted for the call's duration. Returns `Interp` when
 /// no hook is installed or the body has no compiled code — the caller
 /// falls back to the interpreter.
+/// M10: the current realm's %Function.prototype.apply%/%call% intrinsic
+/// bits for the compiled `CallApply` fast path's identity check. `(0, 0)`
+/// when no realm is current or the intrinsic is not yet installed — the
+/// machine code's check then never matches and the site falls back to the
+/// `call_apply` slow path (always correct). The intrinsic functions are
+/// installed once per realm at bootstrap and never reassigned, so the bits
+/// stay valid for the whole run.
+pub(crate) fn call_apply_intrinsic_bits(agent: &Agent) -> (u64, u64) {
+    let Ok(realm) = agent.current_realm() else {
+        return (0, 0);
+    };
+    (
+        realm
+            .intrinsics
+            .apply_builtin()
+            .map(|value| value.bits())
+            .unwrap_or(0),
+        realm
+            .intrinsics
+            .call_builtin()
+            .map(|value| value.bits())
+            .unwrap_or(0),
+    )
+}
+
 pub(crate) fn run_jit_body(
     agent: &mut Agent,
     vm: &mut Vm,
@@ -4405,6 +4502,14 @@ pub(crate) fn run_jit_body(
         let current = agent.running_context()?.lexical_environment;
         matches!(&*current, EnvRecord::Global(_)) && current.outer().is_none()
     };
+    // M10: the compiled `CallApply` fast path compares the member-read
+    // result against the realm's intrinsic — snapshot the bits per run (a
+    // body with no apply site skips the realm read entirely).
+    let (apply_builtin_bits, call_builtin_bits) = if ir.has_call_apply {
+        call_apply_intrinsic_bits(agent)
+    } else {
+        (0, 0)
+    };
     let mut ctx = JitCallContext {
         pending: false,
         error: None,
@@ -4420,6 +4525,8 @@ pub(crate) fn run_jit_body(
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
+        apply_builtin_bits,
+        call_builtin_bits,
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
@@ -4623,6 +4730,13 @@ pub(crate) fn run_jit_resume(
         let current = agent.running_context()?.lexical_environment;
         matches!(&*current, EnvRecord::Global(_)) && current.outer().is_none()
     };
+    // M10: see `run_jit_body` — the resumed body's `CallApply` sites compare
+    // against the realm's intrinsic bits.
+    let (apply_builtin_bits, call_builtin_bits) = if ir.has_call_apply {
+        call_apply_intrinsic_bits(agent)
+    } else {
+        (0, 0)
+    };
     let mut ctx = JitCallContext {
         pending: false,
         error: None,
@@ -4638,6 +4752,8 @@ pub(crate) fn run_jit_resume(
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
+        apply_builtin_bits,
+        call_builtin_bits,
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
@@ -5013,6 +5129,7 @@ mod tests {
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             has_loop,
+            has_call_apply: false,
         })
     }
 
