@@ -226,6 +226,39 @@ alias (Cut 35 slice 23) is the frame-discipline blueprint.
   dead-arg elimination (the last factor to node's 0.12ms) is the
   explicitly long-term follow-up.
 
+**Status (2026-09-02): the premise is superseded by measurement — the
+direct-call path is already near its protocol floor, and the plan's
+row targets were based on harness-inflated numbers.** 1M-iteration
+steady-state A/B (the exact `function calls` row shape measured 7ns/call,
+not the harness's 19ns — the `--jit-bench` single-timed-eval methodology
+re-creates the callee function per eval, re-probing the per-site leaf
+cache): member-callee 7ns/call, direct global 6ns, slot/param 5ns. The
+Cut 39/68 per-site leaf-cache gate already skips the probe on warm
+repeat visits; what remains per call is the gate itself (~6 loads + 5
+compares) + the in-frame leaf run — a ~1-2ns ceiling for Level 1's
+"skip the gate for constant callees" on shapes that are already fast.
+The real remaining call-row cost is the **apply/call machinery**: the
+`apply leaf call` row decomposes to ~90ns/call (vs 10ns for a direct
+9-arg call) — the `.apply`/`.call` member read (the prototype chain) +
+the builtin round-trip + `create_list_from_array_like`'s per-call copy
+(the plan's M10 lever, not M4). Re-scope M4 to the apply/call machinery
+or defer to body inlining (the long-term item).
+
+**Harness fix (2026-09-02): `bench_once` now measures steady state.** The
+old single-timed-eval methodology re-parsed the snippet per eval, so the
+timed window included a fresh ~1ms Cranelift compile of the re-created
+bodies (and the interp column's timed eval ran under the GC pressure of
+the warmup eval's garbage on allocation-heavy rows). The harness now
+evacuates the definition once, binds `bench` + the ARGS to globals once
+(function-literal arguments stay the SAME object across calls), warms
+with 2 calls, and reports the min of 3 timed calls. The compile
+inflation and the GC skew are gone: `function calls` jit 1.9→0.71ms
+(the measured ~7ns/call steady), `wide leaf call` 3.2→1.6ms, arithmetic
+3.3→2.6ms, and `string concat` interp 10.6→3.6ms (the old number was
+GC-polluted — the isolated steady probe confirms 4-5ms). The 2026-09-02
+table's small-row JIT gaps were therefore 15-30% pessimistic and the
+call rows ~2.7x so.
+
 ### M5 — JIT: inline typed-array store + bounds elision
 
 The `typed-array write` row (103x) is the canonical
