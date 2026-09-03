@@ -1747,6 +1747,24 @@ impl MemberValueCell {
     }
 }
 
+/// The write-side value-cache entry (L1a warm-store fast path): (id,
+/// name, generation, slot) — "at this generation, `name` is an own
+/// writable data property of `id` at property-vector `slot`". A member
+/// write whose (id, name, generation) match stores directly at the slot
+/// — no [[Set]] re-derivation. Sound because an own writable data
+/// property shadows the entire chain (spec 7.3.3 step 3 — the chain is
+/// consulted only when the own property is absent), so no setter
+/// tracking is needed, and the slice-11 discipline (every own-property
+/// mutation bumps the generation, including in-place `set_key`) makes a
+/// generation match pin the recorded slot's content.
+#[derive(Clone, Copy)]
+pub(crate) struct MemberWriteCell {
+    pub id: u64,
+    pub name: crux::AtomId,
+    pub generation: u32,
+    pub slot: usize,
+}
+
 /// The prototype-chain read cache (2026-09-01): the resolved value of
 /// `(receiver id, name)` found on the prototype chain, re-validated by
 /// the receiver's generation (an own property appearing on the receiver
@@ -3691,6 +3709,128 @@ impl Vm {
     /// The direct-mapped cache index for (object id, array index).
     fn array_element_index(object_id: u64, index: u64) -> usize {
         (object_id as usize ^ index as usize) & (MEMBER_CELLS - 1)
+    }
+
+    /// The object side of a value whose own properties the L1a store cell
+    /// can serve: Ordinary objects and functions with an Ordinary object
+    /// part. Arrays are excluded — their `length`/canonical-index writes
+    /// are exotic intercepts (ArraySetLength, element defines) the store
+    /// cell must never bypass. Every other kind stays on the full [[Set]].
+    fn store_cell_object(value: &Value) -> Option<Handle<crux::object::JsObject>> {
+        match value.kind() {
+            ValueKind::Object(object)
+                if matches!(object.kind, crux::object::ObjectKind::Ordinary) =>
+            {
+                Some(object)
+            }
+            ValueKind::Function(function) => {
+                let object = &function.object;
+                if matches!(object.kind, crux::object::ObjectKind::Ordinary) {
+                    Some(*object)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The L1a warm-store fast path (a store-side cell mirroring the read
+    /// cells, put_value's hot member-write path): a write to `base.name`
+    /// whose cached (id, name, generation) matches stores directly into the
+    /// recorded property-vector slot — no namespace/receiver probes, no
+    /// primitive boxing, no `find_ecma_accessor` own-property lookup, no
+    /// descriptor machinery. Sound because an own writable data property
+    /// shadows the whole chain (spec 7.3.3 step 3 consults the chain only
+    /// when the own property is absent), so no setter tracking is needed;
+    /// the slice-11 discipline (every own-property mutation bumps the
+    /// generation, including in-place `set_key`) invalidates on redefinition/
+    /// delete/accessor-conversion. The caller (put_value) has already gated
+    /// receiver == base on an Object/Function with a string key. Returns
+    /// true when the store happened; false falls back to the full [[Set]].
+    pub(crate) fn warm_store_put(
+        agent: &mut Agent,
+        base: &Value,
+        name: crux::AtomId,
+        value: Value,
+    ) -> bool {
+        let Some(object) = Self::store_cell_object(base) else {
+            return false;
+        };
+        let index = Self::member_cell_index(object.id(), name);
+        let Some(cell) = agent.member_write_cells[index] else {
+            return false;
+        };
+        if cell.id != object.id() || cell.name != name || cell.generation != object.generation() {
+            return false;
+        }
+        if !object.write_data_property_slot(&PropertyKey::String(name), cell.slot, value) {
+            return false;
+        }
+        // The in-place write bumped the generation (the read-side value
+        // caches re-validate); re-record the cell at the new generation and
+        // front the fresh value so the next read — and the compiled
+        // `GetMemberName` probe — hits without a property-vector access.
+        let generation = object.generation();
+        agent.member_write_cells[index] = Some(MemberWriteCell {
+            id: object.id(),
+            name,
+            generation,
+            slot: cell.slot,
+        });
+        agent.member_value_cells[index] = MemberValueCell {
+            id: object.id(),
+            name,
+            generation,
+            value,
+        };
+        true
+    }
+
+    /// Record the L1a store cell after a full-[[Set]] write completed on
+    /// `base.name` (the store cell missed or was cold): when the write left
+    /// `name` an own writable data property — an in-place update or a fresh
+    /// define, not a setter-invoked accessor — resolve its vector slot and
+    /// cache (id, name, generation, slot) so the next write takes
+    /// `warm_store_put`. Also fronts the read-side value cell with the
+    /// stored value: the full path bumped the generation, so the next read
+    /// would otherwise re-resolve. No-op for every other outcome.
+    pub(crate) fn warm_store_record(agent: &mut Agent, base: &Value, name: crux::AtomId) {
+        let Some(object) = Self::store_cell_object(base) else {
+            return;
+        };
+        let key = PropertyKey::String(name);
+        let Some(slot) = object.property_slot(&key) else {
+            return;
+        };
+        let props = object.properties.borrow();
+        let Some((stored, property)) = props.get(slot) else {
+            return;
+        };
+        if *stored != key {
+            return;
+        }
+        let crux::object::PropertyKind::Data { value, writable } = &property.kind else {
+            return;
+        };
+        if !*writable {
+            return;
+        }
+        let value = *value;
+        let generation = object.generation();
+        let index = Self::member_cell_index(object.id(), name);
+        agent.member_write_cells[index] = Some(MemberWriteCell {
+            id: object.id(),
+            name,
+            generation,
+            slot,
+        });
+        agent.member_value_cells[index] = MemberValueCell {
+            id: object.id(),
+            name,
+            generation,
+            value,
+        };
     }
 
     /// The cached read of `object[index]` — an own data element of a plain
@@ -7820,6 +7960,18 @@ impl Vm {
     ) -> Result<(), JsError> {
         match op {
             AssignOp::Assign => {
+                // L1a: probe the warm-store cell before the fresh-store and
+                // full-[[Set]] paths — a hot write to an existing own
+                // writable data property stores directly here, skipping the
+                // `fast_fresh_store` existing-check, the `member_reference`
+                // build, and the `put_value` layer (which keeps its own probe
+                // for its other callers).
+                if let Some(atom) = name_atom(&key)
+                    && Self::warm_store_put(agent, &object, atom, value)
+                {
+                    self.stack.push(value);
+                    return Ok(());
+                }
                 // Cut 22: a fresh-property write on a plain object with a
                 // cache-verified accessor-free chain defines directly — no
                 // [[Set]] chain walk, no descriptor/validate machinery (the
@@ -7835,6 +7987,12 @@ impl Vm {
                 self.stack.push(value);
             }
             AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
+                if let Some(atom) = name_atom(&key)
+                    && Self::warm_store_put(agent, &object, atom, value)
+                {
+                    self.stack.push(value);
+                    return Ok(());
+                }
                 let reference = member_reference(&object, &key, self.strict);
                 crate::context::put_value(agent, &reference, value)?;
                 self.stack.push(value);
@@ -7847,6 +8005,12 @@ impl Vm {
                     ));
                 };
                 let new = crate::expr::apply_compound(agent, op, &old, &value)?;
+                if let Some(atom) = name_atom(&key)
+                    && Self::warm_store_put(agent, &object, atom, new)
+                {
+                    self.stack.push(new);
+                    return Ok(());
+                }
                 let reference = member_reference(&object, &key, self.strict);
                 crate::context::put_value(agent, &reference, new)?;
                 self.stack.push(new);
@@ -10843,13 +11007,28 @@ pub(crate) fn update_value(
     Ok((old_numeric, new))
 }
 
+/// The string atom of a member-store key when the L1a store cell can serve
+/// it: a named property or a computed key already converted to a string atom
+/// (symbol keys have no atom and never take the warm store).
+pub(crate) fn name_atom(key: &PropertyKeyName) -> Option<crux::AtomId> {
+    match key {
+        PropertyKeyName::Name(id) => Some(*id),
+        PropertyKeyName::Key(PropertyKey::String(id)) => Some(*id),
+        PropertyKeyName::Key(_) => None,
+    }
+}
+
 pub(crate) fn member_reference(
     object: &Value,
     key: &PropertyKeyName,
     strict: bool,
 ) -> crate::context::Reference {
     let name = match key {
-        PropertyKeyName::Name(id) => PropertyKey::from_js_string(&crux::lookup(*id)),
+        // `Name` already holds the interned atom: the canonical
+        // `PropertyKey::String(id)` form. Round-tripping through
+        // `crux::lookup` + re-intern would clone the string and re-hash it
+        // on every member write for no change (interning is injective).
+        PropertyKeyName::Name(id) => PropertyKey::String(*id),
         PropertyKeyName::Key(key) => key.clone(),
     };
     crate::context::Reference {
@@ -10868,7 +11047,7 @@ fn super_reference(
     this: &Value,
 ) -> crate::context::Reference {
     let name = match key {
-        PropertyKeyName::Name(id) => PropertyKey::from_js_string(&crux::lookup(*id)),
+        PropertyKeyName::Name(id) => PropertyKey::String(*id),
         PropertyKeyName::Key(key) => key.clone(),
     };
     crate::context::Reference {

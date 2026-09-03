@@ -144,6 +144,16 @@ pub struct Agent {
     /// cells at fixed offsets; `MemberValueCell::empty()`'s impossible id
     /// never validates.
     pub(crate) member_value_cells: Box<[crate::ir::MemberValueCell; crate::ir::MEMBER_CELLS]>,
+    /// The write-side value cache (L1a warm-store fast path): (id, name,
+    /// generation, slot) — "at this generation, `name` is an own writable
+    /// data property of `id` at property-vector `slot`". A store whose (id,
+    /// name, generation) match skips the full [[Set]] re-derivation and
+    /// writes the recorded slot in place (the own writable data property
+    /// shadows the whole chain — spec 7.3.3 — and every own-property
+    /// mutation bumps the generation, so a match pins the slot's content).
+    /// Index-only — no trace edges. Boxed per the Cut 27 lesson.
+    pub(crate) member_write_cells:
+        Box<[Option<crate::ir::MemberWriteCell>; crate::ir::MEMBER_CELLS]>,
     /// The prototype-chain read cache (2026-09-01): (receiver id, name,
     /// receiver generation, the resolved chain value, the walked links' (id,
     /// generation)) — a hit returns the value with no property-vector borrow
@@ -677,6 +687,7 @@ impl Agent {
             member_value_cells: Box::new(std::array::from_fn(|_| {
                 crate::ir::MemberValueCell::empty()
             })),
+            member_write_cells: Box::new(std::array::from_fn(|_| None)),
             member_chain_cells: Box::new(std::array::from_fn(|_| None)),
             array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
             array_length_cells: Box::new(std::array::from_fn(|_| None)),

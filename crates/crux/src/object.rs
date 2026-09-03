@@ -2474,6 +2474,47 @@ impl JsObject {
         false
     }
 
+    /// The cached-slot in-place write behind the interpreter's warm-store
+    /// fast path (L1a): write `value` into the own writable data property
+    /// `key` at property-vector `slot`, mirror the inline field, and bump
+    /// the generation (an in-place value update is an own-property change —
+    /// the read-side value caches re-validate, slice 11). The caller
+    /// validated the own data property through its store cell; the slot
+    /// checks here are the O(1) backstop against a stale cell. Restricted
+    /// to Ordinary objects (an Array's `length`/index writes are exotic
+    /// intercepts the store cell must never bypass). Returns false when
+    /// `slot` does not hold `key` as a writable data property — the caller
+    /// falls back to the full [[Set]].
+    pub fn write_data_property_slot(&self, key: &PropertyKey, slot: usize, value: Value) -> bool {
+        if !matches!(self.kind, ObjectKind::Ordinary) {
+            return false;
+        }
+        let mut props = self.properties.borrow_mut();
+        let Some((stored, property)) = props.get_mut(slot) else {
+            return false;
+        };
+        if stored != key {
+            return false;
+        }
+        let PropertyKind::Data {
+            value: cell,
+            writable,
+        } = &mut property.kind
+        else {
+            return false;
+        };
+        if !*writable {
+            return false;
+        }
+        *cell = value;
+        // Mirror the in-place value update into the inline field when the
+        // key is mapped (Part B, B5.3) — the map read path serves from
+        // there, so a stale field would win over the property vector.
+        let _ = self.map_set(key, value);
+        self.bump_generation();
+        true
+    }
+
     /// [[Set]] (P, V, Receiver): the arguments-exotic mapping (spec 10.4.4.6)
     /// followed by OrdinarySet.
     pub fn set_with_receiver_key(

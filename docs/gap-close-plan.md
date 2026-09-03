@@ -1,5 +1,10 @@
 # Plan: closing the Slag–Node gap
 
+> **Superseded by `docs/performance-plan.md` (2026-09-03).** This document
+> is kept as the closed historical record of the first (row-organized,
+> estimate-heavy) performance push; the current plan is mechanism-based
+> and covers both engines.
+
 > **Status: closed (2026-09-03).** The gap-close work stops here: the
 > remaining wide gaps need machinery beyond this engine's step-VM design
 > (callee inlining, a store-side hidden-class write path, a GC arena), at

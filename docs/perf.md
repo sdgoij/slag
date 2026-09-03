@@ -2717,6 +2717,64 @@ warmup calls, so the true JIT gaps are a bit smaller than shown. These
 are micro-benchmarks of the JIT's supported subset, not a workload
 comparison.
 
+### L1a — the warm-store fast path (measured 2026-09-03)
+
+The performance plan's L1a (a store-side cell mirroring the read cells)
+landed: `put_value`'s member write to an Ordinary object/function with
+receiver == base and a string key now probes a generation-validated cell
+— `(object id, name, generation, slot)` on `Agent::member_write_cells` —
+recording "at this generation, `name` is an own writable data property
+at property-vector `slot`". On a hit the write calls
+`JsObject::write_data_property_slot` (a direct vector-slot write +
+inline-field mirror + generation bump) and refreshes the read-side value
+cell, skipping `put_value`'s namespace/receiver probes, the primitive
+boxing, `find_ecma_accessor`'s own-property lookup, and
+`set_with_receiver_key`'s second descriptor lookup. Sound because an own
+writable data property shadows the whole chain (spec 7.3.3 step 3
+consults the chain only when the own property is absent) — no setter
+tracking needed — and the slice-11 discipline (every own-property
+mutation bumps the generation) invalidates on redefinition/delete/
+accessor-conversion. The cell is filled after a cold full-[[Set]] write
+that leaves an own writable data property. Interpreter-only: the JIT's
+compiled fast member-store is a separate path (its `call_slow`
+fallbacks inherit the win through `put_value`).
+
+Probe (the plan's next-experiment gate): the `compound assign` row is
+`o.x += 1; s += o.x` per iteration — the write term of the row's ~186ns/
+iter (2026-09-03 decomposition, ~146ns of it the write). Interleaved
+A/B of `--jit-bench` on this worktree vs its parent (ba9a69b), same
+machine: compound assign interp drops 17.5ms (parent, 4 runs 17.1-17.9)
+-> 6.16ms (4 runs 6.08-6.24) — ~2.8x, ~175ns -> ~62ns per iteration. The
+JIT column is unchanged (~1.45-1.5ms); the other `--jit-bench` and
+`--bench` rows are unchanged within the machine swing.
+
+Two slices beyond the cell itself close the write path: (1) the store
+cell is now probed directly from `assign_member`'s Assign/compound/logical
+branches BEFORE `fast_fresh_store` and `put_value` — the hot existing-
+property write skips the fresh-store map check, the `member_reference`
+build, and the `put_value` call layer (put_value keeps its own probe for
+its other callers: updates, destructuring, eval); (2) `member_reference`/
+`super_reference` no longer round-trip a `Name` atom through
+`crux::lookup` + re-intern — `PropertyKey::String(id)` is the canonical
+form, so the clone-and-rehash was pure waste on every member write. The
+second read per iteration also hits the value cell the store refreshed
+(before, the write's generation bump forced it to re-resolve).
+
+Gates: `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` green; the three release sweeps are identical
+to the parent (ba9a69b) sweep on every count — language 23721/23724
+(3 skip), built-ins 23657/23812 (155 skip), annexB 1086/1086, all with
+zero fail/crash/hang on both binaries; the edge probe
+(`scratch/l1a_store_probe.js`: accessor conversion, delete+recreate,
+chain setters present and added later, non-writable + strict,
+function objects, multi-prop thrash, computed keys, super writes,
+proxies, own accessors) passes under the JIT, `--no-jit`, and
+`--gc-stress`.
+
+Next experiment: L1b — fuse the compound store (`o.x += v` as one
+register op on the L1a store cell + the read cell), then L1c (shapes
+with inline-property offsets), per the plan's sequencing.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

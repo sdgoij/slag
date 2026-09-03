@@ -815,6 +815,22 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
         }
         ReferenceBase::Value(base) => {
             let key = &reference.name;
+            // L1a warm-store fast path: a member write to a plain
+            // object/function whose own `name` is a writable data property
+            // (validated by the store cell's (id, name, generation) match)
+            // stores directly into the property vector — an own writable
+            // data property shadows the entire chain (spec 7.3.3 step 3
+            // consults the chain only when the own property is absent), so
+            // the namespace/receiver probes, the primitive boxing, the
+            // accessor chain walk, and the descriptor machinery below are
+            // all skipped. Only for receiver == base (a plain member
+            // reference) on an Ordinary object/function.
+            if let PropertyKey::String(atom) = key
+                && reference.this_value.is_none()
+                && crate::ir::Vm::warm_store_put(agent, base, *atom, value)
+            {
+                return Ok(());
+            }
             // ModuleNamespace [[Set]] (spec 10.4.6.5): a direct write returns
             // false without consulting the exports or the prototype chain —
             // a (deferred) namespace never triggers evaluation on `[[Set]]`,
@@ -939,6 +955,16 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                         key.display_string()
                     ),
                 ));
+            }
+            // L1a: the store cell missed or was cold, so the write ran the
+            // full [[Set]] above — when it left `name` an own writable data
+            // property (an in-place update or a fresh define), record the
+            // store cell so the next write to the same property takes the
+            // warm-store fast path.
+            if reference.this_value.is_none()
+                && let PropertyKey::String(atom) = key
+            {
+                crate::ir::Vm::warm_store_record(agent, &base, *atom);
             }
             Ok(())
         }
