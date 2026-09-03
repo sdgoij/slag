@@ -12032,6 +12032,48 @@ pub fn stmt_contains_suspension(stmt: &Stmt) -> bool {
     }
 }
 
+/// A statement whose control flow never leaves its enclosing statement
+/// list (no `break`/`continue`/`return`/`throw`; suspension is checked by
+/// the caller). Nested loops/labels/switches keep their transfers inside
+/// themselves, and nested function/class declarations are separate
+/// execution contexts, so only statements whose bodies can exit the list
+/// stop the walk.
+fn stmt_has_no_outgoing_transfer(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Return(_) | StmtKind::Throw(_) => {
+            false
+        }
+        StmtKind::Block(block) => block.stmts.iter().all(stmt_has_no_outgoing_transfer),
+        StmtKind::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            stmt_has_no_outgoing_transfer(consequent)
+                && alternate
+                    .as_deref()
+                    .is_none_or(stmt_has_no_outgoing_transfer)
+        }
+        StmtKind::Labeled { body, .. } => stmt_has_no_outgoing_transfer(body),
+        StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => {
+            stmt_has_no_outgoing_transfer(body)
+        }
+        StmtKind::For { body, .. }
+        | StmtKind::ForIn { body, .. }
+        | StmtKind::ForOf { body, .. } => stmt_has_no_outgoing_transfer(body),
+        StmtKind::Switch { cases, .. } => cases
+            .iter()
+            .all(|case| case.consequent.iter().all(stmt_has_no_outgoing_transfer)),
+        // A try/catch/finally redirects transfers through its own machinery
+        // and `with` hosts arbitrary nested scopes — neither is a hot
+        // straight-line loop body, so keep the wrapper.
+        StmtKind::Try { .. } | StmtKind::With { .. } => false,
+        // Empty/expression/declaration statements and nested function/class
+        // declarations cannot transfer out of the list.
+        _ => true,
+    }
+}
+
 fn for_init_contains_suspension(init: &ForInit) -> bool {
     match init {
         ForInit::Expr(expr) => expr_contains_suspension(expr),
@@ -13583,65 +13625,74 @@ impl Compiler {
             .collect()
     }
 
+    /// A block's interior: the Annex B entries / block environment and its
+    /// statement list. `compile_statement` wraps it in `ListBegin`/
+    /// `ListEnd`; a `for` body whose completion the loop discards compiles
+    /// the interior alone (see `compile_for_body`).
+    fn compile_block_contents(&mut self, block: &Block) -> Result<(), JsError> {
+        if self.fast_block(&block.stmts) {
+            // Cut 3: a fast body's block has no lexical declarations
+            // that need an environment, so it contributes no
+            // environment (the per-iteration env allocation in hot
+            // loops disappears). The scope count is untouched, so
+            // control-transfer unwinds stay balanced.
+            //
+            // Cut 6 first slice: an Annex B block function
+            // declaration keeps the block env-free — the block
+            // binding is a frame slot initialized at block entry
+            // (14.2.3) with the hoisted var reset to *undefined*
+            // (B.3.2.1) first, and the declaration statement copies
+            // the block binding into the var binding (B.3.3.3).
+            let indices = self.annex_b_block_entries(&block.stmts);
+            self.annex_b_stack.push(indices.clone());
+            for &index in &indices {
+                let (name, function, block_slot, var_slot) = {
+                    let scope = self
+                        .scope
+                        .as_ref()
+                        .expect("Annex B entries imply a certified body");
+                    let entry = &scope.annex_b[index];
+                    (
+                        entry.name,
+                        entry.function.clone(),
+                        entry.block_slot,
+                        entry.var_slot,
+                    )
+                };
+                if let Some(var_slot) = var_slot {
+                    self.emit(Step::Push(Value::Undefined));
+                    self.emit(Step::InitLocal { slot: var_slot });
+                }
+                let outer_chain = self.closure_outer_chain();
+                let per_iteration_chain = self.closure_per_iteration_chain();
+                self.emit(Step::FunctionDeclInit {
+                    name,
+                    function,
+                    frame_slot: Some(block_slot),
+                    context_slot: None,
+                    outer_chain,
+                    per_iteration_chain,
+                });
+            }
+            self.compile_statements(&block.stmts)?;
+            self.annex_b_stack.pop();
+        } else {
+            self.emit(Step::EnterBlock {
+                decls: Self::block_decls(&block.stmts),
+            });
+            self.scope_count += 1;
+            self.compile_statements(&block.stmts)?;
+            self.scope_count -= 1;
+            self.emit(Step::LeaveBlock);
+        }
+        Ok(())
+    }
+
     fn compile_statement(&mut self, stmt: &Stmt) -> Result<(), JsError> {
         match &stmt.kind {
             StmtKind::Block(block) => {
                 self.emit(Step::ListBegin);
-                if self.fast_block(&block.stmts) {
-                    // Cut 3: a fast body's block has no lexical declarations
-                    // that need an environment, so it contributes no
-                    // environment (the per-iteration env allocation in hot
-                    // loops disappears). The scope count is untouched, so
-                    // control-transfer unwinds stay balanced.
-                    //
-                    // Cut 6 first slice: an Annex B block function
-                    // declaration keeps the block env-free — the block
-                    // binding is a frame slot initialized at block entry
-                    // (14.2.3) with the hoisted var reset to *undefined*
-                    // (B.3.2.1) first, and the declaration statement copies
-                    // the block binding into the var binding (B.3.3.3).
-                    let indices = self.annex_b_block_entries(&block.stmts);
-                    self.annex_b_stack.push(indices.clone());
-                    for &index in &indices {
-                        let (name, function, block_slot, var_slot) = {
-                            let scope = self
-                                .scope
-                                .as_ref()
-                                .expect("Annex B entries imply a certified body");
-                            let entry = &scope.annex_b[index];
-                            (
-                                entry.name,
-                                entry.function.clone(),
-                                entry.block_slot,
-                                entry.var_slot,
-                            )
-                        };
-                        if let Some(var_slot) = var_slot {
-                            self.emit(Step::Push(Value::Undefined));
-                            self.emit(Step::InitLocal { slot: var_slot });
-                        }
-                        let outer_chain = self.closure_outer_chain();
-                        let per_iteration_chain = self.closure_per_iteration_chain();
-                        self.emit(Step::FunctionDeclInit {
-                            name,
-                            function,
-                            frame_slot: Some(block_slot),
-                            context_slot: None,
-                            outer_chain,
-                            per_iteration_chain,
-                        });
-                    }
-                    self.compile_statements(&block.stmts)?;
-                    self.annex_b_stack.pop();
-                } else {
-                    self.emit(Step::EnterBlock {
-                        decls: Self::block_decls(&block.stmts),
-                    });
-                    self.scope_count += 1;
-                    self.compile_statements(&block.stmts)?;
-                    self.scope_count -= 1;
-                    self.emit(Step::LeaveBlock);
-                }
+                self.compile_block_contents(block)?;
                 self.emit(Step::ListEnd);
             }
             StmtKind::Expr(expr) => {
@@ -14364,6 +14415,27 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile a `for` body. A braced block whose statements never transfer
+    /// control out of it compiles without the statement-list wrapper: its
+    /// per-iteration `ListBegin`/`ListEnd` would only save/restore the
+    /// running completion when a statement list ends empty, and an iteration
+    /// body that can end empty (only empty/declaration statements — control
+    /// statements normalize their own completion) ends empty from the loop's
+    /// empty register on every iteration, so the restore never changes the
+    /// result. A body with a `break`/`continue`/`return`/`throw` — or a
+    /// `yield`/`await` that can resume with one — skips the `ListEnd` on
+    /// that transfer, so its push must stay.
+    fn compile_for_body(&mut self, body: &Stmt) -> Result<(), JsError> {
+        if let StmtKind::Block(block) = &body.kind
+            && !stmt_contains_suspension(body)
+            && block.stmts.iter().all(stmt_has_no_outgoing_transfer)
+        {
+            self.compile_block_contents(block)
+        } else {
+            self.compile_statement(body)
+        }
+    }
+
     fn compile_for(
         &mut self,
         init: Option<&ForInit>,
@@ -14655,7 +14727,7 @@ impl Compiler {
                         let saved = self.acc_binding.replace(name);
                         let body_steps = self.steps.len();
                         let body_fixups = self.fixups.len();
-                        self.compile_statement(body)?;
+                        self.compile_for_body(body)?;
                         // Cut 35 slice 9: a body that lowers to register ops
                         // runs on the register executor in one dispatch
                         // (`RunRegBody` saves/restores the accumulator
@@ -14697,7 +14769,7 @@ impl Compiler {
                     self.emit_fused_rel_test(op, loc, name, limit, end_label);
                     let body_start = self.new_label();
                     self.place(body_start);
-                    self.compile_statement(body)?;
+                    self.compile_for_body(body)?;
                     self.place(continue_label);
                     let index = self.steps.len();
                     self.emit(Step::FastLoopHead {
@@ -14727,7 +14799,7 @@ impl Compiler {
             }
             None => self.emit(Step::Push(Value::Boolean(true))),
         }
-        self.compile_statement(body)?;
+        self.compile_for_body(body)?;
         self.place(continue_label);
         if !per_iteration.is_empty() {
             self.emit(Step::PerIteration {

@@ -3175,6 +3175,42 @@ step-path `if (l === N)` guard overhead (~16ns/iter on the shape row) is
 the second measured term, reducible only with a completion-elision or
 fused-test landing.
 
+### Loop-body list wrappers elided for abrupt-free `for` bodies (measured 2026-09-03)
+
+`compile_for` emitted the body block's per-iteration `ListBegin`/`ListEnd`
+statement-list pair — a real `list_stack` push/pop plus the
+empty-restore — even when the body could never end an iteration in a
+state the loop's own completion machinery must restore. A braced `for`
+body whose statements cannot transfer out of it (no
+`break`/`continue`/`return`/`throw`, no `yield`/`await` — an inner
+nested loop keeps its own wrapper) now compiles the block interior
+without the pair (`compile_for_body`). Sound because the loop head's
+`ResetCompletion` empties the register before the first iteration and
+control statements normalize their own completion, so a body that can
+end an iteration empty (only empty/declaration statements) ends every
+iteration empty from an empty pre-iteration register — the wrapper's
+save/restore never changes the result. The JIT already lowers these
+steps as no-ops (Cut 65), so the interpreter converges on the compiled
+path; the guard `if`'s own consequent block keeps its pair.
+
+Measurement (interleaved prev/child A/B on `scratch/trunc_decomp.js`,
+3 rounds each, 2026-09-03): the three guard shapes drop ~4ns/iter interp
+(shape 156->~143ms per 3M, ifappend 151->~138, appendif 157->~144).
+`--jit-bench`: `buildString shape` interp ~159->~141ms (~11%) and
+`buildString full` ~85->~78ms (~9%), JIT columns flat (~41ms/~25ms) —
+per-iteration dispatches removed, not the store machinery. Gates: clippy
+clean, workspace tests green (new `for_body_list_wrappers_drop_only_without_abrupt_control`
+asserting the drop and its absence for break/continue/return bodies, and
+`dropped_for_body_wrapper_keeps_loop_completion` covering the
+completion-value edges), the three release sweeps identical to the
+parent (language 23721/3 skip, built-ins 23657/155 skip, annexB
+1086/1086, zero fail/crash/hang on both binaries).
+
+Next: the guard region's residual per-iteration cost is the step-path
+`if` machinery (its own reset/test/dispatch), which the plan folds into
+L1b's fused guard; the structural L1c shapes item remains the primary
+investment.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

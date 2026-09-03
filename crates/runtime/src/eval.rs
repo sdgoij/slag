@@ -3358,6 +3358,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn for_body_list_wrappers_drop_only_without_abrupt_control() {
+        // A `for` body block whose statements cannot transfer out of it (no
+        // break/continue/return/throw, no suspension) compiles without the
+        // per-iteration `ListBegin`/`ListEnd` — the loop's own
+        // `ResetCompletion`/`NormalizeCompletion` make the wrapper's
+        // save/restore unobservable. A body with an abrupt transfer keeps
+        // the pair (the transfer would skip the matching `ListEnd`).
+        fn list_step_count(agent: &mut Agent, src: &str, name: &str) -> usize {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter(|s| matches!(s, crate::ir::Step::ListBegin | crate::ir::Step::ListEnd))
+                .count()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // The append-only body has no nested block either — no wrappers at
+        // all.
+        assert_eq!(
+            list_step_count(
+                &mut agent,
+                "function f(n) { var a = []; var l = 0; \
+                 for (var i = 0; i < n; i++) { a[l++] = i; } return l; }",
+                "f"
+            ),
+            0
+        );
+        // The buildString guard shape keeps only the guard's own consequent
+        // block's pair (its `ListBegin`/`ListEnd` are not the loop body's).
+        assert_eq!(
+            list_step_count(
+                &mut agent,
+                "function g(n) { var a = []; var l = 0; var c = 0; \
+                 for (var i = 0; i < n; i++) { a[l++] = i; if (l === 10000) { c++; l = 0; } } \
+                 return c; }",
+                "g"
+            ),
+            2
+        );
+        // A break or continue (even guarded by an `if`) keeps the body's
+        // pair.
+        assert_eq!(
+            list_step_count(
+                &mut agent,
+                "function h(n) { var a = []; var l = 0; \
+                 for (var i = 0; i < n; i++) { a[l++] = i; if (l > 10000) break; } return l; }",
+                "h"
+            ),
+            2
+        );
+        assert_eq!(
+            list_step_count(
+                &mut agent,
+                "function k(n) { var a = []; var l = 0; \
+                 for (var i = 0; i < n; i++) { a[l++] = i; if (l > 10000) continue; } return l; }",
+                "k"
+            ),
+            2
+        );
+        // A return keeps the pair too.
+        assert_eq!(
+            list_step_count(
+                &mut agent,
+                "function m(n) { var a = []; var l = 0; \
+                 for (var i = 0; i < n; i++) { a[l++] = i; if (l > 10000) return l; } return l; }",
+                "m"
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn dropped_for_body_wrapper_keeps_loop_completion() {
+        // The completion of a loop whose body block ends in an `if` with an
+        // empty alternate — a shape whose per-iteration wrapper is dropped —
+        // still normalizes exactly like the wrapped equivalent.
+        assert_eq!(
+            run("var a = []; var l = 0; var c = 0; \
+                 for (var i = 0; i < 20; i++) { a[l++] = i; if (l === 10) { c++; l = 0; } } \
+                 c + a.length + l")
+            .unwrap(),
+            // The guard resets `l` (not the array), so indices 0-9 are
+            // written twice: c = 2, a.length = 10, l = 0.
+            Value::Number(12.0)
+        );
+        assert_eq!(
+            run("var a = []; var l = 0; 1; \
+                 for (var i = 0; i < 3; i++) { a[l++] = i; if (i === 1) { } }")
+            .unwrap(),
+            Value::Undefined
+        );
+        // An empty body block keeps the empty completion (undefined after
+        // the loop's normalize), not a stale accumulation.
+        assert_eq!(
+            run("var i = 0; 7; for (; i < 3; i++) { }").unwrap(),
+            Value::Undefined
+        );
+    }
+
     /// The compiled body of a function bound on the global object.
     fn compiled_body_of(agent: &mut Agent, name: &str) -> std::rc::Rc<crate::ir::CompiledBody> {
         let global = agent.running_context().unwrap().realm.global_object;
