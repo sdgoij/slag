@@ -1,7 +1,7 @@
 //! Expression parsing: the full precedence chain, cover grammar, arrows,
 //! templates, and destructuring targets (spec ch. 13).
 
-use crux::{AtomId, JsError, Span, intern_utf8};
+use crux::{AtomId, JsError, Span, intern, intern_utf8};
 use syntax::keywords::{Keyword, from_identifier, is_future_reserved_word};
 use syntax::{
     Argument, ArrayBindingElement, ArrayElement, ArrayLiteral, ArrowBody, AssignOp, BinaryOp,
@@ -928,6 +928,26 @@ fn parse_member_property(parser: &mut Parser) -> Result<MemberProperty, JsError>
     }
 }
 
+/// A computed member key that is a plain string literal (`o['k']`) is
+/// observationally identical to the named form (`o.k`): ToPropertyKey of a
+/// string is the string itself, so both resolve through the same atom-keyed
+/// property machinery. Normalizing the AST here sends a literal computed key
+/// down the (fast) named member path in every consumer. Excluded: the
+/// `"length"` atom, where the named read path has a typed-array length
+/// shortcut that the computed path (a prototype accessor invocation) does
+/// not.
+fn member_property_from_index(index: Expr) -> MemberProperty {
+    let text = match &index.kind {
+        ExprKind::Literal(Literal::Str(text)) => text,
+        _ => return MemberProperty::Computed(Box::new(index)),
+    };
+    let atom = intern(text.as_slice());
+    if atom == intern_utf8("length") {
+        return MemberProperty::Computed(Box::new(index));
+    }
+    MemberProperty::Name(atom)
+}
+
 /// Member/call/optional-chain continuation (spec 13.4.1).
 pub(crate) fn parse_subscripts(
     parser: &mut Parser,
@@ -961,7 +981,7 @@ pub(crate) fn parse_subscripts(
                     span: Span::new(start, end),
                     kind: ExprKind::Member(MemberExpr {
                         object: Box::new(expr),
-                        property: MemberProperty::Computed(Box::new(index)),
+                        property: member_property_from_index(index),
                         optional: false,
                         span: Span::new(start, end),
                     }),
@@ -1034,7 +1054,7 @@ fn parse_optional_link(parser: &mut Parser, expr: Expr) -> Result<Expr, JsError>
                 span: Span::new(start, end),
                 kind: ExprKind::Member(MemberExpr {
                     object: Box::new(expr),
-                    property: MemberProperty::Computed(Box::new(index)),
+                    property: member_property_from_index(index),
                     optional: true,
                     span: Span::new(start, end),
                 }),

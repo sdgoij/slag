@@ -3060,6 +3060,40 @@ Next: the compile-time string-literal-key normalization (a literal
 computed key like `o['k']` is observationally a name and should compile
 to the named machinery).
 
+### Literal-string computed keys compile as names (measured 2026-09-03)
+
+A computed member key that is a plain string literal (`o['k']`, `o['a-b']`,
+`o?.['m']`) is observationally identical to the named form: ToPropertyKey
+of a string is the string itself, so both resolve through the same
+atom-keyed property machinery. The parser now normalizes the AST at the two
+member-access `[index]` sites (`parse_subscripts`, `parse_optional_link`;
+`super['k']` stays computed) — `member_property_from_index` interns the
+literal and emits `MemberProperty::Name`, so every compiler path (reads,
+writes, compounds, updates, calls, `delete`, optional chains) automatically
+runs the fast named machinery. Excluded: the `"length"` atom, where the
+named read path's typed-array length shortcut (a slot read) differs from the
+computed path's prototype accessor invocation — keeping the literal form on
+the computed path preserves today's behavior for that one atom. Object
+literal `{['k']: v}` properties are a separate AST (`PropertyName`) and are
+untouched (`{['__proto__']: x}` stays a plain property).
+
+Measurement (2M-iteration certified loop, `scratch/computed_probe3.js`):
+`o['k'] += 1` ~157 -> ~12.5ns/iter (JIT) / ~28.5 (interp) — now identical
+to the named `o.x += 1`. Gates: clippy clean, workspace tests green, the
+literal-key probe (`scratch/literal_key_probe.js`: literal reads/writes/
+compounds/updates, non-identifier and empty-string keys, `delete`, accessors,
+optional chains, literal-key calls, `__proto__` writes, certified loops, the
+typed-array `['length']` exclusion, `super['k']`) passes under the JIT,
+`--no-jit`, and `--gc-stress`; the three release sweeps are identical to
+the parent.
+
+Next: the remaining literal-COMPUTED key is a NUMBER literal (`o[0] += 1`
+on a dense array, ~915ns): the register RMW lowering rejects `Const` keys,
+so it stays on the step path — accept `Const` keys in the computed member
+read/RMW lowering (a `Const` Number key then reaches the fused core's
+numeric element fast paths, and a `Const` string key is moot now that
+string literals normalize to names).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
