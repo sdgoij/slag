@@ -2970,6 +2970,62 @@ non-writable, delete+recreate, nullish, mid-loop break) passes under the
 JIT, `--no-jit`, and `--gc-stress`; the three release sweeps are
 identical to the parent.
 
+### Computed-member RMW on the register executor (measured 2026-09-03)
+
+The computed forms of the member RMW — `o[k] += v` (statement position),
+`o[k]++`/`o[k]--`, and the explicit `o[k] = o[k] + 1` — never reached the
+warm member cells: they ran the full Get/Set/Computed machinery per
+iteration (each iteration converting the key and re-resolving the
+property), measuring ~158ns/iter vs the named `o.x += 1` at ~28ns (the
+probe `scratch/computed_probe2.js`). The statement-position compound and
+update now lower to ONE fused register op per iteration
+(`CompoundMemberComputedLocal`, `UpdateMemberComputedLocal`; the
+`Dup2`/`GetMemberComputedKeep` read is deferred into it — sound because
+the RHS must be a pure operand, which emits no op between), and the
+plain-with-computed-value store (`o[k] = o[k] + 1`) lowers to the
+computed read + `StoreMemberComputedLocal`.
+
+The fused ops convert the key ONCE per evaluation and share it between
+the internal read and write — mirroring the step path's
+`GetMemberComputedKeep`, whose write reuses the converted key (spec
+13.15.3). A decomposed read+store with the store re-deriving the key
+from its slot would re-run an object key's ToPropertyKey after the
+read's getters and was rejected in design (the once-key probe
+`scratch/rmw_key_once2.js`, whose `toString` yields a fresh name per
+call, asserts the read and the write hit the same property per
+iteration under the JIT, `--no-jit`, and `--gc-stress`).
+
+Measurement (2M-iteration certified loops, `scratch/computed_probe2.js`,
+multi-run, the machine quiet): `o[k] += 1` ~158 -> ~54ns/iter and
+`o[k]++` ~160 -> ~51.5, in both engines (the JIT's fused-op slow-helper
+call keeps the compiled loop). The register executor's residual is the
+once-per-iteration key conversion + the member-cell read and warm-store
+write. A computed compound with a side-effectful RHS (`o[k] += o.y`), an
+expression-position update, and constant-key forms (`o['k']`, `o[0]`)
+stay on the step path — the constant-string form is the compile-time
+name-normalization slice, and the numeric-keyed dense-array RMW (a
+canonical runtime Number key) still takes the general (string-converted)
+path, pending the fused core's numeric fast paths.
+
+Gates: clippy clean; `cargo test --workspace` green (new lowering test
+asserting the three shapes reduce to their single fused ops and that the
+member-read-RHS and expression-position forms stay step-path); the edge
+probe (`scratch/l1c_computed_rmw_probe.js`: every binary compound op
+against a name reference, string `+=`, own getter/setter, chain
+accessors, shadowed own data, non-writable, delete+recreate, logical
+assigns, counter RHS, numeric-string/NaN updates, prefix/postfix,
+explicit `o[k] = o[k] + 1`, expression-position values, nullish, the
+once-per-evaluation object key, descriptor/order integrity, mid-loop
+break) and the L1a/L1c/compound/update probes pass under the JIT,
+`--no-jit`, and `--gc-stress`; the three release sweeps are identical to
+the parent — language 23721/23724 (3 skip), built-ins 23657/23812
+(155 skip), annexB 1086/1086, all with zero fail/crash/hang.
+
+Next: the compile-time string-literal-key normalization (a literal
+computed key like `o['k']` is observationally a name and should compile
+to the named machinery), and the numeric-keyed dense-array/typed-array
+fast paths inside the fused core.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

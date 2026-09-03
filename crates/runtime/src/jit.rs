@@ -399,6 +399,13 @@ pub struct JitSlowPaths {
     /// `Set(o, key, v)` with a computed key; returns the stored value.
     pub set_member_computed:
         extern "C" fn(ctx: *mut c_void, object: u64, key: u64, value: u64) -> u64,
+    /// The fused register computed-member compound (`o[k] op= v`): `op` is
+    /// an `AssignOp` discriminant; the run discards the result.
+    pub rmw_compound_computed:
+        extern "C" fn(ctx: *mut c_void, object: u64, key: u64, value: u64, op: u64) -> u64,
+    /// The fused register computed-member update (`o[k]++` / `o[k]--`): `op`
+    /// is an `UpdateOp` discriminant; the run discards the result.
+    pub rmw_update_computed: extern "C" fn(ctx: *mut c_void, object: u64, key: u64, op: u64) -> u64,
     /// The general `CallFast` (a body may contain calls — leaf bodies never
     /// do): `args` points at the JIT buffer's argument region (`argc`
     /// slots). Runs the interpreter's call machinery on the Vm's own stack.
@@ -893,6 +900,8 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     get_member_computed,
     set_member_name,
     set_member_computed,
+    rmw_compound_computed,
+    rmw_update_computed,
     call_slow,
     call_apply,
     apply_args_fill,
@@ -1230,6 +1239,53 @@ extern "C" fn set_member_computed(ctx: *mut c_void, object: u64, key: u64, value
             Some(result) => result.bits(),
             None => value.bits(),
         },
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn rmw_compound_computed(
+    ctx: *mut c_void,
+    object: u64,
+    key: u64,
+    value: u64,
+    op: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let object = Value::from_bits(object);
+    let key = Value::from_bits(key);
+    let value = Value::from_bits(value);
+    let op = ASSIGN_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(AssignOp::AddAssign);
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.compound_member_computed(agent, object, key, op, value) {
+        Ok(()) => {
+            // The write's pushed result is discarded by the register run.
+            let _ = vm.stack.pop();
+            value.bits()
+        }
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn rmw_update_computed(ctx: *mut c_void, object: u64, key: u64, op: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let object = Value::from_bits(object);
+    let key = Value::from_bits(key);
+    let op = UPDATE_OPS
+        .get(op as usize)
+        .copied()
+        .unwrap_or(UpdateOp::Increment);
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.update_member_computed(agent, object, key, op) {
+        Ok(()) => {
+            // The write's pushed result is discarded by the register run.
+            let _ = vm.stack.pop();
+            Value::Undefined.bits()
+        }
         Err(error) => slow_error(ctx, error),
     }
 }
@@ -2757,6 +2813,7 @@ extern "C" fn load_const(ctx: *mut c_void, step: u64, op: u64, field: u64) -> u6
         | (crate::ir::LeafOp::GetMemberComputedLocal { key, .. }, 2) => reg_const(key),
         (crate::ir::LeafOp::StoreMemberComputed { key, .. }, 3) => reg_const(key),
         (crate::ir::LeafOp::StoreMemberComputed { value, .. }, 4) => reg_const(value),
+        (crate::ir::LeafOp::CompoundMemberComputedLocal { rhs, .. }, 5) => reg_const(rhs),
         _ => unreachable!("load_const on a const-free op/field"),
     };
     value.bits()

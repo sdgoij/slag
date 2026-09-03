@@ -636,6 +636,7 @@ struct Lowerer<'a> {
     sig_get_comp: SigRef,
     sig_set_name: SigRef,
     sig_set_comp: SigRef,
+    sig_rmw: SigRef,
     sig_call: SigRef,
     /// The `(vm, callee, this, argc, args_ptr, direct_eval) -> value`
     /// signature of `call_slow` (Cut 62: a direct-eval `CallFast` site
@@ -750,6 +751,7 @@ impl<'a> Lowerer<'a> {
         let sig_get_comp = builder.import_signature(helper_sig(&[types::I64; 3], conv));
         let sig_set_name = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_set_comp = builder.import_signature(helper_sig(&[types::I64; 4], conv));
+        let sig_rmw = builder.import_signature(helper_sig(&[types::I64; 5], conv));
         let sig_call = builder.import_signature(helper_sig(&[types::I64; 5], conv));
         let sig_call_slow = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_call_apply = builder.import_signature(helper_sig(&[types::I64; 6], conv));
@@ -846,6 +848,7 @@ impl<'a> Lowerer<'a> {
             sig_get_comp,
             sig_set_name,
             sig_set_comp,
+            sig_rmw,
             sig_call,
             sig_call_slow,
             sig_call_apply,
@@ -5892,26 +5895,55 @@ impl<'a> Lowerer<'a> {
                 let object = self.builder.use_var(self.acc_var);
                 let key = self.leaf_operand(step, op_index, 3, key)?;
                 let value = self.leaf_operand(step, op_index, 4, value)?;
-                // The inline dense-array append gate (shared with the step
-                // path, gap-close M1 C), then the machine typed-array store
-                // (gap-close M5c); the remaining path is the full
-                // `SetMemberComputed` slow call (the register executor
-                // discards the store's result, so no push/merge value).
-                let ta_gate = self.builder.create_block();
-                let slow = self.builder.create_block();
-                let merge = self.builder.create_block();
-                self.emit_dense_array_append_inline(object, key, value, ta_gate, merge)?;
-                self.builder.switch_to_block(ta_gate);
-                self.emit_typed_array_store_inline(object, key, value, slow, merge)?;
-                self.builder.switch_to_block(slow);
-                self.call_slow(
-                    self.sig_set_comp,
-                    Helper::SetMemberComputed,
-                    &[object, key, value],
+                self.emit_computed_store(object, key, value)?;
+            }
+            LeafOp::StoreMemberComputedLocal {
+                object_slot,
+                key_slot,
+            } => {
+                // The object and the key are the frame slots (read at store
+                // time — the late-read contract), the value the accumulator.
+                // Same gates as `StoreMemberComputed`.
+                let object = self.load_slot(*object_slot);
+                let key = self.load_slot(*key_slot);
+                let value = self.builder.use_var(self.acc_var);
+                self.emit_computed_store(object, key, value)?;
+            }
+            LeafOp::CompoundMemberComputedLocal {
+                object_slot,
+                key_slot,
+                op,
+                rhs,
+            } => {
+                // One slow call: the helper converts the key once, reads the
+                // old value, applies the compound to the RHS, and stores
+                // through the same key. The RHS is a pure operand (loaded
+                // here — stable across the helper's read).
+                let object = self.load_slot(*object_slot);
+                let key = self.load_slot(*key_slot);
+                let value = self.leaf_operand(step, op_index, 5, rhs)?;
+                let op = self.builder.ins().iconst(types::I64, *op as i64);
+                let _res = self.call_slow(
+                    self.sig_rmw,
+                    Helper::RmwCompoundComputed,
+                    &[object, key, value, op],
                 )?;
-                self.builder.ins().jump(merge, &[]);
-                self.builder.seal_block(slow);
-                self.builder.switch_to_block(merge);
+            }
+            LeafOp::UpdateMemberComputedLocal {
+                object_slot,
+                key_slot,
+                op,
+            } => {
+                // One slow call: the helper converts the key once, applies
+                // the ToNumeric update, and stores through the same key.
+                let object = self.load_slot(*object_slot);
+                let key = self.load_slot(*key_slot);
+                let op = self.builder.ins().iconst(types::I64, *op as i64);
+                let _res = self.call_slow(
+                    self.sig_set_comp,
+                    Helper::RmwUpdateComputed,
+                    &[object, key, op],
+                )?;
             }
             LeafOp::GetMemberName { name } => {
                 let object = self.builder.use_var(self.acc_var);
@@ -5963,6 +5995,37 @@ impl<'a> Lowerer<'a> {
                 self.builder.ins().return_(&[value]);
             }
         }
+        Ok(())
+    }
+
+    /// The shared computed-member store tail (the register `StoreMemberComputed`
+    /// and `StoreMemberComputedLocal` ops): the inline dense-array append gate
+    /// (shared with the step path, gap-close M1 C), then the machine
+    /// typed-array store (gap-close M5c); the remaining path is the full
+    /// `SetMemberComputed` slow call (the register executor discards the
+    /// store's result, so no push/merge value). `object`/`key`/`value` are
+    /// already materialized values.
+    fn emit_computed_store(
+        &mut self,
+        object: ClifValue,
+        key: ClifValue,
+        value: ClifValue,
+    ) -> Result<(), Unsupported> {
+        let ta_gate = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        self.emit_dense_array_append_inline(object, key, value, ta_gate, merge)?;
+        self.builder.switch_to_block(ta_gate);
+        self.emit_typed_array_store_inline(object, key, value, slow, merge)?;
+        self.builder.switch_to_block(slow);
+        self.call_slow(
+            self.sig_set_comp,
+            Helper::SetMemberComputed,
+            &[object, key, value],
+        )?;
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(slow);
+        self.builder.switch_to_block(merge);
         Ok(())
     }
 

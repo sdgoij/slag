@@ -3214,7 +3214,118 @@ mod tests {
         assert_eq!(expression.len(), 0, "the expression update stays step-path");
     }
 
-    // ---- Cut 3: frame-slot fast path ----
+    #[test]
+    fn computed_member_rmw_lowers_to_register_runs() {
+        // A statement-position computed member compound (`o[k] += 1`) or
+        // update (`o[k]++`) in a certified loop, and an explicit
+        // `o[k] = o[k] + 1`, now lower to one fused register op per
+        // statement (`CompoundMemberComputedLocal`/
+        // `UpdateMemberComputedLocal`/`StoreMemberComputedLocal`). A shape
+        // the fused form cannot preserve (a side-effectful RHS, an
+        // expression-position update whose value feeds later steps) stays
+        // on the step path.
+        fn register_runs(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> Vec<Box<[crate::ir::LeafOp]>> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // `o[k] += 1`: one fused compound op (key converted once, shared by
+        // its internal read and write).
+        let compound = register_runs(
+            &mut agent,
+            "function c(o, k, n) { for (var i = 0; i < n; i++) { o[k] += 1; } return o[k]; }",
+            "c",
+        );
+        assert_eq!(compound.len(), 1, "the o[k] += 1 body must lower");
+        assert!(
+            matches!(
+                &compound[0][..],
+                [crate::ir::LeafOp::CompoundMemberComputedLocal {
+                    object_slot: 0,
+                    key_slot: 1,
+                    op: syntax::ast::AssignOp::AddAssign,
+                    rhs: crate::ir::RegOperand::Const(value),
+                }] if *value == crux::Value::Number(1.0)
+            ),
+            "the o[k] += 1 statement must be exactly one fused op, got {:?}",
+            compound[0]
+        );
+        // `o[k]++`: one fused update op.
+        let update = register_runs(
+            &mut agent,
+            "function u(o, k, n) { for (var i = 0; i < n; i++) { o[k]++; } return o[k]; }",
+            "u",
+        );
+        assert_eq!(update.len(), 1, "the o[k]++ body must lower");
+        assert!(
+            matches!(
+                &update[0][..],
+                [crate::ir::LeafOp::UpdateMemberComputedLocal {
+                    object_slot: 0,
+                    key_slot: 1,
+                    op: syntax::ast::UpdateOp::Increment,
+                }]
+            ),
+            "the o[k]++ statement must be exactly one fused op, got {:?}",
+            update[0]
+        );
+        // `o[k] = o[k] + 1`: the plain computed store of a computed value
+        // (the store defers its own key conversion, matching the step
+        // path).
+        let explicit = register_runs(
+            &mut agent,
+            "function e(o, k, n) { for (var i = 0; i < n; i++) { o[k] = o[k] + 1; } return o[k]; }",
+            "e",
+        );
+        assert_eq!(explicit.len(), 1, "the o[k] = o[k] + 1 body must lower");
+        assert!(
+            explicit[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::StoreMemberComputedLocal {
+                    object_slot: 0,
+                    key_slot: 1
+                }
+            )),
+            "the run must store through the re-read key slot"
+        );
+        // A side-effectful RHS (`o[k] += o.y` — a member read that must run
+        // AFTER the old-value read) keeps the whole statement on the step
+        // path: the fused form cannot defer its read past RHS work.
+        let rhs_read = register_runs(
+            &mut agent,
+            "function h(o, k, n) { for (var i = 0; i < n; i++) { o[k] += o.y; } return o[k]; }",
+            "h",
+        );
+        assert_eq!(
+            rhs_read.len(),
+            0,
+            "a computed compound with a member-read RHS stays step-path"
+        );
+        // An expression-position computed update (`s += o[k]++`) leaves its
+        // result unconsumed and stays on the step path.
+        let expression = register_runs(
+            &mut agent,
+            "function x(o, k, n) { var s = 0; for (var i = 0; i < n; i++) { s += o[k]++; } return s; }",
+            "x",
+        );
+        assert_eq!(
+            expression.len(),
+            0,
+            "the expression-position computed update stays step-path"
+        );
+    }
 
     /// The compiled body of a function bound on the global object.
     fn compiled_body_of(agent: &mut Agent, name: &str) -> std::rc::Rc<crate::ir::CompiledBody> {

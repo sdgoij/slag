@@ -31,6 +31,15 @@ pub enum Helper {
     GetMemberComputed,
     SetMemberName,
     SetMemberComputed,
+    /// The register fused computed-member compound (`o[k] op= v`): converts
+    /// the key once, reads the old value, applies the compound to the RHS
+    /// value, and stores through the same key. `op` is an `AssignOp`
+    /// discriminant.
+    RmwCompoundComputed,
+    /// The register fused computed-member update (`o[k]++` / `o[k]--`):
+    /// converts the key once, applies the ToNumeric update, and stores.
+    /// `op` is an `UpdateOp` discriminant.
+    RmwUpdateComputed,
     CallSlow,
     LeafCallProbe,
     GetGlobal,
@@ -162,6 +171,8 @@ impl Helper {
             Helper::GetMemberComputed => "get_member_computed",
             Helper::SetMemberName => "set_member_name",
             Helper::SetMemberComputed => "set_member_computed",
+            Helper::RmwCompoundComputed => "rmw_compound_computed",
+            Helper::RmwUpdateComputed => "rmw_update_computed",
             Helper::CallSlow => "call_slow",
             Helper::LeafCallProbe => "leaf_call_probe",
             Helper::GetGlobal => "get_global",
@@ -346,6 +357,15 @@ pub struct JitHelpers {
     /// `Set(o, key, v)` with a computed key; returns the stored value.
     pub set_member_computed:
         Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, value: u64) -> u64>,
+    /// The fused register computed-member compound (`o[k] op= v`): `op` is
+    /// an `AssignOp` discriminant; returns nothing meaningful (the run
+    /// discards the result).
+    pub rmw_compound_computed:
+        Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, value: u64, op: u64) -> u64>,
+    /// The fused register computed-member update (`o[k]++` / `o[k]--`): `op`
+    /// is an `UpdateOp` discriminant; returns nothing meaningful.
+    pub rmw_update_computed:
+        Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, op: u64) -> u64>,
     /// The general `CallFast` (a body may contain calls): `args` points at
     /// the JIT buffer's argument region (`argc` slots); returns the call's
     /// result value. `direct_eval` (Cut 62) routes a direct-eval callee
@@ -703,6 +723,8 @@ impl JitHelpers {
             get_member_computed: None,
             set_member_name: None,
             set_member_computed: None,
+            rmw_compound_computed: None,
+            rmw_update_computed: None,
             call_slow: None,
             leaf_call_probe: None,
             get_global: None,
@@ -828,6 +850,8 @@ impl JitHelpers {
             Helper::GetMemberComputed => self.get_member_computed.map(|f| f as usize as u64),
             Helper::SetMemberName => self.set_member_name.map(|f| f as usize as u64),
             Helper::SetMemberComputed => self.set_member_computed.map(|f| f as usize as u64),
+            Helper::RmwCompoundComputed => self.rmw_compound_computed.map(|f| f as usize as u64),
+            Helper::RmwUpdateComputed => self.rmw_update_computed.map(|f| f as usize as u64),
             Helper::CallSlow => self.call_slow.map(|f| f as usize as u64),
             Helper::LeafCallProbe => self.leaf_call_probe.map(|f| f as usize as u64),
             Helper::GetGlobal => self.get_global.map(|f| f as usize as u64),
@@ -1012,6 +1036,25 @@ pub extern "C" fn test_set_member_computed(
     value: u64,
 ) -> u64 {
     value
+}
+
+pub extern "C" fn test_rmw_compound_computed(
+    _vm: *mut c_void,
+    _object: u64,
+    _key: u64,
+    value: u64,
+    _op: u64,
+) -> u64 {
+    value
+}
+
+pub extern "C" fn test_rmw_update_computed(
+    _vm: *mut c_void,
+    _object: u64,
+    _key: u64,
+    _op: u64,
+) -> u64 {
+    0
 }
 
 /// Returns 42 — proves `get_global` was called with the right ABI.

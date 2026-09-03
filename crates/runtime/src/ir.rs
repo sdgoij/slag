@@ -1063,6 +1063,7 @@ fn trace_leaf_op_heaps(op: &LeafOp, visit: &mut dyn FnMut(GcAny)) {
         LeafOp::GetMemberComputed { key, .. } | LeafOp::GetMemberComputedLocal { key, .. } => {
             operand(key, visit);
         }
+        LeafOp::CompoundMemberComputedLocal { rhs, .. } => operand(rhs, visit),
         _ => {}
     }
 }
@@ -1159,6 +1160,40 @@ pub enum LeafOp {
     /// property-key machinery. Neither operand may be `Acc` — the object
     /// load would clobber it.
     StoreMemberComputed { key: RegOperand, value: RegOperand },
+    /// Write the accumulator onto the computed `key` property of the object
+    /// in frame `object_slot`, re-reading the key from frame `key_slot` at
+    /// store time (the computed counterpart of `StoreMemberNameLocal`: the
+    /// store of a computed value with the object and key in frame slots —
+    /// e.g. `o[k] = o[k] + 1`, where the value was computed after the
+    /// reference). The engine's plain computed store defers the target
+    /// key's ToPropertyKey to the store, so this re-derivation matches the
+    /// step path exactly. The lowering emits it only for `tdz=false` slots
+    /// (the late-read contract).
+    StoreMemberComputedLocal { object_slot: usize, key_slot: usize },
+    /// The register form of a statement-position computed member compound
+    /// (`o[k] op= v`): the object and key are frame slots, the RHS a pure
+    /// operand. Converts the key ONCE inside the op and shares it between
+    /// the read and the write (spec 13.15.3 — the step path's
+    /// `GetMemberComputedKeep` converts before the read and hands the
+    /// converted key to the write; a separate store op re-deriving an
+    /// object key would re-run its ToPropertyKey). Reads the old value
+    /// (member-cell probed), applies the compound to the RHS value (a
+    /// caller-resolved pure operand, stable across the read), and stores
+    /// through the same key.
+    CompoundMemberComputedLocal {
+        object_slot: usize,
+        key_slot: usize,
+        op: AssignOp,
+        rhs: RegOperand,
+    },
+    /// The register form of a statement-position computed member update
+    /// (`o[k]++` / `o[k]--`): the same once-converted-key contract;
+    /// applies the ToNumeric update to the read value and stores.
+    UpdateMemberComputedLocal {
+        object_slot: usize,
+        key_slot: usize,
+        op: syntax::ast::UpdateOp,
+    },
     /// acc = the accumulator object's `name` property (the named member
     /// read, `Step::GetMemberName`): the shared `get_member_name` nullish
     /// check + member-cell cache machinery.
@@ -8016,6 +8051,98 @@ impl Vm {
         Ok(value)
     }
 
+    /// The register computed-member compound (`o[k] op= v`, the
+    /// `CompoundMemberComputedLocal` op): the nullish check, then the key is
+    /// converted ONCE and the old value read through the member cell, the
+    /// compound applied to the caller-resolved RHS value, and the result
+    /// stored through the SAME key. Sound because the step path's
+    /// `GetMemberComputedKeep` also converts before the read and hands the
+    /// write the converted key (spec 13.15.3) — re-converting an object key
+    /// at a separate store op would re-run its ToPropertyKey after the
+    /// read's getters.
+    pub(crate) fn compound_member_computed(
+        &mut self,
+        agent: &mut Agent,
+        object: Value,
+        key: Value,
+        op: AssignOp,
+        value: Value,
+    ) -> Result<(), JsError> {
+        if is_nullish(&object) {
+            return Err(nullish_error("Cannot read properties of null"));
+        }
+        let key = crate::context::to_property_key(agent, &key)?;
+        let old = match &key {
+            PropertyKey::String(atom) => match Self::member_cell_get(agent, &object, *atom) {
+                Some(old) => old,
+                None => {
+                    let old = crate::context::get_property_key(agent, &object, &key, object)?;
+                    Self::resolve_member_cell(agent, &object, *atom);
+                    old
+                }
+            },
+            _ => crate::context::get_property_key(agent, &object, &key, object)?,
+        };
+        let new = crate::expr::apply_compound(agent, op, &old, &value)?;
+        self.assign_member(
+            agent,
+            object,
+            PropertyKeyName::Key(key),
+            None,
+            new,
+            AssignOp::Assign,
+        )?;
+        Ok(())
+    }
+
+    /// The register computed-member update (`o[k]++` / `o[k]--`, the
+    /// `UpdateMemberComputedLocal` op): the once-converted-key read then the
+    /// ToNumeric update (the number case is the inline f64 ±1, everything
+    /// else `update_value`) stored through the same key.
+    pub(crate) fn update_member_computed(
+        &mut self,
+        agent: &mut Agent,
+        object: Value,
+        key: Value,
+        op: syntax::ast::UpdateOp,
+    ) -> Result<(), JsError> {
+        if is_nullish(&object) {
+            return Err(nullish_error("Cannot read properties of null"));
+        }
+        let key = crate::context::to_property_key(agent, &key)?;
+        let old = match &key {
+            PropertyKey::String(atom) => match Self::member_cell_get(agent, &object, *atom) {
+                Some(old) => old,
+                None => {
+                    let old = crate::context::get_property_key(agent, &object, &key, object)?;
+                    Self::resolve_member_cell(agent, &object, *atom);
+                    old
+                }
+            },
+            _ => crate::context::get_property_key(agent, &object, &key, object)?,
+        };
+        let new = if let Some(num) = old.as_number() {
+            let delta = if matches!(op, syntax::ast::UpdateOp::Increment) {
+                1.0
+            } else {
+                -1.0
+            };
+            Value::Number(num + delta)
+        } else {
+            let (_, new) = update_value(agent, &op, &old)?;
+            new
+        };
+        self.assign_member(
+            agent,
+            object,
+            PropertyKeyName::Key(key),
+            None,
+            new,
+            AssignOp::Assign,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn assign_member(
         &mut self,
         agent: &mut Agent,
@@ -8816,6 +8943,46 @@ impl Vm {
                     let key = self.leaf_operand_value(agent, key)?;
                     let value = self.leaf_operand_value(agent, value)?;
                     self.assign_computed_plain(agent, object, key, value)?;
+                }
+                LeafOp::StoreMemberComputedLocal {
+                    object_slot,
+                    key_slot,
+                } => {
+                    // The object and key are the frame slots (read at store
+                    // time — the late-read contract, `tdz=false` only), the
+                    // value the accumulator. Mirrors `StoreMemberComputed`:
+                    // the object load never clobbers the value because it
+                    // comes from the slot, so the value can stay in the
+                    // accumulator. The pushed result is discarded by the run
+                    // truncate.
+                    let object = *self.frame_get(*object_slot);
+                    let key = *self.frame_get(*key_slot);
+                    self.assign_computed_plain(agent, object, key, self.acc)?;
+                }
+                LeafOp::CompoundMemberComputedLocal {
+                    object_slot,
+                    key_slot,
+                    op,
+                    rhs,
+                } => {
+                    // The RHS is resolved before the member read: it is a
+                    // pure operand (a `tdz=false` frame slot, a constant, or
+                    // the loop counter) whose load is stable across the
+                    // read, so the engine's evaluation order (the old value
+                    // read before the RHS is observed) is preserved.
+                    let object = *self.frame_get(*object_slot);
+                    let key = *self.frame_get(*key_slot);
+                    let value = self.leaf_operand_value(agent, rhs)?;
+                    self.compound_member_computed(agent, object, key, *op, value)?;
+                }
+                LeafOp::UpdateMemberComputedLocal {
+                    object_slot,
+                    key_slot,
+                    op,
+                } => {
+                    let object = *self.frame_get(*object_slot);
+                    let key = *self.frame_get(*key_slot);
+                    self.update_member_computed(agent, object, key, *op)?;
                 }
                 LeafOp::GetMemberName { name } => {
                     let object = self.acc;
@@ -17777,6 +17944,7 @@ fn leaf_op_has_heap_const(op: &LeafOp) -> bool {
         LeafOp::GetMemberComputed { key, .. } | LeafOp::GetMemberComputedLocal { key, .. } => {
             operand(key)
         }
+        LeafOp::CompoundMemberComputedLocal { rhs, .. } => operand(rhs),
         _ => false,
     }
 }
@@ -17932,6 +18100,35 @@ fn lower_step(
                 | RegOperand::PerIter { .. } => stack.push(top.clone()),
                 _ => return None,
             }
+        }
+        Step::Dup2 => {
+            // Duplicate the top two shadow operands (the computed
+            // compound/update path's `[object, key]` reference pair: the
+            // read consumes the dup copies, the originals stay below for
+            // the write). Same re-readability rule as `Dup` — each
+            // duplicated operand must be loadable again at each
+            // consumption.
+            let b = stack.pop()?;
+            let a = stack.pop()?;
+            if !matches!(
+                a,
+                RegOperand::Reg { .. }
+                    | RegOperand::Const(_)
+                    | RegOperand::Ctx { .. }
+                    | RegOperand::PerIter { .. }
+            ) || !matches!(
+                b,
+                RegOperand::Reg { .. }
+                    | RegOperand::Const(_)
+                    | RegOperand::Ctx { .. }
+                    | RegOperand::PerIter { .. }
+            ) {
+                return None;
+            }
+            stack.push(a.clone());
+            stack.push(b.clone());
+            stack.push(a);
+            stack.push(b);
         }
         Step::LoadLocal { slot } => {
             let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
@@ -18233,18 +18430,43 @@ fn lower_step(
         Step::AssignMemberComputed {
             op: AssignOp::Assign,
         } => {
-            // `o[k] = v` (plain `=` only; compound stays on the step
-            // path): the object is the accumulator, the key and value
-            // direct operands. A computed key or value (`Acc`) cannot be
-            // held while the object load overwrites the accumulator.
+            // `o[k] = v` (plain `=` only): the object is the accumulator,
+            // the key and value direct operands. A computed value (`Acc`)
+            // with a frame-slot object and key (the `o[k] = o[k] + 1`
+            // shape — the value computed after the key) stores via
+            // `StoreMemberComputedLocal`, which reads the object and key
+            // from their slots at store time so the accumulator value is
+            // never clobbered; any other computed key/value (`Acc`) cannot
+            // be held while the object load overwrites the accumulator and
+            // keeps the body on the step path.
             let value = stack.pop()?;
             let key = stack.pop()?;
             let object = stack.pop()?;
-            // A computed key or value (`Acc`) cannot be held while the
-            // object load overwrites the accumulator. A `Counter` (the
-            // single per-run loop-counter read, resolved from the dedicated
-            // field) and a `PostInc` key (the write-back happens at load
-            // time, before the store's nullish check — matching JS
+            if matches!(value, RegOperand::Acc) {
+                let (
+                    RegOperand::Reg {
+                        slot: key_slot,
+                        tdz: false,
+                    },
+                    RegOperand::Reg {
+                        slot: object_slot,
+                        tdz: false,
+                    },
+                ) = (key, object)
+                else {
+                    return None;
+                };
+                ops.push(LeafOp::StoreMemberComputedLocal {
+                    object_slot,
+                    key_slot,
+                });
+                return Some(());
+            }
+            // A computed key (`Acc`) or a spilled value cannot be held
+            // while the object load overwrites the accumulator. A `Counter`
+            // (the single per-run loop-counter read, resolved from the
+            // dedicated field) and a `PostInc` key (the write-back happens
+            // at load time, before the store's nullish check — matching JS
             // evaluation order) are direct operands.
             if matches!(key, RegOperand::Acc | RegOperand::Spilled)
                 || matches!(value, RegOperand::Acc | RegOperand::Spilled)
@@ -18255,6 +18477,117 @@ fn lower_step(
                 return None;
             }
             ops.push(LeafOp::StoreMemberComputed { key, value });
+        }
+        Step::AssignMemberComputed {
+            op:
+                op @ (AssignOp::AddAssign
+                | AssignOp::SubAssign
+                | AssignOp::MulAssign
+                | AssignOp::DivAssign
+                | AssignOp::RemAssign
+                | AssignOp::ExpAssign
+                | AssignOp::LeftShiftAssign
+                | AssignOp::RightShiftAssign
+                | AssignOp::UnsignedRightShiftAssign
+                | AssignOp::BitAndAssign
+                | AssignOp::BitOrAssign
+                | AssignOp::BitXorAssign),
+        } => {
+            // A binary compound computed member assign (`o[k] += v`, ...):
+            // one fused op (`CompoundMemberComputedLocal`) that converts the
+            // key ONCE (the preceding `GetMemberComputedKeep` deferred its
+            // read into this op — sound because the RHS is a pure operand
+            // whose load emits no op and is stable across the read, so
+            // nothing observable runs between the keep and this op), reads
+            // the old value, applies the compound, and stores through the
+            // same key. The object/key must be `tdz=false` frame slots and
+            // the RHS a pure operand (`Reg`/`Const`/`Counter` — a computed
+            // `Acc`/spilled value means side-effectful RHS work ran between
+            // the keep and here, whose order this op cannot preserve). The
+            // logical assigns (`&&=`/`||=`/`??=`) stay on the step path
+            // (they short-circuit).
+            let value = stack.pop()?;
+            let key = stack.pop()?;
+            let object = stack.pop()?;
+            if !matches!(
+                value,
+                RegOperand::Reg { tdz: false, .. } | RegOperand::Const(_) | RegOperand::Counter
+            ) {
+                return None;
+            }
+            let (
+                RegOperand::Reg {
+                    slot: key_slot,
+                    tdz: false,
+                },
+                RegOperand::Reg {
+                    slot: object_slot,
+                    tdz: false,
+                },
+            ) = (key, object)
+            else {
+                return None;
+            };
+            ops.push(LeafOp::CompoundMemberComputedLocal {
+                object_slot,
+                key_slot,
+                op: *op,
+                rhs: value,
+            });
+        }
+        Step::UpdateMemberComputed { op, prefix: _ } => {
+            // A statement-position computed member update (`o[k]++` /
+            // `o[k]--`): one fused op (`UpdateMemberComputedLocal`) with the
+            // once-converted-key read, update, and store. The result (old
+            // for postfix, new for prefix) is discarded at the statement
+            // boundary, so the form is identical for both; an
+            // expression-position update leaves its result unconsumed and
+            // the run machinery keeps it on the step path.
+            let key = stack.pop()?;
+            let object = stack.pop()?;
+            let (
+                RegOperand::Reg {
+                    slot: key_slot,
+                    tdz: false,
+                },
+                RegOperand::Reg {
+                    slot: object_slot,
+                    tdz: false,
+                },
+            ) = (key, object)
+            else {
+                return None;
+            };
+            ops.push(LeafOp::UpdateMemberComputedLocal {
+                object_slot,
+                key_slot,
+                op: *op,
+            });
+        }
+        Step::GetMemberComputedKeep => {
+            // The computed compound/update path's read is deferred into the
+            // fused `CompoundMemberComputedLocal`/`UpdateMemberComputedLocal`
+            // op emitted at the following assign/update step (which converts
+            // the key once and shares it between its internal read and
+            // write). Here the duplicated `(object, key)` reference pair's
+            // copies are consumed — the originals stay on the shadow for the
+            // fused op. The op emits nothing: nothing observable runs between
+            // this step and the assign (the RHS must be a pure operand for
+            // the run to lower, which the assign's arm enforces), so the
+            // deferred read is unobservable. A group that cannot lower (a
+            // side-effectful RHS, an object/key that is not a frame slot)
+            // discards the whole run at the assign and keeps the step path.
+            let key = stack.pop()?;
+            let object = stack.pop()?;
+            if !matches!(
+                (object, key),
+                (
+                    RegOperand::Reg { tdz: false, .. },
+                    RegOperand::Reg { tdz: false, .. }
+                )
+            ) {
+                return None;
+            }
         }
         Step::GetMemberName { name } => {
             // `o.x` (in value position): a frame-slot object fuses the
@@ -18504,6 +18837,9 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
         | Some(LeafOp::StoreReg { .. })
         | Some(LeafOp::StoreMemberName { .. })
         | Some(LeafOp::StoreMemberComputed { .. })
+        | Some(LeafOp::StoreMemberComputedLocal { .. })
+        | Some(LeafOp::CompoundMemberComputedLocal { .. })
+        | Some(LeafOp::UpdateMemberComputedLocal { .. })
         | None => {}
         _ => return None,
     }
