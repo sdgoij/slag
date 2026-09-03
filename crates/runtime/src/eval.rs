@@ -1715,6 +1715,23 @@ mod tests {
         evaluate(source)
     }
 
+    /// Run `source` on a thread with a large native stack and check its
+    /// completion value. The interpreter collapses only SELF tail calls:
+    /// the mutual `even`/`odd` recursion below grows a fresh interpreter
+    /// frame set per call (~160 KB per level in the unoptimized test build),
+    /// so `even(10)`'s ~12 levels overflow the default 2 MiB test-thread
+    /// stack on some targets. The `Value` cannot cross threads, so the check
+    /// runs here and only the boolean crosses back.
+    fn run_deep(source: &'static str, check: impl Fn(&Value) -> bool + Send + 'static) -> bool {
+        std::thread::Builder::new()
+            .name("deep-recursion".into())
+            .stack_size(64 << 20)
+            .spawn(move || run(source).is_ok_and(|value| check(&value)))
+            .expect("spawns the deep-recursion thread")
+            .join()
+            .expect("the deep-recursion thread panicked")
+    }
+
     #[test]
     fn evaluates_a_trivial_script_to_a_value() {
         let mut agent = Agent::new();
@@ -4565,15 +4582,19 @@ mod tests {
             vec![Some(0), Some(1)],
             "both declarations must live in the capture context"
         );
-        assert_eq!(
-            run("function f() { function even(n) { return n === 0 ? true : odd(n - 1); } function odd(n) { return n === 0 ? false : even(n - 1); } return even(10); } f()")
-                .unwrap(),
-            Value::Boolean(true)
+        assert!(
+            run_deep(
+                "function f() { function even(n) { return n === 0 ? true : odd(n - 1); } function odd(n) { return n === 0 ? false : even(n - 1); } return even(10); } f()",
+                |v| v == &Value::Boolean(true),
+            ),
+            "even(10) mutual recursion must terminate"
         );
-        assert_eq!(
-            run("function f() { function even(n) { return n === 0 ? true : odd(n - 1); } function odd(n) { return n === 0 ? false : even(n - 1); } return odd(7); } f()")
-                .unwrap(),
-            Value::Boolean(true)
+        assert!(
+            run_deep(
+                "function f() { function even(n) { return n === 0 ? true : odd(n - 1); } function odd(n) { return n === 0 ? false : even(n - 1); } return odd(7); } f()",
+                |v| v == &Value::Boolean(true),
+            ),
+            "odd(7) mutual recursion must terminate"
         );
         // A closure capturing the declared name reads it from the capture
         // context after the body returns.
