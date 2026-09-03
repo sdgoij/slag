@@ -2999,6 +2999,79 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn loop_counter_operands_lower_to_register_runs() {
+        // The acc-path loop counter (`PushAcc`) as a binary RIGHT operand
+        // (`s += i`) or a plain member-store VALUE (`o.x = i`) previously
+        // kept the whole loop body on the step path. Both positions resolve
+        // the counter from the dedicated field at execution time, so they
+        // lower to register runs.
+        fn register_runs(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> Vec<Box<[crate::ir::LeafOp]>> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // `s += i`: the counter is the binary's right operand — the run
+        // loads it into the accumulator and combines the late-read frame
+        // slot (`BinLeftReg`).
+        let var_chain = register_runs(
+            &mut agent,
+            "function g(o, n) { var s = 0; for (var i = 0; i < n; i++) { s += i; } return s; }",
+            "g",
+        );
+        assert_eq!(var_chain.len(), 1, "the s += i body must lower");
+        assert!(
+            var_chain[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::LoadCounter)),
+            "the run must load the counter operand"
+        );
+        assert!(
+            var_chain[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::BinLeftReg { .. })),
+            "the run must combine the frame slot with the counter"
+        );
+        assert!(
+            var_chain[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::StoreReg { .. })),
+            "the run must write the accumulator back"
+        );
+        // `o.x = i`: the counter is the member store's value operand (the
+        // store resolves it from the field after the object load).
+        let member_store = register_runs(
+            &mut agent,
+            "function h(o, n) { for (var i = 0; i < n; i++) { o.x = i; } return o.x; }",
+            "h",
+        );
+        assert_eq!(member_store.len(), 1, "the o.x = i body must lower");
+        assert!(
+            member_store[0].iter().any(|op| {
+                matches!(
+                    op,
+                    crate::ir::LeafOp::StoreMemberName {
+                        value: crate::ir::RegOperand::Counter,
+                        ..
+                    }
+                )
+            }),
+            "the run must store the counter value onto the member"
+        );
+    }
+
     // ---- Cut 3: frame-slot fast path ----
 
     /// The compiled body of a function bound on the global object.

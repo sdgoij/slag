@@ -2826,11 +2826,88 @@ super receivers, proxies, >16-key thrash) passes under the JIT,
 
 The slice's value is the pinned-offset mechanism: the store cell now
 carries the map/field pair the deeper L1c write phases need (shape-check
-field writes that drop the per-write vector/descriptor machinery). Next:
-probe what the residual ~40ns warm write actually spends (the
-`assign_member`/step-dispatch and register-op share vs the vector
-borrow), then carry the shape check to the read path and the JIT inline
-store per the plan's L1c phasing.
+field writes that drop the per-write vector/descriptor machinery).
+
+Decomposition probe (the recorded next step, 2026-09-03): where the
+~63ns/iter `compound assign` row actually spends, isolated in the
+certified-leaf regime (`scratch/l1c_write_decomp.js`, 2M iters, medians of
+5 runs): the loop+var floor is ~10ns/iter (f6, `s = i`); the warm member
+WRITE is ~22ns (f5 `o.x = i` minus the floor); a serial dependent `+=`
+chain costs ~12-14ns per chain (f0 `s += i` = 22 vs f6 = 10), and the row
+carries TWO such chains (`o.x`'s RMW and the `s` accumulator); the warm
+member read is ~3ns. The compound step is NOT a tax: `o.x += 1` (f2,
+~49ns) equals the plain `o.x = o.x + 1` (f9, ~47ns) — both pay the read +
+serial chain on `o.x`. So the row is roughly floor 10 + write 22 + RMW
+chain ~14 + s chain ~14 + reads ~4 ≈ 64. Conclusion: the L1b fuse was
+right to defer — fusing the compound buys nothing the plain RMW already
+pays (the earlier "~20ns of non-write overhead" premise was the chain
+latency, which fusion cannot remove).
+
+Attribution probe (what the structural L1c write could actually reclaim,
+2026-09-03): a throwaway variant removing the property-vector write
+entirely from `write_data_property_slot` (the RefCell borrow, the
+backstop re-checks, and the vector slot store — the field mirror,
+generation bump, and both cell records kept) drops f5 from ~31.5 to
+~26.5ns/iter (write ~22 -> ~17ns) and leaves the row (f3) unchanged at
+~62ns. So the vector write is only ~5ns of the ~22ns write; the
+field-authoritative rewrite (making the map field the storage authority
+for mapped keys, shrinking SmallProps to overflow) removes ~5ns of the
+~63ns row (~8%) at the cost of making every descriptor/enumeration/
+structural consumer field-aware. That trade is NOT justified: the
+remaining ~17ns is the field mirror + generation bump + write-cell
+re-record + value-cell front + interpreter dispatch — the generation/
+record discipline the JIT's compiled probes share. Cutting it requires
+the deep L1c+JIT step (shape-based reads in BOTH engines so the
+value-cell records die), and even then the row stays ~45-50ns because of
+the two ~14ns dependent chains + 10ns floor. The row is now executor-
+bound, not property-bound: reads + vector write are ~8ns of the 63, and
+further interpreter property slices (L1c write or read) have low measured
+ceiling on it. The measured levers left are the register executor's
+dependent-add latency (shared with the `arithmetic` and `property read`
+rows) and the L1c-JIT record-discipline redesign.
+
+### Register-run coverage: the loop counter as a binary/store operand (measured 2026-09-03)
+
+Refining the decomposition above: the ~12ns "dependent-chain" cost on
+pure-var chains was NOT register-executor latency — it was a step-path
+fallback. Certified acc-path loop bodies stayed on the step path whenever
+the loop counter (the `PushAcc` operand, the dedicated `loop_counter`
+field) appeared as a binary RIGHT operand (`for (var i..) { s += i }`) or
+a plain member-store VALUE (`o.x = i`): the register lowering rejected
+`RegOperand::Counter` in both positions, so the whole body dispatched per
+step. The lowering now admits it: the binary arm loads the counter first
+and combines a spilled / late-readable frame-slot left
+(`LoadCounter` + `BinAccPop`/`BinLeftReg` — safe for `tdz=false` slots,
+where nothing in the straight-line run writes the slot between the load
+and the combine), and `StoreMemberName` resolves the counter from the
+dedicated field at execution time (after the object load and nullish
+check). Both reuse existing leaf ops, so the executor and the JIT need no
+new arms — newly-register-run bodies are `RunRegBody`s of ops both
+engines already emit.
+
+Measurement (certified-leaf probes `scratch/l1c_write_decomp.js`,
+high-priority interleaved runs, new vs the parent fresh build a962bb6):
+f0 `s += i` ~21 -> ~13ns/iter; f5 `o.x = i` ~31 -> ~22.5; f4
+`o.x = i; s += o.x` ~44.5 -> ~34. Controls flat: f6 `s = i` 9.5, f1
+`s += o.x` 16.5 (the earlier 23.5 reading was a code-layout artifact of an
+incremental build), f2/f8/f9 (member compound, step path by design)
+47-52. The 12 `--jit-bench` rows are unchanged (fresh-build A/B:
+arithmetic 11.99 vs 11.97, property read 23.30 vs 22.94, compound assign
+6.01 vs 6.04) — the suite has no counter-fed var-accumulator or
+member-store row; the slice widens register-run coverage to the common
+`for`-loop shapes that feed a var or store the counter onto a member.
+
+Gates: `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` green (incl. a new eval test asserting both
+shapes lower to `RunRegBody`); the edge probes pass under the JIT,
+`--no-jit`, and `--gc-stress`; the three release sweeps are identical to
+the parent — language 23721/23724 (3 skip), built-ins 23657/23812
+(155 skip), annexB 1086/1086, all with zero fail/crash/hang.
+
+Next: the compound row's residual cost is the member-compound step path
+(f2/f3 unchanged here) and the member-read-fed chains — those need the
+member ops' own fusion, and the `s += o.x`/`o.x += 1` step bodies remain
+the row's floor.
 
 ## Deferred milestones
 

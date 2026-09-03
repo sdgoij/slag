@@ -17872,7 +17872,27 @@ fn lower_step(
         Step::Binary(op) => {
             let right = stack.pop()?;
             let left = stack.pop()?;
-            if matches!(right, RegOperand::Acc) {
+            if matches!(right, RegOperand::Counter) {
+                // The acc-path loop counter as the RIGHT operand (the
+                // `s += i` shape: `i` reads as `PushAcc`). The counter
+                // lives in the dedicated field, so it loads into the
+                // accumulator without touching the frame; the left
+                // operand then combines exactly like the right-in-acc
+                // shapes below (`BinAccPop` for a spilled left,
+                // `BinLeftReg` for a late-readable frame-slot left). The
+                // frame-slot read is safe late for a `tdz=false` slot:
+                // nothing in the straight-line run writes it between the
+                // counter load and the combine.
+                ops.push(LeafOp::LoadCounter);
+                match left {
+                    RegOperand::Spilled => ops.push(LeafOp::BinAccPop { op: *op }),
+                    RegOperand::Reg { slot, tdz: false } => {
+                        ops.push(LeafOp::BinLeftReg { op: *op, slot })
+                    }
+                    _ => return None,
+                }
+                stack.push(RegOperand::Acc);
+            } else if matches!(right, RegOperand::Acc) {
                 // The right operand is the accumulator's live value. A
                 // spilled left operand combines by popping it back
                 // (`BinAccPop`); a frame-slot left operand reads the
@@ -18012,13 +18032,13 @@ fn lower_step(
             // A `PostInc` value would run the write-back after the
             // nullish check, inverting the step path's order (`l++`
             // evaluates before [[Set]] throws on a nullish receiver) —
-            // keep it on the step path.
+            // keep it on the step path. The loop Counter IS allowed: the
+            // store op resolves it from the dedicated field at execution
+            // time (after the object load), so it needs no accumulator
+            // slot.
             if matches!(
                 value,
-                RegOperand::Acc
-                    | RegOperand::Spilled
-                    | RegOperand::Counter
-                    | RegOperand::PostInc { .. }
+                RegOperand::Acc | RegOperand::Spilled | RegOperand::PostInc { .. }
             ) {
                 return None;
             }
