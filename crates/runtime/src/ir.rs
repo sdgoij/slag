@@ -9330,8 +9330,8 @@ impl Vm {
             // The loop counter lives in the dedicated `loop_counter` field
             // (Cut 35 slice 21: no entry push — the field IS the storage, so
             // the operand reads it directly, mirroring `LeafOp::LoadCounter`
-            // and the JIT's `counter_bits`). The single-read guard keeps the
-            // shadow stack at most one `Counter`.
+            // and the JIT's `counter_bits`). The read-count guard keeps the
+            // shadow stack at most two `Counter` entries.
             RegOperand::Counter => Ok(Value::Number(self.loop_counter)),
         }
     }
@@ -18185,8 +18185,9 @@ pub enum RegOperand {
     /// The accumulator-loop counter (Cut 35 slice 16): the body read it
     /// via `Step::PushAcc`; a `LoadCounter` (or a member op's operand
     /// resolution) reads the dedicated `Vm::loop_counter` field directly —
-    /// no stack round-trip since slice 21. At most one read per run (the
-    /// lowering allows a single `PushAcc` per `RunRegBody`).
+    /// no stack round-trip since slice 21. At most two reads per run (the
+    /// computed-store key + value shape; the lowering guard caps the
+    /// `PushAcc` count).
     Counter,
     Reg {
         slot: usize,
@@ -18279,9 +18280,13 @@ fn spill_live_acc(ops: &mut Vec<LeafOp>, stack: &mut [RegOperand]) {
 /// else — a live accumulator value, a spill, a counter, a post-increment —
 /// stays on the step path.
 fn is_stable_computed_key(operand: &RegOperand) -> bool {
+    // A `Counter` (the loop counter field) is stable like a `Const`: the
+    // acc-path head updates the field only between iterations, so its
+    // value cannot change between the read-side key conversion and the
+    // late store-time re-read of a fused computed op.
     matches!(
         operand,
-        RegOperand::Reg { tdz: false, .. } | RegOperand::Const(_)
+        RegOperand::Reg { tdz: false, .. } | RegOperand::Const(_) | RegOperand::Counter
     )
 }
 
@@ -18312,7 +18317,13 @@ fn lower_step(
     match step {
         Step::Push(value) => stack.push(RegOperand::Const(*value)),
         Step::PushAcc => {
-            if *counter_reads > 0 {
+            // At most two accumulator-loop counter reads per body: the
+            // computed-store shape `o[k] = <counter-derived value>` reads
+            // the counter as the key AND in the value expression. The
+            // counter lives in the dedicated field and nothing in the run
+            // writes it, so each read resolves the same value (slice 21:
+            // no entry push — the ops read the field directly).
+            if *counter_reads >= 2 {
                 return None;
             }
             *counter_reads += 1;
@@ -18851,10 +18862,7 @@ fn lower_step(
             // not the live value.)
             let key = stack.pop()?;
             let object = stack.pop()?;
-            if matches!(
-                key,
-                RegOperand::Acc | RegOperand::Spilled | RegOperand::Counter
-            ) {
+            if matches!(key, RegOperand::Acc | RegOperand::Spilled) {
                 return None;
             }
             match object {
@@ -18945,9 +18953,9 @@ fn lower_leaf_ops_segmented(
         }
         let mut ops = Vec::new();
         let mut stack: Vec<RegOperand> = Vec::new();
-        // Cut 35 slice 16/21: at most one counter read per run (the counter
-        // lives in the dedicated field; the single-read guard keeps the
-        // shadow stack at most one `Counter`).
+        // Cut 35 slice 16/21: at most two counter reads per run (the counter
+        // lives in the dedicated field; the guard keeps the shadow stack at
+        // most two `Counter` entries — the computed-store key + value shape).
         let mut counter_reads = 0;
         let run_start = i;
         // The last (exclusive end, ops length) where the run is committed:
@@ -19037,9 +19045,9 @@ fn lower_leaf_ops_segmented(
 fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
     let mut ops = Vec::new();
     let mut stack: Vec<RegOperand> = Vec::new();
-    // Cut 35 slice 16/21: at most one accumulator-loop counter read per
-    // body (the counter lives in the dedicated field; a second `PushAcc`
-    // would push a second `Counter` onto the shadow stack).
+    // Cut 35 slice 16/21: at most two accumulator-loop counter reads per
+    // body (the counter lives in the dedicated field; the guard keeps at
+    // most two `Counter` entries on the shadow stack).
     let mut counter_reads = 0;
     for (index, step) in steps.iter().enumerate() {
         lower_step(

@@ -3289,11 +3289,10 @@ Measurement (fresh builds of both trees, tight per-pair alternation, 3M
 iters, 2026-09-03): a warm named-store row (`o.x = i; s += i`) drops
 ~99 -> ~87ms (~11%); the compound row (`o.x += 1; s += o.x`) drops ~115
 -> ~109ms (~4%); the `var`-loop floor is flat and an isolated arithmetic
-row is flat. The `--jit-bench` suite does NOT show the compound win: by
-the compound row the shared direct-mapped member cells are thrashed by
-the ~13 prior rows (Cut 35 slice 5), so the L1a cell rarely hits in the
-suite and the warm-hit change is invisible there — the clean-context
-probes are the measurement, as with the earlier coverage slices. Gates:
+row is flat. The `--jit-bench` suite does NOT show the compound win: the
+row is only 100k iterations, so a ~1.7ns/iter saving (~0.17ms) is inside
+the row's run-to-run noise — clean-context probes are the measurement,
+as with the earlier coverage slices. Gates:
 clippy clean, workspace tests green, the three release sweeps identical
 to the parent (language 23721/3 skip, built-ins 23657/155 skip, annexB
 1086/1086, zero fail/crash/hang), and the member-store differential
@@ -3301,6 +3300,45 @@ probe (warm stores, accessor receivers, chain setters under an own data
 shadow, non-writable, delete+recreate mid-loop, accessor conversion
 mid-loop, array `length`, vector-only props, function own props) is
 byte-identical under `--no-jit` and the JIT.
+
+### Counter-keyed computed member access register-runs (measured 2026-09-03)
+
+The typed-array element rows access `ta[k]` with the acc-path loop
+counter as the computed key, but the register lowering rejected a
+`Counter` key (the `GetMemberComputed` arm lumped it with `Acc`/`Spilled`)
+and capped counter reads at one per run — so `s += ta[k]` and the bench's
+`ta[k] = k & 255` body (the counter as the key AND in the value
+expression: two reads) dispatched per step (~6-7 steps/iteration). Three
+lowering relaxations register-run them: a `Counter` key is admitted to
+the computed-read arms; `Counter` joins `is_stable_computed_key` (the
+fused computed ops may re-read it at store time — sound because the
+acc-path head updates the dedicated `loop_counter` field only between
+iterations, so it is run-invariant, like a `Const`); and the `PushAcc`
+guard allows two counter reads per run (each read resolves the same
+field value — no entry push since slice 21). The executor and the JIT
+already resolved `Counter` operands (`leaf_operand_value`/`leaf_operand`
+`counter_bits`), so no op or machine-code arm changed: the typed-array
+write body now lowers to `[LoadCounter, BinImm, StoreMemberComputedLocal
+{ key: Counter }]` and a computed read to `[GetMemberComputedLocal
+{ key: Counter }, BinLeftReg, StoreReg]` — one dispatch each.
+
+Measurement (interleaved A/B both orders, 4+2 pairs, 2026-09-03):
+`--jit-bench` `typed-array write` interp ~38.3 -> ~30.3ms (~21%),
+order-independent, JIT column flat (~12.2ms); the isolated row probe
+matches (39 -> ~30ms over 800k) and the counter-keyed read row drops
+~54 -> ~45ms; `arithmetic`/`property read` moved faster in this build
+(code-layout luck — no regression). Gates: clippy clean, workspace tests
+green (new `counter_keyed_computed_access_lowers_to_register_runs`
+asserting the read and write bodies lower to one `RunRegBody` with a
+`Counter` key and covering the uint8 wrap behavior), the three release
+sweeps identical to the parent (language 23721/3 skip, built-ins
+23657/155 skip, annexB 1086/1086, zero fail/crash/hang), and the
+counter-keyed differential probe (Uint8/Int16/Float64 arrays, plain
+arrays and objects, nested receivers, float-step counters, OOB
+read/write, over-2^32 keys) is byte-identical under `--no-jit` and the
+JIT. Computed compounds/updates (`ta[k] += 1`) still lower to the
+`Dup2` general path and stay step-path — the fused compound form does
+not yet reach them.
 
 ## Deferred milestones
 

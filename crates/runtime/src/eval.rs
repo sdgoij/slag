@@ -3359,6 +3359,87 @@ mod tests {
     }
 
     #[test]
+    fn counter_keyed_computed_access_lowers_to_register_runs() {
+        // The typed-array element rows access `ta[k]` with the acc-path loop
+        // counter as the computed key. The lowering previously rejected a
+        // `Counter` key (and capped the counter reads at one), so the whole
+        // body dispatched per step. A single-counter computed READ
+        // (`s += ta[k]`) and the computed-store shape (`ta[k] = k & 255` —
+        // the counter as the key AND in the value expression, two reads)
+        // now lower to one register run each.
+        fn register_runs(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> Vec<Box<[crate::ir::LeafOp]>> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // The read: one run with a Counter-keyed computed read.
+        let reads = register_runs(
+            &mut agent,
+            "function f(ta) { var L = ta.length; var s = 0; \
+             for (var k = 0; k < L; k++) { s += ta[k]; } return s; }",
+            "f",
+        );
+        assert_eq!(reads.len(), 1, "the counter-keyed read body must lower");
+        assert!(
+            reads[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::GetMemberComputedLocal {
+                    object_slot: 0,
+                    key: crate::ir::RegOperand::Counter,
+                    ..
+                }
+            )),
+            "the run must read through the Counter key"
+        );
+        // The write row shape: the counter is the key AND the value's
+        // operand (two reads) — one run, a Counter-keyed computed store.
+        let writes = register_runs(
+            &mut agent,
+            "function g(ta) { var L = ta.length; \
+             for (var k = 0; k < L; k++) { ta[k] = k & 255; } return L; }",
+            "g",
+        );
+        assert_eq!(writes.len(), 1, "the counter-keyed store body must lower");
+        assert!(
+            writes[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::StoreMemberComputedLocal {
+                    object_slot: 0,
+                    key: crate::ir::RegOperand::Counter,
+                }
+            )),
+            "the run must store through the Counter key"
+        );
+        // Behavior: the register-run rows match the step-path semantics
+        // (byte values, the uint8 wrap, OOB-free range).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "var ta = new Uint8Array(1000); var s = 0; \
+                 for (var k = 0; k < ta.length; k++) { ta[k] = k & 255; s += ta[k]; } \
+                 ta[0] * 1000000 + ta[255] * 1000 + ta[256] + s",
+            )
+            .unwrap();
+        // ta[k] = k & 255: ta[0] = 0, ta[255] = 255, ta[256] = 0 (256 wraps);
+        // s = sum of k & 255 over 0..1000 = 3 full 0..255 cycles (32640 each)
+        // + the 0..231 tail (26796) = 124716.
+        assert_eq!(value, Value::Number(255.0 * 1000.0 + 124_716.0));
+    }
+
+    #[test]
     fn for_body_list_wrappers_drop_only_without_abrupt_control() {
         // A `for` body block whose statements cannot transfer out of it (no
         // break/continue/return/throw, no suspension) compiles without the
