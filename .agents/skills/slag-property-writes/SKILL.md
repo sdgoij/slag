@@ -1,6 +1,6 @@
 ---
 name: slag-property-writes
-description: "Load when working on Slag's property-write machinery: put_value (crates/runtime/src/context.rs), the L1a warm-store cell (Agent::member_write_cells, Vm::warm_store_put/record), the JsObject in-place writers (set_key, write_data_property, write_data_property_slot), or the JIT's compiled member store (set_member_slot). Documents the two-engine generation discipline — interpreter writes MUST bump (the read-side value cells validate by generation), the JIT's write_data_property path deliberately does not — and the store-cell invalidation rules."
+description: "Load when working on Slag's property-write machinery: put_value (crates/runtime/src/context.rs), the L1a/L1c warm-store cell (Agent::member_write_cells, Vm::warm_store_put/record, JsObject::write_data_property_slot/map_store_field), the JsObject in-place writers (set_key, write_data_property), or the JIT's compiled member store (set_member_slot). Documents the two-engine generation discipline — interpreter writes MUST bump (the read-side value cells validate by generation), the JIT's write_data_property path deliberately does not — and the store-cell invalidation and pinned-field rules."
 ---
 
 # Slag property-write machinery traps
@@ -91,6 +91,42 @@ fresh value (so the immediately following read — and the compiled probe
   (ArraySetLength, element defines, typed arrays) that a direct vector
   write must never bypass; super references (`this_value = Some`) write
   the RECEIVER, not the base, so they never take the cell.
+
+### The L1c pinned-field mirror (the store cell pins the inline field too)
+
+- The write cell also records `(map_id, field)` — the (map id, in-object
+  field offset) the object's map assigned the property
+  (`JsObject::map_store_field`) — next to the vector slot. On a fast-path
+  hit `write_data_property_slot` receives `pinned_field: Option<(u64,
+  usize)>` and mirrors the value into `in_fields[field]` after one map-id
+  compare, instead of `map_set`'s per-store descriptor scan.
+- **The generation gate pins the map exactly as it pins the slot.** Every
+  structural change bumps: defines through `define_property_key`'s entry
+  bump (function defines delegate to the object part), deletes, accessor
+  conversions under `validate_and_apply`, map transitions. A map id pins
+  the descriptor layout — maps are immutable after creation, and deleting
+  a MAPPED key drops the whole map (`drop_map_if_mapped`), it never
+  reorders descriptors.
+- **Keep the write-time map-id re-check in `write_data_property_slot`.**
+  Under the generation gate it cannot fail, but it is the backstop that
+  keeps a missed bump from writing a stale field offset; a mismatched or
+  dropped map falls back to `map_set`. Do not delete it to save a compare.
+- **Record derives, the fast-path re-record reuses.** `warm_store_record`
+  derives `(map_id, field)` once (cold, after a full-[[Set]] write); the
+  hit-time re-record keeps the recorded pair — a value write changes no
+  shape.
+- **A live map can coexist with vector-only own properties.** Past
+  `INLINE_FIELDS` (4) descriptors, fresh defines spill to the vector while
+  the map stays live describing the first four (map full ≠ dictionary
+  mode), and non-w/e/c data defines (`defineProperty` with non-default
+  attributes) never enter the map. Those properties record
+  `field = MEMBER_WRITE_FIELD_NONE` and take the `map_set` scan on each
+  warm write — correct but slower; never pin an offset the map does not
+  own.
+- **`MemberWriteCell` is interpreter-only** — the JIT never reads the
+  write cells (only `member_value_cells`), so its layout is free to
+  extend. The value cells stay the `#[repr(C)]`-visible ABI; do not touch
+  those.
 
 ## 3. Adding a path that mutates the property vector
 

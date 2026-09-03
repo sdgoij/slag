@@ -1747,6 +1747,11 @@ impl MemberValueCell {
     }
 }
 
+/// `MemberWriteCell::field` value when no inline-field mirror is pinned:
+/// the object was dictionary-mode or its map did not describe the key when
+/// the cell was recorded (a vector-only property).
+pub(crate) const MEMBER_WRITE_FIELD_NONE: u8 = u8::MAX;
+
 /// The write-side value-cache entry (L1a warm-store fast path): (id,
 /// name, generation, slot) — "at this generation, `name` is an own
 /// writable data property of `id` at property-vector `slot`". A member
@@ -1757,12 +1762,28 @@ impl MemberValueCell {
 /// tracking is needed, and the slice-11 discipline (every own-property
 /// mutation bumps the generation, including in-place `set_key`) makes a
 /// generation match pin the recorded slot's content.
+///
+/// L1c: the cell also records the inline-field mirror of the property —
+/// the (map id, in-object offset) assigned by the object's map (see
+/// `JsObject::map_store_field`) — so the warm write mirrors the value
+/// into `in_fields` at the pinned offset without re-scanning the map's
+/// descriptors. The same generation gate pins the map (every structural
+/// change — define, delete, accessor conversion, map transition — bumps),
+/// and a map id pins its descriptor layout (maps are immutable after
+/// creation). `map_id` is 0 and `field` is `MEMBER_WRITE_FIELD_NONE`
+/// when no mirror is pinned.
 #[derive(Clone, Copy)]
 pub(crate) struct MemberWriteCell {
     pub id: u64,
     pub name: crux::AtomId,
     pub generation: u32,
     pub slot: usize,
+    /// The map id whose descriptors assign `field`, when a mirror is
+    /// pinned (see `field`).
+    pub map_id: u64,
+    /// The in-object field offset of the mirrored property, or
+    /// `MEMBER_WRITE_FIELD_NONE` when no mirror is pinned.
+    pub field: u8,
 }
 
 /// The prototype-chain read cache (2026-09-01): the resolved value of
@@ -3764,19 +3785,35 @@ impl Vm {
         if cell.id != object.id() || cell.name != name || cell.generation != object.generation() {
             return false;
         }
-        if !object.write_data_property_slot(&PropertyKey::String(name), cell.slot, value) {
+        // The cell pinned the inline-field mirror (map id + offset) when it
+        // was recorded under the same generation gate that pins the slot; a
+        // map id pins the descriptor layout, so the mirror writes at the
+        // offset with no descriptor re-scan. An unpinned cell (dictionary
+        // mode / unmapped property) falls back to the scan.
+        let pinned_field =
+            (cell.field != MEMBER_WRITE_FIELD_NONE).then_some((cell.map_id, cell.field as usize));
+        if !object.write_data_property_slot(
+            &PropertyKey::String(name),
+            cell.slot,
+            value,
+            pinned_field,
+        ) {
             return false;
         }
         // The in-place write bumped the generation (the read-side value
         // caches re-validate); re-record the cell at the new generation and
         // front the fresh value so the next read — and the compiled
-        // `GetMemberName` probe — hits without a property-vector access.
+        // `GetMemberName` probe — hits without a property-vector access. A
+        // value write changes no shape, so the pinned mirror survives the
+        // re-record unchanged.
         let generation = object.generation();
         agent.member_write_cells[index] = Some(MemberWriteCell {
             id: object.id(),
             name,
             generation,
             slot: cell.slot,
+            map_id: cell.map_id,
+            field: cell.field,
         });
         agent.member_value_cells[index] = MemberValueCell {
             id: object.id(),
@@ -3817,6 +3854,14 @@ impl Vm {
             return;
         }
         let value = *value;
+        // Pin the inline-field mirror (map id + offset) when the object's
+        // map describes the key: the next warm write mirrors the field at
+        // the pinned offset without the descriptor scan. Dictionary-mode
+        // and vector-only properties record no mirror.
+        let (map_id, field) = match object.map_store_field(&key) {
+            Some((map_id, field)) => (map_id, field as u8),
+            None => (0, MEMBER_WRITE_FIELD_NONE),
+        };
         let generation = object.generation();
         let index = Self::member_cell_index(object.id(), name);
         agent.member_write_cells[index] = Some(MemberWriteCell {
@@ -3824,6 +3869,8 @@ impl Vm {
             name,
             generation,
             slot,
+            map_id,
+            field,
         });
         agent.member_value_cells[index] = MemberValueCell {
             id: object.id(),

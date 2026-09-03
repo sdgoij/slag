@@ -2485,7 +2485,20 @@ impl JsObject {
     /// intercepts the store cell must never bypass). Returns false when
     /// `slot` does not hold `key` as a writable data property — the caller
     /// falls back to the full [[Set]].
-    pub fn write_data_property_slot(&self, key: &PropertyKey, slot: usize, value: Value) -> bool {
+    ///
+    /// `pinned_field` carries the caller's store-cell record of the inline
+    /// mirror — the (map id, in-object offset) the object's map assigned
+    /// `key` (see `map_store_field`). On `Some`, the mirror is written
+    /// directly at the offset after re-checking the map id, skipping
+    /// `map_set`'s descriptor scan; on `None` (or when the re-check fails)
+    /// the mirror falls back to the descriptor scan.
+    pub fn write_data_property_slot(
+        &self,
+        key: &PropertyKey,
+        slot: usize,
+        value: Value,
+        pinned_field: Option<(u64, usize)>,
+    ) -> bool {
         if !matches!(self.kind, ObjectKind::Ordinary) {
             return false;
         }
@@ -2509,10 +2522,37 @@ impl JsObject {
         *cell = value;
         // Mirror the in-place value update into the inline field when the
         // key is mapped (Part B, B5.3) — the map read path serves from
-        // there, so a stale field would win over the property vector.
-        let _ = self.map_set(key, value);
+        // there, so a stale field would win over the property vector. The
+        // pinned path writes the field at the recorded offset directly: the
+        // store cell recorded it under its generation gate, and a map id
+        // pins the descriptor layout (maps are immutable after creation).
+        // The id re-check is the backstop for a missed generation bump — a
+        // mismatched or dropped map falls back to the descriptor scan.
+        match pinned_field {
+            Some((map_id, field))
+                if field < INLINE_FIELDS && self.map.get().is_some_and(|m| m.id() == map_id) =>
+            {
+                self.in_fields[field].set(Some(value));
+            }
+            _ => {
+                let _ = self.map_set(key, value);
+            }
+        }
         self.bump_generation();
         true
+    }
+
+    /// The (map id, in-object field offset) the object's map assigned
+    /// `key`, when it describes the key as an inline field. `None` for a
+    /// dictionary-mode object (no map), a key past the inline capacity, or
+    /// a vector-only property the map does not describe (non-transitionable
+    /// attributes). The L1c store cell records this pair with the cell so a
+    /// warm write mirrors the inline field at the pinned offset without
+    /// re-scanning the descriptors.
+    pub fn map_store_field(&self, key: &PropertyKey) -> Option<(u64, usize)> {
+        let map = self.map.get()?;
+        let offset = map.find(key)?;
+        (offset < INLINE_FIELDS).then_some((map.id(), offset))
     }
 
     /// [[Set]] (P, V, Receiver): the arguments-exotic mapping (spec 10.4.4.6)
@@ -4709,6 +4749,100 @@ mod tests {
         // win): the map read falls through and the property is gone.
         assert_eq!(obj.map_get(&PropertyKey::from_utf8("x")), None);
         assert_eq!(obj.get(&key("x")).unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn map_store_field_pins_mapped_inline_properties() {
+        let obj = JsObject::ordinary_object_create(None);
+        // Four fresh w/e/c defines transition the map to describe each key
+        // at offsets 0..3 (the map is at inline capacity but still live).
+        let names = ["a", "b", "c", "d"];
+        for (i, name) in names.iter().enumerate() {
+            assert!(
+                obj.fresh_data_define(&PropertyKey::from_utf8(name), Value::Number(i as f64 + 1.0))
+            );
+        }
+        for (i, name) in names.iter().enumerate() {
+            let prop_key = PropertyKey::from_utf8(name);
+            let (map_id, field) = obj.map_store_field(&prop_key).expect("mapped key");
+            assert_eq!(field, i, "{name} inline offset");
+            assert!(map_id > 0);
+        }
+        // A fifth key overflows the inline capacity: it stays vector-only
+        // (dictionary) while the map still describes the first four, so
+        // only the overflow key is unpinned.
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("e"), Value::Number(5.0)));
+        assert!(obj.map_store_field(&PropertyKey::from_utf8("a")).is_some());
+        assert_eq!(obj.map_store_field(&PropertyKey::from_utf8("e")), None);
+        // The vector still serves the spilled property.
+        assert_eq!(obj.get(&key("e")).unwrap(), Value::Number(5.0));
+    }
+
+    #[test]
+    fn pinned_field_write_updates_field_and_vector() {
+        let obj = JsObject::ordinary_object_create(None);
+        for name in ["a", "b", "c", "d"] {
+            assert!(obj.fresh_data_define(&PropertyKey::from_utf8(name), Value::Number(0.0)));
+        }
+        let key = PropertyKey::from_utf8("d");
+        let (map_id, field) = obj.map_store_field(&key).unwrap();
+        let slot = obj.property_slot(&key).unwrap();
+        // The warm-store fast path writes the vector slot and mirrors the
+        // field at the pinned offset in one step.
+        assert!(obj.write_data_property_slot(
+            &key,
+            slot,
+            Value::Number(9.0),
+            Some((map_id, field))
+        ));
+        assert_eq!(obj.map_get(&key), Some(Value::Number(9.0)));
+        assert_eq!(obj.get_key(&key).unwrap(), Value::Number(9.0));
+        assert_eq!(obj.map_store_field(&key), Some((map_id, field)));
+    }
+
+    #[test]
+    fn pinned_field_write_falls_back_on_map_change() {
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("a"), Value::Number(1.0)));
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("b"), Value::Number(2.0)));
+        let prop_key = PropertyKey::from_utf8("b");
+        let (map_id, field) = obj.map_store_field(&prop_key).unwrap();
+        // A delete of a mapped key drops the object to dictionary mode (the
+        // runtime would also have bumped the generation, so the pinned cell
+        // would miss; here we force the stale-pin path directly).
+        assert!(obj.delete(&key("a")).unwrap());
+        assert_eq!(obj.map_store_field(&prop_key), None);
+        let slot = obj.property_slot(&prop_key).unwrap();
+        // The stale pinned field (old map id) falls back to the descriptor
+        // scan — the vector write still lands and no stale field is served.
+        assert!(obj.write_data_property_slot(
+            &prop_key,
+            slot,
+            Value::Number(7.0),
+            Some((map_id, field))
+        ));
+        assert_eq!(obj.map_get(&prop_key), None);
+        assert_eq!(obj.get_key(&prop_key).unwrap(), Value::Number(7.0));
+    }
+
+    #[test]
+    fn pinned_field_write_rejects_stale_slot() {
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("a"), Value::Number(1.0)));
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("b"), Value::Number(2.0)));
+        let prop_key = PropertyKey::from_utf8("a");
+        let (map_id, field) = obj.map_store_field(&prop_key).unwrap();
+        // A wrong slot (what a stale cell after a delete would hold) is
+        // rejected by the stored-key re-check: no write, no field change.
+        let wrong_slot = obj.property_slot(&PropertyKey::from_utf8("b")).unwrap();
+        assert!(!obj.write_data_property_slot(
+            &prop_key,
+            wrong_slot,
+            Value::Number(3.0),
+            Some((map_id, field))
+        ));
+        assert_eq!(obj.get_key(&prop_key).unwrap(), Value::Number(1.0));
+        assert_eq!(obj.map_get(&prop_key), Some(Value::Number(1.0)));
     }
 
     #[test]

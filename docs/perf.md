@@ -2771,9 +2771,66 @@ function objects, multi-prop thrash, computed keys, super writes,
 proxies, own accessors) passes under the JIT, `--no-jit`, and
 `--gc-stress`.
 
-Next experiment: L1b — fuse the compound store (`o.x += v` as one
-register op on the L1a store cell + the read cell), then L1c (shapes
-with inline-property offsets), per the plan's sequencing.
+Next experiment: L1c (shapes with inline-property offsets), the plan's
+primary architectural investment. The L1b fuse was skipped ahead of it:
+L1b's probe showed the compound row's residual ~20ns of non-write
+overhead (of ~62ns/iter) is only partly the read-modify-write split, and
+L1c's timing note — the cell model only accretes more property paths the
+longer it stays — argues for the shape work first. The first L1c write
+slice landed below.
+
+### L1c-1 — pinned inline-field mirror in the store cell (measured 2026-09-03)
+
+The performance plan's first L1c write-path slice: the L1a store cell now
+records the property's inline-field mirror — the (map id, in-object
+field offset) assigned by the object's map (`JsObject::map_store_field`)
+— alongside the property-vector slot. A warm write mirrors the value
+into `in_fields` at the pinned offset directly (one map-id compare)
+instead of re-scanning the map's descriptors via `map_set` on every
+store. Sound under the same generation gate that already pins the slot:
+every structural change (define, delete, accessor conversion, map
+transition — all of which run through `define_property_key`'s entry bump
+or `delete_key`) bumps the object generation, and a map id pins its
+descriptor layout (maps are immutable after creation). The pinned write
+re-checks the map id as a backstop for a missed bump; a mismatched or
+dropped map (dictionary mode) and vector-only properties (non-w/e/c
+defines, the >4-property spill) fall back to the `map_set` scan. The
+write cell is interpreter-only, so the cell layout is not JIT-visible.
+
+Probe (the plan's next-experiment gate): the mirror-scan share of a warm
+write. A/B of the `compound assign` row (a 1-descriptor object, scan
+depth 1) between fresh full builds of this worktree and its parent
+(20be822), interleaved at high priority on a CPU-saturated machine
+(llama-server pegged all 16 cores, so absolute deltas carry extra noise;
+identical-source control builds moved ±12% on the untouched `arithmetic`
+row from code-layout luck alone): compound assign interp is neutral —
+6.10ms (parent, 5 runs 6.08-6.27) vs 6.08ms (5 runs 6.01-6.09). The
+depth-sensitive probe (`scratch/l1c_ab.js`, a certified-leaf row writing
+the LAST of a 4-descriptor map, 4M iters) moved 255.5ms (parent median)
+-> 247.5ms — ~3%, ~2ns/iter at scan depth 4 — with the depth-1 control
+moving ~1.6% in the same direction, so the net scan saving is ~1-2ns at
+depth 4 and below resolution at depth 1. The row's residual cost is not
+the mirror scan.
+
+Gates: `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` green (incl. four new crux tests:
+`map_store_field_*`, `pinned_field_write_*`); the three release sweeps
+are identical to the parent on every count — language 23721/23724
+(3 skip), built-ins 23657/23812 (155 skip), annexB 1086/1086, all with
+zero fail/crash/hang; the edge probe (`scratch/l1c_store_probe.js`:
+4-descriptor warm writes, sibling/overflow props, accessor conversion
+after warm, delete+recreate on a full map, vector-only non-enumerable
+defines beside a live map, shared-shape instances, function objects,
+super receivers, proxies, >16-key thrash) passes under the JIT,
+`--no-jit`, and `--gc-stress`; the L1a probe still passes.
+
+The slice's value is the pinned-offset mechanism: the store cell now
+carries the map/field pair the deeper L1c write phases need (shape-check
+field writes that drop the per-write vector/descriptor machinery). Next:
+probe what the residual ~40ns warm write actually spends (the
+`assign_member`/step-dispatch and register-op share vs the vector
+borrow), then carry the shape check to the read path and the JIT inline
+store per the plan's L1c phasing.
 
 ## Deferred milestones
 
