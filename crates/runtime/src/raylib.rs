@@ -569,9 +569,22 @@ fn init_window(args: &[Value]) -> Result<Value, JsError> {
     let width = int_arg(args, 0, "initWindow")?;
     let height = int_arg(args, 1, "initWindow")?;
     let title = text_arg(args, 2, "initWindow")?;
-    // SAFETY: raylib copies `title` before returning; the window-thread guard
-    // in `window_method` keeps this on the thread that opened the window.
-    unsafe { raylib_sys::InitWindow(width, height, title.as_ptr()) };
+    // SAFETY: all calls on the installing thread (see `window_method`); raylib
+    // copies `title` before returning.
+    //
+    // Without FLAG_WINDOW_HIGHDPI raylib assumes the GL drawable matches the
+    // requested logical size. On a Wayland build with a scale > 1 display
+    // that is false: raylib's GLFW backend leaves GLFW_SCALE_FRAMEBUFFER
+    // enabled (the Wayland-only code that disables it does not compile —
+    // `_GLFW_WAYLAND` is never defined for raylib's own sources), so the
+    // drawable is `scale` times larger than the window while raylib renders
+    // into the WIDTH x HEIGHT viewport, leaving the game in a corner of the
+    // window. HIGHDPI makes raylib size its render surface to the actual
+    // framebuffer; at scale 1 it is a no-op.
+    unsafe {
+        raylib_sys::SetConfigFlags(raylib_sys::ConfigFlags::FLAG_WINDOW_HIGHDPI as u32);
+        raylib_sys::InitWindow(width, height, title.as_ptr())
+    };
     Ok(Value::Undefined)
 }
 
