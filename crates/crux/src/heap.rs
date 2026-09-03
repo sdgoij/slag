@@ -489,7 +489,7 @@ thread_local! {
 /// live count). 1024 keeps the heap bounded at a few thousand garbage
 /// boxes in a hot allocation loop while the back-edge check itself stays a
 /// single compare.
-const ALLOC_BUDGET: u64 = 1073741824; // TEMP-EXPERIMENT
+const ALLOC_BUDGET: u64 = 1024;
 
 /// GC-5: the cheap safe-point check for loop back-edges. Returns true when
 /// enough allocations have happened since the last check (the caller then

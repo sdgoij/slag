@@ -13829,6 +13829,15 @@ impl Compiler {
                             self.compile_destructure_binding(&decl.pattern, declaration)?;
                         } else if !declaration && matches!(decl.pattern, BindingPattern::Ident(_)) {
                             self.emit(Step::PutVarReference);
+                            // The binding step re-pushed the initialized
+                            // value (its assignment-expression semantics); a
+                            // declaration statement completes empty, so the
+                            // value is discarded. Without this, an
+                            // env-path declaration inside a loop body
+                            // leaves one handle per iteration on the
+                            // precisely-traced value stack, retaining every
+                            // initialized object for the loop's duration.
+                            self.emit(Step::Pop);
                         } else {
                             let step = if declaration {
                                 Step::DeclInit {
@@ -13840,6 +13849,10 @@ impl Compiler {
                                 }
                             };
                             self.emit(step);
+                            // See the `PutVarReference` branch above: a
+                            // statement-position declaration's bound value
+                            // is not the statement's result.
+                            self.emit(Step::Pop);
                         }
                     } else if declaration {
                         // `let x;` initializes the binding to *undefined*
@@ -13864,6 +13877,7 @@ impl Compiler {
                             self.emit(Step::DeclInit {
                                 pattern: decl.pattern.clone(),
                             });
+                            self.emit(Step::Pop);
                         }
                     }
                 }
@@ -13885,6 +13899,10 @@ impl Compiler {
                             pattern: decl.pattern.clone(),
                             is_await: *is_await,
                         });
+                        // `UsingInit` re-pushes the registered value like
+                        // `DeclInit`; the declaration statement's value is
+                        // empty, so it is discarded.
+                        self.emit(Step::Pop);
                     }
                 }
             }
@@ -14088,6 +14106,9 @@ impl Compiler {
                     self.emit(Step::DeclInit {
                         pattern: BindingPattern::Ident(name),
                     });
+                    // `DeclInit` re-pushed the class value; a class
+                    // declaration completes empty.
+                    self.emit(Step::Pop);
                 }
             }
             StmtKind::Empty | StmtKind::Debugger => {}
@@ -14558,6 +14579,11 @@ impl Compiler {
                                 self.emit(Step::Destructure {
                                     pattern: decl.pattern.clone(),
                                 });
+                                // The head initializer's value is discarded
+                                // (`Destructure` re-pushed it) — without the
+                                // pop an env-path `for` head leaves a handle
+                                // on the stack for the loop's duration.
+                                self.emit(Step::Pop);
                             }
                         }
                     }
