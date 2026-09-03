@@ -3079,6 +3079,125 @@ mod tests {
     }
 
     #[test]
+    fn braced_fused_store_bodies_lower_to_register_runs() {
+        // M7 slice 1a: a braced loop body whose last statement is a
+        // self-balancing fused store (`{ n += 1; }` — the store pops its
+        // own value and is followed only by the block's `ListEnd`) must
+        // close a register run exactly like the unbraced form. Before the
+        // commit rule recognized the fused store as a statement boundary,
+        // the trailing `ListEnd` left the run uncommitted and the whole
+        // braced body dispatched per step.
+        fn register_runs(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> Vec<Box<[crate::ir::LeafOp]>> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let braced = register_runs(
+            &mut agent,
+            "function braced() { var n = 0; for (var i = 0; i < 10; i++) { n += 1; } return n; }",
+            "braced",
+        );
+        assert_eq!(braced.len(), 1, "the braced fused-store body must lower");
+        assert!(
+            braced[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::StoreReg { .. })),
+            "the run must contain the accumulator store"
+        );
+        // The unbraced equivalent lowers to the same run.
+        let unbraced = register_runs(
+            &mut agent,
+            "function flat() { var n = 0; for (var i = 0; i < 10; i++) n += 1; return n; }",
+            "flat",
+        );
+        assert_eq!(unbraced.len(), 1);
+        assert_eq!(braced[0].len(), unbraced[0].len());
+        // The braced body's `ListBegin`/`ListEnd` pair is ABSORBED into the
+        // run span (an all-register block's wrappers are a completion
+        // no-op), so the whole loop body is the single run — no list steps
+        // remain in the function.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "function absorbed() { var n = 0; for (var i = 0; i < 10; i++) { n += 1; } return n; }",
+            )
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "absorbed");
+        assert!(
+            !ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::ListBegin | crate::ir::Step::ListEnd)),
+            "the all-register braced loop body must absorb its list wrappers"
+        );
+        // A fused-store statement BEFORE a control-flow statement closes its
+        // run at the store (the `if`'s reset/jump steps stay on the step
+        // path); the statement inside the `if`'s block lowers too.
+        let segmented = register_runs(
+            &mut agent,
+            "function seg() { var n = 0; for (var i = 0; i < 10; i++) { n += 1; if (n > 3) { n = 0; } } return n; }",
+            "seg",
+        );
+        assert_eq!(segmented.len(), 2, "both fused-store statements must lower");
+        assert_eq!(
+            segmented[0].len(),
+            unbraced[0].len(),
+            "the pre-`if` statement lowers to the same run as the flat body"
+        );
+    }
+
+    #[test]
+    fn braced_member_store_body_keeps_its_set_completion_absorbed() {
+        // The member-store statement's step-path form leaves the assigned
+        // value for its trailing `SetCompletion` to pop; the register form
+        // consumes it, so the run must ABSORB the `SetCompletion` (commit at
+        // it, never at the member store). Ending the run at the store would
+        // strand the pop on the step path — the `a[l++] = i` buildString
+        // corruption. The braced body must still lower to ONE run whose ops
+        // end in the member store.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "function f() { var a = []; var l = 0; \
+                 for (var i = 0; i < 10; i++) { a[l++] = i; } return a[9] + l; }",
+            )
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        let runs: Vec<&Box<[crate::ir::LeafOp]>> = ir
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                crate::ir::Step::RunRegBody { ops } => Some(ops),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 1);
+        assert!(matches!(
+            runs[0].last(),
+            Some(crate::ir::LeafOp::StoreMemberComputed { .. })
+        ));
+        // And the statement's value still completes correctly at the top
+        // level (the absorbed `SetCompletion` is the statement's only pop).
+        assert_eq!(
+            run("var a = []; var l = 0; a[l++] = 7; a[0] * 10 + l").unwrap(),
+            Value::Number(71.0)
+        );
+    }
+
+    #[test]
     fn slice23_args_alias_gates_read_only_params() {
         fn args_alias(agent: &mut Agent, src: &str, name: &str) -> bool {
             agent.run_script(src).unwrap();

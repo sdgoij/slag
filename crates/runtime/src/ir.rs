@@ -17925,16 +17925,19 @@ fn lower_step(
 
 /// Segment a step slice into maximal straight-line register runs. Each run
 /// starts at an empty shadow stack and closes at the last statement
-/// boundary (a `SetCompletion`, or the slice end) where the shadow is empty
-/// and a meaningful op was emitted — a non-lowerable step (a jump, an env
-/// step, a prefix update, a statement-position update whose write-back is
-/// never consumed) closes the run at the previous boundary and stays on the
-/// step path. The list wrappers (`ListBegin`/`ListEnd`) are never absorbed
-/// into a run: they push/pop the completion state on the step path, so a
-/// run absorbing the `ListBegin` while the step path runs its `ListEnd`
-/// would pop the ENCLOSING list's entry. Returns the `(start, end, ops)`
-/// runs (offsets into `steps`, in order) to replace with `Step::RunRegBody`;
-/// the remaining steps run on the step path.
+/// boundary (a `SetCompletion`, a self-balancing fused statement-terminal
+/// store, or the slice end) where the shadow is empty and a meaningful op
+/// was emitted — a non-lowerable step (a jump, an env step, a prefix
+/// update, a statement-position update whose write-back is never consumed)
+/// closes the run at the previous boundary and stays on the step path. The
+/// list wrappers (`ListBegin`/`ListEnd`) are never absorbed INTO a run's
+/// ops (they push/pop the completion state on the step path), but a run
+/// bracketed directly by a matching pair — a block whose every statement
+/// lowered — absorbs the pair into its span (see the post-pass below), so
+/// a braced loop body's per-iteration list push/pop disappears. Returns
+/// the `(start, end, ops)` runs (offsets into `steps`, in order) to
+/// replace with `Step::RunRegBody`; the remaining steps run on the step
+/// path.
 fn lower_leaf_ops_segmented(
     steps: &[Step],
     scope: &ScopeInfo,
@@ -17988,11 +17991,31 @@ fn lower_leaf_ops_segmented(
             {
                 break;
             }
-            if stack.is_empty()
-                && !ops.is_empty()
-                && (i == steps.len() - 1 || matches!(steps[i], Step::SetCompletion))
-            {
-                commit = Some((i + 1, ops.len()));
+            if stack.is_empty() && !ops.is_empty() {
+                // A run may close at the slice end, at a `SetCompletion`
+                // (absorbed into the run span — its statement's value was
+                // consumed by the register ops), or at a self-balancing
+                // fused statement-terminal store: `FusedStoreLocal`/
+                // `StoreLocal`/`InitLocal` pop their own value on the step
+                // path and leave nothing for a later step to pop, so a
+                // braced body whose last statement is such a store (the
+                // store followed only by the block's `ListEnd`) can still
+                // close a run. A MEMBER store is not such a boundary — its
+                // statement's step-path form leaves the assigned value on
+                // the stack for the trailing `SetCompletion` to pop, so a
+                // run ending at the member store would strand that pop
+                // (the `a[l++] = i` buildString corruption). The run must
+                // absorb the member store's `SetCompletion` with it.
+                let statement_store = matches!(
+                    steps[i],
+                    Step::FusedStoreLocal { .. } | Step::StoreLocal { .. } | Step::InitLocal { .. }
+                );
+                if i == steps.len() - 1
+                    || matches!(steps[i], Step::SetCompletion)
+                    || statement_store
+                {
+                    commit = Some((i + 1, ops.len()));
+                }
             }
             i += 1;
         }
@@ -18001,6 +18024,26 @@ fn lower_leaf_ops_segmented(
             i = end;
         } else {
             i = run_start + 1;
+        }
+    }
+    // A run bracketed directly by a `ListBegin`/`ListEnd` pair (a braced
+    // block whose EVERY statement lowered into the run — nothing step-path
+    // sits between the wrappers) absorbs the pair: over an all-register
+    // block the wrappers are a no-op on the step path. `ListBegin` saves
+    // the completion state and `ListEnd` restores it only when the body
+    // left it empty, and the register ops never write the completion — so
+    // dropping the pair (and its per-iteration list push/pop) is
+    // unobservable. The run contains no abrupt control (breaks/jumps never
+    // lower), so the pop can never be skipped. Nested all-register blocks
+    // absorb outward one pair at a time.
+    for run in runs.iter_mut() {
+        while run.0 > 0
+            && run.1 < steps.len()
+            && matches!(steps[run.0 - 1], Step::ListBegin)
+            && matches!(steps[run.1], Step::ListEnd)
+        {
+            run.0 -= 1;
+            run.1 += 1;
         }
     }
     runs

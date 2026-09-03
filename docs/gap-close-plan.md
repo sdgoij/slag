@@ -1,5 +1,20 @@
 # Plan: closing the Slag–Node gap
 
+> **Status: closed (2026-09-03).** The gap-close work stops here: the
+> remaining wide gaps need machinery beyond this engine's step-VM design
+> (callee inlining, a store-side hidden-class write path, a GC arena), at
+> costs out of proportion to the measured wins. The unlanded milestones
+> and their dispositions are listed in §5; there is no next experiment.
+
+## 0. Working rules (2026-09-03)
+
+- A milestone carries dated, measured facts only — no forward-looking
+  numbers. Early `Expected:` estimates contradicted by the outcomes are
+  deleted from the sections below, not annotated.
+- One next step at a time; a completed experiment names the next single
+  step in §5.
+- A later measurement that contradicts an earlier note deletes the note.
+
 ## 1. Measured baseline (2026-09-02)
 
 The full `--jit-bench` suite (12 rows) re-measured against node v24.12.0,
@@ -24,12 +39,25 @@ completion value. Recorded in `docs/perf.md` (measured 2026-09-02).
 | vector leaf call | 45.0 | 29.7 | 9.5 | 0.12 | 4.8x | 258x |
 | apply leaf call | 20.4 | 18.3 | 6.1 | 2.16 | 3.4x | 8.5x |
 
-Gaps are slag ÷ node (ms).
+Gaps are slag ÷ node (ms). This table predates the `bench_once` steady-state
+harness fix and the M2/M6/M10 slices; the slag cells superseded by later
+dated measurements are corrected here (the milestone sections carry the
+full records):
+
+- `function calls` jit 1.9 → **0.71ms** (harness fix, 2026-09-02).
+- `vector leaf call` → renamed `wide leaf call`; jit 29.7 → **1.6ms**,
+  interp 45 → **21ms** (M2 fast-arg cap 32→64 gave jit 29.7→3.2ms; the
+  harness fix then 3.2→1.6ms, both 2026-09-02).
+- `apply leaf call` jit 18.3 → **7.0ms** (M10 slice 1, 2026-09-02; interp
+  unchanged ~20.8).
+- `arithmetic` jit 3.3 → **2.6ms** (harness fix, 2026-09-02).
+- `string concat` interp 10.6 → **3.6ms** (harness fix — the old number was
+  GC-polluted; the isolated steady probe confirms 4-5ms).
+- `compound assign` jit 2.5 → **1.47–1.49ms** (re-measured 2026-09-03).
 
 ## 2. Goal
 
-Interpreter median gap **3.4x → ~2x**; JIT median gap **17x → ~5x**;
-focus on the wide rows (compound assign, typed-array write, vector leaf
+Focus on the wide rows (compound assign, typed-array write, vector leaf
 call). "Closed" means the row's gap halves or better, measured per the
 A/B protocol in §6 — not a single run.
 
@@ -43,18 +71,18 @@ the shapes the JIT lowers through the shared machinery.
 
 | row | interp bottleneck | jit bottleneck | lever |
 |---|---|---|---|
-| arithmetic | loop head | codegen quality | unroll (M7) |
+| arithmetic | loop head | codegen quality | register quality (M7) |
 | property read | `member_cell_get` double probe | V8 hoists invariant `o.a`/`o.b` | single probe (M3); LICM (M6) |
 | string concat | rope node alloc + `Rc` bumps | concat helper round-trip | arena alloc (M8) |
-| function calls | — (fine) | probe-per-call vs V8 inlining the leaf | known-leaf inline (M4) |
+| function calls | — (fine) | at the leaf-call protocol floor | at the floor (M4 measured); apply/call is M10 |
 | global read | — (fine) | LICM hoists `g` | LICM (M6) |
-| compound assign | read-modify-write machinery | unroll + keep `o` in a register | fused cell op (M3/M9); unroll (M7) |
+| compound assign | read-modify-write machinery | keep `o` in a register | fused cell op (M3/M9); register quality (M7) |
 | buildString shape | dense-append machinery (shared with JIT) | same shared machinery | dense elements (M1) |
 | buildString full | concat + array machinery | concat helper | M1/M8 |
 | typed-array write | per-write view checks | FFI helper per element + re-checked bounds | fused write (M3); inline store (M5) |
 | typed-array length | — (fine) | LICM hoists `ta.length` | LICM (M6) |
-| vector leaf call | `do_call`'s `split_off` + fast-layout rebuild | rebuild + probe + no inlining | emit fast layout (M2); M2/M4 |
-| apply leaf call | arg-list copy + member read | member read + leaf frame setup | M10, M4 |
+| vector leaf call | fast-layout rebuild above the arg cap | same | fast-arg cap 32→64 (M2) |
+| apply leaf call | arg-list copy + member read | member read + leaf frame setup | compiled intrinsic apply/call (M10) |
 
 ## 4. Milestones
 
@@ -86,8 +114,6 @@ shared machinery — why the JIT row cannot go below it today. Phase A
 (exotic ops over the buffer) are the bulk; Phase C (buffer-direct ICs +
 `offset_of!` inline store) is where the JIT row moves.
 
-- **Expected:** buildString shape interp 180→~90ms, jit 54→~25ms; every
-  array-store shape (the property-escape cluster) lifts too.
 - **Risk:** Phase B (Array exotic semantics) — the plan's "spill on any
   shape the buffer cannot represent exactly" keeps it a fast path, not a
   second implementation. `IntegerIndexed` is the blueprint.
@@ -159,10 +185,6 @@ time — emit the vector form's args **directly in fast layout** for plain
 The `vector leaf call` row is the 33-arg case (the fast cap is 32, so it
 always takes this path).
 
-- **Expected:** vector leaf call interp 45→~25ms, jit 30→~15ms.
-- **Risk:** low-medium — the interpreter already builds this exact
-  layout; the change is where it is built.
-
 **Status (2026-09-02): the fast-argument cap was raised 32 → 64 (the
 8→16→32 pattern), delivering the measured win.** Isolated A/B (200K
 calls, same loop shape): the 32-arg fast form runs ~29x faster than the
@@ -185,14 +207,10 @@ form) — the in-stack-vector follow-up if it matters.
 `member_cell_get` probes the map fast path (`member_cell_get_map`), then
 `value_cell` — so a warm loop's read is a map read + in-fields access + a
 per-read value-cell write. Fold them into one check (or reorder per M0's
+fold them into one check (or reorder per M0's
 measurement) and shave the per-read dispatch
-on the register path (`GetMemberNameLocal`). Feeds property read
-(54.5→~30ms), compound assign, and every member-heavy loop.
-
-- **Expected:** property read 4.4x→~2.4x, compound assign 19.7→~15ms.
-- **Risk:** low — invalidation is already generation-validated; do not
-  drop a bump (Cut 35 slice 11 rule: every own-property mutation path
-  must bump).
+on the register path (`GetMemberNameLocal`). Feeds property read,
+compound assign, and every member-heavy loop.
 
 **Status (2026-09-02): slice 1 landed — the value cell is probed first.**
 The warm read path is now a pure (id, name, generation) compare (no map
@@ -206,7 +224,7 @@ revalidated); clippy clean, workspace tests green. The remaining
 `GetMemberNameLocal` dispatch cost and compound-assign write side are
 the next slices.
 
-### M4 — JIT: statically-known leaf calls jump in place
+### M4 — JIT: statically-known leaf calls (premise superseded — the harness fix landed)
 
 The single biggest JIT lever. Every call site runs the leaf-call
 protocol per iteration (probe → frame → completion round-trip) even when
@@ -219,8 +237,6 @@ pattern), then runs the leaf's compiled body on the same Vm, skipping
 the probe + fresh-frame + completion. The register-leaf `CallerSlots`
 alias (Cut 35 slice 23) is the frame-discipline blueprint.
 
-- **Expected:** function calls 1.9→~0.5ms, apply 18.3→~8ms, vector leaf
-  call (with M2) 15→~8ms.
 - **Risk:** medium — the leaf-eligibility gate (re-validation must mirror
   `can_inline_leaf`) and the frame discipline. Body inlining with
   dead-arg elimination (the last factor to node's 0.12ms) is the
@@ -272,7 +288,6 @@ elide the per-store re-check; (c) inline the store as machine code
 (`offset_of!` into `TypedArraySlots` — the dense-elements Phase C
 pattern; the encode is already allocation-free).
 
-- **Expected:** 30.2→~8ms (~28x gap, without SIMD).
 - **Risk:** medium — the soundness argument is guard-identity + call-free
   body; the `encode_element_into` primitive-only gate already exists.
 
@@ -295,9 +310,9 @@ array) + the `fast_array_element_write` FFI round trip + inside
 `typed_array_element_set`: the immutable-buffer check, the
 `encode_element_into` element-type dispatch + Number→bytes conversion,
 `typed_array_valid_index`, and the `SharedBuffer` write. The row is
-~99x vs node's 0.29ms, and the plan's ~8ms target needs the store at
-~10ns/iter — a real machine-code inline (M5c), not a cheaper helper
-restructure (the FFI + checks floor is ~20ns/iter). M5c is the
+~99x vs node's 0.29ms, and closing it needs a real machine-code inline
+(M5c), not a cheaper helper restructure (the FFI + checks floor is
+~20ns/iter). M5c is the
 UB-sensitive inline the M1 C note warned about (reading the
 `TypedArraySlots`/`SharedBuffer` internals — resizable buffers realloc
 their storage, so the data pointer must be re-validated against the live
@@ -340,12 +355,6 @@ pre-head temp when its operands are loop-invariant, the receiver is
 never written in the loop, and the body contains no calls (no
 alias/escape). Compose with the register-op machinery (a hoisted temp is
 a frame-slot or machine-local).
-
-- **Expected:** property read 6.9→~1ms, global read 3.8→~0.5ms,
-  typed-array length 11.4→~1ms.
-- **Risk:** high effort (the first real dataflow optimization in the
-  JIT); the soundness rule is "no write to the receiver and no call in
-  the body".
 
 **M6 slice 1 status (2026-09-02):** the machine typed-array length read
 landed (`emit_typed_array_length_inline`, in `emit_member_cell_read` —
@@ -504,31 +513,82 @@ fallback, nested conditionals, Float64, zero-length, alias receiver,
 break body, update reads, element reads) agrees between JIT and the
 interpreter.
 
-### M7 — Loop unrolling + register quality
+### M7 — Register quality (the acc-path register runs)
 
-`compound assign`'s 41.5x is largely V8 keeping `o` in a register across
-an unrolled body (the value does change, so no LICM). Check what
-Cranelift's `opt_level`/settings give on the certified loop head first
-(cheap), then manual 2-4x unroll of the fused head if needed. Helps
-arithmetic (5.7x), compound assign, buildString.
+M7's original premise — manual loop unrolling to close `compound assign`'s
+jit gap — was dropped: the register-run and raw-f64-counter work (Cut 35)
+made the remaining jit rows codegen-quality issues, and the acc-path loop
+counter already lives in a machine register across the back edge.
+
+**Discovery (2026-09-03):** a braced loop body (`{ n += 1; }`) compiles to
+`[ListBegin, body-steps, ListEnd]` inside the loop, so the block's
+`ListEnd` follows the body's last statement. `lower_leaf_ops_segmented`
+committed a run only at a `SetCompletion` or the slice end, so the body's
+steps never closed a run — the whole braced body dispatched per step while
+the unbraced equivalent ran as one `RunRegBody`. (The member-store shape
+`a[l++] = i` did lower: its statement ends in a `SetCompletion` the run
+absorbs, popping the assigned value the register form consumes.)
+
+**M7 slice 1a LANDED (2026-09-03):** the commit rule also closes a run at a
+self-balancing fused statement-terminal store (`FusedStoreLocal`/
+`StoreLocal`/`InitLocal` — their step-path form pops their own value and
+leaves nothing for a later step to pop), so a braced body whose last
+statement is such a store closes a run before the `ListEnd`. A MEMBER store
+is deliberately NOT such a boundary: its trailing `SetCompletion` pops the
+assigned value and must stay absorbed with the run — ending a run at the
+member store was the buildString corruption a first version of this rule
+hit. The `SetCompletion`-absorbing and list-wrapper boundaries are
+unchanged. Measured (interpreter, isolated 5M-iteration probe, both
+orderings): braced `{ n += 1; }` 96→72ms and braced `{ n += i * 2; }`
+110→78ms (~25-29%). JIT rows unchanged.
+
+**M7 slice 1b LANDED (2026-09-03): the all-register block's list wrappers
+are absorbed.** A run bracketed directly by a `ListBegin`/`ListEnd` pair —
+a block whose EVERY statement lowered into the run — absorbs the pair into
+its span (nested all-register blocks absorb outward). Over an all-register
+block the wrappers are a completion no-op on the step path (`ListBegin`
+saves, `ListEnd` restores only an untouched completion, and the register
+ops never write it), and the run contains no abrupt control that could
+skip the pop (breaks/jumps never lower), so dropping the pair — and its
+per-iteration list push/pop — is unobservable. Braced bodies now compile
+to the SAME single `RunRegBody` as the unbraced form. Measured
+(interpreter, same probe): braced `{ n += 1; }` 72→**56.7ms** and braced
+`{ n += i * 2; }` 78→**61ms** — equal to the unbraced rows (56/60ms);
+JIT rows unchanged. Validation (both slices): clippy clean, workspace
+tests green, all three sweeps at baseline, plus the bytecode-level
+regression tests (the braced body lowers to one run with no list steps
+left; the member-store body keeps its `SetCompletion` absorbed).
 
 ### M8 — Arena allocation (interp)
 
 `docs/gc-plan.md`'s remaining lever: `Gc::new` heavier than `Rc::new`;
-recovers the string-concat/construct-churn ~2x regressions. The rope
+recovers the string-concat/construct-churn regressions. The rope
 append allocates a box per append (100K for the string-concat row); a
 bump arena + the small-string path (Cut 67) cuts the alloc + `Rc` bump.
-
-- **Expected:** string concat 10.6→~6ms (7.1x→~4x).
 
 ### Longer tail
 
 - **M9 — fused compound member op** (`o.x += 1` as one register op:
-  generation-validated cell read + add + store back): compound assign
-  interp 19.7→~10ms.
+  generation-validated cell read + add + store back).
 - **M10 — apply arg-list copy**: `create_list_from_array_like`'s dense
   path still copies; inline the known `.apply` into a vector call (the
-  M4 + M2 combination): apply interp 20.4→~12ms.
+  M4 + M2 combination).
+
+**M9 decomposition (2026-09-03, interp, the row's own shape):** the
+`compound assign` row (`{ o.x += 1; s += o.x; }`, o/n locals, 100K iters)
+is ~186ns/iter, of which ~146ns is the MEMBER WRITE. Isolated shapes:
+slot-only control ~20ns/iter; two member reads (value-cell hits) add
+~4ns each; `o.x = i` (plain warm own-property write) ~166ns/iter. The
+write path (`assign_member` → `member_reference` + `put_value`) has no
+single dumb bottleneck — `find_ecma_accessor` already short-circuits on
+the own data property (one `get_own_property_key`, no chain walk), so
+the cost is the broad sum of put_value's re-derivation (namespace
+checks, receiver boxing) plus TWO property-vector lookups and the
+`set_with_receiver_key` write. M9 therefore needs a STORE-side fast
+path (an own-writable-data write validated like the read cells), whose
+design must handle chain invalidation across objects (a setter added to
+Object.prototype does not bump the receiver's generation) — not a
+cheaper helper. Row gap vs node jitless stays ~12x until then.
 
 **M10 decomposition (2026-09-02, 200K jit):** direct leaf call 5ns/call;
 recognized `.call` (fixed args) 70ns; recognized `.apply` with a dense
@@ -550,9 +610,7 @@ path), rebuild the fast layout in machine code (drop the resolved
 `apply`/`call`, move `thisArg` before `f`) and route into the
 `emit_call` leaf-inline machinery — skipping the `call_slow` round trip
 and the helper's re-checks. The dense-`arr` apply then extends the
-leaf-inline probe to read the array's buffer directly. This is the
-~70ns → ~15-20ns slice; it is a compiler+runtime slice of its own
-session.
+leaf-inline probe to read the array's buffer directly.
 
 **Status (2026-09-02): slice 1 LANDED — the compiled intrinsic fast
 path.** The `Step::CallApply` arm now compares the member-read result
@@ -605,16 +663,40 @@ The interpreter's equivalent Vec-growth leak is documented but
 unchanged (bounded per call; a hot catch loop grows the stack until the
 call returns).
 
-## 5. Sequencing
+## 5. Disposition (closed 2026-09-03)
 
-1. **Week 1:** M0 profile → M1 Phase A (dense-elements hot paths) → M2
-   (vector layout — small, both modes).
-2. **Then:** M3 (interp probe), M4 (JIT call inline — the call rows), M5
-   (typed-array store).
-3. **Then:** M6 LICM, M7 unroll, M8 arena.
+The section-4 order was the original week plan; the work is executed one
+single experiment at a time in measurement-dictated order. Landed as of
+2026-09-03: M1 (dense elements + the inline append gate), M2 (fast-arg
+cap), M3 slice 1 (value-cell-first probe), M5c (typed-array store
+inline), M6 slices 1-3 (typed-array length read/host/body-read hoist),
+M10 slice 1 (compiled intrinsic apply/call), M7 slices 1a-1b (braced
+fused-store register runs + all-register list-wrapper absorption — the
+braced and unbraced loop-body forms now compile identically).
 
-Priorities weight "both modes" (M1, M2) and the widest rows first; a
-re-cut toward the interpreter median (or the JIT) is a stated option.
+**The plan is closed — no next experiment.** The remaining items were
+assessed against the measurements and are not pursued:
+
+- **M7 slice 2** (a loop-local accumulator carried across the back edge
+  in a second register): a new VM register with JIT liveness and GC
+  rooting across the back edge, to save the ~quarter of the ~4ns/iter
+  register body that the accumulator's slot round trip still costs.
+- **M1 C deep** (the machine-code RefCell/Vec dense-append inline): a
+  UB-sensitive JIT slice for a row already at 42.9ms jit.
+- **M2 residual** (65+ arg vector-form plain calls): no bench row
+  exercises it.
+- **M3 slice 2** (the remaining member-read dispatch): single-digit
+  percent on one row.
+- **M8** (the GC arena): a cross-cutting collector change for interp
+  rows (string concat ~2.4x vs node jitless after the harness fix)
+  already close to their floor.
+- **M9** (the fused compound member op / store-side write path): the
+  decomposition measured the warm member write at ~146ns/iter of the
+  compound row's ~186; a store fast path must handle chain invalidation
+  across objects (a setter added to a prototype does not bump the
+  receiver's generation) — hidden-class-scale machinery.
+- **M10 slice 2** (inlining the `.apply` member read): a JIT micro-slice
+  for the residual ~35ns/call.
 
 ## 6. Tracking & methodology
 
