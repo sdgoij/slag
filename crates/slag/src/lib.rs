@@ -56,4 +56,16 @@ mod tests {
         context.install_fs().unwrap();
         assert!(context.eval("typeof fs").is_ok());
     }
+
+    #[cfg(feature = "raylib")]
+    #[test]
+    fn raylib_namespace_installs_through_the_feature() {
+        let mut context = Context::new().unwrap();
+        context.install_raylib().unwrap();
+        assert_eq!(
+            context.eval("typeof rl").unwrap().as_string().as_deref(),
+            Some("object")
+        );
+        assert!(context.eval("rl.drawCircle").is_ok());
+    }
 }

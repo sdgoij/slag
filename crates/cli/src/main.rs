@@ -181,6 +181,11 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
         jit::install(context.agent_mut()).map_err(report)?;
     }
     context.install_fs().map_err(report)?;
+    // A raylib-enabled build always exposes the `rl` global; the feature is
+    // the gate, and installing the module opens no window until the script
+    // itself calls `rl.initWindow`.
+    #[cfg(feature = "raylib")]
+    context.install_raylib().map_err(report)?;
     if !args.is_empty() {
         let mut argv = vec![
             std::env::current_exe()

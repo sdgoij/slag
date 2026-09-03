@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 crux = { path = "../crux" }
 parser = { path = "../parser" }
+# Trimmed raylib build. Keep `SUPPORT_WINMM_HIGHRES_TIMER`: without it,
+# raylib's Windows frame limiter uses the ~15.6ms Sleep granularity and
+# `SetTargetFPS(60)` paces at ~30ms/frame instead of 16.6.
+raylib-sys = { version = "6.0.0", default-features = false, features = ["SUPPORT_MODULE_RSHAPES", "SUPPORT_MODULE_RTEXTURES", "SUPPORT_MODULE_RTEXT", "SUPPORT_TRACELOG", "SUPPORT_WINMM_HIGHRES_TIMER"], optional = true }
 regexp = { path = "../regexp" }
 syntax = { path = "../syntax" }
 unicode = { path = "../unicode" }
@@ -20,3 +24,8 @@ workers = ["crux/workers"]
 # Host-filesystem globals (`fs.readFileSync`/`readdirSync`/`statSync`) on
 # `Context`; I/O surface the embeddable core leaves off by default.
 fs = []
+# The raylib host module (`rl.*`): a windowing/drawing/input surface backed
+# by raylib's C library. Opt-in because it compiles raylib (bindgen + cmake)
+# and links native window/OpenGL code — only meaningful on hosts with a
+# display. See `crates/runtime/src/raylib.rs`.
+raylib = ["dep:raylib-sys"]

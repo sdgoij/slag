@@ -29,6 +29,8 @@ pub mod jit;
 pub mod job;
 pub mod module;
 pub mod promise;
+#[cfg(feature = "raylib")]
+pub mod raylib;
 pub mod realm;
 pub mod script;
 #[cfg(feature = "workers")]

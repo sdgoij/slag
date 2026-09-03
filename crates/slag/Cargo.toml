@@ -17,3 +17,6 @@ jit = ["dep:jit"]
 # Pass-throughs of the runtime's own optional surfaces.
 workers = ["runtime/workers"]
 fs = ["runtime/fs"]
+# The raylib host module (`rl.*`); compiles raylib's C library (needs a
+# display). See `crates/runtime/src/raylib.rs`.
+raylib = ["runtime/raylib"]

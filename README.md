@@ -42,9 +42,11 @@ JavaScriptCore C-API bindings.
   sweep runs the full corpus through the JIT by default (`--jitless`
   disables it). Design, status, and remaining work: `docs/jit-report.md`.
 - **Portable** — no third-party runtime dependencies beyond the Rust
-  standard library (see `PLAN.md` §4.10), with one opt-in exception: the
+  standard library (see `PLAN.md` §4.10), with two opt-in exceptions: the
   experimental JIT (`crates/jit`) pulls in Cranelift and `region` and is
-  installed only when the `--jit` flag is given. The Unicode property
+  installed only when the `--jit` flag is given, and the `raylib` feature
+  (`crates/runtime/src/raylib.rs`) compiles raylib's C library for the `rl`
+  host module. The Unicode property
   tables are generated at compile time from the pinned corpus fixtures,
   so they can never drift from what the tests assert.
 - **Embeddable** — the `slag` crate exposes the Rust embedding API
@@ -70,7 +72,9 @@ The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
 `readdirSync`/`statSync`) to scripts, and accepts `--dump-ast`,
 `--dump-tokens`, `--print-bytecode` (dump the compiled `Step` stream),
 and `--bench`; `--jit` runs certified bodies through the experimental
-Cranelift JIT and `--jit-bench` times JIT vs interpreter. The
+Cranelift JIT and `--jit-bench` times JIT vs interpreter. Building the
+CLI with the `raylib` feature exposes the `rl` host module to every
+script (`cargo run -p cli --features raylib -- game.js`). The
 `--stack-size`, `--max-old-space`, and `--harmony-*` knobs are accepted
 for compatibility (no-ops for now).
 
@@ -104,6 +108,23 @@ println!("{doubled}"); // 42
 
 `HostCallbacks` routes `console` output and promise-rejection tracking;
 `install_process_argv` installs a Node-style `process.argv`.
+
+### The `rl` host module
+
+With the `raylib` feature, `Context::install_raylib` exposes an
+immediate-mode windowing/drawing/input surface to scripts as the `rl`
+global (`initWindow`, `beginDrawing`/`endDrawing`, the `draw*`
+primitives, input queries, plus raylib's palette and key/mouse
+constants). A script owns the whole render loop, exactly like a raylib C
+example — `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...;
+rl.endDrawing(); }`. raylib's window state is bound to the thread that
+installed the module; calls from worker agents throw a clean `TypeError`
+instead of racing it.
+
+```sh
+cargo run -p slag --example raylib_demo --features slag/raylib
+cargo run -p cli --features raylib -- game.js
+```
 
 ## Conformance
 

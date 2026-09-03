@@ -17,3 +17,8 @@ lexer = { path = "../lexer" }
 parser = { path = "../parser" }
 runtime = { path = "../runtime", features = ["fs"] }
 syntax = { path = "../syntax" }
+
+[features]
+# Expose the `rl` host module to scripts: compiles raylib's C library (needs
+# a display); without the feature no `rl` global exists and no flag is needed.
+raylib = ["runtime/raylib"]

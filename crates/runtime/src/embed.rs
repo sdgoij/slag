@@ -645,6 +645,20 @@ impl Context {
         Ok(())
     }
 
+    /// Install a `rl` global exposing an immediate-mode raylib surface to
+    /// scripts: `initWindow`/`beginDrawing`/`endDrawing`, the `draw*`
+    /// primitives, input queries, and the color/key/mouse constants. A
+    /// script drives the render loop itself —
+    /// `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...; }` —
+    /// exactly like a raylib C example. Only compiled with the `raylib`
+    /// feature (it compiles raylib's C library and needs a display). The
+    /// window state is bound to the installing thread, so calls from worker
+    /// agents throw instead of racing raylib's global state.
+    #[cfg(feature = "raylib")]
+    pub fn install_raylib(&mut self) -> Result<(), JsError> {
+        crate::raylib::install(&mut self.agent)
+    }
+
     /// Install the `console` global backed by the host callbacks.
     fn install_console(&mut self) -> Result<(), JsError> {
         let realm = self.agent.current_realm()?;
