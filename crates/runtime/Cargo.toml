@@ -10,7 +10,7 @@ parser = { path = "../parser" }
 # Trimmed raylib build. Keep `SUPPORT_WINMM_HIGHRES_TIMER`: without it,
 # raylib's Windows frame limiter uses the ~15.6ms Sleep granularity and
 # `SetTargetFPS(60)` paces at ~30ms/frame instead of 16.6.
-raylib-sys = { version = "6.0.0", default-features = false, features = ["SUPPORT_MODULE_RSHAPES", "SUPPORT_MODULE_RTEXTURES", "SUPPORT_MODULE_RTEXT", "SUPPORT_MODULE_RMODELS", "SUPPORT_TRACELOG", "SUPPORT_WINMM_HIGHRES_TIMER"], optional = true }
+raylib-sys = { version = "6.0.0", default-features = false, features = ["SUPPORT_MODULE_RSHAPES", "SUPPORT_MODULE_RTEXTURES", "SUPPORT_MODULE_RTEXT", "SUPPORT_MODULE_RMODELS", "SUPPORT_MODULE_RAUDIO", "USE_AUDIO", "SUPPORT_FILEFORMAT_PNG", "SUPPORT_FILEFORMAT_WAV", "SUPPORT_TRACELOG", "SUPPORT_WINMM_HIGHRES_TIMER"], optional = true }
 regexp = { path = "../regexp" }
 syntax = { path = "../syntax" }
 unicode = { path = "../unicode" }

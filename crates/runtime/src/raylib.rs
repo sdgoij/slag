@@ -14,7 +14,7 @@
 //! `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...; rl.endDrawing(); }`.
 
 use std::ffi::CString;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
 use crux::error::{ErrorKind, JsError};
@@ -23,13 +23,46 @@ use crux::handle::Handle;
 use crux::object::JsObject as CruxObject;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
-use raylib_sys::{Camera3D, Color, Vector3};
+use raylib_sys::{Camera3D, Color, Image, Rectangle, Sound, Texture2D, Vector2, Vector3};
 
 use crate::agent::Agent;
 
 /// The thread that installed the module. raylib's window state is
 /// process-global and must only be touched from this thread.
 static WINDOW_THREAD: OnceLock<ThreadId> = OnceLock::new();
+
+/// GPU textures created by `makeTexture`/`loadTexture`, indexed by handle.
+static TEXTURES: Mutex<Vec<Texture2D>> = Mutex::new(Vec::new());
+
+/// Sounds created by `loadSound`, indexed by handle.
+static SOUNDS: Mutex<Vec<SoundSlot>> = Mutex::new(Vec::new());
+
+/// raylib sounds are only ever touched from the single window thread (the
+/// `window_method` guard), so the raw-pointer `Sound` can be shared behind a
+/// mutex safely.
+struct SoundSlot(Sound);
+unsafe impl Send for SoundSlot {}
+unsafe impl Sync for SoundSlot {}
+
+/// Assets embedded into the binary by an embedder (see
+/// `Context::register_raylib_asset`), looked up by their logical file name
+/// before falling back to the disk.
+static EMBEDDED_FILES: Mutex<Vec<(&'static str, &'static [u8])>> = Mutex::new(Vec::new());
+
+/// Register an in-memory asset under `name` so `loadTexture`/`loadSound` can
+/// find it without touching the disk.
+pub(crate) fn register_embedded_asset(name: &'static str, data: &'static [u8]) {
+    EMBEDDED_FILES.lock().unwrap().push((name, data));
+}
+
+/// The embedded bytes for `name`, if any.
+fn embedded_asset(name: &str) -> Option<(&'static str, &'static [u8])> {
+    let registry = EMBEDDED_FILES.lock().unwrap();
+    registry
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(n, data)| (*n, *data))
+}
 
 /// raylib's built-in palette (`raylib.h` color defines), as JS constants.
 const COLORS: &[(&str, u8, u8, u8, u8)] = &[
@@ -276,6 +309,257 @@ fn draw_grid(args: &[Value]) -> Result<Value, JsError> {
     let spacing = num_arg(args, 1, "drawGrid")? as f32;
     // SAFETY: as above.
     unsafe { raylib_sys::DrawGrid(slices, spacing) };
+    Ok(Value::Undefined)
+}
+
+// ---- textures (needs the rtextures C module) ----
+
+/// Parse `w*h*8` hex digits (RRGGBBAA per pixel) into RGBA bytes.aa
+fn rgba_hex_to_bytes(
+    hex: &str,
+    width: usize,
+    height: usize,
+    name: &str,
+) -> Result<Vec<u8>, JsError> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    let expected = width * height * 8;
+    if hex.len() != expected {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "rl.{name}: expected {expected} hex digits, got {}",
+                hex.len()
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(width * height * 4);
+    for pair in hex.as_bytes().chunks(2) {
+        let text = std::str::from_utf8(pair)
+            .map_err(|_| JsError::new(ErrorKind::TypeError, format!("rl.{name}: non-ASCII hex")))?;
+        let byte = u8::from_str_radix(text, 16).map_err(|_| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.{name}: invalid hex digit"),
+            )
+        })?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+fn make_texture(args: &[Value]) -> Result<Value, JsError> {
+    let width = int_arg(args, 0, "makeTexture")?;
+    let height = int_arg(args, 1, "makeTexture")?;
+    let hex = match args.get(2).map(Value::kind) {
+        Some(ValueKind::String(text)) => text.to_string_lossy(),
+        _ => return Err(expected("makeTexture", 2, "an 8-hex-per-pixel string")),
+    };
+    let mut rgba = rgba_hex_to_bytes(&hex, width as usize, height as usize, "makeTexture")?;
+    let image = Image {
+        data: rgba.as_mut_ptr() as *mut std::ffi::c_void,
+        width,
+        height,
+        mipmaps: 1,
+        format: 7, // PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
+    };
+    // SAFETY: the window-thread guard runs before this body; `image` points
+    // at `rgba` (kept alive through the call) and the GPU copies the pixels.
+    let texture = unsafe { raylib_sys::LoadTextureFromImage(image) };
+    // SAFETY: as above. TEXTURE_FILTER_POINT keeps the chunky look.
+    unsafe { raylib_sys::SetTextureFilter(texture, 0) };
+    let mut registry = TEXTURES.lock().unwrap();
+    registry.push(texture);
+    Ok(Value::Number((registry.len() - 1) as f64))
+}
+
+fn draw_texture_rect(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "drawTexture")?;
+    let sx = num_arg(args, 1, "drawTexture")? as f32;
+    let sy = num_arg(args, 2, "drawTexture")? as f32;
+    let sw = num_arg(args, 3, "drawTexture")? as f32;
+    let sh = num_arg(args, 4, "drawTexture")? as f32;
+    let dx = num_arg(args, 5, "drawTexture")? as f32;
+    let dy = num_arg(args, 6, "drawTexture")? as f32;
+    let dw = num_arg(args, 7, "drawTexture")? as f32;
+    let dh = num_arg(args, 8, "drawTexture")? as f32;
+    let shade = num_arg(args, 9, "drawTexture")?;
+    let texture = TEXTURES
+        .lock()
+        .unwrap()
+        .get(handle as usize)
+        .copied()
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.drawTexture: unknown texture {handle}"),
+            )
+        })?;
+    let light = shade.clamp(0.0, 1.0);
+    let tint = Color::new(
+        (255.0 * light) as u8,
+        (255.0 * light) as u8,
+        (255.0 * light) as u8,
+        255,
+    );
+    // SAFETY: draw state on the installing thread (see `window_method`);
+    // source/dest are full rectangles in texture/screen pixels.
+    unsafe {
+        raylib_sys::DrawTexturePro(
+            texture,
+            Rectangle {
+                x: sx,
+                y: sy,
+                width: sw,
+                height: sh,
+            },
+            Rectangle {
+                x: dx,
+                y: dy,
+                width: dw,
+                height: dh,
+            },
+            Vector2 { x: 0.0, y: 0.0 },
+            0.0,
+            tint,
+        );
+    }
+    Ok(Value::Undefined)
+}
+
+fn texture_width(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "textureWidth")?;
+    let width = TEXTURES
+        .lock()
+        .unwrap()
+        .get(handle as usize)
+        .map(|t| t.width as f64)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.textureWidth: unknown texture {handle}"),
+            )
+        })?;
+    Ok(Value::Number(width))
+}
+
+fn texture_height(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "textureHeight")?;
+    let height = TEXTURES
+        .lock()
+        .unwrap()
+        .get(handle as usize)
+        .map(|t| t.height as f64)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.textureHeight: unknown texture {handle}"),
+            )
+        })?;
+    Ok(Value::Number(height))
+}
+
+// ---- audio + file-loaded assets (needs the raudio C module) ----
+
+fn init_audio_device(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: window-thread guard; init/use/close all on the same thread.
+    unsafe { raylib_sys::InitAudioDevice() };
+    Ok(Value::Undefined)
+}
+
+fn close_audio_device(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    unsafe { raylib_sys::CloseAudioDevice() };
+    Ok(Value::Undefined)
+}
+
+fn load_texture_from_file(args: &[Value]) -> Result<Value, JsError> {
+    let path = text_arg(args, 0, "loadTexture")?;
+    let path_str = path.to_string_lossy();
+    let texture = if let Some((_, data)) = embedded_asset(&path_str) {
+        let format = CString::new(".png").unwrap();
+        // SAFETY: window-thread guard; raylib decodes from our static bytes.
+        let image = unsafe {
+            raylib_sys::LoadImageFromMemory(format.as_ptr(), data.as_ptr(), data.len() as i32)
+        };
+        if image.width <= 0 || image.height <= 0 {
+            return Ok(Value::Number(-1.0));
+        }
+        let texture = unsafe { raylib_sys::LoadTextureFromImage(image) };
+        unsafe { raylib_sys::UnloadImage(image) };
+        texture
+    } else {
+        // SAFETY: raylib reads the file during this call; window-thread guard.
+        unsafe { raylib_sys::LoadTexture(path.as_ptr()) }
+    };
+    if texture.id == 0 {
+        return Ok(Value::Number(-1.0));
+    }
+    let mut registry = TEXTURES.lock().unwrap();
+    registry.push(texture);
+    Ok(Value::Number((registry.len() - 1) as f64))
+}
+
+fn load_sound_from_file(args: &[Value]) -> Result<Value, JsError> {
+    let path = text_arg(args, 0, "loadSound")?;
+    let path_str = path.to_string_lossy();
+    let sound = if let Some((_, data)) = embedded_asset(&path_str) {
+        let format = CString::new(".wav").unwrap();
+        // SAFETY: window-thread guard; raylib decodes from our static bytes.
+        let wave = unsafe {
+            raylib_sys::LoadWaveFromMemory(format.as_ptr(), data.as_ptr(), data.len() as i32)
+        };
+        if wave.frameCount == 0 {
+            return Ok(Value::Number(-1.0));
+        }
+        let sound = unsafe { raylib_sys::LoadSoundFromWave(wave) };
+        unsafe { raylib_sys::UnloadWave(wave) };
+        sound
+    } else {
+        // SAFETY: as above; the returned handle keeps the decoded samples alive.
+        unsafe { raylib_sys::LoadSound(path.as_ptr()) }
+    };
+    if sound.frameCount == 0 {
+        return Ok(Value::Number(-1.0));
+    }
+    let mut registry = SOUNDS.lock().unwrap();
+    registry.push(SoundSlot(sound));
+    Ok(Value::Number((registry.len() - 1) as f64))
+}
+
+fn sound_handle(args: &[Value], name: &str) -> Result<Sound, JsError> {
+    let handle = int_arg(args, 0, name)?;
+    SOUNDS
+        .lock()
+        .unwrap()
+        .get(handle as usize)
+        .map(|slot| slot.0)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.{name}: unknown sound {handle}"),
+            )
+        })
+}
+
+fn play_sound(args: &[Value]) -> Result<Value, JsError> {
+    let sound = sound_handle(args, "playSound")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::PlaySound(sound) };
+    Ok(Value::Undefined)
+}
+
+fn stop_sound(args: &[Value]) -> Result<Value, JsError> {
+    let sound = sound_handle(args, "stopSound")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::StopSound(sound) };
+    Ok(Value::Undefined)
+}
+
+fn set_sound_volume(args: &[Value]) -> Result<Value, JsError> {
+    let sound = sound_handle(args, "setSoundVolume")?;
+    let volume = num_arg(args, 1, "setSoundVolume")?.clamp(0.0, 1.0) as f32;
+    // SAFETY: as above.
+    unsafe { raylib_sys::SetSoundVolume(sound, volume) };
     Ok(Value::Undefined)
 }
 
@@ -614,6 +898,17 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("drawCube", 7, draw_cube),
         ("drawCubeWires", 7, draw_cube_wires),
         ("drawGrid", 2, draw_grid),
+        ("makeTexture", 3, make_texture),
+        ("drawTexture", 10, draw_texture_rect),
+        ("textureWidth", 1, texture_width),
+        ("textureHeight", 1, texture_height),
+        ("initAudioDevice", 0, init_audio_device),
+        ("closeAudioDevice", 0, close_audio_device),
+        ("loadTexture", 1, load_texture_from_file),
+        ("loadSound", 1, load_sound_from_file),
+        ("playSound", 1, play_sound),
+        ("stopSound", 1, stop_sound),
+        ("setSoundVolume", 2, set_sound_volume),
         ("isKeyDown", 1, is_key_down),
         ("isKeyPressed", 1, is_key_pressed),
         ("isKeyReleased", 1, is_key_released),
