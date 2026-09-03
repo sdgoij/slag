@@ -23,7 +23,7 @@ use crux::handle::Handle;
 use crux::object::JsObject as CruxObject;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
-use raylib_sys::Color;
+use raylib_sys::{Camera3D, Color, Vector3};
 
 use crate::agent::Agent;
 
@@ -203,6 +203,80 @@ fn channel_arg(args: &[Value], index: usize, name: &str) -> Result<u8, JsError> 
         return Err(expected(name, index, "a channel in 0..=255"));
     }
     Ok(number as u8)
+}
+
+// ---- 3D (needs the rmodels C module) ----
+
+fn begin_mode_3d(args: &[Value]) -> Result<Value, JsError> {
+    let px = num_arg(args, 0, "beginMode3D")? as f32;
+    let py = num_arg(args, 1, "beginMode3D")? as f32;
+    let pz = num_arg(args, 2, "beginMode3D")? as f32;
+    let tx = num_arg(args, 3, "beginMode3D")? as f32;
+    let ty = num_arg(args, 4, "beginMode3D")? as f32;
+    let tz = num_arg(args, 5, "beginMode3D")? as f32;
+    let fovy = num_arg(args, 6, "beginMode3D")? as f32;
+    let camera = Camera3D {
+        position: Vector3 {
+            x: px,
+            y: py,
+            z: pz,
+        },
+        target: Vector3 {
+            x: tx,
+            y: ty,
+            z: tz,
+        },
+        up: Vector3 {
+            x: 0.0,
+            y: 1.0,
+            z: 0.0,
+        },
+        fovy,
+        projection: 0, // CAMERA_PERSPECTIVE
+    };
+    // SAFETY: draw state on the installing thread (see `window_method`).
+    unsafe { raylib_sys::BeginMode3D(camera) };
+    Ok(Value::Undefined)
+}
+
+fn end_mode_3d(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    unsafe { raylib_sys::EndMode3D() };
+    Ok(Value::Undefined)
+}
+
+fn draw_cube(args: &[Value]) -> Result<Value, JsError> {
+    let x = num_arg(args, 0, "drawCube")? as f32;
+    let y = num_arg(args, 1, "drawCube")? as f32;
+    let z = num_arg(args, 2, "drawCube")? as f32;
+    let width = num_arg(args, 3, "drawCube")? as f32;
+    let height = num_arg(args, 4, "drawCube")? as f32;
+    let length = num_arg(args, 5, "drawCube")? as f32;
+    let color = color_arg(args, 6, "drawCube")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::DrawCube(Vector3 { x, y, z }, width, height, length, color) };
+    Ok(Value::Undefined)
+}
+
+fn draw_cube_wires(args: &[Value]) -> Result<Value, JsError> {
+    let x = num_arg(args, 0, "drawCubeWires")? as f32;
+    let y = num_arg(args, 1, "drawCubeWires")? as f32;
+    let z = num_arg(args, 2, "drawCubeWires")? as f32;
+    let width = num_arg(args, 3, "drawCubeWires")? as f32;
+    let height = num_arg(args, 4, "drawCubeWires")? as f32;
+    let length = num_arg(args, 5, "drawCubeWires")? as f32;
+    let color = color_arg(args, 6, "drawCubeWires")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::DrawCubeWires(Vector3 { x, y, z }, width, height, length, color) };
+    Ok(Value::Undefined)
+}
+
+fn draw_grid(args: &[Value]) -> Result<Value, JsError> {
+    let slices = int_arg(args, 0, "drawGrid")?;
+    let spacing = num_arg(args, 1, "drawGrid")? as f32;
+    // SAFETY: as above.
+    unsafe { raylib_sys::DrawGrid(slices, spacing) };
+    Ok(Value::Undefined)
 }
 
 // ---- window ----
@@ -454,6 +528,30 @@ fn get_mouse_wheel_move(_args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Number(delta as f64))
 }
 
+fn get_mouse_delta_x(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    let delta = unsafe { raylib_sys::GetMouseDelta() };
+    Ok(Value::Number(delta.x as f64))
+}
+
+fn get_mouse_delta_y(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    let delta = unsafe { raylib_sys::GetMouseDelta() };
+    Ok(Value::Number(delta.y as f64))
+}
+
+fn disable_cursor(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    unsafe { raylib_sys::DisableCursor() };
+    Ok(Value::Undefined)
+}
+
+fn enable_cursor(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    unsafe { raylib_sys::EnableCursor() };
+    Ok(Value::Undefined)
+}
+
 // ---- color helper ----
 
 fn color(args: &[Value]) -> Result<Value, JsError> {
@@ -511,6 +609,11 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("drawRectangle", 5, draw_rectangle),
         ("drawLine", 5, draw_line),
         ("drawPixel", 3, draw_pixel),
+        ("beginMode3D", 7, begin_mode_3d),
+        ("endMode3D", 0, end_mode_3d),
+        ("drawCube", 7, draw_cube),
+        ("drawCubeWires", 7, draw_cube_wires),
+        ("drawGrid", 2, draw_grid),
         ("isKeyDown", 1, is_key_down),
         ("isKeyPressed", 1, is_key_pressed),
         ("isKeyReleased", 1, is_key_released),
@@ -522,6 +625,10 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("getMouseX", 0, get_mouse_x),
         ("getMouseY", 0, get_mouse_y),
         ("getMouseWheelMove", 0, get_mouse_wheel_move),
+        ("getMouseDeltaX", 0, get_mouse_delta_x),
+        ("getMouseDeltaY", 0, get_mouse_delta_y),
+        ("disableCursor", 0, disable_cursor),
+        ("enableCursor", 0, enable_cursor),
     ] {
         define(&rl, name, window_method(name, arity, body)?)?;
     }

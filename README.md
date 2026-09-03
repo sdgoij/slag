@@ -111,11 +111,12 @@ println!("{doubled}"); // 42
 
 ### The `rl` host module
 
-With the `raylib` feature, `Context::install_raylib` exposes an
-immediate-mode windowing/drawing/input surface to scripts as the `rl`
-global (`initWindow`, `beginDrawing`/`endDrawing`, the `draw*`
-primitives, input queries, plus raylib's palette and key/mouse
-constants). A script owns the whole render loop, exactly like a raylib C
+With the `raylib` feature, `Context::install_raylib` exposes a host
+surface to scripts as the `rl` global: window control, `beginDrawing`/
+`draw*`/`endDrawing` 2D primitives, a small 3D surface
+(`beginMode3D`/`drawCube`/`drawGrid`, needs raylib's `rmodels` module),
+input queries, plus raylib's palette and key/mouse
+constants. A script owns the whole render loop, exactly like a raylib C
 example — `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...;
 rl.endDrawing(); }`. raylib's window state is bound to the thread that
 installed the module; calls from worker agents throw a clean `TypeError`
@@ -123,6 +124,7 @@ instead of racing it.
 
 ```sh
 cargo run -p slag --example raylib_demo --features slag/raylib
+cargo run -p slag --example raylib_voxel --features slag/raylib,slag/jit   # first-person voxel sandbox
 cargo run -p cli --features raylib -- game.js
 ```
 
