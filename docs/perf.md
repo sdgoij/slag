@@ -3021,10 +3021,44 @@ break) and the L1a/L1c/compound/update probes pass under the JIT,
 the parent — language 23721/23724 (3 skip), built-ins 23657/23812
 (155 skip), annexB 1086/1086, all with zero fail/crash/hang.
 
+### Numeric-keyed array RMW fast paths in the fused core (measured 2026-09-03)
+
+A canonical runtime Number key on a dense Array or typed array
+(`arr[i] += 1`, `ta[i]++` — the byte/count-loop shape) still ran the
+fused core's general path, converting the number to a string key and
+re-resolving the property every iteration (~740ns/iter on a dense
+array). The two fused cores now serve a canonical Number key through the
+element paths directly — `array_element_get`/`array_element_write` for
+dense/spilled arrays (a hole reads `None` and falls to the general path,
+so a prototype-chain read still sees the chain) and
+`typed_array_element_get`/`typed_array_element_set` for typed arrays
+(OOB reads undefined and the setter no-ops, spec 10.4.7.5/10.4.7.6). The
+numeric paths run no user code (ToPropertyKey of a Number is pure), so
+they need no key conversion and are exact; when the element write doubts
+after the compound's coercion mutated the receiver, the ALREADY-computed
+value is written through the converted key — never re-read/re-applied.
+
+The cores are push-neutral (`assign_member`'s result push is popped
+inside): the numeric paths return without any push, so a JIT helper that
+unconditionally popped would steal a caller stack slot (a compiled
+`o[k]++` on a Uint8Array underflowed `do_call_fast` at the next call
+until the helpers stopped popping).
+
+Measurement (2M-iteration certified loops, `scratch/numeric_rmw_probe.js`):
+dense-array `o[0] += 1` ~740 -> ~20ns/iter and `o[0]++` ~17.5ns (JIT,
+interp ~28/25.5), typed-array (Float64Array) `ta[0] += 1` ~53.5 and
+`ta[0]++` ~51 (interp ~65/59.5). Gates: clippy clean, workspace tests
+green, the numeric edge probe (`scratch/numeric_rmw_edge_probe.js`:
+dense in-range RMW, a hole reading through a prototype and writing an
+own element, append-position NaN semantics, uint8 modulo wrap /
+uint8clamped clamp / float64 +=, typed OOB no-op, a coercion-mutated
+receiver writing exactly once, numeric-string elements) passes under the
+JIT, `--no-jit`, and `--gc-stress`; the three release sweeps are
+identical to the parent.
+
 Next: the compile-time string-literal-key normalization (a literal
 computed key like `o['k']` is observationally a name and should compile
-to the named machinery), and the numeric-keyed dense-array/typed-array
-fast paths inside the fused core.
+to the named machinery).
 
 ## Deferred milestones
 

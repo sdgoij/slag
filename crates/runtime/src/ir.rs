@@ -8051,6 +8051,23 @@ impl Vm {
         Ok(value)
     }
 
+    /// The register member-write tail for the fused computed RMW ops:
+    /// `assign_member` (whose pushed result is the step path's expression
+    /// value) followed by popping that push — the register path discards the
+    /// result. Push-neutral, so the ops' JIT slow-helper calls need no
+    /// balancing pop (the numeric fast paths return without any push).
+    fn assign_member_discard(
+        &mut self,
+        agent: &mut Agent,
+        object: Value,
+        key: PropertyKeyName,
+        value: Value,
+    ) -> Result<(), JsError> {
+        self.assign_member(agent, object, key, None, value, AssignOp::Assign)?;
+        self.stack.pop();
+        Ok(())
+    }
+
     /// The register computed-member compound (`o[k] op= v`, the
     /// `CompoundMemberComputedLocal` op): the nullish check, then the key is
     /// converted ONCE and the old value read through the member cell, the
@@ -8059,7 +8076,11 @@ impl Vm {
     /// `GetMemberComputedKeep` also converts before the read and hands the
     /// write the converted key (spec 13.15.3) — re-converting an object key
     /// at a separate store op would re-run its ToPropertyKey after the
-    /// read's getters.
+    /// read's getters. A canonical Number key on a dense Array or typed
+    /// array runs no user code (ToPropertyKey of a Number is pure), so the
+    /// element paths serve the read AND the write directly with no key
+    /// conversion — mirroring `get_member_computed`'s numeric read and
+    /// `assign_computed_plain`'s numeric write.
     pub(crate) fn compound_member_computed(
         &mut self,
         agent: &mut Agent,
@@ -8070,6 +8091,44 @@ impl Vm {
     ) -> Result<(), JsError> {
         if is_nullish(&object) {
             return Err(nullish_error("Cannot read properties of null"));
+        }
+        let numeric = match key.kind() {
+            ValueKind::Number(number)
+                if number.fract() == 0.0 && (0.0..4294967295.0).contains(&number) =>
+            {
+                Some(number as u64)
+            }
+            _ => None,
+        };
+        if let Some(index) = numeric
+            && let ValueKind::Object(object_ref) = object.kind()
+        {
+            // Dense/spilled arrays: a present element reads fast; a hole
+            // reads None and falls to the general path (the array's ordinary
+            // [[Get]] sees the chain).
+            if let Some(old) = Self::array_element_get(agent, &object, index) {
+                let new = crate::expr::apply_compound(agent, op, &old, &value)?;
+                if matches!(object_ref.kind, crux::object::ObjectKind::Array(_))
+                    && object_ref.array_element_write(index, new)?.is_some()
+                {
+                    return Ok(());
+                }
+                // The element write doubted (the compound's coercion can
+                // mutate the receiver): write the ALREADY-computed value
+                // through the converted key — never re-read/re-apply.
+                let key = crate::context::to_property_key(agent, &key)?;
+                self.assign_member_discard(agent, object, PropertyKeyName::Key(key), new)?;
+                return Ok(());
+            }
+            // Typed arrays: the element read covers every index (OOB reads
+            // undefined, spec 10.4.7.5) and the setter no-ops OOB.
+            if let crux::object::ObjectKind::IntegerIndexed(slots) = &object_ref.kind {
+                let old = object_ref.typed_array_element_get(slots, index)?;
+                let new = crate::expr::apply_compound(agent, op, &old, &value)?;
+                if object_ref.typed_array_element_set(slots, index, new)? {
+                    return Ok(());
+                }
+            }
         }
         let key = crate::context::to_property_key(agent, &key)?;
         let old = match &key {
@@ -8084,21 +8143,16 @@ impl Vm {
             _ => crate::context::get_property_key(agent, &object, &key, object)?,
         };
         let new = crate::expr::apply_compound(agent, op, &old, &value)?;
-        self.assign_member(
-            agent,
-            object,
-            PropertyKeyName::Key(key),
-            None,
-            new,
-            AssignOp::Assign,
-        )?;
+        self.assign_member_discard(agent, object, PropertyKeyName::Key(key), new)?;
         Ok(())
     }
 
     /// The register computed-member update (`o[k]++` / `o[k]--`, the
     /// `UpdateMemberComputedLocal` op): the once-converted-key read then the
     /// ToNumeric update (the number case is the inline f64 ±1, everything
-    /// else `update_value`) stored through the same key.
+    /// else `update_value`) stored through the same key. The canonical
+    /// Number-keyed array/typed-array element paths bypass the conversion
+    /// (deterministic, no user code), like `compound_member_computed`.
     pub(crate) fn update_member_computed(
         &mut self,
         agent: &mut Agent,
@@ -8108,6 +8162,51 @@ impl Vm {
     ) -> Result<(), JsError> {
         if is_nullish(&object) {
             return Err(nullish_error("Cannot read properties of null"));
+        }
+        let numeric = match key.kind() {
+            ValueKind::Number(number)
+                if number.fract() == 0.0 && (0.0..4294967295.0).contains(&number) =>
+            {
+                Some(number as u64)
+            }
+            _ => None,
+        };
+        if let Some(index) = numeric
+            && let ValueKind::Object(object_ref) = object.kind()
+        {
+            // The ToNumeric ±1 update (the number case inlines the f64;
+            // everything else falls to `update_value`).
+            let apply_update = |agent: &mut Agent, old: Value| -> Result<Value, JsError> {
+                if let Some(num) = old.as_number() {
+                    let delta = if matches!(op, syntax::ast::UpdateOp::Increment) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    Ok(Value::Number(num + delta))
+                } else {
+                    let (_, new) = update_value(agent, &op, &old)?;
+                    Ok(new)
+                }
+            };
+            if let Some(old) = Self::array_element_get(agent, &object, index) {
+                let new = apply_update(agent, old)?;
+                if matches!(object_ref.kind, crux::object::ObjectKind::Array(_))
+                    && object_ref.array_element_write(index, new)?.is_some()
+                {
+                    return Ok(());
+                }
+                let key = crate::context::to_property_key(agent, &key)?;
+                self.assign_member_discard(agent, object, PropertyKeyName::Key(key), new)?;
+                return Ok(());
+            }
+            if let crux::object::ObjectKind::IntegerIndexed(slots) = &object_ref.kind {
+                let old = object_ref.typed_array_element_get(slots, index)?;
+                let new = apply_update(agent, old)?;
+                if object_ref.typed_array_element_set(slots, index, new)? {
+                    return Ok(());
+                }
+            }
         }
         let key = crate::context::to_property_key(agent, &key)?;
         let old = match &key {
@@ -8132,14 +8231,7 @@ impl Vm {
             let (_, new) = update_value(agent, &op, &old)?;
             new
         };
-        self.assign_member(
-            agent,
-            object,
-            PropertyKeyName::Key(key),
-            None,
-            new,
-            AssignOp::Assign,
-        )?;
+        self.assign_member_discard(agent, object, PropertyKeyName::Key(key), new)?;
         Ok(())
     }
 

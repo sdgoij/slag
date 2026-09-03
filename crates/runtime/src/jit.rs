@@ -1261,11 +1261,7 @@ extern "C" fn rmw_compound_computed(
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
     match vm.compound_member_computed(agent, object, key, op, value) {
-        Ok(()) => {
-            // The write's pushed result is discarded by the register run.
-            let _ = vm.stack.pop();
-            value.bits()
-        }
+        Ok(()) => value.bits(),
         Err(error) => slow_error(ctx, error),
     }
 }
@@ -1281,11 +1277,7 @@ extern "C" fn rmw_update_computed(ctx: *mut c_void, object: u64, key: u64, op: u
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
     match vm.update_member_computed(agent, object, key, op) {
-        Ok(()) => {
-            // The write's pushed result is discarded by the register run.
-            let _ = vm.stack.pop();
-            Value::Undefined.bits()
-        }
+        Ok(()) => Value::Undefined.bits(),
         Err(error) => slow_error(ctx, error),
     }
 }
