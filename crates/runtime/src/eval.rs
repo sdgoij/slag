@@ -3158,6 +3158,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn statement_member_updates_lower_to_register_runs() {
+        // A statement-position `o.x++`/`o.x--` in a certified loop: read the
+        // old value (`GetMemberNameLocal`), apply the ToNumeric update
+        // (`UpdateAcc`), and store it back onto the slot object's member
+        // (`StoreMemberNameLocal`). An expression-position update (its value
+        // feeds a later step) must stay on the step path.
+        fn register_runs(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> Vec<Box<[crate::ir::LeafOp]>> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let statement = register_runs(
+            &mut agent,
+            "function u(o, n) { for (var i = 0; i < n; i++) { o.x++; } return o.x; }",
+            "u",
+        );
+        assert_eq!(statement.len(), 1, "the o.x++ body must lower");
+        assert!(
+            statement[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::UpdateAcc {
+                    op: syntax::ast::UpdateOp::Increment
+                }
+            )),
+            "the run must apply the update"
+        );
+        assert!(
+            statement[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::StoreMemberNameLocal { object_slot: 0, .. }
+            )),
+            "the run must store onto the slot object"
+        );
+        // An expression-position update (`s += o.x++`) keeps the step path
+        // (its result feeds the add).
+        let expression = register_runs(
+            &mut agent,
+            "function e(o, n) { var s = 0; for (var i = 0; i < n; i++) { s += o.x++; } return s; }",
+            "e",
+        );
+        assert_eq!(expression.len(), 0, "the expression update stays step-path");
+    }
+
     // ---- Cut 3: frame-slot fast path ----
 
     /// The compiled body of a function bound on the global object.

@@ -2951,6 +2951,25 @@ three release sweeps are identical to the parent — language 23721/23724
 (3 skip), built-ins 23657/23812 (155 skip), annexB 1086/1086, all with
 zero fail/crash/hang.
 
+The same mechanism then covers statement-position member UPDATES
+(`o.x++` / `o.x--`): the lowering decomposes `Step::UpdateMemberName` into
+the read + a new `UpdateAcc` leaf op (ToNumeric ±1 — NOT the binary `+`,
+which would concatenate a numeric string — with the number case inlined
+and `update_value` as the fallback) + `StoreMemberNameLocal`. The update's
+expression result (old/new) is discarded at the statement boundary, so
+prefix and postfix lower identically; an expression-position update
+(`s += o.x++`) leaves its value unconsumed and stays on the step path
+(asserted by the new eval test). The JIT emits `UpdateAcc` with the
+`emit_update` fast/slow shape (inline f64 ±1, `UpdateValueSlow`
+fallback). Measured: `o.x++` ~48 -> ~27ns/iter and `o.x--` ~27.5 in
+certified loops; the compound row and all jit-bench rows unchanged.
+Gates: clippy clean, workspace tests green, the update probe
+(`scratch/l1c_update_probe.js`: numeric/numeric-string/NaN/Infinity
+updates, postfix/prefix values, own accessors, chain accessors,
+non-writable, delete+recreate, nullish, mid-loop break) passes under the
+JIT, `--no-jit`, and `--gc-stress`; the three release sweeps are
+identical to the parent.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

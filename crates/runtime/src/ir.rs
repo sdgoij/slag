@@ -1196,6 +1196,12 @@ pub enum LeafOp {
     /// accumulator right operand (a body that spilled the first operand of
     /// a binary while computing the second).
     BinAccPop { op: BinaryOp },
+    /// acc = the accumulator's `++`/`--` update value (the statement-position
+    /// member update, `o.x++`): applies `update_value` semantics —
+    /// ToNumeric, then ±1 — NOT the binary `+`/`-` (a non-numeric string
+    /// would concatenate, not increment). The number case is the inline
+    /// f64 ±1; anything else falls to the general `update_value`.
+    UpdateAcc { op: syntax::ast::UpdateOp },
     /// acc = frame[slot] op acc — a frame-slot left operand combined with
     /// the accumulator right operand. The slot is read at the combine,
     /// after the accumulator value was computed; that is safe only for
@@ -8860,6 +8866,23 @@ impl Vm {
                 LeafOp::BinAccPop { op } => {
                     let left = self.pop();
                     self.acc = Self::binary_inline(agent, *op, &left, &self.acc)?;
+                }
+                LeafOp::UpdateAcc { op } => {
+                    // The statement-position member update: ToNumeric, then
+                    // ±1 (update_value). A number in the accumulator takes
+                    // the inline f64 path; anything else (a numeric string,
+                    // a BigInt) runs the general updater.
+                    if let Some(num) = self.acc.as_number() {
+                        let delta = if matches!(op, syntax::ast::UpdateOp::Increment) {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        self.acc = Value::Number(num + delta);
+                    } else {
+                        let (_, new) = update_value(agent, op, &self.acc)?;
+                        self.acc = new;
+                    }
                 }
                 LeafOp::BinLeftReg { op, slot } => {
                     let left = *self.frame_get(*slot);
@@ -18175,6 +18198,37 @@ fn lower_step(
                 // the old value and may skip the write — no register form.
                 _ => return None,
             }
+        }
+        Step::UpdateMemberName {
+            name,
+            op,
+            prefix: _,
+        } => {
+            // A statement-position member update (`o.x++` / `o.x--`): the
+            // cached old value (read by the preceding `GetMemberName`, live
+            // in the accumulator) updates in place and stores back onto the
+            // frame-slot object. The result (old for postfix, new for
+            // prefix) is discarded at the statement boundary, so the form is
+            // identical for both; an expression-position update leaves its
+            // result unconsumed and the run machinery keeps it on the step
+            // path.
+            let old = stack.pop()?;
+            let object = stack.pop()?;
+            if !matches!(old, RegOperand::Acc) {
+                return None;
+            }
+            let RegOperand::Reg {
+                slot: object_slot,
+                tdz: false,
+            } = object
+            else {
+                return None;
+            };
+            ops.push(LeafOp::UpdateAcc { op: *op });
+            ops.push(LeafOp::StoreMemberNameLocal {
+                object_slot,
+                name: *name,
+            });
         }
         Step::AssignMemberComputed {
             op: AssignOp::Assign,
