@@ -3154,11 +3154,19 @@ the computed-RMW probe set passes under the JIT, `--no-jit`, and
 `--gc-stress`; the three release sweeps are identical to the parent.
 
 Separate pre-existing finding (reproduced at parent HEAD, not introduced
-here): a register computed store whose `PostInc` key is NaN or Infinity
-raises an illegal instruction under the JIT — the compiled body's
-non-canonical-Number key falls through to the slow helper, and the
-machine-code fallback crashes (the interpreter is exact; `--no-jit`
-runs the same shape cleanly). Left for a JIT-side landing.
+by the interpreter slice): a register computed store whose PostInc key is
+NaN or Infinity raised an illegal instruction under the JIT — the
+compiled dense-array-append gate ran a NON-saturating `fcvt_to_uint` on
+any double key before its range branches could route a non-canonical key
+to the slow helper, and the x64 lowering traps on NaN, an infinity, a
+negative, or a value >= 2^63. Fixed in the same pass: the append gate
+converts with `fcvt_to_uint_sat`, which never traps; the round-trip
+integrality + range gates below send every non-canonical value to the
+legacy helper exactly as before (a canonical index < 2^32 is never
+saturated, so the fast path is unchanged — the buildString rows measure
+identically). Covered by the e2e `installed_jit_non_canonical_post_inc_keys_fall_back_cleanly`
+(NaN/±Infinity/negative/fractional/over-2^63/BigInt PostInc keys under
+the real JIT; the parent-HEAD binary dies on its script).
 
 Next: the remaining interp cost on the append store is the object
 machinery itself (chain-clean verdict, buffer push, length mirror,

@@ -4735,6 +4735,38 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_non_canonical_post_inc_keys_fall_back_cleanly() {
+        // A register computed store whose PostInc key is a real double that
+        // is NOT a canonical array index must fall back to the slow helper
+        // and land exactly like the interpreter. The dense-append gate used a
+        // NON-saturating `fcvt_to_uint`, which the x64 backend lowers to a
+        // trap on NaN, an infinity, a negative, or a value >= 2^63 — the
+        // machine code died with an illegal instruction before its range
+        // checks could route the key to the legacy path. Each function has a
+        // loop, so it compiles on its first call and runs the machine store.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function fn_nan() { var a = []; var l = NaN; for (var i = 0; i < 2; i++) { a[l++] = i; } return (a.NaN === 1 && l !== l) ? 0 : 1; }\n\
+                     function fn_inf() { var a = []; var l = Infinity; for (var i = 0; i < 1; i++) { a[l++] = 5; } return (a.Infinity === 5 && l === Infinity) ? 0 : 1; }\n\
+                     function fn_ninf() { var a = []; var l = -Infinity; for (var i = 0; i < 1; i++) { a[l++] = 6; } return (a['-Infinity'] === 6 && l === -Infinity) ? 0 : 1; }\n\
+                     function fn_neg() { var a = []; var l = -1; for (var i = 0; i < 1; i++) { a[l++] = 5; } return (a['-1'] === 5 && l === 0 && a.length === 0) ? 0 : 1; }\n\
+                     function fn_frac() { var a = []; var l = 2.5; for (var i = 0; i < 1; i++) { a[l++] = 7; } return (a['2.5'] === 7 && l === 3.5) ? 0 : 1; }\n\
+                     function fn_huge() { var a = []; var l = 9223372036854775808; for (var i = 0; i < 1; i++) { a[l++] = 2; } return (a['9223372036854776000'] === 2 && a.length === 0) ? 0 : 1; }\n\
+                     function fn_bigint() { var a = []; var l = 1n; for (var i = 0; i < 1; i++) { a[l++] = 9; } return (a.length === 2 && a[1] === 9 && l === 2n) ? 0 : 1; }\n\
+                     fn_nan() + fn_inf() + fn_ninf() + fn_neg() + fn_frac() + fn_huge() + fn_bigint();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(0.0));
+        // The loop bodies compile (5 of the 7 functions — the rest stay
+        // interpreted for benign reasons), and the parent-HEAD binary died
+        // with an illegal instruction on this exact script, so the compiled
+        // path is exercised and the regression is caught.
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_string_concat_in_a_fast_loop() {
         // Cut 41: `s += x` with two strings in a certified loop lowers to
         // `BinLeftReg` whose compiled Add now checks both string tags and

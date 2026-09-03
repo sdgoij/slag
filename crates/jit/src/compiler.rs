@@ -1550,7 +1550,16 @@ impl<'a> Lowerer<'a> {
             .ins()
             .brif(is_double, key_ok_check, &[], legacy, &[]);
         self.builder.seal_block(key_check);
-        // The canonical-index checks: no fraction, 0 <= n < 2^32-1.
+        // The canonical-index checks: no fraction, 0 <= n < 2^32-1. The
+        // conversion is SATURATING: the non-saturating `fcvt_to_uint`
+        // lowers to a trap on a real double that is NaN, an infinity,
+        // negative, or >= 2^63 (the is-double gate only excludes heap
+        // values), and this block runs the conversion before the range
+        // branches below can route such a key to `legacy`. The saturating
+        // form converts every double; the round-trip integrality and range
+        // gates below then send every non-canonical value to `legacy`
+        // (a canonical index < 2^32 is never saturated, so the fast path
+        // is unchanged).
         self.builder.switch_to_block(key_ok_check);
         let num = self
             .builder
@@ -1563,7 +1572,7 @@ impl<'a> Lowerer<'a> {
             .ins()
             .fcmp(FloatCC::GreaterThanOrEqual, num, zero);
         let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
-        let idx = self.builder.ins().fcvt_to_uint(types::I64, num);
+        let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
         let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
         let integral = self.builder.ins().fcmp(FloatCC::Equal, back, num);
         let in_range = self.builder.ins().band(ge0, lt_max);
