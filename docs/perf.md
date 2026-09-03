@@ -3340,6 +3340,36 @@ JIT. Computed compounds/updates (`ta[k] += 1`) still lower to the
 `Dup2` general path and stay step-path — the fused compound form does
 not yet reach them.
 
+### Counter-keyed computed compounds/updates fuse (`ta[k] += 1`, `ta[k]++`) (measured 2026-09-03)
+
+The follow-on to the counter-keyed access landing: computed compounds
+and updates on a `Counter` key stayed on the step path because the
+`Dup2` that duplicates the `(object, key)` reference pair rejected a
+`Counter` operand. A `Counter` is re-readable — the dedicated
+loop-counter field is run-invariant, so the read-side and write-side
+resolutions see the same value — so the `Dup2` arm admits it, and the
+existing fused-op arms (`CompoundMemberComputedLocal`/
+`UpdateMemberComputedLocal`, already `Counter`-key-enabled by the
+previous landing) now fuse `ta[k] += 1` into ONE op and `ta[k]++` into
+ONE op per iteration. This also fixes a step-path pathology: the
+step-path compound on a typed array converted the key to a string and
+re-resolved the property per iteration (~2150ns/iter), so the register
+run is ~30x faster.
+
+Measurement (fresh builds, tight per-pair alternation, 800k iters,
+2026-09-03): `ta[k] += 1` on a Float64Array drops ~1720 -> ~54ms and
+`ta[k]++` ~1700 -> ~50ms (~30-33x); the `--jit-bench` rows are
+unchanged (no suite row exercises counter-keyed compounds). Gates:
+clippy clean, workspace tests green (new
+`counter_keyed_computed_compound_and_update_lower` asserting the single
+fused ops and covering uint8 wrap / Int16 negatives), the three release
+sweeps identical to the parent (language 23721/3 skip, built-ins
+23657/155 skip, annexB 1086/1086, zero fail/crash/hang), and the
+compound differential probe (typed-array kinds, plain arrays/objects,
+getters reading once, sparse-hole NaN, string-concat compounds,
+object-key once-conversion) is byte-identical under `--no-jit` and the
+JIT.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

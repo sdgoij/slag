@@ -3440,6 +3440,90 @@ mod tests {
     }
 
     #[test]
+    fn counter_keyed_computed_compound_and_update_lower() {
+        // The `Dup2` duplicated `(object, key)` pair of the computed compound
+        // / update path now re-reads a `Counter` key (the loop-counter field
+        // is run-invariant, so the read-side and write-side resolutions see
+        // the same value), so `ta[k] += 1` fuses into ONE
+        // `CompoundMemberComputedLocal` op and `ta[k]++` into ONE
+        // `UpdateMemberComputedLocal` op — the step-path compound on a typed
+        // array converted the key to a string and re-resolved per iteration
+        // (~30x slower).
+        fn register_runs(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> Vec<Box<[crate::ir::LeafOp]>> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let compounds = register_runs(
+            &mut agent,
+            "function h(ta) { var L = ta.length; \
+             for (var k = 0; k < L; k++) { ta[k] += 1; } return L; }",
+            "h",
+        );
+        assert_eq!(compounds.len(), 1, "the compound body must lower");
+        assert!(
+            compounds[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::CompoundMemberComputedLocal {
+                    object_slot: 0,
+                    key: crate::ir::RegOperand::Counter,
+                    op: syntax::ast::AssignOp::AddAssign,
+                    rhs: crate::ir::RegOperand::Const(_),
+                }
+            )),
+            "the run must fuse the Counter-keyed compound"
+        );
+        let updates = register_runs(
+            &mut agent,
+            "function u(ta) { var L = ta.length; \
+             for (var k = 0; k < L; k++) { ta[k]++; } return L; }",
+            "u",
+        );
+        assert_eq!(updates.len(), 1, "the update body must lower");
+        assert!(
+            updates[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::UpdateMemberComputedLocal {
+                    object_slot: 0,
+                    key: crate::ir::RegOperand::Counter,
+                    ..
+                }
+            )),
+            "the run must fuse the Counter-keyed update"
+        );
+        // Behavior across typed-array kinds: the register-run compound and
+        // update match the step-path semantics (uint8 wrap, Int16 negatives,
+        // float64 +=).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "var u8 = new Uint8Array(256); var i16 = new Int16Array(8); \
+                 for (var k = 0; k < 256; k++) { u8[k] = k; } \
+                 for (var k = 0; k < 256; k++) { u8[k] += 1; } \
+                 for (var k = 0; k < 8; k++) { i16[k] = k - 4; } \
+                 for (var k = 0; k < 8; k++) { i16[k]++; } \
+                 u8[0] + u8[254] + u8[255] * 1000 + i16[0] + i16[7]",
+            )
+            .unwrap();
+        // u8[k] = k then += 1: u8[0] = 1, u8[254] = 255, u8[255] = 0 (255+1
+        // wraps to 0). i16[k] = k - 4 then ++: i16[0] = -3, i16[7] = 4.
+        assert_eq!(value, Value::Number(1.0 + 255.0 + 0.0 + (-3.0) + 4.0));
+    }
+
+    #[test]
     fn for_body_list_wrappers_drop_only_without_abrupt_control() {
         // A `for` body block whose statements cannot transfer out of it (no
         // break/continue/return/throw, no suspension) compiles without the

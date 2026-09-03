@@ -18352,7 +18352,10 @@ fn lower_step(
             // read consumes the dup copies, the originals stay below for
             // the write). Same re-readability rule as `Dup` — each
             // duplicated operand must be loadable again at each
-            // consumption.
+            // consumption. A `Counter` key is re-readable (the dedicated
+            // loop-counter field is run-invariant, so the read-side and
+            // write-side resolutions see the same value); a `PostInc`
+            // would run its write-back twice and stays on the step path.
             let b = stack.pop()?;
             let a = stack.pop()?;
             if !matches!(
@@ -18361,12 +18364,14 @@ fn lower_step(
                     | RegOperand::Const(_)
                     | RegOperand::Ctx { .. }
                     | RegOperand::PerIter { .. }
+                    | RegOperand::Counter
             ) || !matches!(
                 b,
                 RegOperand::Reg { .. }
                     | RegOperand::Const(_)
                     | RegOperand::Ctx { .. }
                     | RegOperand::PerIter { .. }
+                    | RegOperand::Counter
             ) {
                 return None;
             }
