@@ -3072,6 +3072,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn member_compound_and_computed_stores_lower_to_register_runs() {
+        // A member RMW in a certified loop (`o.x += 1`) and a plain member
+        // store of a computed value (`o.x = o.x + 1`) previously kept the
+        // whole statement on the step path (the compound step, the `Dup`,
+        // and the Acc-value store all lacked register forms). Now the whole
+        // body lowers to one register run: the read (`GetMemberNameLocal`),
+        // the combine (BinConst/BinImm/BinReg/... on the cached old value),
+        // and the store (`StoreMemberNameLocal`, which reads the object
+        // from its frame slot at store time).
+        fn register_runs(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> Vec<Box<[crate::ir::LeafOp]>> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // `o.x += 1` (a binary compound with a const RHS).
+        let compound = register_runs(
+            &mut agent,
+            "function c(o, n) { for (var i = 0; i < n; i++) { o.x += 1; } return o.x; }",
+            "c",
+        );
+        assert_eq!(compound.len(), 1, "the o.x += 1 body must lower");
+        let ops = &compound[0];
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::GetMemberNameLocal { .. })),
+            "the run must read the old value"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::BinConst {
+                    op: syntax::ast::BinaryOp::Add,
+                    ..
+                }
+            )),
+            "the run must combine the old value with the RHS"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::StoreMemberNameLocal { object_slot: 0, .. }
+            )),
+            "the run must store the result onto the slot object's member"
+        );
+        // `o.x += i` (the loop counter RHS spills the cached old value).
+        let counter_rhs = register_runs(
+            &mut agent,
+            "function g(o, n) { for (var i = 0; i < n; i++) { o.x += i; } return o.x; }",
+            "g",
+        );
+        assert_eq!(counter_rhs.len(), 1, "the o.x += i body must lower");
+        assert!(
+            counter_rhs[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::BinAccPop { .. })),
+            "the counter RHS must spill-combine the old value"
+        );
+        // `o.x = o.x + 1` (a plain store of a computed value).
+        let computed = register_runs(
+            &mut agent,
+            "function h(o, n) { for (var i = 0; i < n; i++) { o.x = o.x + 1; } return o.x; }",
+            "h",
+        );
+        assert_eq!(computed.len(), 1, "the o.x = o.x + 1 body must lower");
+        assert!(
+            computed[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::StoreMemberNameLocal { object_slot: 0, .. }
+            )),
+            "the computed-value store must target the slot object"
+        );
+    }
+
     // ---- Cut 3: frame-slot fast path ----
 
     /// The compiled body of a function bound on the global object.

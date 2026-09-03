@@ -2905,9 +2905,51 @@ the parent — language 23721/23724 (3 skip), built-ins 23657/23812
 (155 skip), annexB 1086/1086, all with zero fail/crash/hang.
 
 Next: the compound row's residual cost is the member-compound step path
-(f2/f3 unchanged here) and the member-read-fed chains — those need the
-member ops' own fusion, and the `s += o.x`/`o.x += 1` step bodies remain
-the row's floor.
+(f2/f3 unchanged here) and the member-read-fed chains.
+
+### Member-store register fusion: `o.x op= v` and `o.x = <computed>` in runs (measured 2026-09-03)
+
+The member-RMW bodies land on the register executor. The row's `o.x +=
+1` body dispatched 9 steps/iter (LoadLocal o; Dup; GetMemberName; Push;
+AssignMemberName compound; SetCompletion; ListEnd; head) and a plain
+computed-value store (`o.x = o.x + 1`) stayed step-path purely because the
+value was live in the accumulator. The lowering now handles all three
+blockers: `Step::Dup` (a loadable shadow operand duplicates by re-read);
+the compound member assign decomposes into the plain binary on the cached
+old value plus a plain store — sound because `apply_compound(op, l, r)`
+IS `apply_binary(compound_binary(op), l, r)`, so `o.x op= v` ≡ read +
+binary + plain store (a setter/chain receiver runs exactly once, on the
+write); and a computed (`Acc`) member-store value with a frame-slot object
+stores via the new `StoreMemberNameLocal` leaf op, which reads the object
+from its slot at store time so the value never round-trips the
+accumulator. The RHS must be a pure operand (Reg/Const/Ctx/PerIter, plus
+the loop Counter via a PushAcc+LoadCounter+BinAccPop spill) and the object
+a `tdz=false` frame slot (the late-read contract). The logical assigns
+(`&&=`/`||=`/`??=`) stay on the step path (they short-circuit). The JIT
+emits `StoreMemberNameLocal` with the step path's inline validated store
+(`obj_ok` gate + member-value-cell probe + `set_member_slot`), so the
+compiled compound column does NOT regress to the slow helper.
+
+Measurement (certified-leaf probes `scratch/l1c_write_decomp.js`, 2M
+iters, 5-run medians, high-priority interleaved; the machine was noisy so
+the floor drifted 9.5-11): f2 `o.x += 1` ~48.5 -> ~29.5ns/iter; f8
+`o.x += i` ~49 -> ~33; f9 `o.x = o.x + 1` ~47 -> ~26.5; the full row
+(f3) ~62 -> ~40.5. The `--jit-bench` compound-assign interp row drops
+6.0 -> ~3.9ms/100k (~35%, 62 -> ~39ns/iter) with the JIT column flat
+(1.44ms vs 1.43) and the other rows unchanged within the machine swing.
+
+Gates: `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` green (incl. two new eval tests asserting the
+counter-fed and member-RMW bodies lower to `RunRegBody`); the edge probe
+(`scratch/l1c_compound_probe.js`: every binary compound op, string +=,
+own getter/setter accessors, chain accessors with and without an own data
+shadow, non-writable, delete+recreate, logical assigns, counter RHS,
+expression-position compounds, nullish receivers, undefined +=
+NaN, descriptor/enumeration integrity, mid-loop break) passes under the
+JIT, `--no-jit`, and `--gc-stress`, as do the L1a/L1c store probes; the
+three release sweeps are identical to the parent — language 23721/23724
+(3 skip), built-ins 23657/23812 (155 skip), annexB 1086/1086, all with
+zero fail/crash/hang.
 
 ## Deferred milestones
 

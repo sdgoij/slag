@@ -5723,6 +5723,133 @@ impl<'a> Lowerer<'a> {
                     &[object, name, value],
                 )?;
             }
+            LeafOp::StoreMemberNameLocal { object_slot, name } => {
+                // The object is the frame slot (read at store time), the
+                // value the accumulator. Inline the validated in-place
+                // member store like the step path's member write: an
+                // ordinary-object receiver whose member value cell
+                // validates (an own writable data property at the current
+                // generation — the run's preceding `GetMemberNameLocal`
+                // read refreshed it) writes through `set_member_slot` (no
+                // generation bump, no [[Set]] walk); every other receiver
+                // falls to the full `SetMemberName` helper (nullish check
+                // + assign machinery).
+                let object = self.load_slot(*object_slot);
+                let value = self.builder.use_var(self.acc_var);
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let ctx = self.vm();
+                // The object-kind gate mirrors the step's `obj_ok`: the
+                // payload must point at an object before the cell probe
+                // dereferences it.
+                let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
+                let is_obj =
+                    self.builder
+                        .ins()
+                        .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+                let tag = self.builder.ins().ushr_imm_u(object, 44);
+                let tag = self.builder.ins().band_imm_u(tag, 0xF);
+                let tag_obj =
+                    self.builder
+                        .ins()
+                        .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
+                let obj_ok = self.builder.ins().band(is_obj, tag_obj);
+                let validate = self.builder.create_block();
+                let slow = self.builder.create_block();
+                let merge = self.builder.create_block();
+                self.builder.ins().brif(obj_ok, validate, &[], slow, &[]);
+                // The cell probe (mirrors `GetMemberName`/the step store):
+                // the live id/generation must match the cell the run's read
+                // warmed on an own data-property read.
+                self.builder.switch_to_block(validate);
+                let cells = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+                );
+                let ptr = self
+                    .builder
+                    .ins()
+                    .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+                let ptr = self.builder.ins().ishl_imm_u(ptr, 4);
+                // The payload stores the `GcBox` base; the `JsObject` sits
+                // after the box header (`mark` + `size`).
+                let ptr = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+                let live_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ptr,
+                    Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+                );
+                let live_gen = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    ptr,
+                    Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+                );
+                let cell_slot = self.builder.ins().bxor(live_id, name_imm);
+                let cell_slot = self
+                    .builder
+                    .ins()
+                    .band_imm_u(cell_slot, (MEMBER_CELLS - 1) as i64);
+                let index_bytes = self
+                    .builder
+                    .ins()
+                    .imul_imm_s(cell_slot, std::mem::size_of::<MemberValueCell>() as i64);
+                let cell = self.builder.ins().iadd(cells, index_bytes);
+                let cell_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+                );
+                let cell_name = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+                );
+                let cell_gen = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+                );
+                let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
+                let name_ok = self
+                    .builder
+                    .ins()
+                    .icmp_imm_u(IntCC::Equal, cell_name, *name as i64);
+                let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
+                let id_name_ok = self.builder.ins().band(id_ok, name_ok);
+                let ok = self.builder.ins().band(id_name_ok, gen_ok);
+                let fast = self.builder.create_block();
+                self.builder.ins().brif(ok, fast, &[], slow, &[]);
+                // The fast path: the helper writes the property vector in
+                // place and refreshes the cell (no generation bump). The
+                // store's result is discarded by the run truncate.
+                self.builder.switch_to_block(fast);
+                let _stored = self.call_slow(
+                    self.sig_set_name,
+                    Helper::SetMemberSlot,
+                    &[object, name_imm, value],
+                )?;
+                self.builder.ins().jump(merge, &[]);
+                // The slow path: the full member store helper (nullish
+                // check + assign machinery).
+                self.builder.switch_to_block(slow);
+                let _stored = self.call_slow(
+                    self.sig_set_name,
+                    Helper::SetMemberName,
+                    &[object, name_imm, value],
+                )?;
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
+            }
             LeafOp::StoreMemberComputed { key, value } => {
                 let object = self.builder.use_var(self.acc_var);
                 let key = self.leaf_operand(step, op_index, 3, key)?;

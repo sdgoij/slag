@@ -1139,6 +1139,20 @@ pub enum LeafOp {
         name: crux::AtomId,
         value: RegOperand,
     },
+    /// Write the accumulator onto the `name` property of the object in
+    /// frame `object_slot` (the plain member store of a computed value to
+    /// a frame-slot object, and the store half of the register-lowered
+    /// binary compound member assign): runs `assign_member` like
+    /// `StoreMemberName`, but the object is read from the slot at store
+    /// time so the value can stay in the accumulator — the object load
+    /// never clobbers it. The lowering emits it only for `tdz=false`
+    /// slots, the late-read contract (`BinLeftReg`): nothing in the
+    /// straight-line run writes the slot between its original evaluation
+    /// and the store.
+    StoreMemberNameLocal {
+        object_slot: usize,
+        name: crux::AtomId,
+    },
     /// Write `value` onto the object in the accumulator under the computed
     /// `key` (the plain-assign computed member store, `Step::AssignMemberComputed`
     /// with a plain `=`): the shared `assign_computed_plain` fast-array and
@@ -8758,6 +8772,26 @@ impl Vm {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
                     let value = self.leaf_operand_value(agent, value)?;
+                    self.assign_member(
+                        agent,
+                        object,
+                        PropertyKeyName::Name(*name),
+                        None,
+                        value,
+                        AssignOp::Assign,
+                    )?;
+                }
+                LeafOp::StoreMemberNameLocal { object_slot, name } => {
+                    // The object is the frame slot (read at store time — the
+                    // late-read contract, `tdz=false` only), the value is the
+                    // accumulator. Mirrors `Step::AssignMemberName` with a
+                    // plain `=`: the nullish check, then `assign_member`
+                    // (whose pushed result the frame truncate discards).
+                    let object = *self.frame_get(*object_slot);
+                    if is_nullish(&object) {
+                        return Err(nullish_error("Cannot set properties of null"));
+                    }
+                    let value = self.acc;
                     self.assign_member(
                         agent,
                         object,
@@ -17859,6 +17893,23 @@ fn lower_step(
             *counter_reads += 1;
             stack.push(RegOperand::Counter);
         }
+        Step::Dup => {
+            // Duplicate the top shadow operand. A loadable operand with no
+            // accumulator residency duplicates freely (a `Reg`/`Const`/
+            // `Ctx`/`PerIter` source is re-readable at each consumption);
+            // an `Acc` value exists once in the accumulator, a `PostInc`
+            // would run its write-back twice, and a `Counter` would read
+            // the loop counter twice (the single-read guard counts only
+            // `PushAcc` steps) — all stay on the step path.
+            let top = stack.last()?;
+            match top {
+                RegOperand::Reg { .. }
+                | RegOperand::Const(_)
+                | RegOperand::Ctx { .. }
+                | RegOperand::PerIter { .. } => stack.push(top.clone()),
+                _ => return None,
+            }
+        }
         Step::LoadLocal { slot } => {
             let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
             stack.push(RegOperand::Reg { slot: *slot, tdz });
@@ -18017,35 +18068,113 @@ fn lower_step(
                 tdz: false,
             });
         }
-        Step::AssignMemberName {
-            name,
-            op: AssignOp::Assign,
-        } => {
-            // `this.x = x` / `o.x = v` (plain `=` only; compound stays on
-            // the step path): the object is the accumulator, the value a
-            // direct operand. A computed value (`Acc` — from a binary
-            // like `this.y = a + b`) cannot be held while the object
-            // load overwrites the accumulator — the same restriction as
-            // the binary ops' right operand.
+        Step::AssignMemberName { name, op } => {
             let value = stack.pop()?;
-            let object = stack.pop()?;
-            // A `PostInc` value would run the write-back after the
-            // nullish check, inverting the step path's order (`l++`
-            // evaluates before [[Set]] throws on a nullish receiver) —
-            // keep it on the step path. The loop Counter IS allowed: the
-            // store op resolves it from the dedicated field at execution
-            // time (after the object load), so it needs no accumulator
-            // slot.
-            if matches!(
-                value,
-                RegOperand::Acc | RegOperand::Spilled | RegOperand::PostInc { .. }
-            ) {
-                return None;
+            match op {
+                AssignOp::Assign => {
+                    let object = stack.pop()?;
+                    // `this.x = x` / `o.x = v` (plain `=`): the value is a
+                    // direct operand, or a computed value live in the
+                    // accumulator when the object is a frame slot (the
+                    // store keeps the value in the accumulator and reads
+                    // the object from the slot).
+                    if matches!(value, RegOperand::Spilled | RegOperand::PostInc { .. }) {
+                        // A `PostInc` value would run the write-back after
+                        // the nullish check, inverting the step path's
+                        // order (`l++` evaluates before [[Set]] throws on a
+                        // nullish receiver) — keep it on the step path.
+                        return None;
+                    }
+                    if matches!(value, RegOperand::Acc) {
+                        // A computed value: only a `tdz=false` frame-slot
+                        // object works (the store reads the slot at store
+                        // time, so the value is never clobbered).
+                        let RegOperand::Reg { slot, tdz: false } = object else {
+                            return None;
+                        };
+                        ops.push(LeafOp::StoreMemberNameLocal {
+                            object_slot: slot,
+                            name: *name,
+                        });
+                    } else {
+                        // A direct operand value: load the object into the
+                        // accumulator and store (the loop Counter resolves
+                        // from the dedicated field at execution time, after
+                        // the object load).
+                        if !load_operand(ops, object) {
+                            return None;
+                        }
+                        ops.push(LeafOp::StoreMemberName { name: *name, value });
+                    }
+                }
+                op @ (AssignOp::AddAssign
+                | AssignOp::SubAssign
+                | AssignOp::MulAssign
+                | AssignOp::DivAssign
+                | AssignOp::RemAssign
+                | AssignOp::ExpAssign
+                | AssignOp::LeftShiftAssign
+                | AssignOp::RightShiftAssign
+                | AssignOp::UnsignedRightShiftAssign
+                | AssignOp::BitAndAssign
+                | AssignOp::BitOrAssign
+                | AssignOp::BitXorAssign) => {
+                    // A binary compound member assign (`o.x += v`, ...):
+                    // decompose into the plain binary on the cached old
+                    // value (live in the accumulator) plus a plain store of
+                    // the result. Sound because `o.x op= v` ≡ `o.x = o.x
+                    // <bop> v` (`apply_compound` is `apply_binary` of the
+                    // compound's binary op) — the store is a plain assign
+                    // of the computed value, so a setter/chain receiver
+                    // runs exactly once on the write. The RHS must be a
+                    // pure operand (no side effects between the old read
+                    // and the store), and the object a `tdz=false` frame
+                    // slot (late-read contract).
+                    let old = stack.pop()?;
+                    let object = stack.pop()?;
+                    if !matches!(old, RegOperand::Acc) {
+                        return None;
+                    }
+                    let RegOperand::Reg {
+                        slot: object_slot,
+                        tdz: false,
+                    } = object
+                    else {
+                        return None;
+                    };
+                    let bop = crate::expr::compound_binary(*op);
+                    match value {
+                        RegOperand::Reg { slot, tdz: false } => ops.push(LeafOp::BinReg {
+                            op: bop,
+                            slot,
+                            tdz: false,
+                        }),
+                        RegOperand::Const(v) => ops.push(LeafOp::BinConst { op: bop, value: v }),
+                        RegOperand::Ctx { index } => {
+                            ops.push(LeafOp::BinContext { op: bop, index })
+                        }
+                        RegOperand::PerIter { index } => {
+                            ops.push(LeafOp::BinPerIter { op: bop, index })
+                        }
+                        // The loop counter as the RHS (`o.x += i`): spill the
+                        // cached old value (in the accumulator), load the
+                        // counter, and combine by popping the spill back.
+                        RegOperand::Counter => {
+                            ops.push(LeafOp::PushAcc);
+                            ops.push(LeafOp::LoadCounter);
+                            ops.push(LeafOp::BinAccPop { op: bop });
+                        }
+                        _ => return None,
+                    }
+                    ops.push(LeafOp::StoreMemberNameLocal {
+                        object_slot,
+                        name: *name,
+                    });
+                }
+                // The logical assigns (`&&=`, `||=`, `??=`) short-circuit on
+                // the old value and may skip the write — no register form.
+                _ => return None,
             }
-            if !load_operand(ops, object) {
-                return None;
-            }
-            ops.push(LeafOp::StoreMemberName { name: *name, value });
         }
         Step::AssignMemberComputed {
             op: AssignOp::Assign,
