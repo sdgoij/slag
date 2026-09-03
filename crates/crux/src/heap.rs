@@ -788,13 +788,54 @@ fn stack_bounds() -> Option<(usize, usize)> {
     }
 }
 
-/// Linux: the committed anonymous mapping containing the current stack
-/// pointer (the main thread's `[stack]` entry and worker-thread stacks both
-/// appear in `/proc/self/maps`; the guard page is a separate `---p` mapping,
-/// excluded by the read-permission check).
+/// Linux: the current thread's stack top. `pthread_getattr_np`/`pthread_attr_getstack`
+/// report the exact usable range of the calling thread (guard excluded) — the same
+/// source the Boehm GC uses. Parsing `/proc/self/maps` alone is not reliable here:
+/// adjacent per-thread stacks can be covered by one mapping (and split by nothing
+/// the scan can see), so the region containing the stack pointer may extend past
+/// this thread's stack into a neighbour's guard page, faulting the scan.
 #[cfg(target_os = "linux")]
 fn stack_bounds() -> Option<(usize, usize)> {
-    let sp = &0usize as *const usize as usize;
+    // A named local's address is a genuine stack location; taking the address
+    // of the literal (`&0usize`) would be const-promoted to the binary's
+    // read-only data, so any mapping lookup would match the wrong region.
+    let probe = 0usize;
+    let sp = &probe as *const usize as usize;
+    let high = match (pthread_stack_top(), maps_stack_top(sp)) {
+        (Some(a), Some(m)) => Some(a.min(m)),
+        (a, m) => a.or(m),
+    }?;
+    (high > sp).then_some((sp, high))
+}
+
+#[cfg(target_os = "linux")]
+fn pthread_stack_top() -> Option<usize> {
+    // SAFETY: `pthread_getattr_np` initializes `attr` for the current thread;
+    // after it succeeds the attribute is valid for `pthread_attr_getstack` and
+    // must be released with `pthread_attr_destroy`.
+    unsafe {
+        let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+        if libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) != 0 {
+            return None;
+        }
+        let mut base: *mut libc::c_void = std::ptr::null_mut();
+        let mut size = 0usize;
+        let got = libc::pthread_attr_getstack(attr.as_ptr(), &mut base, &mut size);
+        let destroyed = libc::pthread_attr_destroy(attr.as_mut_ptr());
+        if got == 0 && destroyed == 0 && !base.is_null() && size > 0 {
+            Some(base as usize + size)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn maps_stack_top(sp: usize) -> Option<usize> {
+    // The end of the readable mapping containing `sp` (the guard page is a
+    // separate `---p` mapping, excluded by the read-permission check). Only a
+    // clamp on the pthread bounds: it is the *smaller* endpoint that wins, so
+    // a merged multi-stack mapping can never widen the scan, only narrow it.
     let text = std::fs::read_to_string("/proc/self/maps").ok()?;
     for line in text.lines() {
         let mut fields = line.split_whitespace();
@@ -802,7 +843,6 @@ fn stack_bounds() -> Option<(usize, usize)> {
             continue;
         };
         if !perms.contains('r') {
-            // Guard pages (`---p`) fault on read; skip them.
             continue;
         }
         let Some((start, end)) = range.split_once('-') else {
@@ -815,7 +855,7 @@ fn stack_bounds() -> Option<(usize, usize)> {
             continue;
         };
         if start <= sp && sp < end {
-            return Some((start, end));
+            return Some(end);
         }
     }
     None

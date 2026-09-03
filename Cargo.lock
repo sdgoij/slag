@@ -286,6 +286,7 @@ name = "crux"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libc",
  "num-bigint",
  "num-traits",
  "proptest",

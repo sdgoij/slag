@@ -10,6 +10,9 @@ num-bigint = "0.4"
 num-traits = "0.2"
 ryu = "1"
 half = "2"
+# `pthread_getattr_np` (Linux stack-scan bounds); also pulled in by the rest
+# of the workspace, so no new download.
+libc = "0.2"
 
 [features]
 # Experimental multi-agent mode (PLAN Phase 17): SharedArrayBuffer storage

@@ -57,7 +57,7 @@ mod tests {
     #[test]
     fn copies_bytes_into_executable_memory() {
         let code = ExecutableCode::new(&[0x90, 0x90, 0xC3]).expect("allocates");
-        assert_eq!(code.len(), 4096); // one page, rounded up
+        assert_eq!(code.len(), region::page::size()); // one page, rounded up
         assert!(!code.is_empty());
         assert!(!code.as_ptr().is_null());
         // The bytes are readable back at the pointer.
@@ -87,6 +87,6 @@ mod tests {
     fn rejects_zero_length() {
         // region::alloc rejects size 0; `new` passes at least 1.
         let code = ExecutableCode::new(&[]).expect("allocates");
-        assert_eq!(code.len(), 4096);
+        assert_eq!(code.len(), region::page::size());
     }
 }
