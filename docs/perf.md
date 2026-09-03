@@ -3270,6 +3270,38 @@ rerun swept clean), and the extended member-read differential probe
 reads, nullish mid-chain, primitive receivers) is byte-identical under
 `--no-jit` and the JIT.
 
+### Warm named-member stores probe the L1a cell directly in the register executor (measured 2026-09-03)
+
+The write-side mirror of the read fold: the register `StoreMemberName`/
+`StoreMemberNameLocal` arms called `assign_member` on every store, which
+op-matched to its Assign branch, ran `name_atom`, called `warm_store_put`
+(the L1a cell probe + direct slot/field write + value-cell refresh), and
+pushed the result onto the value stack (discarded by the `RunRegBody`
+truncate). The arms now run the nullish check and probe `warm_store_put`
+directly — a warm write skips the `assign_member` call, its op match, and
+the per-store value-stack push (the register path discards the result
+anyway) — and only a miss falls back to `assign_member` (which re-probes;
+cold writes are rare). Pure refactor: the L1a gate (receiver == base on an
+Ordinary object/function, own writable data property at the recorded
+slot) and every fallback are unchanged.
+
+Measurement (fresh builds of both trees, tight per-pair alternation, 3M
+iters, 2026-09-03): a warm named-store row (`o.x = i; s += i`) drops
+~99 -> ~87ms (~11%); the compound row (`o.x += 1; s += o.x`) drops ~115
+-> ~109ms (~4%); the `var`-loop floor is flat and an isolated arithmetic
+row is flat. The `--jit-bench` suite does NOT show the compound win: by
+the compound row the shared direct-mapped member cells are thrashed by
+the ~13 prior rows (Cut 35 slice 5), so the L1a cell rarely hits in the
+suite and the warm-hit change is invisible there — the clean-context
+probes are the measurement, as with the earlier coverage slices. Gates:
+clippy clean, workspace tests green, the three release sweeps identical
+to the parent (language 23721/3 skip, built-ins 23657/155 skip, annexB
+1086/1086, zero fail/crash/hang), and the member-store differential
+probe (warm stores, accessor receivers, chain setters under an own data
+shadow, non-writable, delete+recreate mid-loop, accessor conversion
+mid-loop, array `length`, vector-only props, function own props) is
+byte-identical under `--no-jit` and the JIT.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

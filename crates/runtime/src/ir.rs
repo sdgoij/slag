@@ -9010,41 +9010,47 @@ impl Vm {
                 LeafOp::StoreMemberName { name, value } => {
                     // The object is the accumulator; the value comes from the
                     // operand. Mirrors `Step::AssignMemberName` with a plain
-                    // `=`: the nullish check, then `assign_member` (whose
-                    // pushed result the frame truncate discards).
+                    // `=`: the nullish check, then the L1a warm-store probe
+                    // directly (a warm write skips `assign_member`'s call +
+                    // op match), then `assign_member` for the fallbacks
+                    // (whose pushed result the frame truncate discards).
                     let object = self.acc;
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
                     let value = self.leaf_operand_value(agent, value)?;
-                    self.assign_member(
-                        agent,
-                        object,
-                        PropertyKeyName::Name(*name),
-                        None,
-                        value,
-                        AssignOp::Assign,
-                    )?;
+                    if !Self::warm_store_put(agent, &object, *name, value) {
+                        self.assign_member(
+                            agent,
+                            object,
+                            PropertyKeyName::Name(*name),
+                            None,
+                            value,
+                            AssignOp::Assign,
+                        )?;
+                    }
                 }
                 LeafOp::StoreMemberNameLocal { object_slot, name } => {
                     // The object is the frame slot (read at store time — the
                     // late-read contract, `tdz=false` only), the value is the
                     // accumulator. Mirrors `Step::AssignMemberName` with a
-                    // plain `=`: the nullish check, then `assign_member`
-                    // (whose pushed result the frame truncate discards).
+                    // plain `=`: the nullish check, then the L1a warm-store
+                    // probe directly, then `assign_member` for the fallbacks.
                     let object = *self.frame_get(*object_slot);
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
                     let value = self.acc;
-                    self.assign_member(
-                        agent,
-                        object,
-                        PropertyKeyName::Name(*name),
-                        None,
-                        value,
-                        AssignOp::Assign,
-                    )?;
+                    if !Self::warm_store_put(agent, &object, *name, value) {
+                        self.assign_member(
+                            agent,
+                            object,
+                            PropertyKeyName::Name(*name),
+                            None,
+                            value,
+                            AssignOp::Assign,
+                        )?;
+                    }
                 }
                 LeafOp::StoreMemberComputed { key, value } => {
                     // The object is the accumulator; the key and value come
