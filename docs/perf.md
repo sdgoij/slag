@@ -3094,6 +3094,39 @@ read/RMW lowering (a `Const` Number key then reaches the fused core's
 numeric element fast paths, and a `Const` string key is moot now that
 string literals normalize to names).
 
+### Const-key computed RMW on the register executor (measured 2026-09-03)
+
+The register computed RMW lowering only accepted a frame-slot (`Reg`)
+key, so a literal Number key (`o[0] += 1` on a dense array) stayed on the
+step path: every iteration converted the number to a string key and
+re-resolved the property (~915ns/iter). The fused ops
+(`CompoundMemberComputedLocal`/`UpdateMemberComputedLocal`/
+`StoreMemberComputedLocal`) now carry the key as a `RegOperand` — a
+`tdz=false` frame slot OR a `Const` (`is_stable_computed_key`) — resolved
+by the interpreter handler / JIT leaf_operand at op-execution time (a
+`Const` is immutable, so the same late-read/deferred-read soundness
+holds). A `Const` Number key reaches the fused core's numeric element
+fast paths (dense/typed arrays) with no key conversion.
+
+Measurement (2M-iteration certified loops, `scratch/computed_probe3.js`):
+dense-array `o[0] += 1` ~915 -> ~20ns/iter (JIT) / ~29.5 (interp) — the
+numeric element paths — and the explicit `o[0] = o[0] + 1` and `o[0]++`
+literal forms lower too. Gates: clippy clean, workspace tests green (the
+lowering test asserts the Const-key fused shape), the const-key probe
+(`scratch/const_key_rmw_probe.js`: literal vs runtime-key agreement,
+separate literal indices, append-position NaN, plain-object index-string
+properties, explicit `o[0] = o[0] + 1`, typed arrays incl. OOB,
+oversized non-index keys) and the heap-const-key probe (`o[1n]` — the
+BigInt-literal key rides the `load_const` field plumbing, rooted under
+`--gc-stress`) pass under the JIT, `--no-jit`, and `--gc-stress`; the
+three release sweeps are identical to the parent.
+
+Next: the computed-member family is now fast across runtime keys (string
+and number), literal string keys (names), and literal number keys
+(Const). The remaining measured member-op gap is the NAMED side's own
+exotic cases and the L1c shapes work (the plan's structural item);
+re-probe the jit-bench rows and pick the next mechanism by measurement.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

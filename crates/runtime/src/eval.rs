@@ -3254,7 +3254,10 @@ mod tests {
                 &compound[0][..],
                 [crate::ir::LeafOp::CompoundMemberComputedLocal {
                     object_slot: 0,
-                    key_slot: 1,
+                    key: crate::ir::RegOperand::Reg {
+                        slot: 1,
+                        tdz: false,
+                    },
                     op: syntax::ast::AssignOp::AddAssign,
                     rhs: crate::ir::RegOperand::Const(value),
                 }] if *value == crux::Value::Number(1.0)
@@ -3274,12 +3277,37 @@ mod tests {
                 &update[0][..],
                 [crate::ir::LeafOp::UpdateMemberComputedLocal {
                     object_slot: 0,
-                    key_slot: 1,
+                    key: crate::ir::RegOperand::Reg {
+                        slot: 1,
+                        tdz: false,
+                    },
                     op: syntax::ast::UpdateOp::Increment,
                 }]
             ),
             "the o[k]++ statement must be exactly one fused op, got {:?}",
             update[0]
+        );
+        // A literal Number key (`o[0] += 1`) lowers with the key as a
+        // `Const` operand — the fused core then reaches its numeric element
+        // fast paths.
+        let const_key = register_runs(
+            &mut agent,
+            "function n(o, n) { for (var i = 0; i < n; i++) { o[0] += 1; } return o[0]; }",
+            "n",
+        );
+        assert_eq!(const_key.len(), 1, "the o[0] += 1 body must lower");
+        assert!(
+            matches!(
+                &const_key[0][..],
+                [crate::ir::LeafOp::CompoundMemberComputedLocal {
+                    object_slot: 0,
+                    key: crate::ir::RegOperand::Const(value),
+                    op: syntax::ast::AssignOp::AddAssign,
+                    rhs: crate::ir::RegOperand::Const(rhs),
+                }] if *value == crux::Value::Number(0.0) && *rhs == crux::Value::Number(1.0)
+            ),
+            "the o[0] += 1 statement must carry the Const key, got {:?}",
+            const_key[0]
         );
         // `o[k] = o[k] + 1`: the plain computed store of a computed value
         // (the store defers its own key conversion, matching the step
@@ -3295,7 +3323,10 @@ mod tests {
                 op,
                 crate::ir::LeafOp::StoreMemberComputedLocal {
                     object_slot: 0,
-                    key_slot: 1
+                    key: crate::ir::RegOperand::Reg {
+                        slot: 1,
+                        tdz: false,
+                    },
                 }
             )),
             "the run must store through the re-read key slot"

@@ -692,11 +692,12 @@ pub struct JitSlowPaths {
     /// mirroring the interpreter's `stack.push(*value)`).
     pub push_const: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
     /// A register body's heap constant (`LeafOp::LoadConst`/`BinConst` or a
-    /// member op's `RegOperand::Const`): read the value out of the running
+    /// a member op's `RegOperand::Const`): read the value out of the running
     /// body's register op at `(step, op)` and return its bits. `field`
     /// selects the const-bearing field of the op (0 = the op's own Value,
     /// 1 = `StoreMemberName.value`, 2 = `GetMemberComputed(.Local).key`,
-    /// 3/4 = `StoreMemberComputed.key/value`).
+    /// 3/4 = `StoreMemberComputed.key/value`, 5 = the computed-store/key or
+    /// fused-RMW operand, 6 = `CompoundMemberComputedLocal.key`).
     pub load_const: extern "C" fn(ctx: *mut c_void, step: u64, op: u64, field: u64) -> u64,
     /// `Step::EnterBlock` (Cut 55): push a declarative block environment and
     /// instantiate its declarations; `decls` are read back from the running
@@ -2805,7 +2806,10 @@ extern "C" fn load_const(ctx: *mut c_void, step: u64, op: u64, field: u64) -> u6
         | (crate::ir::LeafOp::GetMemberComputedLocal { key, .. }, 2) => reg_const(key),
         (crate::ir::LeafOp::StoreMemberComputed { key, .. }, 3) => reg_const(key),
         (crate::ir::LeafOp::StoreMemberComputed { value, .. }, 4) => reg_const(value),
+        (crate::ir::LeafOp::StoreMemberComputedLocal { key, .. }, 5) => reg_const(key),
         (crate::ir::LeafOp::CompoundMemberComputedLocal { rhs, .. }, 5) => reg_const(rhs),
+        (crate::ir::LeafOp::CompoundMemberComputedLocal { key, .. }, 6) => reg_const(key),
+        (crate::ir::LeafOp::UpdateMemberComputedLocal { key, .. }, 5) => reg_const(key),
         _ => unreachable!("load_const on a const-free op/field"),
     };
     value.bits()

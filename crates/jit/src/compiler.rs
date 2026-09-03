@@ -5897,30 +5897,27 @@ impl<'a> Lowerer<'a> {
                 let value = self.leaf_operand(step, op_index, 4, value)?;
                 self.emit_computed_store(object, key, value)?;
             }
-            LeafOp::StoreMemberComputedLocal {
-                object_slot,
-                key_slot,
-            } => {
-                // The object and the key are the frame slots (read at store
-                // time — the late-read contract), the value the accumulator.
-                // Same gates as `StoreMemberComputed`.
+            LeafOp::StoreMemberComputedLocal { object_slot, key } => {
+                // The object is the frame slot (read at store time — the
+                // late-read contract), the key a `Reg`/`Const` operand, the
+                // value the accumulator. Same gates as `StoreMemberComputed`.
                 let object = self.load_slot(*object_slot);
-                let key = self.load_slot(*key_slot);
+                let key = self.leaf_operand(step, op_index, 5, key)?;
                 let value = self.builder.use_var(self.acc_var);
                 self.emit_computed_store(object, key, value)?;
             }
             LeafOp::CompoundMemberComputedLocal {
                 object_slot,
-                key_slot,
+                key,
                 op,
                 rhs,
             } => {
                 // One slow call: the helper converts the key once, reads the
                 // old value, applies the compound to the RHS, and stores
-                // through the same key. The RHS is a pure operand (loaded
-                // here — stable across the helper's read).
+                // through the same key. The key and the RHS are pure
+                // operands (loaded here — stable across the helper's read).
                 let object = self.load_slot(*object_slot);
-                let key = self.load_slot(*key_slot);
+                let key = self.leaf_operand(step, op_index, 6, key)?;
                 let value = self.leaf_operand(step, op_index, 5, rhs)?;
                 let op = self.builder.ins().iconst(types::I64, *op as i64);
                 let _res = self.call_slow(
@@ -5931,13 +5928,13 @@ impl<'a> Lowerer<'a> {
             }
             LeafOp::UpdateMemberComputedLocal {
                 object_slot,
-                key_slot,
+                key,
                 op,
             } => {
                 // One slow call: the helper converts the key once, applies
                 // the ToNumeric update, and stores through the same key.
                 let object = self.load_slot(*object_slot);
-                let key = self.load_slot(*key_slot);
+                let key = self.leaf_operand(step, op_index, 5, key)?;
                 let op = self.builder.ins().iconst(types::I64, *op as i64);
                 let _res = self.call_slow(
                     self.sig_set_comp,
