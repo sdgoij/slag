@@ -423,6 +423,33 @@ impl SharedBuffer {
         }
     }
 
+    /// Copy `out.len()` bytes out of the block at `offset` into `out` — the
+    /// allocation-free sibling of `read`, for the hot typed-array element
+    /// read path (the element decodes from a stack buffer, so a per-element
+    /// `Vec` would be pure churn). Errors like `read` when the range is out
+    /// of bounds.
+    pub fn read_into(&self, offset: usize, out: &mut [u8]) -> Result<(), JsError> {
+        #[cfg(not(feature = "workers"))]
+        {
+            let data = self.block.borrow();
+            data.get(offset..offset + out.len())
+                .map(|slice| out.copy_from_slice(slice))
+                .ok_or_else(out_of_bounds)
+        }
+        #[cfg(feature = "workers")]
+        {
+            if offset + out.len() > self.byte_length() {
+                return Err(out_of_bounds());
+            }
+            let base = self.block.as_ptr() as *const AtomicU64 as *const u8;
+            // SAFETY: bounds-checked above; the Arc keeps the block alive.
+            unsafe {
+                std::ptr::copy_nonoverlapping(base.add(offset), out.as_mut_ptr(), out.len());
+            }
+            Ok(())
+        }
+    }
+
     /// Copy `bytes` into the block at `offset` (a plain write; the caller
     /// synchronizes concurrent access).
     pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), JsError> {

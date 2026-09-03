@@ -3370,6 +3370,25 @@ getters reading once, sparse-hole NaN, string-concat compounds,
 object-key once-conversion) is byte-identical under `--no-jit` and the
 JIT.
 
+### Typed-array element reads allocate nothing per element (measured 2026-09-03)
+
+The typed-array element read path (`typed_array_element_get` and the
+`[[Get]]`/`[[GetOwnProperty]]` helpers) decoded each element through
+`SharedBuffer::read`, which returned a fresh `Vec<u8>` per call that
+`decode_element` then re-read — the write path had already moved to a
+stack buffer (`encode_element_into`), and the read row measured
+conspicuously heavier than the write row. Add `SharedBuffer::read_into`
+(copy into a caller buffer) and decode from a `[u8; MAX_ELEMENT_SIZE]`
+stack buffer, so a hot element read allocates nothing.
+
+Measurement (fresh builds, tight per-pair alternation in both orders,
+800k iters over a `Uint8Array`, 2026-09-03): the `s += ta[k]` read row
+drops ~35-37ms -> ~16-18ms (~2x, ~41ns -> ~19-21ns per element); the
+`ta[k] = k & 255` write row and the empty-loop floor are unchanged
+(~12ms / ~2ms). Gates: clippy clean, workspace tests green, and the
+three release sweeps identical to the parent (language 23721/3 skip,
+built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

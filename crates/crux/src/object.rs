@@ -2043,8 +2043,9 @@ impl JsObject {
         index: u64,
     ) -> Result<Value, JsError> {
         if typed_array_valid_index(slots, index as f64) {
-            let bytes = element_bytes(slots, index as f64)?;
-            crate::typed_array::decode_element(slots.element_type, &bytes, 0)
+            let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
+            let size = element_bytes_into(slots, index as f64, &mut bytes)?;
+            crate::typed_array::decode_element(slots.element_type, &bytes[..size], 0)
         } else {
             Ok(Value::Undefined)
         }
@@ -3964,13 +3965,22 @@ fn typed_array_valid_index(slots: &TypedArraySlots, index: f64) -> bool {
         && (index as usize) < typed_array_effective_length(slots)
 }
 
-/// The element bytes of the TypedArray at a valid canonical index.
-fn element_bytes(slots: &TypedArraySlots, index: f64) -> Result<Vec<u8>, JsError> {
+/// Fill `out[..size]` with the element bytes at a valid canonical index;
+/// returns the element size. The caller supplies a stack buffer so a hot
+/// element read allocates nothing (the `read`-based predecessor returned a
+/// fresh `Vec` per element).
+fn element_bytes_into(
+    slots: &TypedArraySlots,
+    index: f64,
+    out: &mut [u8],
+) -> Result<usize, JsError> {
+    let size = slots.element_type.size();
     let index = index as usize;
-    let offset = slots.byte_offset + index * slots.element_type.size();
+    let offset = slots.byte_offset + index * size;
     slots
         .buffer
-        .read(offset, slots.element_type.size())
+        .read_into(offset, &mut out[..size])
+        .map(|()| size)
         .map_err(|_| {
             JsError::new(
                 ErrorKind::TypeError,
@@ -3990,8 +4000,9 @@ fn typed_array_get_own_property(
 ) -> Result<Option<Property>, JsError> {
     if let Some(index) = canonical_index(key) {
         if typed_array_valid_index(slots, index) {
-            let bytes = element_bytes(slots, index)?;
-            let value = crate::typed_array::decode_element(slots.element_type, &bytes, 0)?;
+            let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
+            let size = element_bytes_into(slots, index, &mut bytes)?;
+            let value = crate::typed_array::decode_element(slots.element_type, &bytes[..size], 0)?;
             return Ok(Some(Property::data(value, true, true, true)));
         }
         return Ok(None);
@@ -4073,8 +4084,9 @@ fn typed_array_get(
 ) -> Result<Value, JsError> {
     if let Some(index) = canonical_index(key) {
         if typed_array_valid_index(slots, index) {
-            let bytes = element_bytes(slots, index)?;
-            return crate::typed_array::decode_element(slots.element_type, &bytes, 0);
+            let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
+            let size = element_bytes_into(slots, index, &mut bytes)?;
+            return crate::typed_array::decode_element(slots.element_type, &bytes[..size], 0);
         }
         // An invalid index (incl. a detached buffer) reads *undefined*
         // without consulting the prototype chain (spec 10.4.7.5).
