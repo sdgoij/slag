@@ -3211,6 +3211,65 @@ Next: the guard region's residual per-iteration cost is the step-path
 L1b's fused guard; the structural L1c shapes item remains the primary
 investment.
 
+### L1c read path: warm member reads fold inline into the register executor (measured 2026-09-03)
+
+The interpreter's warm member read on the register path measured ~9-10ns
+per op (the `property read` row's `o.a + o.b` reads) against a ~2-3ns
+plain-register-op floor. The register executor's `GetMemberNameLocal`
+arm called the full `member_cell_get` (an out-of-line call through the
+big `Vm` helper: `cell_object` re-derivation + the value-cell probe + the
+map live-field probe + the slot/vector tail). The warm probes are now
+extracted into `member_cell_warm_probe` (`#[inline(always)]` — the
+value cell, then the map live-field read) shared by `member_cell_get`
+and folded directly into the executor arm: the arm derives the object
+part once and probes inline, so a warm read pays no out-of-line call;
+only a miss falls back to `get_member_name`. Pure refactor — the probe
+order and every fallback are unchanged (`member_cell_get` reuses the
+same helper, so the step path and the JIT-mirrored semantics are
+identical).
+
+Measurement (interleaved A/B both orders, 3 rounds each, 2026-09-03):
+`--jit-bench` `property read` interp ~29.3 -> ~24.1ms (~18%) with the
+JIT column flat (~5.0ms); the isolated 2-read probe (`scratch/
+l1c_read_probe.js`, 3M iters) drops ~91 -> ~79ms (~1.7ns/read) with the
+`var`-loop floor flat; `arithmetic` unchanged within noise (the apparent
+first-order gain reversed under order interleaving — code-layout luck).
+Gates: clippy clean, workspace tests green, the three release sweeps
+identical to the parent (language 23721/3 skip, built-ins 23657/155
+skip, annexB 1086/1086, zero fail/crash/hang), and a register-path
+member-read differential probe (own data, accessors, chain methods,
+typed-array `length`, delete/redefine mid-loop, vector-only props past
+the inline fields, proxy receivers, own-shadow over a chain data
+property, function own props) is byte-identical under `--no-jit` and the
+JIT.
+
+Next (L1c read path continued): the remaining ~7ns/read is the
+value-cell probe itself under the register-op dispatch; the plan's
+shape-compare end state (per-site map validation, L2) is the structural
+follow-on, and the write-side record discipline remains gated on the
+interpreter-vs-JIT generation-bump split.
+
+The same fold then covers the accumulator-object arm. `GetMemberName`
+(a receiver computed into the accumulator — a captured or chained
+object) previously called `get_member_name` out of line on every read:
+the nullish check, the typed-array `length` atom probe, AND another
+out-of-line `member_cell_get` inside it. The arm now derives the object
+part and runs the same inline warm probe; non-cell receivers (nullish,
+proxies, typed arrays) and misses fall back to `get_member_name`
+unchanged. Measurement (tight per-pair alternation, 6 pairs, 3M iters,
+2026-09-03): a monomorphic chain (`o.a.b + o.a.c` — two acc reads per
+iteration) drops ~118 -> ~103ms (~13%, ~2.5ns/acc read, every pair); a
+computed-receiver row (`arr[i % 8].a + arr[i % 8].b`) drops ~289 ->
+~278ms (~4%, diluted by the element reads); the `--jit-bench` rows are
+unchanged within noise. Gates: clippy clean, workspace tests green, the
+three release sweeps identical to the parent (language 23721/3 skip,
+built-ins 23657/155 skip, annexB 1086/1086 — a single load-dependent
+built-ins reduceRight flake reproduced in isolation 5/5 PASS and the
+rerun swept clean), and the extended member-read differential probe
+(chain tails, getters mid-chain, computed receivers, own-absent chain
+reads, nullish mid-chain, primitive receivers) is byte-identical under
+`--no-jit` and the JIT.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

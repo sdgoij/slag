@@ -3368,6 +3368,30 @@ impl Vm {
         Some(value)
     }
 
+    /// The warm member-read probes shared by `member_cell_get` and the
+    /// register executor's member-read arms: the generation-validated value
+    /// cell first (a pure (id, name, generation) compare — no map read, no
+    /// in-fields access, no per-read cache write), then the map live-field
+    /// read, which warms the value cell on its hit so the next read — and
+    /// the JIT's inline probe, which sees only the value cell — is served
+    /// by the pure compare. `#[inline(always)]` so a warm register read
+    /// folds into the executor arm with no out-of-line call; `None` means
+    /// both probes missed and the caller falls back to the full resolution
+    /// (which re-runs these probes, then the slot/vector and chain paths).
+    #[inline(always)]
+    fn member_cell_warm_probe(
+        agent: &mut Agent,
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+    ) -> Option<Value> {
+        let index = Self::member_cell_index(object.id(), name);
+        let cell = &agent.member_value_cells[index];
+        if cell.id == object.id() && cell.name == name && cell.generation == object.generation() {
+            return Some(cell.value);
+        }
+        Self::member_cell_get_map(agent, object, name)
+    }
+
     /// The cached read of `object.name` — an own data property on a plain
     /// object at the direct-mapped slot, re-validated against the stored key
     /// and property kind. `None` falls back to the full Get (which then
@@ -3376,20 +3400,11 @@ impl Vm {
     /// generation matches the cached read (every own-property mutation path
     /// bumps the generation, including `set_key`'s in-place value update).
     fn member_cell_get(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
-        // The generation-validated value cell first: the warm read path is
-        // a pure (id, name, generation) compare — no map read, no in-fields
-        // access, no per-read cache write. The map probe below warms the
-        // cell on its hit, so a hot loop's second read is served here (this
-        // also matches the JIT's inline probe order).
         let object = Self::cell_object(object)?;
-        let index = Self::member_cell_index(object.id(), name);
-        let cell = &agent.member_value_cells[index];
-        if cell.id == object.id() && cell.name == name && cell.generation == object.generation() {
-            return Some(cell.value);
-        }
-        if let Some(value) = Self::member_cell_get_map(agent, &object, name) {
+        if let Some(value) = Self::member_cell_warm_probe(agent, &object, name) {
             return Some(value);
         }
+        let index = Self::member_cell_index(object.id(), name);
         let slot = match agent.member_cells[index] {
             Some((cached_id, cached_name, slot))
                 if cached_id == object.id() && cached_name == name =>
@@ -9080,7 +9095,19 @@ impl Vm {
                 }
                 LeafOp::GetMemberName { name } => {
                     let object = self.acc;
-                    self.acc = self.get_member_name(agent, object, *name)?;
+                    // The same inline warm probe as `GetMemberNameLocal`:
+                    // a cell-kind object in the accumulator (a captured or
+                    // computed receiver) serves the warm read without the
+                    // `get_member_name` out-of-line call; only a miss (or a
+                    // non-cell receiver — nullish, a proxy, a typed array)
+                    // falls back to it.
+                    self.acc = match Self::cell_object(&object) {
+                        Some(cell) => match Self::member_cell_warm_probe(agent, &cell, *name) {
+                            Some(value) => value,
+                            None => self.get_member_name(agent, object, *name)?,
+                        },
+                        None => self.get_member_name(agent, object, *name)?,
+                    };
                 }
                 LeafOp::GetMemberComputed { key } => {
                     let object = self.acc;
@@ -9093,9 +9120,11 @@ impl Vm {
                     name,
                 } => {
                     // The hot path reads the frame slot by reference (no
-                    // value clone) and tries the shared member-cell read
-                    // first; only a miss clones the value for the full
-                    // `get_member_name` fallback.
+                    // value clone), derives the object part once, and folds
+                    // the warm member-cell probe (the value cell, then the
+                    // map live-field read) inline — a warm read pays no
+                    // out-of-line `member_cell_get` call. Only a miss falls
+                    // back to the full `get_member_name`.
                     let object = self.frame_get(*object_slot);
                     if *tdz && object.is_uninitialized() {
                         return Err(JsError::new(
@@ -9103,8 +9132,11 @@ impl Vm {
                             "Cannot access a binding before initialization".into(),
                         ));
                     }
-                    self.acc = match Self::member_cell_get(agent, object, *name) {
-                        Some(value) => value,
+                    self.acc = match Self::cell_object(object) {
+                        Some(cell) => match Self::member_cell_warm_probe(agent, &cell, *name) {
+                            Some(value) => value,
+                            None => self.get_member_name(agent, *object, *name)?,
+                        },
                         None => self.get_member_name(agent, *object, *name)?,
                     };
                 }
