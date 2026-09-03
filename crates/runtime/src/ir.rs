@@ -9237,6 +9237,22 @@ impl Vm {
                         "Cannot access a binding before initialization".into(),
                     ));
                 }
+                // A slot that already holds a Number updates on the raw f64:
+                // the postfix key (`a[l++] = v` on the buildString rows) skips
+                // the ToNumeric/ToPrimitive dispatch in `update_value`, which
+                // re-boxes and re-coerces a value that is provably a Number.
+                // Number is closed under `++`/`--` (NaN and the infinities
+                // included), and the old value is the yielded key unchanged, so
+                // the fast path is exactly `update_value`'s Number branch.
+                if let ValueKind::Number(number) = old.kind() {
+                    let delta = if matches!(op, UpdateOp::Increment) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    *self.frame_get_mut(*slot) = Value::Number(number + delta);
+                    return Ok(old);
+                }
                 let (old_numeric, new) = update_value(agent, op, &old)?;
                 *self.frame_get_mut(*slot) = new;
                 Ok(old_numeric)

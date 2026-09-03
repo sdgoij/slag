@@ -1380,6 +1380,74 @@ mod tests {
     }
 
     #[test]
+    fn post_inc_key_number_fast_path_matches_update_value() {
+        // A PostInc key whose slot already holds a Number updates on the raw
+        // f64 in `leaf_operand_value` (skipping the ToNumeric/ToPrimitive
+        // dispatch of the general `update_value`). Number is closed under
+        // `++`/`--`, so the edge values must land exactly as the general path
+        // would: NaN and the infinities stay put, -0 is a canonical index 0,
+        // and a fractional or over-2^32 key writes a plain (non-index)
+        // property. These are certified scripts — no calls — so the loop
+        // body runs on the register executor and resolves the key through
+        // the fast path.
+        assert_eq!(
+            value(
+                "var a = []; var l = NaN; for (var i = 0; i < 2; i++) { a[l++] = i; } \
+                 a.NaN + '|' + l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("1|NaN")))
+        );
+        assert_eq!(
+            value(
+                "var a = []; var l = Infinity; for (var i = 0; i < 1; i++) { a[l++] = 5; } \
+                 a.Infinity + '|' + l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("5|Infinity")))
+        );
+        assert_eq!(
+            value(
+                "var a = []; var l = 2.5; for (var i = 0; i < 1; i++) { a[l++] = 7; } \
+                 a['2.5'] + '|' + l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("7|3.5")))
+        );
+        assert_eq!(
+            value(
+                "var a = [0]; var l = -0; for (var i = 0; i < 1; i++) { a[l++] = 9; } \
+                 a[0] + '|' + l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("9|1")))
+        );
+        // A post-DECREMENT key takes the same fast path with delta -1.
+        assert_eq!(
+            value(
+                "var a = []; var l = 2; for (var i = 0; i < 3; i++) { a[l--] = i; } \
+                 a[0] + a[1] + a[2] + '|' + l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("3|-1")))
+        );
+        // A key past the array-index maximum is a plain property, not an
+        // element; the array length stays untouched.
+        assert_eq!(
+            value(
+                "var a = []; var l = 4294967296; for (var i = 0; i < 1; i++) { a[l++] = 3; } \
+                 a.length + '|' + a[4294967296] + '|' + l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("0|3|4294967297")))
+        );
+        // A non-Number slot (a BigInt) still resolves through the general
+        // `update_value` machinery: the write-back lands at 2n and the key
+        // (old 1n) defines the array element "1", growing the length to 2.
+        assert_eq!(
+            value(
+                "var a = []; var l = 1n; for (var i = 0; i < 1; i++) { a[l++] = 9; } \
+                 a.length + '|' + a[1] + '|' + typeof l"
+            ),
+            Value::String(Handle::new(JsString::from_utf8("2|9|bigint")))
+        );
+    }
+
+    #[test]
     fn register_counter_member_operands_stay_spec_exact() {
         // The register loop body's counter serves as a member store's value
         // or key (`a[l++] = i`, `b[j] = j * 10`). Since Cut 35 slice 21 the

@@ -3127,6 +3127,46 @@ and number), literal string keys (names), and literal number keys
 exotic cases and the L1c shapes work (the plan's structural item);
 re-probe the jit-bench rows and pick the next mechanism by measurement.
 
+### PostInc keys on a Number slot resolve on the raw f64 (measured 2026-09-03)
+
+The buildString rows' interpreter column is the computed-store machinery:
+`a[l++] = i` runs one `RunRegBody` op whose `PostInc` key resolution went
+through the general `update_value` (a full `to_numeric`
+ToPrimitive/ToNumber dispatch) on every iteration just to add 1 to a
+slot that provably holds a Number. The register executor now handles a
+`PostInc` key whose slot holds a Number inline (`n ± 1`, one slot write,
+the old value yielded unchanged) and falls through to `update_value` for
+everything else. Sound because Number is closed under `++`/`--` (NaN and
+the infinities stay put) and `to_numeric` of a Number is the value
+itself. Interpreter-only: the JIT resolves `PostInc` in machine code, so
+no JIT arm and the compiled columns are untouched.
+
+Measurement (interleaved parent/child A/B, 3 rounds each, 2026-09-03):
+`buildString shape` interp ~171-192ms -> ~145-162ms (best-of-3 171.3 ->
+145.0, ~15%), JIT column unchanged (~40ms); the isolated `a[l++]=i`
+append drops ~41.0 -> ~33.2ns/iter interp (~19%), while the
+step-path `a[l]=i; l++` control (a separate `UpdateLocal` step, not the
+fused key) is unchanged; `buildString full` (apply/fromCodePoint-bound)
+is unchanged. Gates: clippy clean, workspace tests green (new
+`post_inc_key_number_fast_path_matches_update_value` regression covering
+NaN/±Infinity/-0/fractional/over-2^32 keys and the BigInt fallback),
+the computed-RMW probe set passes under the JIT, `--no-jit`, and
+`--gc-stress`; the three release sweeps are identical to the parent.
+
+Separate pre-existing finding (reproduced at parent HEAD, not introduced
+here): a register computed store whose `PostInc` key is NaN or Infinity
+raises an illegal instruction under the JIT — the compiled body's
+non-canonical-Number key falls through to the slow helper, and the
+machine-code fallback crashes (the interpreter is exact; `--no-jit`
+runs the same shape cleanly). Left for a JIT-side landing.
+
+Next: the remaining interp cost on the append store is the object
+machinery itself (chain-clean verdict, buffer push, length mirror,
+generation bump) — the plan's structural L1c element-storage item; the
+step-path `if (l === N)` guard overhead (~16ns/iter on the shape row) is
+the second measured term, reducible only with a completion-elision or
+fused-test landing.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
