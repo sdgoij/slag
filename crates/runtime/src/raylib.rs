@@ -12,6 +12,9 @@
 //! Drawing is immediate-mode and blocking: the script drives the loop
 //! itself, exactly like a raylib C example —
 //! `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...; rl.endDrawing(); }`.
+//!
+//! With the additional `raygui` feature, raygui's `Gui*` controls are
+//! installed on the same object as `rl.gui*` (see the gated `gui` module).
 
 use std::ffi::CString;
 use std::sync::{Mutex, OnceLock};
@@ -863,6 +866,401 @@ fn color(args: &[Value]) -> Result<Value, JsError> {
     Ok(to_js_color(Color::new(r, g, b, a)))
 }
 
+// ---- raygui controls (needs the runtime `raygui` feature) ----
+//
+// The `rl.gui*` surface mirrors raygui's immediate-mode controls, drawn
+// inside `beginDrawing`/`endDrawing` like the `draw*` helpers above. A
+// control that owns state across frames (a checkbox, slider, ...) holds it
+// through a C pointer in raygui, so its wrapper takes the *current* value as
+// an argument and returns `{ action, value }`: feed `value` back in on the
+// next frame and treat `action` as raygui's own return (nonzero means
+// clicked / changed / Enter pressed, depending on the control). Text-heavy
+// lists (`;`-separated, like combo/dropdown items) are passed as plain
+// strings exactly as raygui expects.
+
+#[cfg(feature = "raygui")]
+mod gui {
+    use super::*;
+
+    /// raygui's `GuiState` enum (`STATE_NORMAL`..`STATE_DISABLED`) as JS
+    /// constants for `guiSetState`.
+    const GUI_STATES: &[(&str, i32)] = &[
+        ("GUI_STATE_NORMAL", 0),
+        ("GUI_STATE_FOCUSED", 1),
+        ("GUI_STATE_PRESSED", 2),
+        ("GUI_STATE_DISABLED", 3),
+    ];
+
+    /// A control's `(x, y, width, height)` bounds, the first four arguments
+    /// of every control, flattened like the `draw*` rectangle helpers above.
+    fn bounds(args: &[Value], name: &str) -> Result<Rectangle, JsError> {
+        Ok(Rectangle {
+            x: num_arg(args, 0, name)? as f32,
+            y: num_arg(args, 1, name)? as f32,
+            width: num_arg(args, 2, name)? as f32,
+            height: num_arg(args, 3, name)? as f32,
+        })
+    }
+
+    fn bool_arg(args: &[Value], index: usize, name: &str) -> Result<bool, JsError> {
+        match args.get(index).map(Value::kind) {
+            Some(ValueKind::Boolean(value)) => Ok(value),
+            _ => Err(expected(name, index, "a boolean")),
+        }
+    }
+
+    /// Pack raygui's `(return value, out-parameter state)` pair into a JS
+    /// object. The updated state flows back through `value` because
+    /// JavaScript has no pass-by-reference; `action` keeps raygui's own
+    /// return (1 when the control was activated) for callers that branch.
+    fn pair(action: i32, value: Value) -> Result<Value, JsError> {
+        let result = CruxObject::ordinary_object_create(None);
+        result.create_data_property_or_throw(
+            &JsString::from_utf8("action"),
+            Value::Number(action as f64),
+        )?;
+        result.create_data_property_or_throw(&JsString::from_utf8("value"), value)?;
+        Ok(Value::Object(result))
+    }
+
+    // SAFETY for every call below: raygui is synchronous immediate-mode C.
+    // Each function consumes its arguments (stack locals or a transient
+    // buffer) before returning and never retains the pointers, and the
+    // `window_method` guard keeps every call on the thread that installed
+    // the module, exactly like the other `rl.*` drawing calls.
+
+    // ---- global state / style ----
+
+    fn gui_enable(_args: &[Value]) -> Result<Value, JsError> {
+        unsafe { raylib_sys::GuiEnable() };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_disable(_args: &[Value]) -> Result<Value, JsError> {
+        unsafe { raylib_sys::GuiDisable() };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_lock(_args: &[Value]) -> Result<Value, JsError> {
+        unsafe { raylib_sys::GuiLock() };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_unlock(_args: &[Value]) -> Result<Value, JsError> {
+        unsafe { raylib_sys::GuiUnlock() };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_is_locked(_args: &[Value]) -> Result<Value, JsError> {
+        let locked = unsafe { raylib_sys::GuiIsLocked() };
+        Ok(Value::Boolean(locked))
+    }
+
+    fn gui_set_alpha(args: &[Value]) -> Result<Value, JsError> {
+        let alpha = num_arg(args, 0, "guiSetAlpha")?;
+        if !(0.0..=1.0).contains(&alpha) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "rl.guiSetAlpha: argument 0 must be an alpha in 0..=1".into(),
+            ));
+        }
+        unsafe { raylib_sys::GuiSetAlpha(alpha as f32) };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_set_state(args: &[Value]) -> Result<Value, JsError> {
+        let state = int_arg(args, 0, "guiSetState")?;
+        // raygui indexes its style arrays by state, so reject values outside
+        // the enum instead of letting a bad state read out of bounds later.
+        if !(0..=3).contains(&state) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "rl.guiSetState: argument 0 must be one of the rl.GUI_STATE_* constants".into(),
+            ));
+        }
+        unsafe { raylib_sys::GuiSetState(state) };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_get_state(_args: &[Value]) -> Result<Value, JsError> {
+        let state = unsafe { raylib_sys::GuiGetState() };
+        Ok(Value::Number(state as f64))
+    }
+
+    fn gui_load_style_default(_args: &[Value]) -> Result<Value, JsError> {
+        unsafe { raylib_sys::GuiLoadStyleDefault() };
+        Ok(Value::Undefined)
+    }
+
+    // ---- controls without owned state ----
+
+    fn gui_window_box(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiWindowBox")?;
+        let title = text_arg(args, 4, "guiWindowBox")?;
+        let close = unsafe { raylib_sys::GuiWindowBox(bounds, title.as_ptr()) != 0 };
+        Ok(Value::Boolean(close))
+    }
+
+    fn gui_group_box(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiGroupBox")?;
+        let text = text_arg(args, 4, "guiGroupBox")?;
+        unsafe { raylib_sys::GuiGroupBox(bounds, text.as_ptr()) };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_line(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiLine")?;
+        let text = text_arg(args, 4, "guiLine")?;
+        unsafe { raylib_sys::GuiLine(bounds, text.as_ptr()) };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_panel(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiPanel")?;
+        let text = text_arg(args, 4, "guiPanel")?;
+        unsafe { raylib_sys::GuiPanel(bounds, text.as_ptr()) };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_label(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiLabel")?;
+        let text = text_arg(args, 4, "guiLabel")?;
+        unsafe { raylib_sys::GuiLabel(bounds, text.as_ptr()) };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_button(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiButton")?;
+        let text = text_arg(args, 4, "guiButton")?;
+        let clicked = unsafe { raylib_sys::GuiButton(bounds, text.as_ptr()) != 0 };
+        Ok(Value::Boolean(clicked))
+    }
+
+    fn gui_label_button(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiLabelButton")?;
+        let text = text_arg(args, 4, "guiLabelButton")?;
+        let clicked = unsafe { raylib_sys::GuiLabelButton(bounds, text.as_ptr()) != 0 };
+        Ok(Value::Boolean(clicked))
+    }
+
+    fn gui_status_bar(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiStatusBar")?;
+        let text = text_arg(args, 4, "guiStatusBar")?;
+        unsafe { raylib_sys::GuiStatusBar(bounds, text.as_ptr()) };
+        Ok(Value::Undefined)
+    }
+
+    fn gui_dummy_rec(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiDummyRec")?;
+        let text = text_arg(args, 4, "guiDummyRec")?;
+        unsafe { raylib_sys::GuiDummyRec(bounds, text.as_ptr()) };
+        Ok(Value::Undefined)
+    }
+
+    /// `guiMessageBox` returns the 1-based index of the clicked button, 0
+    /// when its window is closed, and -1 while it just sits on screen.
+    fn gui_message_box(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiMessageBox")?;
+        let title = text_arg(args, 4, "guiMessageBox")?;
+        let message = text_arg(args, 5, "guiMessageBox")?;
+        let buttons = text_arg(args, 6, "guiMessageBox")?;
+        let clicked = unsafe {
+            raylib_sys::GuiMessageBox(bounds, title.as_ptr(), message.as_ptr(), buttons.as_ptr())
+        };
+        Ok(Value::Number(clicked as f64))
+    }
+
+    // ---- controls with owned state: `{ action, value }` ----
+
+    fn gui_toggle(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiToggle")?;
+        let text = text_arg(args, 4, "guiToggle")?;
+        let mut active = bool_arg(args, 5, "guiToggle")?;
+        let action = unsafe { raylib_sys::GuiToggle(bounds, text.as_ptr(), &mut active) };
+        pair(action, Value::Boolean(active))
+    }
+
+    fn gui_check_box(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiCheckBox")?;
+        let text = text_arg(args, 4, "guiCheckBox")?;
+        let mut checked = bool_arg(args, 5, "guiCheckBox")?;
+        let action = unsafe { raylib_sys::GuiCheckBox(bounds, text.as_ptr(), &mut checked) };
+        pair(action, Value::Boolean(checked))
+    }
+
+    fn gui_slider(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiSlider")?;
+        let text_left = text_arg(args, 4, "guiSlider")?;
+        let text_right = text_arg(args, 5, "guiSlider")?;
+        let mut value = num_arg(args, 6, "guiSlider")? as f32;
+        let min_value = num_arg(args, 7, "guiSlider")? as f32;
+        let max_value = num_arg(args, 8, "guiSlider")? as f32;
+        let action = unsafe {
+            raylib_sys::GuiSlider(
+                bounds,
+                text_left.as_ptr(),
+                text_right.as_ptr(),
+                &mut value,
+                min_value,
+                max_value,
+            )
+        };
+        pair(action, Value::Number(value as f64))
+    }
+
+    fn gui_slider_bar(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiSliderBar")?;
+        let text_left = text_arg(args, 4, "guiSliderBar")?;
+        let text_right = text_arg(args, 5, "guiSliderBar")?;
+        let mut value = num_arg(args, 6, "guiSliderBar")? as f32;
+        let min_value = num_arg(args, 7, "guiSliderBar")? as f32;
+        let max_value = num_arg(args, 8, "guiSliderBar")? as f32;
+        let action = unsafe {
+            raylib_sys::GuiSliderBar(
+                bounds,
+                text_left.as_ptr(),
+                text_right.as_ptr(),
+                &mut value,
+                min_value,
+                max_value,
+            )
+        };
+        pair(action, Value::Number(value as f64))
+    }
+
+    fn gui_progress_bar(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiProgressBar")?;
+        let text_left = text_arg(args, 4, "guiProgressBar")?;
+        let text_right = text_arg(args, 5, "guiProgressBar")?;
+        let mut value = num_arg(args, 6, "guiProgressBar")? as f32;
+        let min_value = num_arg(args, 7, "guiProgressBar")? as f32;
+        let max_value = num_arg(args, 8, "guiProgressBar")? as f32;
+        let action = unsafe {
+            raylib_sys::GuiProgressBar(
+                bounds,
+                text_left.as_ptr(),
+                text_right.as_ptr(),
+                &mut value,
+                min_value,
+                max_value,
+            )
+        };
+        pair(action, Value::Number(value as f64))
+    }
+
+    fn gui_combo_box(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiComboBox")?;
+        let text = text_arg(args, 4, "guiComboBox")?;
+        let mut active = int_arg(args, 5, "guiComboBox")?;
+        let action = unsafe { raylib_sys::GuiComboBox(bounds, text.as_ptr(), &mut active) };
+        pair(action, Value::Number(active as f64))
+    }
+
+    fn gui_dropdown_box(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiDropdownBox")?;
+        let text = text_arg(args, 4, "guiDropdownBox")?;
+        let mut active = int_arg(args, 5, "guiDropdownBox")?;
+        let edit_mode = bool_arg(args, 6, "guiDropdownBox")?;
+        let action =
+            unsafe { raylib_sys::GuiDropdownBox(bounds, text.as_ptr(), &mut active, edit_mode) };
+        pair(action, Value::Number(active as f64))
+    }
+
+    fn gui_text_box(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiTextBox")?;
+        // raygui edits the buffer in place and needs headroom past the
+        // current contents, so copy the JS string out with spare capacity
+        // (at least 256 bytes) and read the result back after the call.
+        let initial = match args.get(4).map(Value::kind) {
+            Some(ValueKind::String(text)) => text.to_string_lossy(),
+            _ => return Err(expected("guiTextBox", 4, "a string")),
+        };
+        let mut buffer = CString::new(initial.as_bytes())
+            .map_err(|_| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "rl.guiTextBox: argument 4 contains a NUL byte".into(),
+                )
+            })?
+            .into_bytes_with_nul();
+        let capacity = buffer.len().max(256);
+        buffer.resize(capacity, 0);
+        let edit_mode = bool_arg(args, 5, "guiTextBox")?;
+        let action = unsafe {
+            raylib_sys::GuiTextBox(
+                bounds,
+                buffer.as_mut_ptr() as *mut std::ffi::c_char,
+                capacity as i32,
+                edit_mode,
+            )
+        };
+        // SAFETY: raygui keeps the buffer NUL-terminated after every edit.
+        let edited =
+            unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr() as *const std::ffi::c_char) }
+                .to_string_lossy()
+                .into_owned();
+        pair(
+            action,
+            Value::String(Handle::new(JsString::from_utf8(&edited))),
+        )
+    }
+
+    fn gui_color_picker(args: &[Value]) -> Result<Value, JsError> {
+        let bounds = bounds(args, "guiColorPicker")?;
+        let text = text_arg(args, 4, "guiColorPicker")?;
+        let mut color = color_arg(args, 5, "guiColorPicker")?;
+        let action = unsafe { raylib_sys::GuiColorPicker(bounds, text.as_ptr(), &mut color) };
+        pair(action, to_js_color(color))
+    }
+
+    /// Install the `rl.gui*` methods and constants on the `rl` namespace.
+    pub(super) fn install(rl: &CruxObject) -> Result<(), JsError> {
+        for (name, arity, body) in [
+            (
+                "guiEnable",
+                0u64,
+                gui_enable as fn(&[Value]) -> Result<Value, JsError>,
+            ),
+            ("guiDisable", 0, gui_disable),
+            ("guiLock", 0, gui_lock),
+            ("guiUnlock", 0, gui_unlock),
+            ("guiIsLocked", 0, gui_is_locked),
+            ("guiSetAlpha", 1, gui_set_alpha),
+            ("guiSetState", 1, gui_set_state),
+            ("guiGetState", 0, gui_get_state),
+            ("guiLoadStyleDefault", 0, gui_load_style_default),
+            ("guiWindowBox", 5, gui_window_box),
+            ("guiGroupBox", 5, gui_group_box),
+            ("guiLine", 5, gui_line),
+            ("guiPanel", 5, gui_panel),
+            ("guiLabel", 5, gui_label),
+            ("guiButton", 5, gui_button),
+            ("guiLabelButton", 5, gui_label_button),
+            ("guiStatusBar", 5, gui_status_bar),
+            ("guiDummyRec", 5, gui_dummy_rec),
+            ("guiMessageBox", 7, gui_message_box),
+            ("guiToggle", 6, gui_toggle),
+            ("guiCheckBox", 6, gui_check_box),
+            ("guiSlider", 9, gui_slider),
+            ("guiSliderBar", 9, gui_slider_bar),
+            ("guiProgressBar", 9, gui_progress_bar),
+            ("guiComboBox", 6, gui_combo_box),
+            ("guiDropdownBox", 7, gui_dropdown_box),
+            ("guiTextBox", 6, gui_text_box),
+            ("guiColorPicker", 6, gui_color_picker),
+        ] {
+            define(rl, name, window_method(name, arity, body)?)?;
+        }
+        for (name, state) in GUI_STATES {
+            rl.create_data_property_or_throw(
+                &JsString::from_utf8(name),
+                Value::Number(*state as f64),
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Install the `rl` namespace on the current realm's global object.
 pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
     // Bind the window thread to the *first* installer. A later install on
@@ -941,6 +1339,9 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         define(&rl, name, window_method(name, arity, body)?)?;
     }
     define(&rl, "color", plain_method("color", 3, color)?)?;
+
+    #[cfg(feature = "raygui")]
+    gui::install(&rl)?;
 
     // raylib's palette; `a` occupies the low byte so the packed form reads
     // `0xRRGGBBAA` in hex.
@@ -1050,5 +1451,34 @@ mod tests {
         assert!(error.contains("rl.color"), "{error}");
         assert!(error.contains("argument 0"), "{error}");
         assert!(error.contains("0..=255"), "{error}");
+    }
+
+    #[cfg(feature = "raygui")]
+    #[test]
+    fn installs_the_raygui_surface_when_the_feature_is_on() {
+        let mut context = Context::new().unwrap();
+        context.install_raylib().unwrap();
+
+        // Controls are installed as `rl.gui*` methods; only their shape is
+        // checked here — drawing them needs a live window.
+        assert_eq!(
+            context
+                .eval("typeof rl.guiButton === 'function' && typeof rl.guiSlider === 'function'")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context.eval("rl.GUI_STATE_DISABLED").unwrap().as_number(),
+            Some(3.0)
+        );
+        // States outside the enum are rejected instead of letting raygui
+        // index its style arrays out of bounds on a later draw.
+        let error = match context.eval("rl.guiSetState(7)") {
+            Ok(_) => panic!("rl.guiSetState with an out-of-range state must throw"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rl.guiSetState"), "{error}");
+        assert!(error.contains("GUI_STATE"), "{error}");
     }
 }

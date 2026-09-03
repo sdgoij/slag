@@ -74,7 +74,8 @@ The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
 and `--bench`; `--jit` runs certified bodies through the experimental
 Cranelift JIT and `--jit-bench` times JIT vs interpreter. Building the
 CLI with the `raylib` feature exposes the `rl` host module to every
-script (`cargo run -p cli --features raylib -- game.js`). The
+script (`cargo run -p cli --features raylib -- game.js`); add `raygui`
+(`--features raylib,raygui`) to also get raygui's controls as `rl.gui*`. The
 `--stack-size`, `--max-old-space`, and `--harmony-*` knobs are accepted
 for compatibility (no-ops for now).
 
@@ -116,7 +117,9 @@ surface to scripts as the `rl` global: window control, `beginDrawing`/
 `draw*`/`endDrawing` 2D primitives, a small 3D surface
 (`beginMode3D`/`drawCube`/`drawGrid`, needs raylib's `rmodels` module),
 input queries, plus raylib's palette and key/mouse
-constants. A script owns the whole render loop, exactly like a raylib C
+constants. Building with `raygui` as well (`--features raylib,raygui`)
+additionally installs raygui's immediate-mode controls (`rl.guiButton`,
+`rl.guiSlider`, ...) for UI inside the render loop. A script owns the whole render loop, exactly like a raylib C
 example — `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...;
 rl.endDrawing(); }`. raylib's window state is bound to the thread that
 installed the module; calls from worker agents throw a clean `TypeError`
@@ -125,6 +128,7 @@ instead of racing it.
 ```sh
 cargo run -p slag --example raylib_demo --features slag/raylib
 cargo run -p slag --example raylib_voxel --features slag/raylib,slag/jit   # first-person voxel sandbox
+cargo run -p slag --example raygui_demo --features slag/raygui            # raygui control panel (also needs a display)
 cargo run -p cli --features raylib -- game.js
 ```
 

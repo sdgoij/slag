@@ -20,3 +20,6 @@ fs = ["runtime/fs"]
 # The raylib host module (`rl.*`); compiles raylib's C library (needs a
 # display). See `crates/runtime/src/raylib.rs`.
 raylib = ["runtime/raylib"]
+# The raygui control set (`rl.gui*`), a separate opt-in on top of `raylib`;
+# implies it so the host module is actually installed.
+raygui = ["raylib", "runtime/raygui"]

@@ -40,3 +40,8 @@ fs = []
 # and links native window/OpenGL code — only meaningful on hosts with a
 # display. See `crates/runtime/src/raylib.rs`.
 raylib = ["dep:raylib-sys"]
+# The raygui control set (`rl.gui*`), on top of `raylib`: compiles raygui's
+# C library (vendored inside raylib-sys) and gates the `Gui*` wrappers in
+# raylib.rs. Implies `raylib`; a raygui build without the window/drawing
+# surface would have nothing to attach controls to.
+raygui = ["raylib", "raylib-sys/raygui"]

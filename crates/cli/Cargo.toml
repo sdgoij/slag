@@ -22,3 +22,6 @@ syntax = { path = "../syntax" }
 # Expose the `rl` host module to scripts: compiles raylib's C library (needs
 # a display); without the feature no `rl` global exists and no flag is needed.
 raylib = ["runtime/raylib"]
+# The raygui control set (`rl.gui*`), a separate opt-in on top of `raylib`;
+# implies it so the `rl` global is installed by the CLI.
+raygui = ["raylib", "runtime/raygui"]

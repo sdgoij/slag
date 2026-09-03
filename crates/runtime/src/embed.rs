@@ -651,7 +651,9 @@ impl Context {
     /// script drives the render loop itself —
     /// `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...; }` —
     /// exactly like a raylib C example. Only compiled with the `raylib`
-    /// feature (it compiles raylib's C library and needs a display). The
+    /// feature (it compiles raylib's C library and needs a display); with
+    /// the additional `raygui` feature the same install also exposes
+    /// raygui's controls as `rl.gui*`. The
     /// window state is bound to the installing thread, so calls from worker
     /// agents throw instead of racing raylib's global state.
     #[cfg(feature = "raylib")]
