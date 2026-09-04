@@ -4246,6 +4246,55 @@ Next: register the keyed module's handlers O(1) (candidate (c), now the
 row floor), and extend the index to WeakMap/WeakSet only behind a
 measured probe (their compaction interplay is real work).
 
+### Keyed builtins register O(1): Map/Set/WeakMap/WeakSet skip their dispatch chain (measured 2026-09-04)
+
+Candidate (c) lands for the keyed module. The index landing's residual
+per-call cost (Map.get ~1.9µs, Set.has ~5µs — Set.has's arm sat ~40
+`intrinsics.get` calls into the module chain) was the keyed
+`dispatch_call` linear identity chain, exactly the cost 4.2's
+`handler_for` registration removes for String/Number/Boolean/BigInt:
+every arm allocates a JsString and hash-looks-up the intrinsic.
+`keyed::handler_for` now maps each `Intrinsics::define`'d keyed function
+(Map/Set/WeakMap/WeakSet methods, the statics, the size/species getters,
+and the two iterator `next`s) to the named `(agent, this, args)` handler
+the chain already calls — the four constructors register their
+call-without-new TypeError, and their `new` path keeps
+`dispatch_construct` (a construct cannot be a warm call-by-id dispatch).
+Realm.rs wires the module into the `define` chain, so install registers
+every id; a warm `m.get`/`s.has` call dispatches through
+`builtin_handler(id)` in O(1). The chain stays for anything unregistered
+(the `%Set.prototype.keys%` alias, prototype patches, cross-realm
+function objects).
+
+**Measurement** (fresh release builds of parent `3cd5c9b` — the index
+landing — + probe rows vs this tree, 200k-call rows, both engines):
+
+| row | index-only (3cd5c9b) | + registration |
+|---|---|---|
+| Map.get (1024-entry) | ~356ms (~1.78µs/call) | ~45.6ms (~228ns/call) |
+| Map.set (1024-entry) | ~513ms (~2.6µs/call) | ~44.3ms (~221ns/call) |
+| Set.has (1024-entry) | ~891ms (~4.45µs/call) | ~48.9ms (~244ns/call) |
+| Map delete+set churn (1024 live) | ~770ms (~3.9µs/iter) | ~94ms (~470ns/iter) |
+
+~7.8x / ~11.6x / ~18x / ~8x. Set.has's late chain arm collapses to
+Map.get's cost (~244ns vs ~228ns/call), confirming the residual was the
+chain position; the keyed row floor is now the registered-call floor
+(the (c) probe's registered charCodeAt ~350ns), not a scan or a chain.
+The JIT column matches (the compiled loop's native calls route through
+the same O(1) dispatch).
+
+**Gates**: clippy clean; `cargo test --workspace` green (new
+`keyed_builtins_dispatch_via_registered_handlers` pinning the
+registered handlers behave exactly like the chain arms — results,
+receiver TypeErrors, constructor-without-new, getOrInsert/groupBy,
+set-methods, iterator pairs, and prototype-patch liveness); the three
+release sweeps at baseline (language 23721/3 skip, built-ins 23657/155
+skip, annexB 1086/1086, zero fail/crash/hang). Next: the same
+registration for the remaining agent-dependent modules is bounded by
+their measured hotness — the (c) probe's residual was Object's (its
+`dispatch_call` arms are inline closures, so registration needs a
+named-handler refactor first) and DataView's; extend per probe.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

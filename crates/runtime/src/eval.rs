@@ -5447,6 +5447,69 @@ mod tests {
     }
 
     #[test]
+    fn keyed_builtins_dispatch_via_registered_handlers() {
+        // The Map/Set/WeakMap/WeakSet members used to scan the keyed module's
+        // ~55-intrinsic identity chain per warm call (each `intrinsics.get`
+        // arm allocates a JsString + hash-lookup; Set.has's late arm measured
+        // ~5µs/call, the index landing's residual). `keyed::handler_for` now
+        // registers every method in the O(1) per-function-id table at define
+        // time. These asserts pin that the registered handlers behave exactly
+        // like the chain arms they replace: results, receiver validation,
+        // constructor-call errors, iteration, and the set-methods.
+        let text = |src: &str| -> String {
+            match run(src).unwrap().kind() {
+                ValueKind::String(s) => s.to_string_lossy(),
+                other => panic!("expected a string, got {other:?}"),
+            }
+        };
+        // Map get/has/set/delete/size/clear through the handlers.
+        assert_eq!(
+            text(
+                "(function(){ var m = new Map(); m.set('a', 1).set('b', 2); var r = m.get('a') + ':' + m.has('b') + ':' + m.size; m.delete('a'); m.set('c', 3); m.clear(); return r + ':' + m.size; })()"
+            ),
+            "1:true:2:0"
+        );
+        // Map iteration (keys/values/entries + the iterator next handlers)
+        // and getOrInsert / groupBy statics.
+        assert_eq!(
+            text(
+                "(function(){ var m = new Map([['a', 1], ['b', 2]]); var out = []; for (var e of m) out.push(e.join(':')); var g = Map.groupBy([1, 2, 3], function (v) { return v % 2; }); return out.join(',') + '|' + g.get(1) + '|' + m.getOrInsert('a', 9); })()"
+            ),
+            "a:1,b:2|1,3|1"
+        );
+        // Set add/has/delete/size and the ES2025 set-methods.
+        assert_eq!(
+            text(
+                "(function(){ var a = new Set([1, 2, 3]); var b = new Set([2, 3, 4]); a.add(4); var u = a.union(b); return a.has(4) + ':' + u.size + ':' + a.intersection(b).size + ':' + a.difference(b).size; })()"
+            ),
+            "true:4:3:1"
+        );
+        // WeakMap/WeakSet handlers, including the non-weak-key TypeError.
+        assert_eq!(
+            text(
+                "(function(){ var wm = new WeakMap(); var ws = new WeakSet(); var o = {}; wm.set(o, 5); ws.add(o); var r = wm.get(o) + ':' + ws.has(o); var e1 = ''; var e2 = ''; try { wm.set(5, 1); } catch (e) { e1 = e.name; } try { ws.add('x'); } catch (e) { e2 = e.name; } return r + ':' + e1 + ':' + e2 + ':' + wm.delete(o) + ':' + ws.delete(o); })()"
+            ),
+            "5:true:TypeError:TypeError:true:true"
+        );
+        // Constructor calls without `new` still throw through the registered
+        // call handlers, and incompatible receivers still throw.
+        assert_eq!(
+            text(
+                "(function(){ var e = []; try { Map(); } catch (x) { e.push(x.name); } try { Set(); } catch (x) { e.push(x.name); } try { WeakMap(); } catch (x) { e.push(x.name); } try { WeakSet(); } catch (x) { e.push(x.name); } try { Map.prototype.get.call({}, 'a'); } catch (x) { e.push(x.name); } return e.join(','); })()"
+            ),
+            "TypeError,TypeError,TypeError,TypeError,TypeError"
+        );
+        // A prototype-patched method is read live and its call goes to the
+        // patch, not the registered intrinsic.
+        assert_eq!(
+            text(
+                "(function(){ var orig = Map.prototype.get; Map.prototype.get = function () { return 7; }; var patched = new Map().get('x'); Map.prototype.get = orig; return patched + ':' + new Map([['a', 1]]).get('a'); })()"
+            ),
+            "7:1"
+        );
+    }
+
+    #[test]
     fn fast_path_annex_b_block_functions() {
         // Cut 6 first slice (Annex B): a block-level function declaration
         // in a sloppy body certifies — the block binding is a frame slot

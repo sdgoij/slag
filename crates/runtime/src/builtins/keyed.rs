@@ -2417,6 +2417,90 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The O(1) dispatch table for the Map/Set/WeakMap/WeakSet members that need
+/// the agent: `Intrinsics::define` registers each builtin function's id
+/// against its native handler so a warm call dispatches by function id
+/// instead of scanning this module's ~55-intrinsic identity chain
+/// (`dispatch_call` below — every arm allocates a JsString and hash-looks-up
+/// the intrinsic). The measured removal: Map.get ~2.9 -> ~1.9µs/call and
+/// Set.has ~5.5 -> ~5.2µs/call were the index landing's residual (perf.md,
+/// 2026-09-04); the chain cost is the rest. See the String `handler_for`
+/// note (4.2) for the shared pattern. Every arm here is the named
+/// `(agent, this, args)` handler the chain already calls; the four
+/// constructors register their call-without-new TypeError (their construct
+/// path keeps `dispatch_construct` — `new` cannot be a warm call-by-id
+/// dispatch).
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        MAP => Some(|_, _, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "Map constructor cannot be called without 'new'".into(),
+            ))
+        }),
+        SET => Some(|_, _, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "Set constructor cannot be called without 'new'".into(),
+            ))
+        }),
+        WEAK_MAP => Some(|_, _, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "WeakMap constructor cannot be called without 'new'".into(),
+            ))
+        }),
+        WEAK_SET => Some(|_, _, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "WeakSet constructor cannot be called without 'new'".into(),
+            ))
+        }),
+        MAP_GROUP_BY => Some(map_group_by),
+        MAP_CLEAR => Some(map_clear),
+        MAP_DELETE => Some(map_delete),
+        MAP_ENTRIES => Some(map_entries),
+        MAP_FOR_EACH => Some(map_for_each),
+        MAP_GET => Some(map_get),
+        MAP_GET_OR_INSERT => Some(map_get_or_insert),
+        MAP_GET_OR_INSERT_COMPUTED => Some(map_get_or_insert_computed),
+        MAP_HAS => Some(map_has),
+        MAP_KEYS => Some(map_keys),
+        MAP_SET => Some(map_set),
+        MAP_VALUES => Some(map_values),
+        MAP_SIZE => Some(map_size),
+        MAP_SPECIES => Some(species_getter),
+        MAP_ITERATOR_NEXT => Some(map_iterator_next),
+        SET_ADD => Some(set_add),
+        SET_CLEAR => Some(set_clear),
+        SET_DELETE => Some(set_delete),
+        SET_DIFFERENCE => Some(set_difference),
+        SET_ENTRIES => Some(set_entries),
+        SET_FOR_EACH => Some(set_for_each),
+        SET_HAS => Some(set_has),
+        SET_INTERSECTION => Some(set_intersection),
+        SET_IS_DISJOINT_FROM => Some(set_is_disjoint_from),
+        SET_IS_SUBSET_OF => Some(set_is_subset_of),
+        SET_IS_SUPERSET_OF => Some(set_is_superset_of),
+        SET_SYMMETRIC_DIFFERENCE => Some(set_symmetric_difference),
+        SET_UNION => Some(set_union),
+        SET_VALUES => Some(set_values),
+        SET_SIZE => Some(set_size),
+        SET_SPECIES => Some(species_getter),
+        SET_ITERATOR_NEXT => Some(set_iterator_next),
+        WEAK_MAP_DELETE => Some(weak_map_delete),
+        WEAK_MAP_GET => Some(weak_map_get),
+        WEAK_MAP_GET_OR_INSERT => Some(weak_map_get_or_insert),
+        WEAK_MAP_GET_OR_INSERT_COMPUTED => Some(weak_map_get_or_insert_computed),
+        WEAK_MAP_HAS => Some(weak_map_has),
+        WEAK_MAP_SET => Some(weak_map_set),
+        WEAK_SET_ADD => Some(weak_set_add),
+        WEAK_SET_DELETE => Some(weak_set_delete),
+        WEAK_SET_HAS => Some(weak_set_has),
+        _ => None,
+    }
+}
+
 /// Dispatch by intrinsic identity from `runtime::function::call`.
 pub fn dispatch_call(
     agent: &mut Agent,
