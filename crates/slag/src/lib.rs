@@ -102,7 +102,7 @@ mod tests {
             )
             .unwrap();
         context
-            .eval(include_str!("../examples/rlx_demo.js"))
+            .eval_jsx(include_str!("../examples/rlx_demo.jsx"))
             .unwrap();
     }
 }

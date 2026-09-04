@@ -167,6 +167,14 @@ impl Context {
         Ok(JsValue(value))
     }
 
+    /// Like [`Context::eval`], parsing with the JSX extension enabled: JSX
+    /// elements desugar to `rlx.h(...)` calls at parse time.
+    pub fn eval_jsx(&mut self, source: &str) -> Result<JsValue, JsError> {
+        let value = self.agent.run_script_jsx(source)?;
+        self.agent.run_jobs()?;
+        Ok(JsValue(value))
+    }
+
     /// Call a function value with a `this` and arguments, then drain jobs.
     pub fn call(
         &mut self,

@@ -81,6 +81,10 @@ pub struct Parser<'s> {
     /// Parsing a module: `await` is a reserved word, import/export only at
     /// the top level, no Annex B HTML comments.
     pub(crate) in_module: bool,
+    /// JSX extension mode (default off): `<` at an expression start parses a
+    /// JSX element, desugared to an `rlx.h(...)` call at parse time. With
+    /// this off, `<` is only ever the relational/shift operator.
+    pub(crate) jsx: bool,
     /// Module top-level: `await` may be used as an expression.
     pub(crate) top_level_await: bool,
     /// Inside a class method/field/static-block body: `super.x` is legal.
@@ -167,6 +171,7 @@ impl<'s> Parser<'s> {
             in_generator: false,
             in_async: false,
             in_module: false,
+            jsx: false,
             top_level_await: false,
             allow_super: false,
             nt_context: false,

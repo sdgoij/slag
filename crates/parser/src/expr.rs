@@ -329,7 +329,8 @@ fn parse_yield(parser: &mut Parser, allow_in: bool) -> Result<Expr, JsError> {
             },
         });
     }
-    if can_start_expression(parser.peek()?.kind.clone()) {
+    let next_kind = parser.peek()?.kind.clone();
+    if can_start_expression_for(parser, next_kind) {
         let argument = parse_assignment(parser, allow_in)?;
         let end = argument.span.end;
         return Ok(Expr {
@@ -390,6 +391,13 @@ pub(crate) fn can_start_expression(kind: TokenKind) -> bool {
         | TokenKind::MinusMinus => true,
         _ => false,
     }
+}
+
+/// Whether a token can begin an expression, extended for JSX mode: a `<`
+/// starts a JSX element there (used after `yield`/`return`/`throw`, where
+/// the decision is made before falling into the expression parser).
+pub(crate) fn can_start_expression_for(parser: &Parser, kind: TokenKind) -> bool {
+    (parser.jsx && kind == TokenKind::LessThan) || can_start_expression(kind)
 }
 
 /// `ConditionalExpression` (spec 13.14).
@@ -1161,6 +1169,9 @@ fn is_legacy_octal_literal(raw: Vec<u16>) -> bool {
 
 /// `PrimaryExpression` (spec 13.2).
 fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
+    if parser.jsx && parser.at_punct(TokenKind::LessThan)? {
+        return crate::jsx::parse_element(parser);
+    }
     let tok = parser.peek()?.clone();
     match tok.kind {
         TokenKind::Identifier(_) if tok.escaped => {

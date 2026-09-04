@@ -1,15 +1,11 @@
-// The Slag × rlx demo (slice 1): retained state and events on top of the
-// declarative layer. One root component owns the whole scene: useState feeds
-// the controls, useRef holds the ball's physics (advanced every frame), and
-// onChange/onClick handlers written inside the component write state back,
-// so the next frame renders with the new values. Slice 1 keeps the raygui
-// controls *controlled*: a slider/checkbox/textbox is fed from state and
-// adopts its update in onChange (typing reports value changes even when the
-// control's action flag is 0, which is why onChange also fires then).
+// The Slag × rlx demo, authored in JSX. JSX elements desugar to rlx.h(...)
+// calls at parse time, so the tree the reconciler sees is identical to an
+// h()-built one. The parser gate is opt-in: the host evaluates this file
+// with Context::eval_jsx.
 //
-// The canvas is drawn through the same op pipeline: rlx.draw is wrapped to
-// add canvas/ball/caption ops, while the stock backend still handles the
-// raygui controls.
+// Text children are raw JSXText (scanned, then Babel-cleaned); a capitalized
+// element like <Column> is a component reference, lowercase names are
+// intrinsics.
 
 const WIDTH = 960;
 const HEIGHT = 560;
@@ -27,8 +23,9 @@ function rainbowColor(hue) {
 }
 
 // Layout component: stack element children down the column, inheriting
-// x/width and giving each its declared height plus a gap.
-function column(props) {
+// x/width and giving each its declared height plus a gap. It lays children
+// out programmatically, so it still builds rows with rlx.h internally.
+function Column(props) {
     const gap = props.gap !== undefined ? props.gap : 14;
     const children = props.children === undefined ? [] :
         (Array.isArray(props.children) ? props.children : [props.children]);
@@ -48,7 +45,7 @@ function column(props) {
     return rows;
 }
 
-// The root component: state + physics + the whole frame's op tree.
+// The root component: state + physics + the whole frame's JSX tree.
 function Demo(props) {
     const speed = rlx.useState(180);
     const radius = rlx.useState(10);
@@ -88,62 +85,35 @@ function Demo(props) {
     }
 
     return [
-        // The canvas (custom ops handled by the wrapped rlx.draw below).
-        rlx.h("canvas", { x: 0, y: 0, width: PANEL - 8, height: HEIGHT, color: rl.color(24, 26, 38, 255) }),
-        rlx.h("ball", { x: ball.current.x, y: ball.current.y, radius: radius[0], color: color }),
-        rlx.h("caption", { x: 16, y: 14, size: 20, color: rl.RAYWHITE }, caption[0] + " — drag, toggle, type"),
+        <canvas x={0} y={0} width={PANEL - 8} height={HEIGHT} color={rl.color(24, 26, 38, 255)} />,
+        <ball x={ball.current.x} y={ball.current.y} radius={radius[0]} color={color} />,
+        <caption x={16} y={14} size={20} color={rl.RAYWHITE}>{caption[0] + " — drag, toggle, type"}</caption>,
 
-        // The settings panel.
-        rlx.h("panel", { x: PANEL - 8, y: 8, width: WIDTH - PANEL + 8, height: HEIGHT - 40 }),
-        rlx.h(column, { x: X, y: 32, width: CW, gap: 12 },
-            rlx.h("label", { height: 18 }, "Settings (controlled)"),
-            rlx.h("slider", {
-                height: 24,
-                value: speed[0],
-                min: 0,
-                max: 400,
-                left: String(Math.round(speed[0])),
-                right: "400",
-                onChange: function (event) { speed[1](event.value); },
-            }),
-            rlx.h("slider", {
-                height: 24,
-                value: radius[0],
-                min: 4,
-                max: 40,
-                left: String(radius[0]),
-                right: "40",
-                onChange: function (event) { radius[1](Math.round(event.value)); },
-            }),
-            rlx.h("checkbox", {
-                height: 24,
-                checked: rainbow[0],
-                onChange: function (event) { rainbow[1](event.value); },
-            }, "rainbow ball"),
-            rlx.h("toggle", {
-                height: 24,
-                active: paused[0],
-                onChange: function (event) { paused[1](event.value); },
-            }, "pause"),
-            rlx.h("label", { height: 16 }, "caption (click to edit, Enter to commit)"),
-            rlx.h("textbox", {
-                height: 24,
-                value: caption[0],
-                edit: editing[0],
-                onChange: function (event) {
+        <panel x={PANEL - 8} y={8} width={WIDTH - PANEL + 8} height={HEIGHT - 40} />,
+        <Column x={X} y={32} width={CW} gap={12}>
+            <label height={18}>Settings (controlled)</label>
+            <slider height={24} value={speed[0]} min={0} max={400}
+                left={String(Math.round(speed[0]))} right={"400"}
+                onChange={function (event) { speed[1](event.value); }} />
+            <slider height={24} value={radius[0]} min={4} max={40}
+                left={String(radius[0])} right={"40"}
+                onChange={function (event) { radius[1](Math.round(event.value)); }} />
+            <checkbox height={24} checked={rainbow[0]}
+                onChange={function (event) { rainbow[1](event.value); }}>rainbow ball</checkbox>
+            <toggle height={24} active={paused[0]}
+                onChange={function (event) { paused[1](event.value); }}>pause</toggle>
+            <label height={16}>caption (click to edit, Enter to commit)</label>
+            <textbox height={24} value={caption[0]} edit={editing[0]}
+                onChange={function (event) {
                     caption[1](event.value);
                     if (event.action) editing[1](function (prev) { return !prev; });
-                },
-            }),
-            rlx.h("button", { height: 28, onClick: resetAll }, "Reset"),
-        ),
-        rlx.h("status", {
-            x: 0,
-            y: HEIGHT - 24,
-            width: WIDTH,
-            height: 24,
-        }, "fps " + rl.getFPS() + "  •  ball at " + Math.round(ball.current.x) + "," +
-            Math.round(ball.current.y) + "  •  " + caption[0]),
+                }} />
+            <button height={28} onClick={resetAll}>Reset</button>
+        </Column>,
+        <status x={0} y={HEIGHT - 24} width={WIDTH} height={24}>
+            {"fps " + rl.getFPS() + "  •  ball at " + Math.round(ball.current.x) + "," +
+                Math.round(ball.current.y) + "  •  " + caption[0]}
+        </status>,
     ];
 }
 
@@ -165,7 +135,7 @@ rlx.draw = function (op) {
     }
 };
 
-rl.initWindow(WIDTH, HEIGHT, "rlx declarative layer (slice 1)");
+rl.initWindow(WIDTH, HEIGHT, "rlx declarative layer (JSX)");
 rl.setTargetFPS(60);
 
 let frame = 0;
@@ -176,7 +146,7 @@ while (!rl.windowShouldClose()) {
 
     rl.beginDrawing();
     rl.clearBackground(rl.BLACK);
-    rlx.present(rlx.h(Demo, { dt: dt, t: t }));
+    rlx.present(<Demo dt={dt} t={t} />);
     rl.endDrawing();
 }
 

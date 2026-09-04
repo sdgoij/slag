@@ -291,7 +291,7 @@ pub struct Agent {
     pub(crate) compiled_bodies:
         std::collections::HashMap<usize, crate::function::CompiledBodyCacheEntry>,
     /// Per-source compiled SCRIPT/EVAL bodies, keyed by the exact
-    /// source text + (strict, fast_script). `run_script`/`perform_eval`
+    /// source text + (strict, fast_script, jsx). `run_script`/`perform_eval`
     /// re-parse the same source into a fresh AST each call, so without this
     /// the `compile_statements` IR (and the JIT machine code via the
     /// per-body `jit_info` fast pointer) recompiled on every re-evaluation —
@@ -301,9 +301,11 @@ pub struct Agent {
     /// declaration instantiation and env setup stay per-eval — and the
     /// cache is traced like `compiled_bodies` so the literal `Value`s stay
     /// rooted. Entries live for the agent's life (scripts/eval sites are
-    /// rare and small; consistent with the function caches).
+    /// rare and small; consistent with the function caches). The `jsx` bit is
+    /// part of the key because JSX source desugars to a different program
+    /// than the same text parsed without the extension.
     pub(crate) script_bodies: std::collections::HashMap<
-        (crux::JsString, bool, bool),
+        (crux::JsString, bool, bool, bool),
         std::rc::Rc<crate::ir::CompiledBody>,
     >,
     /// The Promise Records keyed by promise-object identity (spec 27.2.1).
@@ -1031,12 +1033,26 @@ impl Agent {
     /// Parse and evaluate a Script (spec 16.1.4-16.1.6) in the current
     /// realm, returning the script's completion value.
     pub fn run_script(&mut self, source: &str) -> Result<Value, JsError> {
+        self.run_script_mode(source, false)
+    }
+
+    /// Like [`Agent::run_script`], parsing with the JSX extension enabled:
+    /// JSX elements desugar to `rlx.h(...)` calls at parse time.
+    pub fn run_script_jsx(&mut self, source: &str) -> Result<Value, JsError> {
+        self.run_script_mode(source, true)
+    }
+
+    fn run_script_mode(&mut self, source: &str, jsx: bool) -> Result<Value, JsError> {
         crux::function::with_agent(self as *mut Agent as *mut (), || {
             // GC-5: a fresh script is a fresh execution unit — the safe-point
             // allocation budget must not leak in from the previous script.
             crux::heap::reset_allocation_budget();
             let realm = self.current_realm()?;
-            let script = crate::script::parse_script(source, realm)?;
+            let script = if jsx {
+                crate::script::parse_script_jsx(source, realm)?
+            } else {
+                crate::script::parse_script(source, realm)?
+            };
             let result = crate::script::script_evaluation(self, &script);
             // GC-1 slice 3: a script boundary with no pending jobs is a
             // quiescent point — every live value is reachable from the

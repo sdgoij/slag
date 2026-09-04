@@ -38,6 +38,16 @@ mod tests {
         );
     }
 
+    /// Like `assert_eval_true`, through the JSX-eval goal.
+    fn assert_jsx_true(context: &mut Context, source: &str) {
+        let value = context.eval_jsx(source).unwrap();
+        assert_eq!(
+            value.as_boolean(),
+            Some(true),
+            "expected `true` from (jsx): {source}"
+        );
+    }
+
     #[test]
     fn installs_the_rlx_helpers() {
         let mut context = Context::new().unwrap();
@@ -103,6 +113,83 @@ mod tests {
             &mut context,
             "(() => { try { rlx.draw({ type: 'label', props: {}, text: '' }); return false; } \
              catch (error) { return error instanceof Error && error.message.indexOf('rl host module') !== -1; } })()",
+        );
+    }
+
+    #[test]
+    fn eval_jsx_desugars_elements_into_rlx_calls() {
+        let mut context = Context::new().unwrap();
+        context.install_rlx().unwrap();
+        // JSX elements become rlx.h(...) calls through the whole
+        // parse → compile → run path.
+        assert_jsx_true(
+            &mut context,
+            "(() => { const ops = rlx.render(<button x={10} y={20}>Go</button>); \
+             return ops.length === 1 && ops[0].type === 'button' && ops[0].text === 'Go' && \
+             ops[0].props.x === 10 && ops[0].props.y === 20 && ops[0].path === '0'; })()",
+        );
+        // Components and nested elements flow through too.
+        assert_jsx_true(
+            &mut context,
+            "(() => { function Demo() { return <panel>hi<label>nested</label></panel>; } \
+             const ops = rlx.render(<Demo/>); \
+             return ops.length === 2 && ops[0].text === 'hi' && ops[1].text === 'nested'; })()",
+        );
+        // The default eval goal still rejects the same text: JSX is opt-in.
+        let error = match context.eval("const v = <button/>;") {
+            Ok(_) => panic!("plain eval must reject JSX"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("unexpected") || error.contains("Unexpected"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn jsx_text_children_render_cleaned_text() {
+        let mut context = Context::new().unwrap();
+        context.install_rlx().unwrap();
+        // Raw JSXText is scanned (never tokenized), so comment-like text
+        // survives, and Babel-style whitespace cleaning applies.
+        assert_jsx_true(
+            &mut context,
+            "rlx.render(<box>50% off // sale</box>)[0].text === '50% off // sale'",
+        );
+        assert_jsx_true(
+            &mut context,
+            "rlx.render(<label>say \"hi\"</label>)[0].text === 'say \"hi\"'",
+        );
+        // Indented lines between elements collapse; in-line spaces survive.
+        assert_jsx_true(
+            &mut context,
+            "(() => { const ops = rlx.render(<box>\n    hello\n    <b>world</b>\n  </box>); \
+             return ops[0].text === 'hello' && ops[1].text === 'world'; })()",
+        );
+        assert_jsx_true(&mut context, "rlx.render(<box>a</box>)[0].text === 'a'");
+    }
+
+    #[test]
+    fn jsx_fragments_and_spreads_run() {
+        let mut context = Context::new().unwrap();
+        context.install_rlx().unwrap();
+        // A fragment (array) flattens into sibling ops.
+        assert_jsx_true(
+            &mut context,
+            "(() => { const ops = rlx.render(<><label>a</label><label>b</label></>); \
+             return ops.length === 2 && ops[0].text === 'a' && ops[1].text === 'b'; })()",
+        );
+        // Spread attributes merge into props.
+        assert_jsx_true(
+            &mut context,
+            "rlx.render(<box {...{x: 1}} y={2}/>)[0].props.x === 1 && \
+             rlx.render(<box {...{x: 1}} y={2}/>)[0].props.y === 2",
+        );
+        // Dashed tags/attributes and namespaced names desugar to strings.
+        assert_jsx_true(
+            &mut context,
+            "(() => { const op = rlx.render(<my-box data-id=\"7\">x</my-box>)[0]; \
+             return op.type === 'my-box' && op.props['data-id'] === '7' && op.text === 'x'; })()",
         );
     }
 

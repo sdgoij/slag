@@ -72,7 +72,9 @@ The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
 `readdirSync`/`statSync`) to scripts, and accepts `--dump-ast`,
 `--dump-tokens`, `--print-bytecode` (dump the compiled `Step` stream),
 and `--bench`; `--jit` runs certified bodies through the experimental
-Cranelift JIT and `--jit-bench` times JIT vs interpreter. Building the
+Cranelift JIT and `--jit-bench` times JIT vs interpreter. `--jsx` parses
+the input with the opt-in JSX extension (`<element/>` syntax desugaring to
+`rlx.h(...)` calls). Building the
 CLI with the `raylib` feature exposes the `rl` host module to every
 script (`cargo run -p cli --features raylib -- game.js`); add `raygui`
 (`--features raylib,raygui`) to also get raygui's controls as `rl.gui*`. The
@@ -112,7 +114,9 @@ println!("{doubled}"); // 42
 UI, `Context::install_rlx` installs a small virtual-element layer — `rlx.h`
 trees driven frame-by-frame with `rlx.present`, retained per-path state via
 `rlx.useState`, and control events dispatched to `onClick`/`onChange` —
-that can sit on top of the raylib surface below.
+that can sit on top of the raylib surface below. `Context::eval_jsx` parses
+scripts with the opt-in JSX extension, which desugars `<element/>` syntax to
+`rlx.h(...)` calls.
 
 ### The `rl` host module
 
@@ -133,7 +137,7 @@ instead of racing it.
 cargo run -p slag --example raylib_demo --features slag/raylib
 cargo run -p slag --example raylib_voxel --features slag/raylib,slag/jit   # first-person voxel sandbox
 cargo run -p slag --example raygui_demo --features slag/raygui            # raygui control panel (also needs a display)
-cargo run -p slag --example rlx_demo --features slag/raygui              # declarative rlx.h() UI with state + events
+cargo run -p slag --example rlx_demo --features slag/raygui              # declarative JSX UI (rlx layer, state + events)
 cargo run -p cli --features raylib -- game.js
 ```
 

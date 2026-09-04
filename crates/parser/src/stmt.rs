@@ -7,7 +7,7 @@ use syntax::{
     TokenKind, VarDeclKind, VarDeclarator,
 };
 
-use crate::expr::{can_start_expression, parse_assignment, parse_expression};
+use crate::expr::{can_start_expression_for, parse_assignment, parse_expression};
 use crate::parser::Parser;
 
 /// Parses statements until the terminator token or EOF. `var` names
@@ -970,9 +970,10 @@ fn parse_return(parser: &mut Parser) -> Result<Stmt, JsError> {
             "Illegal return statement in a class static initialization block",
         ));
     }
+    let next_kind = parser.peek()?.kind.clone();
     let argument = if parser.peek()?.line_break_before {
         None
-    } else if can_start_expression(parser.peek()?.kind.clone()) {
+    } else if can_start_expression_for(parser, next_kind) {
         Some(parse_expression(parser, true)?)
     } else {
         None

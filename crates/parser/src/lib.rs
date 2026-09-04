@@ -7,6 +7,7 @@
 mod class;
 mod early_errors;
 mod expr;
+mod jsx;
 mod module;
 mod parser;
 mod stmt;
@@ -25,6 +26,20 @@ pub fn parse_script(source: &str) -> Result<Program, JsError> {
         false,
         None,
         &[],
+        false,
+    )
+}
+
+/// Parses a Script with the JSX extension enabled (`jsx` in the parser):
+/// JSX elements are desugared into `rlx.h(...)` calls. Spec parsing is
+/// untouched — without this entry point `<` stays a relational operator.
+pub fn parse_script_jsx(source: &str) -> Result<Program, JsError> {
+    parse_script_units(
+        &source.encode_utf16().collect::<Vec<u16>>(),
+        false,
+        None,
+        &[],
+        true,
     )
 }
 
@@ -35,7 +50,7 @@ pub fn parse_script(source: &str) -> Result<Program, JsError> {
 /// `'use strict';` prefix, which would otherwise push a leading hashbang off
 /// the first position.
 pub fn parse_script_utf16(units: &[u16]) -> Result<Program, JsError> {
-    parse_script_units(units, true, None, &[])
+    parse_script_units(units, true, None, &[], false)
 }
 
 /// The eval-caller context that relaxes the Script early errors for a direct
@@ -62,7 +77,7 @@ pub fn parse_script_utf16_eval(
     eval: &EvalContext,
     caller_private_names: &[crux::AtomId],
 ) -> Result<Program, JsError> {
-    parse_script_units(units, true, Some(*eval), caller_private_names)
+    parse_script_units(units, true, Some(*eval), caller_private_names, false)
 }
 
 fn parse_script_units(
@@ -70,9 +85,11 @@ fn parse_script_units(
     allow_hashbang_after_directives: bool,
     eval: Option<EvalContext>,
     caller_private_names: &[crux::AtomId],
+    jsx: bool,
 ) -> Result<Program, JsError> {
     let source = SourceText::from_utf16(units.to_vec());
     let mut parser = Parser::new(&source, true, allow_hashbang_after_directives);
+    parser.jsx = jsx;
     if let Some(eval) = eval {
         // The eval goal inherits the caller's function/method context: the
         // Script early errors for `new.target`/`super` are relaxed, and a

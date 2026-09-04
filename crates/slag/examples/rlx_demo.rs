@@ -1,7 +1,8 @@
 //! Drive a windowed declarative-UI demo from a Slag script: install the `rl`
 //! host module (raylib + raygui controls) plus the pure-JS `rlx` layer, and
-//! let a Slag script describe a control tree with `rlx.h()` which `rlx.render`
-//! turns into draw ops for `rlx.draw` each frame (see `rlx_demo.js`).
+//! let a Slag script describe a control tree in JSX (see `rlx_demo.jsx`),
+//! which the parser desugars to `rlx.h(...)` calls for `rlx.present` to
+//! render and draw each frame.
 //!
 //! Run: `cargo run -p slag --example rlx_demo --features slag/raygui`
 //!      (add `jit` to run the loop's JS through the Cranelift JIT:
@@ -29,6 +30,6 @@ fn run_demo() {
     slag::install_jit(&mut context).unwrap();
     context.install_raylib().unwrap();
     context.install_rlx().unwrap();
-    context.eval(include_str!("rlx_demo.js")).unwrap();
+    context.eval_jsx(include_str!("rlx_demo.jsx")).unwrap();
     println!("demo finished");
 }

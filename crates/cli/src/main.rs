@@ -36,6 +36,7 @@ struct Options {
     gc_stress: bool,
     jit: bool,
     no_jit: bool,
+    jsx: bool,
     stack_size: Option<u64>,
     max_old_space: Option<u64>,
 }
@@ -63,6 +64,7 @@ fn parse(args: &[String]) -> Command {
             "--help" | "-h" => return Command::Help,
             "--dump-ast" => options.dump_ast = true,
             "--dump-tokens" => options.dump_tokens = true,
+            "--jsx" => options.jsx = true,
             "--bench" => options.bench = true,
             "--jit-bench" => options.jit_bench = true,
             "--print-bytecode" => options.print_bytecode = true,
@@ -117,6 +119,7 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --version, -V");
             eprintln!("  --help, -h");
             eprintln!("  --dump-ast, --dump-tokens");
+            eprintln!("  --jsx                     parse the file/input with the JSX extension");
             eprintln!("  --bench");
             eprintln!("  --jit-bench               JIT vs interpreter comparison");
             eprintln!("  --jit                     install the Cranelift JIT hook (default)");
@@ -181,6 +184,11 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
         jit::install(context.agent_mut()).map_err(report)?;
     }
     context.install_fs().map_err(report)?;
+    // JSX desugars to `rlx.h(...)` calls, so the declarative layer is part
+    // of the `--jsx` goal.
+    if options.jsx {
+        context.install_rlx().map_err(report)?;
+    }
     // A raylib-enabled build always exposes the `rl` global; the feature is
     // the gate, and installing the module opens no window until the script
     // itself calls `rl.initWindow`.
@@ -196,7 +204,12 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
         argv.extend(args.iter().cloned());
         context.install_process_argv(&argv).map_err(report)?;
     }
-    match context.eval(source) {
+    let result = if options.jsx {
+        context.eval_jsx(source)
+    } else {
+        context.eval(source)
+    };
+    match result {
         // A script file's completion value is not printed (matching node et
         // al.); the REPL prints its own results.
         Ok(_) => Ok(()),
@@ -272,6 +285,9 @@ fn dump_bytecode(source: &str) -> Result<(), u8> {
 fn repl(options: &Options) -> Result<(), u8> {
     let mut context = Context::new().map_err(report)?;
     context.set_gc_stress(options.gc_stress);
+    if options.jsx {
+        context.install_rlx().map_err(report)?;
+    }
     if options.jit || !options.no_jit {
         jit::install(context.agent_mut()).map_err(report)?;
     }
@@ -305,7 +321,12 @@ fn repl(options: &Options) -> Result<(), u8> {
             continue;
         }
         let source = std::mem::take(&mut buffer);
-        match context.eval(&source) {
+        let result = if options.jsx {
+            context.eval_jsx(&source)
+        } else {
+            context.eval(&source)
+        };
+        match result {
             Ok(value) => {
                 if value.type_name() != "undefined" {
                     println!("{value}");
@@ -700,6 +721,22 @@ mod tests {
             ..Options::default()
         };
         assert_eq!(parse(&["--jit-bench".into()]), Command::Repl(options));
+    }
+
+    #[test]
+    fn jsx_flag_is_recognized() {
+        let options = Options {
+            jsx: true,
+            ..Options::default()
+        };
+        assert_eq!(
+            parse(&["--jsx".into(), "file.jsx".into()]),
+            Command::Run {
+                file: "file.jsx".into(),
+                args: vec![],
+                options,
+            }
+        );
     }
 
     #[test]

@@ -32,17 +32,19 @@ use crate::script::bound_names;
 /// the caller's lexical environment). `source` (Cut 63) keys the per-agent
 /// compiled-body cache — re-evaluating the same source reuses the compiled
 /// IR (the parse still runs; the compile and the JIT machine code do not
-/// repeat). `None` compiles fresh (modules evaluate once).
+/// repeat). `jsx` is part of that key: the same text desugars differently
+/// under the JSX goal. `None` compiles fresh (modules evaluate once).
 pub fn eval_program(
     agent: &mut Agent,
     program: &Program,
     strict: bool,
     fast_script: bool,
+    jsx: bool,
     source: Option<&crux::JsString>,
 ) -> Result<Value, JsError> {
     let body = match source {
         Some(source) => {
-            let key = (source.clone(), strict, fast_script);
+            let key = (source.clone(), strict, fast_script, jsx);
             if let Some(body) = agent.script_bodies.get(&key) {
                 body.clone()
             } else {
@@ -1751,6 +1753,7 @@ mod tests {
             realm,
             code: program,
             source: crux::string::JsString::from_utf8(""),
+            jsx: false,
         });
         let value = crate::script::script_evaluation(&mut agent, &script).unwrap();
         assert_eq!(value, Value::Number(42.0));

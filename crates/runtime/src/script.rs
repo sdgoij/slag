@@ -31,6 +31,10 @@ pub struct ScriptRecord {
     pub code: Program,
     /// The exact source text, for `Function.prototype.toString`.
     pub source: JsString,
+    /// Whether the source was parsed with the JSX extension (`<a/>`
+    /// desugars to `rlx.h("a", …)` calls). Part of the compiled-body cache
+    /// key: the same text parses to a different program under the two goals.
+    pub jsx: bool,
 }
 
 impl Trace for ScriptRecord {
@@ -50,6 +54,23 @@ pub fn parse_script(source: &str, realm: Handle<Realm>) -> Result<Handle<ScriptR
         realm,
         code,
         source: JsString::from_utf8(source),
+        jsx: false,
+    }))
+}
+
+/// Like [`parse_script`], with the JSX extension enabled: JSX elements are
+/// desugared to `rlx.h(...)` calls at parse time.
+pub fn parse_script_jsx(
+    source: &str,
+    realm: Handle<Realm>,
+) -> Result<Handle<ScriptRecord>, JsError> {
+    crate::expr::bump_template_parse_generation();
+    let code = parser::parse_script_jsx(source)?;
+    Ok(Handle::new(ScriptRecord {
+        realm,
+        code,
+        source: JsString::from_utf8(source),
+        jsx: true,
     }))
 }
 
@@ -75,7 +96,14 @@ pub fn script_evaluation(
     let strict = script_is_strict(&script.source, &script.code);
     let result = (|| -> Result<Value, JsError> {
         global_declaration_instantiation(agent, &script.code, &global_env, strict)?;
-        crate::eval::eval_program(agent, &script.code, strict, true, Some(&script.source))
+        crate::eval::eval_program(
+            agent,
+            &script.code,
+            strict,
+            true,
+            script.jsx,
+            Some(&script.source),
+        )
     })();
 
     agent.execution_context_stack.pop();
@@ -830,7 +858,7 @@ pub fn perform_eval(
     agent.execution_context_stack.push(eval_context);
     let result = (|| -> Result<Value, JsError> {
         eval_declaration_instantiation(agent, &program, &variable_env, &lexical_env, strict_eval)?;
-        crate::eval::eval_program(agent, &program, strict_eval, false, Some(source))
+        crate::eval::eval_program(agent, &program, strict_eval, false, false, Some(source))
     })();
     agent.execution_context_stack.pop();
     result

@@ -113,6 +113,16 @@ impl<'s> TokenStream<'s> {
         Ok(&self.buffer[2])
     }
 
+    /// Repositions the lexer to an absolute offset, discarding any buffered
+    /// or peeked tokens. Used by JSX, which scans raw source text between
+    /// elements and realigns the lexer at the next `<`/`{` boundary; the
+    /// lexical goal is recomputed by the next `Parser::peek`.
+    pub(crate) fn seek(&mut self, pos: usize) {
+        self.lexer.set_position(pos);
+        self.buffer.clear();
+        self.starts.clear();
+    }
+
     pub fn next(&mut self) -> Result<Token, JsError> {
         self.peek()?;
         self.starts.pop_front();
