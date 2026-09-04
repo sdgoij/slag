@@ -311,9 +311,25 @@ pub struct JitCallContext {
     /// Cut 58: the working-stack pointer the entry should use on a resume
     /// (the restored region base plus the pushed-resume-value offset).
     pub resume_sp: u64,
-    /// Cut 58: the resume value for the machinery kinds (throw/return).
+    /// The resume value for the machinery kinds (throw/return).
     pub resume_value: u64,
+    /// The compiled-loop safe-point countdown: machine code decrements it at
+    /// each loop header (a block executed once per iteration) and calls
+    /// `gc_safepoint` when it reaches zero, resetting it to
+    /// [`JIT_GC_PROBE_INTERVAL`]. This is the compiled analogue of the
+    /// interpreter's per-back-edge allocation-budget check (a TLS read per
+    /// iteration would be unreachable from machine code, so the poll is a
+    /// cheap ctx field instead). Seeded per run — a compiled body is
+    /// single-threaded and the field never crosses a context boundary.
+    pub gc_ticks: u64,
 }
+
+/// The number of loop-header visits between compiled safe-point polls (see
+/// `JitCallContext::gc_ticks`). 1024 matches the interpreter's
+/// `ALLOC_BUDGET`: an allocating loop (>= 1 box per iteration) crosses the
+/// budget within one interval, so the collection trigger fires at the same
+/// pace the interpreter's back edges would set.
+pub const JIT_GC_PROBE_INTERVAL: u64 = 1024;
 
 /// A direct-mapped global-value cell the compiled `LoadGlobal`/`StoreGlobal`
 /// fast paths read and write in place: `name` plus the capturing
@@ -390,6 +406,12 @@ pub struct JitSlowPaths {
     pub to_boolean_slow: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
     /// Throws the TDZ ReferenceError (reported through the context).
     pub tdz_error: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// The compiled-loop safe point (see `JitCallContext::gc_ticks`): runs
+    /// `Agent::maybe_collect` when the allocation budget is exceeded and
+    /// clears the leaf-call-cache records (a collection can recycle a freed
+    /// closure box's address, which a record's payload match would then
+    /// mistake for the original callee). Returns 0.
+    pub gc_safepoint: extern "C" fn(ctx: *mut c_void) -> u64,
     /// `Get(o, name)`; `name` is an `AtomId`.
     pub get_member_name: extern "C" fn(ctx: *mut c_void, object: u64, name: u64) -> u64,
     /// `Get(o, key)` with a computed key.
@@ -897,6 +919,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     update_value_slow,
     to_boolean_slow,
     tdz_error,
+    gc_safepoint,
     get_member_name,
     get_member_computed,
     set_member_name,
@@ -1172,6 +1195,27 @@ extern "C" fn tdz_error(ctx: *mut c_void) -> u64 {
             "Cannot access a binding before initialization".into(),
         ),
     )
+}
+
+/// The compiled-loop safe point: the machine code polls every
+/// [`JIT_GC_PROBE_INTERVAL`] iterations (the interpreter checks the same
+/// budget at every loop back edge); when enough boxes were allocated since
+/// the last check, run the real collection trigger. Can never set the
+/// pending error — a GC runs no user code (finalizer callbacks are queued
+/// as jobs). The leaf-call-cache records are cleared whenever the trigger
+/// fires: the sweep (or the dead-closure reap that rides on every trigger)
+/// can free a callee box whose address a later allocation recycles, and a
+/// record's payload match would then mistake the new object for the cached
+/// callee — clearing forces the next call site to re-probe.
+extern "C" fn gc_safepoint(ctx: *mut c_void) -> u64 {
+    if !crux::heap::allocation_budget_exceeded() {
+        return 0;
+    }
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    agent.maybe_collect();
+    ctx.leaf_call_cache = [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES];
+    0
 }
 
 extern "C" fn get_member_name(ctx: *mut c_void, object: u64, name: u64) -> u64 {
@@ -4602,6 +4646,7 @@ pub(crate) fn run_jit_body(
         resume_ip: 0,
         resume_sp: 0,
         resume_value: 0,
+        gc_ticks: JIT_GC_PROBE_INTERVAL,
     };
     // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
     // nested leaf jit roots) plus the working area for the call's duration:
@@ -4829,6 +4874,7 @@ pub(crate) fn run_jit_resume(
         resume_ip: vm.ip,
         resume_sp: (work_ptr as usize + sp_offset * std::mem::size_of::<Value>()) as u64,
         resume_value: resume_value.bits(),
+        gc_ticks: JIT_GC_PROBE_INTERVAL,
     };
     agent.jit_depth += 1;
     let result = crate::ir::with_jit_run(vm, ir, work, || unsafe {

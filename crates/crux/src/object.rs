@@ -30,6 +30,20 @@ thread_local! {
     /// threads, and values never cross heaps), so allocation avoids a
     /// locked atomic per object (GC-5: the construct hot path).
     static NEXT_OBJECT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    /// Primitive-wrapper boxes the arena sweep dropped since the runtime
+    /// last drained the queue. Each entry is the wrapper's object id; the
+    /// runtime (which keeps the id-keyed per-object data tables) removes the
+    /// matching records at its next collection trigger. Ids are
+    /// process-global and never reused, so a stale id in the queue is a
+    /// harmless no-op for an agent that never registered it.
+    static DEAD_WRAPPER_IDS: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the ids of the primitive-wrapper boxes the sweep dropped since the
+/// last call ([`Agent::maybe_collect`] runs it at every collection trigger).
+pub fn take_dead_wrapper_ids() -> Vec<u64> {
+    DEAD_WRAPPER_IDS.with(|queue| std::mem::take(&mut *queue.borrow_mut()))
 }
 
 /// The next object identity key (see [`JsObject::id`]).
@@ -785,6 +799,22 @@ impl PartialEq for JsObject {
 }
 impl Eq for JsObject {}
 
+impl Drop for JsObject {
+    fn drop(&mut self) {
+        // A primitive-wrapper box died (the sweep reclaimed it — a Gc box is
+        // only ever freed there, and a live root would have kept it). The
+        // runtime's id-keyed wrapper tables (`number_data`/`boolean_data`/
+        // `bigint_data`) hold one entry per wrapper and have no other
+        // eviction, so queue the id for the next collection trigger. Only
+        // wrappers register: `boxed` is set once at creation and never
+        // cleared, so the check is a cheap filter that keeps ordinary
+        // objects (the construct hot path) off the queue.
+        if self.boxed.get().is_some() {
+            DEAD_WRAPPER_IDS.with(|queue| queue.borrow_mut().push(self.id));
+        }
+    }
+}
+
 impl fmt::Debug for JsObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}#{}", self.kind.name(), self.id)
@@ -1035,10 +1065,7 @@ impl JsObject {
         pointer: usize,
         prototype: Option<Handle<JsObject>>,
     ) -> Handle<JsObject> {
-        let object = Handle::new(Self {
-            kind: ObjectKind::External(pointer),
-            ..Self::basic_object_create(prototype)
-        });
+        let object = Handle::new(Self::with_kind(ObjectKind::External(pointer), prototype));
         Self::link_self_handle(&object);
         object
     }
@@ -1049,12 +1076,36 @@ impl JsObject {
         ops: std::rc::Rc<dyn crate::host::HostOps>,
         prototype: Option<Handle<JsObject>>,
     ) -> Handle<JsObject> {
-        let object = Handle::new(Self {
-            kind: ObjectKind::Host(ops),
-            ..Self::basic_object_create(prototype)
-        });
+        let object = Handle::new(Self::with_kind(ObjectKind::Host(ops), prototype));
         Self::link_self_handle(&object);
         object
+    }
+
+    /// The ordinary field layout with `kind` replaced (the `External`/`Host`
+    /// constructors' common body). A `Drop` impl makes the struct-update
+    /// spread (`..Self::basic_object_create(..)`) illegal — moving fields out
+    /// of a type with drop glue is an error — so the shared constructor
+    /// spells the fields out once.
+    fn with_kind(kind: ObjectKind, prototype: Option<Handle<JsObject>>) -> Self {
+        Self {
+            id: next_object_id(),
+            kind,
+            array_dense: Cell::new(None),
+            typed_array: Cell::new(None),
+            prototype: Cell::new(prototype),
+            map: Cell::new(Some(canonical_empty_map(prototype))),
+            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            extensible: Cell::new(true),
+            immutable_prototype: Cell::new(false),
+            generation: Cell::new(0),
+            store_chain_clean: Cell::new(None),
+            properties: RefCell::new(SmallProps::new()),
+            property_index: RefCell::new(None),
+            private_elements: RefCell::new(Vec::new()),
+            self_handle: Cell::new(None),
+            function_self: Cell::new(None),
+            boxed: Cell::new(None),
+        }
     }
 
     /// The host's `$262.IsHTMLDDA` (Annex B.3.7): an object with the

@@ -41,12 +41,12 @@ use runtime::ir::{
     RegOperand, RelLimit, ScopeInfo, Step, is_compound_assign,
 };
 use runtime::jit::{
-    AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JIT_APPLY_MAX_ARGS, JitCallContext,
-    LEAF_CALL_CACHE_ENTRIES, LeafCallSiteCache, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL,
-    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
-    VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
-    VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_PENDING_LEN_OFFSET,
-    VM_TRY_STACK_LEN_OFFSET,
+    AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JIT_APPLY_MAX_ARGS, JIT_GC_PROBE_INTERVAL,
+    JitCallContext, LEAF_CALL_CACHE_ENTRIES, LeafCallSiteCache, LeafInlineInfo,
+    TYPED_ARRAY_LENGTH_SENTINEL, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET,
+    VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET,
+    VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET,
+    VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -2778,6 +2778,44 @@ impl<'a> Lowerer<'a> {
 
     // ----- steps -----
 
+    /// The compiled GC safe point, emitted at the top of a loop-header block
+    /// (see the `emit_step` gate): count the ctx's per-run ticker down; on
+    /// underflow reset it to [`JIT_GC_PROBE_INTERVAL`] and call the
+    /// `gc_safepoint` helper, which runs the collection trigger when the
+    /// allocation budget is exceeded. The helper cannot set the pending
+    /// error (a collection runs no user code), so the raw call is safe and
+    /// no leaf-epoch bump is needed (the helper clears the leaf-call-cache
+    /// records itself when it collects).
+    fn emit_gc_probe(&mut self) -> Result<(), Unsupported> {
+        let ctx = self.vm();
+        let offset = Offset32::new(std::mem::offset_of!(JitCallContext, gc_ticks) as i32);
+        let ticks = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), ctx, offset);
+        let next = self.builder.ins().iadd_imm_s(ticks, -1);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), next, ctx, offset);
+        let due = self.builder.ins().icmp_imm_u(IntCC::Equal, next, 0);
+        let slow = self.builder.create_block();
+        let cont = self.builder.create_block();
+        self.builder.ins().brif(due, slow, &[], cont, &[]);
+        self.builder.switch_to_block(slow);
+        let interval = self
+            .builder
+            .ins()
+            .iconst(types::I64, JIT_GC_PROBE_INTERVAL as i64);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), interval, ctx, offset);
+        self.emit_raw_call(self.sig_tdz, Helper::GcSafepoint, &[])?;
+        self.builder.ins().jump(cont, &[]);
+        self.builder.switch_to_block(cont);
+        self.builder.seal_block(cont);
+        Ok(())
+    }
+
     fn emit_step(&mut self, index: usize, step: &Step) -> Result<(), Unsupported> {
         // Cut 55: the pending-error dispatch and the control helpers pass the
         // interpreter's ip for this step (the loop-top increment means a
@@ -2799,6 +2837,15 @@ impl<'a> Lowerer<'a> {
         {
             let entry = self.builder.use_var(self.handler_sp_vars[*handler]);
             self.builder.def_var(self.sp_var, entry);
+        }
+        // The compiled GC safe point: a block that runs once per iteration —
+        // a back-edge target or the certified `FastLoopHead` — counts the
+        // ctx's ticker down and polls the allocation budget every
+        // `JIT_GC_PROBE_INTERVAL` iterations (the interpreter checks the
+        // same budget at every loop back edge; compiled code cannot read the
+        // crux TLS counter from machine code, so it polls instead).
+        if matches!(step, Step::FastLoopHead { .. }) || self.back_targets.contains(&index) {
+            self.emit_gc_probe()?;
         }
         match step {
             Step::Push(value) => {

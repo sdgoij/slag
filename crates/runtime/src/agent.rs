@@ -1047,6 +1047,11 @@ impl Agent {
             // GC-5: a fresh script is a fresh execution unit — the safe-point
             // allocation budget must not leak in from the previous script.
             crux::heap::reset_allocation_budget();
+            // Release the records of closures a previous script's boundary
+            // collection swept (the death queue is drained at every run
+            // entry and collection trigger).
+            self.reap_dead_functions();
+            self.reap_dead_wrappers();
             let realm = self.current_realm()?;
             let script = if jsx {
                 crate::script::parse_script_jsx(source, realm)?
@@ -1466,10 +1471,63 @@ impl Agent {
     /// past twice the post-collection live count (or every safe point in
     /// `--gc-stress` mode).
     pub(crate) fn maybe_collect(&mut self) {
+        // Release the records of closures the collector swept since the
+        // last trigger (their boxes died at the sweep; the records' traced
+        // `environment` roots would otherwise pin the captured chains
+        // forever). The ids come from the crux-side death queue the sweep's
+        // `drop_in_place` filled; ids this agent never registered (builtin
+        // or bound functions) are filtered out.
+        self.reap_dead_functions();
+        self.reap_dead_wrappers();
         let live = crux::heap::with_heap(|heap| heap.live_count());
         let threshold = self.last_collected_live.get().max(1024).saturating_mul(2);
         if self.gc_stress.get() || live > threshold {
             self.collect_garbage();
+        }
+    }
+
+    /// Drop the per-function records of closures whose boxes a sweep
+    /// reclaimed (see [`Function::drop`] and the dead-function queue). Each
+    /// record holds the closure's [[Environment]] — the per-iteration env a
+    /// loop-created closure captures — so releasing it lets the collector
+    /// reclaim the whole captured chain. The matching leaf-cache cell is
+    /// cleared too: it also holds the closure env and would keep it
+    /// reachable.
+    fn reap_dead_functions(&mut self) {
+        let dead = crux::function::take_dead_function_ids();
+        if dead.is_empty() {
+            return;
+        }
+        for id in dead {
+            if self.ecma_functions.remove(&id).is_none() {
+                continue;
+            }
+            let index =
+                id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
+            if let Some((cached_id, _)) = &self.leaf_cache[index]
+                && *cached_id == id
+            {
+                self.leaf_cache[index] = None;
+            }
+        }
+    }
+
+    /// Drop the per-object records of primitive-wrapper boxes a sweep
+    /// reclaimed (see [`crux::object::JsObject`]'s `Drop` and the dead-id
+    /// queue). The `number_data`/`boolean_data`/`bigint_data` tables answer
+    /// the "is this a wrapper / what does it wrap" checks (valueOf, JSON
+    /// stringify) and hold no handle to the object itself, so a dead
+    /// wrapper's entry is pure retained memory — ids are never reused, so
+    /// removing it is always safe.
+    fn reap_dead_wrappers(&mut self) {
+        let dead = crux::object::take_dead_wrapper_ids();
+        if dead.is_empty() {
+            return;
+        }
+        for id in dead {
+            self.number_data.remove(&id);
+            self.boolean_data.remove(&id);
+            self.bigint_data.remove(&id);
         }
     }
 

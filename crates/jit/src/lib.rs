@@ -331,6 +331,7 @@ fn runtime_helpers() -> JitHelpers {
         update_value_slow: Some(rt.update_value_slow),
         to_boolean_slow: Some(rt.to_boolean_slow),
         tdz_error: Some(rt.tdz_error),
+        gc_safepoint: Some(rt.gc_safepoint),
         get_member_name: Some(rt.get_member_name),
         get_member_computed: Some(rt.get_member_computed),
         set_member_name: Some(rt.set_member_name),
@@ -537,6 +538,7 @@ mod tests {
             update_value_slow: Some(helpers::test_update_value_slow),
             to_boolean_slow: Some(helpers::test_to_boolean_slow),
             tdz_error: Some(helpers::test_tdz_error),
+            gc_safepoint: Some(helpers::test_gc_safepoint),
             get_member_name: Some(helpers::test_get_member_name),
             get_member_computed: Some(helpers::test_get_member_computed),
             set_member_name: Some(helpers::test_set_member_name),
@@ -698,6 +700,7 @@ mod tests {
             resume_ip: 0,
             resume_sp: 0,
             resume_value: 0,
+            gc_ticks: runtime::jit::JIT_GC_PROBE_INTERVAL,
         };
         // Safety: the buffers outlive the call; `vm` is never dereferenced by
         // the scaffold's test helpers.
@@ -1046,6 +1049,7 @@ mod tests {
             resume_ip: 0,
             resume_sp: 0,
             resume_value: 0,
+            gc_ticks: runtime::jit::JIT_GC_PROBE_INTERVAL,
         };
         let result = unsafe {
             compiled.call(
@@ -1289,6 +1293,7 @@ mod tests {
             resume_ip: 0,
             resume_sp: 0,
             resume_value: 0,
+            gc_ticks: runtime::jit::JIT_GC_PROBE_INTERVAL,
         };
         let result = unsafe {
             compiled.call(
@@ -1374,6 +1379,7 @@ mod tests {
             resume_ip: 0,
             resume_sp: 0,
             resume_value: 0,
+            gc_ticks: runtime::jit::JIT_GC_PROBE_INTERVAL,
         };
         let result = unsafe {
             compiled.call(

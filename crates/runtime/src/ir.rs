@@ -10565,6 +10565,7 @@ impl Vm {
             resume_ip: 0,
             resume_sp: 0,
             resume_value: 0,
+            gc_ticks: crate::jit::JIT_GC_PROBE_INTERVAL,
         };
         let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
         // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.

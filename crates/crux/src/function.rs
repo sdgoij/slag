@@ -25,6 +25,22 @@ use crate::value::{Value, ValueKind, is_callable, is_constructor};
 
 static NEXT_FUNCTION_ID: AtomicU64 = AtomicU64::new(1);
 
+thread_local! {
+    /// Function boxes the arena sweep dropped since the runtime last drained
+    /// the queue. Each entry is a function id; the runtime (which registers
+    /// the per-function records) takes the queue and releases the records
+    /// whose closures are gone — dropping the [[Environment]] chain they
+    /// anchored. Ids are process-global and never reused, so a stale id in
+    /// the queue is a harmless no-op for an agent that never registered it.
+    static DEAD_FUNCTION_IDS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drain the ids of the function boxes the sweep dropped since the last
+/// call ([`Agent::maybe_collect`] runs it at every collection trigger).
+pub fn take_dead_function_ids() -> Vec<u64> {
+    DEAD_FUNCTION_IDS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
 /// The runtime's executor for ECMAScript function bodies. The bodies live in
 /// the runtime's agent, so `call`/`construct` on `FunctionKind::EcmaScript`
 /// route through this hook when the runtime has installed it; `agent` is the
@@ -207,6 +223,18 @@ impl Trace for Function {
             bound_this.trace(visit);
             bound_args.trace(visit);
         }
+    }
+}
+
+impl Drop for Function {
+    fn drop(&mut self) {
+        // The arena sweep dropped this function box: no live value can
+        // reference it anymore, so the runtime's per-function record
+        // (whose `environment` roots the closure's captured chain) can be
+        // released. Pushing the id is cheap and allocation-free; the
+        // runtime drains the queue at its next collection trigger and
+        // filters ids it never registered (builtins, bound functions).
+        DEAD_FUNCTION_IDS.with(|slot| slot.borrow_mut().push(self.id));
     }
 }
 

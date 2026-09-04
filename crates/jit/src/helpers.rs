@@ -27,6 +27,7 @@ pub enum Helper {
     UpdateValueSlow,
     ToBooleanSlow,
     TdzError,
+    GcSafepoint,
     GetMemberName,
     GetMemberComputed,
     SetMemberName,
@@ -167,6 +168,7 @@ impl Helper {
             Helper::UpdateValueSlow => "update_value_slow",
             Helper::ToBooleanSlow => "to_boolean_slow",
             Helper::TdzError => "tdz_error",
+            Helper::GcSafepoint => "gc_safepoint",
             Helper::GetMemberName => "get_member_name",
             Helper::GetMemberComputed => "get_member_computed",
             Helper::SetMemberName => "set_member_name",
@@ -347,6 +349,10 @@ pub struct JitHelpers {
     /// Throws the TDZ ReferenceError. Never returns normally (the JIT emits
     /// `unreachable` after the call).
     pub tdz_error: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    /// The compiled-loop safe point (see `JitCallContext::gc_ticks`): runs
+    /// the runtime's collection trigger when the allocation budget is
+    /// exceeded. Returns 0; never sets the pending error.
+    pub gc_safepoint: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     /// `Get(o, name)`: `name` is an `AtomId`; returns the value.
     pub get_member_name: Option<extern "C" fn(vm: *mut c_void, object: u64, name: u64) -> u64>,
     /// `Get(o, key)` with a computed key value.
@@ -719,6 +725,7 @@ impl JitHelpers {
             update_value_slow: None,
             to_boolean_slow: None,
             tdz_error: None,
+            gc_safepoint: None,
             get_member_name: None,
             get_member_computed: None,
             set_member_name: None,
@@ -846,6 +853,7 @@ impl JitHelpers {
             Helper::UpdateValueSlow => self.update_value_slow.map(|f| f as usize as u64),
             Helper::ToBooleanSlow => self.to_boolean_slow.map(|f| f as usize as u64),
             Helper::TdzError => self.tdz_error.map(|f| f as usize as u64),
+            Helper::GcSafepoint => self.gc_safepoint.map(|f| f as usize as u64),
             Helper::GetMemberName => self.get_member_name.map(|f| f as usize as u64),
             Helper::GetMemberComputed => self.get_member_computed.map(|f| f as usize as u64),
             Helper::SetMemberName => self.set_member_name.map(|f| f as usize as u64),
@@ -1010,6 +1018,10 @@ pub extern "C" fn test_to_boolean_slow(_vm: *mut c_void, _value: u64) -> u64 {
 
 pub extern "C" fn test_tdz_error(_vm: *mut c_void) -> u64 {
     panic!("the TDZ error slow path ran in a test (a lexical slot was read before init)")
+}
+
+pub extern "C" fn test_gc_safepoint(_vm: *mut c_void) -> u64 {
+    0
 }
 
 pub extern "C" fn test_get_member_name(_vm: *mut c_void, _object: u64, _name: u64) -> u64 {
