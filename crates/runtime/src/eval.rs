@@ -2203,6 +2203,28 @@ mod tests {
     }
 
     #[test]
+    fn warm_stores_across_many_distinct_objects_keep_separate_cells() {
+        // The L1a store cells live in a SEPARATE, larger direct-mapped table
+        // (MEMBER_WRITE_CELLS) than the read-side value cells (MEMBER_CELLS):
+        // a store-cell miss falls back to the full [[Set]], so more than 16
+        // distinct (object, name) warm-store pairs must not alias each other
+        // out of the cache. Regression guard for the split-index discipline:
+        // the store probe/record indexes the write table by its own mask
+        // while the value-cell front keeps the read table's mask (a shared
+        // index once wrote the 16-wide read table at a >16 write index and
+        // panicked out of bounds).
+        let source = "var os = [];\n\
+                     for (var j = 0; j < 64; j++) { os[j] = { x: j }; }\n\
+                     for (var k = 0; k < 64; k++) { os[k].x = k + 1; }\n\
+                     for (var k = 0; k < 64; k++) { os[k].x = os[k].x + 1000; }\n\
+                     os[0].x + '|' + os[31].x + '|' + os[63].x;";
+        assert_eq!(
+            run(source).unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("1001|1032|1064")))
+        );
+    }
+
+    #[test]
     fn chain_reads_observe_warm_value_writes_to_the_found_link() {
         // The prototype-chain read cache re-reads the found property LIVE
         // (through the found link's member value cell when warm, else the

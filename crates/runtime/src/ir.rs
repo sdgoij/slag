@@ -1732,6 +1732,19 @@ const INLINE_FRAME: usize = 8;
 /// indexes the same table.
 pub const MEMBER_CELLS: usize = 16;
 
+/// The write-side store-cell table size (L1a warm-store cell): a SEPARATE,
+/// larger direct-mapped table than the read cells, because a store-cell
+/// miss falls back to the full [[Set]] (~140ns) while a read-cell miss
+/// falls back to the map live-field path (~+1ns). The 16-entry read tables
+/// are fine at their working sets (probe 2026-09-04: 64 distinct same-map
+/// objects read at ~4.2ns/op, +0.7ns over warm); a 16-entry write table
+/// aliases across any >16-object store loop and every store pays the full
+/// [[Set]] (probe: 64-object cycling stores ~140ns/store vs ~20ns warm).
+/// Mirrors the GLOBAL_CELLS 32->256 bump (Cut 35 slice 5). The JIT never
+/// reads the write cells, so the size is interpreter-only. Power of two so
+/// the index is a mask.
+pub(crate) const MEMBER_WRITE_CELLS: usize = 256;
+
 /// Part B, B5.4: the cached constructor boilerplate map — (function id,
 /// prototype id, function-object generation) → the final shape the body's
 /// `this.*` stores transition to. Re-validated against the function object's
@@ -3348,6 +3361,12 @@ impl Vm {
         (object_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
     }
 
+    /// The direct-mapped cache index for the L1a store cells (a larger
+    /// table than the read cells — see [`MEMBER_WRITE_CELLS`]).
+    fn member_write_cell_index(object_id: u64, name: crux::AtomId) -> usize {
+        (object_id as usize ^ name as usize) & (MEMBER_WRITE_CELLS - 1)
+    }
+
     /// The direct-mapped cache index for (map id, name atom). Part B, B5.2.
     fn member_map_cell_index(map_id: u64, name: crux::AtomId) -> usize {
         (map_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
@@ -3973,7 +3992,7 @@ impl Vm {
         let Some(object) = Self::store_cell_object(base) else {
             return false;
         };
-        let index = Self::member_cell_index(object.id(), name);
+        let index = Self::member_write_cell_index(object.id(), name);
         let Some(cell) = agent.member_write_cells[index] else {
             return false;
         };
@@ -4008,7 +4027,11 @@ impl Vm {
         // changes (define/delete/accessor conversion/map transition) still
         // bump through their own paths.
         let generation = object.generation();
-        agent.member_value_cells[index] = MemberValueCell {
+        // The read-side value cell keeps the SMALL table's index (the JIT's
+        // compiled probe and every read path mask by MEMBER_CELLS - 1); only
+        // the store-cell probe/record use the larger write table.
+        let read_index = Self::member_cell_index(object.id(), name);
+        agent.member_value_cells[read_index] = MemberValueCell {
             id: object.id(),
             name,
             generation,
@@ -4056,8 +4079,8 @@ impl Vm {
             None => (0, MEMBER_WRITE_FIELD_NONE),
         };
         let generation = object.generation();
-        let index = Self::member_cell_index(object.id(), name);
-        agent.member_write_cells[index] = Some(MemberWriteCell {
+        let write_index = Self::member_write_cell_index(object.id(), name);
+        agent.member_write_cells[write_index] = Some(MemberWriteCell {
             id: object.id(),
             name,
             generation,
@@ -4065,7 +4088,9 @@ impl Vm {
             map_id,
             field,
         });
-        agent.member_value_cells[index] = MemberValueCell {
+        // The read-side value cell keeps the SMALL table's index.
+        let read_index = Self::member_cell_index(object.id(), name);
+        agent.member_value_cells[read_index] = MemberValueCell {
             id: object.id(),
             name,
             generation,

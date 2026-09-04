@@ -3,12 +3,13 @@
 > Merged, prioritized view of the remaining work in the active plan
 > (`docs/performance-plan.md`, mechanism-based, supersedes) and the closed
 > historical plan (`docs/gap-close-plan.md`). Status reflects everything
-> landed through `83b7bea` (the `BinStoreReg` local-compound fuse): the gap-
-> close milestones M1-M7/M10, the L1a/L1c register-path work, the typed-
-> array no-alloc reads, the `UpdateReg`/`JumpIfEqImm`/`BinStoreReg` slices,
-> and the GC fixes. Only remaining work is listed. One experiment at a
-> time; a lever opens with its probe; every landing gates on clippy clean,
-> workspace tests green, and the three release sweeps.
+> landed through `0d70d3e` (the L1c record-discipline landing) plus this
+> tree's write-cell capacity slice (1.3): the gap-close milestones
+> M1-M7/M10, the L1a/L1c register-path work, the typed-array no-alloc
+> reads, the `UpdateReg`/`JumpIfEqImm`/`BinStoreReg` slices, and the GC
+> fixes. Only remaining work is listed. One experiment at a time; a lever
+> opens with its probe; every landing gates on clippy clean, workspace
+> tests green, and the three release sweeps.
 
 ## P0 — Correctness (JIT)
 
@@ -20,8 +21,9 @@
 
 | # | Item | Status | Evidence / first action |
 |---|---|---|---|
-| 1.1 | L1c read/write end-state on maps/shapes: hot member paths serve via shape-compare + inline-field access instead of the generation/id/name value-cell probes; exotic receivers/accessors/index keys fall back to the exact machinery | partial; the record-discipline program (stones 1-3) LANDED 2026-09-04; the remaining read end-state (per-site map validation) is the next slice | **Stones 1-3 (LANDED, one commit, 2026-09-04)**: the interpreter's warm member write stopped bumping the generation (`write_data_property_slot`, the JIT's existing no-bump discipline), after converting the three generation-stamped VALUE caches to the L1c oracle pattern (cache the RESOLUTION, never the value): **stone 1** `construct_this_object` reads `prototype` via the shared (JsObject id, "prototype") member value cell when warm (Cut 26 `construct_prototypes` deleted; a value write to `prototype` can no longer leave a stale construct proto); **stone 2** `member_chain_cells` cache links + the found vector slot and re-read the value live through the found link's member value cell (all-scalar, trace arm gone) so a warm proto-link write is observed; **stone 3** the for-of fast verdict oracles AIP's own `next` through its member value cell, then the bump drops. Every other value write still bumps (`set_key`, defines, deletes, accessor conversion); the construct boilerplate map re-validates the CURRENT proto id, so a warm proto swap cannot reuse a stale shape. Measurement (perf.md, 2026-09-04): ~0.5-1ns/write by within-binary isolation; the row A/B is inconclusive (cross-build layout moves the no-property-write `arithmetic` control ~24% — recorded as measured). Gates: clippy, workspace tests (new `construct_observes_warm_prototype_value_writes`, `chain_reads_observe_warm_value_writes_to_the_found_link`), three sweeps at baseline (the one `spread-sngl-iter.js` failure seen mid-program is a non-reproducible batch flake of the documented heap-state class — full language sweep clean on the landing tree). **Next**: the read end-state — per-site map-validated member reads on the register executor (the map/shape layer exists; the read residual is the in-suite direct-mapped probe), which is the 1.2 entry slice below. |
-| 1.2 | L2 per-site feedback: per-call-site IC entries (shape/offset) shared by the interpreter and the JIT, replacing the global direct-mapped tables | not started (entry slice is 1.1's first slice — see the 1.1 row) | The map/shape representation 1.1 was to establish now exists, so the per-site IC machinery (a per-body mutable IC table for the register member ops, interpreter first, then the JIT) is the concrete first slice of the 1.1 read end-state rather than a separate deferred item. |
+| 1.1 | L1c read/write end-state on maps/shapes: hot member paths serve via shape-compare + inline-field access instead of the generation/id/name value-cell probes; exotic receivers/accessors/index keys fall back to the exact machinery | partial; stones 1-3 (record discipline) and 1.3 (write-cell capacity) LANDED; the READ-end-state premise was probed and FALSIFIED on the interpreter (perf.md, 2026-09-04) | **Stones 1-3 (LANDED, 2026-09-04)**: the warm member write stopped bumping the generation (`write_data_property_slot`) after converting the three generation-stamped VALUE caches to the L1c oracle pattern (`construct_this_object` reads `prototype` via the shared member value cell; `member_chain_cells` cache the resolution and re-read live; the for-of verdict oracles AIP's `next`). **1.3 (LANDED, this tree)**: the L1a store cells moved to a SEPARATE 256-entry table (`MEMBER_WRITE_CELLS`) — see the 1.3 row. **Read probe (FALSIFIED the per-site read premise)**: warm register member reads are ~3.5ns and read 64 distinct same-map objects at ~4.2ns (+0.7ns — the map-cell layer absorbs value-cell misses at near-warm cost); a 16->256 `MEMBER_CELLS` experiment did NOT speed the cycling-object rows and bloated the Agent's inline tables ~25% slower on every warm row. So the interpreter read path is near its floor; per-site read ICs are NOT the next slice. **Next**: the write end-state — see 1.3's follow-on (per-site store cells only if >256-object working sets show up in a probe). |
+| 1.2 | L2 per-site feedback: per-call-site IC entries (shape/offset) shared by the interpreter and the JIT, replacing the global direct-mapped tables | re-scoped by the 2026-09-04 probes | The interpreter read path does not need per-site ICs (1.1's probe: reads ~3.5-4.2ns across 64-object working sets). The remaining per-site argument is the WRITE side beyond the 256-entry capacity (1.3) and the JIT's compiled shape-compare end-state. Defer full L2 until a >256-object store-loop probe shows the capacity ceiling, or the JIT work needs the shape/offset representation. |
+| 1.3 | L1a store cells on a separate, larger table (`MEMBER_WRITE_CELLS`) | **landed 2026-09-04** (this tree) | The 16-entry write cells alias across any >16-object store loop; a store-cell miss falls back to the full [[Set]] (~140ns). Interleaved A/B (parent `0d70d3e` + probe rows vs this tree): a 64-distinct-object cycling-store row (32M stores) drops ~4.4-4.5s -> ~0.42s (~10x, ~140ns -> ~13ns/store); the warm rows moved within the cross-build layout band (`arithmetic` — no property cells — moved ~±25%, recorded as noise). Read cells stay at 16 (1.1's probe); the store probe/record now index by `MEMBER_WRITE_CELLS` while the value-cell front keeps the read table's mask. Gates: clippy, workspace tests (new `warm_stores_across_many_distinct_objects_keep_separate_cells`), three sweeps at baseline. Follow-on: per-site store ICs if a probe finds >256-object hot store loops (the JIT's compiled stores are separate). |
 
 ## P2 — JIT coverage (L3)
 
@@ -56,10 +58,12 @@
 2. 5.1-5.4 are LANDED/CLOSED (2026-09-04): the register-run local-compound
    arc ended at the `BinStoreReg` fuse (5.3); the direct-right fat-op
    generalization measured as a regression (5.4) and the branchy micro-arc
-   is at its 4-dispatch floor. The next slice is 1.1's first slice: a
-   per-site map-validated member read on the register executor (the shape
-   layer is in place; the read residual is in-suite direct-mapped thrash).
-3. Then the plan's own sequencing: the remaining 1.1 work (the read
-   end-state) is the per-site map-validated member read — the 1.2 entry
-   slice, ahead of 2.1 (L3) unless a probe changes the calculus.
+   is at its 4-dispatch floor. 1.3 (write-cell capacity) is LANDED on this
+   tree.
+3. The read-end-state premise (per-site member reads) was probed and
+   FALSIFIED (1.1): interpreter member reads are ~3.5-4.2ns across
+   64-object working sets — the map-cell layer already absorbs the
+   value-cell misses. The next slice is the write-side follow-on probe
+   (does a realistic >256-object hot store loop exist, justifying per-site
+   store ICs / full L2), then 2.1 (L3) unless a probe changes the calculus.
 4. 3.1 (L4) and 4.1 (L5) after the L1c/L2/L3 probes re-derive their targets.

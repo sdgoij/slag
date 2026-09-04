@@ -3650,6 +3650,56 @@ documented heap-state flake class (the `TypedArray/prototype/reduce`
 `callbackfn-arguments` flake has the same strict-unmapped-arguments +
 stale-value signature), not a regression of this change.
 
+### Read-side direct-mapped thrash FALSIFIED; write cells get a separate 256-entry table (measured 2026-09-04)
+
+Two probes on the member-cell machinery, one falsification and one
+landing:
+
+**Read probe — the per-site-IC premise does not reproduce.** The
+recorded next step (per-site map-validated member reads on the register
+executor, premised on "the read residual is in-suite direct-mapped
+thrash") was measured directly with certified register-run bodies: a
+warm member read is ~3.5ns/op (the `o.x` row over the var floor), and
+reading 64 DISTINCT same-map objects in one straight-line body (`s = s
++ o0.x + … + o63.x`, 500k iters — 64 (id, name) pairs through the 16
+value cells, ~4-way aliasing) costs ~4.2ns/read — the map-cell layer
+(member_map_cells, one entry for the shared map) absorbs every
+value-cell miss at +0.7ns. A 16->256 `MEMBER_CELLS` experiment did NOT
+move the cycling rows and REGRESSED every warm row ~25% (the inline
+`for_of_fast_cells`/`member_map_cells`/… arrays bloated the Agent hot
+struct — the documented inline-table-bloat trap). Interpreter member
+reads are near their floor; per-site read ICs are not the next slice.
+(Step-path loops over computed indexes — `objs[i & 63].x` — cost more,
+but that is register-run coverage of computed keys, a separate matter
+from the member-cell machinery.)
+
+**Write probe + landing — the store cells were the thrash victim.** A
+store-cell miss falls back to the FULL [[Set]] (~140ns, the pre-L1a
+write cost), not a cheap second level. A 64-distinct-object cycling-
+store register loop (32M stores) aliases the 16 write cells ~4-way, so
+every store misses and pays the full [[Set]]: interp ~4.4-4.5s vs a
+single-object warm-store control at ~23ms/1M (~20ns/store) — ~7x. The
+L1a store cells moved to a SEPARATE 256-entry direct-mapped table
+(`MEMBER_WRITE_CELLS`, interpreter-only — the JIT never reads the
+write cells; a Boxed table, so no Agent hot-struct bloat), with the
+store probe/record indexing by its own mask while the value-cell front
+keeps the READ table's mask (the compiled probe and every read path
+mask by `MEMBER_CELLS - 1`; a shared index once wrote the 16-wide read
+table at a >16 write index and panicked out of bounds — now a
+regression test). Interleaved A/B (parent `0d70d3e` + probe rows vs
+this tree, 3 rounds): the cycling-store row drops ~4.4-4.5s -> ~0.42s
+(~10x, ~140ns -> ~13ns/store); the warm rows moved within the
+cross-build layout band (the no-property-write `arithmetic` control
+moved ~20-33% between the two binaries — recorded as noise, not a
+regression). Read cells stay at 16 (the read probe). Mirrors the
+`GLOBAL_CELLS` 32->256 bump (Cut 35 slice 5).
+
+Gates: clippy clean; `cargo test --workspace` green (new
+`warm_stores_across_many_distinct_objects_keep_separate_cells`); the
+three release sweeps at baseline — language 23721/23724 (3 skip),
+built-ins 23657/23812 (155 skip), annexB 1086/1086, zero fail/crash/
+hang.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

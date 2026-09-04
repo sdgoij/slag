@@ -163,7 +163,7 @@ pub struct Agent {
     /// mutation bumps the generation, so a match pins the slot's content).
     /// Index-only — no trace edges. Boxed per the Cut 27 lesson.
     pub(crate) member_write_cells:
-        Box<[Option<crate::ir::MemberWriteCell>; crate::ir::MEMBER_CELLS]>,
+        Box<[Option<crate::ir::MemberWriteCell>; crate::ir::MEMBER_WRITE_CELLS]>,
     /// The prototype-chain read cache (2026-09-01): (receiver id, name,
     /// receiver generation, the found property's vector slot, the walked
     /// links' (id, generation)) — a hit re-reads the found property LIVE
