@@ -4116,6 +4116,136 @@ behind the L1c shape representation. Gates: clippy clean, `cargo test
 stack temporary), three release sweeps at baseline — language 23721/3
 skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
 
+### Warm prototype-chain read marginal: fixed validation cost, not the walk (measured 2026-09-04)
+
+The chain-read candidate (recommended order (a)), measured cleanly: the
+earlier "~55ns chain read" rows were confounded by `===`-compare +
+branch overhead (a bare function-equality row alone was ~31ns). New rows
+use NUMERIC prototype values (`o.m` where `m: 2` on the prototype — no
+compare, no branch) over 2M reads with a bare-add control subtracted,
+both engines:
+
+| read | interp marginal | jit marginal |
+|---|---|---|
+| own-data (`o.x`) | ~1-3ns | ~0.5ns |
+| chain 1-link (`Object.create({m})`) | ~18ns | ~17ns |
+| chain 2-link | ~19ns | ~17.5ns |
+
+Warm chain reads are ~7-18x own-data reads and their cost is FLAT in
+link depth (1 vs 2 links identical): the fixed `member_chain_get`
+validation — receiver-generation compare, the cached links' (id,
+generation) walk, and the found link's value-cell re-read — dominates,
+not the chain walk. The 2026-09-01 JIT inline-probe experiment (the same
+validation inlined) measured slower, and no shape-free interpreter slice
+obviously clears it, so the fix is L2's per-site shape/offset IC (serve
+the read at own-data cost via a shape compare + slot) once the L1c shape
+representation lands. Tasklist candidate (a) closes with this record; no
+code lands. (No gates run — probe-only; the tree is untouched.)
+
+### The remaining-module registration probe: Map/Set are O(n)-scan bound, not chain-bound (measured 2026-09-04)
+
+Candidate (c) — extend the 4.2 O(1) handler registration to the other
+agent-dependent modules — probed with warm 200k-call rows (both
+engines): Map.get ~2.9µs/call, Map.set ~3.7-4.3µs, Set.has ~5.5-6.2µs,
+Object.hasOwn ~5.0-5.4µs, hasOwnProperty ~950-980ns, DataView.getUint8
+~630-720ns, vs Math.abs (pure closure, no chain) ~155-175ns and
+registered charCodeAt ~350ns. Two distinct causes:
+
+1. **Object and DataView methods are chain-bound** (their late dispatch-
+   chain arms pay ~35 `intrinsics.get` per call — each allocates a
+   JsString + hash-lookup — which is why Object.hasOwn at arm ~35 costs
+   ~5µs). Registration would fix them, but Object's `dispatch_call` arms
+   are INLINE closures (not the named `(agent, this, args)` fns the other
+   modules map), so registering means refactoring them to named handlers
+   first — deferred to L2 or a dedicated mechanical pass.
+2. **Map/Set/WeakMap are NOT chain-bound — they are O(n) per op.**
+   `keyed.rs` stores the entries in a `Vec` and `find_index`/
+   `find_set_index` do `map.iter().position(...)` per get/has/set: a
+   1024-entry map scans up to 1024 `same_value` compares per op (~2.8-5.5
+   ns each). That is a structural data-structure lever (hash-index the
+   entries) that registration cannot touch, and it is invisible to the
+   bench rows (none exercise Map/Set).
+
+Candidate (c) closes by probe; the actionable follow-up is a hash-indexed
+`map_data`/`set_data` (find_index via a key index with the Vec kept for
+insertion order), likely the largest remaining lever for Map/Set-heavy
+code. No code lands. (No gates run — probe-only; the tree is untouched.)
+
+### Hash-indexed Map/Set entries: the keyed collections land their key index (measured 2026-09-04)
+
+The (c)-probe follow-up (candidate (d)) lands: every strong Map/Set now
+carries a SameValue-consistent hash index over its LIVE entries, keeping
+`find_index`'s O(n) scan only as a collision net. The `[[*Data]]` List
+semantics are untouched — `map_data`/`set_data` still hold the
+insertion-ordered, tombstoned entries `Vec` (deleted slots stay so
+suspended iterators keep scanning), now bundled with the index in a
+`MapCollection`/`SetCollection` (agent.rs; the `Trace` covers only the
+entries, and `WeakMap`/`WeakSet` keep their plain `Vec` cells — their GC
+compaction renumbers slots, so a position index would need clearing at
+every sweep, and they are not in the measured rows).
+
+**The word function.** `key_word` maps a canonicalized key to a u64 with
+the property that SameValue-equal keys always share a word, so the index
+can never miss a live key: numbers fold to their bits with NaN (any
+payload SameValue-equals any other) and the ±0 pair folded to constants;
+strings and BigInts hash content (equal content SameValue-equals across
+DISTINCT boxes — `m.set('a'+'b', 1); m.get('ab')` must hit); a Function
+value and an Object value aliasing the function's object side are
+SameValue-equal (spec 7.2.12 step 7), so both hash the object's stable
+id; symbols/objects hash their id. Words never reference a GC box, so
+the index needs no tracing.
+
+**The O(1) shape.** The index maps word -> live slot, one row per live
+key. Because every live key owns its row, a word with no row is an
+authoritative miss (no scan), a delete drops its row in O(1), and a set
+appends + indexes in O(1). The single-slot table is exact unless two
+live keys share a 64-bit word (a genuine hash collision); when an insert
+would shadow a live key (`collided`), lookups/deletes fall back to the
+exact `find_index` scan and deletes rebuild the index, so a collision
+can only cost time, never return a wrong entry. Every mutation keeps the
+index over the live slots: a delete tombstones the slot and removes its
+row; `clear` empties both; the direct-construction sites (`groupBy` and
+the set-methods' result sets via `new_set_from_data`) build the index
+once.
+
+**Measurement** (fresh release builds of parent `908256c` + probe rows vs
+this tree, 200k-call rows, both engines interpret the row bodies):
+
+| row | parent | this |
+|---|---|---|
+| Map.get (1024-entry, hit) | ~606ms (~3.0µs/call) | ~388ms (~1.9µs/call) |
+| Map.get (16-entry) | ~378ms (~1.9µs/call — floor) | ~383ms |
+| Map.get (1024-entry, MISS) | ~908ms (~4.5µs/call — full scan) | ~386ms |
+| Map.set (1024-entry, overwrite) | ~850ms (~4.3µs/call) | ~598ms |
+| Set.has (1024-entry) | ~1245ms (~6.2µs/call) | ~1033ms |
+| Set.has (16-entry) | ~1006ms (floor) | ~1015ms |
+| Map delete+set churn (1024 live) | ~34.5s (~172µs/iter) | ~0.9s (~4.5µs/iter) |
+
+The hit rows are now FLAT in collection size (1024-entry == 16-entry,
+within run noise), so the O(n) per-op scans are gone: a hit, a miss, and
+a delete/set each probe the index once. The churn row — which tombstones
+a slot and re-appends on every iteration — was ~38x scan/retain-bound
+and now runs at the delete+set dispatch floor. The residual per-call
+cost (~1.9µs Map.get, ~3-5µs Set.has) is the module's linear
+`dispatch_call` identity chain (Set.has's arm sits late), not a scan —
+that is the 4.2 `handler_for` registration lever (candidate (c) for the
+keyed module), whose arms are already the named `(agent, this, args)`
+handlers the pattern wants.
+
+**Gates**: clippy clean (`--workspace --all-targets -- -D warnings`);
+`cargo test --workspace` green (new
+`hash_indexed_collections_agree_with_the_exact_scan` — a 3000-op
+pseudo-random differential of the indexed Map/Set against the exact
+scan model over NaN-payload/±0/cross-box-string/object keys, asserting
+identical Vec length, live order, and slot answers after every op — and
+`indexed_map_and_set_survive_gc_stress`, which drives rope/object/NaN
+keys through set/delete churn under per-allocation collections); the
+three release sweeps identical to the parent (language 23721/3 skip,
+built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang).
+Next: register the keyed module's handlers O(1) (candidate (c), now the
+row floor), and extend the index to WeakMap/WeakSet only behind a
+measured probe (their compaction interplay is real work).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

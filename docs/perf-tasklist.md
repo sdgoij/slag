@@ -94,13 +94,45 @@
    bump to 4096 removes it through ~4k-object sets at no measured warm-row
    cost; >4k-object working sets still fall to the full [[Set]] (that
    residual is the L2 per-site store-IC slice). Remaining candidates, in
-   order: (a) the chain-member-read cost itself (~4x own-data reads interp,
-   ~10x jit — and the primitive chain reads now measure ~67-250ns/call
-   interp, the own-scan on the kind prototype) once L2's shape
-   representation lands; (b) the >4096-object store ceiling via L2 per-site
-   store ICs once the shape representation exists; (c) extending 4.2's O(1)
-   handler registration to the remaining agent-dependent modules (Object/
-   Date/Keyed/etc. — same `handler_for` pattern) only if a corpus probe
-   shows their methods hot (array and regexp already registered). 0.1 (the
-   JIT Float16Array/typed-array miscompile) stays owned by the Linux debug
-   agent in parallel.
+   order: (a) the chain-member-read cost itself — probe DONE 2026-09-04:
+   clean marginal warm chain reads (numeric values, bare-row-subtracted,
+   both engines) are interp ~18ns / jit ~17ns vs own-data ~1-3ns, FLAT in
+   link depth (1 vs 2 links identical) — the fixed member_chain_get
+   validation dominates, not the walk; the JIT inline-probe experiment
+   measured slower, and there is no shape-free slice, so the fix is L2's
+   per-site shape/offset IC once the L1c representation lands; (b) the
+   >4096-object store ceiling via L2 per-site store ICs once the shape
+   representation exists; (c) extending 4.2's O(1) handler registration to
+   the remaining agent-dependent modules — probe DONE 2026-09-04: the
+   chain-bound residue is Object's (~40-arm chain: hasOwnProperty ~950ns,
+   Object.hasOwn ~5µs — late arms pay ~35 `intrinsics.get`/call) and
+   DataView's (~660ns) methods, but Object's dispatch arms are INLINE
+   CLOSURES (registering them means refactoring to named fns — defer to L2
+   or a dedicated mechanical pass); Map/Set/WeakMap are NOT chain-bound —
+   they are O(n) per op (find_index/find_set_index linear-scans the
+   entries Vec; Map.get ~2.9µs, Map.set ~3.7µs, Set.has ~5.5µs on a
+   1024-entry map vs Math.abs ~155ns), a structural lever that registration
+   cannot touch. So candidate (c) is superseded by (d): hash-index
+   `map_data`/`set_data` (the entries Vec + a key index) — likely the
+   largest remaining lever for Map/Set-heavy code, and O(n) is why no
+   bench row exposes it. (d) is LANDED (2026-09-04, this tree): each
+   Map/Set now carries a SameValue-consistent key-word index over its live
+   entries (a `MapCollection`/`SetCollection` bundling the tombstoned
+   entries List with the index), so get/has/set/delete probe O(1); a
+   delete drops its row in O(1) and a word-absent probe is an
+   authoritative miss (the exact scan runs only under a genuine 64-bit
+   word collision, `collided`). A/B vs parent (fresh release builds,
+   200k-call rows): the churn row (delete+set over a 1024-entry map, which
+   tombstones and re-appends) drops ~34.5s -> ~0.9s (~38x); Map.get misses
+   ~908 -> ~386ms; Map.get hits ~606 -> ~388ms and Set.has ~1245 -> ~1033ms
+   with the row cost now FLAT in size (1024-entry == 16-entry rows), so
+   the scans are gone. The per-call residual (~1.9µs Map.get / ~3-5µs
+   Set.has) is the module's dispatch-chain arm, NOT a scan — so candidate
+   (c) for the keyed module is the next slice: its dispatch arms are the
+   named `(agent, this, args)` handlers 4.2's `handler_for` pattern wants
+   (unlike Object's inline closures), and registration should collapse the
+   Map.get/Set.has row floors toward the registered charCodeAt ~350ns
+   floor. WeakMap/WeakSet stay linear (their GC compaction renumbers
+   slots, which a position index must clear at every sweep) — not in the
+   measured rows. 0.1 (the JIT Float16Array/typed-array miscompile)
+   stays owned by the Linux debug agent in parallel.

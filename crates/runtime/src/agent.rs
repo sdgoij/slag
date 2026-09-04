@@ -38,6 +38,53 @@ pub type MapEntry = Option<(Value, Value)>;
 /// One element of a Set/WeakSet `[[*Data]]` List.
 pub type SetEntry = Option<Value>;
 
+/// The key index of a Map/Set collection: the SameValue-consistent hash
+/// word of each LIVE key -> the slot of its entry in `entries`. The words
+/// never reference a GC box (numbers fold to bits, strings hash content,
+/// object keys use their stable id), so the index needs no tracing; every
+/// mutation (set/add/delete/clear) keeps it exactly over the live slots, and
+/// a deleted slot drops its rows so a row can never dangle. A word collision
+/// between distinct keys is resolved by the caller's exact SameValue check
+/// on the slot (with a linear-scan fallback), so the index is a pure
+/// accelerator over the tombstoned `entries` List.
+pub type KeyedIndex = std::collections::HashMap<u64, usize>;
+
+/// The [[MapData]] List of a Map instance (spec 24.1.1; `None` is a deleted
+/// ~empty~ slot kept so suspended iterators keep working) plus its key
+/// index. The index maps the SameValue-consistent hash word of each live key
+/// to its slot; because every live key owns a row (except under a genuine
+/// 64-bit word collision, tracked by `collided`), a word with no row is an
+/// authoritative miss and a delete drops its row in O(1).
+#[derive(Default)]
+pub struct MapCollection {
+    pub entries: Vec<MapEntry>,
+    pub index: KeyedIndex,
+    /// Whether two live keys ever shared a hash word (a 64-bit collision):
+    /// while set, the single-slot index cannot shadow one of them, so the
+    /// ops fall back to the exact scan instead of trusting the row.
+    pub collided: bool,
+}
+
+/// The [[SetData]] of a Set instance (spec 24.2.1) plus its element index.
+#[derive(Default)]
+pub struct SetCollection {
+    pub entries: Vec<SetEntry>,
+    pub index: KeyedIndex,
+    pub collided: bool,
+}
+
+impl Trace for MapCollection {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.entries.trace(visit);
+    }
+}
+
+impl Trace for SetCollection {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.entries.trace(visit);
+    }
+}
+
 /// The GC box address of a heap value, `None` for doubles and the non-heap
 /// tags (GC-3: the weak-table compaction and ephemeron registration identify
 /// entries by their key's box).
@@ -602,11 +649,12 @@ pub struct Agent {
     pub raw_json_data: std::collections::HashMap<u64, JsString>,
     /// The [[MapData]] of Map instances, keyed by object identity (spec
     /// 24.1.1: a List of entries; `None` marks a deleted ~empty~ slot that
-    /// suspended Map iterators skip).
-    pub map_data: std::collections::HashMap<u64, RefCell<Vec<MapEntry>>>,
+    /// suspended Map iterators skip). The parallel key index makes the
+    /// get/has/set/delete probes O(1) on the live entries.
+    pub map_data: std::collections::HashMap<u64, RefCell<MapCollection>>,
     /// The [[SetData]] of Set instances, keyed by object identity (spec
-    /// 24.2.1; `None` is a deleted ~empty~ slot).
-    pub set_data: std::collections::HashMap<u64, RefCell<Vec<SetEntry>>>,
+    /// 24.2.1; `None` is a deleted ~empty~ slot) plus the element index.
+    pub set_data: std::collections::HashMap<u64, RefCell<SetCollection>>,
     /// The [[WeakMapData]] of WeakMap instances, keyed by object identity
     /// (spec 26.3.1; the Rc model never collects the keys, Phase 18).
     pub weak_map_data: std::collections::HashMap<u64, RefCell<Vec<MapEntry>>>,

@@ -18,7 +18,7 @@ use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::value::{Value, ValueKind, is_callable};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, MapEntry, SetEntry};
 use crate::context::{as_object, get_property};
 use crate::expr::IteratorRecord;
 use crate::realm::Realm;
@@ -162,8 +162,285 @@ fn canonicalize_key(key: Value) -> Value {
     }
 }
 
+/// The SameValue-consistent hash word of a canonicalized key: two keys that
+/// SameValue-match always produce the same word, so the per-collection index
+/// (word -> live slot) can never miss a live key. Numbers fold NaN (any
+/// payload SameValue-equals any other, spec 7.2.12) and the ±0 pair; strings
+/// and BigInts hash content (equal content SameValue-equals across distinct
+/// boxes); a Function value and an Object value aliasing the function's
+/// object side are SameValue-equal (7.2.12 step 7), so both hash the
+/// object's stable id. Words never reference a GC box, so the index needs no
+/// tracing. A collision between DISTINCT keys is harmless — the slot probe
+/// validates with an exact SameValue compare and falls back to the linear
+/// scan — so the mapping only has to be consistent, not collision-free.
+fn key_word(key: Value) -> u64 {
+    match key.kind() {
+        ValueKind::Number(number) => {
+            if number.is_nan() {
+                0x7ff8_0000_0000_0000
+            } else if number == 0.0 {
+                0x7ff8_0000_0000_0001
+            } else {
+                number.to_bits()
+            }
+        }
+        ValueKind::String(text) => {
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            for &unit in text.as_slice() {
+                hash ^= unit as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash | 0x4000_0000_0000_0000
+        }
+        ValueKind::BigInt(bigint) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            Hash::hash(&*bigint, &mut hasher);
+            hasher.finish() | 0x4000_0000_0000_0000
+        }
+        ValueKind::Symbol(symbol) => symbol.id | 0x2000_0000_0000_0000,
+        ValueKind::Object(object) => object.id(),
+        ValueKind::Function(function) => function.object.id(),
+        ValueKind::Boolean(true) => 0x1000_0000_0000_0001,
+        ValueKind::Boolean(false) => 0x1000_0000_0000_0002,
+        ValueKind::Undefined => 0x1000_0000_0000_0003,
+        ValueKind::Null => 0x1000_0000_0000_0004,
+    }
+}
+
+impl crate::agent::MapCollection {
+    /// The slot of the live entry whose key SameValue-matches `key`, or
+    /// `None` (spec SetDataIndex/MapData scan). Every live key owns exactly
+    /// one index row unless a 64-bit word collision shadowed it (`collided`),
+    /// so without a collision the row (or its absence) is authoritative; the
+    /// exact linear scan runs only as the collision safety net.
+    fn slot(&self, key: &Value) -> Option<usize> {
+        let word = key_word(*key);
+        if let Some(&slot) = self.index.get(&word)
+            && let Some(Some((existing, _))) = self.entries.get(slot)
+            && same_value(existing, key)
+        {
+            return Some(slot);
+        }
+        if self.collided {
+            return find_index(&self.entries, key);
+        }
+        None
+    }
+
+    fn contains(&self, key: &Value) -> bool {
+        self.slot(key).is_some()
+    }
+
+    fn get_value(&self, key: &Value) -> Value {
+        match self.slot(key) {
+            Some(index) => self.entries[index]
+                .as_ref()
+                .map(|entry| entry.1)
+                .unwrap_or(Value::Undefined),
+            None => Value::Undefined,
+        }
+    }
+
+    /// Set or append one entry (spec Map.prototype.set): an existing live
+    /// key updates its value in place; an absent key — including one deleted
+    /// to a tombstone — appends a NEW entry at the List's end.
+    fn set(&mut self, key: Value, value: Value) {
+        if let Some(index) = self.slot(&key) {
+            if let Some(entry) = &mut self.entries[index] {
+                entry.1 = value;
+            }
+        } else {
+            self.push_new(key, value);
+        }
+    }
+
+    fn push_new(&mut self, key: Value, value: Value) {
+        let word = key_word(key);
+        let slot = self.entries.len();
+        self.entries.push(Some((key, value)));
+        if self.index.insert(word, slot).is_some() {
+            // A live entry already carried this word: the single-slot index
+            // can no longer serve both, so lookups must use the exact scan.
+            self.collided = true;
+        }
+    }
+
+    /// Remove the live `key` entry (spec Map.prototype.delete): tombstone its
+    /// slot (kept so suspended iterators keep scanning) and drop the index
+    /// rows that pointed at it.
+    fn remove(&mut self, key: &Value) -> bool {
+        let word = key_word(*key);
+        let found = if let Some(&slot) = self.index.get(&word) {
+            if let Some(Some((existing, _))) = self.entries.get(slot)
+                && same_value(existing, key)
+            {
+                Some(slot)
+            } else if self.collided {
+                find_index(&self.entries, key)
+            } else {
+                None
+            }
+        } else if self.collided {
+            find_index(&self.entries, key)
+        } else {
+            None
+        };
+        if let Some(slot) = found {
+            self.entries[slot] = None;
+            if self.collided {
+                // A collision may have left another live key sharing the
+                // deleted word without a row; rebuild so every remaining
+                // live key owns one again.
+                self.rebuild_index();
+            } else {
+                self.index.remove(&word);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear(&mut self) {
+        for entry in &mut self.entries {
+            *entry = None;
+        }
+        self.index.clear();
+        self.collided = false;
+    }
+
+    fn live_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_some()).count()
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        self.collided = false;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if let Some((key, _)) = entry
+                && self.index.insert(key_word(*key), slot).is_some()
+            {
+                self.collided = true;
+            }
+        }
+    }
+
+    /// A collection over an existing entries list, with every live entry
+    /// indexed (the constructors that build the List directly: `groupBy` and
+    /// the result sets/maps of the set-methods).
+    fn from_entries(entries: Vec<MapEntry>) -> Self {
+        let mut collection = crate::agent::MapCollection {
+            entries,
+            index: std::collections::HashMap::new(),
+            collided: false,
+        };
+        collection.rebuild_index();
+        collection
+    }
+}
+
+impl crate::agent::SetCollection {
+    /// The slot of the live element SameValue-matching `value`, or `None`.
+    fn slot(&self, value: &Value) -> Option<usize> {
+        let word = key_word(*value);
+        if let Some(&slot) = self.index.get(&word)
+            && let Some(Some(existing)) = self.entries.get(slot)
+            && same_value(existing, value)
+        {
+            return Some(slot);
+        }
+        if self.collided {
+            return find_set_index(&self.entries, value);
+        }
+        None
+    }
+
+    fn contains(&self, value: &Value) -> bool {
+        self.slot(value).is_some()
+    }
+
+    /// Add the element when it is new (spec Set.prototype.add).
+    fn add(&mut self, value: Value) {
+        if self.slot(&value).is_none() {
+            let word = key_word(value);
+            let slot = self.entries.len();
+            self.entries.push(Some(value));
+            if self.index.insert(word, slot).is_some() {
+                self.collided = true;
+            }
+        }
+    }
+
+    /// Remove the live `value` element (spec Set.prototype.delete).
+    fn remove(&mut self, value: &Value) -> bool {
+        let word = key_word(*value);
+        let found = if let Some(&slot) = self.index.get(&word) {
+            if let Some(Some(existing)) = self.entries.get(slot)
+                && same_value(existing, value)
+            {
+                Some(slot)
+            } else if self.collided {
+                find_set_index(&self.entries, value)
+            } else {
+                None
+            }
+        } else if self.collided {
+            find_set_index(&self.entries, value)
+        } else {
+            None
+        };
+        if let Some(slot) = found {
+            self.entries[slot] = None;
+            if self.collided {
+                self.rebuild_index();
+            } else {
+                self.index.remove(&word);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear(&mut self) {
+        for entry in &mut self.entries {
+            *entry = None;
+        }
+        self.index.clear();
+        self.collided = false;
+    }
+
+    fn live_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_some()).count()
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        self.collided = false;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if let Some(value) = entry
+                && self.index.insert(key_word(*value), slot).is_some()
+            {
+                self.collided = true;
+            }
+        }
+    }
+
+    fn from_entries(entries: Vec<SetEntry>) -> Self {
+        let mut collection = crate::agent::SetCollection {
+            entries,
+            index: std::collections::HashMap::new(),
+            collided: false,
+        };
+        collection.rebuild_index();
+        collection
+    }
+}
+
 /// Find the index of the entry whose key SameValue-matches (after
-/// canonicalization), or `None` (spec SetDataIndex/MapData scan).
+/// canonicalization), or `None` (spec SetDataIndex/MapData scan). The weak
+/// collections and the set-methods' local result Lists keep the exact scan.
 fn find_index(map: &[Option<(Value, Value)>], key: &Value) -> Option<usize> {
     map.iter().position(|entry| match entry {
         Some((existing, _)) => same_value(existing, key),
@@ -175,11 +452,6 @@ fn find_index(map: &[Option<(Value, Value)>], key: &Value) -> Option<usize> {
 fn find_set_index(set: &[Option<Value>], value: &Value) -> Option<usize> {
     set.iter()
         .position(|entry| matches!(entry, Some(existing) if same_value(existing, value)))
-}
-
-/// The number of live (non-~empty~) entries (spec MapDataSize/SetDataSize).
-fn live_count(map: &[Option<(Value, Value)>]) -> usize {
-    map.iter().filter(|entry| entry.is_some()).count()
 }
 
 /// RequireInternalSlot: `this` is an object registered in the map table.
@@ -220,7 +492,13 @@ fn set_data_count(agent: &Agent, id: u64) -> usize {
     agent
         .set_data
         .get(&id)
-        .map(|cell| cell.borrow().iter().filter(|entry| entry.is_some()).count())
+        .map(|cell| {
+            cell.borrow()
+                .entries
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count()
+        })
         .unwrap_or(0)
 }
 
@@ -232,6 +510,7 @@ fn set_data_at(agent: &Agent, id: u64, index: usize) -> Option<Value> {
         .set_data
         .get(&id)?
         .borrow()
+        .entries
         .get(index)
         .cloned()
         .flatten()
@@ -240,7 +519,7 @@ fn set_data_at(agent: &Agent, id: u64, index: usize) -> Option<Value> {
 /// Whether the live [[SetData]] contains `value`.
 fn set_data_contains(agent: &Agent, id: u64, value: &Value) -> bool {
     let data = agent.set_data.get(&id).map(|cell| cell.borrow()).unwrap();
-    find_set_index(&data, value).is_some()
+    data.contains(value)
 }
 
 fn weak_map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
@@ -307,13 +586,7 @@ fn map_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
-    if let Some(index) = find_index(&data, &key) {
-        if let Some(entry) = &mut data[index] {
-            entry.1 = value;
-        }
-    } else {
-        data.push(Some((key, value)));
-    }
+    data.set(key, value);
     Ok(*this)
 }
 
@@ -322,12 +595,7 @@ fn map_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     let object = map_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
-    if let Some(index) = find_index(&data, &key) {
-        data[index] = None;
-        Ok(Value::Boolean(true))
-    } else {
-        Ok(Value::Boolean(false))
-    }
+    Ok(Value::Boolean(data.remove(&key)))
 }
 
 /// Map.prototype.get (spec 24.1.3.6).
@@ -335,13 +603,7 @@ fn map_get(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     let object = map_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let data = agent.map_data.get(&object.id()).unwrap().borrow();
-    Ok(match find_index(&data, &key) {
-        Some(index) => data[index]
-            .as_ref()
-            .map(|entry| entry.1)
-            .unwrap_or(Value::Undefined),
-        None => Value::Undefined,
-    })
+    Ok(data.get_value(&key))
 }
 
 /// Map.prototype.has (spec 24.1.3.7).
@@ -349,7 +611,7 @@ fn map_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     let object = map_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let data = agent.map_data.get(&object.id()).unwrap().borrow();
-    Ok(Value::Boolean(find_index(&data, &key).is_some()))
+    Ok(Value::Boolean(data.contains(&key)))
 }
 
 /// Map.prototype.clear (spec 24.1.3.1): every entry becomes ~empty~ but the
@@ -357,9 +619,7 @@ fn map_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
 fn map_clear(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = map_of(agent, this)?;
     let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
-    for entry in data.iter_mut() {
-        *entry = None;
-    }
+    data.clear();
     Ok(Value::Undefined)
 }
 
@@ -367,7 +627,7 @@ fn map_clear(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, 
 fn map_size(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = map_of(agent, this)?;
     let data = agent.map_data.get(&object.id()).unwrap().borrow();
-    Ok(Value::Number(live_count(&data) as f64))
+    Ok(Value::Number(data.live_count() as f64))
 }
 
 /// Map.prototype.getOrInsert (spec 24.1.3.6.1).
@@ -376,14 +636,14 @@ fn map_get_or_insert(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
-    if let Some(index) = find_index(&data, &key) {
-        let value = data[index]
+    if let Some(index) = data.slot(&key) {
+        let value = data.entries[index]
             .as_ref()
             .map(|entry| entry.1)
             .unwrap_or(Value::Undefined);
         return Ok(value);
     }
-    data.push(Some((key, value)));
+    data.push_new(key, value);
     Ok(value)
 }
 
@@ -405,8 +665,8 @@ fn map_get_or_insert_computed(
     }
     {
         let data = agent.map_data.get(&object.id()).unwrap().borrow();
-        if let Some(index) = find_index(&data, &key) {
-            let value = data[index]
+        if let Some(index) = data.slot(&key) {
+            let value = data.entries[index]
                 .as_ref()
                 .map(|entry| entry.1)
                 .unwrap_or(Value::Undefined);
@@ -420,13 +680,7 @@ fn map_get_or_insert_computed(
         std::slice::from_ref(&key),
     )?;
     let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
-    if let Some(index) = find_index(&data, &key) {
-        if let Some(entry) = &mut data[index] {
-            entry.1 = value;
-        }
-    } else {
-        data.push(Some((key, value)));
-    }
+    data.set(key, value);
     Ok(value)
 }
 
@@ -446,7 +700,10 @@ fn map_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     loop {
         let (entry, count) = {
             let data = agent.map_data.get(&object.id()).unwrap().borrow();
-            (data.get(index).cloned().flatten(), data.len())
+            (
+                data.entries.get(index).cloned().flatten(),
+                data.entries.len(),
+            )
         };
         if index >= count {
             break;
@@ -521,6 +778,7 @@ fn map_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
         .get(&map_object.id())
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Iterated Map is not a Map".into()))?
         .borrow()
+        .entries
         .clone();
     let len = data.len();
     while index < len {
@@ -573,9 +831,7 @@ fn set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     let object = set_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let mut data = agent.set_data.get(&object.id()).unwrap().borrow_mut();
-    if find_set_index(&data, &value).is_none() {
-        data.push(Some(value));
-    }
+    data.add(value);
     Ok(*this)
 }
 
@@ -584,12 +840,7 @@ fn set_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     let object = set_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let mut data = agent.set_data.get(&object.id()).unwrap().borrow_mut();
-    if let Some(index) = find_set_index(&data, &value) {
-        data[index] = None;
-        Ok(Value::Boolean(true))
-    } else {
-        Ok(Value::Boolean(false))
-    }
+    Ok(Value::Boolean(data.remove(&value)))
 }
 
 /// Set.prototype.has (spec 24.2.3.8).
@@ -597,16 +848,14 @@ fn set_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     let object = set_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let data = agent.set_data.get(&object.id()).unwrap().borrow();
-    Ok(Value::Boolean(find_set_index(&data, &value).is_some()))
+    Ok(Value::Boolean(data.contains(&value)))
 }
 
 /// Set.prototype.clear (spec 24.2.3.2).
 fn set_clear(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = set_of(agent, this)?;
     let mut data = agent.set_data.get(&object.id()).unwrap().borrow_mut();
-    for entry in data.iter_mut() {
-        *entry = None;
-    }
+    data.clear();
     Ok(Value::Undefined)
 }
 
@@ -614,8 +863,7 @@ fn set_clear(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, 
 fn set_size(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = set_of(agent, this)?;
     let data = agent.set_data.get(&object.id()).unwrap().borrow();
-    let count = data.iter().filter(|entry| entry.is_some()).count();
-    Ok(Value::Number(count as f64))
+    Ok(Value::Number(data.live_count() as f64))
 }
 
 /// Set.prototype.forEach (spec 24.2.3.6): callback(value, value, set).
@@ -633,7 +881,10 @@ fn set_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     loop {
         let (entry, count) = {
             let data = agent.set_data.get(&object.id()).unwrap().borrow();
-            (data.get(index).cloned().flatten(), data.len())
+            (
+                data.entries.get(index).cloned().flatten(),
+                data.entries.len(),
+            )
         };
         if index >= count {
             break;
@@ -705,6 +956,7 @@ fn set_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
         .get(&set_object.id())
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Iterated Set is not a Set".into()))?
         .borrow()
+        .entries
         .clone();
     let len = data.len();
     while index < len {
@@ -828,7 +1080,10 @@ fn new_set_from_data(agent: &mut Agent, data: Vec<Option<Value>>) -> Result<Valu
         .and_then(|value| as_object(&value))
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%Set.prototype% missing".into()))?;
     let set = JsObject::ordinary_object_create(Some(proto));
-    agent.set_data.insert(set.id(), RefCell::new(data));
+    agent.set_data.insert(
+        set.id(),
+        RefCell::new(crate::agent::SetCollection::from_entries(data)),
+    );
     Ok(Value::Object(set))
 }
 
@@ -838,7 +1093,13 @@ fn set_union(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let mut result = agent.set_data.get(&object.id()).unwrap().borrow().clone();
+    let mut result = agent
+        .set_data
+        .get(&object.id())
+        .unwrap()
+        .borrow()
+        .entries
+        .clone();
     let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
     while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
         let value = canonicalize_key(next);
@@ -855,7 +1116,13 @@ fn set_intersection(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let data = agent.set_data.get(&object.id()).unwrap().borrow().clone();
+    let data = agent
+        .set_data
+        .get(&object.id())
+        .unwrap()
+        .borrow()
+        .entries
+        .clone();
     let this_size = data.iter().filter(|e| e.is_some()).count();
     let mut result: Vec<Option<Value>> = Vec::new();
     if this_size <= record.size {
@@ -889,7 +1156,13 @@ fn set_difference(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let data = agent.set_data.get(&object.id()).unwrap().borrow().clone();
+    let data = agent
+        .set_data
+        .get(&object.id())
+        .unwrap()
+        .borrow()
+        .entries
+        .clone();
     let this_size = data.iter().filter(|e| e.is_some()).count();
     let mut result = data.clone();
     if this_size <= record.size {
@@ -936,7 +1209,7 @@ fn set_symmetric_difference(
     // checked against the *live* set, because the key iterator's `next` can
     // mutate the receiver (set-like-class-mutation keeps values deleted by
     // the mutation and drops values re-added by it).
-    let mut result = agent.set_data.get(&id).unwrap().borrow().clone();
+    let mut result = agent.set_data.get(&id).unwrap().borrow().entries.clone();
     let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
     while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
         let value = canonicalize_key(next);
@@ -987,7 +1260,13 @@ fn set_is_superset_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let data = agent.set_data.get(&object.id()).unwrap().borrow().clone();
+    let data = agent
+        .set_data
+        .get(&object.id())
+        .unwrap()
+        .borrow()
+        .entries
+        .clone();
     let this_size = data.iter().filter(|e| e.is_some()).count();
     if this_size < record.size {
         return Ok(Value::Boolean(false));
@@ -1363,7 +1642,10 @@ fn map_group_by(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Valu
         let array = crate::builtins::array::array_from_values(agent, &elements)?;
         data.push(Some((key, array)));
     }
-    agent.map_data.insert(map.id(), RefCell::new(data));
+    agent.map_data.insert(
+        map.id(),
+        RefCell::new(crate::agent::MapCollection::from_entries(data)),
+    );
     Ok(Value::Object(map))
 }
 
@@ -1372,7 +1654,10 @@ fn map_group_by(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Valu
 fn map_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Result<Value, JsError> {
     let proto = get_prototype_from_constructor(agent, new_target, MAP_PROTO)?;
     let map = JsObject::ordinary_object_create(Some(proto));
-    agent.map_data.insert(map.id(), RefCell::new(Vec::new()));
+    agent.map_data.insert(
+        map.id(),
+        RefCell::new(crate::agent::MapCollection::default()),
+    );
     let map_value = Value::Object(map);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {
@@ -1392,7 +1677,10 @@ fn map_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Resul
 fn set_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Result<Value, JsError> {
     let proto = get_prototype_from_constructor(agent, new_target, SET_PROTO)?;
     let set = JsObject::ordinary_object_create(Some(proto));
-    agent.set_data.insert(set.id(), RefCell::new(Vec::new()));
+    agent.set_data.insert(
+        set.id(),
+        RefCell::new(crate::agent::SetCollection::default()),
+    );
     let set_value = Value::Object(set);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {
@@ -2553,6 +2841,206 @@ mod tests {
                 "(function(){ var wm = new WeakMap(); var a = {}; wm.set(a, 1); wm.set(a, 9); return wm.get(a); })()"
             ),
             9.0
+        );
+    }
+
+    #[test]
+    fn hash_indexed_collections_agree_with_the_exact_scan() {
+        // The key index must be observationally identical to the exact
+        // SameValue linear scan over the tombstoned entries List: same live
+        // membership, same slot for every key, same insertion order, and the
+        // same append-not-reuse semantics after a delete. Drive a Map and a
+        // Set with a deterministic pseudo-random op sequence over keys that
+        // cover every SameValue subtlety the word function folds: NaN
+        // payloads, the ±0 pair, equal-content strings in DISTINCT boxes,
+        // and object identity.
+        use crate::agent::{MapCollection, SetCollection};
+
+        fn mix(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn model_map_find(model: &[Option<(Value, Value)>], key: &Value) -> Option<usize> {
+            model
+                .iter()
+                .position(|e| matches!(e, Some((existing, _)) if same_value(existing, key)))
+        }
+        fn model_set_find(model: &[Option<Value>], value: &Value) -> Option<usize> {
+            model
+                .iter()
+                .position(|e| matches!(e, Some(existing) if same_value(existing, value)))
+        }
+        // A fresh box per call: equal content, distinct allocation.
+        let string_key = |content: &str| Value::String(Handle::new(JsString::from_utf8(content)));
+        // Distinct NaN bit patterns SameValue-equal (any payload) and unequal
+        // to every non-NaN. `Value::Number(NaN)` canonicalizes colliding
+        // quiet NaNs; a sign-set NaN payload passes through as a double.
+        let nan_a = Value::Number(f64::NAN);
+        let nan_b = Value::from_bits(0xfff8_0000_0000_0001);
+        assert!(nan_a.as_number().unwrap().is_nan());
+        assert!(nan_b.as_number().unwrap().is_nan());
+        assert_ne!(nan_a.bits(), nan_b.bits());
+        assert!(same_value(&nan_a, &nan_b));
+        let object_keys = [
+            Value::Object(JsObject::ordinary_object_create(None)),
+            Value::Object(JsObject::ordinary_object_create(None)),
+            Value::Object(JsObject::ordinary_object_create(None)),
+        ];
+        // 24 distinct contents; every probe passes a fresh box so a hit must
+        // come from content hashing, never pointer equality.
+        let contents: Vec<String> = (0..24).map(|i| format!("key-{i}")).collect();
+        // Non-string fixed keys drawn by index: undefined, null, two
+        // booleans, two NaN payloads, ±0, and twelve numbers.
+        let fixed = [
+            Value::Undefined,
+            Value::Null,
+            Value::Boolean(true),
+            Value::Boolean(false),
+            nan_a,
+            nan_b,
+            Value::Number(0.0),
+            Value::Number(-0.0),
+        ];
+        let fixed_numbers: Vec<Value> = (1..=12).map(|i| Value::Number(i as f64)).collect();
+
+        let draw_key = |state: &mut u64| -> Value {
+            let r = mix(state);
+            match (r % 16) as usize {
+                0..=7 => fixed[r as usize % fixed.len()],
+                8..=11 => string_key(&contents[r as usize % contents.len()]),
+                12..=14 => object_keys[r as usize % object_keys.len()],
+                _ => fixed_numbers[r as usize % fixed_numbers.len()],
+            }
+        };
+
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut map = MapCollection::default();
+        let mut map_model: Vec<Option<(Value, Value)>> = Vec::new();
+        let mut set = SetCollection::default();
+        let mut set_model: Vec<Option<Value>> = Vec::new();
+        for _ in 0..3000 {
+            let op = mix(&mut state) % 5;
+            match op {
+                0 | 1 => {
+                    let key = draw_key(&mut state);
+                    let value = Value::Number((mix(&mut state) % 1000) as f64);
+                    map.set(key, value);
+                    match model_map_find(&map_model, &key) {
+                        Some(i) => map_model[i] = Some((map_model[i].as_ref().unwrap().0, value)),
+                        None => map_model.push(Some((key, value))),
+                    }
+                }
+                2 => {
+                    let key = draw_key(&mut state);
+                    let removed = map.remove(&key);
+                    let expected = match model_map_find(&map_model, &key) {
+                        Some(i) => {
+                            map_model[i] = None;
+                            true
+                        }
+                        None => false,
+                    };
+                    assert_eq!(removed, expected);
+                }
+                3 => {
+                    map.clear();
+                    map_model.fill(None);
+                }
+                _ => {
+                    let value = draw_key(&mut state);
+                    set.add(value);
+                    if model_set_find(&set_model, &value).is_none() {
+                        set_model.push(Some(value));
+                    }
+                }
+            }
+            if mix(&mut state).is_multiple_of(4) {
+                let value = draw_key(&mut state);
+                let removed = set.remove(&value);
+                let expected = match model_set_find(&set_model, &value) {
+                    Some(i) => {
+                        set_model[i] = None;
+                        true
+                    }
+                    None => false,
+                };
+                assert_eq!(removed, expected);
+            }
+            // Both collections must mirror their model exactly after every
+            // op: identical Vec length (tombstones preserved), identical
+            // live membership in insertion order, and identical slot answers
+            // for every probe key (fresh boxes included).
+            assert_eq!(map.entries.len(), map_model.len());
+            let map_live: Vec<(Value, Value)> = map
+                .entries
+                .iter()
+                .flatten()
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            let model_live: Vec<(Value, Value)> = map_model.iter().flatten().copied().collect();
+            assert_eq!(map_live.len(), model_live.len());
+            for (actual, expected) in map_live.iter().zip(&model_live) {
+                assert!(same_value(&actual.0, &expected.0));
+                assert!(same_value(&actual.1, &expected.1));
+            }
+            assert_eq!(set.entries.len(), set_model.len());
+            for content in &contents {
+                let probe = string_key(content);
+                assert_eq!(map.slot(&probe), model_map_find(&map_model, &probe));
+                assert_eq!(set.slot(&probe), model_set_find(&set_model, &probe));
+            }
+            for probe in [nan_a, nan_b, Value::Number(0.0), Value::Number(-0.0)] {
+                assert_eq!(map.slot(&probe), model_map_find(&map_model, &probe));
+                assert_eq!(set.slot(&probe), model_set_find(&set_model, &probe));
+            }
+            for key in &object_keys {
+                assert_eq!(map.slot(key), model_map_find(&map_model, key));
+                assert_eq!(set.slot(key), model_set_find(&set_model, key));
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_map_and_set_survive_gc_stress() {
+        // The index holds no GC references; a collection in the middle of an
+        // indexed op must tolerate a per-allocation collection (the swept
+        // data cell aborts the trace) and the next op must still find every
+        // key. Rope keys (>16 units) exercise the content-hash flatten;
+        // object keys the id path; NaN and -0 the number fold. Keys are
+        // re-set and deleted so tombstones accumulate under stress.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.set_gc_stress(true);
+        let value = agent
+            .run_script(
+                "(function(){ var m = new Map(); var s = new Set(); \
+                  var obj = {}; \
+                  for (var i = 0; i < 200; i++) { \
+                    var longKey = 'k' + i + '-abcdefghijklmnopqrstuvwxyz'; \
+                    var again = 'k' + i + '-abcdefghijklmnopqrstuvwxyz'; \
+                    m.set(longKey, i); s.add(again); m.set(obj, i); m.set(NaN, i); m.set(-0, i); \
+                    if (i % 3 === 0) { m.delete(longKey); s.delete(again); } \
+                  } \
+                  var out = 0; \
+                  for (var i = 0; i < 200; i++) { \
+                    var probe = 'k' + i + '-abcdefghijklmnopqrstuvwxyz'; \
+                    out += (m.has(probe) ? 1 : 0) + (s.has(probe) ? 2 : 0); \
+                  } \
+                  return out + '|' + m.get(obj) + '|' + m.get(NaN) + '|' + m.get(0) + '|' + m.size + '|' + s.size; \
+                })()",
+            )
+            .unwrap();
+        let ValueKind::String(s) = value.kind() else {
+            panic!("expected a string, got {value:?}")
+        };
+        // 200 keys minus the 67 deleted every i%3==0, plus the three
+        // repeated obj/NaN/-0 keys.
+        assert_eq!(
+            s.to_string_lossy(),
+            "399|199|199|199|136|133",
+            "gc-stress Map/Set behavior diverged"
         );
     }
 }
