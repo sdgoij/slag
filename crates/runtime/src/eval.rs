@@ -5276,6 +5276,77 @@ mod tests {
     }
 
     #[test]
+    fn non_string_primitive_method_reads_resolve_on_the_prototype_chain() {
+        // Tasklist recommended-order follow-on: Number/Boolean/BigInt/Symbol
+        // primitives had the SAME per-read wrapper boxing as strings did
+        // (each method read built a fresh wrapper object — a 448B JsObject
+        // plus an agent table insert for the boxed value — before the chain
+        // read; the string-only 1.4/1.5 helper left them on the generic
+        // path). The shared member helpers now route every primitive to
+        // `get_primitive_member`, which resolves the key against the kind's
+        // cached %X.prototype% with the primitive as the [[Get]] receiver.
+        // These asserts pin the semantics the direct resolution must
+        // preserve, kind by kind.
+        assert_eq!(
+            run("(1.25).toFixed(1) + ':' + (255).toString(16) + ':' + (10).toPrecision(3)")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("1.3:ff:10.0")))
+        );
+        assert_eq!(
+            run("true.toString() + ':' + false.valueOf()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("true:false")))
+        );
+        // A data-property patch on the prototype is read live.
+        assert_eq!(
+            run("var npo = Number.prototype.toFixed; \
+                 Number.prototype.toFixed = function () { return 'X'; }; \
+                 var patched = (1.5).toFixed(); Number.prototype.toFixed = npo; patched")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("X")))
+        );
+        // Accessors on the chain see the primitive receiver: a strict getter
+        // on %Number.prototype% receives `this` = the number (only sloppy
+        // this-coercion boxes it).
+        assert_eq!(
+            run("Object.defineProperty(Number.prototype, 'slop', { get: function () { return typeof this; } }); \
+                 Object.defineProperty(Number.prototype, 'strct', { get: function () { 'use strict'; return typeof this; } }); \
+                 var slop = (5).slop; var strct = (5).strct; \
+                 delete Number.prototype.slop; delete Number.prototype.strct; slop + ':' + strct")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("object:number")))
+        );
+        // An exotic (proxy) link later in the chain runs its [[Get]] with
+        // the primitive receiver.
+        assert_eq!(
+            run("var log = []; \
+                 var p = new Proxy({}, { get: function (t, k, r) { 'use strict'; log.push(typeof r); return 3; } }); \
+                 Object.setPrototypeOf(Number.prototype, p); \
+                 var got = (5).zz; Object.setPrototypeOf(Number.prototype, Object.prototype); \
+                 got + ':' + log.join(',')")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("3:number")))
+        );
+        // Symbol chain reads: the `description` accessor and `toString` data
+        // property resolve off %Symbol.prototype%.
+        assert_eq!(
+            run("Symbol('d').description + ':' + (Symbol().description === undefined) + ':' + Symbol('x').toString()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("d:true:Symbol(x)")))
+        );
+        // BigInt chain reads.
+        assert_eq!(
+            run("123n.toString() + ':' + (123n).toString(2)").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("123:1111011")))
+        );
+        // Boxed wrapper objects still read through their own machinery.
+        assert_eq!(
+            run("new Number(5).toFixed(1) + ':' + new Number(5).valueOf() + ':' + Object(5).toFixed(1)")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("5.0:5:5.0")))
+        );
+    }
+
+    #[test]
     fn fast_path_annex_b_block_functions() {
         // Cut 6 first slice (Annex B): a block-level function declaration
         // in a sloppy body certifies — the block binding is a frame slot

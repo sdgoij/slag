@@ -81,10 +81,32 @@ pub struct Intrinsics {
     /// JsString per call, so the cache keeps a hot `s.charAt`-style read off
     /// the allocation path.
     string_prototype: RefCell<Option<Value>>,
+    /// The other primitive-creation prototype intrinsics (%Number.prototype%,
+    /// %Boolean.prototype%, %BigInt.prototype%, %Symbol.prototype%), cached
+    /// after the first resolution like `string_prototype`: non-string
+    /// primitive member reads resolve their chain against these directly
+    /// (their wrappers are ordinary objects with no own properties, so a
+    /// chain read with the primitive receiver is exact).
+    primitive_prototypes: RefCell<[Option<Value>; PRIM_PROTO_COUNT]>,
 }
 
 /// The number of cached function-creation prototype intrinsics.
 pub(crate) const FN_PROTO_COUNT: usize = 6;
+
+/// The number of cached non-string primitive-creation prototype intrinsics
+/// (the primitive member-read fast path resolves chain reads against them).
+pub(crate) const PRIM_PROTO_COUNT: usize = 4;
+
+/// The slot index for a non-string primitive prototype intrinsic name.
+pub(crate) fn primitive_prototype_index(name: &str) -> usize {
+    match name {
+        "%Number.prototype%" => 0,
+        "%Boolean.prototype%" => 1,
+        "%BigInt.prototype%" => 2,
+        "%Symbol.prototype%" => 3,
+        _ => unreachable!("not a cached primitive prototype intrinsic: {name}"),
+    }
+}
 
 /// The slot index for a function-creation prototype intrinsic name.
 pub(crate) fn function_prototype_index(name: &str) -> usize {
@@ -117,6 +139,14 @@ impl Trace for Intrinsics {
         self.apply_builtin.trace(visit);
         self.call_builtin.trace(visit);
         self.string_prototype.trace(visit);
+        match self.primitive_prototypes.try_borrow() {
+            Ok(guard) => {
+                for slot in guard.iter() {
+                    slot.trace(visit);
+                }
+            }
+            Err(_) => crux::heap::note_aborted_trace(),
+        }
     }
 }
 
@@ -184,6 +214,19 @@ impl Intrinsics {
         }
         let value = self.get("%String.prototype%")?;
         *self.string_prototype.borrow_mut() = Some(value);
+        Some(value)
+    }
+
+    /// A non-string primitive prototype intrinsic (%Number.prototype%,
+    /// %Boolean.prototype%, %BigInt.prototype%, %Symbol.prototype%), cached
+    /// after the first resolution (see the struct field).
+    pub fn primitive_prototype(&self, name: &'static str) -> Option<Value> {
+        let index = primitive_prototype_index(name);
+        if let Some(value) = self.primitive_prototypes.borrow()[index] {
+            return Some(value);
+        }
+        let value = self.get(name)?;
+        self.primitive_prototypes.borrow_mut()[index] = Some(value);
         Some(value)
     }
 

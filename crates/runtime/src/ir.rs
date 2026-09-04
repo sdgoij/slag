@@ -8166,11 +8166,12 @@ impl Vm {
                 if let Some(value) = Self::member_chain_get(agent, &object, name) {
                     return Ok(value);
                 }
-                let value = if matches!(object.kind(), ValueKind::String(_)) {
-                    Self::get_string_primitive(agent, object, &PropertyKey::String(name))?
-                } else {
-                    crate::context::get_property(agent, &object, &crux::lookup(name), object)?
-                };
+                let value =
+                    if !matches!(object.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
+                        Self::get_primitive_member(agent, object, &PropertyKey::String(name))?
+                    } else {
+                        crate::context::get_property(agent, &object, &crux::lookup(name), object)?
+                    };
                 Self::resolve_member_cell(agent, &object, name);
                 Self::resolve_chain_cell(agent, &object, name);
                 Ok(value)
@@ -8187,43 +8188,64 @@ impl Vm {
         *LENGTH.get_or_init(|| crux::string::intern_utf8("length"))
     }
 
-    /// Serve a property read on a string PRIMITIVE without building the
-    /// per-read String-exotic wrapper (a 448B JsObject + a 64B [[StringData]]
-    /// copy) the generic [[Get]] pays on primitives. Exact because the
-    /// wrapper's only own properties are the virtual `length` and in-range
-    /// canonical indices — handled here (spec 10.4.3.5 StringGetOwnProperty)
-    /// — and the engine threads the PRIMITIVE as the [[Get]] receiver (spec
-    /// 10.4.3.4: StringExoticObject.[[Get]] passes Receiver through to
-    /// OrdinaryGet), so a read starting at %String.prototype% with the
-    /// primitive receiver reproduces the boxed read for every other key:
-    /// chain data properties and accessors (which see `this` = the
-    /// primitive, exactly as the boxed path's receiver threading already
-    /// does), exotic/proxy links, and missing keys. Non-string receivers
-    /// fall through to the generic path unchanged.
-    fn get_string_primitive(
+    /// Serve a property read on a PRIMITIVE without building the per-read
+    /// wrapper the generic [[Get]] pays on primitives (a 448B JsObject —
+    /// plus a 64B [[StringData]] copy for strings). Exact for the same
+    /// reason in every kind: the engine threads the PRIMITIVE as the [[Get]]
+    /// receiver (spec 10.4.3.4: StringExoticObject.[[Get]] passes Receiver
+    /// through to OrdinaryGet; the other primitive wrappers are ordinary
+    /// objects with no own properties), so a read starting at the kind's
+    /// %X.prototype% with the primitive receiver reproduces the boxed read
+    /// for every key — chain data properties and accessors (which see `this`
+    /// = the primitive, exactly as the boxed path's receiver threading
+    /// already does), exotic/proxy links, and missing keys. The one exotic
+    /// wrapper — the String box — contributes virtual own `length` and
+    /// in-range canonical indices, handled here (spec 10.4.3.5
+    /// StringGetOwnProperty). Object/function receivers fall through to the
+    /// generic path unchanged.
+    fn get_primitive_member(
         agent: &mut Agent,
         receiver: Value,
         key: &PropertyKey,
     ) -> Result<Value, JsError> {
-        let ValueKind::String(s) = receiver.kind() else {
-            return crate::context::get_property_key(agent, &receiver, key, receiver);
-        };
-        if let PropertyKey::String(atom) = key {
-            if *atom == Self::length_atom() {
-                return Ok(Value::Number(s.len() as f64));
+        match receiver.kind() {
+            ValueKind::String(s) => {
+                if let PropertyKey::String(atom) = key {
+                    if *atom == Self::length_atom() {
+                        return Ok(Value::Number(s.len() as f64));
+                    }
+                    if let Some(index) = crux::object::array_index_of(key)
+                        && index < s.len() as u64
+                    {
+                        let unit = s.as_slice()[index as usize];
+                        return Ok(Value::String(Handle::new(JsString::from_utf16(&[unit]))));
+                    }
+                }
+                let realm = agent.current_realm()?;
+                let Some(proto) = realm.intrinsics.string_prototype() else {
+                    return crate::context::get_property_key(agent, &receiver, key, receiver);
+                };
+                crate::context::get_property_key(agent, &proto, key, receiver)
             }
-            if let Some(index) = crux::object::array_index_of(key)
-                && index < s.len() as u64
-            {
-                let unit = s.as_slice()[index as usize];
-                return Ok(Value::String(Handle::new(JsString::from_utf16(&[unit]))));
+            ValueKind::Number(_)
+            | ValueKind::Boolean(_)
+            | ValueKind::BigInt(_)
+            | ValueKind::Symbol(_) => {
+                let name = match receiver.kind() {
+                    ValueKind::Number(_) => "%Number.prototype%",
+                    ValueKind::Boolean(_) => "%Boolean.prototype%",
+                    ValueKind::BigInt(_) => "%BigInt.prototype%",
+                    ValueKind::Symbol(_) => "%Symbol.prototype%",
+                    _ => unreachable!("matched above"),
+                };
+                let realm = agent.current_realm()?;
+                let Some(proto) = realm.intrinsics.primitive_prototype(name) else {
+                    return crate::context::get_property_key(agent, &receiver, key, receiver);
+                };
+                crate::context::get_property_key(agent, &proto, key, receiver)
             }
+            _ => crate::context::get_property_key(agent, &receiver, key, receiver),
         }
-        let realm = agent.current_realm()?;
-        let Some(proto) = realm.intrinsics.string_prototype() else {
-            return crate::context::get_property_key(agent, &receiver, key, receiver);
-        };
-        crate::context::get_property_key(agent, &proto, key, receiver)
     }
 
     /// The shared computed member read (the `GetMemberComputed` step and
@@ -8278,8 +8300,8 @@ impl Vm {
             return Ok(Value::String(Handle::new(JsString::from_utf16(&[*unit]))));
         }
         let key = crate::context::to_property_key(agent, &key)?;
-        let value = if matches!(object.kind(), ValueKind::String(_)) {
-            Self::get_string_primitive(agent, object, &key)?
+        let value = if !matches!(object.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
+            Self::get_primitive_member(agent, object, &key)?
         } else {
             match &key {
                 PropertyKey::String(atom) => match Self::member_cell_get(agent, &object, *atom) {

@@ -3951,6 +3951,85 @@ sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
 annexB 1086/1086, zero fail/crash/hang. Number/Boolean/Symbol primitives
 still box on method reads (n.toFixed etc.) — same pattern, unprobed.
 
+### Non-string primitives resolve method reads on their prototype chain without boxing (tasklist 1.6, measured + landed 2026-09-04)
+
+The 1.5 fix was string-only; the generic `[[Get]]` still boxed a fresh
+wrapper per READ for the other primitives. Probe (200k, `Gc::new` TLS
+counters, both engines): every Number/Boolean/Symbol/BigInt method
+read/call allocated a 448B wrapper per read (Number/Boolean wrapper
+creation also inserts an agent boxed-value-table entry) — `n.toFixed` /
+`n.toString` / `b.toString` / `sy.toString` reads 200k x 448B,
+`sym.description` + 200k result strings, call rows + their inherent
+result boxes, `123n.toString()` + a 48B box. The number method reads were
+~530-595ns/call interp (clean, no counters) — the heaviest measured
+per-operation cost in the engine after the L1a store.
+
+Fix: `Vm::get_string_primitive` generalized to `Vm::get_primitive_member`
+(a String arm with the 1.4 length/index virtuals, a Number/Boolean/
+BigInt/Symbol arm, else the generic path) and BOTH shared member helpers
+route every primitive receiver through it — the `ValueKind::String`
+read-gates became "not Object/Function". New `Intrinsics::primitive_prototypes`
+(the four non-string kind prototypes, an array indexed like
+`function_prototypes`, traced) sits next to the existing
+`string_prototype`. Exactness is the 1.5 argument, simpler: these
+wrappers are ordinary objects with NO own properties, so a chain read
+starting at the kind's %X.prototype% with the primitive receiver
+reproduces every boxed read — data properties, the `Symbol.prototype.
+description` accessor (a strict accessor sees `this` = the primitive),
+proxy links, and missing keys.
+
+Box counts on 200k rows: reads 200k -> 0; `sym.description` 400k -> 200k
+and call rows retain only their inherent result boxes. Clean interleaved
+A/B on Number method-read rows (200k, no counters in): interp ~106-119ms
+-> ~13.3-14.1ms (~8.4x, ~550 -> ~68ns/call), jit ~97-104ms ->
+~7.9-9.7ms (~11-13x). The residual ~67ns/call interp is the chain read
+itself (the %Number.prototype% own-scan) — the chain-read primitive the
+4.1 probe measured, deferred to L2. An 18-line semantic battery
+(toFixed/toString/toPrecision, Boolean methods, Symbol description /
+`Symbol().description === undefined` / toString, BigInt toString,
+boxed `new Number(5)`/`Object(5)` reads, a data-prop patch read live,
+strict vs sloppy getter `this`, a proxy link's receiver type) is
+byte-identical vs the boxed baseline. New eval test
+`non_string_primitive_method_reads_resolve_on_the_prototype_chain`.
+Gates: clippy clean, `cargo test --workspace` green (4650/0), three
+release sweeps at baseline — language 23721/3 skip, built-ins
+23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
+
+### 4.1 probe: the apply/.call residual is diffuse — no narrow slice (measured 2026-09-04)
+
+Fresh A/B decomposition of the `.apply`/`.call` residual on the `apply
+leaf call` shape (200k, per-call, probe rows in `--jit-bench` form, both
+engines, min-of-3-style steady-state counts):
+
+| row | interp ns/call | jit ns/call |
+|---|---|---|
+| apply leaf 9 (`f.apply(null, arr9)`) | ~98-105 | ~36-44 |
+| apply leaf 1 | ~97-107 | ~46-48 |
+| .call 9-arg (`f.call(null, 1..9)`) | ~100-107 | ~26-32 |
+| direct 9-arg call `f(1..9)` (the floor) | ~58-62 | ~6.2 |
+| own-data read row (`o.x`) | ~16-17 | ~2.8 |
+| chain method read rows (`f.apply === ap` / `.call` / `o.m` / `a.push`) | ~54-56 | ~27-35 |
+
+Readings: the apply/.call overhead over a same-leaf direct call is interp
+~40-44ns / jit ~20-37ns per call, and it is allocation-free (boxes 0 for
+the whole 200k row). The arg-array fill is NOT the term in the interp
+(.call ≈ .apply), and jit apply-9 ≈ apply-1 (the array length does not
+scale the cost). The pieces that remain — the per-iteration prototype-
+chain member read of the method, the intrinsic identity compare, and the
+CallApply dispatch — each measure in the ~10-30ns band with no clean
+dominant term: prototype-chain member reads cost ~4x own-data reads in
+interp (~55 vs ~16ns) and ~10x in jit (~28 vs ~2.8ns) across function,
+object, and array receivers, but a narrow `.apply`-only inline has no
+clean target (the chain read is shared with every `o.m()` shape, and the
+2026-09-01 inline-validation experiment measured slower).
+
+Conclusion: 4.1's premise — a distinct `.apply`/`.call` member-read
+residual worth inlining — does not re-derive. The row's remaining cost is
+the general chain method read plus the intrinsic dispatch, so the read
+side defers to L2 (per-site shape/offset ICs once the L1c representation
+lands) and the dispatch side to L5. Tasklist 4.1 closes with this record;
+no code lands. (No gates run — a probe-only turn; the tree is untouched.)
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
