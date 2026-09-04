@@ -876,6 +876,8 @@ impl JsObject {
         unsafe {
             std::ptr::write(std::ptr::addr_of_mut!((*this).id), next_object_id());
             std::ptr::write(std::ptr::addr_of_mut!((*this).kind), ObjectKind::Ordinary);
+            std::ptr::write(std::ptr::addr_of_mut!((*this).array_dense), Cell::new(None));
+            std::ptr::write(std::ptr::addr_of_mut!((*this).typed_array), Cell::new(None));
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).prototype),
                 Cell::new(prototype),
