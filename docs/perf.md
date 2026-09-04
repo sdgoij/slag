@@ -3813,6 +3813,103 @@ sweeps at baseline (with the JIT installed) — language 23721/23724
 (3 skip), built-ins 23657/23812 (155 skip), annexB 1086/1086, zero
 fail/crash/hang.
 
+### L4 counting probe: the two hot rows allocate 1 box/iter (construct) and ~390 boxes total (buildString full) (measured 2026-09-04)
+
+Tasklist 3.1's re-scope mandates counting arena boxes per iteration on the
+`construct churn` and `buildString full` rows before any arena work. Probe
+method: a temporary cumulative counter + rounded-size histogram bumped by
+`Gc::new`/`Gc::new_in_place` (TLS writes), drained before and read after
+the timed `--bench` eval of each row; counts are deterministic and stable
+across repeated runs. Box sizes: a JsObject is the 448B class, an
+ArraySlots/string/rope/concat box the 64B class; the 112B singleton per row
+is the per-eval script record.
+
+- **`construct churn` (100k `new C(i)` iterations): 100,007 boxes —
+  100,002 x 448B (the fresh `C` instances, one per iteration) plus the
+  per-eval setup constants (C's function object, ~5 misc). Exactly 1 arena
+  box per iteration, and it is the instance object itself; the construct
+  path allocates no context/env/key/per-iteration extras.**
+- **`buildString full` (one full-Unicode-range build, ~1.1M code points
+  pushed): 390 boxes TOTAL** — 329 x 64B string/rope boxes (one per
+  `String.fromCodePoint` chunk/final result + one concat node per `+=`
+  append, ~137 of each across the CHUNK=10000 spills and per-range
+  finals) and 59 x 448B array objects (the `lone`/`ranges`/`codePoints`
+  arrays). The ~1.1M dense `codePoints[length++] = codePoint` element
+  writes allocate ZERO arena boxes.
+- Controls that attribute the buckets: `{}`-literal loop = 1 x 448B/iter;
+  `[]`-literal loop = 1 x 448B (JsObject) + 1 x 64B (ArraySlots) per iter;
+  `s += 'x'` loop = 1 x 64B concat node per append; an intrinsic builtin
+  call (`Math.abs`, `String.fromCodePoint`) allocates NOTHING beyond its
+  result on the call path itself.
+
+A side finding (the probe's isolated `s.length` reads): **reading a
+property off a primitive string allocates a fresh String-exotic wrapper
+per read** — `String.fromCodePoint(…).length` in a loop costs 1 x 448B
+(wrapper JsObject) + 1 x 64B (the [[StringData]] copy) per access, and a
+hoisted-constant `'abc'.length` loop costs the same 448+64 per read. The
+member machinery has no primitive-string fast path, so `.length`/index
+reads on strings (an extremely common loop idiom) box every time. That is
+a real allocation lever, but it is a missing primitive-receiver read fast
+path (string-exotic reads served off the raw string, in the L1c read
+machinery), not an arena question.
+
+Conclusion: L4's premise is falsified on both rows it was built on. The
+bump arena the plan proposes ALREADY exists (A5.1: every counted box is an
+arena slot from a bump + size-classed free-list; GC-5 measured the
+free-list half net-neutral and `Gc::new` registration near its floor at
+~11ns/alloc). There is no measured second hot shape to give a dedicated
+arena: `construct churn` allocates only the instance the program is
+constructing (an arena cannot remove that box), and `buildString full`
+allocates ~390 boxes across the whole row — an arena has nothing to save.
+The rows' residual interpreter cost is the certified-construct path and
+the branchy step dispatch (per the earlier 2026-09-04 probes), not
+allocation. Tasklist 3.1 closes with this record; no arena code lands.
+The allocation-adjacent lead this probe surfaced is the primitive-string
+property-read boxing above (probed and landed as tasklist 1.4, below), not
+the arena.
+
+### Primitive-string member reads serve length/units without boxing (tasklist 1.4, measured + landed 2026-09-04)
+
+The L4 probe's side finding, taken to its end: **reading a property off a
+primitive string boxed a fresh String-exotic wrapper on EVERY read path.**
+The certified-body probe (isolated rows in `--jit-bench` shape, 200k
+`s.length` reads on a string param / local / hoisted const, boxes counted
+via the `Gc::new` TLS counters): top-level eval, certified interpreter,
+and the JIT ALL allocated 2 x 200k boxes (448B wrapper + 64B [[StringData]]
+copy per read) — the register-run warm member cells and the compiled path
+have no primitive-receiver fast path, so a string `.length` (or index)
+read falls through to the generic Get, which ToObject-boxes the primitive.
+
+Fix (two shared-helper shortcuts mirroring the existing typed-array
+`length`/element fast paths in `Vm::get_member_name` /
+`get_member_computed`, so the step path, the register ops, and the JIT
+slow-helper ABI all inherit them):
+- `s.length` on a string primitive returns the code-unit count directly
+  (spec 10.4.3.4 StringGet step 1 — an own virtual property of the boxed
+  receiver, so no prototype consult);
+- an in-range canonical numeric index read on a string primitive returns
+  the single code unit as a 1-unit string (spec 10.4.3.5
+  StringGetOwnProperty — an own data property, so it shadows the whole
+  chain; the astral first unit is a lone surrogate). Out-of-range and
+  non-index keys fall through to the exact machinery (a patched
+  `%String.prototype%` numeric key is still found).
+
+Verification of the box counts (200k reads): 400,001 boxes (top-level) /
+400,065 (fn) -> 0-1 boxes on every path. Clean interleaved A/B on the
+certified 200k-`.length` row (min-of-3 per-call, `bench_once` harness,
+probe timings only, no counters in): interp ~106-119ms -> ~4.2-4.8ms
+(~23x, ~550ns -> ~22ns/read); jit ~108-308ms (noisy median ~111ms) ->
+~2.4-2.8ms (~40x, ~12ns/read). Suite rows unaffected (construct churn and
+buildString full read no string primitives in their inner loops). New eval
+test `string_primitive_member_reads_serve_length_and_units_without_boxing`
+pins the semantics: code-UNIT `.length` (an astral char is 2), in-range
+index = single unit (lone-surrogate first unit), out-of-range and
+non-index keys fall through (a patched `%String.prototype%[5]` is found),
+and an in-range index shadows a prototype patch at the same key. Gates:
+clippy clean, `cargo test --workspace` green (4648/0), three release
+sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086, zero fail/crash/hang.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

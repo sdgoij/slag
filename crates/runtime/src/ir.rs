@@ -8127,6 +8127,19 @@ impl Vm {
         if is_nullish(&object) {
             return Err(nullish_error("Cannot read properties of null"));
         }
+        // A primitive string's `length` is its code-unit count (spec
+        // 10.4.3.4 StringGet step 1 — an own virtual property on the boxed
+        // receiver, so no prototype consult). The general path would ToObject
+        // the primitive into a fresh String-exotic wrapper (a 448B JsObject +
+        // a 64B [[StringData]] copy) per read; hot string loops read
+        // `.length` every iteration. A boxed String OBJECT is not a primitive
+        // (its ordinary machinery applies; the shortcut is only for the raw
+        // value).
+        if name == Self::length_atom()
+            && let ValueKind::String(s) = object.kind()
+        {
+            return Ok(Value::Number(s.len() as f64));
+        }
         // A typed array's `length` is a prototype accessor; serving it from
         // the slots skips the accessor invocation, which the fixture
         // byte-copy loops read every iteration (~6.6µs per accessor call).
@@ -8208,6 +8221,19 @@ impl Vm {
             && let crux::object::ObjectKind::IntegerIndexed(slots) = &object_ref.kind
         {
             return object_ref.typed_array_element_get(slots, index);
+        }
+        // A primitive string's in-range canonical index is an OWN data
+        // property holding the single code unit (spec 10.4.3.5
+        // StringGetOwnProperty) — the boxed wrapper's own descriptor wins
+        // over the whole prototype chain, so no wrapper and no chain walk
+        // (reading a string's units by index is the exact analog of the
+        // array element fast path above). Out-of-range falls through: the
+        // chain may hold the key (e.g. a patched `%String.prototype%`).
+        if let Some(index) = numeric
+            && let ValueKind::String(s) = object.kind()
+            && let Some(unit) = s.as_slice().get(index as usize)
+        {
+            return Ok(Value::String(Handle::new(JsString::from_utf16(&[*unit]))));
         }
         let key = crate::context::to_property_key(agent, &key)?;
         let value = match &key {

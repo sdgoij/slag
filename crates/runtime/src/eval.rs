@@ -5151,6 +5151,61 @@ mod tests {
     }
 
     #[test]
+    fn string_primitive_member_reads_serve_length_and_units_without_boxing() {
+        // Tasklist 1.4: reading a property off a primitive string boxed a
+        // fresh String-exotic wrapper per access (a 448B JsObject + a 64B
+        // [[StringData]] copy) on every read path; the shared member reads
+        // now serve `length` (spec 10.4.3.4 StringGet step 1) and in-range
+        // canonical index reads (spec 10.4.3.5 StringGetOwnProperty — an own
+        // data property holding the single code unit) directly off the
+        // string. These asserts pin the semantics the fast paths must
+        // preserve.
+        assert_eq!(
+            run("'abc'.length + ':' + ''.length").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("3:0")))
+        );
+        // `.length` counts code UNITS, not code points (a surrogate pair is
+        // 2).
+        assert_eq!(run("'\u{1F600}'.length").unwrap(), Value::Number(2.0));
+        // In-range index reads return the single code unit; the astral first
+        // unit is a lone surrogate.
+        assert_eq!(
+            run("'abc'[0] + '|' + 'abc'[2]").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("a|c")))
+        );
+        assert_eq!(
+            run("'\u{1F600}'[0]").unwrap(),
+            Value::String(Handle::new(JsString::from_utf16(&[0xD83D])))
+        );
+        // Out-of-range and non-index keys fall through to the prototype
+        // chain (no own property exists there).
+        assert_eq!(
+            run("'abc'[3] === undefined && 'abc'[-1] === undefined").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("String.prototype[5] = 'x'; 'abc'[5]").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("x")))
+        );
+        // An in-range index is an OWN property of the boxed receiver, so it
+        // shadows a prototype patch at the same key.
+        assert_eq!(
+            run("String.prototype[0] = 'PATCHED'; 'abc'[0]").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("a")))
+        );
+        // A literal-string computed key reads `.length` through the named
+        // path too; boxed String objects still read via their own machinery.
+        assert_eq!(
+            run(
+                "var s = 'abcdef'; var r = 0; for (var i = 0; i < 10; i++) { r += s['length']; } \
+                 r + ':' + (new String('xy')).length"
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("60:2")))
+        );
+    }
+
+    #[test]
     fn fast_path_annex_b_block_functions() {
         // Cut 6 first slice (Annex B): a block-level function declaration
         // in a sloppy body certifies — the block binding is a frame slot
