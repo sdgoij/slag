@@ -167,6 +167,14 @@ impl Context {
         Ok(JsValue(value))
     }
 
+    /// Evaluate a Script WITHOUT draining the job queues. Pending microtasks
+    /// and timers stay queued until the caller runs [`Context::run_jobs`]; a
+    /// host binding that stringifies the completion before the drain avoids
+    /// holding a live value across the jobs' GC points.
+    pub fn eval_script(&mut self, source: &str) -> Result<JsValue, JsError> {
+        Ok(JsValue(self.agent.run_script(source)?))
+    }
+
     /// Like [`Context::eval`], parsing with the JSX extension enabled: JSX
     /// elements desugar to `rlx.h(...)` calls at parse time.
     pub fn eval_jsx(&mut self, source: &str) -> Result<JsValue, JsError> {
@@ -209,6 +217,12 @@ impl Context {
     /// Drain the job queues (promise, timeout, then generic jobs).
     pub fn run_jobs(&mut self) -> Result<(), JsError> {
         self.agent.run_jobs()
+    }
+
+    /// Milliseconds until the earliest pending timeout fires, or `None` when
+    /// no timeout jobs are queued. Hosts use it to schedule the next drain.
+    pub fn next_timeout_ms(&self) -> Option<f64> {
+        self.agent.next_timeout_delay_ns().map(|ns| ns as f64 / 1e6)
     }
 
     // ── buffer / typed-array access (Phase 0.1: embedding API) ──────────────

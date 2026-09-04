@@ -8,7 +8,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
@@ -237,7 +236,7 @@ pub struct Agent {
     pub jit_depth: usize,
     pub(crate) promise_jobs: VecDeque<Job>,
     pub(crate) generic_jobs: VecDeque<Job>,
-    pub(crate) timeout_jobs: VecDeque<(Instant, Job)>,
+    pub(crate) timeout_jobs: VecDeque<(u64, Job)>,
     /// Host-defined operations (spec's host hooks); `None` uses the
     /// spec's default implementations.
     pub host_hooks: Option<Box<dyn HostHooks>>,
@@ -964,7 +963,10 @@ impl Agent {
         milliseconds: u64,
         closure: impl FnOnce(&mut Agent) -> Result<Value, JsError> + 'static,
     ) {
-        let deadline = Instant::now() + std::time::Duration::from_millis(milliseconds);
+        // The deadline is host-monotonic nanoseconds (`crate::time`), so
+        // scheduling works on targets whose std clock is unsupported.
+        let deadline =
+            crate::time::monotonic_nanos().saturating_add(milliseconds.saturating_mul(1_000_000));
         self.timeout_jobs
             .push_back((deadline, Job::new(realm, closure)));
     }
@@ -989,11 +991,10 @@ impl Agent {
                 self.run_job(job)?;
                 continue;
             }
-            // Only read the deadline clock when a timer could be due: the
-            // wasm32-unknown-unknown target has no monotonic clock, and most
-            // drains run no timers at all.
+            // Only read the deadline clock when a timer is actually queued
+            // (on wasm32-unknown-unknown it is a host import).
             if !self.timeout_jobs.is_empty() {
-                let now = Instant::now();
+                let now = crate::time::monotonic_nanos();
                 if let Some(index) = self
                     .timeout_jobs
                     .iter()
@@ -1033,6 +1034,18 @@ impl Agent {
 
     pub fn job_queues_empty(&self) -> bool {
         self.promise_jobs.is_empty() && self.generic_jobs.is_empty() && self.timeout_jobs.is_empty()
+    }
+
+    /// Nanoseconds until the earliest queued timeout is due (0 when a job is
+    /// already due), or `None` when no timeout jobs are queued. Hosts use it
+    /// to schedule the drain that lets engine timers progress.
+    pub fn next_timeout_delay_ns(&self) -> Option<u64> {
+        let now = crate::time::monotonic_nanos();
+        self.timeout_jobs
+            .iter()
+            .map(|(deadline, _)| *deadline)
+            .min()
+            .map(|deadline| deadline.saturating_sub(now))
     }
 
     /// Parse and evaluate a Script (spec 16.1.4-16.1.6) in the current

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Slag in the browser</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; }
+      textarea { width: 100%; min-height: 8rem; font: 13px ui-monospace, monospace; }
+      button { padding: 0.4rem 1rem; margin-top: 0.5rem; }
+      pre { background: #f5f5f5; border-radius: 4px; padding: 0.75rem; min-height: 4rem; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>Slag in the browser</h1>
+    <p>
+      Build first: <code>cargo build -p slag --example wasm_binding
+      --target wasm32-unknown-unknown --release</code>, then serve this repo
+      root (e.g. <code>python -m http.server</code>) and reload.
+    </p>
+    <textarea id="src" spellcheck="false">function fib(n) { return n &lt; 2 ? n : fib(n - 1) + fib(n - 2); }
+console.log('fib(20) =', fib(20));
+setTimeout(() => console.log('1s later'), 1000);
+JSON.stringify({ engine: 'slag', ok: true })</textarea>
+    <br />
+    <button id="run">Run</button>
+    <pre id="out">loading…</pre>
+    <script type="module">
+      import { fromUrl } from './slag.js';
+
+      const out = document.getElementById('out');
+      const append = (text) => {
+        out.textContent += text + '\n';
+      };
+
+      const slag = await fromUrl('slag.wasm', {
+        console: {
+          log: (line) => append(`[js] ${line}`),
+          info: (line) => append(`[info] ${line}`),
+          warn: (line) => append(`[warn] ${line}`),
+          error: (line) => append(`[error] ${line}`),
+          debug: (line) => append(`[debug] ${line}`),
+        },
+      });
+      out.textContent = 'Slag ready. Run a script.\n';
+
+      document.getElementById('run').addEventListener('click', () => {
+        const source = document.getElementById('src').value;
+        out.textContent = '';
+        try {
+          const result = slag.eval(source);
+          if (result) append(result);
+        } catch (error) {
+          append(`✗ ${error.message}`);
+        }
+      });
+    </script>
+  </body>
+</html>
