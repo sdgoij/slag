@@ -3734,6 +3734,85 @@ Gates: clippy clean; `cargo test --workspace` green; the three release
 sweeps at baseline — language 23721/23724 (3 skip), built-ins
 23657/23812 (155 skip), annexB 1086/1086, zero fail/crash/hang.
 
+### L3 scope-gate probe: the general path is narrower than the plan assumed (measured 2026-09-04)
+
+The plan's L3 premise — "bodies with env machinery (try/catch, with,
+eval, closures that capture with `this`) never reach the JIT" — was
+probed directly with `--jit-bench`/`--bench` rows:
+
+- **try/catch certifies and reaches the JIT.** A per-iteration `try {
+s += o.x } catch (e) { s += 1 }` loop runs interp ~125ms / jit ~72ms
+for 1M (ratio 0.57 — compiled), and a try AROUND the whole loop equals
+the certified control (~17-19ms interp, jit ~3.7ms). The ~68ns/iter
+per-iteration-try residual is the handler-table frame cost — real
+machinery, not dispatch — and it is already covered by the compiled
+path. The plan's motivating example does not hold in this engine.
+- **The residual uncertified hot shape is a function containing an
+  arrow that captures `this`** (callbacks in methods — forEach/map
+  bodies referencing `this`). Such a method is scope=None (the arrow's
+  `this` is the method's lexical `this`, which the certified model has
+  no env to hand it), so the whole method — including its hot loops —
+  runs the env path. Isolated (arrow created ONCE, hot loop calls it
+  per iteration, 1M iters, `--bench`): a method whose arrow captures a
+  LOCAL (certified) measures ~35ms; the identical method whose arrow
+  captures `this` (uncertified) measures ~1.4s — **~40x**. A per-call
+  this-arrow created-and-invoked-once is ~75x (16.5s vs 221ms for 3M)
+  but that shape is dominated by per-call closure instantiation
+  (~1.65µs/call even certified — the var-arrow control) — an
+  instantiation-cost matter, not coverage.
+- **Redirected next candidate**: rather than L3's general-path compile
+  (which would target these scope=None bodies but is a large
+  architectural effort), the cheaper fix for the dominant shape is
+  certifying `this`-capturing arrows: the enclosing certified non-arrow
+  body captures its `this` value into the arrow's context at creation
+  (a synthetic context entry sourced from the this slot), and the arrow
+  body reads it as a depth-0 context slot. Measured ceiling ~40x on the
+  callback-in-method shape; both engines' arrow creation must mirror.
+
+### This-capturing arrows certify (tasklist 2.3, measured 2026-09-04)
+
+The probe above landed. An arrow created in a certified non-arrow body
+that references `this` no longer bails the body: the closure walker
+records a reserved capture-context marker (`\u{1}captured-this`, a name
+no source identifier can equal), and `analyze_scope` then:
+
+- a NON-ARROW body captures its own `this`: it allocates a context slot
+  for the marker (forced `this_slot`), and `compile_body` emits an entry
+  store copying the this slot into the context (after
+  `OrdinaryCallBindThis`);
+- an ARROW body certifies only when its own `outer_chain` carries the
+  marker (an enclosing certified body captured it): its direct `this`
+  reads compile to `LoadContextSlot` resolved through the outer chain
+  (the `ExprKind::This` compile arm), and deeper this-arrows resolve the
+  same way — no per-arrow re-capture is needed because the marker flows
+  through `outer_chain` and the runtime context chain nests correctly.
+  A this-arrow under a body with no `this` to give (a standalone arrow, a
+  class constructor) stays on the env path.
+
+Env-path arrows (rest params etc. fail certification) created inside a
+certified this-capturing body resolve their lexical `this` through the
+capture context: `DeclarativeEnv::has_captured_this`/
+`captured_this_value` make an env holding the marker serve as the
+this-environment (`EnvRecord::has_this_binding`/`get_this_binding`) —
+without it, such an arrow walked past the Declarative context to the
+global object (the `built-ins/Object/keys/proxy-keys.js` regression:
+the proxy trap getters' rest arrows saw the global object instead of the
+handler; fixed by the env-side change).
+
+Measurement (2026-09-04, `--bench` MC rows): a method whose arrow
+captures `this` (arrow created once, hot loop calls it per iteration,
+1M iters) dropped ~1.4s -> ~41-43ms (~33x) — now close to the
+certified var-arrow control (~35-36ms; the residual is the entry context
+store). New eval test `this_capturing_arrows_certify` covers the direct
+escaping arrow, arrow-in-arrow, a nested function's own-this arrow,
+sloppy global-object coercion, standalone arrows, and the env-path
+rest-arrow case.
+
+Gates: clippy clean; `cargo test --workspace` green; the three release
+sweeps at baseline (with the JIT installed) — language 23721/23724
+(3 skip), built-ins 23657/23812 (155 skip), annexB 1086/1086, zero
+fail/crash/hang.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

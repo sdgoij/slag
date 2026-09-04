@@ -1365,6 +1365,13 @@ pub struct ScopeInfo {
     /// fills it with the OrdinaryCallBindThis result. Arrow bodies (lexical
     /// `this`) stay on the env path.
     pub this_slot: Option<usize>,
+    /// Tasklist 2.3: the capture-context slot holding this body's `this`
+    /// value when an arrow created here references `this` — `Some` for a
+    /// non-arrow body whose arrows capture its lexical `this` (the certified
+    /// entry stores the this slot into the context; the arrows read it
+    /// through the context chain). The slot carries the reserved
+    /// [`captured_this_atom`] binding.
+    pub captured_this: Option<usize>,
     /// Cut 35 slice 23: whether the frame is exactly the parameters, all
     /// present and never assigned — the frame holds only simple params
     /// (`frame_size == arity`, no `this`/`arguments`/`var` slots) and no
@@ -15963,9 +15970,15 @@ impl Compiler {
                 // Cut 3 continuation (this slots): a certified non-arrow
                 // body reads `this` from its dedicated frame slot (the call
                 // filled it with the OrdinaryCallBindThis result); the env
-                // path reads the running context's this binding.
+                // path reads the running context's this binding. Tasklist
+                // 2.3: a certified ARROW body's `this` is lexical — the
+                // enclosing certified body captured it into its context (the
+                // reserved marker is in the outer chain), so the read is a
+                // context-chain load.
                 if let Some(slot) = self.scope.as_ref().and_then(|scope| scope.this_slot) {
                     self.emit(Step::LoadLocal { slot });
+                } else if let Some((depth, index)) = self.outer_context(captured_this_atom()) {
+                    self.emit(Step::LoadContextSlot { depth, index });
                 } else {
                     self.emit(Step::ThisValue);
                 }
@@ -19479,6 +19492,19 @@ pub fn compile_body(
             mapped: scope.arguments_formals.clone(),
         });
     }
+    // Tasklist 2.3: a body whose arrows capture `this` stores its this
+    // value into the capture-context slot at entry (the this slot was filled
+    // by the certified call before the steps ran; the value is fixed for the
+    // run). The arrows read it through the context chain.
+    if let Some(scope) = &compiler.scope
+        && let (Some(this_slot), Some(context_index)) = (scope.this_slot, scope.captured_this)
+    {
+        compiler.emit(Step::LoadLocal { slot: this_slot });
+        compiler.emit(Step::StoreContextSlot {
+            depth: 0,
+            index: context_index,
+        });
+    }
     // A certified body's top-level function declarations are hoisted: each
     // binding is initialized with its closure at entry (spec 10.2.11), and
     // the declaration statement itself evaluates to nothing (15.2.6).
@@ -19777,6 +19803,22 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     if !collect_captures(&function.body.stmts, &scan.bindings, &mut scan.captured) {
         return None;
     }
+    // Tasklist 2.3: an arrow in the body references `this` (the walker
+    // recorded the reserved marker as a capture). A NON-ARROW body can
+    // supply its own `this` (it captures the value into a context slot
+    // below); an ARROW body only when its own outer chain carries the
+    // marker (an enclosing certified body captured it). Class constructors
+    // stay on the env path for now (their `this` is construct machinery).
+    let captures_this = scan.captured.contains(&captured_this_atom());
+    let this_from_chain = function
+        .outer_chain
+        .iter()
+        .flatten()
+        .any(|name| *name == captured_this_atom());
+    if captures_this && !this_from_chain && (!allow_this || function.is_class_constructor) {
+        return None;
+    }
+    scan.this_from_chain = this_from_chain;
     // Captured params get their context bindings first (context slots
     // `0..k`), so the declaration-order walk below appends the captured
     // declared bindings after them.
@@ -19870,11 +19912,28 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     } else {
         None
     };
+    // Tasklist 2.3: a non-arrow body whose arrows capture `this` puts the
+    // value into a capture-context slot — the certified entry stores the
+    // this slot into it (compile_body emits the store), and the arrows read
+    // it through the context chain (their `outer_chain` carries the marker
+    // via `own_context_entry`).
+    let captured_this = if captures_this && allow_this && !function.is_class_constructor {
+        let index = scan.context_names.len();
+        scan.context_slots.insert(captured_this_atom(), index);
+        scan.context_names.push(captured_this_atom());
+        scan.context_tdz.push(false);
+        scan.context_const.push(false);
+        scan.context_param.push(None);
+        Some(index)
+    } else {
+        None
+    };
     // The body's `this` value is a frame slot the certified call fills with
     // the OrdinaryCallBindThis result; `this` is not a name, so it has no
     // `slots`-map entry. A `super` body (Cut 61) gets the slot too — the
-    // super receiver is the this binding.
-    let this_slot = if scan.observes_this || scan.observes_super {
+    // super receiver is the this binding. An arrow-capturing body gets it so
+    // the entry store can copy the value into the capture context.
+    let this_slot = if scan.observes_this || scan.observes_super || captured_this.is_some() {
         let slot = scan.next_slot;
         scan.tdz.push(false);
         scan.next_slot += 1;
@@ -19913,6 +19972,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         arguments_slot,
         arguments_formals,
         this_slot,
+        captured_this,
         args_alias,
         annex_b: scan.annex_b,
         statement_fns: scan.statement_fns,
@@ -20278,6 +20338,27 @@ fn collect_expr_captures(
     }
 }
 
+/// The interned marker for a `this` captured by an arrow from an enclosing
+/// certified body (tasklist 2.3): it names a synthetic capture-context
+/// binding holding the enclosing non-arrow body's `this` value. The name
+/// contains a control character, so no source identifier can equal it — it
+/// never collides with a real binding (`collect_body_bindings` can never
+/// produce it). Resolved once.
+fn captured_this_atom() -> crux::AtomId {
+    use std::sync::OnceLock;
+    static ATOM: OnceLock<crux::AtomId> = OnceLock::new();
+    *ATOM.get_or_init(|| crux::string::intern_utf8("\u{1}captured-this"))
+}
+
+/// The marker's canonical name (`JsString`), shared with the env layer: the
+/// capture context binds it, and an env-path arrow resolving its lexical
+/// `this` recognizes the binding (env.rs `DeclarativeEnv::has_captured_this`).
+/// `crux::lookup` is the interned canonical handle, so handle equality with
+/// the stored binding name is exact.
+pub(crate) fn captured_this_name() -> JsString {
+    crux::lookup(captured_this_atom())
+}
+
 /// Whether a closure can be created inside a certified body (Cut 3
 /// continuation): every identifier it references that binds in the body is
 /// added to `captured` (the body context-allocates it); a reference to a
@@ -20598,13 +20679,25 @@ fn closure_expr_allows(
         | ExprKind::Await(argument) => closure_expr_allows(argument, bindings, captured, own),
         ExprKind::Yield { argument: None, .. } => true,
         // The analyzed body's `this` is never visible inside a closure
-        // unless the closure is an arrow (then `own` is false). Inside a
-        // nested non-arrow function (`own`), `this` is that function's own.
+        // unless the closure is an arrow (then `own` is false). Under `own`
+        // (a nested non-arrow function) `this` is that function's own.
+        // Tasklist 2.3: an ARROW's lexical `this` no longer bails the body —
+        // the walk records the reserved marker as a capture (the analyzed
+        // body decides, in `analyze_scope`, whether it can supply `this`: a
+        // non-arrow captures it into its context; an arrow reads it from its
+        // own outer chain; either is absent -> env path).
         // `super`/class/private/tagged/import constructs stay rejected even
         // under `own` — they need machinery this walk does not model (a
         // class body could capture body bindings through methods the walk
         // never enters), so such closures still bail the body.
-        ExprKind::This => own,
+        ExprKind::This => {
+            if own {
+                true
+            } else {
+                captured.insert(captured_this_atom());
+                true
+            }
+        }
         ExprKind::Super
         | ExprKind::Class(_)
         | ExprKind::PrivateIn { .. }
@@ -20668,6 +20761,12 @@ struct FastScopeScan {
     /// the call's `this` value (Cut 3 continuation; arrows' `this` is
     /// lexical).
     allow_this: bool,
+    /// Tasklist 2.3: whether an ARROW body's lexical `this` is available
+    /// from its outer chain — the enclosing certified body captured it (the
+    /// [`captured_this_atom`] marker is in the function record's
+    /// `outer_chain`). Direct `this` reads in such a body compile to a
+    /// context-chain read instead of bailing to the env path.
+    this_from_chain: bool,
     /// The body references `this`: it gets a `this` slot the certified call
     /// fills with the OrdinaryCallBindThis result.
     observes_this: bool,
@@ -21452,9 +21551,11 @@ impl FastScopeScan {
                 // Cut 3 continuation (this slots): a non-arrow body's own
                 // `this` reads get a `this` slot the certified call fills
                 // with the OrdinaryCallBindThis result; an arrow's `this` is
-                // lexical.
+                // lexical — tasklist 2.3 certifies it when the enclosing
+                // certified body captured it (the marker is in the outer
+                // chain; the compile resolves it to a context read).
                 if !self.allow_this {
-                    return false;
+                    return self.this_from_chain;
                 }
                 self.observes_this = true;
                 true
@@ -22917,6 +23018,7 @@ fn analyze_script_scope(
                 arguments_slot: None,
                 arguments_formals: None,
                 this_slot: None,
+                captured_this: None,
                 args_alias: false,
                 annex_b: Vec::new(),
                 statement_fns: Vec::new(),

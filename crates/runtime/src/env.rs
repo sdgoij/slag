@@ -202,7 +202,13 @@ impl EnvRecord {
         match self {
             EnvRecord::Function(e) => e.has_this_binding(),
             EnvRecord::Global(_) | EnvRecord::Module(_) => true,
-            EnvRecord::Declarative(_) | EnvRecord::Object(_) => false,
+            // Tasklist 2.3: a certified body that captures `this` for its
+            // arrows stores the value in a capture-context binding under the
+            // reserved name; an ENV-PATH arrow (one that failed
+            // certification — a rest param, a non-certifiable body) created
+            // inside it resolves its lexical `this` through that context.
+            EnvRecord::Declarative(e) => e.has_captured_this(),
+            EnvRecord::Object(_) => false,
         }
     }
 
@@ -212,7 +218,10 @@ impl EnvRecord {
             EnvRecord::Function(e) => e.get_this_binding(),
             EnvRecord::Global(e) => Ok(Value::Object(e.global_this)),
             EnvRecord::Module(_) => Ok(Value::Undefined),
-            _ => Err(JsError::new(
+            // The certified body initialized the reserved binding with its
+            // `this` value at entry, so it is always set here.
+            EnvRecord::Declarative(e) => e.captured_this_value(),
+            EnvRecord::Object(_) => Err(JsError::new(
                 ErrorKind::ReferenceError,
                 "No this binding in this environment".into(),
             )),
@@ -551,6 +560,21 @@ impl DeclarativeEnv {
 
     fn has_binding(&self, name: &JsString) -> bool {
         self.bindings.borrow().iter().any(|(n, _)| n == name)
+    }
+
+    /// Tasklist 2.3: whether this capture context carries a certified body's
+    /// captured `this` (the reserved binding). An env-path arrow's lexical
+    /// `this` resolves through it.
+    fn has_captured_this(&self) -> bool {
+        self.has_binding(&crate::ir::captured_this_name())
+    }
+
+    /// The captured-`this` value of a capture context (see
+    /// [`DeclarativeEnv::has_captured_this`]); the certified body initialized
+    /// the binding at entry, so a missing/undefined state is an internal
+    /// error.
+    fn captured_this_value(&self) -> Result<Value, JsError> {
+        self.get_binding_value(&crate::ir::captured_this_name(), true)
     }
 
     fn create_mutable_binding(&self, name: &JsString, deletable: bool) -> Result<(), JsError> {

@@ -5056,6 +5056,101 @@ mod tests {
     }
 
     #[test]
+    fn this_capturing_arrows_certify() {
+        // Tasklist 2.3: an arrow created in a certified non-arrow body that
+        // references `this` no longer bails the body. The body captures its
+        // `this` into a context slot at entry and the arrow reads it through
+        // the context chain — so a method with a `this` callback (the
+        // common `arr.forEach(v => this.x += v)` shape) certifies and runs
+        // on the fast path instead of the env machinery.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "function build(n) { var add = () => this.k; var s = 0; \
+                 for (var i = 0; i < n; i++) { s += add() + i; } return s; }",
+            )
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "build");
+        assert!(
+            ir.scope.is_some(),
+            "a body whose arrow captures `this` must certify"
+        );
+        let scope = ir.scope.as_ref().unwrap();
+        assert!(
+            scope.captured_this.is_some(),
+            "the body must capture `this` into its context"
+        );
+        assert!(scope.this_slot.is_some(), "the capture forces a this slot");
+        assert_eq!(
+            run("function build(n) { var add = () => this.k; var s = 0; \
+                 for (var i = 0; i < n; i++) { s += add() + i; } return s; } \
+                 build.call({ k: 3 }, 5)")
+            .unwrap(),
+            Value::Number(25.0)
+        );
+        // The arrow is created once and escapes; a later call observes the
+        // capturing body's `this` (not undefined / globalThis).
+        assert_eq!(
+            run("function make() { return () => this.v; } var f = make.call({ v: 9 }); f()")
+                .unwrap(),
+            Value::Number(9.0)
+        );
+        // Arrow-in-arrow: the inner arrow reads the same captured `this`
+        // through the outer arrow's context chain.
+        assert_eq!(
+            run("function make() { return () => () => this.v; } \
+                 var f = make.call({ v: 11 }); f()()")
+            .unwrap(),
+            Value::Number(11.0)
+        );
+        // A nested function inside the certified body creates its own arrow
+        // capturing ITS OWN this (the nested call's receiver), not the outer
+        // body's.
+        assert_eq!(
+            run(
+                "function outer() { function inner() { var f = () => this.v; return f(); } \
+                 return inner.call({ v: 1 }) + inner.call({ v: 2 }); } outer()"
+            )
+            .unwrap(),
+            Value::Number(3.0)
+        );
+        // Sloppy `this` coercion: a plain call's `this` is the global
+        // object, so the captured value must be the global object.
+        assert_eq!(
+            run("function g() { var f = () => this === globalThis; return f(); } g()").unwrap(),
+            Value::Boolean(true)
+        );
+        // A standalone arrow whose enclosing body is NOT certified (an arrow
+        // at script top level has globalThis; strict undefined) still works
+        // through the env path.
+        assert_eq!(
+            run("var f = () => this === globalThis; f()").unwrap(),
+            Value::Boolean(true)
+        );
+        // An ENV-PATH arrow (rest params do not certify) created inside a
+        // certified body that captured `this` still resolves its lexical
+        // `this` — the capture context serves as its this-environment
+        // (Object.keys/proxy-keys regression: the trap getters' rest arrows
+        // must see the handler, not the global object).
+        assert_eq!(
+            run(
+                "function make() { return (...args) => this.v + args.length; } \
+                 var f = make.call({ v: 5 }); f(1, 2)"
+            )
+            .unwrap(),
+            Value::Number(7.0)
+        );
+        assert_eq!(
+            run("var ok = false; var handler = { \
+                 get ownKeys() { return (...args) => { ok = this === handler; return ['a']; }; } }; \
+                 var p = new Proxy({}, handler); Object.keys(p); ok;")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
     fn fast_path_annex_b_block_functions() {
         // Cut 6 first slice (Annex B): a block-level function declaration
         // in a sloppy body certifies — the block binding is a frame slot

@@ -505,6 +505,7 @@ mod tests {
             arguments_slot: None,
             arguments_formals: None,
             this_slot: None,
+            captured_this: None,
             args_alias: false,
             annex_b: Vec::new(),
             statement_fns: Vec::new(),

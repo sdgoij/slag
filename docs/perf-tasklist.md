@@ -30,8 +30,9 @@
 
 | # | Item | Status | Evidence / first action |
 |---|---|---|---|
-| 2.1 | Compile the general path (Sparkplug analog): emit every step in machine code for bodies the scope gate excludes (try/catch, `with`, captured closures, complex-object methods), routing env/handler steps through the shared machinery | not started | Those bodies run interpreted forever today. Probe first: (a) fraction of a realistic hot corpus blocked by the scope gate; (b) dispatch share of an uncertified hot loop. Widest JIT-coverage lever. |
-| 2.2 | Certification over-rejection: nested NON-ARROW functions' own `this`/`arguments` bailed the enclosing body's scope certification | **landed 2026-09-04** (this tree) | The closure walker (`closure_*_allows`) now threads an `own` flag: entering a nested non-arrow function sets it (its `this`/`arguments` are its OWN, bound at its own call); arrows propagate the caller's flag (an arrow in the analyzed body still observes its lexical `this` and bails). `super`/`class`/private/tagged/import stays rejected under `own`. Probe (perf.md, 2026-09-04): the construct-churn loop function-wrapped with a nested `function C(x){ this.x = x; }` ran ~117-129ms vs ~19-21ms with C a global; after the fix the nested form matches the control (~6x), because the body re-certifies and its `var`s leave the env path. Gates: clippy, workspace tests (new `nested_function_own_this_and_arguments_keep_the_body_certified`), three sweeps at baseline. **Next**: this narrows the 2.1 scope gate on the nested-constructor/helper shapes; the full general-path (try/catch bodies) probe is still 2.1. |
+| 2.1 | Compile the general path (Sparkplug analog): emit every step in machine code for bodies the scope gate excludes, routing env/handler steps through the shared machinery | re-scoped by the 2026-09-04 probes | The scope-gate probe falsified the plan's premise for try/catch (those certify AND reach the JIT — per-iter try interp ~125ms / jit ~72ms) and 2.3 (this-capturing arrows) landed the dominant residual scope=None shape (~33x). The remaining scope=None hot shapes are narrow (with/eval/async-generator/super-constructors); their dispatch cost is not measured as a lever. Do NOT start the Sparkplug analog without a corpus probe showing uncertified hot bodies whose cost is dispatch (not the env path the certification fixes remove). |
+| 2.2 | Certification over-rejection: nested NON-ARROW functions' own `this`/`arguments` bailed the enclosing body's scope certification | **landed 2026-09-04** | The closure walker (`closure_*_allows`) now threads an `own` flag: entering a nested non-arrow function sets it (its `this`/`arguments` are its OWN, bound at its own call); arrows propagate the caller's flag (an arrow in the analyzed body still observes its lexical `this` and bails). `super`/`class`/private/tagged/import stays rejected under `own`. Probe (perf.md, 2026-09-04): the construct-churn loop function-wrapped with a nested `function C(x){ this.x = x; }` ran ~117-129ms vs ~19-21ms with C a global; after the fix the nested form matches the control (~6x), because the body re-certifies and its `var`s leave the env path. Gates: clippy, workspace tests (new `nested_function_own_this_and_arguments_keep_the_body_certified`), three sweeps at baseline. |
+| 2.3 | Certify `this`-capturing arrows: an arrow created in a certified non-arrow body that references `this` captures the body's this value (a synthetic context entry sourced from the this slot at creation); the arrow body reads it as a depth-0 context slot | **landed 2026-09-04** | The closure walker records a reserved marker (\u{1}captured-this) when an arrow references `this`; a NON-ARROW body allocates a marker context slot + forced this slot and `compile_body` emits an entry store copying this into it; an ARROW body certifies only when its outer chain carries the marker (its direct `this` compiles to a `LoadContextSlot` resolved through the chain; deeper this-arrows flow the same way). Env-path arrows (rest params etc.) inside a capturing body resolve lexical this through the capture context (`DeclarativeEnv::has_captured_this`/`captured_this_value` make the marker env a this-environment — the Object/keys/proxy-keys regression fix). Measurement (perf.md, 2026-09-04): the callback-in-method probe dropped ~1.4s -> ~42ms (~33x). Gates: clippy, workspace tests (new `this_capturing_arrows_certify`), three sweeps at baseline. |
 
 ## P3 — Allocation (L4 / M8 arena)
 
@@ -65,9 +66,9 @@
 3. The read-end-state premise (per-site member reads) was probed and
    FALSIFIED (1.1): interpreter member reads are ~3.5-4.2ns across
    64-object working sets — the map-cell layer already absorbs the
-   value-cell misses. 2.2 (certification over-rejection) is LANDED.
-   The next candidates: (a) the write-side follow-on probe (does a
-   realistic >256-object hot store loop exist, justifying per-site store
-   ICs / full L2); (b) 2.1's scope-gate probe on the remaining uncertified
-   hot shapes (try/catch bodies) to size the general-path JIT work.
-4. 3.1 (L4) and 4.1 (L5) after the L1c/L2/L3 probes re-derive their targets.
+   value-cell misses. 2.2 (certification over-rejection) and 2.3
+   (this-capturing arrows, ~33x) are LANDED, and the scope-gate probe
+   (2.1) closed the Sparkplug-analog premise for try/catch.
+4. Next candidates, in order: (a) the write-side >256 follow-on probe
+   (per-site store ICs) only if a realistic >256-object store loop shows
+   up; (b) 3.1 (L4 arena) and 4.1 (L5) probes re-deriving their targets.
