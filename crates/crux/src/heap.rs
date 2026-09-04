@@ -870,8 +870,24 @@ fn maps_stack_top(sp: usize) -> Option<usize> {
     None
 }
 
+/// wasm32: the shadow stack lives in the module's linear memory (rustc's
+/// wasm layout), and wasm has no OS stack API to query. Scan from the
+/// current frame to the end of the current memory. The region above the
+/// real stack top is the dlmalloc heap and static data that share linear
+/// memory; the conservative scan only ever retains (never falsely frees),
+/// so the wider region is safe — it just widens retention. See the GC-7
+/// note in docs/gc-plan.md: capturing the module-initial stack pointer
+/// would bound the scan to the actual stack.
+#[cfg(target_arch = "wasm32")]
+fn stack_bounds() -> Option<(usize, usize)> {
+    let probe = 0usize;
+    let sp = &probe as *const usize as usize;
+    let end = core::arch::wasm32::memory_size::<0>().saturating_mul(65536);
+    (end > sp).then_some((sp, end))
+}
+
 /// Platforms without a stack-bounds source: no conservative scan.
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_arch = "wasm32")))]
 fn stack_bounds() -> Option<(usize, usize)> {
     None
 }
@@ -1190,6 +1206,10 @@ impl Heap {
                 .ok()
                 .map(|index| live_sorted[index])
         };
+        // A box address can appear in many scanned words (every stored
+        // reference to it); push each box once so the work list stays bounded
+        // by the live set no matter how wide the scanned region is.
+        let mut seen: AddrSet = AddrSet::default();
         let mut addr = sp;
         while addr < high {
             // SAFETY: `[sp, high)` is the current thread's committed stack
@@ -1201,14 +1221,18 @@ impl Heap {
             {
                 // SAFETY: `ptr` is a registered, live box; the scan only
                 // pushes boxes already in the live set.
-                work.push(GcAny(ptr));
+                if seen.insert(ptr as *const u8 as usize) {
+                    work.push(GcAny(ptr));
+                }
             } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
                 && (live_low..=live_high).contains(&box_addr)
                 && let Some(ptr) = find(box_addr)
             {
                 // SAFETY: `ptr` is a registered, live box decoded from a
                 // tagged Value; the scan only pushes boxes already live.
-                work.push(GcAny(ptr));
+                if seen.insert(box_addr) {
+                    work.push(GcAny(ptr));
+                }
             }
             addr += std::mem::size_of::<usize>();
         }

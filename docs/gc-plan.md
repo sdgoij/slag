@@ -198,7 +198,8 @@ precise JS-visible roots plus a conservative native-stack scan:
   live box set — a raw `Gc<T>` word or a NaN-boxed `Value` payload
   (`Value::encoded_box_address`) — so Rust locals and closure captures
   survive. Stack bounds come from `GetCurrentThreadStackLimits` (Windows)
-  or `/proc/self/maps` (Linux); other platforms run precise-roots-only.
+  or `/proc/self/maps` (Linux); wasm scans its linear memory (GC-7); other
+  platforms run precise-roots-only.
 - **Marking is iterative** (an explicit worklist): a deep rope or prototype
   chain cannot overflow the native stack (the recursive first cut crashed
   the `String.prototype.repeat`/`replace` sweep fixtures).
@@ -471,6 +472,69 @@ full sweeps stay 0 fail / 0 crash.
   handle tables root host-held refs correctly.
 - Gate: workers tests green.
 
+### GC-7 — scan-free platforms (wasm) and the conservative-scan dependency
+
+**Context.** The embed core now compiles to `wasm32-unknown-unknown` /
+`wasm32-wasip1` (the `wasm` port; see the feature commit). Long heap-backed
+JS strings corrupted nondeterministically on both wasm targets while native
+x64 looked clean. GC-1 slice 3's note — "other platforms run
+precise-roots-only" — was the cause: `stack_bounds()` returns `None`
+outside Windows/Linux, so the conservative native-stack scan silently never
+runs, and the sweep frees boxes reachable **only from Rust locals** at a
+safe point. The interpreter's values live in traced `Vm` stacks, but the
+embed boundary does not: `Context::eval`'s completion `Value` is held in a
+Rust local across `run_jobs`'s `maybe_collect`, so a safe-point collection
+swept it. The trap stack from the poisoned-box experiment named the site
+exactly (`wasm_smoke::evaluate` → `JsValue::fmt` → `Gc<T>::fmt` →
+`JsString::fmt` reading a swept box).
+
+**Poison-sweep proof it is a root gap, not a 32-bit/wasm bug.** Overwriting
+each swept box's payload with `0xDB` (and skipping the drop/free) turns the
+wasm garbage into immediate out-of-bounds traps — and the **same build
+segfaults natively with the scan disabled**. Native only masks the bug: the
+system heap leaves a freed string buffer's bytes intact until reuse, so
+reads of a swept-but-intact box return correct data, and a pipe-`tail`
+exit-code check can read as clean. The wasm/dlmalloc allocator reuses freed
+buffers promptly, exposing the read-after-sweep. GC off entirely is clean.
+Conclusion: this is a genuine, platform-masked precise-root gap of exactly
+the class the conservative scan exists to protect — D2 stays load-bearing,
+and the wasm port needs a working scan, not (only) a rooting audit.
+
+**Precise-only exploration (option-3 direction).** Running precise-roots-only
+(scan disabled) on native looked clean on production workloads — the
+interpreter values live in traced stacks and GC-2 already `StressSuppress`-s
+native `Vec<Value>` buffers — but the poison build proved that was allocator
+slack, not completeness. The residual `--gc-stress` flakes (the documented
+debug-concat path) also mean the per-allocation net is not yet a trustworthy
+precise-only gate. Fully removing the scan (rooting every Rust local held
+across an allocation, replacing the opaque `Box<dyn FnOnce>` job closures'
+`scan_regions`, deleting the per-platform stack code) is a milestone-scale
+audit; the poison sweep + a scan-disable knob are the reliable detectors for
+driving it incrementally.
+
+**Landed fix (this cut).** `stack_bounds()` for wasm scans from the current
+frame to the end of the current linear memory
+(`core::arch::wasm32::memory_size`); the region above the real stack top is
+dlmalloc heap/static data that share linear memory, and the conservative
+scan only ever retains, so the wider region is safe (it widens retention).
+`scan_stack` now dedups scanned boxes (an `AddrSet` per scan), bounding the
+work list by the live set instead of by every stored reference in the
+scanned region — this removed the `capacity overflow` the earlier
+full-region prototype hit in `scan_stack` after ~10 eval cycles.
+
+Validation: wasm32-unknown-unknown and wasm32-wasip1 both clean — 120
+consecutive fresh-context evals (the previous corruption + overflow
+workload) with 0 mismatches / 0 panics, the 13-feature smoke harness green,
+and 4-round wasip1 string checks exact. Native: `cargo clippy --workspace
+--all-targets -D warnings` clean; `cargo test -p crux` (207) and
+`cargo test -p runtime --lib` (691) pass (the dedup runs on native too).
+
+**Remaining.** (1) Capture the module-initial wasm stack pointer (an
+init-time `.init_array` record) to bound the scan to the actual stack and
+stop over-retaining the shared heap/static region; (2) the option-3
+precise-root audit above, gated on scan-off `--gc-stress` clean + the poison
+detector.
+
 ## 6. Risk register
 
 1. **GC-1 is a genuinely big cut.** PLAN's "the `Handle<T>` API is kept so
@@ -491,6 +555,15 @@ full sweeps stay 0 fail / 0 crash.
    the `Copy`-value win must outweigh it. GC-5 measures; if a hot path
    regresses, the frame-slot/leaf-inline contracts (see the
    `slag-bytecode-vm` skill) are the places to recover it.
+6. **The conservative scan is platform-dependent.** Windows/Linux have stack
+   bounds; wasm now scans the whole linear memory (safe, over-retains) and
+   needs a precise stack-top capture to tighten (GC-7). A precise-root-only
+   future must not assume the scan can simply be deleted.
+7. **Rust-held transients at safe points are load-bearing.** The poison-sweep
+   experiment proved the embed boundary (a `Context::eval` completion value)
+   is swept without the scan on every platform — native only masks it via
+   allocator slack. Any scan-free build needs a root audit (scan-off
+   `--gc-stress` + poison) before it can claim correctness.
 
 ## 7. Validation per cut
 
