@@ -5404,6 +5404,49 @@ mod tests {
     }
 
     #[test]
+    fn number_boolean_bigint_builtins_dispatch_via_registered_handlers() {
+        // The 4.2 registration extended to the Number/Boolean/BigInt
+        // modules: their agent-dependent prototype methods used to scan the
+        // module's linear identity chain per warm call too (toFixed ~1.17us,
+        // bool/bigint toString ~0.6-0.96us/call). These asserts pin that the
+        // registered handlers behave exactly like the chain arms (receiver
+        // unwrapping through the wrapper objects, radix/fraction handling,
+        // constructor call forms).
+        assert_eq!(
+            run("(1.25).toFixed(1) + ':' + (255).toString(16) + ':' + (10).toPrecision(3)")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("1.3:ff:10.0")))
+        );
+        assert_eq!(
+            run("true.toString() + ':' + false.valueOf()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("true:false")))
+        );
+        assert_eq!(
+            run("123n.toString() + ':' + (123n).toString(2)").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("123:1111011")))
+        );
+        // Wrapper receivers unwrap (thisNumberValue/thisBooleanValue/…).
+        assert_eq!(
+            run("new Number(5).toFixed(1) + ':' + new Number(5).valueOf() + ':' + Object(5).toString() + ':' + new Boolean(true).valueOf()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("5.0:5:5:true")))
+        );
+        // The static/constructor call forms (Number(x), BigInt.asUintN).
+        assert_eq!(
+            run("Number('3') + 1 + ':' + BigInt.asUintN(3, 7n) + ':' + String(Boolean(0))")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("4:7:false")))
+        );
+        // Errors still surface through the registered handler (fraction
+        // range, incompatible receiver).
+        assert_eq!(
+            run("var ok = false; try { (1.5).toFixed(101); } catch (e) { ok = e instanceof RangeError; } ok")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
     fn fast_path_annex_b_block_functions() {
         // Cut 6 first slice (Annex B): a block-level function declaration
         // in a sloppy body certifies — the block binding is a frame slot

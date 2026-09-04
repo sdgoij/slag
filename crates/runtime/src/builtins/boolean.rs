@@ -120,6 +120,33 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The Boolean members that need the agent, registered by `Intrinsics::define`
+/// so a warm call dispatches in O(1) by function id instead of scanning the
+/// module's linear intrinsic-identity chain (`dispatch_call`). See the String
+/// `handler_for` note for the measured cost the registration removes.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        BOOLEAN => Some(|_agent, _this, args| {
+            Ok(Value::Boolean(to_boolean(
+                &args.first().cloned().unwrap_or(Value::Undefined),
+            )))
+        }),
+        PROTO_TO_STRING => Some(|agent, this, _args| {
+            this_boolean_value(agent, this).map(|b| {
+                Value::String(Handle::new(JsString::from_utf8(if b {
+                    "true"
+                } else {
+                    "false"
+                })))
+            })
+        }),
+        PROTO_VALUE_OF => {
+            Some(|agent, this, _args| this_boolean_value(agent, this).map(Value::Boolean))
+        }
+        _ => None,
+    }
+}
+
 pub fn dispatch_call(
     agent: &mut Agent,
     callee: &Value,

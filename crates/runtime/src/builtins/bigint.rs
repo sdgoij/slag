@@ -266,6 +266,24 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The BigInt members that need the agent, registered by `Intrinsics::define`
+/// so a warm call dispatches in O(1) by function id instead of scanning the
+/// module's linear intrinsic-identity chain (`dispatch_call`). See the String
+/// `handler_for` note for the measured cost the registration removes.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        BIGINT => Some(|agent, _this, args| bigint_construct(agent, args)),
+        AS_INT_N => Some(|agent, _this, args| as_int_n(agent, args)),
+        AS_UINT_N => Some(|agent, _this, args| as_uint_n(agent, args)),
+        PROTO_TO_STRING => Some(|agent, this, args| to_string_method(agent, this, args)),
+        PROTO_TO_LOCALE_STRING => Some(to_locale_string_method),
+        PROTO_VALUE_OF => Some(|agent, this, _args| {
+            this_bigint_value(agent, this).map(|b| Value::BigInt(Handle::new(b)))
+        }),
+        _ => None,
+    }
+}
+
 /// The BigInt members that need the agent, dispatched by intrinsic identity
 /// from `runtime::function::call`/`construct`.
 pub fn dispatch_call(

@@ -4066,6 +4066,24 @@ skip, annexB 1086/1086, zero fail/crash/hang. The other agent-dependent
 modules (Number/Boolean/BigInt/Object/...) share the same chain pattern;
 extending them is the same mechanical `handler_for` map.
 
+**Extended to Number + Boolean + BigInt** (2026-09-04): the same
+`handler_for` maps — Number's 7 arms (NUMBER ctor via adapter,
+toString/toFixed/toExponential/toPrecision/valueOf/toLocaleString),
+Boolean's 3 (ctor, toString, valueOf), BigInt's 6 (ctor/asIntN/asUintN
+adapters, toString/toLocaleString/valueOf; the `&Agent`-taking toString
+wraps in a closure). Clean interleaved A/B per call on 200k rows: `n.
+toFixed(1)` interp ~1170ns -> ~680ns (~1.7x), `b.toString()` ~615-653 ->
+~300-307 (~2.0-2.3x), `123n.toString()` ~926-963 -> ~346-361
+(~2.6-2.8x); jit proportional; the charCodeAt control is flat (no
+regression). New eval test
+`number_boolean_bigint_builtins_dispatch_via_registered_handlers`
+(wrapper receivers, radix/fraction handling, static/ctor call forms, the
+fraction-range error path). Workspace tests 4652/0; three release sweeps
+at baseline — language 23721/3 skip, built-ins 23657/155 skip, annexB
+1086/1086, zero fail/crash/hang. Remaining unregistered agent-dependent
+modules (Object/Date/Keyed/...) stay on their chains pending a corpus
+probe.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

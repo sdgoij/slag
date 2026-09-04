@@ -546,6 +546,23 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The Number members that need the agent, registered by `Intrinsics::define`
+/// so a warm call dispatches in O(1) by function id instead of scanning this
+/// module's linear intrinsic-identity chain (`dispatch_call`). See the String
+/// `handler_for` note for the measured cost the registration removes.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        NUMBER => Some(|agent, _this, args| number_call(agent, args)),
+        TO_STRING => Some(to_string_method),
+        TO_FIXED => Some(to_fixed),
+        TO_EXPONENTIAL => Some(to_exponential),
+        TO_PRECISION => Some(to_precision),
+        VALUE_OF => Some(|agent, this, _args| this_number_value(agent, this).map(Value::Number)),
+        TO_LOCALE_STRING => Some(to_locale_string_method),
+        _ => None,
+    }
+}
+
 /// The Number members that need the agent, dispatched by intrinsic identity
 /// from `runtime::function::call`/`construct`.
 pub fn dispatch_call(

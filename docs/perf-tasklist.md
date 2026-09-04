@@ -48,7 +48,7 @@
 | # | Item | Status | Evidence / first action |
 |---|---|---|---|
 | 4.1 | Inline the `.apply`/`.call` member read on the compiled intrinsic path | probe done 2026-09-04 — target re-derived as diffuse; deferred to the L2 per-site IC and the L5 call-dispatch levers | Fresh A/B decomposition on the `apply leaf call` shape (200k, per call): apply-9 interp ~98-105ns / jit ~36-44ns; .call-9 interp ~100-107 / jit ~26-32; same-leaf direct 9-arg call interp ~58-62 / jit ~6.2 (the floor). Overhead vs the direct call: interp ~40-44ns, jit ~20-37ns — allocation-free (boxes 0) and the arg-array fill is NOT the term (interp .call ≈ .apply; jit apply-9 ≈ apply-1). The residual is spread across the per-iteration chain member read of the method, the intrinsic identity compare, and the CallApply dispatch; prototype-chain member reads cost ~4x own-data reads interp and ~10x jit (55 vs 16ns interp; ~28 vs ~2.8ns jit) across function/object/array receivers — the read IS a real primitive, but a narrow `.apply`-only inline has no clean target (the read is shared with every `o.m()`; an inline validation was measured slower in 2026-09-01). Defer the read-side fix to L2 (per-site shape/offset ICs) and the dispatch-side residual to L5. |
-| 4.2 | Register agent-dependent builtin handlers in the O(1) per-function-id table so warm calls skip the module dispatch chains (the L5 intrinsic-call dispatch floor) | **partial — String landed 2026-09-04**; Number/Boolean/BigInt/Object/etc. chains share the pattern | Probe (200k calls, certified rows, both engines): `s.charCodeAt` ~1.18µs/call interp and `a.push` ~1.7µs vs `Math.abs` ~150ns (a plain native closure, no agent chain) and a same-work JS leaf ~90ns. Mechanism: agent-dependent methods (ToString/@@-delegation need the agent, so they are placeholder-closure builtins dispatched by intrinsic identity) run the module's LINEAR `dispatch_call` chain on every warm call — each `intrinsics.get` arm allocates a JsString + hash-lookup, and only `array::handler_for`/`regexp::handler_for` register O(1) per-id handlers today. Fix: `string::handler_for` (the ~39 non-HTML chain arms mapped to their `(agent, this, args)` handlers) consulted by `Intrinsics::define`, registering each method by function id. charCodeAt interp ~1.18µs -> ~380ns (~3.1x), jit ~1.14µs -> ~350ns (~3.3x); the residual is the primitive-string chain READ (~250ns) plus the native call — the L2 read lever. Gates: clippy, workspace tests (new `string_agent_builtins_dispatch_identically_via_registered_handlers`), three sweeps at baseline (perf.md record). Next: the same `handler_for` maps for the other agent-dependent modules. |
+| 4.2 | Register agent-dependent builtin handlers in the O(1) per-function-id table so warm calls skip the module dispatch chains (the L5 intrinsic-call dispatch floor) | **landed 2026-09-04 — String + Number + Boolean + BigInt**; Object/Date/Keyed/etc. chains share the pattern | Probe (200k calls, certified rows, both engines): `s.charCodeAt` ~1.18µs/call interp and `a.push` ~1.7µs vs `Math.abs` ~150ns (a plain native closure, no agent chain) and a same-work JS leaf ~90ns. Mechanism: agent-dependent methods (ToString/@@-delegation need the agent, so they are placeholder-closure builtins dispatched by intrinsic identity) run the module's LINEAR `dispatch_call` chain on every warm call — each `intrinsics.get` arm allocates a JsString + hash-lookup, and only `array::handler_for`/`regexp::handler_for` register O(1) per-id handlers today. Fix: per-module `handler_for` maps (String ~39 non-HTML arms, Number 7, Boolean 3, BigInt 6 — each arm's `(agent, this, args)` handler, constructor arms via adapter closures) consulted by `Intrinsics::define`, registering each method by function id at install. charCodeAt interp ~1.18µs -> ~380ns (~3.1x); clean A/B per call on the primitive rows: `n.toFixed(1)` interp ~1170 -> ~680ns (~1.7x), `b.toString()` ~615-653 -> ~300-307 (~2.0-2.3x), `123n.toString()` ~926-963 -> ~346-361 (~2.6-2.8x); jit proportional. Residual is the primitive chain READ (~250ns) + native call (the L2 read lever). Gates: clippy, workspace tests (new `string_agent_builtins_dispatch_identically_via_registered_handlers` + `number_boolean_bigint_builtins_dispatch_via_registered_handlers`), three sweeps at baseline (perf.md record). Next: the same `handler_for` maps for the other agent-dependent modules if a corpus probe shows their methods hot. |
 
 ## P5 — Small interpreter micro-slices (probe first)
 
@@ -86,14 +86,16 @@
    CallApply dispatch — no narrow .apply-only slice; the read side defers
    to L2 (per-site ICs), the dispatch side to L5. 4.2 (the intrinsic-CALL
    dispatch floor: warm agent-dependent builtin calls paid the module's
-   linear identity chain) is PARTIAL — String handlers registered O(1)
-   (charCodeAt ~3.1x; see the 4.2 row). Remaining candidates, in order:
-   (a) the write-side >256 follow-on probe (per-site store ICs) only if a
-   realistic >256-object store loop shows up; (b) the chain-member-read
-   cost itself (~4x own-data reads interp, ~10x jit — and the primitive
-   chain reads now measure ~67-250ns/call interp, the own-scan on the kind
-   prototype) once L2's shape representation lands; (c) extending 4.2's
-   O(1) handler registration to the other agent-dependent modules
-   (Number/Boolean/BigInt/Object/... — same `handler_for` pattern as the
-   landed String map). 0.1 (the JIT Float16Array/typed-array miscompile)
-   stays owned by the Linux debug agent in parallel.
+   linear identity chain) is LANDED for String + Number/Boolean/BigInt
+   (charCodeAt ~3.1x, toFixed ~1.7x, bool/bigint toString ~2-2.8x; see the
+   4.2 row). Remaining candidates, in order: (a) the write-side >256
+   follow-on probe (per-site store ICs) only if a realistic >256-object
+   store loop shows up; (b) the chain-member-read cost itself (~4x
+   own-data reads interp, ~10x jit — and the primitive chain reads now
+   measure ~67-250ns/call interp, the own-scan on the kind prototype)
+   once L2's shape representation lands; (c) extending 4.2's O(1) handler
+   registration to the remaining agent-dependent modules (Object/Date/
+   Keyed/etc. — same `handler_for` pattern) only if a corpus probe shows
+   their methods hot (array and regexp already registered). 0.1 (the JIT
+   Float16Array/typed-array miscompile) stays owned by the Linux debug
+   agent in parallel.

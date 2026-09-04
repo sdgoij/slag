@@ -243,6 +243,9 @@ impl Intrinsics {
             && let Some(handler) = crate::builtins::array::handler_for(name)
                 .or_else(|| crate::builtins::regexp::handler_for(name))
                 .or_else(|| crate::builtins::string::handler_for(name))
+                .or_else(|| crate::builtins::number::handler_for(name))
+                .or_else(|| crate::builtins::boolean::handler_for(name))
+                .or_else(|| crate::builtins::bigint::handler_for(name))
         {
             crate::function::register_builtin_handler(function.id(), handler);
         }
