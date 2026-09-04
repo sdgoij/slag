@@ -4084,6 +4084,38 @@ at baseline — language 23721/3 skip, built-ins 23657/155 skip, annexB
 modules (Object/Date/Keyed/...) stay on their chains pending a corpus
 probe.
 
+### The >256-object store ceiling and the write-cell capacity bump (tasklist 1.7, measured + landed 2026-09-04)
+
+The write-side >256 follow-on probe (recommended order (a)): cycling
+member stores over distinct-object working sets (1M stores, certified
+rows, both engines). The 256-entry direct-mapped write cells hold up to
+~256 objects; at 1024+ objects every store thrashes out of the table and
+falls to the full [[Set]]: interp ~55ns/store (1-256 objects) -> ~180ns
+(1024/8192), jit ~40 -> ~165ns. READ rows do NOT cliff (59-61ns at both
+64 and 1024 objects — the read map/proto-cell layers absorb misses), so
+the cliff is write-cell capacity specifically. Such loops are realistic
+(per-frame entity/record updates over thousands of objects), so the
+ceiling matters.
+
+Fix: `MEMBER_WRITE_CELLS` 256 -> 4096. The write table is a BOXED Agent
+field (unlike the inline read tables the 1.1 probe found bloated the
+Agent struct), so growing it costs only per-Agent heap (~128KB at 4096)
+and no warm-row struct footprint. `Agent::new` must build it heap-
+direct: `Box::new(std::array::from_fn(|_| None))` materializes the array
+ON THE STACK first (~128KB in debug at 4096) and overflowed the 1MB-
+stack embed doctest — the init now sizes a `Vec` on the heap and converts
+to the boxed array. Measured: the 1024-object store row drops interp
+~180 -> ~55ns/store (~3.3x) and jit ~165 -> ~40ns; working sets <=4096
+fit; warm rows (1-obj/64/256 stores), the suite rows, and the charCodeAt
+control all move within the cross-build layout band (property read —
+which never touches the write table — moved a similar ~±18%, confirming
+noise). Working sets beyond 4096 objects still fall back to the full
+[[Set]]; that residual is the L2 per-site store-IC slice, deferred
+behind the L1c shape representation. Gates: clippy clean, `cargo test
+--workspace` green (4652/0, including the embed doctest that caught the
+stack temporary), three release sweeps at baseline — language 23721/3
+skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

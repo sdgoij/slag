@@ -28,6 +28,7 @@
 | 1.4 | Primitive-string property reads box a String-exotic wrapper per access | **landed 2026-09-04** | Certified-body probe (200k `s.length` reads, `Gc::new` TLS counters): top-level eval, certified interp, AND the JIT all boxed 448B wrapper + 64B [[StringData]] per read. Fix in the shared `Vm::get_member_name`/`get_member_computed` helpers (mirroring the typed-array `length`/element shortcuts, so the step path, register ops, and JIT ABI all inherit): string-`.length` returns the code-unit count; in-range canonical numeric index returns the single code unit (StringGetOwnProperty — own, shadows the chain); OOB/non-index falls through (patched `%String.prototype%` numeric keys still found). Counts 400k -> 0; clean A/B on the 200k row: interp ~106-119ms -> ~4.2-4.8ms (~23x), jit ~108-308ms -> ~2.4-2.8ms (~40x). Gates: clippy, workspace tests (new `string_primitive_member_reads_serve_length_and_units_without_boxing`), three sweeps at baseline (perf.md record). |
 | 1.5 | Primitive-string METHOD reads (chain data/accessor/symbol keys) resolve on `%String.prototype%` without boxing | **landed 2026-09-04** | Probe: `s.charAt`/`charCodeAt`/`indexOf` each boxed 448B wrapper + 64B [[StringData]] per CALL on top-level eval, certified interp, AND the JIT (200k calls = 400k boxes; the compiled call path has no primitive-receiver member fast path). Fix: `Vm::get_string_primitive` — after the 1.4 length/index shortcuts, a string-primitive fallback resolves the key against the realm's cached `%String.prototype%` with the PRIMITIVE as the [[Get]] receiver (exact: the wrapper's own props are only length/index, and the engine threads Receiver=primitive through OrdinaryGet — data props, accessors (strict getters see the primitive; sloppy this-coercion boxes), proxy links, symbol keys all match). Boxes 400k -> 0 (charAt retains its inherent result-string box). Clean A/B on 200k rows: charCodeAt interp ~413-430 -> ~246-250ms (~1.7x), charAt ~348-371 -> ~207-216 (~1.7x), indexOf ~550-578 -> ~394-409 (~1.4x); jit similar; the residual per-call cost is the intrinsic CALL dispatch (4.1/L5), not the read. Semantic battery byte-identical vs the boxed path (sloppy/strict getters, patched methods, proxy-in-chain receiver, numeric OOB). Gates: clippy, workspace tests (new `string_primitive_method_reads_resolve_on_the_prototype_chain`), three sweeps at baseline (perf.md record). |
 | 1.6 | Non-string primitives (Number/Boolean/BigInt/Symbol) METHOD reads resolve on their %X.prototype% without boxing | **landed 2026-09-04** | The 1.4/1.5 helper was string-only; probe (200k, `Gc::new` TLS counters) showed Number/Boolean/Symbol/BigInt method reads/calls boxed a 448B wrapper PER READ on both engines (number/boolean wrapper creation also inserts an agent boxed-value-table entry): `n.toFixed`/`toString` reads 200k x 448B, call rows + the inherent result-string boxes, `sym.description` + result, bigint call + 48B box. Fix: generalized `Vm::get_string_primitive` -> `Vm::get_primitive_member` and routed every primitive (not just String) through it in `get_member_name`/`get_member_computed`; new `Intrinsics::primitive_prototypes` cache (Number/Boolean/BigInt/Symbol, array indexed like `function_prototypes`). Exactness is the same argument as 1.5 (these wrappers are ordinary objects with NO own properties — the direct chain read with the primitive receiver reproduces every read; the `description` accessor and proxy links see the primitive receiver). Boxes 200k -> 0 on reads. Clean A/B on Number method-read rows (200k): interp ~106-119ms -> ~13.3-14.1ms (~8.4x), jit ~97-104ms -> ~7.9-9.7ms (~11-13x); the residual ~67ns/call interp is the %Number.prototype% own-scan chain read (the 4.1 probe's chain-read primitive — L2). 18-line semantic battery byte-identical (methods, patches, strict/sloppy getters, proxy receiver, `Symbol().description`, boxed `new Number(5)` reads). Gates: clippy, workspace tests (new `non_string_primitive_method_reads_resolve_on_the_prototype_chain`), three sweeps at baseline (perf.md record). |
+| 1.7 | Store-cell capacity: `MEMBER_WRITE_CELLS` 256 -> 4096 (boxed table, heap-direct init) | **landed 2026-09-04** | The (a) probe: a >256-distinct-object cycling store loop hits a real cliff — 1M stores across 1024 objects ~180ns/store interp (~165 jit) vs ~55ns/~40ns for 1-256-object sets, because the 256-entry direct-mapped write cells thrash and every store falls to the full [[Set]]; READ rows do NOT cliff (59-61ns at both 64 and 1024 — the read map/proto-cell layer absorbs). Such loops are realistic (per-frame entity/record updates over thousands of objects). Fix: grow the boxed `MEMBER_WRITE_CELLS` 256 -> 4096 and make `Agent::new` build it heap-direct (the `from_fn` array temporary sat on the stack — ~128KB at 4096 — and overflowed the 1MB-stack embed doctest). 1024-object stores drop ~180 -> ~55ns interp (~165 -> ~40 jit); warm rows and the suite move within the cross-build layout band; the charCodeAt control flat. Working sets >4096 still cliff (that residual is the L2 per-site store-IC target, deferred behind L1c). Gates: clippy, workspace tests (4652/0 incl. the embed doctest), three sweeps at baseline (perf.md record). |
 
 ## P2 — JIT coverage (L3)
 
@@ -88,14 +89,18 @@
    dispatch floor: warm agent-dependent builtin calls paid the module's
    linear identity chain) is LANDED for String + Number/Boolean/BigInt
    (charCodeAt ~3.1x, toFixed ~1.7x, bool/bigint toString ~2-2.8x; see the
-   4.2 row). Remaining candidates, in order: (a) the write-side >256
-   follow-on probe (per-site store ICs) only if a realistic >256-object
-   store loop shows up; (b) the chain-member-read cost itself (~4x
-   own-data reads interp, ~10x jit — and the primitive chain reads now
-   measure ~67-250ns/call interp, the own-scan on the kind prototype)
-   once L2's shape representation lands; (c) extending 4.2's O(1) handler
-   registration to the remaining agent-dependent modules (Object/Date/
-   Keyed/etc. — same `handler_for` pattern) only if a corpus probe shows
-   their methods hot (array and regexp already registered). 0.1 (the JIT
-   Float16Array/typed-array miscompile) stays owned by the Linux debug
+   4.2 row). 1.7 (the write-side >256 capacity probe) is LANDED: the
+   cliff was real (~3.3x at >256 objects) and the boxed `MEMBER_WRITE_CELLS`
+   bump to 4096 removes it through ~4k-object sets at no measured warm-row
+   cost; >4k-object working sets still fall to the full [[Set]] (that
+   residual is the L2 per-site store-IC slice). Remaining candidates, in
+   order: (a) the chain-member-read cost itself (~4x own-data reads interp,
+   ~10x jit — and the primitive chain reads now measure ~67-250ns/call
+   interp, the own-scan on the kind prototype) once L2's shape
+   representation lands; (b) the >4096-object store ceiling via L2 per-site
+   store ICs once the shape representation exists; (c) extending 4.2's O(1)
+   handler registration to the remaining agent-dependent modules (Object/
+   Date/Keyed/etc. — same `handler_for` pattern) only if a corpus probe
+   shows their methods hot (array and regexp already registered). 0.1 (the
+   JIT Float16Array/typed-array miscompile) stays owned by the Linux debug
    agent in parallel.

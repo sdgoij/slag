@@ -689,7 +689,19 @@ impl Agent {
             member_value_cells: Box::new(std::array::from_fn(|_| {
                 crate::ir::MemberValueCell::empty()
             })),
-            member_write_cells: Box::new(std::array::from_fn(|_| None)),
+            member_write_cells: {
+                // The write table is larger than the other IC tables; build it
+                // on the heap directly (a `from_fn` array temporary would sit on
+                // the stack — ~128KB at MEMBER_WRITE_CELLS=4096 — and overflow a
+                // small-stack embedding context).
+                let mut cells: Vec<Option<crate::ir::MemberWriteCell>> =
+                    Vec::with_capacity(crate::ir::MEMBER_WRITE_CELLS);
+                cells.resize_with(crate::ir::MEMBER_WRITE_CELLS, || None);
+                cells
+                    .into_boxed_slice()
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("sized exactly MEMBER_WRITE_CELLS"))
+            },
             member_chain_cells: Box::new(std::array::from_fn(|_| None)),
             array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
             array_length_cells: Box::new(std::array::from_fn(|_| None)),

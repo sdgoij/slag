@@ -1750,7 +1750,7 @@ pub const MEMBER_CELLS: usize = 16;
 /// Mirrors the GLOBAL_CELLS 32->256 bump (Cut 35 slice 5). The JIT never
 /// reads the write cells, so the size is interpreter-only. Power of two so
 /// the index is a mask.
-pub(crate) const MEMBER_WRITE_CELLS: usize = 256;
+pub(crate) const MEMBER_WRITE_CELLS: usize = 4096;
 
 /// Part B, B5.4: the cached constructor boilerplate map — (function id,
 /// prototype id, function-object generation) → the final shape the body's
