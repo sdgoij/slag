@@ -3910,6 +3910,47 @@ clippy clean, `cargo test --workspace` green (4648/0), three release
 sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
 annexB 1086/1086, zero fail/crash/hang.
 
+### Primitive-string METHOD reads resolve on the prototype chain without boxing (tasklist 1.5, measured + landed 2026-09-04)
+
+The 1.4 fix left the METHOD-read shape boxing: `s.charAt(0)` reads the
+`charAt` METHOD off the string, and that member read (a chain data
+property) still paid the per-read wrapper. Probe (200k calls, `Gc::new`
+TLS counters): `charCodeAt`/`indexOf` allocated 448B wrapper + 64B
+[[StringData]] per CALL, and `charAt` +1 x 64B result — identically on
+top-level eval, certified interp, and JIT. The compiled call path has no
+primitive-receiver fast path for chain keys.
+
+Fix: `Vm::get_string_primitive` — the shared member helpers' string
+fallback now resolves the key against the realm's cached
+`%String.prototype%` (`Intrinsics::string_prototype`, a `string_prototype`
+cache mirroring `object_prototype`) with the PRIMITIVE as the [[Get]]
+receiver. Exact because the boxed wrapper's only own properties are the
+virtual `length`/in-range indices (the 1.4 shortcuts, re-checked inside
+the helper for the named-path `s["3"]` and computed-key shapes) and this
+engine threads Receiver=primitive through OrdinaryGet (spec 10.4.3.4) —
+so a read starting at `%String.prototype%` reproduces the boxed read for
+data properties, accessors (a strict getter sees `this` = the primitive;
+only sloppy this-coercion boxes it), proxy links (the get trap's
+receiver is the primitive), and symbol keys. Box counts on 200k calls:
+charCodeAt/indexOf 400k -> 0; charAt 600k -> 200k (the inherent
+result-string boxes); s[i] unchanged (200k result boxes only).
+
+Clean interleaved A/B (probe timings only, no counters): charCodeAt interp
+~413-430ms -> ~246-250ms (~1.7x), charAt ~348-371ms -> ~207-216ms
+(~1.7x), indexOf ~550-578ms -> ~394-409ms (~1.4x) per 200k; jit moves
+proportionally (~1.65x/1.7x/1.35x); the s[i] row (~24ms) is flat. The
+residual ~1.2µs/call is the intrinsic CALL dispatch (builtin frame
+setup), not the read — that cost belongs to the 4.1/L5 call lever. A
+17-line semantic battery (sloppy vs strict getters, patched method
+`this`, proxy-in-chain receiver type, numeric-OOB patches, code-unit
+length/index, `new String` wrapper reads) is byte-identical vs the boxed
+baseline. New eval test
+`string_primitive_method_reads_resolve_on_the_prototype_chain`. Gates:
+clippy clean, `cargo test --workspace` green (4649/0), three release
+sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086, zero fail/crash/hang. Number/Boolean/Symbol primitives
+still box on method reads (n.toFixed etc.) — same pattern, unprobed.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

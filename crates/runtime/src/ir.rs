@@ -8166,8 +8166,11 @@ impl Vm {
                 if let Some(value) = Self::member_chain_get(agent, &object, name) {
                     return Ok(value);
                 }
-                let value =
-                    crate::context::get_property(agent, &object, &crux::lookup(name), object)?;
+                let value = if matches!(object.kind(), ValueKind::String(_)) {
+                    Self::get_string_primitive(agent, object, &PropertyKey::String(name))?
+                } else {
+                    crate::context::get_property(agent, &object, &crux::lookup(name), object)?
+                };
                 Self::resolve_member_cell(agent, &object, name);
                 Self::resolve_chain_cell(agent, &object, name);
                 Ok(value)
@@ -8182,6 +8185,45 @@ impl Vm {
         use std::sync::OnceLock;
         static LENGTH: OnceLock<crux::AtomId> = OnceLock::new();
         *LENGTH.get_or_init(|| crux::string::intern_utf8("length"))
+    }
+
+    /// Serve a property read on a string PRIMITIVE without building the
+    /// per-read String-exotic wrapper (a 448B JsObject + a 64B [[StringData]]
+    /// copy) the generic [[Get]] pays on primitives. Exact because the
+    /// wrapper's only own properties are the virtual `length` and in-range
+    /// canonical indices — handled here (spec 10.4.3.5 StringGetOwnProperty)
+    /// — and the engine threads the PRIMITIVE as the [[Get]] receiver (spec
+    /// 10.4.3.4: StringExoticObject.[[Get]] passes Receiver through to
+    /// OrdinaryGet), so a read starting at %String.prototype% with the
+    /// primitive receiver reproduces the boxed read for every other key:
+    /// chain data properties and accessors (which see `this` = the
+    /// primitive, exactly as the boxed path's receiver threading already
+    /// does), exotic/proxy links, and missing keys. Non-string receivers
+    /// fall through to the generic path unchanged.
+    fn get_string_primitive(
+        agent: &mut Agent,
+        receiver: Value,
+        key: &PropertyKey,
+    ) -> Result<Value, JsError> {
+        let ValueKind::String(s) = receiver.kind() else {
+            return crate::context::get_property_key(agent, &receiver, key, receiver);
+        };
+        if let PropertyKey::String(atom) = key {
+            if *atom == Self::length_atom() {
+                return Ok(Value::Number(s.len() as f64));
+            }
+            if let Some(index) = crux::object::array_index_of(key)
+                && index < s.len() as u64
+            {
+                let unit = s.as_slice()[index as usize];
+                return Ok(Value::String(Handle::new(JsString::from_utf16(&[unit]))));
+            }
+        }
+        let realm = agent.current_realm()?;
+        let Some(proto) = realm.intrinsics.string_prototype() else {
+            return crate::context::get_property_key(agent, &receiver, key, receiver);
+        };
+        crate::context::get_property_key(agent, &proto, key, receiver)
     }
 
     /// The shared computed member read (the `GetMemberComputed` step and
@@ -8236,16 +8278,20 @@ impl Vm {
             return Ok(Value::String(Handle::new(JsString::from_utf16(&[*unit]))));
         }
         let key = crate::context::to_property_key(agent, &key)?;
-        let value = match &key {
-            PropertyKey::String(atom) => match Self::member_cell_get(agent, &object, *atom) {
-                Some(value) => value,
-                None => {
-                    let value = crate::context::get_property_key(agent, &object, &key, object)?;
-                    Self::resolve_member_cell(agent, &object, *atom);
-                    value
-                }
-            },
-            _ => crate::context::get_property_key(agent, &object, &key, object)?,
+        let value = if matches!(object.kind(), ValueKind::String(_)) {
+            Self::get_string_primitive(agent, object, &key)?
+        } else {
+            match &key {
+                PropertyKey::String(atom) => match Self::member_cell_get(agent, &object, *atom) {
+                    Some(value) => value,
+                    None => {
+                        let value = crate::context::get_property_key(agent, &object, &key, object)?;
+                        Self::resolve_member_cell(agent, &object, *atom);
+                        value
+                    }
+                },
+                _ => crate::context::get_property_key(agent, &object, &key, object)?,
+            }
         };
         if let Some(index) = numeric {
             Self::resolve_array_element(agent, &object, index);

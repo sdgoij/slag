@@ -5206,6 +5206,76 @@ mod tests {
     }
 
     #[test]
+    fn string_primitive_method_reads_resolve_on_the_prototype_chain() {
+        // Tasklist follow-on: a method call on a primitive string boxes a
+        // fresh String-exotic wrapper for the member READ of the method
+        // (charAt/charCodeAt/indexOf and the s[i]-style index reads each
+        // paid a 448B wrapper + 64B [[StringData]] copy per call on every
+        // read path). The shared member helpers now resolve chain reads on a
+        // string primitive directly against %String.prototype% with the
+        // primitive as the [[Get]] receiver. These asserts pin the semantics
+        // the direct resolution must preserve: the wrapper's own virtual
+        // `length`/in-range indices shadow the chain, every other key reads
+        // the live chain (data props, patched methods, accessors seeing the
+        // primitive receiver, proxy links, symbol keys), and out-of-range
+        // numeric keys fall to the chain.
+        assert_eq!(
+            run("'abc'.charCodeAt(1) + ':' + 'abc'.charAt(2) + ':' + 'abc'.indexOf('b')").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("98:c:1")))
+        );
+        // A data-property patch is read live and called (with `this` = the
+        // primitive, which sloppy this-coercion boxes — `this` is a String
+        // object, not the literal).
+        assert_eq!(
+            run("var orig = String.prototype.charAt; \
+                 String.prototype.charAt = function () { return this; }; \
+                 var out = typeof 'ab'.charAt(0) + ':' + ('ab'.charAt(0) instanceof String); \
+                 String.prototype.charAt = orig; out")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("object:true")))
+        );
+        // An accessor on the chain sees the PRIMITIVE as `this` when strict
+        // (the engine's [[Get]] receiver is the primitive; only sloppy
+        // this-coercion boxes it).
+        assert_eq!(
+            run("Object.defineProperty(String.prototype, 'slop', { get: function () { return typeof this; } }); \
+                 Object.defineProperty(String.prototype, 'strct', { get: function () { 'use strict'; return typeof this; } }); \
+                 var slop = 'a'.slop; var strct = 'a'.strct; \
+                 delete String.prototype.slop; delete String.prototype.strct; slop + ':' + strct")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("object:string")))
+        );
+        // An exotic (proxy) link later in the chain runs its [[Get]] with
+        // the primitive receiver.
+        assert_eq!(
+            run("var log = []; \
+                 var p = new Proxy({}, { get: function (t, k, r) { 'use strict'; log.push(typeof r); return 7; } }); \
+                 Object.setPrototypeOf(String.prototype, p); \
+                 var got = 'a'.zz; Object.setPrototypeOf(String.prototype, Object.prototype); \
+                 got + ':' + log.join(',')")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("7:string")))
+        );
+        // A symbol-keyed chain read (the iterator method) resolves.
+        assert_eq!(
+            run("typeof 'abc'[Symbol.iterator] === 'function'").unwrap(),
+            Value::Boolean(true)
+        );
+        // In-range index reads (numeric and literal-string keys) serve the
+        // single code unit and shadow chain patches; out-of-range falls to
+        // the chain.
+        assert_eq!(
+            run("String.prototype[0] = 'PATCHED'; \
+                 String.prototype[9] = 'nine'; \
+                 var a = 'ab'[0]; var b = 'ab'['1']; var o = 'ab'[9]; \
+                 delete String.prototype[0]; delete String.prototype[9]; \
+                 a + '|' + b + '|' + o")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("a|b|nine")))
+        );
+    }
+
+    #[test]
     fn fast_path_annex_b_block_functions() {
         // Cut 6 first slice (Annex B): a block-level function declaration
         // in a sloppy body certifies — the block binding is a frame slot

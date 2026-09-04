@@ -74,6 +74,13 @@ pub struct Intrinsics {
     /// populated at bootstrap and never reassigned).
     apply_builtin: RefCell<Option<Value>>,
     call_builtin: RefCell<Option<Value>>,
+    /// The realm's %String.prototype% value, cached after the first
+    /// resolution: primitive-string member reads resolve their chain
+    /// directly against it instead of boxing a per-read String-exotic
+    /// wrapper (tasklist 1.4 follow-on). `Intrinsics::get` allocates a
+    /// JsString per call, so the cache keeps a hot `s.charAt`-style read off
+    /// the allocation path.
+    string_prototype: RefCell<Option<Value>>,
 }
 
 /// The number of cached function-creation prototype intrinsics.
@@ -109,6 +116,7 @@ impl Trace for Intrinsics {
         }
         self.apply_builtin.trace(visit);
         self.call_builtin.trace(visit);
+        self.string_prototype.trace(visit);
     }
 }
 
@@ -165,6 +173,17 @@ impl Intrinsics {
         }
         let value = self.get("%Function.prototype.call%")?;
         *self.call_builtin.borrow_mut() = Some(value);
+        Some(value)
+    }
+
+    /// The realm's %String.prototype% value, cached after the first
+    /// resolution (see the struct field).
+    pub fn string_prototype(&self) -> Option<Value> {
+        if let Some(value) = self.string_prototype.borrow().as_ref() {
+            return Some(*value);
+        }
+        let value = self.get("%String.prototype%")?;
+        *self.string_prototype.borrow_mut() = Some(value);
         Some(value)
     }
 
