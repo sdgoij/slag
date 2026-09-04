@@ -3451,6 +3451,34 @@ Next (slice (b)): the per-iteration conditional test inside a certified
 loop stays on the step path — the remaining ~98ms floor of the
 `buildString shape` row.
 
+### Strict-equality `if`/`while` conditions fuse into one jump (`JumpIfEqImm`/`JumpIfNeqImm`) (measured 2026-09-04)
+
+Slice (b) of the L4 probe: the per-iteration `if (l === 10000)` guard in
+a certified loop body compiled to LoadLocal + BinaryImm + JumpIfFalse
+(~3 step dispatches per iteration — the `buildString shape` row's
+remaining floor). Strict equality against a numeric literal is
+coercion-free (only the Number `imm` itself matches — a String, BigInt,
+or Object never `===` a Number), so a fused step needs NO general
+evaluator: `compile_if`/`compile_while` now recognize `ident ===
+<number>` / `ident !== <number>` over a frame-slot binding and emit
+`JumpIfEqImm`/`JumpIfNeqImm` (read the slot TDZ-checked, f64 compare,
+jump when the encoded test is false — the `JumpIfLtImm` family
+convention), one dispatch in both engines.
+
+Measurement (fresh builds, tight per-pair alternation in both orders, 3M
+iters, 2026-09-04): the `if (l === 10000)` rows drop ~99-101ms ->
+~62-64ms interp (~1.6x) and ~13-14ms -> ~8-9ms under the JIT (the fused
+branch shortens the compiled path too); the `buildString shape` suite row
+(`a[l++] = i; if (l === 10000) { c++; a.length = l = 0; }`) drops
+~135-139ms -> ~102-108ms interp (~1.3x) and ~42ms -> ~35ms JIT;
+straight-line rows are flat. Gates: clippy clean, workspace tests green
+(new `strict_eq_if_conditions_fuse_into_one_jump` lowering/semantics test
+and an `installed_jit` parity test over Numbers, a numeric-string, and
+`!==`/`while`), and the three release sweeps at exact parent parity
+(language 23721/3 skip, annexB 1086/1086, built-ins identical crash sets
+323/323 vs the parent d58caea run — the pre-existing worker-death
+regression unchanged).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

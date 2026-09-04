@@ -1651,6 +1651,29 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_strict_eq_conditions_match_the_interpreter() {
+        // The fused `JumpIfEqImm`/`JumpIfNeqImm` step (an `if (x === N)` /
+        // `x !== N` test in one dispatch) must agree with the interpreter
+        // over Numbers, a numeric-string (never `===` a Number), and `!==`,
+        // in loops and as a `while` condition.
+        let source = "function f(n) { var l = '5'; var c = 0; for (var i = 0; i < n; i++) { if (l === 5) { c++; } } return c; }\n\
+                     function g(n) { var l = 0; var c = 0; for (var i = 0; i < n; i++) { l++; if (l === 10000) { c++; } } return c; }\n\
+                     function h(n) { var l = 0; var c = 0; while (l !== n) { c++; l++; } return c; }\n\
+                     f(7) + g(20000) * 1000 + h(6);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled body must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_typed_array_length_probe_serves_compiled_reads() {
         // A loop reading `ta.length` per iteration compiles, and the
         // compiled `GetMemberName`-with-length probe serves the slots length

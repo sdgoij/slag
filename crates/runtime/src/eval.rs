@@ -3176,6 +3176,64 @@ mod tests {
     }
 
     #[test]
+    fn strict_eq_if_conditions_fuse_into_one_jump() {
+        // An `if (x === N)` / `x !== N` condition inside a certified loop
+        // body compiled to LoadLocal + BinaryImm + JumpIfFalse per iteration
+        // (three step dispatches — the buildString guard `l === 10000`). The
+        // test now fuses into ONE `JumpIfEqImm`/`JumpIfNeqImm` step: a
+        // slot-vs-numeric-literal strict-equality test that jumps when the
+        // test is FALSE. Strict equality against a Number is coercion-free
+        // (only the Number `imm` itself matches), so the fused step needs no
+        // general evaluator; a non-Number value (a String, a BigInt, an
+        // Object) simply takes the false path.
+        fn steps(agent: &mut Agent, src: &str, name: &str) -> Vec<crate::ir::Step> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps.to_vec()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let steps = steps(
+            &mut agent,
+            "function g(n) { var l = 0; var c = 0; for (var i = 0; i < n; i++) { l++; if (l === 10000) { c++; } } return c; }",
+            "g",
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::JumpIfEqImm { imm: 10000.0, .. })),
+            "the === N condition must fuse into a JumpIfEqImm"
+        );
+        assert!(
+            !steps.iter().any(|s| matches!(
+                s,
+                crate::ir::Step::BinaryImm {
+                    op: syntax::ast::BinaryOp::StrictEqual,
+                    ..
+                }
+            )),
+            "no general === binary may remain for the fused condition"
+        );
+        // Semantics: the fused strict test is exact across value kinds — a
+        // numeric-string never matches a Number, `!==` fires on it, and a
+        // Number boundary still trips the guard.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "function g(n) { var l = 0; var c = 0; for (var i = 0; i < n; i++) { l++; if (l === 10000) { c++; } } return c; } \
+                 function h(n) { var l = '5'; var c = 0; for (var i = 0; i < n; i++) { if (l === 5) { c++; } } return c; } \
+                 function k(n) { var l = 0; var c = 0; for (var i = 0; i < n; i++) { l++; if (l !== 10000) { c++; } } return c; } \
+                 g(25000) * 100 + h(3) * 10 + k(5)",
+            )
+            .unwrap();
+        // g: l increments 1..25000 and hits 10000 exactly once (1); h: "5"
+        // !== 5, never (0); k: l increments 1..5, never 10000, so all five
+        // iterations count (5).
+        assert_eq!(value, Value::Number(105.0));
+    }
+
+    #[test]
     fn member_compound_and_computed_stores_lower_to_register_runs() {
         // A member RMW in a certified loop (`o.x += 1`) and a plain member
         // store of a computed value (`o.x = o.x + 1`) previously kept the

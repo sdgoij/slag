@@ -749,6 +749,27 @@ pub enum Step {
         imm: f64,
         target: usize,
     },
+    /// Fused strict-equality branch `slot === imm` (an `if (x === N)` /
+    /// `while (x === N)` condition as ONE step instead of LoadLocal +
+    /// BinaryImm + JumpIfFalse): read the slot, test it against the numeric
+    /// literal with STRICT equality — a non-Number value is never strictly
+    /// equal to a Number, so the test needs no coercion and no general
+    /// evaluator — and jump to `target` when the test is FALSE (the family
+    /// convention: `JumpIfLtImm` likewise jumps when `slot < imm` is
+    /// false). Emitted only for a tdz-free frame-slot `var`.
+    JumpIfEqImm {
+        slot: usize,
+        imm: f64,
+        target: usize,
+    },
+    /// The `slot !== imm` sibling of [`Step::JumpIfEqImm`]: jump to
+    /// `target` when `slot !== imm` is false (i.e. when the slot holds the
+    /// Number `imm`).
+    JumpIfNeqImm {
+        slot: usize,
+        imm: f64,
+        target: usize,
+    },
     /// The fused relational loop test with a fast-binding limit (`i < n`
     /// where `n` is a frame slot or declared global — the general path
     /// evaluates the limit every iteration, so the fused head re-reads it):
@@ -2896,6 +2917,39 @@ impl Vm {
             Some(base) => &mut self.stack[base + slot],
             None => Frame::get_mut(&mut self.frame, slot),
         }
+    }
+
+    /// The fused strict-equality branch (`JumpIfEqImm`/`JumpIfNeqImm`): read
+    /// the slot (TDZ-checked like `LoadLocal`), test it against the numeric
+    /// literal with STRICT equality — a non-Number value is never strictly
+    /// equal to a Number, so no coercion and no general evaluator — and jump
+    /// to `target` when `equal == jump_when_equal` (the step's convention:
+    /// `JumpIfEqImm` jumps when the `===` test is FALSE, `JumpIfNeqImm`
+    /// when the `!==` test is FALSE).
+    fn jump_if_strict_eq_imm(
+        &mut self,
+        slot: usize,
+        imm: f64,
+        jump_when_equal: bool,
+        target: usize,
+    ) -> Result<(), JsError> {
+        let left = *self.frame_get(slot);
+        if left.is_uninitialized() {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                "Cannot access a binding before initialization".into(),
+            ));
+        }
+        let equal = match left.as_number() {
+            // Strict equality of two Numbers: NaN compares false, -0 == 0,
+            // matching Rust's f64 `==` (the engine has no boxed Numbers).
+            Some(num) => num == imm,
+            None => false,
+        };
+        if equal == jump_when_equal {
+            self.ip = target;
+        }
+        Ok(())
     }
 
     /// The fused relational-imm loop test (Cut 4): read the slot (TDZ-checked
@@ -6915,6 +6969,12 @@ impl Vm {
                 }
                 Step::JumpIfLtImm { slot, imm, target } => {
                     self.jump_if_rel_imm(agent, BinaryOp::LessThan, *slot, *imm, *target)?
+                }
+                Step::JumpIfEqImm { slot, imm, target } => {
+                    self.jump_if_strict_eq_imm(*slot, *imm, false, *target)?
+                }
+                Step::JumpIfNeqImm { slot, imm, target } => {
+                    self.jump_if_strict_eq_imm(*slot, *imm, true, *target)?
                 }
                 Step::JumpIfLeImm { slot, imm, target } => {
                     self.jump_if_rel_imm(agent, BinaryOp::LessEqual, *slot, *imm, *target)?
@@ -12212,6 +12272,15 @@ enum Fixup {
         slot: usize,
         imm: f64,
     },
+    /// The fused strict-equality-imm branch: the step's `target` resolves
+    /// at compile end; `neq` (the source `!==` form) picks the variant.
+    JumpIfStrictEqImm {
+        index: usize,
+        label: usize,
+        neq: bool,
+        slot: usize,
+        imm: f64,
+    },
     /// The fused relational-imm loop test on a declared top-level var (the
     /// fast-script variant of `JumpIfRelImm`).
     JumpIfRelGlobalImm {
@@ -13004,6 +13073,56 @@ impl Compiler {
         }
     }
 
+    /// An `if`/`while` condition that is `ident === <number>` or
+    /// `ident !== <number>` over a frame-slot binding — the strict-equality
+    /// sibling of [`Compiler::fused_rel_test`]. Strict equality against a
+    /// numeric literal is coercion-free (only the Number `imm` itself
+    /// matches), so the fused `JumpIfEqImm`/`JumpIfNeqImm` test needs no
+    /// general evaluator; the slot read TDZ-checks like `LoadLocal`.
+    fn fused_strict_eq_test(&self, test: &Expr) -> Option<(usize, f64, bool)> {
+        if let ExprKind::Binary { op, left, right } = &test.kind {
+            let neq = match op {
+                BinaryOp::StrictEqual => false,
+                BinaryOp::StrictNotEqual => true,
+                _ => return None,
+            };
+            if let (ExprKind::Ident(name), ExprKind::Literal(syntax::ast::Literal::Number(n))) =
+                (&left.kind, &right.kind)
+                && let BindingLoc::Slot(slot) = self.binding(*name)
+            {
+                return Some((slot, *n, neq));
+            }
+        }
+        None
+    }
+
+    /// Emit the fused strict-equality branch (slice B): the
+    /// `JumpIfEqImm`/`JumpIfNeqImm` step with `target: 0`, patched to
+    /// `target_label` at compile end.
+    fn emit_fused_strict_eq_test(&mut self, neq: bool, slot: usize, imm: f64, target_label: usize) {
+        let index = self.steps.len();
+        self.emit(if neq {
+            Step::JumpIfNeqImm {
+                slot,
+                imm,
+                target: 0,
+            }
+        } else {
+            Step::JumpIfEqImm {
+                slot,
+                imm,
+                target: 0,
+            }
+        });
+        self.fixups.push(Fixup::JumpIfStrictEqImm {
+            index,
+            label: target_label,
+            neq,
+            slot,
+            imm,
+        });
+    }
+
     /// A `for` update that is a bare `i++`/`i--` on a fast binding (Cut 4):
     /// the loop protocol discards the update's value, so the fused `Inc`/
     /// `Dec` (store, no push) is exactly the update step + `Pop`. Only the
@@ -13452,6 +13571,20 @@ impl Compiler {
                     if let Step::JumpIfRelLimit { target, .. } = &mut self.steps[index] {
                         *target = self.labels[&label];
                     }
+                }
+                Fixup::JumpIfStrictEqImm {
+                    index,
+                    label,
+                    neq,
+                    slot,
+                    imm,
+                } => {
+                    let target = self.labels[&label];
+                    self.steps[index] = if neq {
+                        Step::JumpIfNeqImm { slot, imm, target }
+                    } else {
+                        Step::JumpIfEqImm { slot, imm, target }
+                    };
                 }
                 Fixup::TypedArrayLengthHoist { index, label } => {
                     if let Step::TypedArrayLengthHoist { target } = &mut self.steps[index] {
@@ -13998,10 +14131,16 @@ impl Compiler {
                 alternate,
             } => {
                 self.emit(Step::ResetCompletion);
-                self.compile_expr(test)?;
                 let else_label = self.new_label();
                 let end_label = self.new_label();
-                self.jump_if_false(else_label);
+                if let Some((slot, imm, neq)) = self.fused_strict_eq_test(test) {
+                    // The `x === N` / `x !== N` condition fuses with the
+                    // false-jump (LoadLocal + BinaryImm + JumpIfFalse).
+                    self.emit_fused_strict_eq_test(neq, slot, imm, else_label);
+                } else {
+                    self.compile_expr(test)?;
+                    self.jump_if_false(else_label);
+                }
                 self.compile_statement(consequent)?;
                 self.jump(end_label);
                 self.place(else_label);
@@ -14025,7 +14164,11 @@ impl Compiler {
                 });
                 self.resolve_labeled_continue(test_label, continue_count);
                 self.place(test_label);
-                if let Some((op, loc, name, imm)) = self.fused_rel_test(test) {
+                if let Some((slot, imm, neq)) = self.fused_strict_eq_test(test) {
+                    // The `x === N` / `x !== N` condition fuses with the
+                    // false-jump (LoadLocal + BinaryImm + JumpIfFalse).
+                    self.emit_fused_strict_eq_test(neq, slot, imm, end_label);
+                } else if let Some((op, loc, name, imm)) = self.fused_rel_test(test) {
                     // Cut 4/5: the loop test `binding <op> imm` fuses with
                     // the false-jump (LoadLocal/LoadGlobal + BinaryImm +
                     // JumpIfFalse).
@@ -14207,6 +14350,7 @@ impl Compiler {
             Fixup::JumpIfRelImm { index, .. } => index,
             Fixup::JumpIfRelGlobalImm { index, .. } => index,
             Fixup::JumpIfRelLimit { index, .. } => index,
+            Fixup::JumpIfStrictEqImm { index, .. } => index,
             Fixup::FastLoopHead(index, _, _) => index,
             Fixup::TypedArrayLengthHoist { index, .. } => index,
             Fixup::Break(index, _) => index,
@@ -17956,6 +18100,8 @@ fn step_targets(step: &Step) -> Vec<usize> {
         | Step::JumpIfLeImm { target, .. }
         | Step::JumpIfGtImm { target, .. }
         | Step::JumpIfGeImm { target, .. }
+        | Step::JumpIfEqImm { target, .. }
+        | Step::JumpIfNeqImm { target, .. }
         | Step::JumpIfLtGlobalImm { target, .. }
         | Step::JumpIfLeGlobalImm { target, .. }
         | Step::JumpIfGtGlobalImm { target, .. }

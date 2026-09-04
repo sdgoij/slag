@@ -542,6 +542,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::SaveCompletion
         | Step::RestoreCompletion => "Completion",
         Step::JumpIfRelLimit { .. } => "JumpIfRelLimit",
+        Step::JumpIfEqImm { .. } | Step::JumpIfNeqImm { .. } => "JumpIfEqImm/NeqImm",
         Step::TypedArrayLengthHoist { .. } => "TypedArrayLengthHoist",
         Step::LoadPerIteration { .. }
         | Step::StorePerIteration { .. }
@@ -566,6 +567,8 @@ fn step_targets(step: &Step) -> Vec<usize> {
         | Step::JumpIfLeImm { target, .. }
         | Step::JumpIfGtImm { target, .. }
         | Step::JumpIfGeImm { target, .. }
+        | Step::JumpIfEqImm { target, .. }
+        | Step::JumpIfNeqImm { target, .. }
         | Step::JumpIfLtGlobalImm { target, .. }
         | Step::JumpIfLeGlobalImm { target, .. }
         | Step::JumpIfGtGlobalImm { target, .. }
@@ -3116,6 +3119,12 @@ impl<'a> Lowerer<'a> {
             Step::JumpIfLtImm { slot, imm, target } => {
                 self.emit_rel_test_jump(*slot, *imm, BinaryOp::LessThan, *target, index + 1)?
             }
+            Step::JumpIfEqImm { slot, imm, target } => {
+                self.emit_strict_eq_jump(*slot, *imm, false, *target, index + 1)?
+            }
+            Step::JumpIfNeqImm { slot, imm, target } => {
+                self.emit_strict_eq_jump(*slot, *imm, true, *target, index + 1)?
+            }
             Step::JumpIfLeImm { slot, imm, target } => {
                 self.emit_rel_test_jump(*slot, *imm, BinaryOp::LessEqual, *target, index + 1)?
             }
@@ -5062,6 +5071,46 @@ impl<'a> Lowerer<'a> {
         let test = self.emit_rel_test(op, bits, imm)?;
         let block = self.ensure_block(target);
         self.cond_jump(test, false, block, next);
+        Ok(())
+    }
+
+    /// The fused strict-equality branch (`JumpIfEqImm`/`JumpIfNeqImm`):
+    /// strict equality of the frame slot against the numeric literal — a
+    /// non-Number is never `===` a Number, so the test is the double tag
+    /// check + f64 compare with NO slow path — and jump to `target` when
+    /// the encoded test is FALSE (the family convention: `JumpIfEqImm`
+    /// jumps when `slot === imm` is false, `JumpIfNeqImm` when `slot !==
+    /// imm` is false). The TDZ check mirrors `LoadLocal`.
+    fn emit_strict_eq_jump(
+        &mut self,
+        slot: usize,
+        imm: f64,
+        jump_when_equal: bool,
+        target: usize,
+        next: usize,
+    ) -> Result<(), Unsupported> {
+        let bits = self.load_slot(slot);
+        if self.slot_is_lexical(slot) {
+            self.emit_tdz_check(bits)?;
+        }
+        let is_num = self.is_double(bits);
+        let num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), bits);
+        let imm_c = self.builder.ins().f64const(imm);
+        let eq = self.builder.ins().fcmp(FloatCC::Equal, num, imm_c);
+        let is_num_64 = self.bint(is_num);
+        let eq_64 = self.bint(eq);
+        let equal = self.builder.ins().band(is_num_64, eq_64);
+        let jump = if jump_when_equal {
+            equal
+        } else {
+            let one = self.builder.ins().iconst(types::I64, 1);
+            self.builder.ins().bxor(equal, one)
+        };
+        let block = self.ensure_block(target);
+        self.cond_jump(jump, true, block, next);
         Ok(())
     }
 
