@@ -3700,6 +3700,40 @@ three release sweeps at baseline — language 23721/23724 (3 skip),
 built-ins 23657/23812 (155 skip), annexB 1086/1086, zero fail/crash/
 hang.
 
+### Nested non-arrow functions' own this/arguments no longer bail the enclosing body (measured 2026-09-04)
+
+The scope gate (analyze_scope) rejected ANY `this`/`arguments`/`super`/…
+inside a nested closure, including inside a nested NON-ARROW function
+whose `this`/`arguments` are its OWN (bound at its own call) — so a body
+containing a nested constructor or helper that read its own `this` never
+certified and ran the env path (every `var` access paid the env walk).
+The closure walker (`closure_allows`/`closure_stmt_allows`/`closure_expr_
+allows`/`closure_arrow_allows`) now threads an `own` flag: entering a
+nested non-arrow function (declaration/expression/method/getter/setter)
+sets it, under which `this` and `arguments` resolve to the nested
+function itself; an arrow propagates the caller's flag (an arrow created
+directly in the analyzed body still observes the body's lexical
+`this`/`arguments` and keeps bailing). `super`/`class`/private/tagged/
+`import` constructs stay rejected under `own` — their bodies would need
+machinery this walk does not model. Arrows' lexical-this tests, the
+sweeps, and the workspace suite are the backstop for a wrong
+certification.
+
+Measurement (2026-09-04): probe A/B in the `--jit-bench` list — the
+construct-churn loop function-wrapped with a NESTED `function C(x) {
+this.x = x; }` vs the same loop with C a global (control, certifies):
+interp ~117-129ms -> ~18.5-21ms (nested now matches the ~19-21ms
+control, ~6x), JIT columns flat (~1.0 both — `new C()` is a
+`Construct` step the JIT does not lower). New eval test
+`nested_function_own_this_and_arguments_keep_the_body_certified` asserts
+the construct body certifies (`scope.is_some`), the nested `arguments`
+are the nested call's, a method call binds the nested `this` to the
+receiver, and an arrow's lexical `this` still flows (env path).
+
+Gates: clippy clean; `cargo test --workspace` green; the three release
+sweeps at baseline — language 23721/23724 (3 skip), built-ins
+23657/23812 (155 skip), annexB 1086/1086, zero fail/crash/hang.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

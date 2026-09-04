@@ -20175,7 +20175,7 @@ fn collect_expr_captures(
             closure_allows(&function.params, &function.body.stmts, bindings, captured)
         }
         ExprKind::Arrow { params, body, .. } => {
-            closure_arrow_allows(params, body, bindings, captured)
+            closure_arrow_allows(params, body, bindings, captured, false)
         }
         ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
             ObjectProperty::Method { function, .. } => {
@@ -20295,14 +20295,19 @@ fn closure_allows(
     bindings: &HashSet<crux::AtomId>,
     captured: &mut HashSet<crux::AtomId>,
 ) -> bool {
+    // A non-arrow function (a declaration/expression/method/getter/setter)
+    // has its OWN `this`/`arguments`/`new.target`, bound at its own call:
+    // walking its body in the `own` mode lets those through (they are the
+    // nested function's, not observations of the analyzed body) instead of
+    // bailing the enclosing body's certification.
     params.iter().all(|param| {
         param
             .init
             .as_ref()
-            .is_none_or(|init| closure_expr_allows(init, bindings, captured))
+            .is_none_or(|init| closure_expr_allows(init, bindings, captured, true))
     }) && stmts
         .iter()
-        .all(|stmt| closure_stmt_allows(stmt, bindings, captured))
+        .all(|stmt| closure_stmt_allows(stmt, bindings, captured, true))
 }
 
 fn closure_arrow_allows(
@@ -20310,18 +20315,23 @@ fn closure_arrow_allows(
     body: &ArrowBody,
     bindings: &HashSet<crux::AtomId>,
     captured: &mut HashSet<crux::AtomId>,
+    own: bool,
 ) -> bool {
+    // An arrow inherits `this`/`arguments`/`new.target` lexically from the
+    // innermost enclosing non-arrow: `own` stays false for an arrow created
+    // directly in the analyzed body (its references observe the body's
+    // bindings) and true for an arrow inside a nested non-arrow function.
     params.iter().all(|param| {
         param
             .init
             .as_ref()
-            .is_none_or(|init| closure_expr_allows(init, bindings, captured))
+            .is_none_or(|init| closure_expr_allows(init, bindings, captured, own))
     }) && match body {
-        ArrowBody::Expr(expr) => closure_expr_allows(expr, bindings, captured),
+        ArrowBody::Expr(expr) => closure_expr_allows(expr, bindings, captured, own),
         ArrowBody::Block(block) => block
             .stmts
             .iter()
-            .all(|s| closure_stmt_allows(s, bindings, captured)),
+            .all(|s| closure_stmt_allows(s, bindings, captured, own)),
     }
 }
 
@@ -20329,21 +20339,22 @@ fn closure_stmt_allows(
     stmt: &Stmt,
     bindings: &HashSet<crux::AtomId>,
     captured: &mut HashSet<crux::AtomId>,
+    own: bool,
 ) -> bool {
     match &stmt.kind {
         StmtKind::Block(block) => block
             .stmts
             .iter()
-            .all(|s| closure_stmt_allows(s, bindings, captured)),
+            .all(|s| closure_stmt_allows(s, bindings, captured, own)),
         StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
-        StmtKind::Expr(expr) => closure_expr_allows(expr, bindings, captured),
+        StmtKind::Expr(expr) => closure_expr_allows(expr, bindings, captured, own),
         StmtKind::VarDecl { decls, .. } | StmtKind::UsingDecl { decls, .. } => {
             decls.iter().all(|decl| {
                 // The declared names are bound here (shadowing); only the
                 // initializers are references.
                 decl.init
                     .as_ref()
-                    .is_none_or(|init| closure_expr_allows(init, bindings, captured))
+                    .is_none_or(|init| closure_expr_allows(init, bindings, captured, own))
             })
         }
         StmtKind::If {
@@ -20351,15 +20362,15 @@ fn closure_stmt_allows(
             consequent,
             alternate,
         } => {
-            closure_expr_allows(test, bindings, captured)
-                && closure_stmt_allows(consequent, bindings, captured)
+            closure_expr_allows(test, bindings, captured, own)
+                && closure_stmt_allows(consequent, bindings, captured, own)
                 && alternate
                     .as_deref()
-                    .is_none_or(|a| closure_stmt_allows(a, bindings, captured))
+                    .is_none_or(|a| closure_stmt_allows(a, bindings, captured, own))
         }
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
-            closure_expr_allows(test, bindings, captured)
-                && closure_stmt_allows(body, bindings, captured)
+            closure_expr_allows(test, bindings, captured, own)
+                && closure_stmt_allows(body, bindings, captured, own)
         }
         StmtKind::For {
             init,
@@ -20369,27 +20380,27 @@ fn closure_stmt_allows(
         } => {
             let init_ok = match init {
                 None => true,
-                Some(ForInit::Expr(expr)) => closure_expr_allows(expr, bindings, captured),
+                Some(ForInit::Expr(expr)) => closure_expr_allows(expr, bindings, captured, own),
                 Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
                     decl.init
                         .as_ref()
-                        .is_none_or(|init| closure_expr_allows(init, bindings, captured))
+                        .is_none_or(|init| closure_expr_allows(init, bindings, captured, own))
                 }),
             };
             init_ok
                 && test
                     .as_ref()
-                    .is_none_or(|t| closure_expr_allows(t, bindings, captured))
+                    .is_none_or(|t| closure_expr_allows(t, bindings, captured, own))
                 && update
                     .as_ref()
-                    .is_none_or(|u| closure_expr_allows(u, bindings, captured))
-                && closure_stmt_allows(body, bindings, captured)
+                    .is_none_or(|u| closure_expr_allows(u, bindings, captured, own))
+                && closure_stmt_allows(body, bindings, captured, own)
         }
         StmtKind::Return(expr) => expr
             .as_ref()
-            .is_none_or(|e| closure_expr_allows(e, bindings, captured)),
-        StmtKind::Throw(expr) => closure_expr_allows(expr, bindings, captured),
-        StmtKind::Labeled { body, .. } => closure_stmt_allows(body, bindings, captured),
+            .is_none_or(|e| closure_expr_allows(e, bindings, captured, own)),
+        StmtKind::Throw(expr) => closure_expr_allows(expr, bindings, captured, own),
+        StmtKind::Labeled { body, .. } => closure_stmt_allows(body, bindings, captured, own),
         StmtKind::FunctionDecl(function) => {
             closure_allows(&function.params, &function.body.stmts, bindings, captured)
         }
@@ -20400,14 +20411,14 @@ fn closure_stmt_allows(
             left, right, body, ..
         } => {
             let left_ok = match left {
-                ForBinding::Expr(expr) => closure_expr_allows(expr, bindings, captured),
+                ForBinding::Expr(expr) => closure_expr_allows(expr, bindings, captured, own),
                 ForBinding::VarDecl { init, .. } => init
                     .as_ref()
-                    .is_none_or(|init| closure_expr_allows(init, bindings, captured)),
+                    .is_none_or(|init| closure_expr_allows(init, bindings, captured, own)),
             };
             left_ok
-                && closure_expr_allows(right, bindings, captured)
-                && closure_stmt_allows(body, bindings, captured)
+                && closure_expr_allows(right, bindings, captured, own)
+                && closure_stmt_allows(body, bindings, captured, own)
         }
         StmtKind::Try {
             block,
@@ -20417,19 +20428,19 @@ fn closure_stmt_allows(
             block
                 .stmts
                 .iter()
-                .all(|s| closure_stmt_allows(s, bindings, captured))
+                .all(|s| closure_stmt_allows(s, bindings, captured, own))
                 && handler.as_ref().is_none_or(|handler| {
                     // The catch parameter is bound; its body walks.
                     handler
                         .body
                         .stmts
                         .iter()
-                        .all(|s| closure_stmt_allows(s, bindings, captured))
+                        .all(|s| closure_stmt_allows(s, bindings, captured, own))
                 })
                 && finalizer.as_ref().is_none_or(|f| {
                     f.stmts
                         .iter()
-                        .all(|s| closure_stmt_allows(s, bindings, captured))
+                        .all(|s| closure_stmt_allows(s, bindings, captured, own))
                 })
         }
         StmtKind::Switch {
@@ -20437,15 +20448,15 @@ fn closure_stmt_allows(
             cases,
             ..
         } => {
-            closure_expr_allows(discriminant, bindings, captured)
+            closure_expr_allows(discriminant, bindings, captured, own)
                 && cases.iter().all(|case| {
                     case.test
                         .as_ref()
-                        .is_none_or(|t| closure_expr_allows(t, bindings, captured))
+                        .is_none_or(|t| closure_expr_allows(t, bindings, captured, own))
                         && case
                             .consequent
                             .iter()
-                            .all(|s| closure_stmt_allows(s, bindings, captured))
+                            .all(|s| closure_stmt_allows(s, bindings, captured, own))
                 })
         }
         StmtKind::ClassDecl(_) | StmtKind::With { .. } => false,
@@ -20456,15 +20467,18 @@ fn closure_expr_allows(
     expr: &Expr,
     bindings: &HashSet<crux::AtomId>,
     captured: &mut HashSet<crux::AtomId>,
+    own: bool,
 ) -> bool {
     match &expr.kind {
         // A read or write of a body binding is a capture: the body
         // context-allocates it. `arguments` is the special binding the fast
-        // path never creates. A lexical for-head binding is captured like
-        // any other — the loop's per-iteration env gives the closure the
+        // path never creates — for the ANALYZED body; inside a nested
+        // non-arrow function (`own`) it is that function's own arguments
+        // object. A lexical for-head binding is captured like any other —
+        // the loop's per-iteration env gives the closure the
         // fresh-per-iteration value it needs.
         ExprKind::Ident(name) => {
-            if crux::lookup(*name) == JsString::from_utf8("arguments") {
+            if !own && crux::lookup(*name) == JsString::from_utf8("arguments") {
                 return false;
             }
             if bindings.contains(name) {
@@ -20476,7 +20490,7 @@ fn closure_expr_allows(
         ExprKind::Array(array) => array.elements.iter().all(|element| match element {
             ArrayElement::Hole => true,
             ArrayElement::Expr(e) | ArrayElement::Spread(e) => {
-                closure_expr_allows(e, bindings, captured)
+                closure_expr_allows(e, bindings, captured, own)
             }
         }),
         ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
@@ -20496,46 +20510,46 @@ fn closure_expr_allows(
                 let key_ok = match key {
                     // A property key is not a reference.
                     PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
-                    PropertyName::Computed(e) => closure_expr_allows(e, bindings, captured),
+                    PropertyName::Computed(e) => closure_expr_allows(e, bindings, captured, own),
                 };
-                key_ok && closure_expr_allows(value, bindings, captured)
+                key_ok && closure_expr_allows(value, bindings, captured, own)
             }
-            ObjectProperty::Spread(e) => closure_expr_allows(e, bindings, captured),
+            ObjectProperty::Spread(e) => closure_expr_allows(e, bindings, captured, own),
         }),
-        ExprKind::Paren(inner) => closure_expr_allows(inner, bindings, captured),
-        ExprKind::Unary { operand, .. } => closure_expr_allows(operand, bindings, captured),
-        ExprKind::Update { target, .. } => closure_expr_allows(target, bindings, captured),
+        ExprKind::Paren(inner) => closure_expr_allows(inner, bindings, captured, own),
+        ExprKind::Unary { operand, .. } => closure_expr_allows(operand, bindings, captured, own),
+        ExprKind::Update { target, .. } => closure_expr_allows(target, bindings, captured, own),
         ExprKind::Binary { left, right, .. } => {
-            closure_expr_allows(left, bindings, captured)
-                && closure_expr_allows(right, bindings, captured)
+            closure_expr_allows(left, bindings, captured, own)
+                && closure_expr_allows(right, bindings, captured, own)
         }
         ExprKind::Logical { left, right, .. } => {
-            closure_expr_allows(left, bindings, captured)
-                && closure_expr_allows(right, bindings, captured)
+            closure_expr_allows(left, bindings, captured, own)
+                && closure_expr_allows(right, bindings, captured, own)
         }
         ExprKind::Conditional {
             test,
             consequent,
             alternate,
         } => {
-            closure_expr_allows(test, bindings, captured)
-                && closure_expr_allows(consequent, bindings, captured)
-                && closure_expr_allows(alternate, bindings, captured)
+            closure_expr_allows(test, bindings, captured, own)
+                && closure_expr_allows(consequent, bindings, captured, own)
+                && closure_expr_allows(alternate, bindings, captured, own)
         }
         ExprKind::Assign { target, value, .. } => {
             // An assignment target is a reference (writing a body binding is
             // a capture).
-            closure_expr_allows(target, bindings, captured)
-                && closure_expr_allows(value, bindings, captured)
+            closure_expr_allows(target, bindings, captured, own)
+                && closure_expr_allows(value, bindings, captured, own)
         }
         ExprKind::Member(member) => {
             if matches!(member.property, MemberProperty::Private(_)) {
                 return false;
             }
-            let object_ok = closure_expr_allows(&member.object, bindings, captured);
+            let object_ok = closure_expr_allows(&member.object, bindings, captured, own);
             let key_ok = match &member.property {
                 // A property name is not a reference.
-                MemberProperty::Computed(key) => closure_expr_allows(key, bindings, captured),
+                MemberProperty::Computed(key) => closure_expr_allows(key, bindings, captured, own),
                 _ => true,
             };
             object_ok && key_ok
@@ -20547,45 +20561,51 @@ fn closure_expr_allows(
             ) {
                 return false;
             }
-            closure_expr_allows(&call.callee, bindings, captured)
+            closure_expr_allows(&call.callee, bindings, captured, own)
                 && call.args.iter().all(|arg| match arg {
                     Argument::Expr(e) | Argument::Spread(e) => {
-                        closure_expr_allows(e, bindings, captured)
+                        closure_expr_allows(e, bindings, captured, own)
                     }
                 })
         }
         ExprKind::New(new) => {
-            closure_expr_allows(&new.callee, bindings, captured)
+            closure_expr_allows(&new.callee, bindings, captured, own)
                 && new.args.iter().all(|arg| match arg {
                     Argument::Expr(e) | Argument::Spread(e) => {
-                        closure_expr_allows(e, bindings, captured)
+                        closure_expr_allows(e, bindings, captured, own)
                     }
                 })
         }
         ExprKind::Template(template) => template
             .exprs
             .iter()
-            .all(|e| closure_expr_allows(e, bindings, captured)),
+            .all(|e| closure_expr_allows(e, bindings, captured, own)),
         ExprKind::Sequence(exprs) => exprs
             .iter()
-            .all(|e| closure_expr_allows(e, bindings, captured)),
+            .all(|e| closure_expr_allows(e, bindings, captured, own)),
         ExprKind::Function(function) => {
             closure_allows(&function.params, &function.body.stmts, bindings, captured)
         }
         ExprKind::Arrow { params, body, .. } => {
-            closure_arrow_allows(params, body, bindings, captured)
+            closure_arrow_allows(params, body, bindings, captured, own)
         }
         // `yield`/`await` suspend the closure itself, never the enclosing
-        // body, so they are fine here — their operands still walk. The rest
-        // observe the body's bindings or its absent `this`/`arguments`.
+        // body, so they are fine here — their operands still walk.
         ExprKind::Yield {
             argument: Some(argument),
             ..
         }
-        | ExprKind::Await(argument) => closure_expr_allows(argument, bindings, captured),
+        | ExprKind::Await(argument) => closure_expr_allows(argument, bindings, captured, own),
         ExprKind::Yield { argument: None, .. } => true,
-        ExprKind::This
-        | ExprKind::Super
+        // The analyzed body's `this` is never visible inside a closure
+        // unless the closure is an arrow (then `own` is false). Inside a
+        // nested non-arrow function (`own`), `this` is that function's own.
+        // `super`/class/private/tagged/import constructs stay rejected even
+        // under `own` — they need machinery this walk does not model (a
+        // class body could capture body bindings through methods the walk
+        // never enters), so such closures still bail the body.
+        ExprKind::This => own,
+        ExprKind::Super
         | ExprKind::Class(_)
         | ExprKind::PrivateIn { .. }
         | ExprKind::TaggedTemplate { .. }
@@ -21494,7 +21514,7 @@ impl FastScopeScan {
                 )
             }
             ExprKind::Arrow { params, body, .. } => {
-                closure_arrow_allows(params, body, &self.bindings, &mut self.captured)
+                closure_arrow_allows(params, body, &self.bindings, &mut self.captured, false)
             }
         }
     }

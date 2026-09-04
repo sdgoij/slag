@@ -3,13 +3,14 @@
 > Merged, prioritized view of the remaining work in the active plan
 > (`docs/performance-plan.md`, mechanism-based, supersedes) and the closed
 > historical plan (`docs/gap-close-plan.md`). Status reflects everything
-> landed through `0d70d3e` (the L1c record-discipline landing) plus this
-> tree's write-cell capacity slice (1.3): the gap-close milestones
-> M1-M7/M10, the L1a/L1c register-path work, the typed-array no-alloc
-> reads, the `UpdateReg`/`JumpIfEqImm`/`BinStoreReg` slices, and the GC
-> fixes. Only remaining work is listed. One experiment at a time; a lever
-> opens with its probe; every landing gates on clippy clean, workspace
-> tests green, and the three release sweeps.
+> landed through `0d70d3e` (the L1c record-discipline landing), the
+> write-cell capacity slice (1.3), and the certification-coverage slice
+> (2.2): the gap-close milestones M1-M7/M10, the L1a/L1c register-path
+> work, the typed-array no-alloc reads, the `UpdateReg`/`JumpIfEqImm`/
+> `BinStoreReg` slices, and the GC fixes. Only remaining work is listed.
+> One experiment at a time; a lever opens with its probe; every landing
+> gates on clippy clean, workspace tests green, and the three release
+> sweeps.
 
 ## P0 — Correctness (JIT)
 
@@ -30,6 +31,7 @@
 | # | Item | Status | Evidence / first action |
 |---|---|---|---|
 | 2.1 | Compile the general path (Sparkplug analog): emit every step in machine code for bodies the scope gate excludes (try/catch, `with`, captured closures, complex-object methods), routing env/handler steps through the shared machinery | not started | Those bodies run interpreted forever today. Probe first: (a) fraction of a realistic hot corpus blocked by the scope gate; (b) dispatch share of an uncertified hot loop. Widest JIT-coverage lever. |
+| 2.2 | Certification over-rejection: nested NON-ARROW functions' own `this`/`arguments` bailed the enclosing body's scope certification | **landed 2026-09-04** (this tree) | The closure walker (`closure_*_allows`) now threads an `own` flag: entering a nested non-arrow function sets it (its `this`/`arguments` are its OWN, bound at its own call); arrows propagate the caller's flag (an arrow in the analyzed body still observes its lexical `this` and bails). `super`/`class`/private/tagged/import stays rejected under `own`. Probe (perf.md, 2026-09-04): the construct-churn loop function-wrapped with a nested `function C(x){ this.x = x; }` ran ~117-129ms vs ~19-21ms with C a global; after the fix the nested form matches the control (~6x), because the body re-certifies and its `var`s leave the env path. Gates: clippy, workspace tests (new `nested_function_own_this_and_arguments_keep_the_body_certified`), three sweeps at baseline. **Next**: this narrows the 2.1 scope gate on the nested-constructor/helper shapes; the full general-path (try/catch bodies) probe is still 2.1. |
 
 ## P3 — Allocation (L4 / M8 arena)
 
@@ -63,7 +65,9 @@
 3. The read-end-state premise (per-site member reads) was probed and
    FALSIFIED (1.1): interpreter member reads are ~3.5-4.2ns across
    64-object working sets — the map-cell layer already absorbs the
-   value-cell misses. The next slice is the write-side follow-on probe
-   (does a realistic >256-object hot store loop exist, justifying per-site
-   store ICs / full L2), then 2.1 (L3) unless a probe changes the calculus.
+   value-cell misses. 2.2 (certification over-rejection) is LANDED.
+   The next candidates: (a) the write-side follow-on probe (does a
+   realistic >256-object hot store loop exist, justifying per-site store
+   ICs / full L2); (b) 2.1's scope-gate probe on the remaining uncertified
+   hot shapes (try/catch bodies) to size the general-path JIT work.
 4. 3.1 (L4) and 4.1 (L5) after the L1c/L2/L3 probes re-derive their targets.

@@ -5005,6 +5005,57 @@ mod tests {
     }
 
     #[test]
+    fn nested_function_own_this_and_arguments_keep_the_body_certified() {
+        // A nested NON-ARROW function has its OWN `this`/`arguments`, bound
+        // at its own call — so a body containing one that reads them must
+        // not bail to the env path. Previously any `this` inside a nested
+        // closure bailed the enclosing body's certification (~5x on the
+        // construct-churn shape; measured 2026-09-04: a function-wrapped
+        // `new C(i)` loop ~123ms -> ~19ms). An ARROW still observes the
+        // analyzed body's lexical `this`, so those keep the env path.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "function build() { function C(x) { this.x = x; } var s = 0; \
+                 for (var i = 0; i < 10; i++) { var o = new C(i); s += o.x; } return s; }",
+            )
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "build");
+        assert!(
+            ir.scope.is_some(),
+            "a nested constructor's own `this` must keep the body certified"
+        );
+        assert_eq!(agent.run_script("build()").unwrap(), Value::Number(45.0));
+        // The nested function's `arguments` is its own (the nested call's,
+        // not the enclosing body's).
+        assert_eq!(
+            run(
+                "function outer() { function inner(a, b) { return arguments[0] + arguments[1]; } \
+                 return inner(3, 4) + inner(5, 6); } outer()"
+            )
+            .unwrap(),
+            Value::Number(18.0)
+        );
+        // A nested function called as a method binds its OWN this to the
+        // receiver.
+        assert_eq!(
+            run(
+                "function make() { function getX() { return this.x; } return getX; } \
+                 var f = make(); f.call({ x: 42 });"
+            )
+            .unwrap(),
+            Value::Number(42.0)
+        );
+        // An arrow inside the analyzed body still observes the body's
+        // lexical `this` (env path; the value must flow through).
+        assert_eq!(
+            run("function t() { return () => this.v; } t.call({ v: 7 })()").unwrap(),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
     fn fast_path_annex_b_block_functions() {
         // Cut 6 first slice (Annex B): a block-level function declaration
         // in a sloppy body certifies — the block binding is a frame slot
