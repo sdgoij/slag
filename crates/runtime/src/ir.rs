@@ -14130,7 +14130,24 @@ impl Compiler {
                 consequent,
                 alternate,
             } => {
-                self.emit(Step::ResetCompletion);
+                // A certified loop body's statements lower to register runs
+                // (or step-path statements whose own SetCompletion writes the
+                // register), and the loop's own trailing NormalizeCompletion
+                // defines its completion — the per-if reset exists only so the
+                // if's own NormalizeCompletion can turn an empty register into
+                // Normal(undefined), which the loop boundary already does. It
+                // is a redundant per-iteration dispatch on the branchy hot
+                // path, so emit it only outside certified loop bodies (the
+                // register runs never touch the completion register, so
+                // skipping it there is unobservable).
+                let in_certified_loop = self.scope.is_some()
+                    && self
+                        .scope_stack
+                        .iter()
+                        .any(|s| matches!(s, Scope::Loop { .. }));
+                if !in_certified_loop {
+                    self.emit(Step::ResetCompletion);
+                }
                 let else_label = self.new_label();
                 let end_label = self.new_label();
                 if let Some((slot, imm, neq)) = self.fused_strict_eq_test(test) {

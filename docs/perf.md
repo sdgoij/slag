@@ -3479,6 +3479,32 @@ and an `installed_jit` parity test over Numbers, a numeric-string, and
 323/323 vs the parent d58caea run — the pre-existing worker-death
 regression unchanged).
 
+### Certified loop-body `if`s drop the redundant per-iteration completion reset (measured 2026-09-04)
+
+An `if` inside a certified loop body compiled to ResetCompletion + test/
+branch + NormalizeCompletion. The reset exists only so the if's OWN
+NormalizeCompletion can turn an empty register into Normal(undefined) —
+but in a certified loop body the register runs never touch the
+completion register and the loop's own trailing NormalizeCompletion
+defines the loop's completion, so the reset was a redundant
+per-iteration dispatch on the branchy hot path (the `buildString shape`
+row: 5 dispatches/iteration -> 4). `compile_if` now emits it only
+outside certified loop bodies (`scope.is_some()` and inside a `Loop`
+scope); non-loop `if`s and env-path/step bodies keep it unchanged.
+
+Measurement (interleaved A/B in both orders, 3M iters, interpreter,
+2026-09-04): the `buildString shape` suite row drops ~99-104ms ->
+~94-97ms (~5%); the `s += i; if (l === 10000) { c++; } l++` row drops
+~62-64ms -> ~59-61ms; the JIT column is flat (the compiled bodies drop
+the same redundant completion write). Gates: clippy clean, workspace
+tests green (new `certified_loop_ifs_skip_the_redundant_completion_reset`
+lowering test — a loop-body if leaves only the loop's own leading reset,
+a non-loop if keeps its own), a 15-case completion battery (for/while/do/
+nested, step-path statements before the if, closure-creation before the
+if) byte-identical under the JIT and the interpreter, and the three
+release sweeps at baseline (language 23721/3 skip, annexB 1086/1086,
+built-ins 23657/155 skip, zero fail/crash/hang).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

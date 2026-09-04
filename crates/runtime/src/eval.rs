@@ -3234,6 +3234,51 @@ mod tests {
     }
 
     #[test]
+    fn certified_loop_ifs_skip_the_redundant_completion_reset() {
+        // Inside a certified loop body the statements lower to register runs
+        // that never touch the completion register and the loop's own
+        // trailing NormalizeCompletion defines its completion, so the per-if
+        // ResetCompletion (emitted so the if's NormalizeCompletion can turn
+        // an empty register into Normal(undefined)) is a redundant
+        // per-iteration dispatch. The gate drops it only there; an `if`
+        // outside a loop keeps it (its enclosing block/ListEnd can observe
+        // the emptiness).
+        fn reset_count(agent: &mut Agent, src: &str, name: &str) -> usize {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter(|s| matches!(s, crate::ir::Step::ResetCompletion))
+                .count()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // A loop-body if: the per-iteration reset is gone. The loop's own
+        // leading ResetCompletion (before the init, once) remains, so g
+        // carries exactly one — before the change the if's per-iteration
+        // reset made it two.
+        assert_eq!(
+            reset_count(
+                &mut agent,
+                "function g(n) { var l = 0; var c = 0; for (var i = 0; i < n; i++) { l++; if (l === 10000) { c++; } } return c; }",
+                "g"
+            ),
+            1,
+            "a certified loop-body if must not carry the per-iteration reset"
+        );
+        // A plain (non-loop) if keeps its reset.
+        assert_eq!(
+            reset_count(
+                &mut agent,
+                "function h(x) { var z = 0; if (x) { z = 1; } else { z = 2; } return z; }",
+                "h"
+            ),
+            1,
+            "a non-loop if keeps its ResetCompletion"
+        );
+    }
+
+    #[test]
     fn member_compound_and_computed_stores_lower_to_register_runs() {
         // A member RMW in a certified loop (`o.x += 1`) and a plain member
         // store of a computed value (`o.x = o.x + 1`) previously kept the
