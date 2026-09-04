@@ -32,6 +32,7 @@ pub mod promise;
 #[cfg(feature = "raylib")]
 pub mod raylib;
 pub mod realm;
+mod rlx;
 pub mod script;
 #[cfg(feature = "workers")]
 pub mod workers;

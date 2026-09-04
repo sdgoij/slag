@@ -68,4 +68,41 @@ mod tests {
         );
         assert!(context.eval("rl.drawCircle").is_ok());
     }
+
+    #[test]
+    fn rlx_demo_renders_headlessly_against_a_stub_rl() {
+        // Run the actual rlx_demo.js (render + draw path) against a stub `rl`
+        // backend so the demo file is exercised without a window. This keeps
+        // the demo honest headlessly — a bad `rl`/`rlx` reference or a draw
+        // mistake fails here instead of at the first frame on a display.
+        let mut context = Context::new().unwrap();
+        context.install_rlx().unwrap();
+        context
+            .eval(
+                "if (typeof console === 'undefined') { globalThis.console = { log: function () {} }; }\n\
+                 let frames = 0;\n\
+                 globalThis.rl = {\n\
+                     DARKGRAY: 1, RAYWHITE: 2,\n\
+                     initWindow: function () {}, setTargetFPS: function () {},\n\
+                     windowShouldClose: function () { frames += 1; return frames > 1; },\n\
+                     beginDrawing: function () {}, endDrawing: function () {},
+                     clearBackground: function () {}, drawText: function () {},
+                     getFPS: function () { return 60; }, closeWindow: function () {},
+                     getFrameTime: function () { return 0.016; },
+                     drawRectangle: function () {}, drawCircle: function () {},
+                     color: function (r, g, b, a) {
+                         return ((r & 255) << 24) | ((g & 255) << 16) | ((b & 255) << 8) | (a & 255);
+                     },
+                     guiPanel: function () {}, guiLabel: function () {},
+                     guiSlider: function () {}, guiCheckBox: function () {},
+                     guiToggle: function () {}, guiTextBox: function () {},
+                     guiButton: function () { return false; },
+                     guiStatusBar: function () {},\n\
+                 };\n",
+            )
+            .unwrap();
+        context
+            .eval(include_str!("../examples/rlx_demo.js"))
+            .unwrap();
+    }
 }

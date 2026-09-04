@@ -645,6 +645,18 @@ impl Context {
         Ok(())
     }
 
+    /// Install a `rlx` global: the declarative layer's pure core. It exposes
+    /// `rlx.h` (virtual elements), `rlx.render` (element tree → draw ops
+    /// with stable paths), `rlx.present` (the per-frame driver: render,
+    /// draw, and dispatch control events), and `rlx.useState`/`rlx.useRef`
+    /// (component state retained per tree path). `rlx.draw` is the stock
+    /// backend mapping ops onto the `rl.gui*` surface. Pure JS with no
+    /// raylib dependency, so it installs on any realm; `rlx.draw` only needs
+    /// raylib at draw time.
+    pub fn install_rlx(&mut self) -> Result<(), JsError> {
+        crate::rlx::install(&mut self.agent)
+    }
+
     /// Install a `rl` global exposing an immediate-mode raylib surface to
     /// scripts: `initWindow`/`beginDrawing`/`endDrawing`, the `draw*`
     /// primitives, input queries, and the color/key/mouse constants. A

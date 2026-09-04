@@ -108,7 +108,11 @@ println!("{doubled}"); // 42
 ```
 
 `HostCallbacks` routes `console` output and promise-rejection tracking;
-`install_process_argv` installs a Node-style `process.argv`.
+`install_process_argv` installs a Node-style `process.argv`. For declarative
+UI, `Context::install_rlx` installs a small virtual-element layer — `rlx.h`
+trees driven frame-by-frame with `rlx.present`, retained per-path state via
+`rlx.useState`, and control events dispatched to `onClick`/`onChange` —
+that can sit on top of the raylib surface below.
 
 ### The `rl` host module
 
@@ -129,6 +133,7 @@ instead of racing it.
 cargo run -p slag --example raylib_demo --features slag/raylib
 cargo run -p slag --example raylib_voxel --features slag/raylib,slag/jit   # first-person voxel sandbox
 cargo run -p slag --example raygui_demo --features slag/raygui            # raygui control panel (also needs a display)
+cargo run -p slag --example rlx_demo --features slag/raygui              # declarative rlx.h() UI with state + events
 cargo run -p cli --features raylib -- game.js
 ```
 
