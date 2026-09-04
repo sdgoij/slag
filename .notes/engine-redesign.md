@@ -1,7 +1,7 @@
 # Engine redesign: bump-pointer generational GC + map-based object model
 
 Engineering spec for the two structural levers identified by the construct
-churn / string concat measurements (Cut 35 slice 30-31, `docs/gc-plan.md`
+churn / string concat measurements (Cut 35 slice 30-31, `.notes/gc-plan.md`
 GC-5 "remaining structural gap to V8: bump/semi-space allocation and
 register-style bytecode"). The regression net is the project standard:
 `cargo clippy --workspace --all-targets -- -D warnings` clean,

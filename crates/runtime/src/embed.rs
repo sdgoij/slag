@@ -141,7 +141,7 @@ impl Context {
     }
 
     /// Toggle `--gc-stress`: collect at every safe point (script boundary /
-    /// job-queue drain) instead of only on heap growth (docs/gc-plan.md
+    /// job-queue drain) instead of only on heap growth (.notes/gc-plan.md
     /// GC-1 slice 3; GC-2 hardens the root audit under it).
     pub fn set_gc_stress(&mut self, enabled: bool) {
         self.agent.set_gc_stress(enabled);

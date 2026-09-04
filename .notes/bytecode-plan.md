@@ -10,7 +10,7 @@ Status: **Cuts 1-4's first slices landed and validated** (zero conformance
 regressions each), and the perf gate is now **closed**: every `--bench` row
 is ≥ 5x the corrected 2026-08-18 baseline (arithmetic 2.52s → ~43ms,
 property 3.22s → ~83ms, string 0.88s → ~43ms, array 15.42s → ~233ms,
-function calls 5.73s → ~293ms; see `docs/perf.md`). Three rows were
+function calls 5.73s → ~293ms; see `.notes/perf.md`). Three rows were
 added to `--bench` (2026-08-22) covering the continuation's certified
 shapes the original five predate: `closure capture` (~320ms),
 `per-iteration` (~51ms), and `construct churn` (~452ms). Cut 3 gives
@@ -484,7 +484,7 @@ implementation* for the VM itself.
 - Top-level `var` bindings are not slots at this slice (top level stays
   `scope: None`), so the arithmetic/property/concat benches don't move yet
   — that's a separate mechanism (script-level bindings), the follow-on to
-  Cut 3, **which has since landed** (`docs/perf.md` Cuts 5-16: fast
+  Cut 3, **which has since landed** (`.notes/perf.md` Cuts 5-16: fast
   scripts + script var slots closed the gate).
 - `arguments`, `this`, closures **that capture a body binding**, mapped
   arguments, Annex B — all bail to the env path; correctness preserved,
@@ -496,7 +496,7 @@ implementation* for the VM itself.
   `let` runs the loop through per-iteration envs), and nested context
   chains (a certified closure's references to enclosing certified
   bodies' captured bindings compile to static context-chain reads)
-  landed in later slices (`docs/perf.md` Cuts 17+): loop-body-scoped
+  landed in later slices (`.notes/perf.md` Cuts 17+): loop-body-scoped
   captures are still deferred (a closure capturing a lexical binding
   declared inside a loop body bails — its per-iteration block scope is
   not flattenable), top-level function declarations now certify

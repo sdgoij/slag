@@ -2,7 +2,7 @@
 
 This is the engineering spec for replacing the `Rc`-based ownership model
 with a garbage-collected heap (PLAN.md §4.3 step 2, Phase 18 item 2, and the
-deferred milestone in `docs/perf.md`). The regression net is the same one
+deferred milestone in `.notes/perf.md`). The regression net is the same one
 every milestone uses: `cargo clippy --workspace --all-targets -- -D warnings`
 clean, `cargo test --workspace` green, and the full release test262 sweep at
 zero regressions on the previously-passing union, at every cut.
@@ -22,7 +22,7 @@ collector is missing.
 - **Performance** — `Value` becomes `Copy` (a plain NaN-boxed `u64`), the
   stated prerequisite for the three remaining allocation-bound benchmark
   rows (construct churn ~12.9x, string concat ~8.6x, per-iteration closures
-  ~6.8x behind V8 `--jitless`; the `docs/perf.md` 2–4x target for those rows
+  ~6.8x behind V8 `--jitless`; the `.notes/perf.md` 2–4x target for those rows
   is explicitly "after GC").
 - **Fidelity** — the Weak-* fixtures that currently pass *because nothing
   dies* become real assertions.

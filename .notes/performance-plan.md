@@ -46,7 +46,7 @@
    workspace tests green. A perf change that costs a fixture is reverted.
 2. **A lever opens with its probe.** Before implementation, quantify the
    current cost of the mechanism being replaced with a dated measurement
-   (recorded in `docs/perf.md`). No expected numbers on a milestone; a
+   (recorded in `.notes/perf.md`). No expected numbers on a milestone; a
    milestone records what its probe showed and what its landing measured.
 3. **One experiment at a time.** A landing names the next experiment.
 4. **Both engines move together.** The interpreter and the JIT lower the
@@ -200,12 +200,12 @@ L1a/L1b land, ahead of L2 unless the probes change the calculus.
 
 Landing gates (every item): clippy clean, `cargo test --workspace`
 green, language + built-ins + annexB release sweeps at baseline, the row
-A/B in both modes recorded in `docs/perf.md`, and the measurement the
+A/B in both modes recorded in `.notes/perf.md`, and the measurement the
 item's probe promised.
 
 ## 6. Measurement discipline
 
-- Rows live in `docs/perf.md` with their dates and harness; the machine
+- Rows live in `.notes/perf.md` with their dates and harness; the machine
   swings ±15%, so deltas are judged on multi-run interleaved A/Bs, never
   single runs.
 - The A/B harness (`bench_once`) measures steady state: definition

@@ -687,7 +687,7 @@ pub struct Agent {
     /// intrinsic table holds it (`None` for non-intrinsic functions).
     pub function_realms: RefCell<std::collections::HashMap<u64, Option<Handle<Realm>>>>,
     /// GC-1 slice 3: collect at every safe point when set (the `--gc-stress`
-    /// mode; docs/gc-plan.md GC-2 hardens the root audit under it).
+    /// mode; .notes/gc-plan.md GC-2 hardens the root audit under it).
     pub gc_stress: Cell<bool>,
     /// The live-box count after the last collection, for the growth
     /// threshold that decides when a safe point collects.
@@ -1150,7 +1150,7 @@ impl Agent {
     }
 
     /// GC-1 slice 3: every `Value`/`Handle`/`JsString`/`Symbol` the agent
-    /// holds directly — the JS-visible roots of docs/gc-plan.md §3. The
+    /// holds directly — the JS-visible roots of .notes/gc-plan.md §3. The
     /// conservative native-stack scan covers Rust-held handles; this covers
     /// the agent's own tables (which live in heap-allocated buffers the
     /// stack scan cannot see). Index-only caches and primitive tables need

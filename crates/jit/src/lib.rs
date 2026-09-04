@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     fn apply_call_step_lowers_and_runs_the_helper() {
-        // The compiled `Step::CallApply` (perf.md "remaining apply floor")
+        // The compiled `Step::CallApply` (.notes/perf.md "remaining apply floor")
         // lowers to the `call_apply` helper: `[f, apply/call, thisArg,
         // a1..aN]` on the work stack, the argument region passed by pointer.
         // The test double sums the argument region (the `thisArg` first), so

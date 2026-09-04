@@ -1,4 +1,4 @@
-//! The GC heap (docs/gc-plan.md, GC-1): `Gc<T>` handles into a thread-local
+//! The GC heap (.notes/gc-plan.md, GC-1): `Gc<T>` handles into a thread-local
 //! mark-sweep heap.
 //!
 //! Modeled on the `gc` crate: each traced object lives in a `GcBox<T>` that
@@ -876,7 +876,7 @@ fn maps_stack_top(sp: usize) -> Option<usize> {
 /// real stack top is the dlmalloc heap and static data that share linear
 /// memory; the conservative scan only ever retains (never falsely frees),
 /// so the wider region is safe — it just widens retention. See the GC-7
-/// note in docs/gc-plan.md: capturing the module-initial stack pointer
+/// note in .notes/gc-plan.md: capturing the module-initial stack pointer
 /// would bound the scan to the actual stack.
 #[cfg(target_arch = "wasm32")]
 fn stack_bounds() -> Option<(usize, usize)> {

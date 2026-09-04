@@ -1,6 +1,6 @@
 # Plan: closing the Slag–Node gap
 
-> **Superseded by `docs/performance-plan.md` (2026-09-03).** This document
+> **Superseded by `.notes/performance-plan.md` (2026-09-03).** This document
 > is kept as the closed historical record of the first (row-organized,
 > estimate-heavy) performance push; the current plan is mechanism-based
 > and covers both engines.
@@ -27,7 +27,7 @@ both JIT (default) and interpreter-only (`--jitless`, V8's Ignition), on
 the same machine and session. Slag columns are best-of-3 `--jit-bench`
 process runs; Node columns are the best (steady-state) round of
 `tools/jit_bench/node_bench.js`. All four modes agree on every row's
-completion value. Recorded in `docs/perf.md` (measured 2026-09-02).
+completion value. Recorded in `.notes/perf.md` (measured 2026-09-02).
 
 | Benchmark | slag interp | slag jit | node jitless | node jit | interp gap | jit gap |
 |---|---|---|---|---|---|---|
@@ -108,7 +108,7 @@ rows' decompositions remain when their slices start.
 
 ### M1 — Dense array elements (both modes) — existing plan, highest absolute ROI
 
-`docs/array-store-plan.md` Item 2 (`ArraySlots`: keyless
+`.notes/array-store-plan.md` Item 2 (`ArraySlots`: keyless
 `Vec<Option<Value>>` + `Cell<f64>` length, spill-on-miss). The
 `buildString shape` row is the suite's biggest absolute time (interp
 180ms); the append path (`array_element_write`: key + clone +
@@ -566,7 +566,7 @@ left; the member-store body keeps its `SetCompletion` absorbed).
 
 ### M8 — Arena allocation (interp)
 
-`docs/gc-plan.md`'s remaining lever: `Gc::new` heavier than `Rc::new`;
+`.notes/gc-plan.md`'s remaining lever: `Gc::new` heavier than `Rc::new`;
 recovers the string-concat/construct-churn regressions. The rope
 append allocates a box per append (100K for the string-concat row); a
 bump arena + the small-string path (Cut 67) cuts the alloc + `Rc` bump.
@@ -705,7 +705,7 @@ assessed against the measurements and are not pursued:
 
 ## 6. Tracking & methodology
 
-- **Gate:** the §1 table in `docs/perf.md` (measured 2026-09-02). After
+- **Gate:** the §1 table in `.notes/perf.md` (measured 2026-09-02). After
   each milestone, re-run `--jit-bench` and `tools/jit_bench/node_bench.js`
   in both modes and append a dated row.
 - **A/B protocol (the machine swings ±15%; judge only multi-run

@@ -73,7 +73,7 @@ The sweep overhead is dominated by one-shot script/function bodies. Under the th
 4. Bench: `perf.md` hot rows before/after.
 5. Sweep: time `--jit` before/after; re-run language/annexB/built-ins for pass/fail/hang parity (must be unchanged).
 6. Tune K (4/16/64) if warranted.
-7. Docs: `docs/jit-report.md` row 40 + TODO; `slag-jit` skill trap (the gate in `lookup_info`, the `body_has_loop`↔`step_targets` sync, the `call_slow→try_jit_leaf` promotion chain).
+7. Docs: `.notes/jit-report.md` row 40 + TODO; `slag-jit` skill trap (the gate in `lookup_info`, the `body_has_loop`↔`step_targets` sync, the `call_slow→try_jit_leaf` promotion chain).
 8. Commit message.
 
 ## 7. Measurement plan (defensible evidence)

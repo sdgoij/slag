@@ -120,7 +120,7 @@ function classify(file, source) {
     return "stale: +275760-09-12T00:00:01Z relativeTo is in range per the current spec";
   }
   // ECMA-402 feature gates (mirrors run_fixture): each `Intl.*` tag skips
-  // until its component lands (docs/intl-plan.md cuts). Cut 1 implements
+  // until its component lands (.notes/intl-plan.md cuts). Cut 1 implements
   // `Intl.Locale`; Cut 2 opens NumberFormat (basic/unified/v3) and
   // supportedValuesOf (the `Intl-enumeration` tag); Cut 3 opens
   // PluralRules and RelativeTimeFormat; Cut 4 opens ListFormat and

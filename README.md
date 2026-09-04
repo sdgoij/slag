@@ -27,7 +27,7 @@ JavaScriptCore C-API bindings.
   edge cases so conformance bugs are easy to diff.
 - **Conformant** — 48,006 passing fixtures, **0 failures / 0 crashes**
   across 48,622 `test262` fixtures (runnable-only; see
-  `docs/conformance.md`). Proper tail calls: 34/34 `tco-*`. Workspace
+  `.notes/conformance.md`). Proper tail calls: 34/34 `tco-*`. Workspace
   tests: 4,316 pass / 0 fail.
 - **Complete modern feature surface** — modules (source-text module
   machinery, top-level await, dynamic import), async/await, generators,
@@ -40,7 +40,7 @@ JavaScriptCore C-API bindings.
   direct-mapped global/member value cells, and register-resident fast
   loops. `--jit-bench` times JIT vs interpreter, and the conformance
   sweep runs the full corpus through the JIT by default (`--jitless`
-  disables it). Design, status, and remaining work: `docs/jit-report.md`.
+  disables it). Design, status, and remaining work: `.notes/jit-report.md`.
 - **Portable** — no third-party runtime dependencies beyond the Rust
   standard library (see `PLAN.md` §4.10), with two opt-in exceptions: the
   experimental JIT (`crates/jit`) pulls in Cranelift and `region` and is
@@ -164,8 +164,7 @@ corpus asserts `\n` (the skip is conditional — a clean LF checkout runs
 them). The 458 hangs are slow-but-correct fixtures at the default
 deadline; the long config (`--timeout 120 --recheck-timeout 120`)
 reclassifies them as passes. The full methodology and triage live in
-`docs/conformance.md`; the honest market-readiness assessment is
-`docs/readiness.md`.
+`.notes/conformance.md`.
 
 ## Repository layout
 
@@ -187,13 +186,12 @@ reclassifies them as passes. The full methodology and triage live in
 ## Documentation
 
 - `PLAN.md` — the implementation plan, per-phase spec coverage, and status
-- `docs/conformance.md` — conformance methodology, results, and triage
-- `docs/readiness.md` — honest readiness and market-entry assessment
-- `docs/gc-plan.md` — the GC milestone plan (arena heap + mark-sweep, cut-by-cut)
-- `docs/intl-plan.md` — the ECMA-402 (Intl) implementation plan and cut status
-- `docs/jit-report.md` — the experimental Cranelift JIT: design, fast paths, hardening, validation, and remaining work
-- `docs/memory-model.md` — ECMAScript ch. 28 shared-memory model
-- `docs/perf.md` — performance milestones and deferred work
+- `.notes/conformance.md` — conformance methodology, results, and triage
+- `.notes/gc-plan.md` — the GC milestone plan (arena heap + mark-sweep, cut-by-cut)
+- `.notes/intl-plan.md` — the ECMA-402 (Intl) implementation plan and cut status
+- `.notes/jit-report.md` — the experimental Cranelift JIT: design, fast paths, hardening, validation, and remaining work
+- `.notes/memory-model.md` — ECMAScript ch. 28 shared-memory model
+- `.notes/perf.md` — performance milestones and deferred work
 
 ## License
 

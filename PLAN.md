@@ -2002,7 +2002,7 @@ invariant matrix, `Reflect.construct` with custom `newTarget`, `Reflect.apply` w
 multi-agent execution (workers sharing `SharedArrayBuffer`). The base engine runs one agent. This
 phase therefore delivers:
 
-1. **A design document** (`docs/memory-model.md`) that maps ch. 28 onto a future
+1. **A design document** (`.notes/memory-model.md`) that maps ch. 28 onto a future
    thread-per-agent design: Shared Data Blocks, Agent Signifiers, read/write/read-modify-write
    executions, synchronizes-with (via `Atomics.notify`/`wait` and `SeqCst` fencing), happens-before
    (sequenced-before, synchronization edge, transitive), data-race definition and the
@@ -2018,7 +2018,7 @@ phase therefore delivers:
    `--test-threads=1`-safe harness.
 
 **Exit criteria:** single-agent behavior unchanged; feature-gated worker mode passes stress tests;
-`docs/memory-model.md` reviewed against ch. 28.
+`.notes/memory-model.md` reviewed against ch. 28.
 
 ---
 
@@ -2029,7 +2029,7 @@ phase therefore delivers:
 1. **Conformance hardening:**
    - Full `test262` sweep: run everything, triage failures into categories (bug / host-dependent /
      missing-host-hook / Intl-required). Target **≥ 95% of runnable tests**, with the remainder
-     documented in `docs/conformance.md` (expected: host-dependent, `dynamic import` with no
+     documented in `.notes/conformance.md` (expected: host-dependent, `dynamic import` with no
      module loader, Intl).
    - Annex B suite (`annexB/`) explicitly tracked — legacy behaviors are part of the spec.
    - Error-message and stack-trace polish (V8-compatible formats for `message` and `stack`).
@@ -2053,12 +2053,12 @@ phase therefore delivers:
    `--dump-ast`, `--dump-tokens`.
 
 **Exit criteria:** conformance target met; GC stress clean; perf milestones each pass their gate
-or are explicitly deferred in `docs/perf.md`; embedding API documented with examples.
+or are explicitly deferred in `.notes/perf.md`; embedding API documented with examples.
 
 **Status (in progress):** the embedding API and CLI workstreams are delivered and documented
 with doc-tests/examples; the conformance target is certified at **100% of runnable** across
-all three sweep areas (see `docs/conformance.md`); the GC and performance milestones are
-explicitly deferred (gates and rationale in `docs/perf.md`).
+all three sweep areas (see `.notes/conformance.md`); the GC and performance milestones are
+explicitly deferred (gates and rationale in `.notes/perf.md`).
 
 Delivered:
 - **Embedding API** (`crates/runtime/src/embed.rs`, exported as `runtime::Context`):
@@ -2073,22 +2073,22 @@ Delivered:
   (`--print-bytecode`, `--stack-size`, `--max-old-space`, `--harmony-*`).
 - **Conformance tooling**: `full_sweep` scanner in `crates/test262` walks `language`,
   `built-ins`, and `annexB` (new `Area::AnnexB`) with `SWEEP`/`SWEEP_SAMPLE` knobs;
-  `docs/conformance.md` documents methodology, the 3317 passing vendored fixtures, the
+  `.notes/conformance.md` documents methodology, the 3317 passing vendored fixtures, the
   skip taxonomy, and the expected non-runnable categories (Intl, `dynamic import` without a
-  loader, host-dependent behavior). `docs/perf.md` documents the benchmark gate and the
+  loader, host-dependent behavior). `.notes/perf.md` documents the benchmark gate and the
   deferred milestones.
 - **Conformance certification**: the full ~49k-fixture release sweep (`test262-sweep`, all
   three areas, long config) measures **100% of runnable** — language 18,052 / built-ins
   17,179 / annexB 956 pass, 0 fail, 0 crash, 0 hang of 48,622 fixtures (module/async,
   host-dependent, and out-of-scope Temporal/ShadowRealm/await-dictionary fixtures
   skipped). The language area closed via the direct-eval caller-context rules, the
-  field-initializer evaluation context, and the Annex B restorations; `docs/conformance.md`
+  field-initializer evaluation context, and the Annex B restorations; `.notes/conformance.md`
   records the full triage.
 
 Remaining before exit criteria:
 - GC milestone (arena heap + mark-sweep, `--gc-stress`, leak harness) and the performance
   milestones (NaN-boxed `Value`, bytecode VM, shapes/ICs, string ropes) stay deferred per
-  `docs/perf.md`.
+  `.notes/perf.md`.
 
 ---
 
@@ -2131,7 +2131,7 @@ Percentages are planning estimates; the exit criteria in each phase are authorit
 - **Performance** (Phase 18): NaN-boxing, bytecode VM, hidden classes/ICs; each gated by
   benchmarks with saved baselines.
 - **Embedding** (`HostHooks` trait): designed in Phase 4, filled out per phase, stabilized in 18.
-- **Docs:** `docs/` for conformance, perf, memory model; every phase updates the milestone table.
+- **Docs:** `.notes/` for conformance, perf, memory model; every phase updates the milestone table.
 
 ## 9. Risks and mitigations
 
@@ -2152,10 +2152,10 @@ Percentages are planning estimates; the exit criteria in each phase are authorit
 - [ ] Every `pub` item in every crate has inline unit tests (§5); the coverage gate passes at 100%
       `pub`-item coverage.
 - [x] `slag file.js` and the REPL execute ES2026 scripts; `--dump-ast`/`--dump-tokens` work.
-- [x] test262 at **≥ 95%** of runnable tests; all failures triaged in `docs/conformance.md`
+- [x] test262 at **≥ 95%** of runnable tests; all failures triaged in `.notes/conformance.md`
       (100% of runnable measured across language/built-ins/annexB).
 - [ ] GC milestone active (no unbounded leaks on long-running programs; `WeakRef`/`FinalizationRegistry`
       semantics verified).
 - [ ] Embedding API (`runtime::Context`, host hooks) documented with working examples.
-- [ ] `docs/memory-model.md` present; worker mode feature-gated and stress-tested.
+- [ ] `.notes/memory-model.md` present; worker mode feature-gated and stress-tested.
 - [ ] Every phase's exit criteria satisfied; milestone table up to date.

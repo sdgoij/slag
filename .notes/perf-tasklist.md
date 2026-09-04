@@ -1,8 +1,8 @@
 # Perf tasklist (merged from performance-plan.md + gap-close-plan.md, 2026-09-04)
 
 > Merged, prioritized view of the remaining work in the active plan
-> (`docs/performance-plan.md`, mechanism-based, supersedes) and the closed
-> historical plan (`docs/gap-close-plan.md`). Status reflects everything
+> (`.notes/performance-plan.md`, mechanism-based, supersedes) and the closed
+> historical plan (`.notes/gap-close-plan.md`). Status reflects everything
 > landed through `0d70d3e` (the L1c record-discipline landing), the
 > write-cell capacity slice (1.3), and the certification-coverage slice
 > (2.2): the gap-close milestones M1-M7/M10, the L1a/L1c register-path

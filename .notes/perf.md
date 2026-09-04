@@ -35,7 +35,7 @@ correctness gate.
 - **Memory**: a GC-managed arena heap — bump allocation + mark-sweep with
   root tracing (incl. a conservative native-stack scan), ephemeron-aware
   WeakMap/WeakSet, and `WeakRef`/`FinalizationRegistry` driven by the
-  heap; `--gc-stress` collects per allocation. See `docs/gc-plan.md`.
+  heap; `--gc-stress` collects per allocation. See `.notes/gc-plan.md`.
 
 ## Benchmark gate
 
@@ -2310,7 +2310,7 @@ next section), in order of expected value:
 
 | lever | current gap vs node | where |
 |---|---|---|
-| GC slot-arena allocation (GC-5's remaining lever) — `Gc::new` heavier than `Rc::new`; recovers the construct-churn / string-concat ~2x regressions | 2x | `docs/gc-plan.md` |
+| GC slot-arena allocation (GC-5's remaining lever) — `Gc::new` heavier than `Rc::new`; recovers the construct-churn / string-concat ~2x regressions | 2x | `.notes/gc-plan.md` |
 | interpreter per-op floor — the 0.7µs bare-loop iteration is ~100x off mainstream; the floor section calls the VM core a real but secondary target | ~100x | `runtime/src/ir.rs` |
 | the apply floor — **closed** (the compiled `CallApply` step below): interp 208→101ms, jit 204→89ms on the `apply leaf call` row; the residual is the member read + element reads + leaf frame setup | ~5x on a 1-elem apply | `runtime/src/ir.rs` |
 
@@ -2351,7 +2351,7 @@ buildString.
 
 ### Vector-call leaf-inline and the apply/call leaf fast path (measured 2026-09-01)
 
-The last call-step gap from `docs/jit-report.md` §7 item 7 — "a vector
+The last call-step gap from `.notes/jit-report.md` §7 item 7 — "a vector
 call to a certified LEAF still runs the general `call_inner`" — is closed,
 and `Function.prototype.apply`/`call` gained the same leaf fast path. New
 `--jit-bench` rows: `vector leaf call` (9-arg leaf, 200K) and
@@ -4517,7 +4517,7 @@ ephemeron-aware WeakMap/WeakSet; `WeakRef`/`FinalizationRegistry` semantics
 activated; `--gc-stress` mode) is a rewrite of the value/object model from
 `Rc`-based ownership to GC-managed handles. It is **landed** (GC-1..4:
 `Handle` → GC heap, collector wiring, per-allocation `--gc-stress` root
-audit, ephemerons, weak-ref semantics) — see `docs/gc-plan.md`.
+audit, ephemerons, weak-ref semantics) — see `.notes/gc-plan.md`.
 
 **GC-5 measured (2026-08-26)** — the eight `--bench` rows vs the pre-GC Rc
 model on the same machine (interleaved medians):

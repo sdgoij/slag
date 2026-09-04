@@ -740,7 +740,7 @@ array-iteration benchmark has ranged 13.7–19.1s across identical runs) —
 only judge consistent multi-run deltas, never a single run. An empty
 1M-iteration `var` loop alone is ~630ms of the ~1.19s arithmetic bench: the
 loop machinery (dispatch + env resolution) dominates, so encoding fusion
-moves numbers within noise, and the perf.md ≥5x gate needs structural work
+moves numbers within noise, and the .notes/perf.md ≥5x gate needs structural work
 (registers/accumulator, i.e. the plan's Cut 3), not more step fusion.
 
 **The direct-mapped caches thrash with many keys — a realm-wide

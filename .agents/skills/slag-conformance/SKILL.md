@@ -122,7 +122,7 @@ the 17 preceding `TypedArray/prototype/reduce/*` fixtures (16 BigInt + `callback
 arguments-custom-accumulator`) — prefix bisection: `lines[:17] + target` reproduces,
 shorter prefixes don't. Root cause unpinned (heap-state/timing dependent, consistent
 with a stale pointer in the strict-unmapped `arguments` path); documented in
-docs/conformance.md Open items. Re-run the fixture before triaging it as a regression.
+.notes/conformance.md Open items. Re-run the fixture before triaging it as a regression.
 
 ## Relationship to the other skills
 

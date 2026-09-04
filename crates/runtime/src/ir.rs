@@ -1498,7 +1498,7 @@ pub struct CompiledBody {
     /// re-alloc): `do_call_fast` inlines it when the caller's shared stacks
     /// are empty. A leaf cannot recurse (it contains no calls), so the
     /// flat save/restore of the few fields it touches is safe. See
-    /// `docs/perf.md` Cut 25.
+    /// `.notes/perf.md` Cut 25.
     pub leaf: bool,
     /// Cut 28: whether the leaf reads captured per-iteration heads — its
     /// steps contain `LoadPerIteration`/`StorePerIteration`/

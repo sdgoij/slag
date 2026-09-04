@@ -15,7 +15,7 @@ Segmenter, DurationFormat). Cut 9 (the intl402/Temporal integration) is in
 flight: the Temporal×DateTimeFormat integration (format/toLocaleString on
 Temporal values, the [[Calendar]] slots, the un-skipped intl402 gate) is
 committed; the **time-zone data decision is made** (corpus-derived tables,
-spike validated — see `docs/tz-data-decision.md`). The DST-aware Temporal
+spike validated — see `.notes/tz-data-decision.md`). The DST-aware Temporal
 algorithms are done (the wall→instant resolver + disambiguation in
 `temporal/shell.rs`, AddZonedDateTime/AddInstant, zoned round/with/until/
 since, getTimeZoneTransition with strictly-before previous semantics, and
@@ -166,7 +166,7 @@ surface). Calendar machinery (gregory first; the tested alternate
 calendars as needed), month/weekday/day-period/era names, hour cycles,
 date/time patterns, and **time zones** — the IANA tz data question was
 deferred to Cut 9 and **decided in favor of corpus-derived tables**
-(`docs/tz-data-decision.md`): a generator over a vendored IANA subset
+(`.notes/tz-data-decision.md`): a generator over a vendored IANA subset
 (chrono-tz/jiff lack the transition API the corpus's getTimeZoneTransition
 and hoursInDay fixtures require). `formatToParts` + `formatRange`.
 Fixtures: 244 + 37 formatRange + 31 String/Date.
@@ -266,4 +266,4 @@ months), sub-minute offset matching, and a few edge singles.
   forces it (bounded: `icu_collator` only).
 - No Temporal work beyond the intl402 integration points (Temporal
   itself is implemented and its skips are closed).
-- No Intl performance gates in `docs/perf.md`.
+- No Intl performance gates in `.notes/perf.md`.

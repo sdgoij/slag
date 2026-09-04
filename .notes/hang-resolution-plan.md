@@ -7,7 +7,7 @@ regexp per-char predicate fix. This plan covers what remains, in order,
 with a named output and an acceptance gate at every step so progress is
 auditable and nothing is changed on a guess.
 
-References: `docs/array-store-plan.md` (landed), `docs/perf.md`
+References: `.notes/array-store-plan.md` (landed), `.notes/perf.md`
 ("Interpreter per-op floor"), the `slag-conformance` skill (sweep
 methodology: union-of-failures comparisons, never raw counts).
 
@@ -87,7 +87,7 @@ the array-like).
   after Item 3 — if they are the stale `relativeTo` cases (per the
   existing skip note), mark them; if they are real engine loops, this
   plan is amended with a scoped Item 5.
-- **Interpreter core-loop floor** (`docs/perf.md`, ~0.7µs bare loop): a
+- **Interpreter core-loop floor** (`.notes/perf.md`, ~0.7µs bare loop): a
   perf milestone, not a hang; the plan's dense-elements work already
   removed the buildString share of it.
 - **Dense-elements Phases B–D** (re-densify, sealed/frozen kinds,

@@ -533,7 +533,7 @@ pub struct JitHelpers {
     pub args_spread: Option<extern "C" fn(vm: *mut c_void, iterable: u64) -> u64>,
     pub call_vector:
         Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
-    /// The compiled `Step::CallApply` (perf.md "remaining apply floor"):
+    /// The compiled `Step::CallApply` (.notes/perf.md "remaining apply floor"):
     /// `args` points at the JIT buffer's argument region (`argc` slots, the
     /// `thisArg` first); `kind` is 0 for `apply`, 1 for `call`. Runs the
     /// interpreter's `do_call_apply` — the intrinsic check, the direct call

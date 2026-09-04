@@ -102,7 +102,7 @@ validation inline cannot win. Reverted; the interp-side cache inside the
 helper remains the win. Trap for a retry: `JsObject`/`MemberChainCell`
 are repr(Rust), not `repr(C)` (doc comments say otherwise) — the probe
 stayed consistent via `offset_of!`/`size_of!`, but a stable ABI needs
-`repr(C)` first. Full detail in `docs/perf.md`. |
+`repr(C)` first. Full detail in `.notes/perf.md`. |
 
 ### Slow-path helper table (`JitSlowPaths`, 113 helpers)
 

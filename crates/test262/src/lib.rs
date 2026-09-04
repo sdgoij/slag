@@ -39,7 +39,7 @@ pub mod harness {
     }
 
     /// Enable the per-allocation `--gc-stress` mode for subsequent fixture
-    /// agents (the `test262-sweep --gc-stress` gate, docs/gc-plan.md GC-2).
+    /// agents (the `test262-sweep --gc-stress` gate, .notes/gc-plan.md GC-2).
     pub fn set_gc_stress(enabled: bool) {
         GC_STRESS.with(|stress| stress.set(enabled));
     }
@@ -12441,7 +12441,7 @@ var $DONE = function (error) {
         Ok(())
     }
 
-    /// The ECMA-402 features implemented so far (plan cuts; docs/intl-plan.md
+    /// The ECMA-402 features implemented so far (plan cuts; .notes/intl-plan.md
     /// §4). Cut 1: `%Intl%`, `Intl.getCanonicalLocales`, and `Intl.Locale`.
     /// Cut 2: `Intl.NumberFormat` (basic, unified, v3) and
     /// `Intl.supportedValuesOf` (the `Intl-enumeration` tag). Cut 3:
@@ -12476,7 +12476,7 @@ var $DONE = function (error) {
 
     /// The first unimplemented ECMA-402 feature a fixture tags, or `None`.
     /// The `Intl.*` gates flip to implemented as their plan cuts land
-    /// (docs/intl-plan.md §4); the mirror lives in tools/skip_tally.js.
+    /// (.notes/intl-plan.md §4); the mirror lives in tools/skip_tally.js.
     fn unimplemented_intl_feature(fm: &Frontmatter) -> Option<String> {
         for feature in &fm.features {
             if feature.starts_with("Intl") && !INTL_IMPLEMENTED.iter().any(|f| f == feature) {
@@ -12566,7 +12566,7 @@ var $DONE = function (error) {
             // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.
             return FixtureResult::Skip("ShadowRealm is out of scope".into());
         }
-        // ECMA-402 feature gates (docs/intl-plan.md): each `Intl.*` tag
+        // ECMA-402 feature gates (.notes/intl-plan.md): each `Intl.*` tag
         // skips with an explicit reason until its component lands. The
         // implemented set grows per cut; the mirror lives in
         // tools/skip_tally.js.
@@ -12842,7 +12842,7 @@ var $DONE = function (error) {
     /// Phase 18). `run_fixture` reuses the vendored-fixture runner, so the
     /// module/async/unsupported-include skips apply here too. Set `SWEEP` to
     /// `language`, `built-ins`, or `annexB` to scan one area; the output
-    /// feeds `docs/conformance.md`.
+    /// feeds `.notes/conformance.md`.
     #[test]
     #[ignore = "full test262 sweep (slow); set SWEEP=language|built-ins|annexB"]
     fn full_sweep() {

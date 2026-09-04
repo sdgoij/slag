@@ -1059,7 +1059,7 @@ pub(crate) const INLINE_JIT_BUF: usize = 64;
 /// corpus's one-shot script/function bodies run once each, so they never
 /// amortize a Cranelift compile; loop bodies bypass the gate entirely
 /// (they run once with many internal iterations, so a pure count would
-/// never promote them). See `docs/jit-compile-threshold.md`.
+/// never promote them). See `.notes/jit-compile-threshold.md`.
 pub(crate) const JIT_COMPILE_THRESHOLD: u32 = 16;
 
 /// The `BinaryOp` variants in declaration order (a fieldless enum's

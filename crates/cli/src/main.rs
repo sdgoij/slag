@@ -25,7 +25,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// CLI knobs. The performance flags are accepted for CLI compatibility; the
 /// GC knobs (`--gc-stress` is live since GC-1 slice 3; `--max-old-space` is
-/// still a no-op) are documented in `docs/gc-plan.md`.
+/// still a no-op) are documented in `.notes/gc-plan.md`.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Options {
     dump_ast: bool,
@@ -256,7 +256,7 @@ fn dump_ast(source: &str) -> Result<(), u8> {
 }
 
 /// Parse `source` as a fast script, compile it, and print the bytecode
-/// (`--print-bytecode`; the `docs/bytecode-plan.md` Cut 5 debugging tool).
+/// (`--print-bytecode`; the `.notes/bytecode-plan.md` Cut 5 debugging tool).
 fn dump_bytecode(source: &str) -> Result<(), u8> {
     match parser::parse_script(source) {
         Ok(program) => {
@@ -412,7 +412,7 @@ fn input_complete(source: &str) -> bool {
 /// (interning, hooks), then timed. The sources use `var` (not `let`) so a
 /// second evaluation in the same realm is legal and the timed run measures
 /// the real loop rather than a re-declaration error. The timings are only
-/// comparable within a build profile; see `docs/perf.md` for the benchmark
+/// comparable within a build profile; see `.notes/perf.md` for the benchmark
 /// gates.
 ///
 /// The last three rows exercise the Cut 3 continuation certification

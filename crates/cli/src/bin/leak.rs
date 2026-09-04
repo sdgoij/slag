@@ -1,4 +1,4 @@
-//! Leak-detection harness for the GC milestone (docs/gc-plan.md, GC-0).
+//! Leak-detection harness for the GC milestone (.notes/gc-plan.md, GC-0).
 //!
 //! Runs a workload in-process and samples the process working set, so the
 //! Rc-model baseline can be measured before the arena + collector lands and

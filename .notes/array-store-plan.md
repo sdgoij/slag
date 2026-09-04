@@ -19,8 +19,8 @@ Scope: close the gap on the `test262` harness's `buildString`
 (`test262/harness/regExpUtils.js`) — the fill-reset array-store loop that
 historically made the RegExp property-escape fixtures the sweep's slowest
 cluster. Two work items: two cheap slices (land next) and the dense-elements
-milestone (the real fix). References: `docs/perf.md` ("Interpreter per-op
-floor", measured 2026-08-31) and `docs/jit-report.md` §6 / §7 item 12.
+milestone (the real fix). References: `.notes/perf.md` ("Interpreter per-op
+floor", measured 2026-08-31) and `.notes/jit-report.md` §6 / §7 item 12.
 
 ## Measured baseline (current tree, `--jit-bench` "buildString shape" row)
 
