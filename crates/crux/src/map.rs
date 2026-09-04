@@ -234,15 +234,38 @@ thread_local! {
 /// (including null vs. null) get separate maps.
 pub fn canonical_empty_map(prototype: Option<Handle<JsObject>>) -> Handle<Map> {
     let key = prototype.map(|p| p.id());
+    // The cache lookup must not hold its borrow across `Map::new_empty`: a
+    // `--gc-stress` collection fires inside the allocation, and the sweep's
+    // cache prune (`drop_unmarked_empty_maps`) needs the borrow.
+    let cached = EMPTY_MAP_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, handle)| *handle)
+    });
+    if let Some(handle) = cached {
+        return handle;
+    }
+    let handle = Map::new_empty(prototype);
+    EMPTY_MAP_CACHE.with(|cache| cache.borrow_mut().push((key, handle)));
+    handle
+}
+
+/// Drop the cached canonical empty maps whose boxes the just-finished mark
+/// will sweep. The cache is the only owner of an empty map once the last
+/// live object using it dies, and the collector does not trace the cache, so
+/// an unpruned entry would dangle into every later object creation with that
+/// prototype (`Heap::collect_from_work` calls this with the final mark bits
+/// still set, right before the sweep frees the unmarked boxes). An entry
+/// whose box survived the mark stays valid: boxes are only freed inside a
+/// collection, so a surviving entry cannot go stale before the next sweep.
+pub(crate) fn drop_unmarked_empty_maps() {
     EMPTY_MAP_CACHE.with(|cache| {
-        let mut map_cache = cache.borrow_mut();
-        if let Some((_, handle)) = map_cache.iter().find(|(k, _)| *k == key) {
-            return *handle;
-        }
-        let handle = Map::new_empty(prototype);
-        map_cache.push((key, handle));
-        handle
-    })
+        cache
+            .borrow_mut()
+            .retain(|(_, map)| map.as_any().is_marked());
+    });
 }
 
 #[cfg(test)]

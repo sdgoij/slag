@@ -41,6 +41,15 @@ impl GcAny {
     pub fn addr(self) -> usize {
         self.0 as *const u8 as usize
     }
+
+    /// Whether the box's mark bit is set: reachable from the roots of the
+    /// collection whose mark phase just finished. Read only between the mark
+    /// and the sweep (unmarked boxes are dropped right after).
+    pub(crate) fn is_marked(self) -> bool {
+        // SAFETY: `self` comes from a registered box (`Gc<T>`'s `Trace`); the
+        // mark bit is valid from the mark phase until the sweep resets it.
+        unsafe { (*self.0).mark.get() }
+    }
 }
 
 /// A cell in the GC heap. `T` is unsized only through `dyn Trace`; for a
@@ -1110,6 +1119,11 @@ impl Heap {
             }
             EPHEMERONS.with(|slot| slot.borrow_mut().clear());
         }
+        // GC-6: the sweep frees the unmarked boxes below. Prune the caches
+        // that own GC handles the collector does not trace (the canonical
+        // empty maps) while the mark bits are still final, so a box this
+        // sweep drops is never handed out again.
+        crate::map::drop_unmarked_empty_maps();
         let mut keep = Vec::with_capacity(self.live.len());
         let mut swept = Vec::new();
         let mut new_min = usize::MAX;
