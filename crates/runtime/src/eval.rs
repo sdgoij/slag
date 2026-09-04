@@ -3093,6 +3093,89 @@ mod tests {
     }
 
     #[test]
+    fn statement_position_local_updates_fuse_into_register_runs() {
+        // A statement-position local update (`l++;`, `++l;`, `l--;`) has no
+        // register form: its `UpdateLocal` pushes a result the trailing
+        // `SetCompletion` discards, so `s += i; l++;` kept the update on the
+        // step path — one extra dispatch per iteration. A statement-position
+        // update is exactly `UpdateLocal` immediately followed by
+        // `SetCompletion`: the run now stores the update in place
+        // (`UpdateReg`, no push) and both statements lower to one run. The
+        // expression-position forms (`x = l++`, `a[l++] = v`) keep the
+        // deferred `PostInc` write-back.
+        fn steps(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> (usize, Vec<Box<[crate::ir::LeafOp]>>) {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            let step_updates = ir
+                .steps
+                .iter()
+                .filter(|s| matches!(s, crate::ir::Step::UpdateLocal { .. }))
+                .count();
+            let runs = ir
+                .steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect();
+            (step_updates, runs)
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let (updates, runs) = steps(
+            &mut agent,
+            "function g(n) { var s = 0; var l = 0; for (var i = 0; i < n; i++) { s += i; l++; } return s; }",
+            "g",
+        );
+        assert_eq!(
+            updates, 0,
+            "the statement l++ must not stay on the step path"
+        );
+        assert_eq!(
+            runs.len(),
+            1,
+            "the two-statement body must lower to one run"
+        );
+        assert!(
+            runs[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::UpdateReg { .. })),
+            "the run must contain the fused local update"
+        );
+        // Prefix (`++l`) and decrement (`l--`) fuse the same way, and a
+        // numeric-string counter exercises the register op's general
+        // ToNumeric updater (only a Number takes the inline f64 path).
+        let (updates, runs) = steps(
+            &mut agent,
+            "function h(n) { var l = '5'; var s = 0; for (var i = 0; i < n; i++) { s += i; ++l; } return s; }",
+            "h",
+        );
+        assert_eq!(updates, 0, "the statement ++l must fuse");
+        assert_eq!(runs.len(), 1);
+        let (updates, runs) = steps(
+            &mut agent,
+            "function k(n) { var l = 10; for (var i = 0; i < n; i++) { l--; } return l; }",
+            "k",
+        );
+        assert_eq!(updates, 0, "the statement l-- must fuse");
+        assert_eq!(runs.len(), 1);
+        // The expression-position postfix (`x = l++`) still lowers through
+        // the deferred `PostInc` operand (no `UpdateReg`), and the results
+        // match the step path exactly.
+        let result = agent
+            .run_script(
+                "function p(n) { var x = 0; var l = 0; for (var i = 0; i < n; i++) { x = l++; } return x; } p(5);",
+            )
+            .unwrap();
+        assert_eq!(result, Value::Number(4.0));
+    }
+
+    #[test]
     fn member_compound_and_computed_stores_lower_to_register_runs() {
         // A member RMW in a certified loop (`o.x += 1`) and a plain member
         // store of a computed value (`o.x = o.x + 1`) previously kept the
@@ -3572,8 +3655,14 @@ mod tests {
             ),
             0
         );
-        // The buildString guard shape keeps only the guard's own consequent
-        // block's pair (its `ListBegin`/`ListEnd` are not the loop body's).
+        // The buildString guard shape: the guard's own consequent block
+        // (`{ c++; l = 0; }`) is now fully register (statement-position
+        // `c++` has a register form, and `l = 0` is a fused store), so its
+        // all-register pair is absorbed — the loop body's wrappers are gone
+        // (the body has no abrupt transfer), leaving none. The absorption is
+        // sound: nothing step-path reads the consequent's completion before
+        // the `if` normalizes it, and the shape runs byte-identical under
+        // the JIT and the interpreter.
         assert_eq!(
             list_step_count(
                 &mut agent,
@@ -3582,7 +3671,7 @@ mod tests {
                  return c; }",
                 "g"
             ),
-            2
+            0
         );
         // A break or continue (even guarded by an `if`) keeps the body's
         // pair.

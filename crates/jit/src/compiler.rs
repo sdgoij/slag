@@ -5796,6 +5796,49 @@ impl<'a> Lowerer<'a> {
                 let new_value = self.builder.use_var(new_var);
                 self.builder.def_var(self.acc_var, new_value);
             }
+            LeafOp::UpdateReg { slot, tdz, op } => {
+                // frame[slot] = ToNumeric(frame[slot]) ± 1 (a
+                // statement-position local update — the result is
+                // discarded, so no push): the number case is the inline
+                // f64 add (mirrors `emit_update`), anything else falls to
+                // the general `UpdateValueSlow`.
+                let old = self.load_slot(*slot);
+                if *tdz {
+                    self.emit_tdz_check(old)?;
+                }
+                let is_num = self.is_double(old);
+                let num = self
+                    .builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), old);
+                let delta = if matches!(op, syntax::ast::UpdateOp::Increment) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let delta_c = self.builder.ins().f64const(delta);
+                let new_num = self.builder.ins().fadd(num, delta_c);
+                let new_bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), new_num);
+                let new_fast = self.canon(new_bits);
+                let new_var = self.builder.declare_var(types::I64);
+                self.builder.def_var(new_var, new_fast);
+                let merge = self.builder.create_block();
+                let slow = self.builder.create_block();
+                self.builder.ins().brif(is_num, merge, &[], slow, &[]);
+                self.builder.switch_to_block(slow);
+                let inc_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                let new_slow =
+                    self.call_slow(self.sig_update, Helper::UpdateValueSlow, &[inc_imm, old])?;
+                self.builder.def_var(new_var, new_slow);
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
+                let new_value = self.builder.use_var(new_var);
+                self.store_slot(*slot, new_value);
+            }
             LeafOp::BinLeftReg { op, slot } => {
                 let left = self.load_slot(*slot);
                 let right = self.builder.use_var(self.acc_var);

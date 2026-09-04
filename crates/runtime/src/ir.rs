@@ -1199,6 +1199,17 @@ pub enum LeafOp {
         key: RegOperand,
         op: syntax::ast::UpdateOp,
     },
+    /// The register form of a statement-position LOCAL update (`l++` /
+    /// `++l` / `l--` as a statement — the result is discarded by the
+    /// trailing `SetCompletion`): reads the frame slot, applies the
+    /// ToNumeric update (`update_value` — number case inline f64 ±1), and
+    /// stores the new value, pushing nothing. The `tdz` bit mirrors
+    /// `StoreReg`'s assignment-time uninitialized check.
+    UpdateReg {
+        slot: usize,
+        tdz: bool,
+        op: syntax::ast::UpdateOp,
+    },
     /// acc = the accumulator object's `name` property (the named member
     /// read, `Step::GetMemberName`): the shared `get_member_name` nullish
     /// check + member-cell cache machinery.
@@ -9006,6 +9017,33 @@ impl Vm {
                         ));
                     }
                     *self.frame_get_mut(*slot) = self.acc;
+                }
+                LeafOp::UpdateReg { slot, tdz, op } => {
+                    // A statement-position local update (`l++;` as a
+                    // statement — the value is discarded): ToNumeric, then
+                    // ±1, stored in place (no push). A number in the slot
+                    // takes the inline f64 path; anything else (a numeric
+                    // string, a BigInt) runs the general updater. The `tdz`
+                    // check mirrors `StoreReg`'s.
+                    let old = *self.frame_get(*slot);
+                    if *tdz && old.is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    let new = if let Some(num) = old.as_number() {
+                        let delta = if matches!(op, syntax::ast::UpdateOp::Increment) {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        Value::Number(num + delta)
+                    } else {
+                        let (_, new) = update_value(agent, op, &old)?;
+                        new
+                    };
+                    *self.frame_get_mut(*slot) = new;
                 }
                 LeafOp::StoreMemberName { name, value } => {
                     // The object is the accumulator; the value comes from the
@@ -18332,10 +18370,12 @@ fn is_stable_computed_key(operand: &RegOperand) -> bool {
 /// Returns `None` (the step stays on the step path) when the step has no
 /// register form. The state may be partially mutated on rejection — the
 /// callers discard it (the whole body, or the uncommitted run tail).
+#[allow(clippy::too_many_arguments)]
 fn lower_step(
     step: &Step,
     index: usize,
     total: usize,
+    next: Option<&Step>,
     scope: &ScopeInfo,
     ops: &mut Vec<LeafOp>,
     stack: &mut Vec<RegOperand>,
@@ -18531,21 +18571,32 @@ fn lower_step(
             stack.push(RegOperand::Acc);
         }
         Step::UpdateLocal { slot, op, prefix } => {
-            // A post-increment key (`a[l++] = v`): the operand loads the
-            // slot and writes the update back at load time. A prefix
-            // form (`++l`) yields the new value — no register shape; a
-            // statement-position update (`a[l] = i; l++;`) leaves the
-            // operand unconsumed, so the end-of-body stack check keeps
-            // it on the step path (the write-back must not be lost).
-            if *prefix {
+            // A statement-position local update (`l++;` / `++l;` / `l--;`):
+            // the immediately-following `SetCompletion` discards the result,
+            // so the run stores the update in place and pushes nothing
+            // (`UpdateReg` — the shadow stays empty and the run commits at
+            // that SetCompletion). An expression-position postfix update is
+            // deferred as a `PostInc` operand (`a[l++] = v` keys, `x =
+            // l++`): its write-back runs when the operand loads, preserving
+            // evaluation order. An expression-position prefix update yields
+            // the NEW value and has no register shape.
+            if matches!(next, Some(Step::SetCompletion)) {
+                let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
+                ops.push(LeafOp::UpdateReg {
+                    slot: *slot,
+                    tdz,
+                    op: *op,
+                });
+            } else if *prefix {
                 return None;
+            } else {
+                let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
+                stack.push(RegOperand::PostInc {
+                    slot: *slot,
+                    tdz,
+                    op: *op,
+                });
             }
-            let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
-            stack.push(RegOperand::PostInc {
-                slot: *slot,
-                tdz,
-                op: *op,
-            });
         }
         Step::StoreLocal { slot } | Step::FusedStoreLocal { slot } => {
             let value = stack.pop()?;
@@ -19007,6 +19058,7 @@ fn lower_leaf_ops_segmented(
                 &steps[i],
                 i,
                 steps.len(),
+                steps.get(i + 1),
                 scope,
                 &mut ops,
                 &mut stack,
@@ -19086,6 +19138,7 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
             step,
             index,
             steps.len(),
+            steps.get(index + 1),
             scope,
             &mut ops,
             &mut stack,

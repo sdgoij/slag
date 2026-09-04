@@ -1628,6 +1628,29 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_statement_local_updates_match_the_interpreter() {
+        // Statement-position local updates (`l++;`, `++l;`, `l--;`) now fuse
+        // into the loop body's register run (`LeafOp::UpdateReg`), so the
+        // compiled body carries the op: the interpreter's inline f64 update
+        // and the machine code's mirror must agree over postfix/prefix/
+        // decrement and a numeric-string counter (the slow ToNumeric path).
+        let source = "function f(n) { var l = '5'; var s = 0; for (var i = 0; i < n; i++) { s += i; l++; } return s; }\n\
+                     function g(n) { var l = 0; for (var i = 0; i < n; i++) { ++l; l--; l++; } return l; }\n\
+                     f(7) + g(7);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled body must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_typed_array_length_probe_serves_compiled_reads() {
         // A loop reading `ta.length` per iteration compiles, and the
         // compiled `GetMemberName`-with-length probe serves the slots length

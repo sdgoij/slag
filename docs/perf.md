@@ -3389,6 +3389,68 @@ drops ~35-37ms -> ~16-18ms (~2x, ~41ns -> ~19-21ns per element); the
 three release sweeps identical to the parent (language 23721/3 skip,
 built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang).
 
+### L4 probe: the buildString-shape interpreter cost is loop-body step dispatch, not allocation (measured 2026-09-04)
+
+The plan's L4 premise is that the `buildString`-shape rows are
+allocation churn (a bump arena would help). Probe at HEAD (3M iters,
+interpreter): the suite row `a[l++] = i; if (l === 10000) { c++;
+a.length = l = 0; }` runs ~138ms, but REMOVING the array entirely
+(the same loop with only `s += i` in the body) still runs ~133ms —
+allocation is not the row's cost. Decomposition (interp, 3M iters):
+bare `s += i` ~35ms (~12ns/iter — one `RunRegBody` + fast-loop head);
+adding a plain `var l++` (a step-path `UpdateLocal`, NOT a register op)
+~78ms (~26ns/iter — one extra step dispatch per iteration); adding the
+`if (l === 10000)` test ~133ms (~44ns/iter — the per-iteration
+conditional dispatches ~3 steps on the step path, because a register
+run is straight-line and cannot contain the branch). The JIT column
+handles all three shapes at ~2-5ns/iter (the branch compiles).
+
+Conclusion: L4's bump arena is not indicated by this row. The
+interpreter gap is step-dispatch coverage of (a) statement-position
+local updates (`l++`/`l--` in a certified body have no register form)
+and (b) per-iteration conditional tests inside certified loops. Both
+are two-engine changes (the JIT must mirror any new `LeafOp`), with
+(b) the larger machinery and the one that moves the 138ms suite row.
+
+### Statement-position local updates fuse into register runs (`UpdateReg`) (measured 2026-09-04)
+
+Slice (a) of the probe above: a statement-position local update
+(`l++;` / `++l;` / `l--;` — an `UpdateLocal` step immediately followed by
+the `SetCompletion` that discards its result) had no register form, so
+every statement after the first in a certified body dispatched on the
+step path. `lower_step` now recognizes the `UpdateLocal` + `SetCompletion`
+adjacency and emits a new `LeafOp::UpdateReg { slot, tdz, op }` — read the
+slot, apply the ToNumeric update (inline f64 ±1 for a Number, the general
+`update_value` otherwise), store back, push nothing — in both engines (the
+JIT `emit_leaf_op` mirror inlines the same f64 add + `UpdateValueSlow`
+fallback; the expression-position `x = l++` / `a[l++] = v` shapes keep the
+deferred `PostInc` operand). `s += i; l++;` now lowers to ONE `RunRegBody`
+of `[LoadCounter, BinLeftReg, StoreReg, UpdateReg]`.
+
+Measurement (fresh builds, tight per-pair alternation in both orders, 3M
+iters, interpreter, 2026-09-04): the `s += i; l++;` body drops ~78-82ms
+-> ~41-45ms (~1.8x, ~26ns -> ~14ns/iter); the branchy body with a trailing
+`l++` drops ~132-134ms -> ~98-103ms (the fused update; the per-iteration
+`if` test stays on the step path — that is slice (b)); the bare-loop floor
+is flat. The `buildString shape` suite row barely moves (~138 -> ~136ms):
+its body has no standalone `l++` (the key increments via `a[l++]`'s
+`PostInc`), and the `if (l === 10000)` test dominates. Gates: clippy
+clean, workspace tests green (new `statement_position_local_updates_
+fuse_into_register_runs` lowering/behavior test and an `installed_jit`
+interpreter-vs-compiled parity test), and the three release sweeps match
+the PARENT at d58caea — language 23721/3 skip, annexB 1086/1086, and
+built-ins crash-for-crash on every targeted group (entries 4/4, subarray
+48/48). NOTE: the built-ins sweep at parent d58caea itself deterministically
+kills sweep workers in the Array/TypedArray fixture groups (~323-328
+"batch process died mid-fixture" crashes; each fixture passes in
+isolation); that regression predates this slice (introduced somewhere
+between 6dae441 and d58caea, likely the memory-bounding fix) and is
+unrelated to it — worth its own investigation.
+
+Next (slice (b)): the per-iteration conditional test inside a certified
+loop stays on the step path — the remaining ~98ms floor of the
+`buildString shape` row.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
