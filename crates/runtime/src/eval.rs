@@ -5347,6 +5347,63 @@ mod tests {
     }
 
     #[test]
+    fn string_agent_builtins_dispatch_identically_via_registered_handlers() {
+        // The String methods that need the agent (ToString on object
+        // receivers, @@match/@@split/@@replace/@@search delegation) used to
+        // dispatch by scanning the module's linear intrinsic-identity chain
+        // on EVERY warm call — each `intrinsics.get` allocates a JsString and
+        // hash-looks-up, measured ~1.18µs/call interp for `s.charCodeAt`.
+        // `string::handler_for` now registers them in the O(1)
+        // per-function-id table at `Intrinsics::define` time. These asserts
+        // pin that the registered handlers behave exactly like the chain
+        // arms they replace (identity, results, delegation, receiver
+        // handling).
+        assert_eq!(
+            run("'abc'.charCodeAt(1) + ':' + '😀'.codePointAt(0) + ':' + 'abc'.at(-1)").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("98:128512:c")))
+        );
+        assert_eq!(
+            run("typeof 'a'.charCodeAt === 'function' && 'a'.charCodeAt === String.prototype.charCodeAt")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        // The delegation arms (a regexp argument consults @@match/etc.) run
+        // through the registered handler unchanged.
+        assert_eq!(
+            run("'a1b2'.match(/\\d/g).join(',') + ':' + 'a1b2'.replace(/\\d/g, 'x') + ':' + 'a,b,c'.split(',').length")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("1,2:axbx:3")))
+        );
+        // Object receivers are ToString'd; boxed String receivers unwrap via
+        // valueOf/toString.
+        assert_eq!(
+            run("String.prototype.toUpperCase.call({ toString: function () { return 'obj'; } }) + ':' + new String('xy').slice(1)")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("OBJ:y")))
+        );
+        // The String iterator and its next are registered too.
+        assert_eq!(
+            run("var it = 'ab'[Symbol.iterator](); it.next().value + it.next().value + it.next().done")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("abtrue")))
+        );
+        // Non-String builtins (the eval host) still dispatch by identity.
+        assert_eq!(
+            run("typeof eval === 'function' && (0, eval)('1 + 2')").unwrap(),
+            Value::Number(3.0)
+        );
+        // A prototype-patched string method is read live and its call goes
+        // to the patch (not the registered intrinsic).
+        assert_eq!(
+            run("var orig = String.prototype.charCodeAt; \
+                 String.prototype.charCodeAt = function () { return 7; }; \
+                 var patched = 'a'.charCodeAt(0); String.prototype.charCodeAt = orig; patched")
+            .unwrap(),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
     fn fast_path_annex_b_block_functions() {
         // Cut 6 first slice (Annex B): a block-level function declaration
         // in a sloppy body certifies — the block binding is a frame slot

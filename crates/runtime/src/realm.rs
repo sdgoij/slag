@@ -242,6 +242,7 @@ impl Intrinsics {
         if let Some(function) = value.as_function()
             && let Some(handler) = crate::builtins::array::handler_for(name)
                 .or_else(|| crate::builtins::regexp::handler_for(name))
+                .or_else(|| crate::builtins::string::handler_for(name))
         {
             crate::function::register_builtin_handler(function.id(), handler);
         }

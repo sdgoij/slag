@@ -4030,6 +4030,42 @@ side defers to L2 (per-site shape/offset ICs once the L1c representation
 lands) and the dispatch side to L5. Tasklist 4.1 closes with this record;
 no code lands. (No gates run — a probe-only turn; the tree is untouched.)
 
+### Agent-dependent builtin handlers register O(1) — String module (tasklist 4.2, measured + landed 2026-09-04)
+
+The L5 intrinsic-call dispatch floor, localized. Probe (200k calls,
+certified rows, both engines): `s.charCodeAt(i)` ~1.18µs/call interp
+(~1.14µs jit) and `a.push(i)` ~1.7µs/call, vs `Math.abs` ~150ns (a plain
+native closure) and a same-work JS leaf ~90ns. Mechanism: the methods
+that need the agent (ToString on object receivers, @@match/@@split/
+@@replace/@@search delegation) are placeholder-closure builtins that must
+dispatch by intrinsic identity; `call_inner` memoizes only the MODULE in
+`agent.builtin_dispatch_cache`, so every warm call re-runs the module's
+LINEAR `dispatch_call` chain — each `intrinsics.get` arm allocates a
+JsString and hash-looks-up the entries table (charCodeAt is arm ~5, so
+~5 allocs+lookups per call). Only `array::handler_for` and
+`regexp::handler_for` registered O(1) per-function-id handlers
+(`BUILTIN_HANDLERS`) today.
+
+Fix: `string::handler_for` — the ~39 non-HTML `dispatch_call` arms mapped
+to their `(agent, this, args)` handlers (String ctor via an adapter) —
+consulted by `Intrinsics::define`, which registers each String method by
+function id at install time, so a warm call is a TLS HashMap get + direct
+handler call in both engines. HTML wrappers and anything unmapped keep
+the existing chain. charCodeAt per 200k (clean, both engines): interp
+~1.18µs -> ~380ns/call (~3.1x), jit ~1.14µs -> ~350ns (~3.3x); the
+residual is the primitive-string chain READ of the method (~250ns — the
+L2 read lever) plus the native call itself. Math.abs and the leaf rows
+are flat. Behavior is identical by construction (registration is the
+chain's own identity match, hoisted); new eval test
+`string_agent_builtins_dispatch_identically_via_registered_handlers`
+exercises the registered arms (identity, @@-delegation, object receivers,
+boxed receivers, the String iterator + next, a live prototype patch).
+Gates: clippy clean, `cargo test --workspace` green (4651/0), three
+release sweeps at baseline — language 23721/3 skip, built-ins 23657/155
+skip, annexB 1086/1086, zero fail/crash/hang. The other agent-dependent
+modules (Number/Boolean/BigInt/Object/...) share the same chain pattern;
+extending them is the same mechanical `handler_for` map.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

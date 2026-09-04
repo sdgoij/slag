@@ -1941,6 +1941,57 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The String members that need the agent, registered by `Intrinsics::define`
+/// so a warm call dispatches in O(1) by function id instead of scanning this
+/// module's linear intrinsic-identity chain (`dispatch_call`) — every
+/// `intrinsics.get` in the chain allocates a JsString and hash-looks-up the
+/// entries table, which is what a warm `s.charCodeAt`-style call paid per
+/// call (measured ~1.18µs/call vs ~150ns for a plain native like `Math.abs`).
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        STRING => Some(|agent, _this, args| string_call(agent, args)),
+        RAW => Some(raw),
+        AT => Some(at),
+        CHAR_AT => Some(char_at),
+        CHAR_CODE_AT => Some(char_code_at),
+        CODE_POINT_AT => Some(code_point_at),
+        CONCAT => Some(concat),
+        ENDS_WITH => Some(ends_with),
+        INCLUDES => Some(includes),
+        INDEX_OF => Some(index_of),
+        IS_WELL_FORMED => Some(is_well_formed),
+        LAST_INDEX_OF => Some(last_index_of),
+        LOCALE_COMPARE => Some(locale_compare),
+        MATCH => Some(match_method),
+        MATCH_ALL => Some(match_all),
+        NORMALIZE => Some(normalize),
+        PAD_END => Some(pad_end),
+        PAD_START => Some(pad_start),
+        REPEAT => Some(repeat),
+        REPLACE => Some(replace),
+        REPLACE_ALL => Some(replace_all),
+        SEARCH => Some(search),
+        SLICE => Some(slice),
+        SPLIT => Some(split),
+        STARTS_WITH => Some(starts_with),
+        SUBSTR => Some(substr),
+        SUBSTRING => Some(substring_method),
+        TO_LOCALE_LOWER_CASE => Some(to_locale_lower_case),
+        TO_LOCALE_UPPER_CASE => Some(to_locale_upper_case),
+        TO_LOWER_CASE => Some(to_lower_case),
+        TO_UPPER_CASE => Some(to_upper_case),
+        TO_STRING => Some(to_string_method),
+        TO_WELL_FORMED => Some(to_well_formed),
+        TRIM => Some(trim),
+        TRIM_END => Some(trim_end),
+        TRIM_START => Some(trim_start),
+        VALUE_OF => Some(value_of),
+        ITERATOR => Some(string_iterator),
+        STRING_ITERATOR_NEXT => Some(string_iterator_next),
+        _ => None,
+    }
+}
+
 /// The String members that need the agent, dispatched by intrinsic identity
 /// from `runtime::function::call`/`construct`.
 pub fn dispatch_call(
