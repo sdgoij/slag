@@ -989,17 +989,22 @@ impl Agent {
                 self.run_job(job)?;
                 continue;
             }
-            let now = Instant::now();
-            if let Some(index) = self
-                .timeout_jobs
-                .iter()
-                .position(|(deadline, _)| *deadline <= now)
-            {
-                let Some((_, job)) = self.timeout_jobs.remove(index) else {
+            // Only read the deadline clock when a timer could be due: the
+            // wasm32-unknown-unknown target has no monotonic clock, and most
+            // drains run no timers at all.
+            if !self.timeout_jobs.is_empty() {
+                let now = Instant::now();
+                if let Some(index) = self
+                    .timeout_jobs
+                    .iter()
+                    .position(|(deadline, _)| *deadline <= now)
+                {
+                    let Some((_, job)) = self.timeout_jobs.remove(index) else {
+                        continue;
+                    };
+                    self.run_job(job)?;
                     continue;
-                };
-                self.run_job(job)?;
-                continue;
+                }
             }
             if let Some(job) = self.generic_jobs.pop_front() {
                 self.run_job(job)?;

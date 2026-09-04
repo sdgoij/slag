@@ -162,11 +162,9 @@ pub(crate) fn default_random() -> f64 {
     static STATE: AtomicU64 = AtomicU64::new(0);
     let mut x = STATE.load(Ordering::Relaxed);
     if x == 0 {
-        x = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x1234_5678_9ABC_DEF0)
-            | 1;
+        // Seed from the wall clock; the `| 1` keeps the state odd so the
+        // xorshift never lands on zero (epoch-0 hosts included).
+        x = crate::time::epoch_nanos() as u64 | 1;
     }
     x ^= x >> 12;
     x ^= x << 25;

@@ -261,10 +261,7 @@ fn utc_time(time: f64) -> f64 {
 
 /// The current time in ms since the epoch.
 pub(crate) fn now_ms() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as f64)
-        .unwrap_or(0.0)
+    crate::time::epoch_ms()
 }
 
 /// The year field of the Date Time String Format: 4 digits for 0-9999,

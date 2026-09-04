@@ -1702,11 +1702,7 @@ fn install_now(temporal: &Handle<JsObject>, realm: &Handle<Realm>) -> Result<(),
 
 /// The current time as epoch nanoseconds (spec 2.3.3 SystemUTCEpochNanoseconds).
 pub fn system_utc_epoch_nanoseconds() -> i128 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0);
-    now.clamp(iso::NS_MIN_INSTANT, iso::NS_MAX_INSTANT)
+    (crate::time::epoch_nanos() as i128).clamp(iso::NS_MIN_INSTANT, iso::NS_MAX_INSTANT)
 }
 
 fn now_dispatch(

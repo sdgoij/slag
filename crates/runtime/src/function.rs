@@ -571,12 +571,7 @@ pub fn shared_function_body(
 /// A stable content hash of a function's source slice, used to disambiguate
 /// cache keys across parses (see `shared_function_body`).
 fn source_hash(source: &JsString) -> usize {
-    let mut hash: usize = 0xcbf2_9ce4_8422_2325;
-    for unit in source.as_slice() {
-        hash ^= *unit as usize;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    fnv1a_units(source.as_slice())
 }
 
 /// `source_hash` over the running context's source slice at `span`, WITHOUT
@@ -589,12 +584,19 @@ fn source_hash_at(agent: &Agent, span: crux::Span) -> Option<usize> {
     if start >= end || end > source.len() {
         return None;
     }
-    let mut hash: usize = 0xcbf2_9ce4_8422_2325;
-    for unit in &source.as_slice()[start..end] {
-        hash ^= *unit as usize;
+    Some(fnv1a_units(&source.as_slice()[start..end]))
+}
+
+/// FNV-1a over UTF-16 code units, narrowed to `usize`. The 64-bit basis and
+/// prime would overflow a 32-bit `usize` (wasm32), so the hash is computed
+/// at `u64` width first; the low bits stay well mixed on 32-bit targets.
+fn fnv1a_units(units: &[u16]) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &unit in units {
+        hash ^= unit as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    Some(hash)
+    hash as usize
 }
 
 type FunctionBodyKey = (usize, usize, usize, usize, usize);
