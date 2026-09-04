@@ -2530,15 +2530,21 @@ impl JsObject {
 
     /// The cached-slot in-place write behind the interpreter's warm-store
     /// fast path (L1a): write `value` into the own writable data property
-    /// `key` at property-vector `slot`, mirror the inline field, and bump
-    /// the generation (an in-place value update is an own-property change —
-    /// the read-side value caches re-validate, slice 11). The caller
-    /// validated the own data property through its store cell; the slot
-    /// checks here are the O(1) backstop against a stale cell. Restricted
-    /// to Ordinary objects (an Array's `length`/index writes are exotic
-    /// intercepts the store cell must never bypass). Returns false when
-    /// `slot` does not hold `key` as a writable data property — the caller
-    /// falls back to the full [[Set]].
+    /// `key` at property-vector `slot` and mirror the inline field. The
+    /// L1c record discipline: an in-place VALUE write does NOT bump the
+    /// generation — an own writable data property shadows the whole chain
+    /// (spec 7.3.3 step 3 consults the chain only when the own property is
+    /// absent), and the interpreter's warm-store caller refreshes the
+    /// read-side value cell with the new value at the unchanged generation
+    /// (the JIT's compiled store already follows this no-bump discipline).
+    /// Structural changes (a define, a delete, an accessor conversion, a map
+    /// transition) still bump through their own paths. The caller validated
+    /// the own data property through its store cell; the slot checks here
+    /// are the O(1) backstop against a stale cell. Restricted to Ordinary
+    /// objects (an Array's `length`/index writes are exotic intercepts the
+    /// store cell must never bypass). Returns false when `slot` does not
+    /// hold `key` as a writable data property — the caller falls back to
+    /// the full [[Set]].
     ///
     /// `pinned_field` carries the caller's store-cell record of the inline
     /// mirror — the (map id, in-object offset) the object's map assigned
@@ -2580,8 +2586,8 @@ impl JsObject {
         // pinned path writes the field at the recorded offset directly: the
         // store cell recorded it under its generation gate, and a map id
         // pins the descriptor layout (maps are immutable after creation).
-        // The id re-check is the backstop for a missed generation bump — a
-        // mismatched or dropped map falls back to the descriptor scan.
+        // The id re-check is the backstop for a stale cell — a mismatched
+        // or dropped map falls back to the descriptor scan.
         match pinned_field {
             Some((map_id, field))
                 if field < INLINE_FIELDS && self.map.get().is_some_and(|m| m.id() == map_id) =>
@@ -2592,7 +2598,6 @@ impl JsObject {
                 let _ = self.map_set(key, value);
             }
         }
-        self.bump_generation();
         true
     }
 

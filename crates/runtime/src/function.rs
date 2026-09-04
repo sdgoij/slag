@@ -2396,6 +2396,14 @@ fn is_revoked_proxy(value: &Value) -> bool {
     )
 }
 
+/// The interned "prototype" atom, resolved once: the member-value-cell
+/// oracle a constructor's `prototype` read is keyed on.
+fn prototype_atom() -> crux::AtomId {
+    use std::sync::OnceLock;
+    static ATOM: OnceLock<crux::AtomId> = OnceLock::new();
+    *ATOM.get_or_init(|| crux::string::intern_utf8("prototype"))
+}
+
 /// OrdinaryCreateFromConstructor (spec 10.2.4): the `this` object of a base
 /// constructor call — newTarget's `prototype` (an object — including a
 /// function value), falling back to %Object.prototype% when it isn't an
@@ -2404,21 +2412,31 @@ pub(crate) fn construct_this_object(
     agent: &mut Agent,
     new_target: &Value,
 ) -> Result<Value, JsError> {
-    // Cut 26: cache the constructor's `prototype` read per function id,
-    // re-validated against the function object's generation counter (Cut
-    // 22's mechanism — a redefine/delete bumps it, so a stale entry misses
-    // and re-reads). The construct bench's `new C(i)` ran the full property
-    // path (own-scan + chain walk) per construct; a proxy or other exotic
-    // newTarget stays on the uncached path (its `prototype` read can run
-    // traps).
+    // The constructor's `prototype` (spec 10.1.1.2 step 1): the common
+    // shape is an own data property, served exactly by the shared (function
+    // id, "prototype") member value cell when warm — the value oracle the
+    // L1c record-discipline work keeps exact (every warm L1a store fronts
+    // it; every structural change bumps past it), so a VALUE write to
+    // `prototype` can never leave a stale cached prototype behind. The Cut
+    // 26 generation-keyed construct cache is gone: a generation stamp
+    // cannot distinguish a value write to `prototype` from an unrelated
+    // write, so a warm store that stopped bumping would serve a stale
+    // value. A cold/evicted cell — or a non-own/exotic `prototype` (a bound
+    // function; a proxy newTarget stays on the uncached path) — resolves
+    // through the full Get and warms the cell only when the resolve landed
+    // on an own data property (the member value cells never hold accessor
+    // or inherited values).
     let prototype = if let ValueKind::Function(function) = new_target.kind() {
-        let generation = function.object.generation();
-        let index = (function.id().wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize)
-            & (crate::ir::CONSTRUCT_PROTO_CELLS - 1);
-        if let Some(cell) = agent.construct_prototypes[index].as_ref()
-            && cell.id == function.id()
-            && cell.generation == generation
-        {
+        // The member value cells are keyed on the JsObject id (the writes
+        // and reads the cell mirrors use `object.id()`), NOT the Function
+        // record id — keying on the wrong id would orphan the construct's
+        // oracle read from every warm-store front.
+        let object = function.object;
+        let id = object.id();
+        let name = prototype_atom();
+        let index = (id as usize ^ name as usize) & (crate::ir::MEMBER_CELLS - 1);
+        let cell = &agent.member_value_cells[index];
+        if cell.id == id && cell.name == name && cell.generation == object.generation() {
             cell.value
         } else {
             let value = crate::context::get_property(
@@ -2427,11 +2445,28 @@ pub(crate) fn construct_this_object(
                 &JsString::from_utf8("prototype"),
                 *new_target,
             )?;
-            agent.construct_prototypes[index] = Some(crate::ir::ConstructPrototypeCell {
-                id: function.id(),
-                generation,
-                value,
-            });
+            let key = crux::PropertyKey::String(name);
+            let own_data = {
+                let props = object.properties.borrow();
+                match object.property_slot(&key) {
+                    Some(slot) => match props.get(slot) {
+                        Some((stored, property)) => {
+                            *stored == key
+                                && matches!(property.kind, crux::object::PropertyKind::Data { .. })
+                        }
+                        None => false,
+                    },
+                    None => false,
+                }
+            };
+            if own_data {
+                agent.member_value_cells[index] = crate::ir::MemberValueCell {
+                    id,
+                    name,
+                    generation: object.generation(),
+                    value,
+                };
+            }
             value
         }
     } else {

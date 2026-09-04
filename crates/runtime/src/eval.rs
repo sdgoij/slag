@@ -2174,6 +2174,81 @@ mod tests {
     }
 
     #[test]
+    fn construct_observes_warm_prototype_value_writes() {
+        // The constructor's `prototype` read is served by the (function id,
+        // "prototype") member value cell when warm (the L1c record-
+        // discipline oracle), so every `new C()` must observe the CURRENT
+        // `C.prototype` — including across repeated WARM in-place stores
+        // (the second `C.prototype = ...` is an L1a warm write that fronts
+        // the value cell without re-resolving the property).
+        let source = "function C() { this.x = 1; }\n\
+                     C.prototype = { a: 1 };\n\
+                     C.prototype = { a: 2 };\n\
+                     var o1 = new C();\n\
+                     C.prototype = { a: 3 };\n\
+                     var o2 = new C();\n\
+                     var o3 = new C();\n\
+                     Object.getPrototypeOf(o1).a + ',' + Object.getPrototypeOf(o2).a + ',' + Object.getPrototypeOf(o3).a;";
+        assert_eq!(
+            run(source).unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("2,3,3")))
+        );
+        // A class constructor (non-writable prototype) and a function whose
+        // prototype is redefined as an accessor stay exact through the full
+        // Get path.
+        assert_eq!(
+            run("class D {}; var d = new D(); Object.getPrototypeOf(d) === D.prototype").unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn chain_reads_observe_warm_value_writes_to_the_found_link() {
+        // The prototype-chain read cache re-reads the found property LIVE
+        // (through the found link's member value cell when warm, else the
+        // recorded vector slot) instead of returning a cached value, so a
+        // chain read must observe a VALUE write to the found prototype
+        // link's own property — including repeated warm in-place stores.
+        // First link and a two-link chain.
+        let source = "function A() {}\n\
+                     A.prototype.m = function () { return 1; };\n\
+                     function B() {}\n\
+                     B.prototype = Object.create(A.prototype);\n\
+                     B.prototype.m = function () { return 10; };\n\
+                     var out = [];\n\
+                     var a = new A();\n\
+                     var b = new B();\n\
+                     for (var i = 0; i < 3; i++) {\n\
+                       out.push(a.m());\n\
+                       out.push(b.m());\n\
+                       if (i === 0) {\n\
+                         A.prototype.m = function () { return 2; };\n\
+                         B.prototype.m = function () { return 20; };\n\
+                       }\n\
+                     }\n\
+                     out.join(',');";
+        assert_eq!(
+            run(source).unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("1,10,2,20,2,20")))
+        );
+        // A two-link chain read whose value lives on the second link
+        // observes a warm write there.
+        assert_eq!(
+            run("function C() {}\n\
+                C.prototype = { base: 5 };\n\
+                function D() {}\n\
+                D.prototype = Object.create(C.prototype);\n\
+                var d = new D();\n\
+                var r = [d.base];\n\
+                C.prototype.base = 9;\n\
+                r.push(d.base);\n\
+                r.join(',');")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("5,9")))
+        );
+    }
+
+    #[test]
     fn in_operator() {
         assert_eq!(
             run("let o = { x: 1 }; 'x' in o").unwrap(),

@@ -3547,6 +3547,109 @@ collapse them once the left-load is recognized. The L1c read/write end
 state (shape-based reads in both engines) remains the plan's structural
 follow-on.
 
+### Direct-operand local compounds do NOT fuse profitably (measured 2026-09-04, REVERTED)
+
+The follow-up to the `BinStoreReg` accumulator-RHS landing: generalize
+the store-step fuse to the RHS-as-direct-operand shapes (`s += 1` =
+`[LoadReg, BinConst, StoreReg]`, `s += t` = `[LoadReg, BinReg,
+StoreReg]`, plus the captured/context forms), collapsing the whole
+read-modify-write into ONE fat right-operand op (frame read + operand
+match + `binary_inline` + write-back). Interleaved A/B,
+round-by-round alternate builds vs the parent (`83b7bea`, the
+`BinStoreReg` landing), 3 rounds: `--jit-bench` arithmetic interp
+11.46/11.61/11.60 (parent) -> 12.27/14.06/12.87 (this) and bare loop
+10.34/10.56/10.80 -> 10.83/11.94/10.95 — a consistent ~1ns/iter
+REGRESSION on both rows, including with the accumulator-right path
+restored to the parent's exact straight-line code. The executor's
+per-op match dispatch is cheap (~1-2ns) and the shared combine work
+small, so a single fat arm (extra discriminant branches + a cold
+`leaf_operand_value` tail hurting the hot arm's layout) does not beat
+the composed minimal ops it replaces — unlike the `BinStoreReg` fuse,
+which removed a whole extra `StoreReg` dispatch from an already-
+work-heavy `BinLeftReg`. REVERTED to `83b7bea`; the direct-right shapes
+stay three ops. Conclusion: the register-run local-compound arc's
+remaining shapes are closed by measurement — the per-op dispatch floor
+dominates, and the row levers move on to the L1c read/write end state.
+
+### L1c record discipline — warm stores stop bumping the generation (measured 2026-09-04)
+
+The write-side half of the L1c program (tasklist 1.1, stones 1-3). The
+plan's M9 correction (spec 7.3.3 step 3 consults the chain only when the
+OWN property is absent) makes the interpreter's per-value-write generation
+bump unnecessary: an own writable data property shadows the whole chain,
+so a warm in-place value write needs no setter/chain invalidation. What
+the bump WAS protecting was the read-side (id, generation)-stamped VALUE
+caches — a warm store that did not bump would leave them serving stale
+values. Before dropping the bump, the three such caches converted to the
+L1c oracle pattern (cache the RESOLUTION, never the value):
+
+- `construct_this_object` reads a constructor's `prototype` through the
+  shared (object id, "prototype") member value cell when warm — every warm
+  store fronts it, every structural change bumps past it. The Cut 26
+  generation-keyed `construct_prototypes` cell is deleted; a VALUE write
+  to `prototype` can no longer leave a stale cached prototype behind. The
+  cell is keyed on the JsObject id (the warm-store front's id), not the
+  Function-record id — keying on the latter orphaned the oracle from every
+  front (the stone-1 stale-construct bug, caught and fixed before this
+  landing).
+- `member_chain_cells` cache the chain RESOLUTION (the walked links + the
+  found property's vector slot), not the value: a chain hit re-reads the
+  found property LIVE (through the found link's member value cell when
+  warm — the resolve warms it — else the recorded slot), so a warm value
+  write to a prototype link's own property is always observed. The cells
+  are now all-scalar; the value trace arm is gone.
+- The for-of fast verdict additionally oracles %ArrayIteratorPrototype%'s
+  own `next` through its member value cell (the resolve warms the cell
+  with the stock value; a warm store to AIP.next fronts it, so the probe's
+  value compare catches a no-bump replacement). %Array.prototype%'s own
+  @@iterator is a SYMBOL-keyed property, so replacing it never takes the
+  warm-store cell and still bumps through the full-[[Set]] path.
+
+`write_data_property_slot` then dropped the bump — the interpreter now
+matches the JIT's compiled-store discipline (in-place value write, front
+the read value cell, generation unchanged) — and `warm_store_put` keeps
+its store cell valid at the unchanged generation (no structural change
+means the recorded slot/map/field still hold; only the read cell is
+refreshed). Every other value write still bumps through its own path
+(`set_key`, defines, deletes, accessor conversion), and the
+constructor-boilerplate cache re-validates the CURRENT prototype object
+id, so a warm `C.prototype = p2` swaps the construct's proto without a
+stale-map hit.
+
+Measurement (2026-09-04): the change removes the bump's Cell RMW in
+`write_data_property_slot` + `warm_store_put`'s write-cell re-record from
+each warm interpreter member write. Row-level A/B (interleaved, 5 rounds,
+full `--jit-bench` of a bump-restored intermediate vs this tree) is
+INCONCLUSIVE: compound assign interp 3.54-3.84ms (bump) vs 3.11-3.21ms
+(no-bump, ~11-17%), but the pure-register `arithmetic` row (no property
+writes at all) moved 15.2ms -> 11.5ms (~24%) across the same two
+binaries, and two byte-identical rebuilds of each variant agree to <1% —
+so the gap is dominated by cross-build code layout, not the write path. A
+within-binary isolation (certified loops f5 `o.x = i; s = i` minus f6
+`s = i`, 2M iters, medians of 5) puts the warm write at ~12.2ns/iter
+(bump) vs ~11.5ns (no-bump) — ~0.5-1ns/write, the mechanism's size, but
+still inside the layout band of the f6 floor (which itself moved ~22%
+between the binaries). Recorded as measured: the no-bump discipline is
+primarily the L1c RECORD change — it retires the last generation-stamped
+value caches so the L1c read/write end-state can drop the (id, generation,
+name) probes entirely — not a row lever by itself, and the row A/B is not
+a clean number on this machine.
+
+Gates: `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` green (new `construct_observes_warm_prototype_
+value_writes` and `chain_reads_observe_warm_value_writes_to_the_found_
+link` eval tests); the three release sweeps at baseline — language
+23721/23724 (3 skip), built-ins 23657/23812 (155 skip), annexB
+1086/1086, all with zero fail/crash/hang. The single language failure
+seen on an earlier intermediate build of this change
+(`expressions/new/spread-sngl-iter.js` Strict: arguments[1] read 5 vs 2,
+batch-state only, passes isolated) does not reproduce on the landing
+tree: full language sweep clean, and the reconstructed 32-fixture batch
+clean over 10 runs + 4 `--gc-stress` runs — consistent with the
+documented heap-state flake class (the `TypedArray/prototype/reduce`
+`callbackfn-arguments` flake has the same strict-unmapped-arguments +
+stale-value signature), not a regression of this change.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

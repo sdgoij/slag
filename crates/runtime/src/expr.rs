@@ -2203,11 +2203,24 @@ fn iterator_chain_has_return(agent: &mut Agent, iterator: &Value) -> Result<bool
     Ok(false)
 }
 
+/// The interned "next" atom, resolved once (the member-value-cell oracle a
+/// for-of fast-verdict probe re-reads AIP's `next` through).
+fn for_of_next_atom() -> crux::AtomId {
+    use std::sync::OnceLock;
+    static ATOM: OnceLock<crux::AtomId> = OnceLock::new();
+    *ATOM.get_or_init(|| crux::string::intern_utf8("next"))
+}
+
 /// The for-of fast-verdict probe (Cut 24): the cached "the Array-iteration
 /// infrastructure is stock" verdict holds while the three shared objects'
 /// generations match — a mutation anywhere (Array.prototype's @@iterator
 /// patched, %ArrayIteratorPrototype%.next replaced, a `return` added to
-/// the chain) bumps one and re-resolves.
+/// the chain) bumps one and re-resolves. A VALUE write to AIP's own `next`
+/// is a warm store that does NOT bump under the L1c record discipline, so
+/// the probe additionally re-reads AIP's `next` through its member value
+/// cell (which the resolve warmed with the stock value and every warm
+/// store fronts): a warm cell holding a different value — or a cold/
+/// evicted cell — fails the probe and re-resolves.
 fn for_of_fast_probe(agent: &mut Agent, array_proto: &crux::object::JsObject) -> bool {
     let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
     let Some(verdict) = agent.for_of_fast_cells[index].as_ref() else {
@@ -2218,8 +2231,16 @@ fn for_of_fast_probe(agent: &mut Agent, array_proto: &crux::object::JsObject) ->
     {
         return false;
     }
-    verdict.aip.1 == verdict.aip_handle.generation()
-        && verdict.object_proto.1 == verdict.object_proto_handle.generation()
+    if verdict.aip.1 != verdict.aip_handle.generation()
+        || verdict.object_proto.1 != verdict.object_proto_handle.generation()
+    {
+        return false;
+    }
+    let vcell = &agent.member_value_cells[verdict.aip_next_vindex];
+    vcell.id == verdict.aip_handle.id()
+        && vcell.name == for_of_next_atom()
+        && vcell.generation == verdict.aip_handle.generation()
+        && vcell.value == verdict.aip_next
 }
 
 /// Resolve and cache the for-of fast verdict (Cut 24): %Array.prototype%'s
@@ -2249,11 +2270,11 @@ fn for_of_fast_resolve(
         return Ok(None);
     };
     let intrinsic_next = realm.intrinsics.get("%ArrayIteratorPrototype.next%");
-    let next_is_stock = match aip.get_own_property_key(&PropertyKey::from_utf8("next"))? {
-        Some(property) => property.value().as_ref() == intrinsic_next.as_ref(),
-        None => false,
+    let next_stock = match aip.get_own_property_key(&PropertyKey::from_utf8("next"))? {
+        Some(property) if property.value().as_ref() == intrinsic_next.as_ref() => property.value(),
+        _ => return Ok(None),
     };
-    if !next_is_stock || iterator_chain_has_return(agent, &aip_value)? {
+    if iterator_chain_has_return(agent, &aip_value)? {
         return Ok(None);
     }
     let Some(object_proto_value) = realm.intrinsics.get("%Object.prototype%") else {
@@ -2263,12 +2284,29 @@ fn for_of_fast_resolve(
         return Ok(None);
     };
     let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+    // Warm the (AIP, "next") member value cell with the stock value and
+    // record it + its slot in the verdict: the probe re-reads AIP's `next`
+    // through that oracle, so a warm no-bump VALUE write to it (which does
+    // not bump AIP's generation) is caught by the probe's value compare.
+    let Some(next_stock) = next_stock else {
+        return Ok(None);
+    };
+    let next_atom = for_of_next_atom();
+    let aip_next_vindex = (aip.id() as usize ^ next_atom as usize) & (crate::ir::MEMBER_CELLS - 1);
+    agent.member_value_cells[aip_next_vindex] = crate::ir::MemberValueCell {
+        id: aip.id(),
+        name: next_atom,
+        generation: aip.generation(),
+        value: next_stock,
+    };
     agent.for_of_fast_cells[index] = Some(crate::agent::ForOfFastVerdict {
         array_proto: (array_proto.id(), array_proto.generation()),
         aip: (aip.id(), aip.generation()),
         aip_handle: aip,
         object_proto: (object_proto.id(), object_proto.generation()),
         object_proto_handle: object_proto,
+        aip_next: next_stock,
+        aip_next_vindex,
     });
     Ok(Some(()))
 }

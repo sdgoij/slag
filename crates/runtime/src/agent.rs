@@ -90,20 +90,30 @@ impl std::hash::Hasher for IdentityHasher {
 /// 24): %Array.prototype%'s own @@iterator is the intrinsic,
 /// %ArrayIteratorPrototype% has the stock `next`, and no `return` on the
 /// AIP → %Object.prototype% chain. The handles are kept so a probe can
-/// re-read the generations; any mutation bumps one and re-resolves the
-/// full check.
+/// re-read the generations; a structural mutation bumps one and re-resolves
+/// the full check. A VALUE write to AIP's own `next` (a warm store that
+/// does not bump under the L1c record discipline) is caught by the probe's
+/// oracle check: `aip_next_vindex` is the (AIP id, "next") member value
+/// cell slot, which resolve warms with the stock `aip_next` and every warm
+/// store to AIP.next fronts, so a probe compares the live cell value to the
+/// recorded stock value.
 pub(crate) struct ForOfFastVerdict {
     pub array_proto: (u64, u32),
     pub aip: (u64, u32),
     pub aip_handle: Handle<crux::object::JsObject>,
     pub object_proto: (u64, u32),
     pub object_proto_handle: Handle<crux::object::JsObject>,
+    /// The stock `next` function the verdict verified on AIP.
+    pub aip_next: Value,
+    /// The member-value-cell slot the probe re-reads AIP's `next` through.
+    pub aip_next_vindex: usize,
 }
 
 impl Trace for ForOfFastVerdict {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.aip_handle.trace(visit);
         self.object_proto_handle.trace(visit);
+        self.aip_next.trace(visit);
     }
 }
 
@@ -155,12 +165,11 @@ pub struct Agent {
     pub(crate) member_write_cells:
         Box<[Option<crate::ir::MemberWriteCell>; crate::ir::MEMBER_CELLS]>,
     /// The prototype-chain read cache (2026-09-01): (receiver id, name,
-    /// receiver generation, the resolved chain value, the walked links' (id,
-    /// generation)) — a hit returns the value with no property-vector borrow
-    /// or chain walk (a method read like `f.apply` / `arr.push` — the
-    /// property lives on a prototype, so the own-property member cells never
-    /// serve it). The VALUE is traced; the link ids are `Copy` handles (no
-    /// trace edge, mirroring `prototype`). Boxed per the Cut 27 lesson.
+    /// receiver generation, the found property's vector slot, the walked
+    /// links' (id, generation)) — a hit re-reads the found property LIVE
+    /// (the chain cell caches the resolution, never the value), so a value
+    /// write to the found link's own property is always observed. All-
+    /// scalar — no trace edges. Boxed per the Cut 27 lesson.
     pub(crate) member_chain_cells:
         Box<[Option<crate::ir::MemberChainCell>; crate::ir::MEMBER_CELLS]>,
     /// The fronting array-element value cache (Cut 35 slice 13): (id, index,
@@ -212,14 +221,6 @@ pub struct Agent {
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
     /// Cut 27 lesson.
     pub(crate) leaf_cache: Box<[Option<(u64, crate::ir::LeafEntry)>; crate::ir::LEAF_CACHE]>,
-    /// The cached `prototype` read of each constructor function (Cut 26):
-    /// `new C()` runs OrdinaryCreateFromConstructor's property read per
-    /// construct; the value is re-validated against the function object's
-    /// generation counter (Cut 22's mechanism — a redefine/delete bumps
-    /// it), so a hot construct loop pays a HashMap probe instead of the
-    /// full property path.
-    pub(crate) construct_prototypes:
-        Box<[Option<crate::ir::ConstructPrototypeCell>; crate::ir::CONSTRUCT_PROTO_CELLS]>,
     /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
     /// construct fast path, and the script/eval paths take one, run, and
     /// return it — a pooled Vm is never handed to a suspended
@@ -700,7 +701,6 @@ impl Agent {
             for_of_fast_cells: std::array::from_fn(|_| None),
             for_of_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
-            construct_prototypes: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             construct_maps: Box::new(std::array::from_fn(|_| None)),
             vm_pool: Vec::new(),
@@ -1084,9 +1084,6 @@ impl Agent {
         for cell in self.member_value_cells.iter() {
             cell.trace(visit);
         }
-        for cell in self.member_chain_cells.iter().flatten() {
-            cell.trace(visit);
-        }
         for cell in self.array_element_value_cells.iter() {
             cell.trace(visit);
         }
@@ -1107,10 +1104,6 @@ impl Agent {
         }
         // The cells below are RefCells: a per-allocation `--gc-stress`
         // collection can fire while one is mutably borrowed, so read them
-        // Cut 26: the cached constructor-prototype reads hold Values.
-        for cell in self.construct_prototypes.iter().flatten() {
-            cell.value.trace(visit);
-        }
         // B5.4: the cached constructor boilerplate maps keep the shapes alive.
         for cell in self.construct_maps.iter().flatten() {
             cell.trace(visit);

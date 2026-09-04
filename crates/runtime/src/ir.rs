@@ -1732,20 +1732,15 @@ const INLINE_FRAME: usize = 8;
 /// indexes the same table.
 pub const MEMBER_CELLS: usize = 16;
 
-/// The cached `prototype` read of a constructor (Cut 26): (function id,
-/// generation, value) — a hot construct loop pays a direct-mapped probe
-/// instead of a HashMap + RefCell borrow per construct.
-pub struct ConstructPrototypeCell {
-    pub id: u64,
-    pub generation: u32,
-    pub value: Value,
-}
-
 /// Part B, B5.4: the cached constructor boilerplate map — (function id,
 /// prototype id, function-object generation) → the final shape the body's
 /// `this.*` stores transition to. Re-validated against the function object's
 /// generation (a `prototype` redefine/delete bumps it) and the prototype's
-/// identity, so a stale entry misses and rebuilds.
+/// identity, so a stale entry misses and rebuilds. (The constructor's
+/// `prototype` VALUE itself is served by the shared (function id,
+/// "prototype") member value cell when warm — the oracle the L1c record-
+/// discipline work keeps value-write-exact — not by a generation-keyed cell,
+/// which a value write to `prototype` would leave stale.)
 pub struct ConstructMapCell {
     pub id: u64,
     pub proto_id: u64,
@@ -1759,8 +1754,8 @@ impl Trace for ConstructMapCell {
     }
 }
 
-/// Direct-mapped slots for [`ConstructPrototypeCell`] (a power of two so
-/// the cache index is a mask).
+/// Direct-mapped slots for the constructor caches ([`ConstructMapCell`] and
+/// the property-pattern pre-warm; a power of two so the index is a mask).
 pub(crate) const CONSTRUCT_PROTO_CELLS: usize = 256;
 /// Direct-mapped slots for the constructor property-pattern cache (Cut 35
 /// slice 30): function id → the `this.*` property names its body assigns.
@@ -1887,30 +1882,29 @@ pub(crate) struct MemberWriteCell {
     pub field: u8,
 }
 
-/// The prototype-chain read cache (2026-09-01): the resolved value of
-/// `(receiver id, name)` found on the prototype chain, re-validated by
+/// The prototype-chain read cache (2026-09-01): the RESOLUTION of
+/// `(receiver id, name)` found on the prototype chain — re-validated by
 /// the receiver's generation (an own property appearing on the receiver
 /// bumps it) and each cached link's (id, generation) (a link's own
 /// mutation or a proto replacement bumps a generation). Deeper links
 /// than the found one cannot shadow its own data property, so the probe
 /// never walks past the cached links. `links[0]` is the receiver's
 /// prototype; `link_count` is 1 when the property is on the first link,
-/// 2 when on the second. `#[repr(C)]` all-scalar for a future compiled
-/// probe (`offset_of!`).
+/// 2 when on the second. The VALUE is deliberately NOT cached: a chain
+/// hit re-reads the found property live (through the found link's member
+/// value cell when warm, else the recorded vector `slot`), so a value
+/// write to the found link's own property — a warm store that must not
+/// bump the link's generation under the L1c record discipline — is always
+/// observed (the slot is stable while the link's generation is unchanged,
+/// which the walk validates). All-scalar; no trace edges.
 #[derive(Clone)]
 pub struct MemberChainCell {
     pub id: u64,
     pub name: crux::AtomId,
     pub generation: u32,
-    pub value: Value,
+    pub slot: usize,
     pub link_count: u8,
     pub links: [(u64, u32); 2],
-}
-
-impl Trace for MemberChainCell {
-    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.value.trace(visit);
-    }
 }
 
 /// Part B, B5.2: map-keyed member cache entry — maps (map_id, name) to a
@@ -3535,11 +3529,16 @@ impl Vm {
     /// The cached prototype-chain member read: returns the value when the
     /// receiver's id/name/generation and every cached link's (id,
     /// generation) still match — an own property appearing on the receiver,
-    /// a link's own mutation (a new value, a define, a delete), or a proto
-    /// replacement anywhere above the found link bumps a generation and
-    /// misses. Links below the found one cannot shadow its own data
-    /// property, so the probe never walks past the cached links. `None`
-    /// falls back to the full Get (which then re-resolves).
+    /// a link's own structural mutation (a define, a delete, a proto
+    /// replacement) bumps a generation and misses. Links below the found
+    /// one cannot shadow its own data property, so the probe never walks
+    /// past the cached links. The resolved value is re-read LIVE from the
+    /// found link (its member value cell when warm, else the recorded
+    /// vector slot): the chain cell caches the resolution, not the value,
+    /// so a VALUE write to the found link's own property — a warm store
+    /// that must not bump the link's generation under the L1c record
+    /// discipline — is always observed. `None` falls back to the full Get
+    /// (which then re-resolves).
     fn member_chain_get(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
         let object = Self::cell_object(object)?;
         let index = Self::member_chain_index(object.id(), name);
@@ -3548,26 +3547,55 @@ impl Vm {
             return None;
         }
         let mut link = object.get_prototype_of().ok().flatten();
+        let mut found: Option<Handle<crux::object::JsObject>> = None;
         for (expected_id, expected_gen) in cell.links.iter().take(cell.link_count as usize) {
             let current = link?;
             if current.id() != *expected_id || current.generation() != *expected_gen {
                 return None;
             }
+            found = Some(current);
             link = current.get_prototype_of().ok().flatten();
         }
-        Some(cell.value)
+        let found_link = found?;
+        // The live re-read: the found link's member value cell, when warm,
+        // IS the current value (every warm L1a store fronts it, every
+        // structural change bumps past it). Otherwise read the recorded
+        // vector slot directly — the slot is stable while the link's
+        // generation is unchanged, which the walk just validated.
+        let vindex = Self::member_cell_index(found_link.id(), name);
+        let vcell = &agent.member_value_cells[vindex];
+        if vcell.id == found_link.id()
+            && vcell.name == name
+            && vcell.generation == found_link.generation()
+        {
+            return Some(vcell.value);
+        }
+        let key = PropertyKey::String(name);
+        let props = found_link.properties.borrow();
+        let (stored, property) = props.get(cell.slot)?;
+        if *stored != key {
+            return None;
+        }
+        match &property.kind {
+            crux::object::PropertyKind::Data { value, .. } => Some(*value),
+            // The found property converted to an accessor: the structural
+            // change bumped the link's generation, so the walk above would
+            // have missed; this is the exact fallback for a missed bump.
+            _ => None,
+        }
     }
 
-    /// Record a prototype-chain read for `(object, name)` resolved to
-    /// `value` by the full Get: walk up to two plain prototype links, cache
-    /// (receiver generation, the links' (id, generation) up to the link
-    /// holding the own DATA property) so a later read re-validates instead
-    /// of re-walking. An own property on the RECEIVER (a data own prop
-    /// would have hit `member_cell_get`; an accessor must not cache the
-    /// getter's value), an accessor on a link (the [[Get]] stops there),
-    /// a non-plain link, a property deeper than two links, or a miss
-    /// records nothing.
-    fn resolve_chain_cell(agent: &mut Agent, object: &Value, name: crux::AtomId, value: Value) {
+    /// Record a prototype-chain read for `(object, name)` resolved by the
+    /// full Get: walk up to two plain prototype links, cache (receiver
+    /// generation, the links' (id, generation) up to the link holding the
+    /// own DATA property, its vector slot) so a later read re-validates
+    /// instead of re-walking, and warm the found link's member value cell
+    /// (the oracle chain hits re-read through). An own property on the
+    /// RECEIVER (a data own prop would have hit `member_cell_get`; an
+    /// accessor must not cache the getter's value), an accessor on a link
+    /// (the [[Get]] stops there), a non-plain link, a property deeper than
+    /// two links, or a miss records nothing.
+    fn resolve_chain_cell(agent: &mut Agent, object: &Value, name: crux::AtomId) {
         let Some(object) = Self::cell_object(object) else {
             return;
         };
@@ -3598,16 +3626,31 @@ impl Vm {
                 {
                     // The property found on this link: a data prop caches,
                     // an accessor does not (the read runs the getter).
-                    Some((stored, crux::object::PropertyKind::Data { .. })) if *stored == key => {
+                    Some((stored, crux::object::PropertyKind::Data { value, .. }))
+                        if *stored == key =>
+                    {
+                        let value = *value;
                         let index = Self::member_chain_index(object.id(), name);
                         agent.member_chain_cells[index] = Some(MemberChainCell {
                             id: object.id(),
                             name,
                             generation: object.generation(),
-                            value,
+                            slot,
                             link_count: count as u8,
                             links,
                         });
+                        // Warm the found link's (link, name) member value
+                        // cell: a chain hit re-reads the found property
+                        // through that oracle (see `member_chain_get`), so
+                        // it must be warm for the next hit to skip the
+                        // vector read.
+                        let vindex = Self::member_cell_index(current.id(), name);
+                        agent.member_value_cells[vindex] = MemberValueCell {
+                            id: current.id(),
+                            name,
+                            generation: current.generation(),
+                            value,
+                        };
                         return;
                     }
                     Some(_) => return,
@@ -3913,11 +3956,14 @@ impl Vm {
     /// descriptor machinery. Sound because an own writable data property
     /// shadows the whole chain (spec 7.3.3 step 3 consults the chain only
     /// when the own property is absent), so no setter tracking is needed;
-    /// the slice-11 discipline (every own-property mutation bumps the
-    /// generation, including in-place `set_key`) invalidates on redefinition/
-    /// delete/accessor-conversion. The caller (put_value) has already gated
-    /// receiver == base on an Object/Function with a string key. Returns
-    /// true when the store happened; false falls back to the full [[Set]].
+    /// a structural change (a redefine, a delete, an accessor conversion)
+    /// bumps the generation and misses the cell. VALUE writes take the L1c
+    /// no-bump discipline (see `write_data_property_slot`): the read-side
+    /// value cell is refreshed here, so the value caches stay exact without
+    /// invalidating every other (id, generation)-keyed entry on a value
+    /// write. The caller (put_value) has already gated receiver == base on
+    /// an Object/Function with a string key. Returns true when the store
+    /// happened; false falls back to the full [[Set]].
     pub(crate) fn warm_store_put(
         agent: &mut Agent,
         base: &Value,
@@ -3949,21 +3995,19 @@ impl Vm {
         ) {
             return false;
         }
-        // The in-place write bumped the generation (the read-side value
-        // caches re-validate); re-record the cell at the new generation and
-        // front the fresh value so the next read — and the compiled
-        // `GetMemberName` probe — hits without a property-vector access. A
-        // value write changes no shape, so the pinned mirror survives the
-        // re-record unchanged.
+        // The L1c record discipline: an in-place VALUE write does not bump
+        // the generation (`write_data_property_slot` mirrors the field and
+        // writes the vector slot in place) — an own writable data property
+        // shadows the whole chain (spec 7.3.3), so no setter/chain
+        // tracking is needed, and the store cell stays valid at the
+        // UNCHANGED generation (no structural change happened, so its
+        // recorded slot/map/field still hold). Only the read-side value
+        // cell needs the refresh: front the fresh value at the current
+        // generation so the next read — and the compiled `GetMemberName`
+        // probe — hits without a property-vector access. Structural
+        // changes (define/delete/accessor conversion/map transition) still
+        // bump through their own paths.
         let generation = object.generation();
-        agent.member_write_cells[index] = Some(MemberWriteCell {
-            id: object.id(),
-            name,
-            generation,
-            slot: cell.slot,
-            map_id: cell.map_id,
-            field: cell.field,
-        });
         agent.member_value_cells[index] = MemberValueCell {
             id: object.id(),
             name,
@@ -8080,7 +8124,7 @@ impl Vm {
                 let value =
                     crate::context::get_property(agent, &object, &crux::lookup(name), object)?;
                 Self::resolve_member_cell(agent, &object, name);
-                Self::resolve_chain_cell(agent, &object, name, value);
+                Self::resolve_chain_cell(agent, &object, name);
                 Ok(value)
             }
         }
