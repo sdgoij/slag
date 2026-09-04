@@ -3505,6 +3505,48 @@ if) byte-identical under the JIT and the interpreter, and the three
 release sweeps at baseline (language 23721/3 skip, annexB 1086/1086,
 built-ins 23657/155 skip, zero fail/crash/hang).
 
+### Statement-position slot compounds fuse the bin+store tail (`BinStoreReg`) (measured 2026-09-04)
+
+A statement-position local compound whose RHS resolved into the
+accumulator — `s += <rhs>` / `s = s <op> <rhs>` — lowered to a
+`BinLeftReg` + `StoreReg` pair on the register executor: the binary read
+the slot (left) and combined with the accumulator, then the immediately-
+following store wrote the result back into the SAME slot (the `n += i * 2`
+bench tail). The store directly consumed the binary's accumulator result
+(nothing sits between them), so the register lowering now collapses the
+pair into ONE `LeafOp::BinStoreReg { op, slot }` — read the slot, combine
+with the accumulator (`binary_inline`), write the result back — at the
+`StoreLocal`/`FusedStoreLocal` step, matching a same-slot `BinLeftReg`
+tail with a `tdz=false` store (`fused_tail` in `lower_step`; the slot
+value is copied before the combine, so a coercion side effect that writes
+the slot cannot change the left operand — the same late-read discipline as
+`BinLeftReg`). A store into a DIFFERENT slot (`x = s + i`) keeps the pair.
+Both engines: the JIT `emit_leaf_op` mirror is the `BinLeftReg` emit plus
+`store_slot`. This is the register-executor dependent-add-latency lever
+(the 2026-09-03 L1c-1 attribution note): each `+=` loses one of its
+dispatches.
+
+Measurement (interleaved A/B, fresh release builds, current vs parent
+856ba28, 3+ runs each, tight): `--jit-bench` arithmetic interp ~13.2-13.5ms
+(parent, matches the recorded baseline) -> ~11.3-11.45ms (this) (~15%),
+JIT column flat (~2.4-2.5ms both); compound assign interp ~3.68-3.73 ->
+~3.22-3.33ms (~12% — the row's `s += o.x` tail fuses); other rows flat
+within noise. Gates: clippy clean, `cargo test --workspace` green (new
+`slot_compounds_fuse_the_bin_store_tail_into_one_op` lowering test,
+`fused_slot_compounds_match_the_pair_semantics`, and
+`installed_jit_fused_slot_compounds_match_the_interpreter` parity over the
+number and string-concat paths; `loop_counter_operands_lower_to_register_runs`
+updated to the fused op), and the three release sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang).
+
+Next: the RHS-not-in-acc compound shapes (`n += 1` = `LoadReg` +
+`BinConst`/`BinImm` + `StoreReg`; `s += t` = `LoadReg` + `BinReg` +
+`StoreReg`) still pay three dispatches — the same store-step fuse can
+collapse them once the left-load is recognized. The L1c read/write end
+state (shape-based reads in both engines) remains the plan's structural
+follow-on.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

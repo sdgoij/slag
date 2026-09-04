@@ -1281,6 +1281,15 @@ pub enum LeafOp {
     /// body's own frame slots and the accepted shapes write no slot between
     /// the load and the combine (the lowering rejects `tdz=true` slots).
     BinLeftReg { op: BinaryOp, slot: usize },
+    /// acc = frame[slot] op acc; frame[slot] = acc — the fused tail of a
+    /// statement-position local compound (`s op= <rhs>` / `s = s op <rhs>`
+    /// whose RHS resolved into the accumulator): the `[BinLeftReg,
+    /// StoreReg]` pair in one dispatch. The slot value is copied before the
+    /// combine (the same late-read discipline as `BinLeftReg` — a coercion
+    /// side effect that writes the slot cannot change the left operand),
+    /// and the write-back skips the `tdz` check (the lowering only fuses
+    /// the `tdz=false` slot shape, where the pair's `StoreReg` had none).
+    BinStoreReg { op: BinaryOp, slot: usize },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
 }
@@ -9284,6 +9293,17 @@ impl Vm {
                 LeafOp::BinLeftReg { op, slot } => {
                     let left = *self.frame_get(*slot);
                     self.acc = Self::binary_inline(agent, *op, &left, &self.acc)?;
+                }
+                LeafOp::BinStoreReg { op, slot } => {
+                    // The fused tail of a slot-left binary stored back into
+                    // the SAME slot (a statement-position `s op= <rhs>`
+                    // whose RHS is in the accumulator): copy the slot,
+                    // combine with the accumulator, write the result back —
+                    // the `[BinLeftReg, StoreReg]` pair in one dispatch.
+                    let left = *self.frame_get(*slot);
+                    let result = Self::binary_inline(agent, *op, &left, &self.acc)?;
+                    self.acc = result;
+                    *self.frame_get_mut(*slot) = result;
                 }
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc));
@@ -18763,10 +18783,38 @@ fn lower_step(
         }
         Step::StoreLocal { slot } | Step::FusedStoreLocal { slot } => {
             let value = stack.pop()?;
+            let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
+            // Fuse a slot compound's tail: `s op= <rhs>` (or `s = s op
+            // <rhs>`) whose RHS resolved into the accumulator lowers to
+            // `BinLeftReg` + `StoreReg` back into the SAME slot. The store
+            // directly consumes the binary's accumulator result (nothing
+            // sits between them), so the pair collapses into one op — the
+            // RMW loses a dispatch. Only the `tdz=false` shape fuses: a
+            // `BinLeftReg` left is late-read (the lowering already rejected
+            // a TDZ slot there), and a `tdz=true` store must keep its
+            // uninitialized check. `fused_tail` is `Some(op)` when the
+            // store's accumulator value is the direct result of a
+            // `BinLeftReg` on the SAME slot — the extract-and-compare ends
+            // the `ops.last()` borrow before the in-place rewrite.
+            let fused_tail = if !tdz && matches!(value, RegOperand::Acc) {
+                match ops.last() {
+                    Some(LeafOp::BinLeftReg {
+                        op,
+                        slot: left_slot,
+                    }) if *left_slot == *slot => Some(*op),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(op) = fused_tail {
+                ops.pop();
+                ops.push(LeafOp::BinStoreReg { op, slot: *slot });
+                return Some(());
+            }
             if !load_operand(ops, value) {
                 return None;
             }
-            let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
             ops.push(LeafOp::StoreReg { slot: *slot, tdz });
         }
         Step::InitLocal { slot } => {
@@ -19314,6 +19362,7 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
         // both identically, so only the stack must be clean.
         Some(LeafOp::ReturnAcc)
         | Some(LeafOp::StoreReg { .. })
+        | Some(LeafOp::BinStoreReg { .. })
         | Some(LeafOp::StoreMemberName { .. })
         | Some(LeafOp::StoreMemberComputed { .. })
         | Some(LeafOp::StoreMemberComputedLocal { .. })

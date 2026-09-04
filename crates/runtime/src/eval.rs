@@ -3059,16 +3059,22 @@ mod tests {
             "the run must load the counter operand"
         );
         assert!(
-            var_chain[0]
-                .iter()
-                .any(|op| matches!(op, crate::ir::LeafOp::BinLeftReg { .. })),
-            "the run must combine the frame slot with the counter"
+            var_chain[0].iter().any(|op| {
+                matches!(
+                    op,
+                    crate::ir::LeafOp::BinStoreReg {
+                        op: syntax::ast::BinaryOp::Add,
+                        ..
+                    }
+                )
+            }),
+            "the run must fuse the slot compound into one bin+store op"
         );
         assert!(
-            var_chain[0]
+            !var_chain[0]
                 .iter()
                 .any(|op| matches!(op, crate::ir::LeafOp::StoreReg { .. })),
-            "the run must write the accumulator back"
+            "the fused compound must not also carry a separate store"
         );
         // `o.x = i`: the counter is the member store's value operand (the
         // store resolves it from the field after the object load).
@@ -3089,6 +3095,94 @@ mod tests {
                 )
             }),
             "the run must store the counter value onto the member"
+        );
+    }
+
+    #[test]
+    fn slot_compounds_fuse_the_bin_store_tail_into_one_op() {
+        // A statement-position local compound whose RHS resolved into the
+        // accumulator (`s += i`, `s = s + i`) lowers to `BinLeftReg` +
+        // `StoreReg` back into the SAME slot; the store directly consumes
+        // the binary's result, so the tail fuses into one `BinStoreReg` op.
+        // A store into a DIFFERENT slot (`x = s + i`) keeps the pair.
+        fn register_runs(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> Vec<Box<[crate::ir::LeafOp]>> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // `s = s + i` — the same slot on both sides, RHS in the accumulator.
+        let self_assign = register_runs(
+            &mut agent,
+            "function g(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + i; } return s; }",
+            "g",
+        );
+        assert_eq!(self_assign.len(), 1, "the s = s + i body must lower");
+        assert!(
+            self_assign[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::BinStoreReg { .. })),
+            "the same-slot self assign must fuse into one bin+store op"
+        );
+        assert!(
+            !self_assign[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::BinLeftReg { .. })),
+            "the fused run must not carry the unfused pair"
+        );
+        // `x = s + i` — the store targets a different slot than the
+        // binary's left, so the pair is not a slot RMW and stays as-is.
+        let cross = register_runs(
+            &mut agent,
+            "function h(n) { var s = 0; var x = 0; for (var i = 0; i < n; i++) { x = s + i; } return x + s; }",
+            "h",
+        );
+        assert_eq!(cross.len(), 1, "the x = s + i body must lower");
+        assert!(
+            cross[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::BinLeftReg { .. })),
+            "a cross-slot store keeps the BinLeftReg"
+        );
+    }
+
+    #[test]
+    fn fused_slot_compounds_match_the_pair_semantics() {
+        // The fused tail must agree with the unfused pair over binary ops
+        // and the string-concat slow path (the exact apply_binary
+        // semantics).
+        assert_eq!(
+            run("function g(n) { var s = 0; for (var i = 0; i < n; i++) { s += i; } return s; } g(100);")
+                .unwrap(),
+            Value::Number(4950.0)
+        );
+        assert_eq!(
+            run("function g(n) { var s = 1; for (var i = 0; i < n; i++) { s *= 2; } return s; } g(10);")
+                .unwrap(),
+            Value::Number(1024.0)
+        );
+        assert_eq!(
+            run("function g(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + i; } return s; } g(100);")
+                .unwrap(),
+            Value::Number(4950.0)
+        );
+        // A string accumulator through the fused op (`s += i` with a string
+        // `s` takes the concat slow path inside the single op).
+        assert_eq!(
+            run("function g(n) { var s = ''; for (var i = 0; i < n; i++) { s += i; } return s; } g(4);")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("0123")))
         );
     }
 

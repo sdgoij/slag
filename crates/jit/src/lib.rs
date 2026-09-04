@@ -1651,6 +1651,31 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_fused_slot_compounds_match_the_interpreter() {
+        // A statement-position slot compound whose RHS resolved into the
+        // accumulator (`s += i`) now fuses the `[BinLeftReg, StoreReg]` tail
+        // into one `BinStoreReg` op, so the compiled body carries it: the
+        // machine-code mirror (combine + store back) must agree with the
+        // interpreter over the inline number path and the string-concat slow
+        // path inside the single op.
+        let source = "function f(n) { var s = 0; for (var i = 0; i < n; i++) { s += i; } return s; }\n\
+                     function g(n) { var s = ''; for (var i = 0; i < n; i++) { s += i; } return s.length; }\n\
+                     function h(n) { var s = 1; for (var i = 0; i < n; i++) { s = s + i; } return s; }\n\
+                     f(100) + g(100) + h(3);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled body must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_strict_eq_conditions_match_the_interpreter() {
         // The fused `JumpIfEqImm`/`JumpIfNeqImm` step (an `if (x === N)` /
         // `x !== N` test in one dispatch) must agree with the interpreter

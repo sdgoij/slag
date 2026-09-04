@@ -5894,6 +5894,16 @@ impl<'a> Lowerer<'a> {
                 let res = self.emit_binary(*op, left, right)?;
                 self.builder.def_var(self.acc_var, res);
             }
+            LeafOp::BinStoreReg { op, slot } => {
+                // The fused tail of a slot-left binary stored back into the
+                // SAME slot (`[BinLeftReg, StoreReg]`): combine the slot
+                // with the accumulator and write the result back, one op.
+                let left = self.load_slot(*slot);
+                let right = self.builder.use_var(self.acc_var);
+                let res = self.emit_binary(*op, left, right)?;
+                self.builder.def_var(self.acc_var, res);
+                self.store_slot(*slot, res);
+            }
             LeafOp::StoreReg { slot, tdz } => {
                 if *tdz {
                     let current = self.load_slot(*slot);
