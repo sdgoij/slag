@@ -1660,6 +1660,34 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_shape_store_serves_cycling_same_shape_objects() {
+        // Slice 2: the compiled plain member store falls back to a shape
+        // gate when the (id, name) value cell misses — probe the shared
+        // (map id, name) map cells and route a map-described key to the
+        // narrow `set_member_slot` write. A 64-object cycling store loop
+        // thrashes the 16-entry value cells every pass, so every store would
+        // otherwise call the full assign helper; the shape gate must land
+        // every value on its own instance (the writable check stays in the
+        // helper).
+        let source = "function C(v) { this.a = v; this.b = v + 1; }\n\
+                     var os = [];\n\
+                     for (var i = 0; i < 64; i++) { os.push(new C(i)); }\n\
+                     for (var r = 0; r < 200; r++) { for (var j = 0; j < 64; j++) { os[j].b = r * 2; } }\n\
+                     var s = 0;\n\
+                     for (var j = 0; j < 64; j++) { s += os[j].b; }\n\
+                     s;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(value, interp, "the shape store must match the interpreter");
+        assert_eq!(value.as_number(), Some(64.0 * 398.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_statement_local_updates_match_the_interpreter() {
         // Statement-position local updates (`l++;`, `++l;`, `l--;`) now fuse
         // into the loop body's register run (`LeafOp::UpdateReg`), so the

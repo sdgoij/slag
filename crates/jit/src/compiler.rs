@@ -1457,6 +1457,242 @@ impl<'a> Lowerer<'a> {
         Ok(self.builder.use_var(value_var))
     }
 
+    /// The member-store shape gate (Slice 2), shared by the compiled member-
+    /// store paths: probe the shared `(map id, name)` map cells — recorded by
+    /// the interpreter's own-data reads and every fresh store — and route a
+    /// hit to the narrow `set_member_slot` write. A hit pins "the receiver's
+    /// CURRENT map describes `name`" (a map id pins the descriptor layout; a
+    /// structural change — delete of a mapped key, accessor conversion —
+    /// drops or transitions the object off the map), so the property is an
+    /// own data property whose writability `set_member_slot` checks
+    /// authoritatively (a hit on a non-writable property or a presize hole
+    /// falls to the helper's full [[Set]] — correct, just slower). The read
+    /// map cells are the reliable shape record for stores: the interpreter's
+    /// direct own-data fallback never calls the full [[Set]] that records the
+    /// L2 shape WRITE cells, so those stay cold on pure store loops. The
+    /// current block is the probe entry; a hit jumps to `hit`, any failure
+    /// (no map — dictionary mode, an unrecorded shape) to `miss`. Every probe
+    /// block is terminated here; the current block is unspecified on return.
+    fn emit_shape_store_probe(
+        &mut self,
+        object: ClifValue,
+        name_imm: ClifValue,
+        hit: Block,
+        miss: Block,
+    ) -> Result<(), Unsupported> {
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let map_handle = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
+        );
+        let has_map = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, map_handle, 0);
+        let shape_map = self.builder.create_block();
+        self.builder.ins().brif(has_map, shape_map, &[], miss, &[]);
+        self.builder.switch_to_block(shape_map);
+        let map_data = self
+            .builder
+            .ins()
+            .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let map_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            map_data,
+            Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+        );
+        let ctx = self.vm();
+        let cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_map_cells) as i32),
+        );
+        let cell_slot = self.builder.ins().bxor(map_id, name_imm);
+        let cell_slot = self
+            .builder
+            .ins()
+            .band_imm_u(cell_slot, (MEMBER_CELLS - 1) as i64);
+        let index_bytes = self
+            .builder
+            .ins()
+            .imul_imm_s(cell_slot, std::mem::size_of::<MemberMapCell>() as i64);
+        let cell = self.builder.ins().iadd(cells, index_bytes);
+        let cell_map_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, map_id) as i32),
+        );
+        let cell_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, name) as i32),
+        );
+        let map_ok = self.builder.ins().icmp(IntCC::Equal, cell_map_id, map_id);
+        let cell_name = self.builder.ins().uextend(types::I64, cell_name);
+        let cell_name_ok = self.builder.ins().icmp(IntCC::Equal, cell_name, name_imm);
+        let shape_ok = self.builder.ins().band(map_ok, cell_name_ok);
+        self.builder.ins().brif(shape_ok, hit, &[], miss, &[]);
+        Ok(())
+    }
+
+    /// The compiled plain member-name store (Slice 2), shared by the register
+    /// body's `StoreMemberNameLocal` (frame-slot object) and `StoreMemberName`
+    /// (accumulator object): an ordinary-object receiver whose member value
+    /// cell validates (an own data property at the current generation — the
+    /// run's preceding read, or a prior store, warmed it) writes through
+    /// `set_member_slot` (no generation bump, no [[Set]] walk). On a
+    /// value-cell miss a shape gate (see `emit_shape_store_probe`) routes a
+    /// map-described key — any object whose CURRENT map pins it, so no
+    /// per-object identity or generation — to the same narrow write, keeping
+    /// a store loop whose object working set exceeds the 16-entry value cells
+    /// O(1) with no full-helper round trip. Every other receiver falls to the
+    /// full `SetMemberName` helper (nullish check + assign machinery), which
+    /// is also the authoritative fallback when `set_member_slot`'s own
+    /// writable check fails (a read-warmed cell never checked it, and a
+    /// map-cell hit pins only data-ness, not writability). The store's result
+    /// is discarded by the run truncate; the merge block is sealed and
+    /// current on return.
+    fn emit_validated_member_store(
+        &mut self,
+        object: ClifValue,
+        value: ClifValue,
+        name: crux::AtomId,
+    ) -> Result<(), Unsupported> {
+        let name_imm = self.builder.ins().iconst(types::I64, name as i64);
+        let ctx = self.vm();
+        // The object-kind gate (mirrors the read probe): the payload must
+        // point at an object before the cell probe dereferences it.
+        let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
+        let is_obj = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+        let tag = self.builder.ins().ushr_imm_u(object, 44);
+        let tag = self.builder.ins().band_imm_u(tag, 0xF);
+        let tag_obj = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
+        let obj_ok = self.builder.ins().band(is_obj, tag_obj);
+        let validate = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let fast = self.builder.create_block();
+        let shape = self.builder.create_block();
+        self.builder.ins().brif(obj_ok, validate, &[], slow, &[]);
+        // The value-cell probe (mirrors `GetMemberName`/the step store): the
+        // live id/generation must match the cell the run's read or a prior
+        // store warmed on an own data-property write.
+        self.builder.switch_to_block(validate);
+        let cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+        );
+        let ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let ptr = self.builder.ins().ishl_imm_u(ptr, 4);
+        let ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let live_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let live_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let cell_slot = self.builder.ins().bxor(live_id, name_imm);
+        let cell_slot = self
+            .builder
+            .ins()
+            .band_imm_u(cell_slot, (MEMBER_CELLS - 1) as i64);
+        let index_bytes = self
+            .builder
+            .ins()
+            .imul_imm_s(cell_slot, std::mem::size_of::<MemberValueCell>() as i64);
+        let cell = self.builder.ins().iadd(cells, index_bytes);
+        let cell_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+        );
+        let cell_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+        );
+        let cell_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+        );
+        let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
+        let name_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, cell_name, name as i64);
+        let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
+        let id_name_ok = self.builder.ins().band(id_ok, name_ok);
+        let ok = self.builder.ins().band(id_name_ok, gen_ok);
+        self.builder.ins().brif(ok, fast, &[], shape, &[]);
+        // The shape store: on a value-cell miss (a working set larger than
+        // the cell), a map-described key is gated by the shared (map id,
+        // name) cells and routed to the same narrow write;
+        // `set_member_slot`'s own writable check stays the authoritative
+        // backstop.
+        self.builder.switch_to_block(shape);
+        self.emit_shape_store_probe(object, name_imm, fast, slow)?;
+        // The fast path: the helper writes the property vector in place and
+        // refreshes the cell (no generation bump). The store's result is
+        // discarded by the run truncate.
+        self.builder.switch_to_block(fast);
+        let _stored = self.call_slow(
+            self.sig_set_name,
+            Helper::SetMemberSlot,
+            &[object, name_imm, value],
+        )?;
+        self.builder.ins().jump(merge, &[]);
+        // The slow path: the full member store helper (nullish check +
+        // assign machinery).
+        self.builder.switch_to_block(slow);
+        let _stored = self.call_slow(
+            self.sig_set_name,
+            Helper::SetMemberName,
+            &[object, name_imm, value],
+        )?;
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(())
+    }
+
     /// The machine typed-array length read (gap-close M6), shared by every
     /// compiled `GetMemberName` site whose name is `length` (the step and
     /// register paths both lower through [`Self::emit_member_cell_read`]):
@@ -3538,7 +3774,30 @@ impl<'a> Lowerer<'a> {
                 let id_name_ok = self.builder.ins().band(id_ok, name_ok);
                 let ok = self.builder.ins().band(id_name_ok, gen_ok);
                 let fast = self.builder.create_block();
-                self.builder.ins().brif(ok, fast, &[], slow, &[]);
+                if compound {
+                    self.builder.ins().brif(ok, fast, &[], slow, &[]);
+                } else {
+                    // Slice 2: on a value-cell miss a map-described key
+                    // routes through the shared (map id, name) cells to the
+                    // narrow `set_member_slot` write (the helper's own
+                    // writable check is the backstop). Every other shape
+                    // falls to the full assign helper below. Compounds keep
+                    // the old miss-to-helper behavior (their cached old value
+                    // came from the value-cell-validated read).
+                    let shape = self.builder.create_block();
+                    let shape_hit = self.builder.create_block();
+                    self.builder.ins().brif(ok, fast, &[], shape, &[]);
+                    self.builder.switch_to_block(shape);
+                    self.emit_shape_store_probe(object, name_imm, shape_hit, slow)?;
+                    self.builder.switch_to_block(shape_hit);
+                    let stored = self.call_slow(
+                        self.sig_set_name,
+                        Helper::SetMemberSlot,
+                        &[object, name_imm, value],
+                    )?;
+                    self.push(stored);
+                    self.builder.ins().jump(merge, &[]);
+                }
                 // The fast path: the helper writes the property vector in
                 // place and refreshes the cell (the write does not bump the
                 // generation, so the next read probe stays warm). The result
@@ -6035,141 +6294,20 @@ impl<'a> Lowerer<'a> {
                 self.store_slot(*slot, value);
             }
             LeafOp::StoreMemberName { name, value } => {
+                // The object is the accumulator, the value a register/const
+                // operand: the shared inline validated store (see
+                // `emit_validated_member_store`).
                 let object = self.builder.use_var(self.acc_var);
                 let value = self.leaf_operand(step, op_index, 1, value)?;
-                let name = self.builder.ins().iconst(types::I64, *name as i64);
-                self.call_slow(
-                    self.sig_set_name,
-                    Helper::SetMemberName,
-                    &[object, name, value],
-                )?;
+                self.emit_validated_member_store(object, value, *name)?;
             }
             LeafOp::StoreMemberNameLocal { object_slot, name } => {
                 // The object is the frame slot (read at store time), the
-                // value the accumulator. Inline the validated in-place
-                // member store like the step path's member write: an
-                // ordinary-object receiver whose member value cell
-                // validates (an own writable data property at the current
-                // generation — the run's preceding `GetMemberNameLocal`
-                // read refreshed it) writes through `set_member_slot` (no
-                // generation bump, no [[Set]] walk); every other receiver
-                // falls to the full `SetMemberName` helper (nullish check
-                // + assign machinery).
+                // value the accumulator: the shared inline validated store
+                // (see `emit_validated_member_store`).
                 let object = self.load_slot(*object_slot);
                 let value = self.builder.use_var(self.acc_var);
-                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
-                let ctx = self.vm();
-                // The object-kind gate mirrors the step's `obj_ok`: the
-                // payload must point at an object before the cell probe
-                // dereferences it.
-                let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
-                let is_obj =
-                    self.builder
-                        .ins()
-                        .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
-                let tag = self.builder.ins().ushr_imm_u(object, 44);
-                let tag = self.builder.ins().band_imm_u(tag, 0xF);
-                let tag_obj =
-                    self.builder
-                        .ins()
-                        .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
-                let obj_ok = self.builder.ins().band(is_obj, tag_obj);
-                let validate = self.builder.create_block();
-                let slow = self.builder.create_block();
-                let merge = self.builder.create_block();
-                self.builder.ins().brif(obj_ok, validate, &[], slow, &[]);
-                // The cell probe (mirrors `GetMemberName`/the step store):
-                // the live id/generation must match the cell the run's read
-                // warmed on an own data-property read.
-                self.builder.switch_to_block(validate);
-                let cells = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
-                );
-                let ptr = self
-                    .builder
-                    .ins()
-                    .band_imm_u(object, crux::PAYLOAD_MASK as i64);
-                let ptr = self.builder.ins().ishl_imm_u(ptr, 4);
-                // The payload stores the `GcBox` base; the `JsObject` sits
-                // after the box header (`mark` + `size`).
-                let ptr = self
-                    .builder
-                    .ins()
-                    .iadd_imm_s(ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
-                let live_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    ptr,
-                    Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
-                );
-                let live_gen = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    ptr,
-                    Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
-                );
-                let cell_slot = self.builder.ins().bxor(live_id, name_imm);
-                let cell_slot = self
-                    .builder
-                    .ins()
-                    .band_imm_u(cell_slot, (MEMBER_CELLS - 1) as i64);
-                let index_bytes = self
-                    .builder
-                    .ins()
-                    .imul_imm_s(cell_slot, std::mem::size_of::<MemberValueCell>() as i64);
-                let cell = self.builder.ins().iadd(cells, index_bytes);
-                let cell_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
-                );
-                let cell_name = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
-                );
-                let cell_gen = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
-                );
-                let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
-                let name_ok = self
-                    .builder
-                    .ins()
-                    .icmp_imm_u(IntCC::Equal, cell_name, *name as i64);
-                let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
-                let id_name_ok = self.builder.ins().band(id_ok, name_ok);
-                let ok = self.builder.ins().band(id_name_ok, gen_ok);
-                let fast = self.builder.create_block();
-                self.builder.ins().brif(ok, fast, &[], slow, &[]);
-                // The fast path: the helper writes the property vector in
-                // place and refreshes the cell (no generation bump). The
-                // store's result is discarded by the run truncate.
-                self.builder.switch_to_block(fast);
-                let _stored = self.call_slow(
-                    self.sig_set_name,
-                    Helper::SetMemberSlot,
-                    &[object, name_imm, value],
-                )?;
-                self.builder.ins().jump(merge, &[]);
-                // The slow path: the full member store helper (nullish
-                // check + assign machinery).
-                self.builder.switch_to_block(slow);
-                let _stored = self.call_slow(
-                    self.sig_set_name,
-                    Helper::SetMemberName,
-                    &[object, name_imm, value],
-                )?;
-                self.builder.ins().jump(merge, &[]);
-                self.builder.seal_block(merge);
-                self.builder.switch_to_block(merge);
+                self.emit_validated_member_store(object, value, *name)?;
             }
             LeafOp::StoreMemberComputed { key, value } => {
                 let object = self.builder.use_var(self.acc_var);

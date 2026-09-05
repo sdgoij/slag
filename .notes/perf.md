@@ -4537,6 +4537,57 @@ under the JIT and `--jitless`; the three release sweeps at baseline
 (language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
 fail/crash/hang).
 
+### Compiled member-store shape gate — Slice 2 (measured 2026-09-05)
+
+The compiled plain member stores were value-cell-validated only: a store
+whose (id, name) value cell missed (any working set larger than the
+16-entry table) fell to the full `SetMemberName`/`assign_member` helper on
+every store — the cycling-object store rows measured ~44-57ns/op at scale
+vs ~12ns single-object, on both the register (`StoreMemberNameLocal` for
+frame-slot objects, `StoreMemberName` for accumulator objects — which was
+a blind helper call) and the step (`AssignMemberName`, plain assigns)
+paths. The register and step store paths now share one inline shape gate:
+on a value-cell miss the machine probes the shared (map id, name) MAP
+cells (the Slice-1 read cells) and routes a hit to the narrow
+`set_member_slot` write (which re-checks writability authoritatively and
+falls back to the full [[Set]] internally, so a map-cell hit pins only
+data-ness — non-writable, accessor-converted, and presize-hole receivers
+stay correct). The step compounds keep the old miss-to-helper behavior
+(their cached old value came from the value-cell-validated read).
+
+Why the read map cells, not the L2 shape WRITE cells: the write cells are
+recorded only by `warm_store_record` (the full-[[Set]] tail), but the
+interpreter's own direct own-data fallback (`warm_store_direct_put`)
+handles warm in-place stores without ever reaching `put_value`, so on pure
+store loops the shape write cells stay cold and a machine probe of them
+never fires (measured flat at ~44ns). The read map cells ARE recorded by
+`fast_fresh_store` on every fresh define and by own-data reads, so they are
+the reliable shape record; a hit routes the vector write through the same
+narrow helper the value-cell fast path already used. No new helper, cell
+layout, or ctx field beyond Slice 1's.
+
+Measurement (release, `scratch/l1c_slice2_probe.js` + the gate probe,
+3-4 run minima): cycling 8192/16384 same-shape stores drop ~44-57 →
+~27-31ns/op on both the acc and slot forms and for BOTH ordinal 1 and the
+map-recorded ordinal 5 (`SetMemberSlot` writes the vector for ord ≥ 4
+keys, so the store side serves them even though the READ side still can't)
+— ~35-45% off, no full-helper round trip; single-object warm stores
+unchanged (~12-13ns); `--jit-bench` rows unchanged within the machine
+swing; reads unchanged. The gate probe store rows at 16384 objects: .b
+~45.8 → ~28.6ns and .f ~49.6 → ~31.5ns (JIT); interp ~84-89 unchanged.
+
+The store side of the same shape now has the same O(1) object-count
+behavior the read side gained in Slice 1; the remaining scale costs are
+the per-store double probe (value-cell miss + map-cell probe) under
+Cranelift, and the ord ≥ 4 READ gap (the Option-3 backing store).
+
+Gates: clippy clean; `cargo test --workspace` green (new jit e2e
+`installed_jit_shape_store_serves_cycling_same_shape_objects`); the L1c
+edge probes (`l1c_store_probe`, `l1c_compound_probe`, `l1c_option1_edge`,
+`l1c_update_probe`) pass under the JIT and `--jitless`; the three release
+sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086, zero fail/crash/hang).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
