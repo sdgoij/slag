@@ -2542,6 +2542,19 @@ pub(crate) fn construct_this_object(
                 let mut map = crux::canonical_empty_map(Some(proto_obj));
                 let mut complete = true;
                 for &name in &arr[..count as usize] {
+                    // Presize only pre-describes keys below INLINE_FIELDS: a
+                    // pre-described key's storage is its in-object hole, the
+                    // only kind a body may leave unset (an unset field reads
+                    // as absent). A descriptor at/above INLINE_FIELDS is
+                    // vector-addressed at the ordinal, so the map must never
+                    // describe such a key before the body has appended it.
+                    // A longer pattern leaves the object on the partial
+                    // shape; its later fields transition on store (aligned
+                    // appends fork shared child maps).
+                    if map.descriptor_count() >= crux::object::INLINE_FIELDS {
+                        complete = false;
+                        break;
+                    }
                     if let Some(child) = map.get_or_create_child(
                         crux::PropertyKey::String(name),
                         crux::MapAttrs::new(true, true, true),

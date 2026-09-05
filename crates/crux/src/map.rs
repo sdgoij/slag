@@ -7,8 +7,12 @@
 //! Two objects with the same shape share one Map. Maps are immutable shapes;
 //! mutations fork to a child map via the transition tree.
 //!
-//! B5.1 status: parallel shape, no storage change. `JsObject.map` holds a
-//! handle; reads/writes stay through `SmallProps`.
+//! A descriptor's field offset addresses the object's per-map storage:
+//! offsets below `INLINE_FIELDS` index the in-object `in_fields` mirror;
+//! offsets at or above it index the object's property vector at the same
+//! position (a map describes every default-attributes key, so for any object
+//! carrying the map those keys occupy the vector prefix in descriptor order —
+//! see `JsObject`'s transition discipline).
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -55,9 +59,10 @@ pub type MapEntry = (PropertyKey, usize, MapAttrs);
 pub struct Map {
     /// Unique identity for this map.
     id: u64,
-    /// Ordered property descriptors. Field offsets are indices into the
-    /// in-object `in_fields` region (not yet allocated — stored as the
-    /// descriptor offset for now).
+    /// Ordered property descriptors. Field offsets below `INLINE_FIELDS`
+    /// index the in-object `in_fields` mirror; offsets at or above it index
+    /// the object's property vector (the descriptor ordinal is the vector
+    /// slot for every map-carrying object).
     descriptors: Vec<MapEntry>,
     /// Prototype of objects described by this map.
     prototype: Option<Handle<JsObject>>,
@@ -186,9 +191,12 @@ impl Map {
         child
     }
 
-    /// Get or create a child map for a new property key. Returns `None`
-    /// if the map already has `INLINE_FIELDS` descriptors (in-field capacity
-    /// exhausted — the object will drop to dictionary mode).
+    /// Get or create a child map for a new property key. A map describes
+    /// every key its objects append (there is no descriptor cap): the new
+    /// key's offset is the parent's descriptor count, and the caller is
+    /// responsible for appending the key at that vector position (the
+    /// L1c transition discipline on `JsObject`). Returns `None` only when
+    /// the caller passes a `&mut` to a map that cannot fork.
     pub fn get_or_create_child(
         &mut self,
         key: PropertyKey,
@@ -196,9 +204,6 @@ impl Map {
     ) -> Option<Handle<Map>> {
         if let Some(child) = self.transitions.get(&key) {
             return Some(*child);
-        }
-        if self.descriptors.len() >= crate::object::INLINE_FIELDS {
-            return None;
         }
         // GcBox header is mark(1) + padding(3) + size(4) = 8 bytes before data.
         let header_offset: usize = 8;
@@ -346,23 +351,28 @@ mod tests {
     }
 
     #[test]
-    fn inline_field_capacity_limits_transitions() {
+    fn transitions_continue_past_the_inline_field_capacity() {
+        // Maps describe every default key an object appends — there is no
+        // 4-descriptor cap. Offsets stay ordinal-consistent (the descriptor
+        // count at fork time) so the map pins each key's vector slot.
         let mut current = Map::new_empty(None);
-        for i in 0..crate::object::INLINE_FIELDS {
+        let limit = crate::object::INLINE_FIELDS + 3;
+        for i in 0..limit {
             let key = PropertyKey::from_utf8(&format!("k{i}"));
             let child = current
-                .get_or_create_child(key, MapAttrs::new(true, true, true))
+                .get_or_create_child(key.clone(), MapAttrs::new(true, true, true))
                 .unwrap();
             assert_eq!(child.descriptor_count(), i + 1);
+            // The new key's offset is its descriptor ordinal; earlier keys
+            // keep theirs (children inherit the parent's descriptors).
+            assert_eq!(child.field_offset(&key), Some(i));
             current = child;
         }
-        // One more than the inline field capacity: no transition — the
-        // object drops to dictionary mode.
-        let overflow = PropertyKey::from_utf8(&format!("k{}", crate::object::INLINE_FIELDS));
-        assert!(
-            current
-                .get_or_create_child(overflow, MapAttrs::new(true, true, true))
-                .is_none()
+        assert_eq!(current.descriptor_count(), limit);
+        assert_eq!(current.field_offset(&PropertyKey::from_utf8("k0")), Some(0));
+        assert_eq!(
+            current.field_offset(&PropertyKey::from_utf8(&format!("k{}", limit - 1))),
+            Some(limit - 1)
         );
     }
 

@@ -1863,10 +1863,23 @@ impl MemberValueCell {
     }
 }
 
-/// `MemberWriteCell::field` value when no inline-field mirror is pinned:
+/// `MemberWriteCell::field` value when no map-pinned field is recorded:
 /// the object was dictionary-mode or its map did not describe the key when
 /// the cell was recorded (a vector-only property).
 pub(crate) const MEMBER_WRITE_FIELD_NONE: u8 = u8::MAX;
+
+/// Encode a map-pinned descriptor offset into a store cell's `u8` `field`:
+/// offsets below `u8::MAX` (the `MEMBER_WRITE_FIELD_NONE` sentinel) fit.
+/// A map describing a key at or above it records no pinned field (the
+/// direct own-data fallback serves those warm stores). A pinned field below
+/// `INLINE_FIELDS` is an in-object mirror; at or above it the field equals
+/// the key's map-pinned vector slot (written by the store itself).
+fn encode_pinned_field(offset: usize) -> u8 {
+    match u8::try_from(offset) {
+        Ok(field) if field != MEMBER_WRITE_FIELD_NONE => field,
+        _ => MEMBER_WRITE_FIELD_NONE,
+    }
+}
 
 /// The number of shape-keyed store cells ([`MemberMapWriteCell`], L2): the
 /// same direct-mapped capacity as the (id, name) write table. Power of two
@@ -1884,50 +1897,54 @@ pub(crate) const MEMBER_MAP_WRITE_CELLS: usize = MEMBER_WRITE_CELLS;
 /// mutation bumps the generation, including in-place `set_key`) makes a
 /// generation match pin the recorded slot's content.
 ///
-/// L1c: the cell also records the inline-field mirror of the property —
-/// the (map id, in-object offset) assigned by the object's map (see
-/// `JsObject::map_store_field`) — so the warm write mirrors the value
-/// into `in_fields` at the pinned offset without re-scanning the map's
-/// descriptors. The same generation gate pins the map (every structural
-/// change — define, delete, accessor conversion, map transition — bumps),
-/// and a map id pins its descriptor layout (maps are immutable after
-/// creation). `map_id` is 0 and `field` is `MEMBER_WRITE_FIELD_NONE`
-/// when no mirror is pinned.
+/// L1c: the cell also records the map pin of the property — the (map id,
+/// descriptor offset) assigned by the object's map (see
+/// `JsObject::map_store_field`) — so a warm write mirrors the in-object
+/// value at the pinned offset without re-scanning the map's descriptors
+/// (an offset at or above `INLINE_FIELDS` equals the recorded vector slot,
+/// which the write already stored). The same generation gate pins the map
+/// (every structural change — define, delete, accessor conversion, map
+/// transition — bumps), and a map id pins its descriptor layout (maps are
+/// immutable after creation). `map_id` is 0 and `field` is
+/// `MEMBER_WRITE_FIELD_NONE` when no pin is recorded.
 #[derive(Clone, Copy)]
 pub(crate) struct MemberWriteCell {
     pub id: u64,
     pub name: crux::AtomId,
     pub generation: u32,
     pub slot: usize,
-    /// The map id whose descriptors assign `field`, when a mirror is
-    /// pinned (see `field`).
+    /// The map id whose descriptors assign the pinned offset (`field`), 0
+    /// when no pin is recorded (a dictionary-mode or vector-only property).
     pub map_id: u64,
-    /// The in-object field offset of the mirrored property, or
-    /// `MEMBER_WRITE_FIELD_NONE` when no mirror is pinned.
+    /// The map-pinned descriptor offset, or `MEMBER_WRITE_FIELD_NONE` when
+    /// no pin is recorded (a dictionary-mode or vector-only property).
     pub field: u8,
 }
 
 /// The shape-keyed store cell (L2): `(map id, name)` -> the property's
-/// vector slot and inline-field mirror, valid for ANY ordinary object whose
+/// vector slot and map-pinned field, valid for ANY ordinary object whose
 /// CURRENT map is `map_id`. A map id pins the descriptor layout (maps are
 /// immutable after creation; a structural change transitions the object off
 /// the map or drops it), so a hit needs no per-object identity or
 /// generation — a store loop over any number of same-shape instances is
 /// O(1), where the (id, name)-keyed `member_write_cells` table thrashes
 /// once the object working set exceeds its size. Probed only after the
-/// (id, name) cell misses, and recorded only for keys the map describes as
-/// an inline field: a vector-only (spilled or non-transitionable) property
-/// is NOT map-pinned — two objects can share a live map yet hold different
-/// vectors after it, so their slot for such a key is per-object and only
-/// the (id, name) cell is safe.
+/// (id, name) cell misses, and recorded only for keys the map describes: a
+/// vector-only (spilled or non-transitionable) property is NOT map-pinned —
+/// two objects can share a live map yet hold different vectors after it, so
+/// their slot for such a key is per-object and only the (id, name) cell is
+/// safe. For a map-described key the slot IS the descriptor ordinal on
+/// every instance (the L1c transition discipline), so one cell serves the
+/// whole shape.
 #[derive(Clone, Copy)]
 pub(crate) struct MemberMapWriteCell {
     pub map_id: u64,
     pub name: crux::AtomId,
     pub slot: usize,
-    /// The in-object field offset of the mirrored property. Always a real
-    /// field (never `MEMBER_WRITE_FIELD_NONE`): only map-described inline
-    /// keys are recorded, so the write's pinned mirror is always valid.
+    /// The map-pinned descriptor offset: below `INLINE_FIELDS` the in-object
+    /// field the write mirrors; at or above it the offset equals `slot` (the
+    /// vector write is the store). Never `MEMBER_WRITE_FIELD_NONE`: only
+    /// map-described keys are recorded, so the pinned field is always real.
     pub field: u8,
 }
 
@@ -4225,7 +4242,7 @@ impl Vm {
             slot,
             map_id: pinned_field.map(|(map_id, _)| map_id).unwrap_or(0),
             field: pinned_field
-                .map(|(_, field)| field as u8)
+                .map(|(_, field)| encode_pinned_field(field))
                 .unwrap_or(MEMBER_WRITE_FIELD_NONE),
         });
         true
@@ -4261,12 +4278,14 @@ impl Vm {
             return;
         }
         let value = *value;
-        // Pin the inline-field mirror (map id + offset) when the object's
-        // map describes the key: the next warm write mirrors the field at
-        // the pinned offset without the descriptor scan. Dictionary-mode
-        // and vector-only properties record no mirror.
+        // Pin the map field when the object's map describes the key: the
+        // next warm write mirrors the in-object field at the pinned offset
+        // (below INLINE_FIELDS) or skips the mirror entirely (the pinned
+        // offset equals the vector slot the write already stored) without
+        // the descriptor scan. Dictionary-mode and vector-only properties
+        // record no pin.
         let (map_id, field) = match object.map_store_field(&key) {
-            Some((map_id, field)) => (map_id, field as u8),
+            Some((map_id, field)) => (map_id, encode_pinned_field(field)),
             None => (0, MEMBER_WRITE_FIELD_NONE),
         };
         let generation = object.generation();
@@ -4279,10 +4298,11 @@ impl Vm {
             map_id,
             field,
         });
-        // L2: also record the shape-keyed cell when the key is a
-        // map-described inline field (the layout a map id pins is shared by
-        // every instance of the shape, so a store loop over many same-shape
-        // objects hits this cell after the (id, name) table thrashes).
+        // L2: also record the shape-keyed cell when the key is map-described
+        // (the layout a map id pins is shared by every instance of the shape,
+        // so a store loop over many same-shape objects hits this cell after
+        // the (id, name) table thrashes). For a described key the recorded
+        // vector slot equals the descriptor ordinal on every instance.
         // Vector-only keys are deliberately not recorded — their slot is
         // per-object, not map-pinned.
         if field != MEMBER_WRITE_FIELD_NONE && map_id != 0 {

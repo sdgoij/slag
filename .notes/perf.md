@@ -4453,6 +4453,30 @@ only remaining full-[[Set]] stores are true defines (a genuinely new
 key), which no IC can make faster without the L1c storage migration.
 The chain-member-read slice (a) still waits on L1c's shape end-state.
 
+### Suite re-baseline after the cell/registration/Map-Set landings (measured 2026-09-04, HEAD 7312c72)
+
+`--jit-bench`, all rows result-ok, one quiet-machine run (interp / jit,
+ms unless noted): arithmetic 13.3/2.46, bare loop 12.6/2.32, property
+read 26.7/5.69, string concat 3.96/1.96, function calls 5.67/0.762,
+global read 16.6/3.49, compound assign 3.56/1.43, buildString shape
+92.9/33.4, buildString full 74.2/24.4, typed-array write 32.3/12.3,
+typed-array length 11.9/1.86, wide leaf call 18.7/1.71, apply leaf call
+19.2/7.09. Since the last recorded table (2026-09-02) the interpreter
+has closed most of the row gaps the earlier landings targeted
+(arithmetic 26.2 -> 13.3, property read 54.5 -> 26.7, string concat
+10.6 -> 3.96, compound assign 19.7 -> 3.56, typed-array write 75 ->
+32.3, buildString shape 180 -> 92.9). The largest remaining
+interpreted rows are now the dense-array/string machinery
+(buildString shape/full ~93/74ms) and typed-array write (~32ms); the
+interpreted property read (~27ms) is ~2x node jitless, consistent with
+the 1.1 read-floor probe (~3.5-4ns/read interp vs the row's ~13ns per
+read+add pair). JIT ratios are 0.09-0.49 across rows — the compiled
+bodies run 2-11x under the interpreter. No row shows a mechanism cliff
+comparable to the closed Map/Set chains or the store-cell thrash; the
+open structural items remain the L1c shape/storage end-state (true
+defines, the JIT shape-compare end-state, and the chain-member-read
+slice (a) behind it).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
