@@ -2252,6 +2252,33 @@ mod tests {
     }
 
     #[test]
+    fn stores_over_many_vector_field_objects_stay_exact() {
+        // The direct cell-miss fallback serves a key the map does NOT pin
+        // (the 5th+ field of a many-field shape is vector-only): when the
+        // (id, name) cell misses and the shape-keyed cell cannot apply, the
+        // store resolves the object's OWN vector slot and writes in place
+        // instead of re-running the full [[Set]]. The hazard is a stale or
+        // cross-shape slot, so drive 9000 six-field instances with distinct
+        // values, interleave non-transitioning defineProperty calls (which
+        // push unmapped keys into the vector and shift later slots on some
+        // objects), delete the hot field on a tail (dropping the map to
+        // dictionary mode), and read every value back.
+        let source = "(function(){ var os = [];\n\
+                     for (var i = 0; i < 9000; i++) { os[i] = { a: 0, b: 0, c: 0, d: 0, e: 0 }; }\n\
+                     for (var i = 0; i < 9000; i++) { os[i].e = i; }\n\
+                     for (var i = 0; i < 9000; i++) { if (os[i].e !== i) { return 'bad ' + i; } }\n\
+                     for (var i = 0; i < 300; i++) { Object.defineProperty(os[i], 'z', { value: i, writable: true, enumerable: false, configurable: true }); }\n\
+                     for (var i = 8700; i < 9000; i++) { delete os[i].e; }\n\
+                     for (var i = 0; i < 9000; i++) { os[i].e = i * 3; }\n\
+                     for (var i = 0; i < 9000; i++) { if (os[i].e !== i * 3) { return 'bad2 ' + i + ':' + os[i].e; } }\n\
+                     return 'ok'; })()\n";
+        assert_eq!(
+            run(source).unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("ok")))
+        );
+    }
+
+    #[test]
     fn chain_reads_observe_warm_value_writes_to_the_found_link() {
         // The prototype-chain read cache re-reads the found property LIVE
         // (through the found link's member value cell when warm, else the

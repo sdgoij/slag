@@ -4410,6 +4410,49 @@ shared maps (a hot 5th+ field of a many-field shape) still take the
 store IC (tasklist 1.2), and the chain-member-read slice (a) stays
 behind L1c's shape end-state.
 
+### The vector-only store fallback: direct own-data writes past the map-pinned fields (measured 2026-09-04)
+
+The 1.8 residual probed: a store loop writing a key the map does NOT
+pin (the 5th+ field of a many-field shape is vector-only — maps stop
+describing keys at `INLINE_FIELDS`, and a vector-only key's slot is
+per-object, since two objects can share a live map yet interleave
+non-transitionable defines that shift their vectors). Probe (200k-call
+rows, this tree): 64/1024-object 5th-field stores ~57ns/store interp,
+8192 ~214ns and 16384 ~223ns — a ~3.8x cliff on BOTH engines, and NOT
+fixable by a per-step IC: nothing shape-pins a vector-only key's slot,
+so no shape/offset record can validate it.
+
+The tractable slice: on a (id, name) cell miss the store jumped
+straight to the full `[[Set]]` (~180-220ns) even when `name` was an
+already-existing own writable data property — a warm in-place value
+write. `warm_store_put`'s miss chain now falls through the shape-keyed
+cell to a DIRECT resolve-and-write: resolve the object's own vector
+slot (`property_slot`), verify the stored key holds a writable data
+property, and write in place through `write_data_property_slot` (with
+the pinned inline mirror when the map does describe the key). Exact:
+an own writable data property shadows the whole chain (spec 7.3.3), and
+accessor/non-writable/absent cases fall through to the full `[[Set]]`.
+The no-bump discipline is unchanged (the read-side value cell is
+fronted and the (id, name) cell re-keyed at the current generation).
+
+The vector-only rows drop ~3.1-3.3x (8192 ~214 -> ~69ns/store interp,
+16384 ~223 -> ~68ns; jit ~184-196 -> ~54ns) and now sit AT the
+64/1024 warm level; the inline-field and single-object rows are
+unchanged (no warm regression).
+
+**Gates**: clippy clean; `cargo test --workspace` green (new
+`stores_over_many_vector_field_objects_stay_exact` — 9000 six-field
+instances with distinct values, non-transitioning `defineProperty`
+interleaved (shifting later vector slots on a subset), and deletes
+dropping the map to dictionary mode, all read back); the three release
+sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086, zero fail/crash/hang). What remains of the per-step
+store-IC case: none of the measured store rows — the direct fallback
+removes the identity-table cliff for every warm in-place write; the
+only remaining full-[[Set]] stores are true defines (a genuinely new
+key), which no IC can make faster without the L1c storage migration.
+The chain-member-read slice (a) still waits on L1c's shape end-state.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

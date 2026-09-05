@@ -4037,10 +4037,10 @@ impl Vm {
         };
         let index = Self::member_write_cell_index(object.id(), name);
         let Some(cell) = agent.member_write_cells[index] else {
-            return Self::warm_store_map_put(agent, &object, name, value);
+            return Self::warm_store_fallback(agent, &object, name, value);
         };
         if cell.id != object.id() || cell.name != name || cell.generation != object.generation() {
-            return Self::warm_store_map_put(agent, &object, name, value);
+            return Self::warm_store_fallback(agent, &object, name, value);
         }
         // The cell pinned the inline-field mirror (map id + offset) when it
         // was recorded under the same generation gate that pins the slot; a
@@ -4143,6 +4143,90 @@ impl Vm {
             slot: cell.slot,
             map_id: cell.map_id,
             field: cell.field,
+        });
+        true
+    }
+
+    /// The cell-miss chain of [`Self::warm_store_put`]: the shape-keyed
+    /// cell first (a same-shape working set shares one (map id, name)
+    /// entry), then the direct own-data slot write for keys the map does not
+    /// pin. Returns true when the store happened; false falls back to the
+    /// full [[Set]].
+    fn warm_store_fallback(
+        agent: &mut Agent,
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+        value: Value,
+    ) -> bool {
+        Self::warm_store_map_put(agent, object, name, value)
+            || Self::warm_store_direct_put(agent, object, name, value)
+    }
+
+    /// The direct fallback for a key the map does not pin (a vector-only
+    /// spill or a dictionary-mode object): when `name` is ALREADY an own
+    /// writable data property, resolve its vector slot and write in place.
+    /// Exact — an own writable data property shadows the whole chain (spec
+    /// 7.3.3), and an accessor, a non-writable, or an absent own property
+    /// falls through to the full [[Set]]. This removes the full-[[Set]] cost
+    /// (~180-220ns, the probe's vector-only store rows) from a store loop
+    /// whose object working set exceeds `MEMBER_WRITE_CELLS`: the identity
+    /// cell cannot hold every object, so without this every store would
+    /// re-run `put_value`'s machinery for what is a warm in-place value
+    /// write.
+    fn warm_store_direct_put(
+        agent: &mut Agent,
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+        value: Value,
+    ) -> bool {
+        let key = PropertyKey::String(name);
+        let Some(slot) = object.property_slot(&key) else {
+            return false;
+        };
+        let writable_data = {
+            let props = object.properties.borrow();
+            match props.get(slot) {
+                Some((stored, property)) if *stored == key => {
+                    matches!(
+                        &property.kind,
+                        crux::object::PropertyKind::Data { writable: true, .. }
+                    )
+                }
+                _ => false,
+            }
+        };
+        if !writable_data {
+            return false;
+        }
+        // Pin the inline mirror when the object's map describes the key (a
+        // mapped inline field); a vector-only key mirrors nothing.
+        let pinned_field = object.map_store_field(&key);
+        if !object.write_data_property_slot(&key, slot, value, pinned_field) {
+            return false;
+        }
+        // The L1c record discipline: an in-place VALUE write does not bump
+        // the generation. Front the read-side value cell (the SMALL table's
+        // index — the compiled probe masks by MEMBER_CELLS - 1) and re-key
+        // the (id, name) cell so the same instance's next store is a primary
+        // hit (valid at the unchanged generation).
+        let generation = object.generation();
+        let read_index = Self::member_cell_index(object.id(), name);
+        agent.member_value_cells[read_index] = MemberValueCell {
+            id: object.id(),
+            name,
+            generation,
+            value,
+        };
+        let write_index = Self::member_write_cell_index(object.id(), name);
+        agent.member_write_cells[write_index] = Some(MemberWriteCell {
+            id: object.id(),
+            name,
+            generation,
+            slot,
+            map_id: pinned_field.map(|(map_id, _)| map_id).unwrap_or(0),
+            field: pinned_field
+                .map(|(_, field)| field as u8)
+                .unwrap_or(MEMBER_WRITE_FIELD_NONE),
         });
         true
     }
