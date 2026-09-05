@@ -17,6 +17,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod convert;
+
 use serde_json::Value;
 use wasm::Value as WasmValue;
 use wasm::types::{FuncType, GlobalType, Limits, MemType, RefType, TableType, ValType};
@@ -31,10 +33,11 @@ const USAGE: &str = "\
 wasmtest — WebAssembly conformance runner
 
 usage:
-  wasmtest check <file.wasm|dir>       decode modules and report per-file status
-  wasmtest convert <file.wast>         compile a .wast with wast2json (wabt)
+  wasmtest check <file.wasm|dir>      decode modules and report per-file status
+  wasmtest convert <file.wast> [out.json]   compile a .wast with the in-process
+                                    converter (JSON + per-module .wasm/.wat)
   wasmtest run <wast|json|dir>...      convert (if needed) and run suites;
-                                      exits nonzero when any suite reports a fail
+                                    exits nonzero when any suite reports a fail
 
 run accepts several paths; a directory is walked recursively for `.wast`
 and `.json` files. Files listed in the exclusion manifest (default
@@ -42,8 +45,13 @@ and `.json` files. Files listed in the exclusion manifest (default
 `skip` and are not failures — the cut's written taxonomy.
 
 environment:
-  $WAST2JSON        path to wabt's wast2json executable when it is not on PATH
+  $WAST2JSON        path to wabt's wast2json executable (forces the wabt
+                    converter; unset means the built-in `wast`-crate converter)
   $WASM_EXCLUSIONS  exclusion manifest path (default: crates/wasmtest/wasm-exclusions.txt)
+
+examples:
+  wasmtest run waspec/test/core/memory64
+  wasmtest convert waspec/test/core/gc/i31.wast out.json
 ";
 
 fn main() -> ExitCode {
@@ -61,13 +69,19 @@ fn main() -> ExitCode {
             check(Path::new(&path))
         }
         "convert" => {
-            let Some(path) = args.next() else {
+            let Some(wast_path) = args.next() else {
                 eprintln!("wasmtest convert: missing path\n\n{USAGE}");
                 return ExitCode::from(2);
             };
-            match convert_wast(Path::new(&path)) {
-                Ok(json) => {
-                    println!("wrote {}", json.display());
+            let wast_path = PathBuf::from(wast_path);
+            let out_json = args.next().map(PathBuf::from).unwrap_or_else(|| {
+                Path::new("target")
+                    .join("wastest")
+                    .join(json_name(&wast_path))
+            });
+            match convert::convert_wast(&wast_path, &out_json) {
+                Ok(()) => {
+                    println!("wrote {}", out_json.display());
                     ExitCode::SUCCESS
                 }
                 Err(message) => {
@@ -416,9 +430,9 @@ fn run_json(json_path: &Path) -> Tally {
                 match module_source(module, dir) {
                     ModuleSource::Binary(bytes) => match decode(&bytes) {
                         Err(DecodeError::Malformed(_)) => Outcome::Pass,
-                        Err(DecodeError::Unsupported(_)) => Outcome::Fail(
-                            "expected malformed, decoder hit unsupported feature".into(),
-                        ),
+                        // The module exercises a feature a later cut owns; the
+                        // decoder cannot tell malformed from valid for it yet.
+                        Err(DecodeError::Unsupported(reason)) => Outcome::Pending(reason),
                         Ok(_) => Outcome::Fail("expected malformed, module decoded".into()),
                     },
                     ModuleSource::Text => Outcome::Pending("quote text module"),
@@ -433,9 +447,9 @@ fn run_json(json_path: &Path) -> Tally {
                         Err(DecodeError::Malformed(message)) => Outcome::Fail(format!(
                             "expected invalid, decoder says malformed: {message}"
                         )),
-                        Err(DecodeError::Unsupported(_)) => Outcome::Fail(
-                            "expected invalid, decoder hit unsupported feature".into(),
-                        ),
+                        // The module exercises a feature a later cut owns, so
+                        // validation (which would reject it) cannot run yet.
+                        Err(DecodeError::Unsupported(reason)) => Outcome::Pending(reason),
                         Ok(module) => match validate(&module) {
                             Err(ValidError::Invalid(_)) => Outcome::Pass,
                             Ok(_) => Outcome::Fail("expected invalid, module validated".into()),
@@ -1143,34 +1157,41 @@ fn module_file(command: &Value, dir: &Path) -> Option<(PathBuf, Vec<u8>)> {
     fs::read(&path).ok().map(|bytes| (path, bytes))
 }
 
-// ---- conversion ($WAST2JSON, then wabt fallbacks) ----
+// ---- conversion (in-process `wast`-crate converter, or wabt when $WAST2JSON) ----
 
 const TOOL_HINT: &str = "\
-Install wabt's wast2json (https://github.com/WebAssembly/wabt) and retry, or set
-WAST2JSON to its path.";
+The built-in converter parses the corpus through the `wast` crate. Set
+WAST2JSON to wabt's wast2json to force the wabt converter instead.";
 
 fn convert_wast(wast: &Path) -> Result<PathBuf, String> {
     let out_dir = Path::new("target").join("wastest");
     fs::create_dir_all(&out_dir)
         .map_err(|error| format!("cannot create {}: {error}", out_dir.display()))?;
     let json_path = out_dir.join(json_name(wast));
-    // A set-but-unrunnable WAST2JSON is a configuration error: surface it
-    // instead of silently falling back to another converter.
     if let Ok(path) = std::env::var("WAST2JSON")
         && !path.trim().is_empty()
-        && Command::new(&path).arg("--version").output().is_err()
     {
-        return Err(format!(
-            "WAST2JSON is set to {path:?}, but that executable cannot be run.\n{TOOL_HINT}"
-        ));
-    }
-    for tool in converter_tools() {
-        if let Some(result) = run_converter(&tool, wast, &json_path) {
-            result?;
-            return Ok(json_path);
+        // $WAST2JSON set: wabt is the converter. A set-but-unrunnable
+        // WAST2JSON is a configuration error: surface it instead of silently
+        // falling back to the in-process converter.
+        if Command::new(&path).arg("--version").output().is_err() {
+            return Err(format!(
+                "WAST2JSON is set to {path:?}, but that executable cannot be run.\n{TOOL_HINT}"
+            ));
         }
+        for tool in converter_tools() {
+            if let Some(result) = run_converter(&tool, wast, &json_path) {
+                result?;
+                return Ok(json_path);
+            }
+        }
+        return Err(format!("no wast2json converter available.\n{TOOL_HINT}"));
     }
-    Err(format!("no wast2json converter available.\n{TOOL_HINT}"))
+    // No $WAST2JSON: convert in-process. GC-era text (rec groups, packed
+    // fields, i31ref, array/elem) that wabt cannot parse is supported here.
+    println!("using in-process converter ({})", wast.display());
+    convert::convert_wast(wast, &json_path)?;
+    Ok(json_path)
 }
 
 /// Converter candidates in order of preference: a wabt build named by

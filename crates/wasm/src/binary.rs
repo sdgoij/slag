@@ -177,6 +177,13 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
         SectionId::Type => {
             let count = read_u32(payload, &mut pos)?;
             for _ in 0..count {
+                // GC composite/rec types are valid type-section forms the
+                // engine does not decode yet; report them as unsupported
+                // rather than malformed so conformance counts stay honest.
+                if payload.get(pos) == Some(&0x4e) || matches!(payload.get(pos), Some(0x50..=0x5f))
+                {
+                    return Err(Error::Unsupported("GC composite type"));
+                }
                 module.types.push(decode_func_type(payload, &mut pos)?);
             }
         }
@@ -341,8 +348,19 @@ fn decode_valtype(bytes: &[u8], pos: &mut usize) -> Result<ValType, Error> {
                 heap,
             }))
         }
+        // The GC abstract heap types are valid single-byte value types;
+        // decoding them is a later cut, so they are unsupported rather than
+        // malformed.
+        _ if is_gc_heap_type(byte) => Err(Error::Unsupported("abstract heap type")),
         _ => ValType::from_byte(byte).ok_or(Error::Malformed("malformed value type")),
     }
+}
+
+/// A single-byte GC abstract heap type (an `anyref`-style value type or the
+/// heap operand of a `(ref ht)` encoding). Not a type index: indices are
+/// signed LEB128 and always need the continuation bit.
+fn is_gc_heap_type(byte: u8) -> bool {
+    matches!(byte, 0x6a..=0x6e | 0x71..=0x74)
 }
 
 fn decode_heap_type(bytes: &[u8], pos: &mut usize) -> Result<HeapType, Error> {
@@ -364,8 +382,13 @@ fn decode_heap_type(bytes: &[u8], pos: &mut usize) -> Result<HeapType, Error> {
             *pos += 1;
             Ok(HeapType::Exn)
         }
-        // Any other heap type (GC abstract heap types) is a later cut; a byte
-        // >= 0x80 continues as a signed type index instead.
+        // Any other heap type: a GC abstract heap type is a later cut and
+        // counts as unsupported, not malformed. A byte >= 0x80 continues as a
+        // signed type index instead.
+        _ if is_gc_heap_type(byte) => {
+            *pos += 1;
+            Err(Error::Unsupported("abstract heap type"))
+        }
         _ => {
             let index = read_s33(bytes, pos)?;
             if index < 0 {

@@ -65,12 +65,12 @@ format** (ch. 6 is out of scope for the runtime — the JS API only consumes
 bytes). Conformance therefore needs a compile step, exactly like the
 `unicode` build script and the `wat2wasm` step in the browser demo:
 
-- **`wast2json`** (wabt, a *test/dev* tool — never a runtime dependency)
-  converts each `.wast` into one `.wasm` per module plus a `.json` of
-  commands (`module`, `assert_return`, `assert_trap`, `assert_invalid`,
+- **`wast`** (the maintained bytecodealliance/wasm-tools text parser, a
+  *test/dev* dependency — never a runtime dependency) converts each `.wast`
+  in-process into one `.wasm` per module plus a `.json` of commands
+  (`module`, `assert_return`, `assert_trap`, `assert_invalid`,
   `assert_malformed`, `assert_unlinkable`, `assert_exhaustion`,
-  `register`, `action`). Feature suites are converted with the matching
-  `--enable-*` flags.
+  `register`, `action`), matching the wast2json JSON shape.
 - A Rust runner executes the JSON commands against the engine — decode →
   validate → instantiate → invoke — and reports failures per file/command.
   This mirrors the test262 sweep (`crates/test262`) and can live in a new
@@ -352,9 +352,15 @@ review, per repo rules hygiene.
 
 ## 8. Decisions (ratified)
 
-1. **`wast2json` is the conformance compiler** (wabt, dev/test-only — never
-   a runtime dependency) for now; revisiting the OCaml reference interpreter
-   is deferred until the runner needs it as an oracle.
+1. **The in-process `wast` crate is the conformance compiler** (wast-tools'
+   `wast`, dev/test-only — never a runtime dependency; ratifying the switch
+   from wabt 2026-09-05). wabt 1.0.41 cannot parse the pinned corpus's modern
+   GC text (rec/sub type defs, packed `i8/i16` storage, `i31ref`, `array
+   .init_elem`), and the `wast2json-rs` CLI was unmaintained/problematic;
+   embedding the maintained crate removes the external-binary dependency
+   entirely. Modules encode in-process (`Wat::encode`); the runner's JSON
+   command format is unchanged. The OCaml reference interpreter stays
+   deferred until the runner needs it as an oracle.
 2. **NaN policy: canonical quiet NaN** for arithmetic results (V8-style),
    payloads only where an operation's semantics require propagating one.
 3. **Feature ordering after Cut 5**: exceptions → SIMD/relaxed-SIMD →
@@ -907,3 +913,23 @@ text fixtures (the engine has no `.wat` parser); the single skip is the
 documented `table_init64` converter exclusion. The exit code is nonzero
 the moment any suite reports a fail, so the command doubles as the cut's
 CI check.
+
+### Cut 9 — GC: converter switch + engine (in progress, 2026-09-05)
+
+The converter switch (ratified above) landed its first step: `wasmtest`
+now depends on the maintained `wast` + `wat` crates (default-features off,
+`wast` with `wasm-module`), and a feasibility probe
+(`crates/wasmtest/examples/gcprobe.rs`) confirms the crate parses the
+pinned GC corpus — `gc/i31.wast`, `gc/struct.wast`, `gc/ref_eq.wast` all
+parse clean, syntaxes wabt 1.0.41 rejects (`sub`/rec, packed `i8/i16`
+fields, `i31ref`, casts). The `wast` tokenizer's NaN-bit resolution
+matches wabt's exactly (`nan:0x200000` → 0x7FA00000 etc.), so converted
+float/v128 values keep bit parity with the old wabt JSONs.
+
+Remaining converter work: a `convert` module mapping `Wast` directives to
+the runner's wast2json-shaped JSON (module `.wasm`/`.wat` files,
+invoke/get actions, expected-value entries incl. float NaN patterns and
+v128 lanes), replacing the external-binary path; then Cut 9's engine
+waves: rec/sub + composite-type decode (type section), GC value/heap
+types and subtyping in validation, the struct/array/ref-cast/i31
+instruction surface, and a GC object runtime — against `gc/` (17).
