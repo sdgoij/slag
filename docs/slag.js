@@ -105,6 +105,35 @@ export async function instantiate(bytes, host = {}) {
       armTimer();
       return text;
     },
+    /// The last eval's completion `typeof` code: 0 unknown, 1 undefined,
+    /// 2 boolean, 3 number, 4 bigint, 5 string, 6 symbol, 7 function,
+    /// 8 object. Read right after a successful `eval`.
+    resultType() {
+      return exports.slag_result_type();
+    },
+    /// Render a debug dump of `source` without evaluating it — kind 0
+    /// tokens, 1 AST, 2 bytecode (the CLI's dump flags). Throws on a
+    /// parse/compile error.
+    dump(kind, source) {
+      const bytes = new TextEncoder().encode(source);
+      const len = bytes.length;
+      const ptr = exports.slag_alloc(len);
+      if (len > 0 && ptr === 0) throw new Error('slag_alloc failed');
+      if (len > 0) new Uint8Array(exports.memory.buffer, ptr, len).set(bytes);
+      let status;
+      try {
+        status = exports.slag_dump(kind, ptr, len);
+      } finally {
+        exports.slag_dealloc(ptr, len);
+      }
+      const text = readResult();
+      if (status !== 0) {
+        const error = new Error(text || 'dump failed');
+        error.slag = true;
+        throw error;
+      }
+      return text;
+    },
     /// Run pending microtasks and due timers immediately; returns false when
     /// a job errored.
     drain() {

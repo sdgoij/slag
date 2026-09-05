@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 crux = { path = "../crux" }
+lexer = { path = "../lexer" }
 parser = { path = "../parser" }
 # Trimmed raylib build. Keep `SUPPORT_WINMM_HIGHRES_TIMER`: without it,
 # raylib's Windows frame limiter uses the ~15.6ms Sleep granularity and

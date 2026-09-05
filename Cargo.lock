@@ -785,6 +785,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "crux",
+ "lexer",
  "parser",
  "raylib-sys",
  "regexp",

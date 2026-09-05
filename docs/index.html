@@ -1,58 +1,1339 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="auto">
   <head>
     <meta charset="utf-8" />
-    <title>Slag in the browser</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Slag — JavaScript in your browser</title>
+    <script>
+      // Apply a persisted theme override before paint (default: follow the
+      // OS/browser setting via prefers-color-scheme).
+      (() => {
+        const key = 'slag-theme';
+        const saved = localStorage.getItem(key);
+        const theme = ['auto', 'light', 'dark'].includes(saved) ? saved : 'auto';
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
     <style>
-      body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; }
-      textarea { width: 100%; min-height: 8rem; font: 13px ui-monospace, monospace; }
-      button { padding: 0.4rem 1rem; margin-top: 0.5rem; }
-      pre { background: #f5f5f5; border-radius: 4px; padding: 0.75rem; min-height: 4rem; white-space: pre-wrap; }
+      /* ---- theme tokens -------------------------------------------------
+         Defaults are light; dark is applied when the OS asks (auto) or the
+         visitor picked it explicitly. */
+      :root {
+        color-scheme: light;
+        --bg: #e9e4dc;
+        --bg-accent: radial-gradient(1100px 560px at 88% -8%, rgba(161, 63, 13, 0.07), transparent 55%),
+          radial-gradient(860px 520px at -6% 112%, rgba(161, 63, 13, 0.05), transparent 50%);
+        --surface: #f4efe8;
+        --surface-raised: #eee8df;
+        --border: #766d5f;
+        --border-strong: #635a4c;
+        --text: #383128;
+        --muted: #635a4c;
+        --faint: #766d5f;
+        --accent: #a13f0d;
+        --accent-hover: #7f2f0a;
+        --accent-soft: rgba(161, 63, 13, 0.13);
+        --on-accent: #ffffff;
+        --warn: #92610a;
+        --danger: #9c2f22;
+        --danger-soft: rgba(156, 47, 34, 0.1);
+        --ok: #0f6b2f;
+        --ok-soft: rgba(15, 107, 47, 0.12);
+        --code-bg: #ece5db;
+        --syn-comment: #857a6c;
+        --syn-keyword: #9a3b13;
+        --syn-string: #2f6b34;
+        --syn-number: #8a5c07;
+        --syn-function: #1a6a8c;
+        --card-highlight: rgba(255, 255, 255, 0.4);
+        --shadow: 0 1px 2px rgba(60, 40, 20, 0.06), 0 14px 30px -20px rgba(60, 40, 20, 0.35);
+        --radius: 14px;
+        --radius-sm: 8px;
+        --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", "SF Mono",
+          Menlo, Consolas, "Liberation Mono", monospace;
+      }
+
+      [data-theme="dark"] {
+        color-scheme: dark;
+        --card-highlight: rgba(255, 255, 255, 0.05);
+        --warn: #fbbf24;
+        --bg: #0d1117;
+        --bg-accent: radial-gradient(1200px 600px at 85% -10%, rgba(251, 146, 60, 0.09), transparent 60%),
+          radial-gradient(900px 500px at -10% 110%, rgba(251, 146, 60, 0.06), transparent 55%);
+        --surface: #161b22;
+        --surface-raised: #1b222c;
+        --border: #2b3441;
+        --border-strong: #3b4654;
+        --text: #e6edf3;
+        --muted: #9aa7b4;
+        --faint: #66707d;
+        --accent: #fb923c;
+        --accent-hover: #fdba74;
+        --accent-soft: rgba(251, 146, 60, 0.14);
+        --on-accent: #1a1206;
+        --danger: #f87171;
+        --danger-soft: rgba(248, 113, 113, 0.12);
+        --ok: #4ade80;
+        --ok-soft: rgba(74, 222, 128, 0.14);
+        --code-bg: #0b0f15;
+        --syn-comment: #8b949e;
+        --syn-keyword: #ff7b72;
+        --syn-string: #a5d6ff;
+        --syn-number: #79c0ff;
+        --syn-function: #d2a8ff;
+        --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 32px -16px rgba(0, 0, 0, 0.6);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme="light"]) {
+          color-scheme: dark;
+          --card-highlight: rgba(255, 255, 255, 0.05);
+          --warn: #fbbf24;
+          --bg: #0d1117;
+          --bg-accent: radial-gradient(1200px 600px at 85% -10%, rgba(251, 146, 60, 0.09), transparent 60%),
+            radial-gradient(900px 500px at -10% 110%, rgba(251, 146, 60, 0.06), transparent 55%);
+          --surface: #161b22;
+          --surface-raised: #1b222c;
+          --border: #2b3441;
+          --border-strong: #3b4654;
+          --text: #e6edf3;
+          --muted: #9aa7b4;
+          --faint: #66707d;
+          --accent: #fb923c;
+          --accent-hover: #fdba74;
+          --accent-soft: rgba(251, 146, 60, 0.14);
+          --on-accent: #1a1206;
+          --danger: #f87171;
+          --danger-soft: rgba(248, 113, 113, 0.12);
+          --ok: #4ade80;
+          --ok-soft: rgba(74, 222, 128, 0.14);
+          --code-bg: #0b0f15;
+          --syn-comment: #8b949e;
+          --syn-keyword: #ff7b72;
+          --syn-string: #a5d6ff;
+          --syn-number: #79c0ff;
+          --syn-function: #d2a8ff;
+          --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 32px -16px rgba(0, 0, 0, 0.6);
+        }
+      }
+
+      /* ---- base ---- */
+      * { box-sizing: border-box; }
+
+      /* `hidden` must always win over a class-set display. */
+      [hidden] { display: none !important; }
+
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      a:hover { color: var(--accent-hover); text-decoration: underline; }
+
+      a.nd {
+        color: inherit; /* blue colors for links too */
+        text-decoration: inherit; /* no underline */
+      }
+
+      ::selection { background: var(--accent-soft); }
+
+      html { height: 100%; }
+
+      body {
+        margin: 0;
+        min-height: 100%;
+        font-family: var(--font-ui);
+        font-size: 15px;
+        line-height: 1.55;
+        color: var(--text);
+        background-color: var(--bg);
+        background-image: var(--bg-accent);
+        background-attachment: fixed;
+        -webkit-font-smoothing: antialiased;
+        transition: background-color 0.25s ease, color 0.25s ease;
+      }
+
+      .shell {
+        max-width: 76rem;
+        margin: 0 auto;
+        padding: clamp(1rem, 4vw, 2.5rem) clamp(1rem, 4vw, 2.5rem) 2rem;
+      }
+
+      /* ---- header ---- */
+      .topbar {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1rem;
+        flex-wrap: wrap;
+        margin-bottom: clamp(1rem, 3vw, 1.75rem);
+      }
+
+      .brand { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; }
+
+      .brand h1 {
+        margin: 0;
+        font-size: 1.7rem;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+      }
+      .brand h1 .flame { color: var(--accent); }
+
+      .tagline { margin: 0; color: var(--muted); font-size: 0.95rem; }
+
+      .top-actions { display: flex; align-items: center; gap: 0.5rem; }
+
+      /* ---- status pill ---- */
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        font-size: 0.8rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        padding: 0.35rem 0.7rem;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--muted);
+        text-transform: uppercase;
+        user-select: none;
+      }
+      .status .dot {
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 50%;
+        background: var(--faint);
+      }
+      .status.loading .dot { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+      .status.ready .dot { background: var(--ok); }
+      .status.error .dot { background: var(--danger); }
+      .status.ready { color: var(--ok); }
+      .status.error { color: var(--danger); }
+
+      @keyframes pulse { 50% { opacity: 0.25; } }
+
+      /* ---- buttons ---- */
+      .btn {
+        font: inherit;
+        font-weight: 600;
+        border: 1px solid transparent;
+        border-radius: var(--radius-sm);
+        padding: 0.5rem 0.95rem;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease,
+          transform 0.05s ease, box-shadow 0.15s ease;
+      }
+      .btn:active { transform: translateY(1px); }
+
+      .btn-primary { background: var(--accent); color: var(--on-accent); }
+      .btn-primary:hover {
+        background: var(--accent-hover);
+        box-shadow: 0 10px 22px -12px var(--accent);
+      }
+
+      .btn-ghost {
+        background: var(--surface);
+        border-color: var(--border-strong);
+        color: var(--text);
+      }
+      .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+      .icon-btn {
+        width: 2.35rem;
+        height: 2.35rem;
+        padding: 0;
+        justify-content: center;
+        font-size: 1.05rem;
+      }
+
+      :focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      /* ---- layout ---- */
+      .panes {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: clamp(0.75rem, 2vw, 1.25rem);
+        align-items: stretch;
+      }
+      @media (max-width: 860px) { .panes { grid-template-columns: 1fr; } }
+
+      .pane {
+        display: flex;
+        flex-direction: column;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: inset 0 1px 0 var(--card-highlight), var(--shadow);
+        overflow: hidden;
+        min-width: 0;
+      }
+
+      .pane-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding: 0.6rem 0.9rem;
+        border-bottom: 1px solid var(--border);
+        background: var(--surface-raised);
+      }
+      .pane-title {
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      .pane-hint { color: var(--faint); font-size: 0.78rem; }
+      .pane-actions { display: flex; align-items: center; gap: 0.5rem; }
+      .pane-tools { display: flex; align-items: center; gap: 0.6rem; }
+
+      .mode-select {
+        font: 600 0.78rem var(--font-ui);
+        color: var(--text);
+        background: var(--surface);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-sm);
+        padding: 0.28rem 0.45rem;
+        cursor: pointer;
+      }
+
+      kbd {
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+        padding: 0.1rem 0.35rem;
+        border: 1px solid var(--border-strong);
+        border-bottom-width: 2px;
+        border-radius: 5px;
+        background: var(--code-bg);
+        color: var(--muted);
+      }
+
+      /* ---- editor ---- */
+      textarea {
+        width: 100%;
+        min-height: 46vh;
+        resize: vertical;
+        border: 0;
+        outline: none;
+        background: var(--surface);
+        color: var(--text);
+        font-family: var(--font-mono);
+        font-size: 13.5px;
+        line-height: 1.6;
+        padding: 1rem 1.1rem;
+        tab-size: 2;
+        caret-color: var(--accent);
+      }
+      textarea::selection { background: var(--accent-soft); }
+
+      /* The editor paints highlighted tokens on an aria-hidden <pre> behind
+         the textarea; the textarea's own text is transparent (caret and
+         selection stay visible) so the tokens show through. Both layers must
+         share font, padding, and wrapping for the overlay to line up. */
+      .editor-wrap { position: relative; }
+      #src {
+        background: transparent;
+        color: transparent;
+        -webkit-text-fill-color: transparent;
+        caret-color: var(--accent);
+      }
+      .src-hl {
+        position: absolute;
+        inset: 0;
+        margin: 0;
+        overflow: hidden;
+        pointer-events: none;
+        user-select: none;
+        background: transparent;
+        color: var(--text);
+        font-family: var(--font-mono);
+        font-size: 13.5px;
+        line-height: 1.6;
+        padding: 1rem 1.1rem;
+        tab-size: 2;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow-wrap: break-word;
+      }
+      .tok-comment { color: var(--syn-comment); font-style: italic; }
+      .tok-keyword { color: var(--syn-keyword); }
+      .tok-string  { color: var(--syn-string); }
+      .tok-number  { color: var(--syn-number); }
+      .tok-func    { color: var(--syn-function); }
+
+      /* ---- console ---- */
+      .console {
+        flex: 1;
+        margin: 0;
+        overflow: auto;
+        min-height: 46vh;
+        background: var(--code-bg);
+        color: var(--text);
+        font-family: var(--font-mono);
+        font-size: 13px;
+        line-height: 1.65;
+        padding: 0.9rem 1.1rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.15rem;
+      }
+      .console .line { white-space: pre-wrap; word-break: break-word; }
+      .console .line .tag {
+        display: inline-block;
+        margin-right: 0.5rem;
+        font-weight: 700;
+        opacity: 0.85;
+      }
+      .console .line.js .tag { color: var(--accent); }
+      .console .line.info .tag { color: var(--accent); }
+      .console .line.warn .tag { color: var(--warn); }
+      .console .line.debug .tag { color: var(--faint); }
+      .console .line.error .tag,
+      .console .line.rejection .tag { color: var(--danger); }
+      .console .line.error { color: var(--danger); }
+      .console .line.result { color: var(--accent); }
+      .console .line.result .tag { color: var(--muted); }
+      .console .line.system { color: var(--muted); font-style: italic; }
+      .console .line.rejection { color: var(--danger); }
+      .console .line:empty { display: none; }
+
+      /* ---- mode switch ---- */
+      .segmented {
+        display: inline-flex;
+        gap: 2px;
+        padding: 3px;
+        border: 1px solid var(--border-strong);
+        border-radius: 999px;
+        background: var(--surface-raised);
+      }
+      .seg {
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        font: inherit;
+        font-size: 0.8rem;
+        font-weight: 600;
+        padding: 0.28rem 0.7rem;
+        border-radius: 999px;
+        cursor: pointer;
+        transition: color 0.15s ease, background-color 0.15s ease;
+      }
+      .seg:hover { color: var(--text); }
+      .seg.active {
+        background: var(--accent);
+        color: var(--on-accent);
+      }
+
+      /* ---- repl ---- */
+      .repl-shell { display: flex; flex-direction: column; min-height: 60vh; }
+      .repl-out {
+        flex: 1 1 auto;
+        min-height: 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .repl-form {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.65rem 1rem;
+        background: var(--surface-raised);
+      }
+      .repl-prompt {
+        color: var(--accent);
+        font-family: var(--font-mono);
+        font-size: 1rem;
+        font-weight: 700;
+        line-height: 1;
+        user-select: none;
+      }
+      .repl-input {
+        flex: 1;
+        min-width: 0;
+        border: 0;
+        outline: none;
+        background: transparent;
+        color: var(--text);
+        font: 13px/1.6 var(--font-mono);
+        caret-color: var(--accent);
+      }
+      .repl-input:disabled { color: var(--faint); }
+      .console .line.input .tag { color: var(--muted); }
+      .console .line.input { color: var(--text); }
+      .console .line.out { color: var(--text); }
+      .console .line.out-void { color: var(--faint); }
+
+      @media (prefers-reduced-motion: reduce) {
+        * { transition: none !important; animation: none !important; }
+      }
+
+      /* ---- footer ---- */
+      footer {
+        margin-top: clamp(1rem, 3vw, 1.75rem);
+        color: var(--faint);
+        font-size: 0.8rem;
+      }
+      footer code {
+        font-family: var(--font-mono);
+        font-size: 0.78rem;
+        background: var(--code-bg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 0.05rem 0.35rem;
+      }
+      footer details { margin-top: 0.4rem; }
+      footer summary { cursor: pointer; }
+      footer pre {
+        font-family: var(--font-mono);
+        font-size: 0.8rem;
+        background: var(--code-bg);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: 0.7rem 0.9rem;
+        overflow: auto;
+      }
     </style>
   </head>
   <body>
-    <h1>Slag in the browser</h1>
-    <p>
-      Build first: <code>cargo build -p slag --example wasm_binding
-      --target wasm32-unknown-unknown --release</code>, then serve this repo
-      root (e.g. <code>python -m http.server</code>) and reload.
-    </p>
-    <textarea id="src" spellcheck="false">function fib(n) { return n &lt; 2 ? n : fib(n - 1) + fib(n - 2); }
-console.log('fib(20) =', fib(20));
-setTimeout(() => console.log('1s later'), 1000);
-JSON.stringify({ engine: 'slag', ok: true })</textarea>
-    <br />
-    <button id="run">Run</button>
-    <pre id="out">loading…</pre>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <a class="nd" href="https://github.com/sdgoij/slag"><h1>Slag<span class="flame">_</span></h1></a>
+          <p class="tagline">a spec-faithful JavaScript engine, running in your browser</p>
+        </div>
+        <div class="top-actions">
+          <span id="status" class="status loading"><i class="dot"></i>loading</span>
+          <div class="segmented" role="group" aria-label="Mode">
+            <button class="seg active" data-mode="script" type="button" aria-pressed="true">Script</button>
+            <button class="seg" data-mode="repl" type="button" aria-pressed="false">REPL</button>
+          </div>
+          <button id="theme" class="btn btn-ghost icon-btn" type="button" title="Theme (auto / light / dark)">◐</button>
+        </div>
+      </header>
+
+      <main>
+        <div id="script-view" class="panes">
+        <section class="pane">
+          <div class="pane-head">
+            <span class="pane-title">script</span>
+            <div class="pane-tools">
+              <select id="example" class="mode-select" aria-label="Example script" title="Load an example into the editor">
+                <option value="default">sample</option>
+                <option value="objects">objects & json</option>
+                <option value="async">async & timers</option>
+                <option value="regexp">regexp</option>
+              </select>
+              <select id="run-mode" class="mode-select" aria-label="Run mode" title="What Run does with the editor contents">
+                <option value="execute">Execute</option>
+                <option value="tokens">Tokens</option>
+                <option value="ast">AST</option>
+                <option value="bytecode">Bytecode</option>
+              </select>
+              <span class="pane-hint">run with <kbd>Ctrl</kbd>+<kbd>Enter</kbd></span>
+            </div>
+          </div>
+          <div class="editor-wrap">
+            <pre id="src-hl" class="src-hl" aria-hidden="true"></pre>
+            <textarea id="src" spellcheck="false" aria-label="JavaScript source">const note = "from scratch, in your browser";
+console.log("hello from slag 👋", note);
+
+function fib(n) {
+  return n < 2 ? n : fib(n - 1) + fib(n - 2);
+}
+console.log("fib(20) =", fib(20));
+
+// Real timers (the glue auto-drains the engine's job queue).
+setTimeout(() => console.log("⏱ one second later — setTimeout works"), 1000);
+
+new Intl.DateTimeFormat("en-GB", { dateStyle: "full", timeStyle: "short" }).format(new Date());</textarea>
+          </div>
+        </section>
+
+        <section class="pane">
+          <div class="pane-head">
+            <span class="pane-title">output</span>
+            <div class="pane-actions">
+              <button id="copy" class="btn btn-ghost" type="button" title="Copy the output to the clipboard">Copy</button>
+              <button id="clear" class="btn btn-ghost" type="button">Clear</button>
+              <button id="run" class="btn btn-primary" type="button">Run</button>
+            </div>
+          </div>
+          <pre id="out" class="console" aria-live="polite">Loading the engine…</pre>
+        </section>
+        </div>
+
+        <section id="repl-view" class="pane repl-shell" hidden>
+          <div class="pane-head">
+            <span class="pane-title">repl</span>
+            <div class="pane-actions">
+              <button id="repl-copy" class="btn btn-ghost" type="button" title="Copy the output to the clipboard">Copy</button>
+              <button id="repl-clear" class="btn btn-ghost" type="button">Clear</button>
+            </div>
+          </div>
+          <pre id="repl-out" class="console repl-out" aria-live="polite"></pre>
+          <form id="repl-form" class="repl-form">
+            <span id="repl-prompt" class="repl-prompt">&gt;</span>
+            <input id="repl-input" class="repl-input" type="text" spellcheck="false"
+              autocomplete="off" aria-label="REPL input"
+              placeholder="type JavaScript, press Enter" disabled />
+          </form>
+        </section>
+      </main>
+
+      <footer>
+        <p>
+          Every byte of the engine — parser, bytecode VM, and built-ins — is
+          <a href="https://github.com/sdgoij/slag">Slag</a>, compiled to WebAssembly. No JavaScript engine is hiding in the
+          browser tab.
+        </p>
+        <details>
+          <summary>Run this locally</summary>
+          <pre><code>cargo build -p slag --example wasm_binding --target wasm32-unknown-unknown --release
+python -m http.server    # then open the served docs/index.html</code></pre>
+          <p>This page executes <code>docs/slag.wasm</code>, built from <code>crates/slag/examples/wasm_binding.rs</code>.</p>
+          <p>Source: <a href="https://github.com/sdgoij/slag">github.com/sdgoij/slag</a></p>
+        </details>
+      </footer>
+    </div>
+
     <script type="module">
       import { fromUrl } from './slag.js';
 
-      const out = document.getElementById('out');
-      const append = (text) => {
-        out.textContent += text + '\n';
+      const status = document.getElementById('status');
+      const src = document.getElementById('src');
+      const runBtn = document.getElementById('run');
+      const runModeEl = document.getElementById('run-mode');
+      const clearBtn = document.getElementById('clear');
+      const themeBtn = document.getElementById('theme');
+      const modeBtns = Array.from(document.querySelectorAll('.seg[data-mode]'));
+      const scriptView = document.getElementById('script-view');
+      const replView = document.getElementById('repl-view');
+      const scriptOut = document.getElementById('out');
+      const replOut = document.getElementById('repl-out');
+      const replForm = document.getElementById('repl-form');
+      const replInput = document.getElementById('repl-input');
+      const replPrompt = document.getElementById('repl-prompt');
+      const replClearBtn = document.getElementById('repl-clear');
+      const replCopyBtn = document.getElementById('repl-copy');
+      const copyBtn = document.getElementById('copy');
+      const exampleEl = document.getElementById('example');
+      const srcHl = document.getElementById('src-hl');
+
+      let slag = null;      // engine binding, set once wasm loads
+      let activeOut = scriptOut;
+      let mode = 'script';
+
+      // ---- theme: auto (follow the OS) → light → dark, persisted. ----
+      const THEMES = ['auto', 'light', 'dark'];
+      const THEME_GLYPH = { auto: '◐', light: '☀', dark: '☾' };
+      const THEME_LABEL = { auto: 'Theme: follow system', light: 'Theme: light', dark: 'Theme: dark' };
+      const applyTheme = (theme) => {
+        document.documentElement.dataset.theme = theme;
+        localStorage.setItem('slag-theme', theme);
+        themeBtn.textContent = THEME_GLYPH[theme];
+        themeBtn.title = THEME_LABEL[theme];
+      };
+      themeBtn.addEventListener('click', () => {
+        const next = THEMES[(THEMES.indexOf(document.documentElement.dataset.theme) + 1) % THEMES.length];
+        applyTheme(next);
+      });
+      applyTheme(document.documentElement.dataset.theme);
+
+      const setStatus = (state, text) => {
+        status.className = `status ${state}`;
+        status.innerHTML = `<i class="dot"></i>${text}`;
       };
 
-      const slag = await fromUrl('slag.wasm', {
-        console: {
-          log: (line) => append(`[js] ${line}`),
-          info: (line) => append(`[info] ${line}`),
-          warn: (line) => append(`[warn] ${line}`),
-          error: (line) => append(`[error] ${line}`),
-          debug: (line) => append(`[debug] ${line}`),
-        },
-      });
-      out.textContent = 'Slag ready. Run a script.\n';
+      // ---- console rendering (one buffer per pane; emit follows the mode) ----
+      const lineInto = (host, kind, tag, text) => {
+        const el = document.createElement('div');
+        el.className = `line ${kind}`;
+        if (tag) {
+          const tagEl = document.createElement('span');
+          tagEl.className = 'tag';
+          tagEl.textContent = tag;
+          el.appendChild(tagEl);
+        }
+        el.appendChild(document.createTextNode(text));
+        host.appendChild(el);
+        host.scrollTop = host.scrollHeight;
+      };
+      const clearInto = (host) => { host.textContent = ''; };
+      const emit = (kind, tag, text) =>
+        lineInto(activeOut, kind, activeOut === replOut ? null : tag, text);
 
-      document.getElementById('run').addEventListener('click', () => {
-        const source = document.getElementById('src').value;
-        out.textContent = '';
+      // ---- copy output to the clipboard ----
+      const copyText = async (text) => {
+        if (navigator.clipboard && window.isSecureContext) {
+          try {
+            await navigator.clipboard.writeText(text);
+            return true;
+          } catch {
+            // Fall through to the legacy path (e.g. permissions denied).
+          }
+        }
+        const helper = document.createElement('textarea');
+        helper.value = text;
+        helper.setAttribute('readonly', '');
+        helper.style.position = 'fixed';
+        helper.style.opacity = '0';
+        document.body.appendChild(helper);
+        helper.select();
+        let ok = false;
         try {
-          const result = slag.eval(source);
-          if (result) append(result);
-        } catch (error) {
-          append(`✗ ${error.message}`);
+          ok = document.execCommand('copy');
+        } catch {
+          ok = false;
+        }
+        helper.remove();
+        return ok;
+      };
+      const flashCopy = async (button, host) => {
+        const lines = Array.from(host.querySelectorAll('.line'));
+        const text = lines.length > 0
+          ? lines.map((line) => line.textContent).join('\n')
+          : host.textContent;
+        const ok = await copyText(text);
+        const previous = button.textContent;
+        button.textContent = ok ? 'Copied' : 'Copy failed';
+        button.disabled = true;
+        setTimeout(() => {
+          button.textContent = previous;
+          button.disabled = false;
+        }, 1200);
+      };
+      copyBtn.addEventListener('click', () => flashCopy(copyBtn, scriptOut));
+      replCopyBtn.addEventListener('click', () => flashCopy(replCopyBtn, replOut));
+
+      // A wasm trap (deep recursion / stack limit) leaves the engine context
+      // unusable; reset it so the next evaluation starts fresh.
+      const handleEvalError = (error) => {
+        if (error && error.slag === true) {
+          emit('error', '✗', error.message);
+          return;
+        }
+        const message = (error && error.message) || 'engine error';
+        emit('error', '✗', message);
+        emit('system', null, 'the wasm stack limit was hit — engine context reset');
+        if (slag) slag.reset();
+        setStatus('ready', 'ready');
+      };
+
+      // ---- mode switching ----
+      const setMode = (next) => {
+        mode = next;
+        modeBtns.forEach((btn) => {
+          const active = btn.dataset.mode === next;
+          btn.classList.toggle('active', active);
+          btn.setAttribute('aria-pressed', String(active));
+        });
+        scriptView.hidden = next !== 'script';
+        replView.hidden = next !== 'repl';
+        activeOut = next === 'repl' ? replOut : scriptOut;
+        resetRepl();
+        if (next === 'repl') {
+          greetRepl();
+          replInput.disabled = slag === null;
+          replInput.focus();
+        }
+      };
+      modeBtns.forEach((btn) => btn.addEventListener('click', () => setMode(btn.dataset.mode)));
+
+      // ---- repl ----
+      let replBuffer = '';
+      let replHistory = [];
+      let replHistPos = 0;
+      let replDraft = '';
+      let replGreeted = false;
+
+      const renderReplPrompt = () => {
+        replPrompt.textContent = replBuffer ? '...' : '>';
+      };
+      const greetRepl = () => {
+        if (replGreeted) return;
+        replGreeted = true;
+        lineInto(replOut, 'system', null, 'Welcome to Slag — JavaScript in your browser');
+        lineInto(replOut, 'system', null, 'Type ".help" for more information.');
+      };
+      const resetRepl = () => {
+        replBuffer = '';
+        replHistPos = replHistory.length;
+        replDraft = '';
+        replInput.value = '';
+        renderReplPrompt();
+      };
+
+      // Mirror of the CLI REPL: only evaluate once strings/templates/comments
+      // are closed and bracket depth is back to zero (so blocks can span
+      // several entered lines).
+      const inputComplete = (source) => {
+        const chars = Array.from(source);
+        let depth = 0;
+        let inString = null;
+        let lineComment = false;
+        let blockComment = false;
+        let i = 0;
+        while (i < chars.length) {
+          const c = chars[i];
+          if (lineComment) {
+            if (c === '\n') lineComment = false;
+            i += 1;
+            continue;
+          }
+          if (blockComment) {
+            if (c === '*' && chars[i + 1] === '/') {
+              blockComment = false;
+              i += 2;
+            } else {
+              i += 1;
+            }
+            continue;
+          }
+          if (inString) {
+            if (c === '\\') {
+              i += 2;
+              continue;
+            }
+            if (c === inString) inString = null;
+            i += 1;
+            continue;
+          }
+          if (c === '/' && chars[i + 1] === '/') {
+            lineComment = true;
+            i += 2;
+            continue;
+          }
+          if (c === '/' && chars[i + 1] === '*') {
+            blockComment = true;
+            i += 2;
+            continue;
+          }
+          if (c === "'" || c === '"' || c === '`') {
+            inString = c;
+          } else if (c === '(' || c === '[' || c === '{') {
+            depth += 1;
+          } else if (c === ')' || c === ']' || c === '}') {
+            depth -= 1;
+          }
+          i += 1;
+        }
+        return depth <= 0 && inString === null && !lineComment && !blockComment;
+      };
+
+      // Node-style dot commands, handled before anything is evaluated.
+      const runDotCommand = (command) => {
+        switch (command) {
+          case '.help':
+            lineInto(replOut, 'system', null, '.break   cancel the current multi-line input');
+            lineInto(replOut, 'system', null, '.clear   clear the console and reset the engine context');
+            lineInto(replOut, 'system', null, '.exit    leave the REPL and return to Script mode');
+            lineInto(replOut, 'system', null, '.help    print this help message');
+            break;
+          case '.clear':
+            clearInto(replOut);
+            if (slag) slag.reset();
+            setStatus('ready', 'ready');
+            break;
+          case '.break':
+            replBuffer = '';
+            renderReplPrompt();
+            break;
+          case '.exit':
+            setMode('script');
+            break;
+          default:
+            // Node's own response to an unknown keyword.
+            lineInto(replOut, 'error', null, 'Invalid REPL keyword');
+        }
+        replOut.scrollTop = replOut.scrollHeight;
+      };
+
+      replForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        if (slag === null) return;
+        const raw = replInput.value;
+        if (!replBuffer && raw.trim() === '') {
+          replInput.value = '';
+          replInput.focus();
+          return;
+        }
+        lineInto(replOut, 'input', replBuffer ? '...' : '>', raw);
+        replInput.value = '';
+        const trimmed = raw.trim();
+        const midMultiLineCommand = trimmed === '.break' || trimmed === '.exit';
+        if (trimmed.startsWith('.') && (!replBuffer || midMultiLineCommand)) {
+          runDotCommand(trimmed);
+          replInput.focus();
+          return;
+        }
+        replBuffer = replBuffer ? `${replBuffer}\n${raw}` : raw;
+        if (!inputComplete(replBuffer)) {
+          renderReplPrompt();
+          replInput.focus();
+          return;
+        }
+        const source = replBuffer;
+        replBuffer = '';
+        renderReplPrompt();
+        if (source.trim() !== '') {
+          replHistory.push(source);
+          replHistPos = replHistory.length;
+          try {
+            const result = slag.eval(source);
+            const type = slag.resultType();
+            // Like Node: show every completion, even `undefined` (e.g. after
+            // `const x = 1;`), and quote string completions.
+            const shown = type === 5 ? quoteString(result) : result;
+            lineInto(replOut, type === 1 ? 'out-void' : 'out', null, shown);
+          } catch (error) {
+            handleEvalError(error);
+          }
+        }
+        replOut.scrollTop = replOut.scrollHeight;
+        replInput.focus();
+      });
+
+      // Up/down walk the history (only at the top level of a submission).
+      replInput.addEventListener('keydown', (event) => {
+        if (replBuffer) return;
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          if (replHistory.length === 0) return;
+          if (replHistPos === replHistory.length) replDraft = replInput.value;
+          if (replHistPos > 0) {
+            replHistPos -= 1;
+            replInput.value = replHistory[replHistPos];
+          }
+        } else if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          if (replHistPos < replHistory.length) {
+            replHistPos += 1;
+            replInput.value = replHistPos === replHistory.length ? replDraft : replHistory[replHistPos];
+          } else {
+            replInput.value = replDraft;
+          }
         }
       });
+
+      replClearBtn.addEventListener('click', () => {
+        clearInto(replOut);
+        resetRepl();
+        if (slag) slag.reset();
+        setStatus('ready', 'ready');
+        lineInto(replOut, 'system', null, 'console cleared · engine context reset');
+        replInput.focus();
+      });
+
+      // ---- editor syntax highlighting ----
+      const SYN_KEYWORDS = new Set([
+        'async', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue',
+        'debugger', 'default', 'delete', 'do', 'else', 'export', 'extends', 'false',
+        'finally', 'for', 'function', 'get', 'if', 'import', 'in', 'instanceof',
+        'let', 'new', 'null', 'of', 'return', 'set', 'static', 'super', 'switch',
+        'this', 'throw', 'true', 'try', 'typeof', 'var', 'void', 'while', 'with',
+        'yield',
+      ]);
+      const isWordStart = (c) => /[A-Za-z_$]/.test(c) || c.charCodeAt(0) > 127;
+      const isWordChar = (c) => /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) > 127;
+
+      const skipQuote = (code, start) => {
+        const quote = code[start];
+        let i = start + 1;
+        while (i < code.length) {
+          const ch = code[i];
+          if (ch === '\\') { i += 2; continue; }
+          if (ch === quote) return i + 1;
+          if (ch === '\n') return i;
+          i += 1;
+        }
+        return code.length;
+      };
+
+      const skipTemplate = (code, start) => {
+        let i = start + 1;
+        while (i < code.length) {
+          const ch = code[i];
+          if (ch === '\\') { i += 2; continue; }
+          if (ch === '`') return i + 1;
+          if (ch === '$' && code[i + 1] === '{') {
+            i = findHoleEnd(code, i + 2) + 1;
+            continue;
+          }
+          i += 1;
+        }
+        return code.length;
+      };
+
+      const findHoleEnd = (code, from) => {
+        // `from` is just past `${` in a template literal; return the index of
+        // its matching `}` (strings, comments, and nested templates ignored).
+        let depth = 1;
+        let i = from;
+        while (i < code.length) {
+          const c = code[i];
+          if (c === '\\') { i += 2; continue; }
+          if (c === "'" || c === '"') { i = skipQuote(code, i); continue; }
+          if (c === '`') { i = skipTemplate(code, i); continue; }
+          if (c === '/' && code[i + 1] === '/') {
+            const nl = code.indexOf('\n', i);
+            i = nl === -1 ? code.length : nl;
+            continue;
+          }
+          if (c === '/' && code[i + 1] === '*') {
+            const end = code.indexOf('*/', i + 2);
+            i = end === -1 ? code.length : end + 2;
+            continue;
+          }
+          if (c === '{') depth += 1;
+          else if (c === '}') {
+            depth -= 1;
+            if (depth === 0) return i;
+          }
+          i += 1;
+        }
+        return code.length;
+      };
+
+      const scanNumber = (code, start) => {
+        const c = code[start];
+        const c1 = code[start + 1] || '';
+        let i = start;
+        if (c === '0' && /[xX]/.test(c1)) {
+          i = start + 2;
+          while (i < code.length && /[0-9a-fA-F_]/.test(code[i])) i += 1;
+        } else if (c === '0' && /[bB]/.test(c1)) {
+          i = start + 2;
+          while (i < code.length && /[01_]/.test(code[i])) i += 1;
+        } else if (c === '0' && /[oO]/.test(c1)) {
+          i = start + 2;
+          while (i < code.length && /[0-7_]/.test(code[i])) i += 1;
+        } else {
+          while (i < code.length && /[0-9_]/.test(code[i])) i += 1;
+          if (code[i] === '.') {
+            i += 1;
+            while (i < code.length && /[0-9_]/.test(code[i])) i += 1;
+          }
+          if (i < code.length && /[eE]/.test(code[i])) {
+            const k = i;
+            let j = i + 1;
+            if (j < code.length && /[+-]/.test(code[j])) j += 1;
+            if (j < code.length && /[0-9]/.test(code[j])) {
+              i = j;
+              while (i < code.length && /[0-9_]/.test(code[i])) i += 1;
+            } else {
+              i = k;
+            }
+          }
+        }
+        if (code[i] === 'n') i += 1;
+        return i;
+      };
+
+      const tokenize = (code) => {
+        const spans = [];
+        const push = (cls, text) => {
+          if (!text) return;
+          const last = spans[spans.length - 1];
+          if (last && last.cls === cls) last.text += text;
+          else spans.push({ cls, text });
+        };
+        let i = 0;
+        while (i < code.length) {
+          const c = code[i];
+          if (/\s/.test(c)) {
+            let j = i + 1;
+            while (j < code.length && /\s/.test(code[j])) j += 1;
+            push(null, code.slice(i, j));
+            i = j;
+            continue;
+          }
+          if (c === '/' && code[i + 1] === '/') {
+            let j = i + 2;
+            while (j < code.length && code[j] !== '\n') j += 1;
+            push('tok-comment', code.slice(i, j));
+            i = j;
+            continue;
+          }
+          if (c === '/' && code[i + 1] === '*') {
+            const end = code.indexOf('*/', i + 2);
+            const j = end === -1 ? code.length : end + 2;
+            push('tok-comment', code.slice(i, j));
+            i = j;
+            continue;
+          }
+          if (c === '"' || c === "'") {
+            const j = skipQuote(code, i);
+            push('tok-string', code.slice(i, j));
+            i = j;
+            continue;
+          }
+          if (c === '`') {
+            // Template literal: `${ expr }` holes are tokenized as code so
+            // braces and strings inside them keep their own colors.
+            let j = i + 1;
+            let seg = i;
+            while (j < code.length) {
+              const ch = code[j];
+              if (ch === '\\') { j += 2; continue; }
+              if (ch === '`') { j += 1; break; }
+              if (ch === '$' && code[j + 1] === '{') {
+                const end = findHoleEnd(code, j + 2);
+                push('tok-string', code.slice(seg, j));
+                push('tok-string', '${');
+                for (const inner of tokenize(code.slice(j + 2, end))) {
+                  push(inner.cls, inner.text);
+                }
+                if (end < code.length) push('tok-string', '}');
+                j = end + 1;
+                seg = j;
+                continue;
+              }
+              j += 1;
+            }
+            push('tok-string', code.slice(seg, j));
+            i = j;
+            continue;
+          }
+          if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(code[i + 1] || ''))) {
+            const j = scanNumber(code, i);
+            push('tok-number', code.slice(i, j));
+            i = j;
+            continue;
+          }
+          if (isWordStart(c)) {
+            let j = i + 1;
+            while (j < code.length && isWordChar(code[j])) j += 1;
+            const word = code.slice(i, j);
+            if (SYN_KEYWORDS.has(word)) {
+              push('tok-keyword', word);
+            } else {
+              let k = j;
+              while (k < code.length && /\s/.test(code[k])) k += 1;
+              push(code[k] === '(' ? 'tok-func' : null, word);
+            }
+            i = j;
+            continue;
+          }
+          push(null, c);
+          i += 1;
+        }
+        return spans;
+      };
+
+      const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+      const escHtml = (text) => text.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
+
+      const alignHighlight = () => {
+        // The overlay must wrap exactly where the textarea does; give it the
+        // same padding plus whatever scrollbar gutter the textarea reserves.
+        const gutter = Math.max(0, src.offsetWidth - src.clientWidth);
+        srcHl.style.paddingRight = gutter > 0 ? `calc(1.1rem + ${gutter}px)` : '';
+      };
+      const paintHighlight = () => {
+        let html = '';
+        for (const { cls, text } of tokenize(src.value)) {
+          const safe = escHtml(text);
+          html += cls ? `<span class="${cls}">${safe}</span>` : safe;
+        }
+        srcHl.innerHTML = html;
+        alignHighlight();
+        srcHl.scrollTop = src.scrollTop;
+        srcHl.scrollLeft = src.scrollLeft;
+      };
+      src.addEventListener('input', paintHighlight);
+      src.addEventListener('scroll', () => {
+        srcHl.scrollTop = src.scrollTop;
+        srcHl.scrollLeft = src.scrollLeft;
+      });
+      new ResizeObserver(alignHighlight).observe(src);
+      paintHighlight(); // paint the initial sample while the engine loads
+
+      // ---- ready-made example snippets ----
+      const EXAMPLES = {
+        objects: `// Objects, classes, JSON, destructuring, and accessors.
+
+class Point {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
+  }
+  norm() {
+    return Math.hypot(this.x, this.y);
+  }
+}
+const p = new Point(3, 4);
+console.log('norm of (3, 4):', p.norm());
+
+const record = {
+  name: 'slag',
+  tags: ['spec', 'faithful'],
+  meta: { edition: 2026 },
+};
+console.log('JSON:', JSON.stringify(record));
+console.log('keys:', Object.keys(record).join(', '));
+console.log('round trip:', JSON.parse(JSON.stringify(record)).meta.edition);
+
+const { name, meta: { edition } } = record;
+console.log('destructured:', name, edition);
+
+const counter = {
+  _n: 0,
+  get n() {
+    return this._n;
+  },
+  set n(value) {
+    this._n = value;
+  },
+};
+counter.n = 41;
+console.log('getter/setter:', counter.n + 1);
+`,
+        async: `// Promises, microtasks, and real timers (the glue drains the engine).
+
+console.log('1: sync start');
+
+Promise.resolve('2: microtask').then(console.log);
+
+setTimeout(() => console.log('5: macrotask after ~100ms'), 100);
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function demo() {
+  console.log('3: async body');
+  await delay(150);
+  console.log('6: after await ~150ms');
+}
+demo();
+
+console.log('4: sync end');
+`,
+        regexp: String.raw`// Regular expressions with full ECMAScript semantics.
+
+const re = /^(?<area>\d{3})-(?<exch>\d{3})-(?<num>\d{4})$/;
+const match = re.exec('800-555-0199');
+console.log('named groups:', match.groups);
+
+console.log('unicode property:', /^\p{Script=Greek}+$/u.test('αβγ'));
+
+console.log('lookahead:', /foo(?=bar)/.test('foobar'));
+
+console.log('backreference:', /^(ab)\1$/.test('abab'));
+
+console.log('replace:', 'a1b2c3'.replace(/\d/g, (digit) => Number(digit) * 10));
+
+console.log('split:', 'The quick brown fox'.split(/\s+/).join('|'));
+`,
+      };
+
+      // The engine hands completion values back as bare text; show string
+      // completions quoted the way Node's REPL does.
+      const quoteString = (text) => {
+        let out = "'";
+        for (const ch of text) {
+          switch (ch) {
+            case '\\': out += '\\\\'; break;
+            case "'": out += "\\'"; break;
+            case '\n': out += '\\n'; break;
+            case '\r': out += '\\r'; break;
+            case '\t': out += '\\t'; break;
+            case '\b': out += '\\b'; break;
+            case '\f': out += '\\f'; break;
+            case '\v': out += '\\v'; break;
+            default: {
+              const point = ch.codePointAt(0);
+              if (point < 0x20 || (point >= 0x7f && point < 0xa0)) {
+                out += '\\x' + point.toString(16).padStart(2, '0');
+              } else {
+                out += ch;
+              }
+            }
+          }
+        }
+        return out + "'";
+      };
+
+      // ---- engine boot ----
+      try {
+        slag = await fromUrl('slag.wasm', {
+          console: {
+            log: (text) => emit('js', '[js]', text),
+            info: (text) => emit('info', '[info]', text),
+            warn: (text) => emit('warn', '[warn]', text),
+            error: (text) => emit('error', '[error]', text),
+            debug: (text) => emit('debug', '[debug]', text),
+          },
+        });
+        setStatus('ready', 'ready');
+        replInput.disabled = false;
+
+        const runScript = () => {
+          clearInto(scriptOut);
+          const source = src.value;
+          const runMode = runModeEl.value;
+          try {
+            if (runMode === 'execute') {
+              const result = slag.eval(source);
+              // String completions are quoted, Node-style.
+              const shown = slag.resultType() === 5 ? quoteString(result) : result;
+              if (shown) lineInto(activeOut, 'result', '→', shown);
+            } else {
+              const kind = runMode === 'tokens' ? 0 : runMode === 'ast' ? 1 : 2;
+              const text = slag.dump(kind, source);
+              if (text) lineInto(activeOut, 'out', null, text);
+            }
+          } catch (error) {
+            handleEvalError(error);
+          }
+        };
+        runBtn.addEventListener('click', runScript);
+        src.addEventListener('keydown', (event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+            event.preventDefault();
+            runScript();
+          }
+        });
+        // Example snippets: replace the editor text and reset the realm so
+        // top-level declarations from a previous run cannot collide.
+        const loadExample = (value) => {
+          const source = value === 'default' ? src.defaultValue : EXAMPLES[value];
+          if (source === undefined) return;
+          src.value = source;
+          clearInto(scriptOut);
+          if (slag) slag.reset();
+          setStatus('ready', 'ready');
+          paintHighlight();
+          const label = exampleEl.options[exampleEl.selectedIndex]?.text ?? value;
+          lineInto(scriptOut, 'system', null, `loaded “${label}” · engine context reset`);
+        };
+        exampleEl.addEventListener('change', () => loadExample(exampleEl.value));
+
+        // Clear wipes the console AND resets the engine realm, so the
+        // sample (top-level `const`) can be run again from scratch.
+        clearBtn.addEventListener('click', () => {
+          clearInto(scriptOut);
+          slag.reset();
+          lineInto(scriptOut, 'system', null, 'console cleared · engine context reset');
+        });
+
+        // The embedded sample runs once on load so the page is alive
+        // immediately; clicking Run re-evaluates it.
+        setMode('script');
+        runScript();
+      } catch (error) {
+        clearInto(scriptOut);
+        setStatus('error', 'failed');
+        lineInto(scriptOut, 'error', '✗', `Could not start the engine: ${error.message}`);
+        lineInto(scriptOut, 'system', null, 'Make sure docs/slag.wasm is served next to this page.');
+      }
     </script>
   </body>
 </html>

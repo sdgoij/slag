@@ -58,6 +58,9 @@ JavaScriptCore C-API bindings.
 
 ## Quick start
 
+Run it in the browser: the [live demo](https://sdgoij.github.io/slag/)
+compiles the same engine to WebAssembly.
+
 Requires a stable Rust toolchain (edition 2024) and the pinned `test262`
 submodule — the `unicode` build script derives the RegExp property-escape
 tables from the corpus fixtures at compile time and fails with

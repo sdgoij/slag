@@ -16,6 +16,7 @@ pub mod binding;
 pub mod builtins;
 pub mod class;
 pub mod context;
+pub mod dump;
 pub mod embed;
 pub mod env;
 pub mod eval;

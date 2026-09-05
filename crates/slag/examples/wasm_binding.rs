@@ -35,6 +35,7 @@ struct Outcome {
 
 static mut CONTEXT: *mut Context = ptr::null_mut();
 static mut OUTCOME: Option<Outcome> = None;
+static mut RESULT_TYPE: u32 = 0;
 
 // Imported from the embedding JS (`env.slag_host_console`).
 #[cfg(target_arch = "wasm32")]
@@ -121,17 +122,44 @@ fn set_outcome(error: bool, text: String) {
     }
 }
 
+/// The completion value's `typeof` name as a small export code (0 unknown,
+/// 1 undefined, 2 boolean, 3 number, 4 bigint, 5 string, 6 symbol,
+/// 7 function, 8 object).
+fn type_code(name: &str) -> u32 {
+    match name {
+        "undefined" => 1,
+        "boolean" => 2,
+        "number" => 3,
+        "bigint" => 4,
+        "string" => 5,
+        "symbol" => 6,
+        "function" => 7,
+        "object" => 8,
+        _ => 0,
+    }
+}
+
+/// Record the completion's type; 0 for non-eval outcomes.
+fn set_result_type(kind: u32) {
+    // SAFETY: only called from the exports, single-threaded.
+    unsafe {
+        RESULT_TYPE = kind;
+    }
+}
+
 /// Evaluate `source` and render its completion, draining jobs only after the
 /// text is copied out (so a job-driven GC cannot move the value first).
 fn evaluate_in(context: &mut Context, source: &str) -> Result<(), String> {
     let value = context
         .eval_script(source)
         .map_err(|error| error.to_string())?;
+    let kind = type_code(value.type_name());
     let text = context
         .to_string(&value)
         .map_err(|error| error.to_string())?;
     context.run_jobs().map_err(|error| error.to_string())?;
     set_outcome(false, text);
+    set_result_type(kind);
     Ok(())
 }
 
@@ -200,6 +228,44 @@ pub unsafe extern "C" fn slag_eval(ptr: u32, len: u32) -> i32 {
     }
 }
 
+/// Render a debug dump of the UTF-8 script at `ptr` without evaluating it:
+/// `kind` 0 = tokens, 1 = AST, 2 = bytecode (the CLI's `--dump-tokens`,
+/// `--dump-ast`, `--print-bytecode`). Returns 0 on success.
+///
+/// # Safety
+/// `ptr` must point at `len` valid bytes in the module's linear memory (see
+/// [`slag_eval`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_dump(kind: u32, ptr: u32, len: u32) -> i32 {
+    let result = (|| {
+        // SAFETY: the caller guarantees `len` readable bytes at `ptr` when
+        // `len` is non-zero; empty scripts read as an empty slice.
+        let bytes = if len == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(ptr as *const u8, len as usize) }
+        };
+        let source =
+            std::str::from_utf8(bytes).map_err(|_| "script is not valid UTF-8".to_string())?;
+        match kind {
+            0 => slag::dump::tokens(source),
+            1 => slag::dump::ast(source),
+            2 => slag::dump::bytecode(source),
+            _ => Err(format!("slag_dump: unknown mode {kind}")),
+        }
+    })();
+    match result {
+        Ok(text) => {
+            set_outcome(false, text);
+            0
+        }
+        Err(message) => {
+            set_outcome(true, message);
+            1
+        }
+    }
+}
+
 /// Drain the pending job queues (microtasks and due timers). The JS glue
 /// calls this automatically when an engine timer comes due; hosts may also
 /// call it directly. Returns 0 on success.
@@ -240,8 +306,17 @@ pub extern "C" fn slag_reset() -> i32 {
             CONTEXT = ptr::null_mut();
         }
         OUTCOME = None;
+        RESULT_TYPE = 0;
     }
     0
+}
+
+/// The last evaluation's completion type as a code (see `type_code`): 0 for
+/// a non-eval outcome (dump/drain/error). Read after `slag_eval` returns 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_result_type() -> u32 {
+    // SAFETY: reads a plain u32; single-threaded.
+    unsafe { RESULT_TYPE }
 }
 
 /// The last outcome's UTF-8 text (0 bytes when empty).

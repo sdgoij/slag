@@ -905,10 +905,8 @@ fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
     Ok(unsafe { &mut *(agent as *mut Agent) })
 }
 
-/// `console.*`: stringify each argument with ToString (so objects run their
-/// `toString`/`valueOf` through the agent) and dispatch to the callback.
-/// The `index`-th argument as a UTF-8 string, or a TypeError naming the
-/// host function that expected it.
+/// The `index`-th argument of an `fs` builtin as a UTF-8 string path, or a
+/// TypeError naming the host function that expected it.
 #[cfg(feature = "fs")]
 fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, JsError> {
     match args.get(index).map(|v| v.kind()) {
@@ -918,6 +916,326 @@ fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, JsErro
             format!("{name}: expected a string path"),
         )),
     }
+}
+
+/// Render one `console.*` argument the way Node's console does: primitives
+/// as plain text (strings stay unquoted at the top level), plain-object and
+/// array containers inspected with a depth cap and an ancestor cycle guard,
+/// and objects with a prototype of their own (RegExp, Date, boxed
+/// primitives, class instances, ...) still rendered through `ToString` so
+/// nothing that printed before changes for them.
+///
+/// Spec `ToString` of a null-prototype object (a RegExp match's `groups`,
+/// `Object.create(null)`) throws; the console is host output and inspects
+/// those containers instead, exactly like Node's `util.inspect`.
+const INSPECT_DEPTH_LIMIT: usize = 3; // the root container is depth 0
+const INSPECT_MAX_ARRAY_ITEMS: usize = 100;
+
+fn render_console_arg(agent: &mut Agent, value: &Value) -> Result<String, JsError> {
+    render_console_value(agent, value, 0, false, &mut Vec::new())
+}
+
+fn render_console_value(
+    agent: &mut Agent,
+    value: &Value,
+    depth: usize,
+    quote_strings: bool,
+    path: &mut Vec<u64>,
+) -> Result<String, JsError> {
+    match value.kind() {
+        ValueKind::Undefined => Ok("undefined".to_string()),
+        ValueKind::Null => Ok("null".to_string()),
+        ValueKind::Boolean(boolean) => Ok(if boolean { "true" } else { "false" }.to_string()),
+        ValueKind::Number(number) => {
+            if number == 0.0 && number.is_sign_negative() {
+                Ok("-0".to_string())
+            } else {
+                js_to_string(agent, value).map(|text| text.to_string_lossy())
+            }
+        }
+        ValueKind::BigInt(_) => Ok(format!(
+            "{}n",
+            js_to_string(agent, value)?.to_string_lossy()
+        )),
+        ValueKind::String(text) => {
+            let text = text.to_string_lossy();
+            if quote_strings {
+                Ok(quote_console_string(&text))
+            } else {
+                Ok(text)
+            }
+        }
+        ValueKind::Symbol(symbol) => match symbol.description.as_ref() {
+            Some(description) => Ok(format!("Symbol({})", description.to_string_lossy())),
+            None => Ok("Symbol()".to_string()),
+        },
+        ValueKind::Function(function) => function_display_name(&function),
+        ValueKind::Object(object) => {
+            if path.contains(&object.id()) {
+                return Ok("[Circular]".to_string());
+            }
+            match &object.kind {
+                ObjectKind::Array(_) => {
+                    if depth >= INSPECT_DEPTH_LIMIT {
+                        Ok("[Array]".to_string())
+                    } else {
+                        render_console_array(agent, object, depth, path)
+                    }
+                }
+                ObjectKind::Ordinary => {
+                    let proto = object.get_prototype_of()?;
+                    let object_proto_id = agent
+                        .current_realm()?
+                        .intrinsics
+                        .get("%Object.prototype%")
+                        .and_then(|value| value.as_object())
+                        .map(|object| object.id());
+                    let plain = match &proto {
+                        None => true,
+                        Some(proto) => object_proto_id == Some(proto.id()),
+                    };
+                    if !plain {
+                        return js_to_string(agent, value).map(|text| text.to_string_lossy());
+                    }
+                    if depth >= INSPECT_DEPTH_LIMIT {
+                        Ok("[Object]".to_string())
+                    } else {
+                        render_console_object(agent, object, proto.is_none(), depth, path)
+                    }
+                }
+                _ => js_to_string(agent, value).map(|text| text.to_string_lossy()),
+            }
+        }
+    }
+}
+
+fn function_display_name(function: &Handle<Function>) -> Result<String, JsError> {
+    // Node prints `[Function: name]`; the name is the function's own data
+    // property, read without invoking any user accessor.
+    let name = function
+        .object
+        .get_own_property_key(&PropertyKey::from_utf8("name"))?
+        .and_then(|property| property.value())
+        .and_then(|value| match value.kind() {
+            ValueKind::String(text) => Some(text.to_string_lossy()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if name.is_empty() {
+        Ok("[Function (anonymous)]".to_string())
+    } else {
+        Ok(format!("[Function: {name}]"))
+    }
+}
+
+fn render_console_object(
+    agent: &mut Agent,
+    object: Handle<CruxObject>,
+    null_prototype: bool,
+    depth: usize,
+    path: &mut Vec<u64>,
+) -> Result<String, JsError> {
+    path.push(object.id());
+    let rendered = (|| -> Result<String, JsError> {
+        let mut parts: Vec<String> = Vec::new();
+        for key in object.own_property_keys()? {
+            let PropertyKey::String(atom) = &key else {
+                continue;
+            };
+            let Some(property) = object.get_own_property_key(&key)? else {
+                continue;
+            };
+            if !property.enumerable {
+                continue;
+            }
+            let name = crux::string::lookup(*atom).to_string_lossy();
+            let key_text = if is_console_identifier(&name) {
+                name
+            } else {
+                quote_console_string(&name)
+            };
+            let value_text = match property.value() {
+                Some(value) => render_console_value(agent, &value, depth + 1, true, path)?,
+                None => console_accessor_text(&property),
+            };
+            parts.push(format!("{key_text}: {value_text}"));
+        }
+        let prefix = if null_prototype {
+            "[Object: null prototype] "
+        } else {
+            ""
+        };
+        if parts.is_empty() {
+            Ok(format!("{prefix}{{}}"))
+        } else {
+            Ok(format!("{prefix}{{ {} }}", parts.join(", ")))
+        }
+    })();
+    path.pop();
+    rendered
+}
+
+fn render_console_array(
+    agent: &mut Agent,
+    array: Handle<CruxObject>,
+    depth: usize,
+    path: &mut Vec<u64>,
+) -> Result<String, JsError> {
+    path.push(array.id());
+    let rendered = (|| -> Result<String, JsError> {
+        let length = array
+            .get_own_property_key(&PropertyKey::from_utf8("length"))?
+            .and_then(|property| property.value())
+            .and_then(|value| value.as_number())
+            .unwrap_or(0.0)
+            .max(0.0) as u64;
+
+        let mut present: Vec<u64> = Vec::new();
+        let mut extra: Vec<String> = Vec::new();
+        for key in array.own_property_keys()? {
+            let PropertyKey::String(atom) = &key else {
+                continue;
+            };
+            let name = crux::string::lookup(*atom).to_string_lossy();
+            if let Ok(index) = name.parse::<u64>()
+                && index < length
+            {
+                present.push(index);
+                continue;
+            }
+            if name == "length" {
+                continue;
+            }
+            let Some(property) = array.get_own_property_key(&key)? else {
+                continue;
+            };
+            if !property.enumerable {
+                continue;
+            }
+            let key_text = if is_console_identifier(&name) {
+                name
+            } else {
+                quote_console_string(&name)
+            };
+            let value_text = match property.value() {
+                Some(value) => render_console_value(agent, &value, depth + 1, true, path)?,
+                None => console_accessor_text(&property),
+            };
+            extra.push(format!("{key_text}: {value_text}"));
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        let shown = present.len().min(INSPECT_MAX_ARRAY_ITEMS);
+        let mut truncated = false;
+        let mut cursor = 0;
+        if present.is_empty() {
+            if length > 0 {
+                parts.push(empty_items_text(length));
+            }
+        } else {
+            for &index in &present[..shown] {
+                if index > cursor {
+                    parts.push(empty_items_text(index - cursor));
+                }
+                let value = array
+                    .get_own_property_key(&PropertyKey::from_utf8(&index.to_string()))?
+                    .and_then(|property| property.value())
+                    .unwrap_or(Value::Undefined);
+                parts.push(render_console_value(agent, &value, depth + 1, true, path)?);
+                cursor = index + 1;
+            }
+            if shown < present.len() {
+                truncated = true;
+            } else if length > cursor {
+                parts.push(empty_items_text(length - cursor));
+            }
+        }
+        parts.extend(extra);
+        if truncated && length > cursor {
+            parts.push(format!("... {} more items", length - cursor));
+        }
+        if parts.is_empty() {
+            Ok("[]".to_string())
+        } else {
+            Ok(format!("[ {} ]", parts.join(", ")))
+        }
+    })();
+    path.pop();
+    rendered
+}
+
+/// `<N empty items>` — Node's spelling for array holes (singular at 1).
+fn empty_items_text(count: u64) -> String {
+    if count == 1 {
+        "<1 empty item>".to_string()
+    } else {
+        format!("<{count} empty items>")
+    }
+}
+
+/// How Node labels an accessor it refuses to invoke while inspecting.
+fn console_accessor_text(property: &crux::object::Property) -> String {
+    match &property.kind {
+        crux::object::PropertyKind::Accessor { get, set } => match (get.is_some(), set.is_some()) {
+            (true, true) => "[Getter/Setter]".to_string(),
+            (true, false) => "[Getter]".to_string(),
+            (false, true) => "[Setter]".to_string(),
+            (false, false) => "[Getter]".to_string(),
+        },
+        _ => "[Getter]".to_string(),
+    }
+}
+
+/// Whether `name` can be printed unquoted as a JS identifier (Node's rule
+/// for object keys; unicode letters count, integer-like names do not).
+fn is_console_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first == '$' || first.is_alphabetic())
+        && chars.all(|c| c == '_' || c == '$' || c.is_alphanumeric())
+}
+
+/// Quote a string for display inside a container, choosing the delimiter
+/// the way Node does: single quotes, double when the text holds `'`, and
+/// backticks when it holds both quote marks.
+fn quote_console_string(text: &str) -> String {
+    let single = text.contains('\'');
+    let double = text.contains('"');
+    let delim = match (single, double) {
+        (false, _) => '\'',
+        (true, false) => '"',
+        (true, true) if !text.contains('`') => '`',
+        (true, true) => '\'',
+    };
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push(delim);
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000c}' => out.push_str("\\f"),
+            '\u{000b}' => out.push_str("\\v"),
+            _ if ch == delim => {
+                out.push('\\');
+                out.push(ch);
+            }
+            ch => {
+                let point = ch as u32;
+                if point < 0x20 || (0x7f..0xa0).contains(&point) {
+                    out.push_str(&format!("\\x{point:02x}"));
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out.push(delim);
+    out
 }
 
 fn console_output(
@@ -933,7 +1251,7 @@ fn console_output(
         } else {
             // SAFETY: as in `current_agent_mut`.
             let agent = unsafe { &mut *(agent as *mut Agent) };
-            js_to_string(agent, arg)?.to_string_lossy()
+            render_console_arg(agent, arg)?
         };
         parts.push(text);
     }
@@ -1324,6 +1642,50 @@ mod tests {
         });
         context.eval("console.log('hello', 42)").unwrap();
         assert_eq!(seen.borrow().as_slice(), &["hello 42".to_string()]);
+    }
+
+    #[test]
+    fn console_inspects_objects_like_node() {
+        let mut context = Context::new().unwrap();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let captured = seen.clone();
+        context.set_host_callbacks(HostCallbacks {
+            console_log: Some(Box::new(move |line| {
+                captured.borrow_mut().push(line.to_string())
+            })),
+            ..HostCallbacks::default()
+        });
+        let mut log = |source: &str| {
+            context.eval(source).unwrap();
+            seen.borrow_mut().pop().unwrap()
+        };
+        // A null-prototype `groups` object used to throw on ToString; it now
+        // inspects like Node's console instead of crashing the log call.
+        assert_eq!(
+            log(
+                "console.log('named groups:', /^(?<area>\\d{3})-(?<exch>\\d{3})-(?<num>\\d{4})$/.exec('800-555-0199').groups)"
+            ),
+            "named groups: [Object: null prototype] { area: '800', exch: '555', num: '0199' }"
+        );
+        assert_eq!(
+            log("console.log({ a: 1, b: 'x', c: [1, [2]], d: { e: true } })"),
+            "{ a: 1, b: 'x', c: [ 1, [ 2 ] ], d: { e: true } }"
+        );
+        assert_eq!(log("console.log([1, , 3])"), "[ 1, <1 empty item>, 3 ]");
+        assert_eq!(log("console.log(new Array(3))"), "[ <3 empty items> ]");
+        assert_eq!(
+            log("console.log({ a: { b: { c: { d: 1 } } } })"),
+            "{ a: { b: { c: [Object] } } }"
+        );
+        assert_eq!(
+            log("console.log(1n, Symbol('s'), -0, 'x')"),
+            "1n Symbol(s) -0 x"
+        );
+        assert_eq!(log("console.log(function hi() {})"), "[Function: hi]");
+        assert_eq!(log("console.log(() => 1)"), "[Function (anonymous)]");
+        let cyclic = log("const o = {}; o.self = o; console.log(o)");
+        assert_eq!(cyclic, "{ self: [Circular] }");
+        assert_eq!(log("console.log({ q: 'it\\'s' })"), "{ q: \"it's\" }");
     }
 
     #[test]

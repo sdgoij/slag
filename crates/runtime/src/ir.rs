@@ -19820,6 +19820,68 @@ pub fn debug_print_body(body: &CompiledBody) {
     }
 }
 
+/// The pretty-printed step stream as a String — the `--print-bytecode` dump
+/// without capturing stdout, so hosts (the CLI, wasm bindings) can render it
+/// themselves.
+pub fn debug_body_to_string(body: &CompiledBody) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if let Some(scope) = &body.scope {
+        writeln!(
+            out,
+            "frame: {} slots, arity {}, {} tdz marks",
+            scope.frame_size,
+            scope.arity,
+            scope.tdz_store.len()
+        )
+        .ok();
+        let mut slots: Vec<_> = scope.slots.iter().collect();
+        slots.sort_by_key(|(_, slot)| **slot);
+        for (name, slot) in slots {
+            writeln!(
+                out,
+                "  slot {slot}: {}",
+                crux::lookup(*name).to_string_lossy()
+            )
+            .ok();
+        }
+    }
+    if let Some(globals) = &body.script_globals {
+        let mut names: Vec<&String> = globals.iter().collect();
+        names.sort();
+        writeln!(
+            out,
+            "script globals: {}",
+            names
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .ok();
+    }
+    writeln!(out, "env_constant: {}", body.env_constant).ok();
+    for (index, step) in body.steps.iter().enumerate() {
+        if let Step::FunctionDeclInit {
+            name,
+            frame_slot,
+            context_slot,
+            ..
+        } = step
+        {
+            writeln!(
+                out,
+                "{index:4}: FunctionDeclInit({} -> frame {frame_slot:?}, context {context_slot:?})",
+                crux::lookup(*name).to_string_lossy()
+            )
+            .ok();
+        } else {
+            writeln!(out, "{index:4}: {step:?}").ok();
+        }
+    }
+    out
+}
+
 // ---- Cut 3 scope analysis ----
 //
 // Certify a function body for the frame-slot fast path and lay out its
