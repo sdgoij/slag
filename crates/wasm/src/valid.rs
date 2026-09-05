@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
+use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
 use crate::types::{
     BlockType, FuncType, GlobalType, HeapType, Limits, MemType, RefType, TableType, ValType,
@@ -50,6 +50,9 @@ struct Spaces<'a> {
     tables: Vec<TableType>,
     /// Full memory index space.
     memories: Vec<MemType>,
+    /// Full tag index space: the resolved function type of each tag (imports
+    /// first, then module-defined tags).
+    tags: Vec<FuncType>,
     /// Function indices a `ref.func` may reference (spec's "declared"
     /// functions): those appearing in an element/global/table initializer or
     /// exported. Function bodies and the start function declare nothing, so a
@@ -83,6 +86,7 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
     let mut tables = Vec::new();
     let mut memories = Vec::new();
     let mut globals = Vec::new();
+    let mut tags = Vec::new();
     for import in &module.imports {
         match &import.desc {
             ImportDesc::Func(type_index) => {
@@ -100,7 +104,10 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
                 check_value_types(&[ty.value], module.types.len(), 0)?;
                 globals.push(*ty);
             }
-            ImportDesc::Tag(type_index) => validate_tag_type(module, *type_index)?,
+            ImportDesc::Tag(type_index) => {
+                validate_tag_type(module, *type_index)?;
+                tags.push(type_at(module, *type_index)?);
+            }
         }
     }
     let imported_globals = globals.len();
@@ -118,6 +125,9 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
     for global in &module.globals {
         check_value_types(&[global.ty.value], module.types.len(), 0)?;
         globals.push(global.ty);
+    }
+    for type_index in &module.tags {
+        tags.push(type_at(module, *type_index)?);
     }
 
     // Declared functions: `ref.func x` is valid only when `x` is declared by
@@ -157,6 +167,7 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
         imported_globals,
         tables,
         memories,
+        tags,
         declared,
     })
 }
@@ -450,6 +461,7 @@ fn matches_ref(expected: RefType, actual: RefType) -> bool {
     match (expected.heap, actual.heap) {
         (HeapType::Func, HeapType::Func) => true,
         (HeapType::Extern, HeapType::Extern) => true,
+        (HeapType::Exn, HeapType::Exn) => true,
         (HeapType::Type(x), HeapType::Type(y)) => x == y,
         // A typed function reference is a function reference.
         (HeapType::Func, HeapType::Type(_)) => true,
@@ -466,6 +478,9 @@ enum Ctrl {
     Loop,
     If,
     Else,
+    /// A `try_table` body: control flows like a block, but a `throw` inside
+    /// the body is delivered to its catch clauses instead of unwinding past.
+    TryTable,
 }
 
 /// An operand-stack entry: a known value type, or [`StackTy::Bot`], the
@@ -664,6 +679,43 @@ impl Machine {
         })
     }
 
+    /// Type-check one `try_table` catch clause (spec 3.4.2). The payload a
+    /// match delivers to the clause's branch target must fit that label's
+    /// types: the tag's parameters (plus the exception reference for the
+    /// `catch_ref` forms), or nothing/just the exception ref for the
+    /// catch-all forms.
+    fn check_catch(&self, catch: Catch, spaces: &Spaces<'_>) -> Result<(), Error> {
+        let (payload, label) = match catch {
+            Catch::Tag { tag, label } => (tag_at(spaces, tag as usize)?.params.clone(), label),
+            Catch::TagRef { tag, label } => {
+                let mut payload = tag_at(spaces, tag as usize)?.params.clone();
+                payload.push(ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::Exn,
+                }));
+                (payload, label)
+            }
+            Catch::All { label } => (vec![], label),
+            Catch::AllRef { label } => (
+                vec![ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::Exn,
+                })],
+                label,
+            ),
+        };
+        let types = self.label_types(label as usize)?;
+        if payload.len() != types.len()
+            || payload
+                .iter()
+                .zip(&types)
+                .any(|(actual, expected)| !matches_val(*expected, *actual))
+        {
+            return Err(Error::Invalid("type mismatch"));
+        }
+        Ok(())
+    }
+
     fn current_results(&self) -> &[ValType] {
         // The function frame is the bottom of the control stack.
         &self.frames[0].end_types
@@ -713,6 +765,17 @@ impl Machine {
                 let (params, results) = resolve_block_type(bt, spaces)?;
                 self.pop_vals(&params)?;
                 self.push_frame(Ctrl::If, params, results);
+            }
+            Instr::TryTable { blocktype, catches } => {
+                // The catch clauses target labels that enclose the
+                // `try_table` (its own label is only pushed once the body is
+                // entered), so check them against the current frames first.
+                let (params, results) = resolve_block_type(blocktype, spaces)?;
+                for catch in catches {
+                    self.check_catch(*catch, spaces)?;
+                }
+                self.pop_vals(&params)?;
+                self.push_frame(Ctrl::TryTable, params, results);
             }
             Instr::Else => {
                 let frame = self.pop_frame()?;
@@ -1027,6 +1090,20 @@ impl Machine {
                 self.pop_vals(ts0)?;
                 self.push_vals(ts0);
             }
+            Instr::Throw(index) => {
+                // A throw never completes normally: pop the tag's parameters
+                // and make the rest of the frame unreachable.
+                let ty = tag_at(spaces, *index as usize)?;
+                self.pop_vals(&ty.params)?;
+                self.unreachable();
+            }
+            Instr::ThrowRef => {
+                self.pop_expected(ValType::Ref(RefType {
+                    nullable: true,
+                    heap: HeapType::Exn,
+                }))?;
+                self.unreachable();
+            }
             Instr::MemoryInit { data_index, .. } => {
                 self.data_index(*data_index as usize, spaces)?;
                 memory_ok(spaces)?;
@@ -1162,6 +1239,10 @@ fn func_at<'s>(spaces: &'s Spaces<'_>, index: usize) -> Result<&'s FuncType, Err
         .funcs
         .get(index)
         .ok_or(Error::Invalid("unknown function"))
+}
+
+fn tag_at<'s>(spaces: &'s Spaces<'_>, index: usize) -> Result<&'s FuncType, Error> {
+    spaces.tags.get(index).ok_or(Error::Invalid("unknown tag"))
 }
 
 fn global_at<'s>(spaces: &'s Spaces<'_>, index: usize) -> Result<&'s GlobalType, Error> {

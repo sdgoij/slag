@@ -191,8 +191,24 @@ pub enum NumOp {
     I64TruncSatF64U,
 }
 
+/// A `try_table` catch clause (spec 2.4.2 / exceptions). The tag variants
+/// carry the tag index and the branch-target label of the *enclosing*
+/// construct the payload is delivered to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Catch {
+    /// `catch x y`: tag match; the branch payload is the tag's parameters.
+    Tag { tag: u32, label: u32 },
+    /// `catch_ref x y`: tag match; the payload is the parameters plus the
+    /// caught exception reference on top.
+    TagRef { tag: u32, label: u32 },
+    /// `catch_all y`: any exception; no payload.
+    All { label: u32 },
+    /// `catch_all_ref y`: any exception; the payload is the exception ref.
+    AllRef { label: u32 },
+}
+
 /// A decoded instruction. The list produced by the code-section decoder is
-/// flat: structured control keeps its `Block`/`Loop`/`If`/`Else`/`End`
+/// flat: structured control keeps its `Block`/`Loop`/`If`/`TryTable`/`Else`/`End`
 /// markers so validation can re-derive nesting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instr {
@@ -201,6 +217,10 @@ pub enum Instr {
     Block(BlockType),
     Loop(BlockType),
     If(BlockType),
+    TryTable {
+        blocktype: BlockType,
+        catches: Vec<Catch>,
+    },
     Else,
     End,
     Br(u32),
@@ -256,6 +276,8 @@ pub enum Instr {
     RefAsNonNull,
     BrOnNull(u32),
     BrOnNonNull(u32),
+    Throw(u32),
+    ThrowRef,
     MemoryInit {
         data_index: u32,
         memory: u32,

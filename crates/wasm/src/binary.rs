@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
+use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp};
 use crate::module::{
     CustomSection, DataMode, DataSegment, ElementMode, ElementSegment, Export, ExportKind,
     FuncBody, Global, Import, ImportDesc, Module, Table,
@@ -359,8 +359,13 @@ fn decode_heap_type(bytes: &[u8], pos: &mut usize) -> Result<HeapType, Error> {
             *pos += 1;
             Ok(HeapType::Extern)
         }
-        // Any other heap type (GC/exception abstract heap types) is a later
-        // cut; a byte >= 0x80 continues as a signed type index instead.
+        0x69 => {
+            // Exception references (`exn`).
+            *pos += 1;
+            Ok(HeapType::Exn)
+        }
+        // Any other heap type (GC abstract heap types) is a later cut; a byte
+        // >= 0x80 continues as a signed type index instead.
         _ => {
             let index = read_s33(bytes, pos)?;
             if index < 0 {
@@ -488,7 +493,7 @@ fn decode_block_type(bytes: &[u8], pos: &mut usize) -> Result<BlockType, Error> 
         *pos += 1;
         return Ok(BlockType::Empty);
     }
-    let single_byte_valtype = matches!(byte, 0x7b..=0x7f | 0x70 | 0x6f);
+    let single_byte_valtype = matches!(byte, 0x7b..=0x7f | 0x70 | 0x6f | 0x69);
     if single_byte_valtype || byte == 0x63 || byte == 0x64 {
         return Ok(BlockType::Val(decode_valtype(bytes, pos)?));
     }
@@ -729,6 +734,17 @@ fn decode_expr(bytes: &[u8], pos: &mut usize) -> Result<Vec<Instr>, Error> {
                     _ => Instr::If(block_type),
                 });
             }
+            0x1f => {
+                // `try_table` opens a structured construct like a block; its
+                // body ends at the matching `end` the depth counter tracks.
+                depth += 1;
+                let block_type = decode_block_type(bytes, pos)?;
+                let catches = decode_catches(bytes, pos)?;
+                instructions.push(Instr::TryTable {
+                    blocktype: block_type,
+                    catches,
+                });
+            }
             0x05 => {
                 // `else` without a matching `if` frame cannot be detected
                 // flatly; the malformed check happens at validation. Decode
@@ -740,10 +756,42 @@ fn decode_expr(bytes: &[u8], pos: &mut usize) -> Result<Vec<Instr>, Error> {
     }
 }
 
+/// A `try_table` catch-clause vector (spec 5.4.2). Each clause is a kind byte
+/// plus its immediates: tag+label for the tag forms, label only for the
+/// catch-all forms.
+fn decode_catches(bytes: &[u8], pos: &mut usize) -> Result<Vec<Catch>, Error> {
+    let count = read_u32(bytes, pos)?;
+    let mut catches = Vec::new();
+    for _ in 0..count {
+        match read_u8(bytes, pos)? {
+            0x00 => {
+                let tag = read_u32(bytes, pos)?;
+                let label = read_u32(bytes, pos)?;
+                catches.push(Catch::Tag { tag, label });
+            }
+            0x01 => {
+                let tag = read_u32(bytes, pos)?;
+                let label = read_u32(bytes, pos)?;
+                catches.push(Catch::TagRef { tag, label });
+            }
+            0x02 => catches.push(Catch::All {
+                label: read_u32(bytes, pos)?,
+            }),
+            0x03 => catches.push(Catch::AllRef {
+                label: read_u32(bytes, pos)?,
+            }),
+            _ => return Err(Error::Malformed("malformed catch clause")),
+        }
+    }
+    Ok(catches)
+}
+
 fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
     match opcode {
         0x00 => Ok(Instr::Unreachable),
         0x01 => Ok(Instr::Nop),
+        0x08 => Ok(Instr::Throw(read_u32(bytes, pos)?)),
+        0x0a => Ok(Instr::ThrowRef),
         0x0c => Ok(Instr::Br(read_u32(bytes, pos)?)),
         0x0d => Ok(Instr::BrIf(read_u32(bytes, pos)?)),
         0x0e => {

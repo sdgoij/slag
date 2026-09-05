@@ -4,12 +4,15 @@
 
 use std::fmt;
 
-/// A heap type: an abstract one (`func`, `extern`, ...) or a type index
-/// (typed references). GC-era abstract heap types are added with their cut.
+/// A heap type: an abstract one (`func`, `extern`, `exn`, ...) or a type
+/// index (typed references). GC-era abstract heap types are added with their
+/// cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HeapType {
     Func,
     Extern,
+    /// Exception references (`exn`, the `exnref` heap type).
+    Exn,
     /// A user-defined type index (`(ref $t)`), carried as an s33 index.
     Type(u32),
 }
@@ -30,6 +33,10 @@ impl RefType {
     pub const EXTERN: Self = RefType {
         nullable: true,
         heap: HeapType::Extern,
+    };
+    pub const EXN: Self = RefType {
+        nullable: true,
+        heap: HeapType::Exn,
     };
 }
 
@@ -56,6 +63,7 @@ impl ValType {
             0x7b => Self::V128,
             0x70 => Self::Ref(RefType::FUNC),
             0x6f => Self::Ref(RefType::EXTERN),
+            0x69 => Self::Ref(RefType::EXN),
             _ => return None,
         })
     }
@@ -66,6 +74,7 @@ impl fmt::Display for HeapType {
         match self {
             HeapType::Func => f.write_str("func"),
             HeapType::Extern => f.write_str("extern"),
+            HeapType::Exn => f.write_str("exn"),
             HeapType::Type(index) => write!(f, "${index}"),
         }
     }

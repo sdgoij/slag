@@ -17,14 +17,16 @@ pub struct FuncAddr {
 }
 
 /// A runtime reference (spec 2.2.5 / 4.2.1). Only nulls, function
-/// references, and host extern payloads (`ref.extern n`, passed in as
-/// arguments) exist before the GC cut.
+/// references, host extern payloads (`ref.extern n`, passed in as
+/// arguments), and exception references exist before the GC cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefValue {
     Null,
     Func(FuncAddr),
     /// A host extern reference wrapping an integer payload (`ref.extern`).
     Extern(u32),
+    /// An exception reference: the id of the exception in the store's pool.
+    Exn(usize),
 }
 
 /// A runtime value. Floats are their IEEE bit patterns.
@@ -65,6 +67,8 @@ pub enum Trap {
     UninitializedElement,
     NullReference,
     NullFunctionReference,
+    /// `throw_ref` of a null exception reference.
+    NullExceptionReference,
     CallStackExhausted,
     UnsupportedImport,
     UnknownFunction,

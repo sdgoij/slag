@@ -12,10 +12,10 @@
 //! bounded by a configured limit instead of the host stack. Numeric semantics
 //! live in [`crate::values`].
 //!
-//! Not executed yet ([`ExecFail::Unsupported`]): exceptions (Cut 6), SIMD
-//! (Cut 7), memory64 (Cut 8), and GC reference operations (Cut 9).
+//! Not executed yet ([`ExecFail::Unsupported`]): SIMD (Cut 7), memory64
+//! (Cut 8), and GC reference operations (Cut 9).
 
-use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
+use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
 use crate::types::{BlockType, FuncType, GlobalType, Limits, MemType, RefType, TableType, ValType};
 use crate::values::{FuncAddr, RefValue, Trap, Value, exec_num};
@@ -26,6 +26,11 @@ pub enum ExecFail {
     Trap(Trap),
     /// A feature this cut does not execute yet (later cuts).
     Unsupported(&'static str),
+    /// An uncaught wasm exception, thrown by `throw`/`throw_ref` and not
+    /// handled by any `try_table`: the id of the exception in the store's
+    /// pool. Only the outermost invocation edge sees this — the run loop
+    /// converts it into a branch whenever a matching catch clause exists.
+    Exception(usize),
 }
 
 impl From<Trap> for ExecFail {
@@ -56,6 +61,9 @@ impl From<ExecFail> for InstantiateError {
         match fail {
             ExecFail::Trap(trap) => InstantiateError::Trap(trap),
             ExecFail::Unsupported(reason) => InstantiateError::Unsupported(reason),
+            ExecFail::Exception(_) => {
+                InstantiateError::Unsupported("exception during instantiation")
+            }
         }
     }
 }
@@ -149,9 +157,25 @@ impl TableInst {
     }
 }
 
+/// A tag instance: the exception's payload shape (its function type's
+/// parameters; the results are empty by validation).
+#[derive(Debug)]
+pub struct TagInst {
+    ty: FuncType,
+}
+
+/// A concrete exception: which tag was thrown plus the argument values.
+/// Both in-flight exceptions (unwinding to a catch) and `exnref` values
+/// reference these cells by id.
+#[derive(Debug)]
+pub struct ExceptionInst {
+    pub tag: usize,
+    pub args: Vec<Value>,
+}
+
 /// A value handed to [`Store::instantiate`] for one import. Function, global,
-/// memory, and table values reference cells/instances that stay alive in the
-/// store.
+/// memory, table, and tag values reference cells/instances that stay alive in
+/// the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternVal {
     /// A host function (e.g. the spectest `print*` family).
@@ -164,6 +188,8 @@ pub enum ExternVal {
     Memory(usize),
     /// A shared table cell.
     Table(usize),
+    /// A shared tag cell.
+    Tag(usize),
     /// The value exists but its kind is not executable this cut.
     Unsupported(&'static str),
 }
@@ -183,8 +209,8 @@ struct HostFunc {
 }
 
 /// A module instance: the module (code, types, exports) plus its index
-/// spaces. Globals, memories, and tables are cell ids into the owning store,
-/// so imports alias the exporter's cells; functions are flattened
+/// spaces. Globals, memories, tables, and tags are cell ids into the owning
+/// store, so imports alias the exporter's cells; functions are flattened
 /// [`FuncTarget`]s. Data and element segments are retained per instance for
 /// the bulk-memory instructions (active segments are dropped after use).
 pub struct Instance {
@@ -193,6 +219,7 @@ pub struct Instance {
     tables: Vec<usize>,
     globals: Vec<usize>,
     memories: Vec<usize>,
+    tags: Vec<usize>,
     element_segments: Vec<Option<Vec<RefValue>>>,
     data_segments: Vec<Option<Vec<u8>>>,
     depth_limit: usize,
@@ -208,6 +235,8 @@ pub struct Store {
     memory_types: Vec<MemType>,
     tables: Vec<TableInst>,
     table_types: Vec<TableType>,
+    tags: Vec<TagInst>,
+    exceptions: Vec<ExceptionInst>,
 }
 
 impl Default for Store {
@@ -227,6 +256,8 @@ impl Store {
             memory_types: Vec::new(),
             tables: Vec::new(),
             table_types: Vec::new(),
+            tags: Vec::new(),
+            exceptions: Vec::new(),
         }
     }
 
@@ -275,6 +306,7 @@ impl Store {
         let mut tables = Vec::with_capacity(module.imports.len());
         let mut globals = Vec::with_capacity(module.imports.len());
         let mut memories = Vec::with_capacity(module.imports.len());
+        let mut tags = Vec::with_capacity(module.imports.len());
 
         for import in &module.imports {
             match &import.desc {
@@ -392,13 +424,32 @@ impl Store {
                         }
                     }
                 }
-                ImportDesc::Tag(_) => match resolve(&import.module, &import.name) {
-                    None => return Err(InstantiateError::Unlinkable("unknown import")),
-                    Some(ExternVal::Unsupported(reason)) => {
-                        return Err(InstantiateError::Unsupported(reason));
+                ImportDesc::Tag(type_index) => {
+                    let expected = module
+                        .types
+                        .get(*type_index as usize)
+                        .ok_or(InstantiateError::Unlinkable("unknown import"))?;
+                    let value = resolve(&import.module, &import.name)
+                        .ok_or(InstantiateError::Unlinkable("unknown import"))?;
+                    match value {
+                        ExternVal::Tag(cell) => {
+                            // Tags match by payload shape: the imported type
+                            // must equal the tag's declared function type.
+                            if self.tags.get(cell).map(|t| &t.ty) != Some(expected) {
+                                return Err(InstantiateError::Unlinkable(
+                                    "incompatible import type",
+                                ));
+                            }
+                            tags.push(cell);
+                        }
+                        ExternVal::Unsupported(reason) => {
+                            return Err(InstantiateError::Unsupported(reason));
+                        }
+                        _ => {
+                            return Err(InstantiateError::Unlinkable("incompatible import type"));
+                        }
                     }
-                    Some(_) => return Err(InstantiateError::Unsupported("tags (Cut 6)")),
-                },
+                }
             }
         }
 
@@ -407,6 +458,15 @@ impl Store {
                 instance: self_id,
                 defined,
             });
+        }
+
+        for type_index in &module.tags {
+            let ty = module
+                .types
+                .get(*type_index as usize)
+                .ok_or(InstantiateError::Unlinkable("unknown tag type"))?;
+            self.tags.push(TagInst { ty: ty.clone() });
+            tags.push(self.tags.len() - 1);
         }
 
         for table in &module.tables {
@@ -450,6 +510,7 @@ impl Store {
             tables,
             globals,
             memories,
+            tags,
             element_segments: Vec::new(),
             data_segments: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
@@ -555,7 +616,7 @@ impl Store {
             ExportKind::Global => ExternVal::Global(inst.globals[export.index as usize]),
             ExportKind::Memory => ExternVal::Memory(inst.memories[export.index as usize]),
             ExportKind::Table => ExternVal::Table(inst.tables[export.index as usize]),
-            ExportKind::Tag => ExternVal::Unsupported("tags (Cut 6)"),
+            ExportKind::Tag => ExternVal::Tag(inst.tags[export.index as usize]),
         })
     }
 
@@ -582,7 +643,7 @@ impl Store {
                             ExportKind::Table => {
                                 ExternVal::Table(inst.tables[export.index as usize])
                             }
-                            ExportKind::Tag => ExternVal::Unsupported("tags (Cut 6)"),
+                            ExportKind::Tag => ExternVal::Tag(inst.tags[export.index as usize]),
                         };
                         (export.name.clone(), value)
                     })
@@ -796,6 +857,16 @@ enum Ctl {
     Finished(Vec<Value>),
 }
 
+/// Where an in-flight exception's unwind stopped.
+enum CatchResult {
+    /// No clause in the scanned frame matched; pop the frame and keep going.
+    Miss,
+    /// A clause matched and branched; execution continues (pc already set).
+    Caught,
+    /// A clause targeted the outermost frame's function label.
+    Finished(Vec<Value>),
+}
+
 /// Per-body maps: the matching `End` for each opening structured
 /// instruction, and the `Else` (if any) for each `if`.
 struct BodyMap {
@@ -809,7 +880,9 @@ fn precompute(body: &[Instr]) -> BodyMap {
     let mut opens: Vec<usize> = Vec::new();
     for (pc, instr) in body.iter().enumerate() {
         match instr {
-            Instr::Block(_) | Instr::Loop(_) | Instr::If(_) => opens.push(pc),
+            Instr::Block(_) | Instr::Loop(_) | Instr::If(_) | Instr::TryTable { .. } => {
+                opens.push(pc)
+            }
             Instr::Else => {
                 if let Some(&open) = opens.last() {
                     else_[open] = Some(pc);
@@ -856,10 +929,21 @@ impl<'a> Engine<'a> {
             .ok_or(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
     }
 
-    /// Run until the outermost frame returns.
+    /// Run until the outermost frame returns. A `throw`/`throw_ref` inside
+    /// any frame becomes an in-flight exception that unwinds to the nearest
+    /// matching `try_table` catch clause (across call frames); only an
+    /// exception no handler matches reaches the caller of `run`.
     fn run(&mut self) -> Result<Vec<Value>, ExecFail> {
         loop {
-            match self.step()? {
+            let ctl = match self.step() {
+                Ok(ctl) => ctl,
+                Err(ExecFail::Exception(exn)) => match self.unwind(exn)? {
+                    Some(results) => return Ok(results),
+                    None => continue,
+                },
+                Err(error) => return Err(error),
+            };
+            match ctl {
                 Ctl::Next => {
                     let top = self.frames.len() - 1;
                     self.frames[top].pc += 1;
@@ -868,6 +952,133 @@ impl<'a> Engine<'a> {
                 Ctl::Finished(results) => return Ok(results),
             }
         }
+    }
+
+    /// Deliver an in-flight exception (a cell in `store.exceptions`) to the
+    /// nearest matching catch clause, popping call frames that cannot handle
+    /// it. Returns `Some(results)` when a catch targeted the outermost
+    /// frame's function label (the invocation returns those results),
+    /// `None` when execution continues after a caught branch, and the
+    /// original error when the exception escapes to the host.
+    fn unwind(&mut self, exn: usize) -> Result<Option<Vec<Value>>, ExecFail> {
+        let (tag, args) = {
+            let exception = &self.store.exceptions[exn];
+            (exception.tag, exception.args.clone())
+        };
+        loop {
+            match self.catch_in_top_frame(tag, &args, exn)? {
+                CatchResult::Miss => {}
+                CatchResult::Caught => return Ok(None),
+                CatchResult::Finished(results) => return Ok(Some(results)),
+            }
+            if self.frames.len() == 1 {
+                return Err(ExecFail::Exception(exn));
+            }
+            // The top frame had no handler: abandon it (and its operand-stack
+            // contribution) and continue searching in its caller.
+            let frame = self.frames.pop().unwrap();
+            self.stack.truncate(frame.base);
+        }
+    }
+
+    /// Scan the top frame's active `try_table` scopes (labels still on the
+    /// stack) for the first catch clause matching `tag`, innermost scope
+    /// first, and branch to its target label with the clause's payload when
+    /// one matches.
+    fn catch_in_top_frame(
+        &mut self,
+        tag: usize,
+        args: &[Value],
+        exn: usize,
+    ) -> Result<CatchResult, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        let count = self.frames[frame_index].labels.len();
+        for pos in (0..count).rev() {
+            let open = self.frames[frame_index].labels[pos].open;
+            let instr = self.body(frame_index).get(open).cloned();
+            let clauses = match instr {
+                Some(Instr::TryTable { catches, .. }) => catches,
+                _ => continue,
+            };
+            // The clause tags are indices into this frame's tag space; the
+            // thrown exception carries the tag's store cell, so resolve each
+            // clause against the same instance before comparing.
+            let instance = self.frames[frame_index].instance;
+            let cells: Vec<Option<usize>> = clauses
+                .iter()
+                .map(|clause| match clause {
+                    Catch::Tag { tag, .. } | Catch::TagRef { tag, .. } => self.store.instances
+                        [instance]
+                        .tags
+                        .get(*tag as usize)
+                        .copied(),
+                    Catch::All { .. } | Catch::AllRef { .. } => None,
+                })
+                .collect();
+            for (clause, cell) in clauses.iter().zip(&cells) {
+                match (clause, cell) {
+                    (Catch::Tag { label, .. }, Some(cell)) if *cell == tag => {
+                        return self.catch_branch(pos, *label, args.to_vec());
+                    }
+                    (Catch::TagRef { label, .. }, Some(cell)) if *cell == tag => {
+                        let mut payload = args.to_vec();
+                        payload.push(Value::Ref(RefValue::Exn(exn)));
+                        return self.catch_branch(pos, *label, payload);
+                    }
+                    (Catch::All { label }, _) => {
+                        return self.catch_branch(pos, *label, Vec::new());
+                    }
+                    (Catch::AllRef { label }, _) => {
+                        return self.catch_branch(
+                            pos,
+                            *label,
+                            vec![Value::Ref(RefValue::Exn(exn))],
+                        );
+                    }
+                    (Catch::Tag { .. } | Catch::TagRef { .. }, _) => {}
+                }
+            }
+        }
+        Ok(CatchResult::Miss)
+    }
+
+    /// Perform the branch a matched catch clause requests: drop the try's
+    /// inner labels plus the try label itself, then deliver `payload` to the
+    /// clause's target label (relative to the labels that enclosed the
+    /// `try_table`), exactly like a `br` to that label.
+    fn catch_branch(
+        &mut self,
+        pos: usize,
+        label: u32,
+        payload: Vec<Value>,
+    ) -> Result<CatchResult, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        self.frames[frame_index].labels.truncate(pos);
+        let target_pos = pos
+            .checked_sub(1 + label as usize)
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        let target = self.frames[frame_index].labels[target_pos];
+        self.stack.truncate(target.height);
+        self.stack.extend(payload);
+        if target_pos == 0 {
+            // The clause targeted the function label: the payload is this
+            // frame's results, so return from it.
+            self.frames.pop();
+            if self.frames.is_empty() {
+                let results = self.stack.split_off(0);
+                return Ok(CatchResult::Finished(results));
+            }
+            return Ok(CatchResult::Caught);
+        }
+        let map = self.map_for(frame_index);
+        if target.is_loop {
+            self.frames[frame_index].labels.truncate(target_pos + 1);
+            self.frames[frame_index].pc = target.open + 1;
+        } else {
+            self.frames[frame_index].labels.truncate(target_pos);
+            self.frames[frame_index].pc = map.end[target.open] + 1;
+        }
+        Ok(CatchResult::Caught)
     }
 
     /// Execute one instruction of the top frame.
@@ -881,7 +1092,7 @@ impl<'a> Engine<'a> {
         match instr {
             Instr::Unreachable => Err(ExecFail::Trap(Trap::Unreachable)),
             Instr::Nop => Ok(Ctl::Next),
-            Instr::Block(_) | Instr::Loop(_) | Instr::If(_) => {
+            Instr::Block(_) | Instr::Loop(_) | Instr::If(_) | Instr::TryTable { .. } => {
                 self.enter_structured(pc)?;
                 Ok(Ctl::Settled)
             }
@@ -1169,6 +1380,31 @@ impl<'a> Engine<'a> {
                     Ok(Ctl::Next)
                 }
             }
+            Instr::Throw(index) => {
+                // Pop the tag's arguments and raise an in-flight exception.
+                let frame_index = self.frames.len() - 1;
+                let instance = self.frames[frame_index].instance;
+                let cell = self.store.instances[instance]
+                    .tags
+                    .get(index as usize)
+                    .copied()
+                    .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                let param_count = self.store.tags[cell].ty.params.len();
+                let args = self.take_top(param_count);
+                let exn = self.store.exceptions.len();
+                self.store
+                    .exceptions
+                    .push(ExceptionInst { tag: cell, args });
+                Err(ExecFail::Exception(exn))
+            }
+            Instr::ThrowRef => {
+                let value = self.pop()?;
+                match value {
+                    Value::Ref(RefValue::Null) => Err(ExecFail::Trap(Trap::NullExceptionReference)),
+                    Value::Ref(RefValue::Exn(exn)) => Err(ExecFail::Exception(exn)),
+                    _ => Err(ExecFail::Unsupported("throw_ref on non-exception ref")),
+                }
+            }
             Instr::TableInit {
                 element_index,
                 table,
@@ -1353,7 +1589,7 @@ impl<'a> Engine<'a> {
         let (params, arity) = self.block_counts(&instr)?;
         let height = self.stack.len().saturating_sub(params);
         match instr {
-            Instr::Block(_) => {
+            Instr::Block(_) | Instr::TryTable { .. } => {
                 self.frames[frame_index].labels.push(Label {
                     arity,
                     height,
@@ -1455,6 +1691,7 @@ impl<'a> Engine<'a> {
     fn block_counts(&self, instr: &Instr) -> Result<(usize, usize), ExecFail> {
         let bt = match instr {
             Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => *bt,
+            Instr::TryTable { blocktype, .. } => *blocktype,
             _ => return Ok((0, 0)),
         };
         match bt {
@@ -1935,6 +2172,7 @@ fn matches_ref(expected: RefType, actual: RefType) -> bool {
     match (expected.heap, actual.heap) {
         (crate::types::HeapType::Func, crate::types::HeapType::Func) => true,
         (crate::types::HeapType::Extern, crate::types::HeapType::Extern) => true,
+        (crate::types::HeapType::Exn, crate::types::HeapType::Exn) => true,
         (crate::types::HeapType::Type(x), crate::types::HeapType::Type(y)) => x == y,
         // A typed function reference is a function reference.
         (crate::types::HeapType::Func, crate::types::HeapType::Type(_)) => true,

@@ -376,7 +376,8 @@ fn run_json(json_path: &Path) -> Tally {
                     }
                 }
             }
-            "action" | "assert_return" | "assert_trap" | "assert_exhaustion" => {
+            "action" | "assert_return" | "assert_trap" | "assert_exhaustion"
+            | "assert_exception" => {
                 if kind == "assert_trap" && command.get("action").is_none() {
                     // `(assert_trap (module ...))`: instantiation must trap.
                     let text = command.get("text").and_then(Value::as_str).unwrap_or("");
@@ -415,6 +416,9 @@ fn run_json(json_path: &Path) -> Tally {
                                     Err(ActOutcome::Unsupported(reason)) => {
                                         Outcome::Pending(reason)
                                     }
+                                    Err(ActOutcome::Exception) => {
+                                        Outcome::Fail("action threw an exception".into())
+                                    }
                                 },
                                 "assert_return" => match result {
                                     Ok(values) => match command
@@ -442,6 +446,9 @@ fn run_json(json_path: &Path) -> Tally {
                                     Err(ActOutcome::Unsupported(reason)) => {
                                         Outcome::Pending(reason)
                                     }
+                                    Err(ActOutcome::Exception) => {
+                                        Outcome::Fail("expected return, exception".into())
+                                    }
                                 },
                                 "assert_trap" => match result {
                                     Err(ActOutcome::Trap(trap)) => {
@@ -462,6 +469,9 @@ fn run_json(json_path: &Path) -> Tally {
                                     Err(ActOutcome::Unsupported(reason)) => {
                                         Outcome::Pending(reason)
                                     }
+                                    Err(ActOutcome::Exception) => {
+                                        Outcome::Fail("expected trap, exception".into())
+                                    }
                                 },
                                 "assert_exhaustion" => match result {
                                     Err(ActOutcome::Trap(Trap::CallStackExhausted)) => {
@@ -474,6 +484,19 @@ fn run_json(json_path: &Path) -> Tally {
                                     Err(ActOutcome::Unsupported(reason)) => {
                                         Outcome::Pending(reason)
                                     }
+                                    Err(ActOutcome::Exception) => {
+                                        Outcome::Fail("expected exhaustion, exception".into())
+                                    }
+                                },
+                                "assert_exception" => match result {
+                                    Err(ActOutcome::Exception) => Outcome::Pass,
+                                    Err(ActOutcome::Trap(_)) => {
+                                        Outcome::Fail("expected exception, trapped".into())
+                                    }
+                                    Err(ActOutcome::Unsupported(reason)) => {
+                                        Outcome::Pending(reason)
+                                    }
+                                    Ok(_) => Outcome::Fail("expected exception, returned".into()),
                                 },
                                 _ => Outcome::Pending("execution (Cut 3)"),
                             }
@@ -506,6 +529,8 @@ enum Outcome {
 
 enum ActOutcome {
     Trap(Trap),
+    /// An uncaught wasm exception (`assert_exception`).
+    Exception,
     Unsupported(&'static str),
 }
 
@@ -513,6 +538,7 @@ impl From<ExecFail> for ActOutcome {
     fn from(fail: ExecFail) -> Self {
         match fail {
             ExecFail::Trap(trap) => ActOutcome::Trap(trap),
+            ExecFail::Exception(_) => ActOutcome::Exception,
             ExecFail::Unsupported(reason) => ActOutcome::Unsupported(reason),
         }
     }
@@ -747,6 +773,7 @@ fn trap_text(trap: Trap) -> &'static str {
         Trap::UninitializedElement => "uninitialized element",
         Trap::NullReference => "null reference",
         Trap::NullFunctionReference => "null function reference",
+        Trap::NullExceptionReference => "null exception reference",
         Trap::UnsupportedImport => "unsupported import",
         Trap::UnknownFunction => "unknown function",
     }

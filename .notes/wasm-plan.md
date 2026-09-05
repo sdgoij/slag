@@ -619,3 +619,54 @@ is fully green. New rules:
 `ref_null.wast` and `table_init.wast` still cannot be converted: their GC
 text (`any`/`anyref`, `array.new_default`) is beyond wabt 1.0.41 (and
 `instance.wast` needs `(module instance …)`).
+
+### Cut 6 — exceptions: tags, throw, try_table, throw_ref (2026-09-05)
+
+The exception-handling runtime landed. Tags are store cells carrying the
+payload function type; `throw` pops a tag's parameters and raises an
+in-flight exception that unwinds through call frames to the nearest
+matching `try_table` clause (or the invocation edge, where the runner's
+`assert_exception` sees it). The engine never uses host unwinding:
+`run` delivers exceptions to catch clauses by scanning each frame's
+active labels (try scopes are labels over `TryTable` instructions),
+dropping inner labels and branching to the clause's target label with
+the payload — `catch`/`catch_ref` (payload + exception ref),
+`catch_all`/`catch_all_ref`. `exnref` values (`RefValue::Exn`) reference
+exception cells in the store; `throw_ref` re-raises one.
+
+Decoder/validation: `throw` (0x08), `throw_ref` (0x0a), `try_table`
+(0x1f) with its catch-clause vector, the `exn` heap type (0x69) as
+`exnref`, and block types over it. Validation checks each clause's
+payload against its enclosing label (tag params, plus the exception ref
+for the `catch_ref` forms), rejects unknown tags, and makes `throw`
+diverge like `br`/`return`. `assert_exception` is wired into the runner;
+tag imports/exports participate in import matching (by payload type).
+
+Gate (0 fail): `exceptions/throw.wast` 13, `exceptions/throw_ref.wast`
+15. `imports.wast` improved 194 → 202 pass (the tag import/export
+fixtures moved out of pending; still 0 fail). No regressions in the Cut
+4/5 sweep.
+
+Two non-obvious points from the runtime: a catch clause's tag immediate
+is an *index into the try's instance tag space*, so matching resolves it
+to the store cell the thrown exception carries (a naive index-vs-cell
+compare only works while cells happen to equal indices — the first
+fixture module masks it); and exceptions caught at the *function label*
+return the payload as the frame's results, which required the unwind
+path to place results exactly like a normal `finish_top`.
+
+`exceptions/tag.wast` (uses `(rec …)` type groups) and
+`exceptions/try_table.wast` (newer typed-block catch syntax) cannot be
+converted by wabt 1.0.41, so those remain outside the green count; the
+engine covers their instructions through the two green files. `tag`
+import/export matching by type equality is in place for the JS API
+(Cut 10).
+
+Known (pre-existing, not exceptions-specific) validator gap: divergence
+inside a *nested empty-result* construct does not mark the enclosing
+frame unreachable at its `End`, so `(func (result i32) (block (result
+i32) (unreachable)))` validates but wrapping that `unreachable` in one
+more empty `(block …)` makes the same function wrongly reject; no green
+corpus fixture exercises the rejected shape. A later cleanup should
+propagate the unreachable flag outward at `End` instead of faking the
+ended frame's result types.
