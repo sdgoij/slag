@@ -2,7 +2,7 @@
 
 ## 1. Problem (measured)
 
-| Build | `--jit` | no JIT |
+| Build | JIT (default) | `--jitless` |
 |---|---|---|
 | HEAD (Cut 68) | 79.1s | 65.9s |
 | Parent (Cut 67) | 80.8s | — |
@@ -16,7 +16,7 @@ Skip/delay compilation of bodies that won't amortize the compile cost, without s
 - **Loop bodies** (internal loop, e.g. `run()` with a `for` loop, certified scripts with a top-level loop — the Cut 65 benches): compile **on first use**.
 - **Straight-line bodies** (mostly leaves): run interpreted — the interpreter's leaf-inline (`run_inline_leaf`, ~82ns/call) is already fast — and **promote to JIT after K invocations** (start K=16).
 
-Success: `--jit` suite time approaches the interpreter baseline; hot benches unchanged; identical pass/fail results.
+Success: the JIT (default) suite time approaches the `--jitless` baseline; hot benches unchanged; identical pass/fail results.
 
 ## 3. Design
 
@@ -53,7 +53,7 @@ A loop body runs once with many internal iterations — a pure count would never
 
 ## 4. Expected effect
 
-The sweep overhead is dominated by one-shot script/function bodies. Under the threshold: script bodies without loops **never compile** (single eval), one-shot functions never compile. Projection: `--jit` suite ~66-70s (near the 65.9s interpreter baseline). Hot benches preserved by 3.3/3.4.
+The sweep overhead is dominated by one-shot script/function bodies. Under the threshold: script bodies without loops **never compile** (single eval), one-shot functions never compile. Projection: the JIT (default) suite ~66-70s (near the 65.9s `--jitless` baseline). Hot benches preserved by 3.3/3.4.
 
 ## 5. Risks & mitigations
 
@@ -71,13 +71,13 @@ The sweep overhead is dominated by one-shot script/function bodies. Under the th
    - Unit: straight-line body `<K` calls → `lookup_info` null, `compiled_count` 0; `≥K` → compiled. Loop body → compiled on first consult.
    - E2e (`with_jit_agent`): a script calling a straight-line fn 8× (not compiled) vs 16+× (compiled); a loop body compiles on first call; re-run the two Cut 68 probe-count tests.
 4. Bench: `perf.md` hot rows before/after.
-5. Sweep: time `--jit` before/after; re-run language/annexB/built-ins for pass/fail/hang parity (must be unchanged).
+5. Sweep: time the default (JIT) run before/after `--jitless`; re-run language/annexB/built-ins for pass/fail/hang parity (must be unchanged).
 6. Tune K (4/16/64) if warranted.
 7. Docs: `.notes/jit-report.md` row 40 + TODO; `slag-jit` skill trap (the gate in `lookup_info`, the `body_has_loop`↔`step_targets` sync, the `call_slow→try_jit_leaf` promotion chain).
 8. Commit message.
 
 ## 7. Measurement plan (defensible evidence)
 
-- **Primary**: full-suite wall time, `--jit` vs no-JIT, before vs after — same bash `time` method (the PowerShell wrapper inflated the JIT side last time).
+- **Primary**: full-suite wall time, JIT (default) vs `--jitless`, before vs after — same bash `time` method (the PowerShell wrapper inflated the JIT side last time).
 - **Secondary**: a temporary `SLAG_JIT_STATS` env hook printing the compiled-body count per run (same pattern as the removed probe counters) to verify the compile-volume drop directly, then remove it.
 - **Correctness**: the three area sweeps' pass/fail/hang sets unchanged — the threshold changes *which* bodies compile, never semantics, but verify.

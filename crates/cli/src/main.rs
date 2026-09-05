@@ -7,19 +7,22 @@
 //!   quits).
 //!
 //! Flags: `--version`/`-V`, `--help`/`-h`, `--dump-ast`, `--dump-tokens`,
-//! `--bench` (run the micro-benchmark suite), `--jit-bench` (run the
-//! JIT-vs-interpreter comparison suite), `--print-bytecode` (print the
-//! compiled step stream), `--jit` (install the Cranelift JIT hook on every
-//! context; on by default for script runs and the REPL, `--no-jit` disables
-//! it, and `--bench` always measures the interpreter), and the
-//! accepted-no-op knobs `--stack-size N`,
-//! `--max-old-space N`, `--harmony-*`.
+//! `--bench` (run the micro-benchmark suite; always the interpreter),
+//! `--print-bytecode` (print the compiled step stream), `--jitless` (run
+//! certified bodies in the interpreter; the Cranelift JIT is on by default
+//! when the `jit` feature is compiled and this flag does not exist without
+//! it), `--jit-bench` (run the JIT-vs-interpreter comparison suite), and
+//! the accepted-no-op knobs `--stack-size N`,
+//! `--max-old-space N`, `--harmony-*`. `--help` lists the features this
+//! binary was compiled with.
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use runtime::embed::{Context, JsValue};
+use runtime::embed::Context;
+#[cfg(feature = "jit")]
+use runtime::embed::JsValue;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -31,14 +34,15 @@ struct Options {
     dump_ast: bool,
     dump_tokens: bool,
     bench: bool,
-    jit_bench: bool,
     print_bytecode: bool,
     gc_stress: bool,
-    jit: bool,
-    no_jit: bool,
     jsx: bool,
     stack_size: Option<u64>,
     max_old_space: Option<u64>,
+    #[cfg(feature = "jit")]
+    jit_bench: bool,
+    #[cfg(feature = "jit")]
+    jitless: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -66,10 +70,11 @@ fn parse(args: &[String]) -> Command {
             "--dump-tokens" => options.dump_tokens = true,
             "--jsx" => options.jsx = true,
             "--bench" => options.bench = true,
-            "--jit-bench" => options.jit_bench = true,
             "--print-bytecode" => options.print_bytecode = true,
-            "--jit" => options.jit = true,
-            "--no-jit" => options.no_jit = true,
+            #[cfg(feature = "jit")]
+            "--jit-bench" => options.jit_bench = true,
+            #[cfg(feature = "jit")]
+            "--jitless" => options.jitless = true,
             "--stack-size" => {
                 index += 1;
                 options.stack_size = args.get(index).and_then(|value| value.parse().ok());
@@ -120,15 +125,20 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --help, -h");
             eprintln!("  --dump-ast, --dump-tokens");
             eprintln!("  --jsx                     parse the file/input with the JSX extension");
-            eprintln!("  --bench");
-            eprintln!("  --jit-bench               JIT vs interpreter comparison");
-            eprintln!("  --jit                     install the Cranelift JIT hook (default)");
-            eprintln!("  --no-jit                  run without the JIT hook");
+            eprintln!("  --bench                   interpreter micro-benchmarks");
+            #[cfg(feature = "jit")]
+            eprintln!(
+                "  --jitless                  disable the Cranelift JIT (it is on by default)"
+            );
+            #[cfg(feature = "jit")]
+            eprintln!("  --jit-bench                JIT vs interpreter comparison");
             eprintln!("  --print-bytecode");
             eprintln!("  --stack-size N            (no-op)");
             eprintln!("  --max-old-space N         (no-op)");
             eprintln!("  --gc-stress               collect at every safe point");
             eprintln!("  --harmony-*               (no-op)");
+            eprintln!();
+            eprintln!("compiled features: {}", compiled_features());
             Err(2)
         }
         Command::Run {
@@ -137,15 +147,15 @@ fn run(command: Command) -> Result<(), u8> {
             options,
         } => run_file(&file, &args, &options),
         Command::Repl(options) => {
-            if options.jit_bench {
-                return run_jit_benchmarks();
+            #[cfg(feature = "jit")]
+            {
+                if options.jit_bench {
+                    return run_jit_benchmarks();
+                }
             }
             if options.bench {
                 let mut context = Context::new().map_err(report)?;
                 context.set_gc_stress(options.gc_stress);
-                if options.jit {
-                    jit::install(context.agent_mut()).map_err(report)?;
-                }
                 return run_benchmarks(&mut context);
             }
             repl(&options)
@@ -156,6 +166,30 @@ fn run(command: Command) -> Result<(), u8> {
 fn report(error: impl std::fmt::Display) -> u8 {
     eprintln!("slag: {error}");
     1
+}
+
+/// The cargo features this binary was compiled with, shown in `--help` so a
+/// user can see which optional surfaces are active. `cfg!` is a compile-time
+/// constant here, so the list reflects this build exactly.
+fn compiled_features() -> String {
+    const NAMES: [&str; 4] = ["jit", "jsc", "raylib", "raygui"];
+    let active = [
+        cfg!(feature = "jit"),
+        cfg!(feature = "jsc"),
+        cfg!(feature = "raylib"),
+        cfg!(feature = "raygui"),
+    ];
+    let enabled: Vec<&str> = NAMES
+        .iter()
+        .zip(active)
+        .filter(|(_, on)| *on)
+        .map(|(name, _)| *name)
+        .collect();
+    if enabled.is_empty() {
+        "none".to_string()
+    } else {
+        enabled.join(", ")
+    }
 }
 
 /// Parse and evaluate a script file (spec 16.1: ParseScript +
@@ -180,7 +214,9 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
     }
     let mut context = Context::new().map_err(report)?;
     context.set_gc_stress(options.gc_stress);
-    if options.jit || !options.no_jit {
+    // The JIT is on by default when compiled; only `--jitless` turns it off.
+    #[cfg(feature = "jit")]
+    if !options.jitless {
         jit::install(context.agent_mut()).map_err(report)?;
     }
     context.install_fs().map_err(report)?;
@@ -288,7 +324,9 @@ fn repl(options: &Options) -> Result<(), u8> {
     if options.jsx {
         context.install_rlx().map_err(report)?;
     }
-    if options.jit || !options.no_jit {
+    // The JIT is on by default when compiled; only `--jitless` turns it off.
+    #[cfg(feature = "jit")]
+    if !options.jitless {
         jit::install(context.agent_mut()).map_err(report)?;
     }
     println!("slag {VERSION} REPL (type .exit or Ctrl-D to quit)");
@@ -495,6 +533,7 @@ fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
 /// these tiny bodies) — the loop timings are therefore pessimistic. The
 /// completion values are compared as a differential check that the machine
 /// code agrees with the interpreter.
+#[cfg(feature = "jit")]
 fn run_jit_benchmarks() -> Result<(), u8> {
     let benchmarks: &[(&str, &str)] = &[
         (
@@ -583,6 +622,7 @@ fn run_jit_benchmarks() -> Result<(), u8> {
 /// the timed calls (their bodies stay compiled and the per-site leaf cache
 /// stays warm). Returns the per-call mean and the completion value's number
 /// (the suite's snippets all complete with a Number).
+#[cfg(feature = "jit")]
 fn bench_once(source: &str, jit: bool) -> Result<(std::time::Duration, Option<f64>), u8> {
     const WARMUP: u32 = 2;
     const TIMED: u32 = 3;
@@ -704,23 +744,28 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "jit")]
     #[test]
     fn jit_flags_are_recognized() {
         let options = Options {
-            jit: true,
+            jitless: true,
             ..Options::default()
         };
-        assert_eq!(parse(&["--jit".into()]), Command::Repl(options.clone()));
-        let options = Options {
-            no_jit: true,
-            ..Options::default()
-        };
-        assert_eq!(parse(&["--no-jit".into()]), Command::Repl(options.clone()));
+        assert_eq!(parse(&["--jitless".into()]), Command::Repl(options.clone()));
         let options = Options {
             jit_bench: true,
             ..Options::default()
         };
         assert_eq!(parse(&["--jit-bench".into()]), Command::Repl(options));
+    }
+
+    #[cfg(not(feature = "jit"))]
+    #[test]
+    fn jit_flags_are_rejected_without_the_feature() {
+        // Without the JIT feature there is no JIT to disable or compare, so
+        // the flags do not exist (they fall through to the unknown-flag path).
+        assert_eq!(parse(&["--jitless".into()]), Command::Help);
+        assert_eq!(parse(&["--jit-bench".into()]), Command::Help);
     }
 
     #[test]

@@ -12,13 +12,23 @@ path = "src/main.rs"
 
 [dependencies]
 crux = { path = "../crux" }
-jit = { path = "../jit" }
+jit = { path = "../jit", optional = true }
+jsc = { path = "../jsc", optional = true }
 lexer = { path = "../lexer" }
 parser = { path = "../parser" }
 runtime = { path = "../runtime", features = ["fs"] }
 syntax = { path = "../syntax" }
 
 [features]
+# The Cranelift JIT: compiled by default (`--jitless` at runtime turns it off
+# for a run; without this feature the flag does not exist). Build with
+# `--no-default-features` for an interpreter-only binary.
+default = ["jit"]
+jit = ["dep:jit"]
+# The drop-in JavaScriptCore C API (`crates/jsc`): not part of the default
+# workspace build; this feature builds it alongside the CLI so a release can
+# ship `slag` plus the JSC-compatible library.
+jsc = ["dep:jsc"]
 # Expose the `rl` host module to scripts: compiles raylib's C library (needs
 # a display); without the feature no `rl` global exists and no flag is needed.
 raylib = ["runtime/raylib"]

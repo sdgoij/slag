@@ -16,6 +16,26 @@ members = [
     "crates/test262",
 ]
 
+# A bare `cargo build`/`cargo test` at the root builds these; `crates/jsc`
+# (the drop-in JavaScriptCore C API) is deliberately left out — build it on
+# request with `cargo build -p jsc` or alongside the CLI with
+# `cargo build -p cli --features jsc`. `cargo build --workspace` still
+# covers everything.
+default-members = [
+    "crates/unicode",
+    "crates/crux",
+    "crates/syntax",
+    "crates/lexer",
+    "crates/parser",
+    "crates/regexp",
+    "crates/runtime",
+    "crates/jit",
+    "crates/slag",
+    "crates/ffi",
+    "crates/cli",
+    "crates/test262",
+]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

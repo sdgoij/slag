@@ -34,24 +34,27 @@ JavaScriptCore C-API bindings.
   Proxy/Reflect, TypedArrays, SharedArrayBuffer/Atomics with worker
   threads, full Intl (ECMA-402 Cuts 1–8), and Temporal (the intl402×
   Temporal integration, Cut 9, is in flight).
-- **Experimental Cranelift JIT** — `--jit` compiles the interpreter's
-  certified `Step` bytecode to native machine code via
-  [Cranelift](https://cranelift.dev): inline number/string fast paths,
-  direct-mapped global/member value cells, and register-resident fast
-  loops. `--jit-bench` times JIT vs interpreter, and the conformance
-  sweep runs the full corpus through the JIT by default (`--jitless`
-  disables it). Design, status, and remaining work: `.notes/jit-report.md`.
+- **Experimental Cranelift JIT** — compiled bodies run as native machine
+  code via [Cranelift](https://cranelift.dev): inline number/string fast
+  paths, direct-mapped global/member value cells, and register-resident
+  fast loops. Compiled with the `jit` feature (on by default in the CLI;
+  the embed crate opts in with `--features slag/jit`) and active for every
+  run unless `--jitless` disables it; `--jit-bench` times JIT vs
+  interpreter. Design, status, and remaining work: `.notes/jit-report.md`.
 - **Portable** — no third-party runtime dependencies beyond the Rust
-  standard library (see `PLAN.md` §4.10), with two opt-in exceptions: the
-  experimental JIT (`crates/jit`) pulls in Cranelift and `region` and is
-  installed only when the `--jit` flag is given, and the `raylib` feature
+  standard library (see `PLAN.md` §4.10), with opt-in exceptions: the
+  experimental JIT (`crates/jit`) pulls in Cranelift and `region` when the
+  `jit` feature is enabled (on by default in the CLI; the embed crate opts
+  in with `--features slag/jit`), the `raylib` feature
   (`crates/runtime/src/raylib.rs`) compiles raylib's C library for the `rl`
-  host module. The Unicode property
+  host module, and the `jsc` drop-in is a separate on-request build
+  (below). The Unicode property
   tables are generated at compile time from the pinned corpus fixtures,
   so they can never drift from what the tests assert.
 - **Embeddable** — the `slag` crate exposes the Rust embedding API
   (`Context`, `JsValue`/`JsObject`, `HostCallbacks`, optional Cranelift JIT
-  hook), plus a drop-in JavaScriptCore C API (`crates/jsc`).
+  hook), plus a drop-in JavaScriptCore C API (`crates/jsc`) built on
+  request (`cargo build -p cli --features jsc`, or `cargo build -p jsc`).
 
 ## Quick start
 
@@ -71,8 +74,10 @@ target/release/slag                       # REPL
 The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
 `readdirSync`/`statSync`) to scripts, and accepts `--dump-ast`,
 `--dump-tokens`, `--print-bytecode` (dump the compiled `Step` stream),
-and `--bench`; `--jit` runs certified bodies through the experimental
-Cranelift JIT and `--jit-bench` times JIT vs interpreter. `--jsx` parses
+`--bench` (interpreter micro-benchmarks), and — when the JIT feature is
+compiled, the default — `--jitless` (disable the Cranelift JIT for the run;
+it is on by default) and `--jit-bench` (time JIT vs interpreter). `--help`
+lists the optional flags and the compiled features. `--jsx` parses
 the input with the opt-in JSX extension (`<element/>` syntax desugaring to
 `rlx.h(...)` calls). Building the
 CLI with the `raylib` feature exposes the `rl` host module to every
@@ -177,9 +182,9 @@ reclassifies them as passes. The full methodology and triage live in
 | `parser` | Recursive-descent parser, cover grammar, early errors |
 | `regexp` | RegExp pattern parser + backtracking matcher |
 | `runtime` | Realms, environments, evaluation, modules, all built-ins (incl. Intl + Temporal), `Context` |
-| `jit` | Experimental Cranelift JIT backend for the interpreter's certified `Step` bytecode (opt-in via `--jit`) |
+| `jit` | Experimental Cranelift JIT backend for the interpreter's certified `Step` bytecode (CLI feature `jit`, on by default) |
 | `ffi` | Shared C-ABI plumbing for the drop-in surfaces (handle tables, value/string marshaling) |
-| `jsc` | Drop-in JavaScriptCore C API (`JSContextRef` family) backed by Slag |
+| `jsc` | Drop-in JavaScriptCore C API (`JSContextRef` family) backed by Slag; not in the default build (`cargo build -p jsc`, or alongside the CLI with `cargo build -p cli --features jsc`) |
 | `cli` | The `slag` binary (script runner + REPL) |
 | `test262` | The pinned corpus + the sweep runner |
 

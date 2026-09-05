@@ -215,7 +215,7 @@ only the JIT arm was missing. Traps:
   PRIVATE frame buffer (`vm.frame` is the CALLER's) — a helper-written
   frame slot would target the caller's frame, and the unmapped form's
   `vm.call_args` is only filled by `setup_certified_frame` on the non-leaf
-  path. The `--jit` sweep caught this: strict
+  path. The default JIT sweep caught this: strict
   `(function () { return arguments; })()` IIFEs (strict via
   `enclosing_strict` inside a strict script) returned `undefined` — the
   Object/defineProperty, Object/create, arguments-object, Array.prototype.*,
@@ -368,7 +368,7 @@ it is the big trap:
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then
 `cargo test --workspace` green — then REBUILD the sweep
 (`cargo build --release -p test262`) and run the full areas (see the
-`slag-conformance` skill). The `--jit` baselines: `language` 23721/0/0/0,
+`slag-conformance` skill). The JIT (default) baselines: `language` 23721/0/0/0,
 `annexB` 1086/0/0/0, `built-ins` ~23210 pass / 0 fail with 440–450
 pre-existing hang wobble on the slow RegExp property-escape /
 CharacterClassEscapes / decodeURI / TypedArray / Temporal clusters (load

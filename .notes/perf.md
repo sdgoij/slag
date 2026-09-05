@@ -2223,14 +2223,14 @@ Both levers the 2026-08-31 section recommended are resolved:
 
 ### CLI JIT default, detached-view length, and the typed-array JIT picture (measured 2026-09-01)
 
-Supersedes the "`--jit` changes nothing on these loops" claim in the floor
+Supersedes the "the JIT changes nothing on these loops" claim in the floor
 section above: dense element stores (609ce62) and the `buildString` shape now
 certify (b61a0b5), so the JIT is a real escape hatch for that cluster
 (`--jit-bench` buildString rows: 191ms → 43ms).
 
 - **The CLI installs the JIT by default** (2026-09-01): `slag file.js` runs
-  certified bodies through Cranelift; `--no-jit` opts out; `--bench` still
-  measures the interpreter floor. Default vs `--no-jit` on the Node probes:
+  certified bodies through Cranelift; `--jitless` opts out; `--bench` still
+  measures the interpreter floor. Default vs `--jitless` on the Node probes:
   buildString shape 43ms vs 194ms (4.5x), buildString full 29ms vs 113ms
   (3.9x).
 - **The numeric-index typed-array `length` fast path missed the
@@ -2249,7 +2249,7 @@ certify (b61a0b5), so the JIT is a real escape hatch for that cluster
 
 Node v24.12.0 comparison (same machine, interleaved 7-rep medians):
 
-| probe | node | slag default (jit) | slag --no-jit | gap |
+| probe | node | slag default (jit) | slag --jitless | gap |
 |---|---|---|---|---|
 | buildString shape (3M appends) | 6ms | 42ms | 189ms | 7x |
 | buildString full (2.16M cps) | 13ms | 28ms | 110ms | 2.2x |
@@ -2768,7 +2768,7 @@ zero fail/crash/hang on both binaries; the edge probe
 (`scratch/l1a_store_probe.js`: accessor conversion, delete+recreate,
 chain setters present and added later, non-writable + strict,
 function objects, multi-prop thrash, computed keys, super writes,
-proxies, own accessors) passes under the JIT, `--no-jit`, and
+proxies, own accessors) passes under the JIT, `--jitless`, and
 `--gc-stress`.
 
 Next experiment: L1c (shapes with inline-property offsets), the plan's
@@ -2822,7 +2822,7 @@ zero fail/crash/hang; the edge probe (`scratch/l1c_store_probe.js`:
 after warm, delete+recreate on a full map, vector-only non-enumerable
 defines beside a live map, shared-shape instances, function objects,
 super receivers, proxies, >16-key thrash) passes under the JIT,
-`--no-jit`, and `--gc-stress`; the L1a probe still passes.
+`--jitless`, and `--gc-stress`; the L1a probe still passes.
 
 The slice's value is the pinned-offset mechanism: the store cell now
 carries the map/field pair the deeper L1c write phases need (shape-check
@@ -2900,7 +2900,7 @@ member-store row; the slice widens register-run coverage to the common
 Gates: `cargo clippy --workspace --all-targets -- -D warnings` clean;
 `cargo test --workspace` green (incl. a new eval test asserting both
 shapes lower to `RunRegBody`); the edge probes pass under the JIT,
-`--no-jit`, and `--gc-stress`; the three release sweeps are identical to
+`--jitless`, and `--gc-stress`; the three release sweeps are identical to
 the parent — language 23721/23724 (3 skip), built-ins 23657/23812
 (155 skip), annexB 1086/1086, all with zero fail/crash/hang.
 
@@ -2946,7 +2946,7 @@ own getter/setter accessors, chain accessors with and without an own data
 shadow, non-writable, delete+recreate, logical assigns, counter RHS,
 expression-position compounds, nullish receivers, undefined +=
 NaN, descriptor/enumeration integrity, mid-loop break) passes under the
-JIT, `--no-jit`, and `--gc-stress`, as do the L1a/L1c store probes; the
+JIT, `--jitless`, and `--gc-stress`, as do the L1a/L1c store probes; the
 three release sweeps are identical to the parent — language 23721/23724
 (3 skip), built-ins 23657/23812 (155 skip), annexB 1086/1086, all with
 zero fail/crash/hang.
@@ -2967,7 +2967,7 @@ Gates: clippy clean, workspace tests green, the update probe
 (`scratch/l1c_update_probe.js`: numeric/numeric-string/NaN/Infinity
 updates, postfix/prefix values, own accessors, chain accessors,
 non-writable, delete+recreate, nullish, mid-loop break) passes under the
-JIT, `--no-jit`, and `--gc-stress`; the three release sweeps are
+JIT, `--jitless`, and `--gc-stress`; the three release sweeps are
 identical to the parent.
 
 ### Computed-member RMW on the register executor (measured 2026-09-03)
@@ -2993,7 +2993,7 @@ from its slot would re-run an object key's ToPropertyKey after the
 read's getters and was rejected in design (the once-key probe
 `scratch/rmw_key_once2.js`, whose `toString` yields a fresh name per
 call, asserts the read and the write hit the same property per
-iteration under the JIT, `--no-jit`, and `--gc-stress`).
+iteration under the JIT, `--jitless`, and `--gc-stress`).
 
 Measurement (2M-iteration certified loops, `scratch/computed_probe2.js`,
 multi-run, the machine quiet): `o[k] += 1` ~158 -> ~54ns/iter and
@@ -3017,7 +3017,7 @@ assigns, counter RHS, numeric-string/NaN updates, prefix/postfix,
 explicit `o[k] = o[k] + 1`, expression-position values, nullish, the
 once-per-evaluation object key, descriptor/order integrity, mid-loop
 break) and the L1a/L1c/compound/update probes pass under the JIT,
-`--no-jit`, and `--gc-stress`; the three release sweeps are identical to
+`--jitless`, and `--gc-stress`; the three release sweeps are identical to
 the parent — language 23721/23724 (3 skip), built-ins 23657/23812
 (155 skip), annexB 1086/1086, all with zero fail/crash/hang.
 
@@ -3053,7 +3053,7 @@ dense in-range RMW, a hole reading through a prototype and writing an
 own element, append-position NaN semantics, uint8 modulo wrap /
 uint8clamped clamp / float64 +=, typed OOB no-op, a coercion-mutated
 receiver writing exactly once, numeric-string elements) passes under the
-JIT, `--no-jit`, and `--gc-stress`; the three release sweeps are
+JIT, `--jitless`, and `--gc-stress`; the three release sweeps are
 identical to the parent.
 
 Next: the compile-time string-literal-key normalization (a literal
@@ -3084,7 +3084,7 @@ literal-key probe (`scratch/literal_key_probe.js`: literal reads/writes/
 compounds/updates, non-identifier and empty-string keys, `delete`, accessors,
 optional chains, literal-key calls, `__proto__` writes, certified loops, the
 typed-array `['length']` exclusion, `super['k']`) passes under the JIT,
-`--no-jit`, and `--gc-stress`; the three release sweeps are identical to
+`--jitless`, and `--gc-stress`; the three release sweeps are identical to
 the parent.
 
 Next: the remaining literal-COMPUTED key is a NUMBER literal (`o[0] += 1`
@@ -3118,7 +3118,7 @@ separate literal indices, append-position NaN, plain-object index-string
 properties, explicit `o[0] = o[0] + 1`, typed arrays incl. OOB,
 oversized non-index keys) and the heap-const-key probe (`o[1n]` — the
 BigInt-literal key rides the `load_const` field plumbing, rooted under
-`--gc-stress`) pass under the JIT, `--no-jit`, and `--gc-stress`; the
+`--gc-stress`) pass under the JIT, `--jitless`, and `--gc-stress`; the
 three release sweeps are identical to the parent.
 
 Next: the computed-member family is now fast across runtime keys (string
@@ -3150,7 +3150,7 @@ fused key) is unchanged; `buildString full` (apply/fromCodePoint-bound)
 is unchanged. Gates: clippy clean, workspace tests green (new
 `post_inc_key_number_fast_path_matches_update_value` regression covering
 NaN/±Infinity/-0/fractional/over-2^32 keys and the BigInt fallback),
-the computed-RMW probe set passes under the JIT, `--no-jit`, and
+the computed-RMW probe set passes under the JIT, `--jitless`, and
 `--gc-stress`; the three release sweeps are identical to the parent.
 
 Separate pre-existing finding (reproduced at parent HEAD, not introduced
@@ -3240,7 +3240,7 @@ skip, annexB 1086/1086, zero fail/crash/hang), and a register-path
 member-read differential probe (own data, accessors, chain methods,
 typed-array `length`, delete/redefine mid-loop, vector-only props past
 the inline fields, proxy receivers, own-shadow over a chain data
-property, function own props) is byte-identical under `--no-jit` and the
+property, function own props) is byte-identical under `--jitless` and the
 JIT.
 
 Next (L1c read path continued): the remaining ~7ns/read is the
@@ -3268,7 +3268,7 @@ built-ins reduceRight flake reproduced in isolation 5/5 PASS and the
 rerun swept clean), and the extended member-read differential probe
 (chain tails, getters mid-chain, computed receivers, own-absent chain
 reads, nullish mid-chain, primitive receivers) is byte-identical under
-`--no-jit` and the JIT.
+`--jitless` and the JIT.
 
 ### Warm named-member stores probe the L1a cell directly in the register executor (measured 2026-09-03)
 
@@ -3299,7 +3299,7 @@ to the parent (language 23721/3 skip, built-ins 23657/155 skip, annexB
 probe (warm stores, accessor receivers, chain setters under an own data
 shadow, non-writable, delete+recreate mid-loop, accessor conversion
 mid-loop, array `length`, vector-only props, function own props) is
-byte-identical under `--no-jit` and the JIT.
+byte-identical under `--jitless` and the JIT.
 
 ### Counter-keyed computed member access register-runs (measured 2026-09-03)
 
@@ -3335,7 +3335,7 @@ sweeps identical to the parent (language 23721/3 skip, built-ins
 23657/155 skip, annexB 1086/1086, zero fail/crash/hang), and the
 counter-keyed differential probe (Uint8/Int16/Float64 arrays, plain
 arrays and objects, nested receivers, float-step counters, OOB
-read/write, over-2^32 keys) is byte-identical under `--no-jit` and the
+read/write, over-2^32 keys) is byte-identical under `--jitless` and the
 JIT. Computed compounds/updates (`ta[k] += 1`) still lower to the
 `Dup2` general path and stay step-path — the fused compound form does
 not yet reach them.
@@ -3367,7 +3367,7 @@ sweeps identical to the parent (language 23721/3 skip, built-ins
 23657/155 skip, annexB 1086/1086, zero fail/crash/hang), and the
 compound differential probe (typed-array kinds, plain arrays/objects,
 getters reading once, sparse-hole NaN, string-concat compounds,
-object-key once-conversion) is byte-identical under `--no-jit` and the
+object-key once-conversion) is byte-identical under `--jitless` and the
 JIT.
 
 ### Typed-array element reads allocate nothing per element (measured 2026-09-03)
