@@ -13,6 +13,12 @@ pub mod binary;
 pub mod instr;
 pub mod module;
 pub mod types;
+pub mod valid;
 
-pub use binary::{Error, decode};
+pub use binary::{Error as DecodeError, decode};
 pub use module::Module;
+pub use valid::validate;
+
+/// The decoder's error type, re-exported under its phase's name for clarity
+/// next to `valid::Error`.
+pub use valid::Error as ValidError;

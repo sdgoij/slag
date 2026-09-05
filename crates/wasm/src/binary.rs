@@ -12,7 +12,7 @@ use std::fmt;
 use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
 use crate::module::{
     CustomSection, DataMode, DataSegment, ElementMode, ElementSegment, Export, ExportKind,
-    FuncBody, Global, Import, ImportDesc, Module,
+    FuncBody, Global, Import, ImportDesc, Module, Table,
 };
 use crate::types::{
     BlockType, FuncType, GlobalType, HeapType, Limits, MemType, RefType, TableType, ValType,
@@ -45,22 +45,26 @@ const MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6d];
 const VERSION: u32 = 1;
 
 /// Section ids and the order the spec requires (custom sections may appear
-/// anywhere; `DataCount` sits between element and code).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// anywhere; the tag section sits between memory and global; `DataCount`
+/// between element and code). Ordering for the "sections in order" check is
+/// positional (see [`SectionId::position`]), not the numeric id, because the
+/// tag id 13 sorts positionally between memory and global.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SectionId {
-    Custom = 0,
-    Type = 1,
-    Import = 2,
-    Function = 3,
-    Table = 4,
-    Memory = 5,
-    Global = 6,
-    Export = 7,
-    Start = 8,
-    Element = 9,
-    DataCount = 12,
-    Code = 10,
-    Data = 11,
+    Custom,
+    Type,
+    Import,
+    Function,
+    Table,
+    Memory,
+    Tag,
+    Global,
+    Export,
+    Start,
+    Element,
+    DataCount,
+    Code,
+    Data,
 }
 
 impl SectionId {
@@ -79,7 +83,28 @@ impl SectionId {
             10 => Self::Code,
             11 => Self::Data,
             12 => Self::DataCount,
+            13 => Self::Tag,
             _ => return None,
+        })
+    }
+
+    /// Position in the required section sequence; `None` for custom.
+    fn position(self) -> Option<u8> {
+        Some(match self {
+            Self::Type => 1,
+            Self::Import => 2,
+            Self::Function => 3,
+            Self::Table => 4,
+            Self::Memory => 5,
+            Self::Tag => 6,
+            Self::Global => 7,
+            Self::Export => 8,
+            Self::Start => 9,
+            Self::Element => 10,
+            Self::DataCount => 11,
+            Self::Code => 12,
+            Self::Data => 13,
+            Self::Custom => return None,
         })
     }
 }
@@ -116,10 +141,15 @@ pub fn decode(bytes: &[u8]) -> Result<Module, Error> {
             return Err(Error::Malformed("section size mismatch"));
         }
         if id != SectionId::Custom {
-            if let Some(previous) = last
-                && id < previous
-            {
-                return Err(Error::Malformed("section out of order"));
+            if let Some(previous) = last {
+                let order = id.position().expect("non-custom section");
+                let previous_order = previous.position().expect("non-custom section");
+                if order == previous_order {
+                    return Err(Error::Malformed("duplicate section"));
+                }
+                if order < previous_order {
+                    return Err(Error::Malformed("section out of order"));
+                }
             }
             last = Some(id);
         }
@@ -157,6 +187,13 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
                     0x01 => ImportDesc::Table(decode_table_type(payload, &mut pos)?),
                     0x02 => ImportDesc::Memory(decode_mem_type(payload, &mut pos)?),
                     0x03 => ImportDesc::Global(decode_global_type(payload, &mut pos)?),
+                    0x04 => {
+                        let attribute = read_u8(payload, &mut pos)?;
+                        if attribute != 0 {
+                            return Err(Error::Malformed("malformed tag attribute"));
+                        }
+                        ImportDesc::Tag(read_u32(payload, &mut pos)?)
+                    }
                     _ => return Err(Error::Malformed("malformed import kind")),
                 };
                 module.imports.push(Import {
@@ -175,13 +212,23 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
         SectionId::Table => {
             let count = read_u32(payload, &mut pos)?;
             for _ in 0..count {
-                module.tables.push(decode_table_type(payload, &mut pos)?);
+                module.tables.push(decode_table_entry(payload, &mut pos)?);
             }
         }
         SectionId::Memory => {
             let count = read_u32(payload, &mut pos)?;
             for _ in 0..count {
                 module.memories.push(decode_mem_type(payload, &mut pos)?);
+            }
+        }
+        SectionId::Tag => {
+            let count = read_u32(payload, &mut pos)?;
+            for _ in 0..count {
+                let attribute = read_u8(payload, &mut pos)?;
+                if attribute != 0 {
+                    return Err(Error::Malformed("malformed tag attribute"));
+                }
+                module.tags.push(read_u32(payload, &mut pos)?);
             }
         }
         SectionId::Global => {
@@ -203,6 +250,7 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
                     0x01 => ExportKind::Table,
                     0x02 => ExportKind::Memory,
                     0x03 => ExportKind::Global,
+                    0x04 => ExportKind::Tag,
                     _ => return Err(Error::Malformed("malformed export kind")),
                 };
                 module.exports.push(Export { name, kind, index });
@@ -342,6 +390,21 @@ fn decode_table_type(bytes: &[u8], pos: &mut usize) -> Result<TableType, Error> 
     Ok(TableType { element, limits })
 }
 
+/// A table-section entry (spec 5.4): a table type, prefixed by `0x40 0x00`
+/// and followed by a constant initializer expression when the element type
+/// has no default value (non-null element types).
+fn decode_table_entry(bytes: &[u8], pos: &mut usize) -> Result<Table, Error> {
+    if bytes.get(*pos) == Some(&0x40) && bytes.get(*pos + 1) == Some(&0x00) {
+        *pos += 2;
+        let ty = decode_table_type(bytes, pos)?;
+        let init = Some(decode_expr(bytes, pos)?);
+        Ok(Table { ty, init })
+    } else {
+        let ty = decode_table_type(bytes, pos)?;
+        Ok(Table { ty, init: None })
+    }
+}
+
 fn decode_mem_type(bytes: &[u8], pos: &mut usize) -> Result<MemType, Error> {
     let limits = decode_limits(bytes, pos)?;
     Ok(MemType {
@@ -388,120 +451,127 @@ fn decode_block_type(bytes: &[u8], pos: &mut usize) -> Result<BlockType, Error> 
 
 fn decode_element(bytes: &[u8], pos: &mut usize) -> Result<ElementSegment, Error> {
     let flags = read_u32(bytes, pos)?;
-    // Encoding (spec 5.5.12): flags bit 0 = passive/declarative, bit 1 =
-    // has explicit table index + offset, bit 2 = expressions-with-type form.
     match flags {
+        // Active (table 0): offset expr + `ref.func` indices. The segment
+        // element type is non-null `(ref func)`.
         0 => {
             let offset = decode_expr(bytes, pos)?;
             let count = read_u32(bytes, pos)?;
-            let mut init = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                let index = read_u32(bytes, pos)?;
-                init.push(vec![Instr::RefFunc(index)]);
-            }
+            let init = decode_func_indices(bytes, pos, count)?;
             Ok(ElementSegment {
-                ty: RefType::FUNC,
+                ty: RefType {
+                    nullable: false,
+                    heap: HeapType::Func,
+                },
                 mode: ElementMode::Active { table: 0, offset },
                 init,
             })
         }
-        1 => {
-            let element_type = decode_ref_type(bytes, pos)?;
+        // Passive/declarative with an element kind byte + `ref.func` indices.
+        1 | 3 => {
+            let element_type = decode_elem_kind(bytes, pos)?;
             let count = read_u32(bytes, pos)?;
-            let mut init = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                let index = read_u32(bytes, pos)?;
-                init.push(vec![Instr::RefFunc(index)]);
-            }
+            let init = decode_func_indices(bytes, pos, count)?;
+            let mode = if flags == 1 {
+                ElementMode::Passive
+            } else {
+                ElementMode::Declarative
+            };
             Ok(ElementSegment {
                 ty: element_type,
-                mode: ElementMode::Passive,
+                mode,
                 init,
             })
         }
+        // Active (explicit table): table index, offset, kind + indices.
         2 => {
+            let table = read_u32(bytes, pos)?;
+            let offset = decode_expr(bytes, pos)?;
+            let element_type = decode_elem_kind(bytes, pos)?;
+            let count = read_u32(bytes, pos)?;
+            let init = decode_func_indices(bytes, pos, count)?;
+            Ok(ElementSegment {
+                ty: element_type,
+                mode: ElementMode::Active { table, offset },
+                init,
+            })
+        }
+        // Active (table 0): offset expr + element expressions.
+        4 => {
             let offset = decode_expr(bytes, pos)?;
             let count = read_u32(bytes, pos)?;
-            let mut init = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                init.push(decode_expr(bytes, pos)?);
-            }
+            let init = decode_expressions(bytes, pos, count)?;
             Ok(ElementSegment {
                 ty: RefType::FUNC,
                 mode: ElementMode::Active { table: 0, offset },
                 init,
             })
         }
-        3 => {
+        // Passive/declarative with a reference type + element expressions.
+        5 | 7 => {
             let element_type = decode_ref_type(bytes, pos)?;
             let count = read_u32(bytes, pos)?;
-            let mut init = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                init.push(decode_expr(bytes, pos)?);
-            }
+            let init = decode_expressions(bytes, pos, count)?;
+            let mode = if flags == 5 {
+                ElementMode::Passive
+            } else {
+                ElementMode::Declarative
+            };
             Ok(ElementSegment {
                 ty: element_type,
-                mode: ElementMode::Declarative,
+                mode,
                 init,
             })
         }
-        4 => {
-            let table = read_u32(bytes, pos)?;
-            let offset = decode_expr(bytes, pos)?;
-            let count = read_u32(bytes, pos)?;
-            let mut init = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                let index = read_u32(bytes, pos)?;
-                init.push(vec![Instr::RefFunc(index)]);
-            }
-            Ok(ElementSegment {
-                ty: RefType::FUNC,
-                mode: ElementMode::Active { table, offset },
-                init,
-            })
-        }
-        5 => {
-            let table = read_u32(bytes, pos)?;
-            let offset = decode_expr(bytes, pos)?;
-            let element_type = decode_ref_type(bytes, pos)?;
-            let count = read_u32(bytes, pos)?;
-            let mut init = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                init.push(decode_expr(bytes, pos)?);
-            }
-            Ok(ElementSegment {
-                ty: element_type,
-                mode: ElementMode::Active { table, offset },
-                init,
-            })
-        }
+        // Active (explicit table): table index, offset, ref type + exprs.
         6 => {
-            let count = read_u32(bytes, pos)?;
-            let mut init = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                init.push(decode_expr(bytes, pos)?);
-            }
-            Ok(ElementSegment {
-                ty: RefType::FUNC,
-                mode: ElementMode::Declarative,
-                init,
-            })
-        }
-        7 => {
+            let table = read_u32(bytes, pos)?;
+            let offset = decode_expr(bytes, pos)?;
             let element_type = decode_ref_type(bytes, pos)?;
             let count = read_u32(bytes, pos)?;
-            let mut init = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                init.push(decode_expr(bytes, pos)?);
-            }
+            let init = decode_expressions(bytes, pos, count)?;
             Ok(ElementSegment {
                 ty: element_type,
-                mode: ElementMode::Passive,
+                mode: ElementMode::Active { table, offset },
                 init,
             })
         }
-        _ => Err(Error::Unsupported("element segment flags")),
+        _ => Err(Error::Malformed("malformed element segment flags")),
     }
+}
+
+/// The legacy element-kind byte: only `funcref` (0x00) is encodable, as the
+/// non-null `(ref func)` form.
+fn decode_elem_kind(bytes: &[u8], pos: &mut usize) -> Result<RefType, Error> {
+    if read_u8(bytes, pos)? == 0 {
+        Ok(RefType {
+            nullable: false,
+            heap: HeapType::Func,
+        })
+    } else {
+        Err(Error::Malformed("malformed element kind"))
+    }
+}
+
+fn decode_func_indices(
+    bytes: &[u8],
+    pos: &mut usize,
+    count: u32,
+) -> Result<Vec<Vec<Instr>>, Error> {
+    let mut init = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let index = read_u32(bytes, pos)?;
+        init.push(vec![Instr::RefFunc(index)]);
+    }
+    Ok(init)
+}
+
+fn decode_expressions(bytes: &[u8], pos: &mut usize, count: u32) -> Result<Vec<Vec<Instr>>, Error> {
+    let mut init = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        init.push(decode_expr(bytes, pos)?);
+    }
+    Ok(init)
 }
 
 fn decode_data(bytes: &[u8], pos: &mut usize) -> Result<DataSegment, Error> {

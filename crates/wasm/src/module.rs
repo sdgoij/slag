@@ -13,6 +13,8 @@ pub enum ImportDesc {
     Table(TableType),
     Memory(MemType),
     Global(GlobalType),
+    /// A tag import: the type index of its function type (exceptions).
+    Tag(u32),
 }
 
 /// A single import: module and field names plus the imported descriptor.
@@ -37,6 +39,7 @@ pub enum ExportKind {
     Table,
     Memory,
     Global,
+    Tag,
 }
 
 /// A global definition: its type plus a constant initializer expression.
@@ -44,6 +47,14 @@ pub enum ExportKind {
 pub struct Global {
     pub ty: GlobalType,
     pub init: Vec<Instr>,
+}
+
+/// A defined table: its type plus an optional constant initializer from the
+/// newer table-section encoding (absent means the `ref.null` default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    pub ty: TableType,
+    pub init: Option<Vec<Instr>>,
 }
 
 /// A function body (spec 2.5.7/5.5.13): local declarations then the
@@ -106,9 +117,12 @@ pub struct Module {
     pub imports: Vec<Import>,
     /// Type index of each module-defined function (not imports).
     pub functions: Vec<u32>,
-    pub tables: Vec<TableType>,
+    pub tables: Vec<Table>,
     pub memories: Vec<MemType>,
     pub globals: Vec<Global>,
+    /// Type index of each module-defined tag (exceptions; tags import like
+    /// funcs/memories/globals).
+    pub tags: Vec<u32>,
     pub exports: Vec<Export>,
     pub start: Option<u32>,
     pub elements: Vec<ElementSegment>,

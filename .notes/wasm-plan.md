@@ -364,3 +364,34 @@ review, per repo rules hygiene.
 4. **Naming/wiring**: `crates/wasm` (core) + `crates/wasmtest` (harness);
    `runtime` gains a `wasm` feature with `Context::install_wasm()`, enabled
    by default in the CLI alongside `fs`.
+
+## 9. Status
+
+**2026-09-05 — Cut 2 (validation) green on its gate, plus the module-level
+validity files.**
+
+- `crates/wasm/src/valid.rs` implements the spec's algorithmic validator:
+  operand + control frames with a `Bot` (unknown) stack entry for
+  unreachable-code polymorphism, `select` (implicit num/vec-only, typed
+  arity-1), table/global/ref-instruction typing, const-expr rules with the
+  per-context visible-global bound, and import/export/element/data checks
+  (incl. duplicate-export names, active-segment memory/table existence and
+  segment-type ⊑ table-element matching).
+- Decoder completions this cut: positional section-order check (tag id 13
+  sits positionally between memory and global), tag imports decode the
+  `0x00`-attribute byte, element segments match the spec's eight flag
+  encodings (funcidx/kind forms type as non-null `(ref func)`; flag-4 items
+  as `funcref`), table entries accept the `0x40 0x00`-prefixed initializer
+  form.
+- `wasmtest` runner: prefers wabt's `wast2json` (env `WAST2JSON`, then
+  `wast2json` on PATH, then this machine's wabt build, then the Rust
+  `wast2json-rs`), invoked with `--enable-function-references --enable-gc`.
+  Deliberately **not** `--enable-all`: it turns on compact-imports, which
+  re-encodes every import section and breaks the corpus's standard layout.
+- Gate results (0 fail): `type`, `unreached-invalid`, `unreached-valid`,
+  `select`, `global`, `elem`, `data`, `imports` (Cut 2 DoD), plus
+  `exports`.
+- **Excluded from Cut 2 (written taxonomy):** `type-equivalence.wast`,
+  `type-rec.wast`, `type-canon.wast` use `(rec …)` type-section text that
+  wabt 1.0.41 cannot parse (recursive types + canonicalization are Cut 9).
+  Revisit with a GC-capable converter and the Cut 9 rec-type decoder.

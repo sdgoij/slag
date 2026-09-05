@@ -2,8 +2,8 @@
 //!
 //! Drives the pinned `waspec/test/core` corpus through the `crates/wasm`
 //! engine. The corpus is `.wast` (text + assertions); the engine never
-//! parses text, so `wast2json-rs` (a Rust wabt-compatible compiler) turns
-//! each file into one `.wasm` per module plus a `.json` of commands. See
+//! parses text, so `wast2json` (wabt; or the Rust wast2json-rs) turns each
+//! file into one `.wasm` per module plus a `.json` of commands. See
 //! `.notes/wasm-plan.md` for the cut plan.
 //!
 //! Command outcomes are classified by what the current engine can judge:
@@ -17,14 +17,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use serde_json::Value;
-use wasm::{Error, decode};
+use wasm::valid::Error as ValidError;
+use wasm::{DecodeError, decode, validate};
 
 const USAGE: &str = "\
 wasmtest — WebAssembly conformance runner
 
 usage:
   wasmtest check <file.wasm|dir>   decode modules and report per-file status
-  wasmtest convert <file.wast>     compile a .wast with wast2json-rs (wabt)
+  wasmtest convert <file.wast>     compile a .wast with wast2json (wabt)
   wasmtest run <wast|json|dir>     convert (if needed) and run a suite
 ";
 
@@ -200,8 +201,11 @@ fn run_json(json_path: &Path) -> Tally {
                 let module = command.get("module").unwrap_or(command);
                 match module_file(module, dir) {
                     Some((_, bytes)) => match decode(&bytes) {
-                        Ok(_) => Outcome::Pass,
-                        Err(error) => Outcome::Fail(format!("module: {error}")),
+                        Err(error) => Outcome::Fail(format!("module decode: {error}")),
+                        Ok(module) => match validate(&module) {
+                            Ok(_) => Outcome::Pass,
+                            Err(error) => Outcome::Fail(format!("module invalid: {error}")),
+                        },
                     },
                     None => Outcome::Pending("module without a file"),
                 }
@@ -210,8 +214,8 @@ fn run_json(json_path: &Path) -> Tally {
                 let module = command.get("module").unwrap_or(command);
                 match module_file(module, dir) {
                     Some((_, bytes)) => match decode(&bytes) {
-                        Err(Error::Malformed(_)) => Outcome::Pass,
-                        Err(Error::Unsupported(_)) => Outcome::Fail(
+                        Err(DecodeError::Malformed(_)) => Outcome::Pass,
+                        Err(DecodeError::Unsupported(_)) => Outcome::Fail(
                             "expected malformed, decoder hit unsupported feature".into(),
                         ),
                         Ok(_) => Outcome::Fail("expected malformed, module decoded".into()),
@@ -221,13 +225,16 @@ fn run_json(json_path: &Path) -> Tally {
             }
             "assert_invalid" => match module_file(command.get("module").unwrap_or(command), dir) {
                 Some((_, bytes)) => match decode(&bytes) {
-                    Ok(_) => Outcome::Pending("validation (Cut 2)"),
-                    Err(Error::Malformed(message)) => Outcome::Fail(format!(
+                    Err(DecodeError::Malformed(message)) => Outcome::Fail(format!(
                         "expected invalid, decoder says malformed: {message}"
                     )),
-                    Err(Error::Unsupported(_)) => {
+                    Err(DecodeError::Unsupported(_)) => {
                         Outcome::Fail("expected invalid, decoder hit unsupported feature".into())
                     }
+                    Ok(module) => match validate(&module) {
+                        Err(ValidError::Invalid(_)) => Outcome::Pass,
+                        Ok(_) => Outcome::Fail("expected invalid, module validated".into()),
+                    },
                 },
                 None => Outcome::Pending("assert_invalid without a module file"),
             },
@@ -272,44 +279,89 @@ fn module_file(command: &Value, dir: &Path) -> Option<(PathBuf, Vec<u8>)> {
 // ---- conversion (wast2json-rs, wabt fallback) ----
 
 const TOOL_HINT: &str = "\
-Install wast2json-rs (cargo install wast2json-rs) or wabt's wast2json
-(https://github.com/WebAssembly/wabt) and retry.";
+Install wabt's wast2json (https://github.com/WebAssembly/wabt) and retry, or set
+WAST2JSON to its path. The Rust wast2json-rs (cargo install wast2json-rs) is
+also accepted but parses a smaller feature set.";
 
 fn convert_wast(wast: &Path) -> Result<PathBuf, String> {
     let out_dir = Path::new("target").join("wastest");
     fs::create_dir_all(&out_dir)
         .map_err(|error| format!("cannot create {}: {error}", out_dir.display()))?;
     let json_path = out_dir.join(json_name(wast));
-    for binary in ["wast2json-rs", "wast2json"] {
-        if let Some(result) = run_converter(binary, wast, &json_path) {
+    for (tool, form) in converter_tools() {
+        if let Some(result) = run_converter(&tool, form, wast, &json_path) {
             result?;
             return Ok(json_path);
         }
     }
-    Err(format!("no wast2json-rs/wast2json on PATH.\n{TOOL_HINT}"))
+    Err(format!("no wast2json converter available.\n{TOOL_HINT}"))
 }
 
-/// Try a converter binary; returns `None` when it is not on PATH, `Some` with
-/// the outcome otherwise.
-fn run_converter(binary: &str, wast: &Path, out_json: &Path) -> Option<Result<(), String>> {
-    let Ok(probe) = Command::new(binary).arg("--version").output() else {
+/// Whether a converter speaks wabt's CLI (feature flags, no `-c`) or the
+/// Rust reimplementation's CLI (`-c` for compact JSON).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConverterForm {
+    Wabt,
+    Rust,
+}
+
+/// Converter candidates in order of preference: a wabt build named by
+/// `WAST2JSON`, wabt's `wast2json` on PATH, the Rust `wast2json-rs` on PATH,
+/// then this machine's wabt build as a last resort.
+fn converter_tools() -> Vec<(String, ConverterForm)> {
+    let mut tools = Vec::new();
+    if let Ok(path) = std::env::var("WAST2JSON")
+        && !path.is_empty()
+    {
+        tools.push((path, ConverterForm::Wabt));
+    }
+    tools.push((String::from("wast2json"), ConverterForm::Wabt));
+    tools.push((String::from("wast2json-rs"), ConverterForm::Rust));
+    let wabt_default = Path::new("C:\\Users\\T\\Desktop\\wabt\\build\\Release\\wast2json.exe");
+    if wabt_default.exists() {
+        tools.push((
+            wabt_default.to_string_lossy().into_owned(),
+            ConverterForm::Wabt,
+        ));
+    }
+    tools
+}
+
+/// Try a converter; returns `None` when it is not runnable, `Some` with the
+/// outcome otherwise.
+fn run_converter(
+    tool: &str,
+    form: ConverterForm,
+    wast: &Path,
+    out_json: &Path,
+) -> Option<Result<(), String>> {
+    let Ok(probe) = Command::new(tool).arg("--version").output() else {
         return None;
     };
     println!(
-        "using {} ({})",
-        binary,
+        "using {tool} ({})",
         String::from_utf8_lossy(&probe.stdout).trim()
     );
-    match Command::new(binary)
-        .arg("-c")
-        .arg(wast)
-        .arg("-o")
-        .arg(out_json)
-        .status()
-    {
+    let mut command = Command::new(tool);
+    match form {
+        ConverterForm::Wabt => {
+            // Enable the proposal features the corpus exercises but wabt
+            // leaves off by default. Not `--enable-all`: compact-imports
+            // rewrites the import section encoding of *every* module, and
+            // the spec tests are written for the standard layout.
+            for feature in ["--enable-function-references", "--enable-gc"] {
+                command.arg(feature);
+            }
+            command.arg(wast).arg("-o").arg(out_json);
+        }
+        ConverterForm::Rust => {
+            command.arg("-c").arg(wast).arg("-o").arg(out_json);
+        }
+    }
+    match command.status() {
         Ok(status) if status.success() => Some(Ok(())),
-        Ok(status) => Some(Err(format!("{binary} exited with {status}"))),
-        Err(error) => Some(Err(format!("failed to run {binary}: {error}"))),
+        Ok(status) => Some(Err(format!("{tool} exited with {status}"))),
+        Err(error) => Some(Err(format!("failed to run {tool}: {error}"))),
     }
 }
 
