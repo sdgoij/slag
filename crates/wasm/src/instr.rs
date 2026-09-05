@@ -363,4 +363,80 @@ pub enum Instr {
     TableGrow(u32),
     TableSize(u32),
     TableFill(u32),
+    // GC aggregate instructions (0xfb prefix, spec 2.4.7/2.4.9).
+    StructNew(u32),
+    StructNewDefault(u32),
+    StructGet {
+        ty: u32,
+        field: u32,
+    },
+    StructGetS {
+        ty: u32,
+        field: u32,
+    },
+    StructGetU {
+        ty: u32,
+        field: u32,
+    },
+    StructSet {
+        ty: u32,
+        field: u32,
+    },
+    ArrayNew(u32),
+    ArrayNewDefault(u32),
+    ArrayNewFixed {
+        ty: u32,
+        n: u32,
+    },
+    ArrayNewData {
+        ty: u32,
+        data: u32,
+    },
+    ArrayNewElem {
+        ty: u32,
+        elem: u32,
+    },
+    ArrayGet(u32),
+    ArrayGetS(u32),
+    ArrayGetU(u32),
+    ArraySet(u32),
+    ArrayLen,
+    ArrayFill(u32),
+    ArrayCopy {
+        dst: u32,
+        src: u32,
+    },
+    ArrayInitData {
+        ty: u32,
+        data: u32,
+    },
+    ArrayInitElem {
+        ty: u32,
+        elem: u32,
+    },
+    /// `ref.test` — `nullable` is the target type's nullability (the 0x14
+    /// non-null form tests nulls as failing; 0x15 lets nulls pass).
+    RefTest {
+        nullable: bool,
+        heap: crate::types::HeapType,
+    },
+    RefCast {
+        nullable: bool,
+        heap: crate::types::HeapType,
+    },
+    BrOnCast {
+        label: u32,
+        from: crate::types::RefType,
+        to: crate::types::RefType,
+    },
+    BrOnCastFail {
+        label: u32,
+        from: crate::types::RefType,
+        to: crate::types::RefType,
+    },
+    AnyConvertExtern,
+    ExternConvertAny,
+    RefI31,
+    I31GetS,
+    I31GetU,
 }

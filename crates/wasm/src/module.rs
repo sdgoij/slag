@@ -4,7 +4,9 @@
 //! instantiated/executed in later cuts.
 
 use crate::instr::Instr;
-use crate::types::{FuncType, GlobalType, Limits, MemType, RefType, TableType, ValType};
+use crate::types::{
+    CompositeType, FuncType, GlobalType, Limits, MemType, RefType, SubType, TableType, ValType,
+};
 
 /// An import description (spec 2.5.11).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,7 +115,9 @@ pub struct CustomSection {
 /// `bodies` parallels the non-import function declarations.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Module {
-    pub types: Vec<FuncType>,
+    /// The module's type space: one entry per subtype (a rec group of `n`
+    /// members occupies `n` consecutive indices).
+    pub types: Vec<SubType>,
     pub imports: Vec<Import>,
     /// Type index of each module-defined function (not imports).
     pub functions: Vec<u32>,
@@ -146,5 +150,20 @@ impl Module {
 
     pub fn func_type(params: Vec<ValType>, results: Vec<ValType>) -> FuncType {
         FuncType { params, results }
+    }
+
+    /// Resolve a type index to its function type, if it is one.
+    pub fn func_at(&self, index: u32) -> Option<&FuncType> {
+        self.types
+            .get(index as usize)
+            .and_then(|sub| match &sub.composite {
+                CompositeType::Func(func) => Some(func),
+                _ => None,
+            })
+    }
+
+    /// Resolve a type index to its function type by value, if it is one.
+    pub fn func_at_cloned(&self, index: u32) -> Option<FuncType> {
+        self.func_at(index).cloned()
     }
 }

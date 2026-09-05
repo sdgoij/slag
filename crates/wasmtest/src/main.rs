@@ -21,10 +21,10 @@ mod convert;
 
 use serde_json::Value;
 use wasm::Value as WasmValue;
-use wasm::types::{FuncType, GlobalType, Limits, MemType, RefType, TableType, ValType};
+use wasm::types::{FuncType, GlobalType, HeapType, Limits, MemType, RefType, TableType, ValType};
 use wasm::valid::Error as ValidError;
-use wasm::values::FuncAddr;
 use wasm::values::RefValue;
+use wasm::values::{ExternInner, FuncAddr};
 use wasm::{
     DecodeError, ExecFail, ExternVal, InstantiateError, Module, Store, Trap, decode, validate,
 };
@@ -373,6 +373,9 @@ fn run_json(json_path: &Path) -> Tally {
                                 Err(DecodeError::Unsupported(reason)) => Outcome::Pending(reason),
                                 Err(error) => Outcome::Fail(format!("module decode: {error}")),
                                 Ok(module) => match validate(&module) {
+                                    Err(ValidError::Unsupported(reason)) => {
+                                        Outcome::Pending(reason)
+                                    }
                                     Err(error) => Outcome::Fail(format!("module invalid: {error}")),
                                     Ok(_) => Outcome::Pass,
                                 },
@@ -452,6 +455,7 @@ fn run_json(json_path: &Path) -> Tally {
                         Err(DecodeError::Unsupported(reason)) => Outcome::Pending(reason),
                         Ok(module) => match validate(&module) {
                             Err(ValidError::Invalid(_)) => Outcome::Pass,
+                            Err(ValidError::Unsupported(reason)) => Outcome::Pending(reason),
                             Ok(_) => Outcome::Fail("expected invalid, module validated".into()),
                         },
                     },
@@ -730,7 +734,10 @@ fn judge_module(
         Ok(module) => module,
     };
     if let Err(error) = validate(&module) {
-        return Verdict::Fail(format!("module invalid: {error}"));
+        return match error {
+            ValidError::Unsupported(reason) => Verdict::Pending(reason),
+            ValidError::Invalid(_) => Verdict::Fail(format!("module invalid: {error}")),
+        };
     }
     let result = {
         let mut resolve = |m: &str, n: &str| {
@@ -788,11 +795,14 @@ fn run_action(
             let index = store
                 .exported_func(instance, field)
                 .ok_or(ActOutcome::Unsupported("unknown function export"))?;
+            let params = store.func_params(instance, index);
             let mut args = Vec::new();
             if let Some(arg_values) = action.get("args").and_then(Value::as_array) {
-                for arg in arg_values {
+                for (position, arg) in arg_values.iter().enumerate() {
+                    let slot = params.as_ref().and_then(|params| params.get(position));
                     args.push(
-                        parse_const(arg).ok_or(ActOutcome::Unsupported("unparseable argument"))?,
+                        parse_arg(arg, slot)
+                            .ok_or(ActOutcome::Unsupported("unparseable argument"))?,
                     );
                 }
             }
@@ -810,8 +820,33 @@ fn run_action(
     }
 }
 
-/// Parse a JSON const (or expected) entry `{"type": ..., "value": ...}` into
-/// a runtime value. NaN patterns are only legal in expectations.
+/// Parse a JSON const entry `{"type": ..., "value": ...}` into a runtime
+/// value. NaN patterns are only legal in expectations (returned as `None`).
+/// `slot` is the *static type* of the argument the entry fills (when known):
+/// the JSON `externref` payload form cannot distinguish `ref.host` (an
+/// internal `any` value) from `ref.extern` (an external wrapper), so the
+/// runner uses the callee's parameter type to pick the representation.
+fn parse_arg(entry: &serde_json::Value, slot: Option<&ValType>) -> Option<WasmValue> {
+    let ty = entry.get("type").and_then(Value::as_str)?;
+    if ty == "externref" {
+        let value = entry.get("value").and_then(Value::as_str)?;
+        if value == "null" {
+            return Some(WasmValue::Ref(RefValue::Null));
+        }
+        let host = value.parse::<u64>().ok()? as u32;
+        let wrapped = match slot {
+            Some(ValType::Ref(reftype)) if reftype.heap == HeapType::Extern => {
+                RefValue::Extern(ExternInner::Host(host))
+            }
+            _ => RefValue::Host(host),
+        };
+        return Some(WasmValue::Ref(wrapped));
+    }
+    parse_const(entry)
+}
+
+/// Parse a JSON const (or expected) entry into a runtime value. NaN patterns
+/// are only legal in expectations (returned as `None`).
 fn parse_const(entry: &serde_json::Value) -> Option<WasmValue> {
     let ty = entry.get("type").and_then(Value::as_str)?;
     if ty == "v128" {
@@ -820,6 +855,22 @@ fn parse_const(entry: &serde_json::Value) -> Option<WasmValue> {
     let value = entry.get("value").and_then(Value::as_str)?;
     if value.starts_with("nan:") {
         return None;
+    }
+    if value == "null"
+        && matches!(
+            ty,
+            "funcref"
+                | "externref"
+                | "exnref"
+                | "anyref"
+                | "eqref"
+                | "structref"
+                | "arrayref"
+                | "i31ref"
+                | "nullref"
+        )
+    {
+        return Some(WasmValue::Ref(RefValue::Null));
     }
     match ty {
         "funcref" => {
@@ -833,7 +884,7 @@ fn parse_const(entry: &serde_json::Value) -> Option<WasmValue> {
             let reference = if value == "null" {
                 RefValue::Null
             } else {
-                RefValue::Extern(value.parse::<u64>().ok()? as u32)
+                RefValue::Extern(ExternInner::Host(value.parse::<u64>().ok()? as u32))
             };
             Some(WasmValue::Ref(reference))
         }
@@ -847,6 +898,41 @@ fn parse_const(entry: &serde_json::Value) -> Option<WasmValue> {
                 _ => return None,
             })
         }
+    }
+}
+
+/// The abstract kind of a non-null runtime reference (used to match GC
+/// `*ref` expected values against what the engine actually produced).
+fn reference_kind(reference: RefValue) -> Option<&'static str> {
+    Some(match reference {
+        RefValue::Null => return None,
+        RefValue::Host(_) => "any",
+        RefValue::I31(_) => "i31",
+        RefValue::Struct(_) => "struct",
+        RefValue::Array(_) => "array",
+        RefValue::Extern(_) => "extern",
+        RefValue::Func(_) => "func",
+        RefValue::Exn(_) => "exn",
+    })
+}
+
+/// Whether a non-null runtime reference satisfies a GC `*ref` expectation's
+/// kind (the expectation's dynamic value is below the expected type, so an
+/// `eqref` matches any eq aggregate, an `anyref` any internal aggregate, and
+/// so on).
+fn gc_expected_matches(expected: &str, reference: RefValue) -> bool {
+    let Some(kind) = reference_kind(reference) else {
+        return false;
+    };
+    match expected {
+        "anyref" => matches!(kind, "any" | "i31" | "struct" | "array"),
+        "eqref" => matches!(kind, "i31" | "struct" | "array"),
+        "structref" => kind == "struct",
+        "arrayref" => kind == "array",
+        "i31ref" => kind == "i31",
+        // `none` is a bottom type: no non-null value is a `nullref`.
+        "nullref" => false,
+        _ => false,
     }
 }
 
@@ -883,8 +969,40 @@ fn matches_expected(expected: &serde_json::Value, actual: WasmValue, module: usi
         return value == "null" && matches!(actual, WasmValue::Ref(RefValue::Null));
     }
     if ty == "externref" {
-        return parse_const(expected) == Some(actual)
-            || (value == "null" && matches!(actual, WasmValue::Ref(RefValue::Null)));
+        // A JSON externref carries a host payload; the runner cannot tell
+        // `ref.host n` (an internal `any`) from `ref.extern n` (a wrapper), so
+        // it accepts either form with the same payload. The bare `(ref.extern)`
+        // pattern is encoded as value "any": any non-null external reference.
+        let WasmValue::Ref(reference) = actual else {
+            return false;
+        };
+        if value == "null" {
+            return reference == RefValue::Null;
+        }
+        if value == "any" {
+            return matches!(reference, RefValue::Extern(_));
+        }
+        let Ok(payload) = value.parse::<u64>() else {
+            return false;
+        };
+        return reference.host_payload() == Some(payload as u32);
+    }
+    // GC abstract reference kinds: value "null" matches a null reference;
+    // value "0" means "some non-null reference of this kind" (like funcref).
+    if matches!(
+        ty,
+        "anyref" | "eqref" | "structref" | "arrayref" | "i31ref" | "nullref"
+    ) {
+        let WasmValue::Ref(reference) = actual else {
+            return false;
+        };
+        if value == "null" {
+            return reference == RefValue::Null;
+        }
+        if value != "0" {
+            return false;
+        }
+        return gc_expected_matches(ty, reference);
     }
     let bits = match actual {
         WasmValue::I32(v) => v as u32 as u64,
@@ -1016,6 +1134,11 @@ fn trap_text(trap: Trap) -> &'static str {
         Trap::NullReference => "null reference",
         Trap::NullFunctionReference => "null function reference",
         Trap::NullExceptionReference => "null exception reference",
+        Trap::NullStructReference => "null structure reference",
+        Trap::NullArrayReference => "null array reference",
+        Trap::NullI31Reference => "null i31 reference",
+        Trap::OutOfBoundsArrayAccess => "out of bounds array access",
+        Trap::CastFailure => "cast failure",
         Trap::UnsupportedImport => "unsupported import",
         Trap::UnknownFunction => "unknown function",
     }

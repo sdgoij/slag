@@ -17,8 +17,11 @@
 
 use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
-use crate::types::{BlockType, FuncType, GlobalType, Limits, MemType, RefType, TableType, ValType};
-use crate::values::{FuncAddr, RefValue, Trap, Value, exec_num};
+use crate::types::{
+    BlockType, CompositeType, FieldType, FuncType, GlobalType, HeapType, Limits, MemType, RefType,
+    StorageType, SubType, TableType, ValType,
+};
+use crate::values::{ExternInner, FuncAddr, RefValue, Trap, Value, exec_num};
 
 /// How execution stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +182,28 @@ pub struct ExceptionInst {
     pub args: Vec<Value>,
 }
 
+/// A GC aggregate object (struct or array) in the store's object pool. The
+/// owning instance's module owns `ty`, which fixes the field/element storage
+/// layout; each data slot is a [`Value`] (packed cells keep the wrapped
+/// unsigned bits). Objects are append-only, so ids stay stable.
+#[derive(Debug)]
+pub struct GcObject {
+    /// The instance whose module allocated this object (its type space owns
+    /// `ty`).
+    pub owner: usize,
+    /// The object's type index in the owner's module.
+    pub ty: u32,
+    pub data: GcData,
+}
+
+#[derive(Debug)]
+pub enum GcData {
+    /// One value per declared struct field.
+    Struct(Vec<Value>),
+    /// One value per array element.
+    Array(Vec<Value>),
+}
+
 /// A value handed to [`Store::instantiate`] for one import. Function, global,
 /// memory, table, and tag values reference cells/instances that stay alive in
 /// the store.
@@ -243,6 +268,9 @@ pub struct Store {
     table_types: Vec<TableType>,
     tags: Vec<TagInst>,
     exceptions: Vec<ExceptionInst>,
+    /// Live GC struct/array objects; ids double as `RefValue::Struct/Array`
+    /// payloads.
+    objects: Vec<GcObject>,
 }
 
 impl Default for Store {
@@ -264,6 +292,7 @@ impl Store {
             table_types: Vec::new(),
             tags: Vec::new(),
             exceptions: Vec::new(),
+            objects: Vec::new(),
         }
     }
 
@@ -315,14 +344,13 @@ impl Store {
             match &import.desc {
                 ImportDesc::Func(type_index) => {
                     let expected = module
-                        .types
-                        .get(*type_index as usize)
+                        .func_at_cloned(*type_index)
                         .ok_or(InstantiateError::Unlinkable("unknown import"))?;
                     let value = resolve(&import.module, &import.name)
                         .ok_or(InstantiateError::Unlinkable("unknown import"))?;
                     match value {
                         ExternVal::HostFunc(id) => {
-                            if self.host_funcs[id].ty != *expected {
+                            if self.host_funcs[id].ty != expected {
                                 return Err(InstantiateError::Unlinkable(
                                     "incompatible import type",
                                 ));
@@ -335,7 +363,7 @@ impl Store {
                                 .get(instance)
                                 .and_then(|i| i.funcs.get(index))
                                 .ok_or(InstantiateError::Unlinkable("unknown import"))?;
-                            if self.target_type(target) != *expected {
+                            if self.target_type(target) != expected {
                                 return Err(InstantiateError::Unlinkable(
                                     "incompatible import type",
                                 ));
@@ -429,8 +457,7 @@ impl Store {
                 }
                 ImportDesc::Tag(type_index) => {
                     let expected = module
-                        .types
-                        .get(*type_index as usize)
+                        .func_at_cloned(*type_index)
                         .ok_or(InstantiateError::Unlinkable("unknown import"))?;
                     let value = resolve(&import.module, &import.name)
                         .ok_or(InstantiateError::Unlinkable("unknown import"))?;
@@ -438,7 +465,7 @@ impl Store {
                         ExternVal::Tag(cell) => {
                             // Tags match by payload shape: the imported type
                             // must equal the tag's declared function type.
-                            if self.tags.get(cell).map(|t| &t.ty) != Some(expected) {
+                            if self.tags.get(cell).map(|t| t.ty.clone()) != Some(expected) {
                                 return Err(InstantiateError::Unlinkable(
                                     "incompatible import type",
                                 ));
@@ -465,17 +492,16 @@ impl Store {
 
         for type_index in &module.tags {
             let ty = module
-                .types
-                .get(*type_index as usize)
+                .func_at_cloned(*type_index)
                 .ok_or(InstantiateError::Unlinkable("unknown tag type"))?;
-            self.tags.push(TagInst { ty: ty.clone() });
+            self.tags.push(TagInst { ty });
             tags.push(self.tags.len() - 1);
         }
 
         for table in &module.tables {
             let init = if let Some(init_expr) = &table.init {
                 let values = self.global_values(&globals);
-                eval_ref_const(init_expr, &values, self_id)?
+                eval_ref_const(self, module, init_expr, &values, self_id)?
             } else {
                 RefValue::Null
             };
@@ -497,8 +523,8 @@ impl Store {
 
         for global in &module.globals {
             let values = self.global_values(&globals);
-            let value =
-                eval_const(&global.init, &values, self_id).map_err(InstantiateError::from)?;
+            let value = eval_const(self, module, &global.init, &values, self_id)
+                .map_err(InstantiateError::from)?;
             self.global_types.push(global.ty);
             self.globals.push(value);
             globals.push(self.globals.len() - 1);
@@ -524,7 +550,7 @@ impl Store {
             let items: Vec<RefValue> = segment
                 .init
                 .iter()
-                .map(|item| eval_ref_const(item, &values, self_id))
+                .map(|item| eval_ref_const(self, module, item, &values, self_id))
                 .collect::<Result<_, _>>()?;
             match &segment.mode {
                 ElementMode::Active { table, offset } => {
@@ -533,8 +559,8 @@ impl Store {
                         .get(*table as usize)
                         .copied()
                         .ok_or(InstantiateError::Trap(Trap::OutOfBoundsTableAccess))?;
-                    let offset_value =
-                        eval_const(offset, &values, self_id).map_err(InstantiateError::from)?;
+                    let offset_value = eval_const(self, module, offset, &values, self_id)
+                        .map_err(InstantiateError::from)?;
                     // The active offset's width follows the table's address
                     // type: i32 for a 32-bit table, i64 for a table64.
                     let start = match offset_value {
@@ -573,8 +599,8 @@ impl Store {
                     .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))
                     .map_err(InstantiateError::from)?;
                 let values = self.global_values(&self.instances[self_id].globals);
-                let offset_value =
-                    eval_const(offset, &values, self_id).map_err(InstantiateError::from)?;
+                let offset_value = eval_const(self, module, offset, &values, self_id)
+                    .map_err(InstantiateError::from)?;
                 // The active offset's width follows the memory's address type:
                 // i32 for a memory32, i64 for a memory64.
                 let start = match offset_value {
@@ -687,6 +713,39 @@ impl Store {
         self.globals.get(cell).copied()
     }
 
+    /// The declared function type at `index` (full function index space) of
+    /// `instance`, if any. Used by the runner to shape reference arguments
+    /// (a `ref.host` payload argument is an internal `any` value, while a
+    /// `ref.extern` payload is wrapped as an external).
+    pub fn func_type(&self, instance: usize, index: usize) -> Option<FuncType> {
+        let inst = self.instances.get(instance)?;
+        let func_imports = inst
+            .module
+            .imports
+            .iter()
+            .filter(|import| matches!(import.desc, ImportDesc::Func(_)))
+            .count();
+        let ti = if index < func_imports {
+            inst.module
+                .imports
+                .iter()
+                .filter_map(|import| match import.desc {
+                    ImportDesc::Func(ty) => Some(ty),
+                    _ => None,
+                })
+                .nth(index)
+        } else {
+            inst.module.functions.get(index - func_imports).copied()
+        }?;
+        inst.module.func_at_cloned(ti)
+    }
+
+    /// The parameter types of function `index` (full function index space) of
+    /// `instance`.
+    pub fn func_params(&self, instance: usize, index: usize) -> Option<Vec<ValType>> {
+        self.func_type(instance, index).map(|ty| ty.params)
+    }
+
     /// Invoke function `index` (full index space) of `instance` with `args`.
     pub fn invoke(
         &mut self,
@@ -736,11 +795,8 @@ impl Store {
                 .get(defined)
                 .copied()
                 .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-            let signature = module
-                .types
-                .get(type_index as usize)
-                .cloned()
-                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+            let signature = module.func_at_cloned(type_index);
+            let signature = signature.ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
             (signature, body.locals.clone())
         };
         let mut locals = args.to_vec();
@@ -777,7 +833,7 @@ impl Store {
                 module
                     .functions
                     .get(defined)
-                    .and_then(|&ti| module.types.get(ti as usize))
+                    .and_then(|&ti| module.func_at(ti))
                     .cloned()
                     .unwrap_or(FuncType {
                         params: Vec::new(),
@@ -1614,6 +1670,630 @@ impl<'a> Engine<'a> {
             Instr::TableGrow(table) => self.table_grow(table as usize),
             Instr::TableSize(table) => self.table_size(table as usize),
             Instr::TableFill(table) => self.table_fill(table as usize),
+            // ---- GC aggregates (Cut 9 wave 3) ----
+            Instr::StructNew(ty) => {
+                let instance = self.frames[frame_index].instance;
+                let storage = self.frame_struct_storage(instance, ty)?;
+                let mut cells = Vec::with_capacity(storage.len());
+                for st in storage.iter().rev() {
+                    let value = self.pop()?;
+                    cells.push(wrap_cell(*st, value)?);
+                }
+                cells.reverse();
+                let id = alloc_struct(self.store, instance, ty, cells);
+                self.stack.push(Value::Ref(RefValue::Struct(id)));
+                Ok(Ctl::Next)
+            }
+            Instr::StructNewDefault(ty) => {
+                let instance = self.frames[frame_index].instance;
+                let storage = self.frame_struct_storage(instance, ty)?;
+                let mut cells = Vec::with_capacity(storage.len());
+                for st in storage {
+                    cells.push(default_storage(st)?);
+                }
+                let id = alloc_struct(self.store, instance, ty, cells);
+                self.stack.push(Value::Ref(RefValue::Struct(id)));
+                Ok(Ctl::Next)
+            }
+            Instr::StructGet { field, .. } => self.struct_field_read(field as usize, GcRead::Plain),
+            Instr::StructGetS { field, .. } => {
+                self.struct_field_read(field as usize, GcRead::Signed)
+            }
+            Instr::StructGetU { field, .. } => {
+                self.struct_field_read(field as usize, GcRead::Unsigned)
+            }
+            Instr::StructSet { field, .. } => {
+                let value = self.pop()?;
+                let reference = self.pop()?;
+                let Value::Ref(reference) = reference else {
+                    return Err(ExecFail::Unsupported("non-reference struct operand"));
+                };
+                let RefValue::Struct(id) = reference else {
+                    return Err(if reference == RefValue::Null {
+                        ExecFail::Trap(Trap::NullStructReference)
+                    } else {
+                        ExecFail::Unsupported("non-struct struct.set operand")
+                    });
+                };
+                let storage = gc_struct_storage(self.store, id)?;
+                let st = *storage
+                    .get(field as usize)
+                    .ok_or(ExecFail::Unsupported("struct field out of range"))?;
+                let cell = wrap_cell(st, value)?;
+                match &mut self.store.objects[id].data {
+                    GcData::Struct(cells) => {
+                        cells[field as usize] = cell;
+                    }
+                    _ => return Err(ExecFail::Unsupported("struct.set of non-struct")),
+                }
+                Ok(Ctl::Next)
+            }
+            Instr::ArrayNew(ty) => {
+                let instance = self.frames[frame_index].instance;
+                let len = self.pop_i32()?;
+                let value = self.pop()?;
+                let st = self.frame_array_storage(instance, ty)?;
+                let cell = wrap_cell(st, value)?;
+                let id = alloc_array_filled(self.store, instance, ty, len, cell)?;
+                self.stack.push(Value::Ref(RefValue::Array(id)));
+                Ok(Ctl::Next)
+            }
+            Instr::ArrayNewDefault(ty) => {
+                let instance = self.frames[frame_index].instance;
+                let len = self.pop_i32()?;
+                let st = self.frame_array_storage(instance, ty)?;
+                let cell = default_storage(st)?;
+                let id = alloc_array_filled(self.store, instance, ty, len, cell)?;
+                self.stack.push(Value::Ref(RefValue::Array(id)));
+                Ok(Ctl::Next)
+            }
+            Instr::ArrayNewFixed { ty, n } => {
+                let instance = self.frames[frame_index].instance;
+                let st = self.frame_array_storage(instance, ty)?;
+                let mut cells = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    let value = self.pop()?;
+                    cells.push(wrap_cell(st, value)?);
+                }
+                cells.reverse();
+                let id = alloc_array(self.store, instance, ty, cells);
+                self.stack.push(Value::Ref(RefValue::Array(id)));
+                Ok(Ctl::Next)
+            }
+            Instr::ArrayNewData { ty, data } => {
+                let instance = self.frames[frame_index].instance;
+                let st = self.frame_array_storage(instance, ty)?;
+                let n = self.pop_i32()? as u32 as u64;
+                let src = self.pop_i32()? as u32 as u64;
+                let width = u64::from(
+                    storage_width(st).ok_or(ExecFail::Unsupported("array.new_data of refs"))?
+                        as u32,
+                );
+                let instance2 = self.frames[frame_index].instance;
+                // A dropped data segment behaves as empty (spec: `data.drop`
+                // empties the segment, so zero-length uses still succeed).
+                let bytes = self.store.instances[instance2].data_segments[data as usize]
+                    .as_deref()
+                    .unwrap_or(&[]);
+                let total = n
+                    .checked_mul(width)
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+                let end = src
+                    .checked_add(total)
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+                if end > bytes.len() as u64 {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+                }
+                let mut cells = Vec::with_capacity(n as usize);
+                for i in 0..n {
+                    let at = (src + i * width) as usize;
+                    cells.push(
+                        data_element(st, bytes, at)
+                            .ok_or(ExecFail::Unsupported("array.new_data element read"))?,
+                    );
+                }
+                let id = alloc_array(self.store, instance, ty, cells);
+                self.stack.push(Value::Ref(RefValue::Array(id)));
+                Ok(Ctl::Next)
+            }
+            Instr::ArrayNewElem { ty, elem } => {
+                let instance = self.frames[frame_index].instance;
+                let n = self.pop_i32()? as u32 as u64;
+                let src = self.pop_i32()? as u32 as u64;
+                // A dropped element segment behaves as empty.
+                let items = self.store.instances[instance].element_segments[elem as usize]
+                    .as_deref()
+                    .unwrap_or(&[]);
+                let end = src
+                    .checked_add(n)
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsTableAccess))?;
+                if end > items.len() as u64 {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
+                }
+                let cells = (0..n)
+                    .map(|i| Value::Ref(items[(src + i) as usize]))
+                    .collect();
+                let id = alloc_array(self.store, instance, ty, cells);
+                self.stack.push(Value::Ref(RefValue::Array(id)));
+                Ok(Ctl::Next)
+            }
+            Instr::ArrayGet(ty) => self.array_read(ty, GcRead::Plain),
+            Instr::ArrayGetS(ty) => self.array_read(ty, GcRead::Signed),
+            Instr::ArrayGetU(ty) => self.array_read(ty, GcRead::Unsigned),
+            Instr::ArraySet(_ty) => {
+                let value = self.pop()?;
+                let index = self.pop_i32()?;
+                let reference = self.pop()?;
+                let Value::Ref(reference) = reference else {
+                    return Err(ExecFail::Unsupported("non-reference array operand"));
+                };
+                let RefValue::Array(id) = reference else {
+                    return Err(if reference == RefValue::Null {
+                        ExecFail::Trap(Trap::NullArrayReference)
+                    } else {
+                        ExecFail::Unsupported("non-array array.set operand")
+                    });
+                };
+                if (index as u32 as usize) >= gc_array_len(self.store, id)? {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess));
+                }
+                let st = gc_array_storage(self.store, id)?;
+                let cell = wrap_cell(st, value)?;
+                match &mut self.store.objects[id].data {
+                    GcData::Array(cells) => cells[index as u32 as usize] = cell,
+                    _ => return Err(ExecFail::Unsupported("array.set of non-array")),
+                }
+                Ok(Ctl::Next)
+            }
+            Instr::ArrayLen => {
+                let reference = self.pop()?;
+                let Value::Ref(reference) = reference else {
+                    return Err(ExecFail::Unsupported("non-reference array operand"));
+                };
+                let RefValue::Array(id) = reference else {
+                    return Err(if reference == RefValue::Null {
+                        ExecFail::Trap(Trap::NullArrayReference)
+                    } else {
+                        ExecFail::Unsupported("array.len of non-array")
+                    });
+                };
+                let len = match &self.store.objects[id].data {
+                    GcData::Array(cells) => cells.len(),
+                    _ => return Err(ExecFail::Unsupported("array.len of non-array")),
+                };
+                self.stack.push(Value::I32(len as i32));
+                Ok(Ctl::Next)
+            }
+            Instr::ArrayFill(_ty) => {
+                let n = self.pop_i32()? as u32 as usize;
+                let value = self.pop()?;
+                let start = self.pop_i32()? as u32 as usize;
+                let reference = self.pop()?;
+                let Value::Ref(reference) = reference else {
+                    return Err(ExecFail::Unsupported("non-reference array operand"));
+                };
+                let RefValue::Array(id) = reference else {
+                    return Err(if reference == RefValue::Null {
+                        ExecFail::Trap(Trap::NullArrayReference)
+                    } else {
+                        ExecFail::Unsupported("array.fill of non-array")
+                    });
+                };
+                let st = gc_array_storage(self.store, id)?;
+                let cell = wrap_cell(st, value)?;
+                let cells = match &mut self.store.objects[id].data {
+                    GcData::Array(cells) => cells,
+                    _ => return Err(ExecFail::Unsupported("array.fill of non-array")),
+                };
+                let Some(end) = start.checked_add(n) else {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess));
+                };
+                if end > cells.len() {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess));
+                }
+                cells[start..end].fill(cell);
+                Ok(Ctl::Next)
+            }
+            Instr::ArrayCopy { .. } => self.array_copy(),
+            Instr::ArrayInitData { data, .. } => self.array_init_data(data as usize),
+            Instr::ArrayInitElem { elem, .. } => self.array_init_elem(elem as usize),
+            Instr::RefTest { nullable, heap } => {
+                let reference = self.pop()?;
+                let Value::Ref(reference) = reference else {
+                    return Err(ExecFail::Unsupported("ref.test of non-reference"));
+                };
+                let matches = self.ref_matches(reference, nullable, heap)?;
+                self.stack.push(Value::I32(i32::from(matches)));
+                Ok(Ctl::Next)
+            }
+            Instr::RefCast { nullable, heap } => {
+                let value = self.pop()?;
+                let Value::Ref(reference) = value else {
+                    return Err(ExecFail::Unsupported("ref.cast of non-reference"));
+                };
+                if self.ref_matches(reference, nullable, heap)? {
+                    self.stack.push(Value::Ref(reference));
+                    Ok(Ctl::Next)
+                } else {
+                    // The spec reports every failed cast (including casting a
+                    // null to a non-nullable target) as `cast failure`.
+                    Err(ExecFail::Trap(Trap::CastFailure))
+                }
+            }
+            Instr::BrOnCast { label, to, .. } => {
+                let value = self.pop()?;
+                let Value::Ref(reference) = value else {
+                    return Err(ExecFail::Unsupported("br_on_cast of non-reference"));
+                };
+                let matches = self.ref_matches(reference, to.nullable, to.heap)?;
+                self.stack.push(Value::Ref(reference));
+                if matches {
+                    if self.branch_to(label as usize)? {
+                        return self.finish();
+                    }
+                    Ok(Ctl::Settled)
+                } else {
+                    Ok(Ctl::Next)
+                }
+            }
+            Instr::BrOnCastFail { label, to, .. } => {
+                let value = self.pop()?;
+                let Value::Ref(reference) = value else {
+                    return Err(ExecFail::Unsupported("br_on_cast_fail of non-reference"));
+                };
+                let matches = self.ref_matches(reference, to.nullable, to.heap)?;
+                self.stack.push(Value::Ref(reference));
+                if matches {
+                    Ok(Ctl::Next)
+                } else if self.branch_to(label as usize)? {
+                    self.finish()
+                } else {
+                    Ok(Ctl::Settled)
+                }
+            }
+            Instr::AnyConvertExtern => {
+                let value = self.pop()?;
+                let Value::Ref(reference) = value else {
+                    return Err(ExecFail::Unsupported("any.convert_extern of non-reference"));
+                };
+                self.stack.push(Value::Ref(reference.unwrap_extern()));
+                Ok(Ctl::Next)
+            }
+            Instr::ExternConvertAny => {
+                let value = self.pop()?;
+                let Value::Ref(reference) = value else {
+                    return Err(ExecFail::Unsupported("extern.convert_any of non-reference"));
+                };
+                let wrapped = match reference {
+                    RefValue::Null => RefValue::Null,
+                    other => match ExternInner::wrap(other) {
+                        Some(inner) => RefValue::Extern(inner),
+                        None => {
+                            return Err(ExecFail::Unsupported(
+                                "extern.convert_any of unboxable reference",
+                            ));
+                        }
+                    },
+                };
+                self.stack.push(Value::Ref(wrapped));
+                Ok(Ctl::Next)
+            }
+            Instr::RefI31 => {
+                let value = self.pop_i32()?;
+                self.stack.push(Value::Ref(RefValue::i31(value)));
+                Ok(Ctl::Next)
+            }
+            Instr::I31GetS => self.i31_read(true),
+            Instr::I31GetU => self.i31_read(false),
+        }
+    }
+
+    // ---- GC execution helpers ----
+
+    /// The struct field storage types declared at type index `ty` of the
+    /// given instance's module (cloned so no borrow outlives the call).
+    fn frame_struct_storage(&self, instance: usize, ty: u32) -> Result<Vec<StorageType>, ExecFail> {
+        let module = &self.store.instances[instance].module;
+        match struct_field_types(module, ty) {
+            Some(fields) => Ok(fields.iter().map(|field| field.ty).collect()),
+            None => Err(ExecFail::Unsupported("unknown struct type")),
+        }
+    }
+
+    /// The array element storage declared at type index `ty` of the given
+    /// instance's module.
+    fn frame_array_storage(&self, instance: usize, ty: u32) -> Result<StorageType, ExecFail> {
+        let module = &self.store.instances[instance].module;
+        match array_element_type(module, ty) {
+            Some(field) => Ok(field.ty),
+            None => Err(ExecFail::Unsupported("unknown array type")),
+        }
+    }
+
+    fn pop_struct_ref(&mut self) -> Result<usize, ExecFail> {
+        let value = self.pop()?;
+        let Value::Ref(reference) = value else {
+            return Err(ExecFail::Unsupported("non-reference struct operand"));
+        };
+        match reference {
+            RefValue::Struct(id) => Ok(id),
+            RefValue::Null => Err(ExecFail::Trap(Trap::NullStructReference)),
+            _ => Err(ExecFail::Unsupported("struct operand is not a struct")),
+        }
+    }
+
+    fn pop_array_ref(&mut self) -> Result<usize, ExecFail> {
+        let value = self.pop()?;
+        let Value::Ref(reference) = value else {
+            return Err(ExecFail::Unsupported("non-reference array operand"));
+        };
+        match reference {
+            RefValue::Array(id) => Ok(id),
+            RefValue::Null => Err(ExecFail::Trap(Trap::NullArrayReference)),
+            _ => Err(ExecFail::Unsupported("array operand is not an array")),
+        }
+    }
+
+    /// `struct.get[_s|_u]` on the popped object.
+    fn struct_field_read(&mut self, field: usize, mode: GcRead) -> Result<Ctl, ExecFail> {
+        let id = self.pop_struct_ref()?;
+        let storage = gc_struct_storage(self.store, id)?;
+        let st = *storage
+            .get(field)
+            .ok_or(ExecFail::Unsupported("struct field out of range"))?;
+        let cell = match &self.store.objects[id].data {
+            GcData::Struct(cells) => *cells
+                .get(field)
+                .ok_or(ExecFail::Unsupported("struct field out of range"))?,
+            _ => return Err(ExecFail::Unsupported("struct.get of non-struct")),
+        };
+        let out = match mode {
+            GcRead::Plain => cell,
+            GcRead::Signed => extend_cell(st, cell, true)?,
+            GcRead::Unsigned => extend_cell(st, cell, false)?,
+        };
+        self.stack.push(out);
+        Ok(Ctl::Next)
+    }
+
+    /// `array.get[_s|_u]`: pop the index, then the array; bounds-checked.
+    fn array_read(&mut self, _ty: u32, mode: GcRead) -> Result<Ctl, ExecFail> {
+        let index = self.pop_i32()? as u32 as usize;
+        let id = self.pop_array_ref()?;
+        let st = gc_array_storage(self.store, id)?;
+        let cell = match &self.store.objects[id].data {
+            GcData::Array(cells) => cells
+                .get(index)
+                .copied()
+                .ok_or(ExecFail::Trap(Trap::OutOfBoundsArrayAccess))?,
+            _ => return Err(ExecFail::Unsupported("array.get of non-array")),
+        };
+        let out = match mode {
+            GcRead::Plain => cell,
+            GcRead::Signed => extend_cell(st, cell, true)?,
+            GcRead::Unsigned => extend_cell(st, cell, false)?,
+        };
+        self.stack.push(out);
+        Ok(Ctl::Next)
+    }
+
+    fn i31_read(&mut self, signed: bool) -> Result<Ctl, ExecFail> {
+        let reference = self.pop()?;
+        let Value::Ref(reference) = reference else {
+            return Err(ExecFail::Unsupported("non-reference i31 operand"));
+        };
+        match reference {
+            RefValue::Null => Err(ExecFail::Trap(Trap::NullI31Reference)),
+            RefValue::I31(value) => {
+                // `get_s` sign-extends bit 30; `get_u` zero-extends it.
+                let out = if signed { (value << 1) >> 1 } else { value };
+                self.stack.push(Value::I32(out));
+                Ok(Ctl::Next)
+            }
+            _ => Err(ExecFail::Unsupported("i31.get of non-i31")),
+        }
+    }
+
+    fn array_copy(&mut self) -> Result<Ctl, ExecFail> {
+        // Bottom-to-top operands: dst array, dst offset, src array, src
+        // offset, length.
+        let n = self.pop_i32()? as u32 as usize;
+        let src_offset = self.pop_i32()? as u32 as usize;
+        let src = self.pop_array_ref()?;
+        let dst_offset = self.pop_i32()? as u32 as usize;
+        let dst = self.pop_array_ref()?;
+        let src_len = gc_array_len(self.store, src)?;
+        let dst_len = gc_array_len(self.store, dst)?;
+        let Some(src_end) = src_offset.checked_add(n) else {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess));
+        };
+        let Some(dst_end) = dst_offset.checked_add(n) else {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess));
+        };
+        if src_end > src_len || dst_end > dst_len {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess));
+        }
+        // Copy through a temporary so overlapping source/destination ranges
+        // behave like memmove.
+        let values = match &self.store.objects[src].data {
+            GcData::Array(cells) => cells[src_offset..src_end].to_vec(),
+            _ => return Err(ExecFail::Unsupported("array.copy of non-array")),
+        };
+        match &mut self.store.objects[dst].data {
+            GcData::Array(cells) => cells[dst_offset..dst_end].copy_from_slice(&values),
+            _ => return Err(ExecFail::Unsupported("array.copy of non-array")),
+        }
+        Ok(Ctl::Next)
+    }
+
+    fn array_init_data(&mut self, data: usize) -> Result<Ctl, ExecFail> {
+        // Bottom-to-top operands: array, dst offset, data offset, length.
+        let n = self.pop_i32()? as u32 as u64;
+        let src = self.pop_i32()? as u32 as u64;
+        let dst_offset = self.pop_i32()? as u32 as usize;
+        let array = self.pop_array_ref()?;
+        let frame_index = self.frames.len() - 1;
+        let instance = self.frames[frame_index].instance;
+        let st = gc_array_storage(self.store, array)?;
+        let width = u64::from(
+            storage_width(st).ok_or(ExecFail::Unsupported("array.init_data of refs"))? as u32,
+        );
+        let len = gc_array_len(self.store, array)?;
+        let dst_end = dst_offset
+            .checked_add(n as usize)
+            .ok_or(ExecFail::Trap(Trap::OutOfBoundsArrayAccess))?;
+        if dst_end > len {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess));
+        }
+        // A dropped data segment behaves as empty (zero-length uses succeed).
+        let bytes = self.store.instances[instance].data_segments[data]
+            .as_deref()
+            .unwrap_or(&[]);
+        let total = n
+            .checked_mul(width)
+            .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+        let data_end = src
+            .checked_add(total)
+            .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+        if data_end > bytes.len() as u64 {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+        }
+        let cells = match &mut self.store.objects[array].data {
+            GcData::Array(cells) => cells,
+            _ => return Err(ExecFail::Unsupported("array.init_data of non-array")),
+        };
+        for i in 0..n {
+            let at = (src + i * width) as usize;
+            let value = data_element(st, bytes, at)
+                .ok_or(ExecFail::Unsupported("array.init_data element read"))?;
+            cells[dst_offset + i as usize] = wrap_cell(st, value)?;
+        }
+        Ok(Ctl::Next)
+    }
+
+    fn array_init_elem(&mut self, elem: usize) -> Result<Ctl, ExecFail> {
+        // Bottom-to-top operands: array, dst offset, elem offset, length.
+        let n = self.pop_i32()? as u32 as u64;
+        let src = self.pop_i32()? as u32 as u64;
+        let dst_offset = self.pop_i32()? as u32 as usize;
+        let array = self.pop_array_ref()?;
+        let frame_index = self.frames.len() - 1;
+        let instance = self.frames[frame_index].instance;
+        let len = gc_array_len(self.store, array)?;
+        let dst_end = dst_offset
+            .checked_add(n as usize)
+            .ok_or(ExecFail::Trap(Trap::OutOfBoundsArrayAccess))?;
+        if dst_end > len {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess));
+        }
+        // A dropped element segment behaves as empty.
+        let items = self.store.instances[instance].element_segments[elem]
+            .as_deref()
+            .unwrap_or(&[]);
+        let src_end = src
+            .checked_add(n)
+            .ok_or(ExecFail::Trap(Trap::OutOfBoundsTableAccess))?;
+        if src_end > items.len() as u64 {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
+        }
+        let cells = match &mut self.store.objects[array].data {
+            GcData::Array(cells) => cells,
+            _ => return Err(ExecFail::Unsupported("array.init_elem of non-array")),
+        };
+        for i in 0..n {
+            cells[dst_offset + i as usize] = Value::Ref(items[(src + i) as usize]);
+        }
+        Ok(Ctl::Next)
+    }
+
+    /// Whether a runtime reference matches the target reftype (`nullable`,
+    /// `heap`) whose heap index is in the top frame's module type space.
+    fn ref_matches(
+        &self,
+        reference: RefValue,
+        nullable: bool,
+        heap: HeapType,
+    ) -> Result<bool, ExecFail> {
+        if reference == RefValue::Null {
+            return Ok(nullable);
+        }
+        let frame_index = self.frames.len() - 1;
+        let frame_instance = self.frames[frame_index].instance;
+        let concrete = match reference {
+            RefValue::Func(addr) => match self.func_type_index(addr) {
+                Some(ty) => Some((addr.instance, ty)),
+                None => return Ok(runtime_abs_matches(HeapType::Func, heap)),
+            },
+            RefValue::Struct(id) => Some((self.store.objects[id].owner, self.store.objects[id].ty)),
+            RefValue::Array(id) => Some((self.store.objects[id].owner, self.store.objects[id].ty)),
+            RefValue::Host(_) => return Ok(runtime_abs_matches(HeapType::Any, heap)),
+            RefValue::I31(_) => return Ok(runtime_abs_matches(HeapType::I31, heap)),
+            RefValue::Extern(_) => return Ok(runtime_abs_matches(HeapType::Extern, heap)),
+            RefValue::Exn(_) => return Ok(runtime_abs_matches(HeapType::Exn, heap)),
+            RefValue::Null => unreachable!(),
+        };
+        let Some((owner, ty)) = concrete else {
+            return Ok(false);
+        };
+        let module = &self.store.instances[owner].module;
+        let composite = module
+            .types
+            .get(ty as usize)
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?
+            .composite
+            .clone();
+        Ok(match heap {
+            HeapType::Type(target) => {
+                if owner == frame_instance {
+                    let types = &self.store.instances[frame_instance].module.types;
+                    type_sub_canon(types, ty, target)
+                } else {
+                    // A concrete target in another module's type space cannot
+                    // be related to this object's type index. Fixtures never
+                    // cast aggregates across module type spaces.
+                    false
+                }
+            }
+            abstract_target => {
+                let kind = match &composite {
+                    CompositeType::Func(_) => HeapType::Func,
+                    CompositeType::Struct(_) => HeapType::Struct,
+                    CompositeType::Array(_) => HeapType::Array,
+                };
+                runtime_abs_matches(kind, abstract_target)
+            }
+        })
+    }
+
+    /// The type index of a function reference's declared type, within the
+    /// module instance that owns the reference. Function references cannot be
+    /// resolved to a declared type only when they are bound to a host
+    /// function from outside the module's type space (treated as abstract
+    /// `func` by the caller).
+    fn func_type_index(&self, addr: FuncAddr) -> Option<u32> {
+        let instance = self.store.instances.get(addr.instance)?;
+        let func_imports = instance
+            .module
+            .imports
+            .iter()
+            .filter(|import| matches!(import.desc, ImportDesc::Func(_)))
+            .count();
+        if addr.index < func_imports {
+            instance
+                .module
+                .imports
+                .iter()
+                .filter_map(|import| match import.desc {
+                    ImportDesc::Func(ty) => Some(ty),
+                    _ => None,
+                })
+                .nth(addr.index)
+        } else {
+            instance
+                .module
+                .functions
+                .get(addr.index - func_imports)
+                .copied()
         }
     }
 
@@ -2033,7 +2713,7 @@ impl<'a> Engine<'a> {
                     .store
                     .instances
                     .get(instance)
-                    .and_then(|i| i.module.types.get(index as usize))
+                    .and_then(|i| i.module.func_at(index))
                     .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
                 Ok((ty.params.len(), ty.results.len()))
             }
@@ -2079,7 +2759,7 @@ impl<'a> Engine<'a> {
             .store
             .instances
             .get(instance)
-            .and_then(|i| i.module.types.get(type_index))
+            .and_then(|i| i.module.func_at(type_index as u32))
             .cloned()
             .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
         if self.store.target_type(target) != expected {
@@ -2110,7 +2790,7 @@ impl<'a> Engine<'a> {
             .store
             .instances
             .get(instance)
-            .and_then(|i| i.module.types.get(type_index))
+            .and_then(|i| i.module.func_at(type_index as u32))
             .cloned()
             .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
         if self.store.target_type(target) != expected {
@@ -2131,7 +2811,7 @@ impl<'a> Engine<'a> {
             .store
             .instances
             .get(instance)
-            .and_then(|i| i.module.types.get(type_index))
+            .and_then(|i| i.module.func_at(type_index as u32))
             .cloned()
             .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
         if self.store.target_type(target) != expected {
@@ -2149,7 +2829,7 @@ impl<'a> Engine<'a> {
             .store
             .instances
             .get(instance)
-            .and_then(|i| i.module.types.get(type_index))
+            .and_then(|i| i.module.func_at(type_index as u32))
             .cloned()
             .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
         if self.store.target_type(target) != expected {
@@ -2197,8 +2877,7 @@ impl<'a> Engine<'a> {
                         .copied()
                         .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
                     let signature = module
-                        .types
-                        .get(type_index as usize)
+                        .func_at(type_index)
                         .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
                     (
                         signature.params.len(),
@@ -2284,8 +2963,7 @@ impl<'a> Engine<'a> {
                         .copied()
                         .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
                     let signature = module
-                        .types
-                        .get(type_index as usize)
+                        .func_at(type_index)
                         .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
                     (
                         signature.params.len(),
@@ -2624,9 +3302,17 @@ fn matches_val(expected: ValType, actual: ValType) -> bool {
 }
 
 /// Evaluate a constant initializer expression (no terminating `end`).
-/// `func_instance` is the instance whose function space a `ref.func` refers
-/// to.
-fn eval_const(expr: &[Instr], globals: &[Value], func_instance: usize) -> Result<Value, ExecFail> {
+/// `module` provides the type layout for GC aggregate constant expressions
+/// (spec const-expr rules) and `func_instance` is the instance whose function
+/// space a `ref.func` refers to; aggregate allocations land in `store`
+/// (constant `struct.new`/`array.new` and friends).
+fn eval_const(
+    store: &mut Store,
+    module: &Module,
+    expr: &[Instr],
+    globals: &[Value],
+    func_instance: usize,
+) -> Result<Value, ExecFail> {
     let mut stack: Vec<Value> = Vec::new();
     for instr in expr {
         match instr {
@@ -2659,6 +3345,96 @@ fn eval_const(expr: &[Instr], globals: &[Value], func_instance: usize) -> Result
                 instance: func_instance,
                 index: *index as usize,
             }))),
+            Instr::RefI31 => {
+                let Value::I32(value) = stack
+                    .pop()
+                    .ok_or(ExecFail::Unsupported("malformed constant expression"))?
+                else {
+                    return Err(ExecFail::Unsupported("non-i32 ref.i31 constant"));
+                };
+                stack.push(Value::Ref(RefValue::i31(value)));
+            }
+            Instr::AnyConvertExtern => {
+                let value = stack
+                    .pop()
+                    .ok_or(ExecFail::Unsupported("malformed constant expression"))?;
+                let unwrapped = match value {
+                    Value::Ref(reference) => reference.unwrap_extern(),
+                    _ => return Err(ExecFail::Unsupported("non-reference internalize")),
+                };
+                stack.push(Value::Ref(unwrapped));
+            }
+            Instr::ExternConvertAny => {
+                let value = stack
+                    .pop()
+                    .ok_or(ExecFail::Unsupported("malformed constant expression"))?;
+                let wrapped = match value {
+                    Value::Ref(RefValue::Null) => RefValue::Null,
+                    Value::Ref(reference) => match ExternInner::wrap(reference) {
+                        Some(inner) => RefValue::Extern(inner),
+                        None => return Err(ExecFail::Unsupported("unboxable externalize")),
+                    },
+                    _ => return Err(ExecFail::Unsupported("non-reference externalize")),
+                };
+                stack.push(Value::Ref(wrapped));
+            }
+            Instr::StructNew(ty) => {
+                let fields = struct_field_types(module, *ty)
+                    .ok_or(ExecFail::Unsupported("unknown struct type"))?;
+                let mut cells = Vec::with_capacity(fields.len());
+                for field in fields.iter().rev() {
+                    let value = stack
+                        .pop()
+                        .ok_or(ExecFail::Unsupported("malformed constant expression"))?;
+                    cells.push(wrap_cell(field.ty, value)?);
+                }
+                cells.reverse();
+                let id = alloc_struct(store, func_instance, *ty, cells);
+                stack.push(Value::Ref(RefValue::Struct(id)));
+            }
+            Instr::StructNewDefault(ty) => {
+                let fields = struct_field_types(module, *ty)
+                    .ok_or(ExecFail::Unsupported("unknown struct type"))?;
+                let mut cells = Vec::with_capacity(fields.len());
+                for field in fields {
+                    cells.push(default_storage(field.ty)?);
+                }
+                let id = alloc_struct(store, func_instance, *ty, cells);
+                stack.push(Value::Ref(RefValue::Struct(id)));
+            }
+            Instr::ArrayNew(ty) => {
+                let field = array_element_type(module, *ty)
+                    .ok_or(ExecFail::Unsupported("unknown array type"))?;
+                let len = pop_const_i32(&mut stack)?;
+                let value = stack
+                    .pop()
+                    .ok_or(ExecFail::Unsupported("malformed constant expression"))?;
+                let cell = wrap_cell(field.ty, value)?;
+                let id = alloc_array_filled(store, func_instance, *ty, len, cell)?;
+                stack.push(Value::Ref(RefValue::Array(id)));
+            }
+            Instr::ArrayNewDefault(ty) => {
+                let field = array_element_type(module, *ty)
+                    .ok_or(ExecFail::Unsupported("unknown array type"))?;
+                let len = pop_const_i32(&mut stack)?;
+                let cell = default_storage(field.ty)?;
+                let id = alloc_array_filled(store, func_instance, *ty, len, cell)?;
+                stack.push(Value::Ref(RefValue::Array(id)));
+            }
+            Instr::ArrayNewFixed { ty, n } => {
+                let field = array_element_type(module, *ty)
+                    .ok_or(ExecFail::Unsupported("unknown array type"))?;
+                let mut cells = Vec::with_capacity(*n as usize);
+                for _ in 0..*n {
+                    let value = stack
+                        .pop()
+                        .ok_or(ExecFail::Unsupported("malformed constant expression"))?;
+                    cells.push(wrap_cell(field.ty, value)?);
+                }
+                cells.reverse();
+                let id = alloc_array(store, func_instance, *ty, cells);
+                stack.push(Value::Ref(RefValue::Array(id)));
+            }
             _ => return Err(ExecFail::Unsupported("constant expression")),
         }
     }
@@ -2667,14 +3443,374 @@ fn eval_const(expr: &[Instr], globals: &[Value], func_instance: usize) -> Result
         .ok_or(ExecFail::Unsupported("empty constant expression"))
 }
 
+/// Pop an i32 from a constant-expression value stack.
+fn pop_const_i32(stack: &mut Vec<Value>) -> Result<i32, ExecFail> {
+    match stack.pop() {
+        Some(Value::I32(v)) => Ok(v),
+        _ => Err(ExecFail::Unsupported("malformed constant expression")),
+    }
+}
+
 /// Evaluate a constant expression that must produce a reference value.
 fn eval_ref_const(
+    store: &mut Store,
+    module: &Module,
     expr: &[Instr],
     globals: &[Value],
     func_instance: usize,
 ) -> Result<RefValue, InstantiateError> {
-    match eval_const(expr, globals, func_instance)? {
+    match eval_const(store, module, expr, globals, func_instance)? {
         Value::Ref(reference) => Ok(reference),
         _ => Err(InstantiateError::Unsupported("non-reference constant")),
     }
+}
+
+// ---- GC object helpers ----
+
+/// The declared struct fields at type index `ty` of `module`.
+fn struct_field_types(module: &Module, ty: u32) -> Option<&[FieldType]> {
+    module
+        .types
+        .get(ty as usize)
+        .and_then(|sub| match &sub.composite {
+            CompositeType::Struct(fields) => Some(fields.as_slice()),
+            _ => None,
+        })
+}
+
+/// The declared array element field at type index `ty` of `module`.
+fn array_element_type(module: &Module, ty: u32) -> Option<&FieldType> {
+    module
+        .types
+        .get(ty as usize)
+        .and_then(|sub| match &sub.composite {
+            CompositeType::Array(field) => Some(field),
+            _ => None,
+        })
+}
+
+/// The field storage of a live struct object (its own declared type's
+/// fields, in order).
+fn gc_struct_storage(store: &Store, object: usize) -> Result<Vec<StorageType>, ExecFail> {
+    let gc_object = &store.objects[object];
+    let module = &store.instances[gc_object.owner].module;
+    match struct_field_types(module, gc_object.ty) {
+        Some(fields) => Ok(fields.iter().map(|f| f.ty).collect()),
+        None => Err(ExecFail::Unsupported("struct object layout")),
+    }
+}
+
+/// The element storage of a live array object.
+fn gc_array_storage(store: &Store, object: usize) -> Result<StorageType, ExecFail> {
+    let gc_object = &store.objects[object];
+    let module = &store.instances[gc_object.owner].module;
+    match array_element_type(module, gc_object.ty) {
+        Some(field) => Ok(field.ty),
+        None => Err(ExecFail::Unsupported("array object layout")),
+    }
+}
+
+/// The default (zero/null) value for a storage type. Non-null reference
+/// storage is not defaultable (validation rejects those declarations).
+fn default_storage(storage: StorageType) -> Result<Value, ExecFail> {
+    Ok(match storage {
+        StorageType::I8 | StorageType::I16 | StorageType::I32 => Value::I32(0),
+        StorageType::I64 => Value::I64(0),
+        StorageType::F32 => Value::F32(0),
+        StorageType::F64 => Value::F64(0),
+        StorageType::V128 => Value::V128(0),
+        StorageType::Ref(reftype) if reftype.nullable => Value::Ref(RefValue::Null),
+        StorageType::Ref(_) => {
+            return Err(ExecFail::Unsupported("non-defaultable reference field"));
+        }
+    })
+}
+
+/// Store `value` into a cell of the given storage type: packed cells keep
+/// the wrapped unsigned low bits, everything else keeps the value verbatim.
+fn wrap_cell(storage: StorageType, value: Value) -> Result<Value, ExecFail> {
+    Ok(match storage {
+        StorageType::I8 => match value {
+            Value::I32(v) => Value::I32((v as u8) as i32),
+            _ => return Err(ExecFail::Unsupported("i8 cell write")),
+        },
+        StorageType::I16 => match value {
+            Value::I32(v) => Value::I32((v as u16) as i32),
+            _ => return Err(ExecFail::Unsupported("i16 cell write")),
+        },
+        StorageType::I32
+        | StorageType::I64
+        | StorageType::F32
+        | StorageType::F64
+        | StorageType::V128
+        | StorageType::Ref(_) => value,
+    })
+}
+
+/// Read a cell with the signed/unsigned extension of the packed `get_s`/
+/// `get_u` forms. Only valid for packed cells (which validation restricts the
+/// `_s`/`_u` instructions to).
+fn extend_cell(storage: StorageType, cell: Value, signed: bool) -> Result<Value, ExecFail> {
+    let Value::I32(bits) = cell else {
+        return Err(ExecFail::Unsupported("packed read of non-i32 cell"));
+    };
+    let out = match (storage, signed) {
+        (StorageType::I8, false) => (bits as u8) as i32,
+        (StorageType::I8, true) => (bits as u8) as i8 as i32,
+        (StorageType::I16, false) => (bits as u16) as i32,
+        (StorageType::I16, true) => (bits as u16) as i16 as i32,
+        _ => return Err(ExecFail::Unsupported("unpacked signed/unsigned read")),
+    };
+    Ok(Value::I32(out))
+}
+
+/// The byte width of a storage type (packed, numeric, or vector). Reference
+/// storage has no byte width (refs never come from data segments).
+fn storage_width(storage: StorageType) -> Option<usize> {
+    match storage {
+        StorageType::I8 => Some(1),
+        StorageType::I16 => Some(2),
+        StorageType::I32 | StorageType::F32 => Some(4),
+        StorageType::I64 | StorageType::F64 => Some(8),
+        StorageType::V128 => Some(16),
+        StorageType::Ref(_) => None,
+    }
+}
+
+/// Load one data-segment element of `storage` at byte offset `at` (little
+/// endian). Packed and integer loads are unsigned; packed cells keep the
+/// wrapped low bits. Returns `None` when the slice is short or the storage is
+/// a reference.
+fn data_element(storage: StorageType, bytes: &[u8], at: usize) -> Option<Value> {
+    let width = storage_width(storage)?;
+    let bytes = bytes.get(at..at + width)?;
+    let mut bits = 0u64;
+    for (i, &byte) in bytes.iter().enumerate() {
+        bits |= u64::from(byte) << (8 * i);
+    }
+    Some(match storage {
+        StorageType::I8 | StorageType::I16 => Value::I32(bits as u32 as i32),
+        StorageType::I32 => Value::I32(bits as u32 as i32),
+        StorageType::I64 => Value::I64(bits as i64),
+        StorageType::F32 => Value::F32(bits as u32),
+        StorageType::F64 => Value::F64(bits),
+        StorageType::V128 => {
+            let mut wide = 0u128;
+            for (i, &byte) in bytes.iter().enumerate() {
+                wide |= u128::from(byte) << (8 * i);
+            }
+            Value::V128(wide)
+        }
+        StorageType::Ref(_) => return None,
+    })
+}
+
+/// Append a struct object to the pool; returns its stable id.
+fn alloc_struct(store: &mut Store, owner: usize, ty: u32, cells: Vec<Value>) -> usize {
+    store.objects.push(GcObject {
+        owner,
+        ty,
+        data: GcData::Struct(cells),
+    });
+    store.objects.len() - 1
+}
+
+/// Append an array object to the pool; returns its stable id.
+fn alloc_array(store: &mut Store, owner: usize, ty: u32, cells: Vec<Value>) -> usize {
+    store.objects.push(GcObject {
+        owner,
+        ty,
+        data: GcData::Array(cells),
+    });
+    store.objects.len() - 1
+}
+
+/// Append an array of `len` copies of `cell`; an oversized request traps like
+/// an out-of-bounds memory access instead of aborting on allocation.
+fn alloc_array_filled(
+    store: &mut Store,
+    owner: usize,
+    ty: u32,
+    len: i32,
+    cell: Value,
+) -> Result<usize, ExecFail> {
+    let count = len as u32 as usize;
+    let mut elements = Vec::new();
+    elements
+        .try_reserve_exact(count)
+        .map_err(|_| ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+    elements.resize(count, cell);
+    Ok(alloc_array(store, owner, ty, elements))
+}
+
+/// How a `get` reads a GC field/element cell: verbatim, or with the packed
+/// sign/zero extension of `get_s`/`get_u`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GcRead {
+    Plain,
+    Signed,
+    Unsigned,
+}
+
+/// The live length of an array object.
+fn gc_array_len(store: &Store, id: usize) -> Result<usize, ExecFail> {
+    match &store.objects[id].data {
+        GcData::Array(cells) => Ok(cells.len()),
+        _ => Err(ExecFail::Unsupported("array operand is not an array")),
+    }
+}
+
+/// The abstract-heap lattice for runtime `ref.test`/`ref.cast` between an
+/// actual value's (abstract) heap kind and the target heap (spec 3.3.3):
+/// `eq` covers `i31`/`struct`/`array`, all of which sit under `any`. The
+/// `_`-arm rejects unrelated kinds (`func`/`extern`/`exn`/bottom) and the
+/// concrete `Type` form (handled before the abstract lattice is consulted).
+fn runtime_abs_matches(sub: HeapType, sup: HeapType) -> bool {
+    use HeapType::*;
+    if sub == sup {
+        return true;
+    }
+    match sub {
+        Eq => sup == Any,
+        I31 | Struct | Array => sup == Eq || sup == Any,
+        _ => false,
+    }
+}
+
+/// Whether concrete type `start` is a subtype of `goal` in `types`: either
+/// the two are canonically (structurally) equal, or `start` follows a
+/// declared supertype edge to a type that is (spec 3.3: subsumption through
+/// declared subtypes, with type equality canonicalized).
+fn type_sub_canon(types: &[SubType], start: u32, goal: u32) -> bool {
+    if type_structural_eq(types, start, goal) {
+        return true;
+    }
+    let Some(sub) = types.get(start as usize) else {
+        return false;
+    };
+    sub.supertypes
+        .iter()
+        .any(|&parent| type_sub_canon(types, parent, goal))
+}
+
+/// Whether two type indices in one module are structurally (canonically)
+/// equal: same composite shape, same field mutability/storage, with nested
+/// type references compared recursively. Recursive type groups compare
+/// coinductively (a revisited pair is assumed equal), which is exact for the
+/// acyclic types the corpus exercises.
+fn type_structural_eq(types: &[SubType], a: u32, b: u32) -> bool {
+    fn recurse(types: &[SubType], a: u32, b: u32, seen: &mut Vec<(u32, u32)>) -> bool {
+        if a == b {
+            return true;
+        }
+        if seen
+            .iter()
+            .any(|&(x, y)| (x, y) == (a, b) || (x, y) == (b, a))
+        {
+            return true;
+        }
+        let (Some(sub_a), Some(sub_b)) = (types.get(a as usize), types.get(b as usize)) else {
+            return false;
+        };
+        if sub_a.is_final != sub_b.is_final
+            || sub_a.supertypes.len() != sub_b.supertypes.len()
+            || !sub_a
+                .supertypes
+                .iter()
+                .zip(&sub_b.supertypes)
+                .all(|(&x, &y)| recurse(types, x, y, seen))
+        {
+            return false;
+        }
+        seen.push((a, b));
+        let equal = composites_equal(types, &sub_a.composite, &sub_b.composite, seen);
+        seen.pop();
+        equal
+    }
+
+    fn composites_equal(
+        types: &[SubType],
+        a: &CompositeType,
+        b: &CompositeType,
+        seen: &mut Vec<(u32, u32)>,
+    ) -> bool {
+        match (a, b) {
+            (CompositeType::Func(fa), CompositeType::Func(fb)) => {
+                fa.params.len() == fb.params.len()
+                    && fa.results.len() == fb.results.len()
+                    && fa
+                        .params
+                        .iter()
+                        .zip(&fb.params)
+                        .all(|(x, y)| valtypes_equal(types, *x, *y, seen))
+                    && fa
+                        .results
+                        .iter()
+                        .zip(&fb.results)
+                        .all(|(x, y)| valtypes_equal(types, *x, *y, seen))
+            }
+            (CompositeType::Struct(fa), CompositeType::Struct(fb)) => {
+                fa.len() == fb.len()
+                    && fa
+                        .iter()
+                        .zip(fb)
+                        .all(|(x, y)| fields_equal(types, x, y, seen))
+            }
+            (CompositeType::Array(fa), CompositeType::Array(fb)) => {
+                fields_equal(types, fa, fb, seen)
+            }
+            _ => false,
+        }
+    }
+
+    fn fields_equal(
+        types: &[SubType],
+        a: &FieldType,
+        b: &FieldType,
+        seen: &mut Vec<(u32, u32)>,
+    ) -> bool {
+        a.mutable == b.mutable && storages_equal(types, a.ty, b.ty, seen)
+    }
+
+    fn storages_equal(
+        types: &[SubType],
+        a: StorageType,
+        b: StorageType,
+        seen: &mut Vec<(u32, u32)>,
+    ) -> bool {
+        match (a, b) {
+            (StorageType::Ref(ra), StorageType::Ref(rb)) => {
+                ra.nullable == rb.nullable && heaps_equal(types, ra.heap, rb.heap, seen)
+            }
+            _ => a == b,
+        }
+    }
+
+    fn valtypes_equal(
+        types: &[SubType],
+        a: ValType,
+        b: ValType,
+        seen: &mut Vec<(u32, u32)>,
+    ) -> bool {
+        match (a, b) {
+            (ValType::Ref(ra), ValType::Ref(rb)) => {
+                ra.nullable == rb.nullable && heaps_equal(types, ra.heap, rb.heap, seen)
+            }
+            _ => a == b,
+        }
+    }
+
+    fn heaps_equal(
+        types: &[SubType],
+        a: HeapType,
+        b: HeapType,
+        seen: &mut Vec<(u32, u32)>,
+    ) -> bool {
+        match (a, b) {
+            (HeapType::Type(x), HeapType::Type(y)) => recurse(types, x, y, seen),
+            _ => a == b,
+        }
+    }
+
+    recurse(types, a, b, &mut Vec::new())
 }

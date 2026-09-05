@@ -16,17 +16,97 @@ pub struct FuncAddr {
     pub index: usize,
 }
 
-/// A runtime reference (spec 2.2.5 / 4.2.1). Only nulls, function
-/// references, host extern payloads (`ref.extern n`, passed in as
-/// arguments), and exception references exist before the GC cut.
+/// The payload an external reference ([`RefValue::Extern`]) wraps. External
+/// references are an opaque `extern`-typed box around an internal object
+/// (`extern.convert_any`); internalizing unwraps the box again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternInner {
+    /// A host payload (`ref.extern n` / `ref.host n`).
+    Host(u32),
+    /// A wrapped i31 (value semantics; masked to 31 bits).
+    I31(i32),
+    /// A wrapped struct object: an id into the store's object pool.
+    Struct(usize),
+    /// A wrapped array object: an id into the store's object pool.
+    Array(usize),
+}
+
+/// A runtime reference (spec 2.2.5 / 4.2.1). GC values (i31, struct/array
+/// objects, and the extern/host wrappers around them) arrive with the GC cut;
+/// struct/array payloads are stable ids into the store's object pool so
+/// `ref.eq` compares object identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefValue {
     Null,
     Func(FuncAddr),
-    /// A host extern reference wrapping an integer payload (`ref.extern`).
-    Extern(u32),
+    /// An external reference: an `extern`-typed box around an internal object.
+    Extern(ExternInner),
     /// An exception reference: the id of the exception in the store's pool.
     Exn(usize),
+    /// A host payload used as an internal `any` value (`ref.host n`, the
+    /// result of internalizing a host external).
+    Host(u32),
+    /// An unboxed 31-bit scalar reference (canonicalized on creation).
+    I31(i32),
+    /// A struct object: an id into the store's object pool.
+    Struct(usize),
+    /// An array object: an id into the store's object pool.
+    Array(usize),
+}
+
+impl RefValue {
+    /// Box an i32 as an i31, truncating to its low 31 bits so every value has
+    /// one representation (spec: `ref.i31` takes the value modulo 2^31).
+    pub fn i31(value: i32) -> RefValue {
+        RefValue::I31(value & 0x7fff_ffff)
+    }
+
+    /// Whether this is a non-null reference.
+    pub fn is_null(&self) -> bool {
+        matches!(self, RefValue::Null)
+    }
+
+    /// The host payload behind a host-any or host-wrapping external value, if
+    /// any. Used by the runner to compare `ref.host`/`ref.extern` results.
+    pub fn host_payload(&self) -> Option<u32> {
+        match *self {
+            RefValue::Host(n) => Some(n),
+            RefValue::Extern(ExternInner::Host(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Unbox an external reference to the internal object it wraps.
+    pub fn unwrap_extern(&self) -> RefValue {
+        match *self {
+            RefValue::Extern(inner) => inner.into_ref(),
+            other => other,
+        }
+    }
+}
+
+impl ExternInner {
+    /// Box a non-null internal reference (any value) as an external. Returns
+    /// `None` for values that cannot be externalized.
+    pub fn wrap(value: RefValue) -> Option<ExternInner> {
+        Some(match value {
+            RefValue::Host(n) => ExternInner::Host(n),
+            RefValue::I31(v) => ExternInner::I31(v),
+            RefValue::Struct(id) => ExternInner::Struct(id),
+            RefValue::Array(id) => ExternInner::Array(id),
+            _ => return None,
+        })
+    }
+
+    /// Unbox to the internal reference the external wraps.
+    pub fn into_ref(self) -> RefValue {
+        match self {
+            ExternInner::Host(n) => RefValue::Host(n),
+            ExternInner::I31(v) => RefValue::I31(v),
+            ExternInner::Struct(id) => RefValue::Struct(id),
+            ExternInner::Array(id) => RefValue::Array(id),
+        }
+    }
 }
 
 /// A runtime value. Floats are their IEEE bit patterns; v128 vectors are the
@@ -71,6 +151,16 @@ pub enum Trap {
     NullFunctionReference,
     /// `throw_ref` of a null exception reference.
     NullExceptionReference,
+    /// A struct operation on a null struct reference.
+    NullStructReference,
+    /// An array operation on a null array reference.
+    NullArrayReference,
+    /// An i31 operation on a null i31 reference.
+    NullI31Reference,
+    /// An index past the end of an array (`out of bounds array access`).
+    OutOfBoundsArrayAccess,
+    /// `ref.cast`/`extern.convert_any`-adjacent failure (`cast failure`).
+    CastFailure,
     CallStackExhausted,
     UnsupportedImport,
     UnknownFunction,

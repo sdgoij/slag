@@ -11,33 +11,14 @@ waspec/test/core/annotations.wast :: annotation directives are harness tooling, 
 waspec/test/core/instance.wast :: module-linking `(instance ...)` is outside the supported corpus
 waspec/test/core/names.wast :: export names use confusing-unicode strings the `wast` lexer rejects
 
-# GC-era type sections and heap types that the engine decodes only in Cut 9
-# (decode reports them unsupported; the corpus stays skipped until the cut).
-waspec/test/core/ref_null.wast :: `anyref` abstract heap types decode as unsupported until GC (Cut 9)
-waspec/test/core/type-canon.wast :: canonicalization of GC `rec` type bags (Cut 9)
+# GC-era type sections and heap types still behind the Cut 9 residual gaps
+# (structural rec-group canonicalization and `rec`-typed tag fixtures).
+waspec/test/core/ref_null.wast :: GC nullable abstract reference fixtures exercise decoder/validator gaps (Cut 9)
 waspec/test/core/type-equivalence.wast :: GC `rec` type bags and subtyping (Cut 9)
 waspec/test/core/type-rec.wast :: recursive GC type groups (Cut 9)
 waspec/test/core/exceptions/tag.wast :: the `rec`-typed tag fixtures use GC type groups (Cut 9)
-waspec/test/core/bulk-memory/table_init.wast :: GC `arrayref` element items (Cut 9)
-waspec/test/core/memory64/table_init64.wast :: GC `arrayref` element items (Cut 9)
 
-# The GC proposal corpus (crates/wasm GC engine is Cut 9). The converter
-# parses all of it; decoding/validation land with the cut, so it is skipped
-# until then rather than failing the gate.
-waspec/test/core/gc/array.wast :: GC composite types and struct/array ops (Cut 9)
-waspec/test/core/gc/array_copy.wast :: GC composite types and struct/array ops (Cut 9)
-waspec/test/core/gc/array_fill.wast :: GC composite types and struct/array ops (Cut 9)
-waspec/test/core/gc/array_init_data.wast :: GC composite types and struct/array ops (Cut 9)
-waspec/test/core/gc/array_init_elem.wast :: GC composite types and struct/array ops (Cut 9)
-waspec/test/core/gc/array_new_data.wast :: GC composite types and struct/array ops (Cut 9)
-waspec/test/core/gc/array_new_elem.wast :: GC composite types and struct/array ops (Cut 9)
-waspec/test/core/gc/binary-gc.wast :: GC type-section encodings (Cut 9)
-waspec/test/core/gc/br_on_cast.wast :: GC casts and subtyping (Cut 9)
-waspec/test/core/gc/br_on_cast_fail.wast :: GC casts and subtyping (Cut 9)
-waspec/test/core/gc/extern.wast :: GC extern interop (Cut 9)
-waspec/test/core/gc/i31.wast :: GC i31 operations (Cut 9)
-waspec/test/core/gc/ref_cast.wast :: GC casts and subtyping (Cut 9)
-waspec/test/core/gc/ref_eq.wast :: GC eq typing rules (Cut 9)
-waspec/test/core/gc/ref_test.wast :: GC casts and subtyping (Cut 9)
-waspec/test/core/gc/struct.wast :: GC composite types and struct ops (Cut 9)
+# The GC proposal corpus: one remaining file uses multi-supertype fixtures the
+# `wast` grammar (and the decoder's single-supertype model) rejects; the rest
+# of the directory runs green as of Cut 9 wave 3.
 waspec/test/core/gc/type-subtyping.wast :: multi-supertype fixtures the `wast` grammar rejects (Cut 9)

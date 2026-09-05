@@ -15,7 +15,8 @@ use std::fmt;
 use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
 use crate::types::{
-    BlockType, FuncType, GlobalType, HeapType, Limits, MemType, RefType, TableType, ValType,
+    BlockType, CompositeType, FieldType, FuncType, GlobalType, HeapType, Limits, MemType, RefType,
+    StorageType, SubType, TableType, ValType,
 };
 
 /// A validation error. Messages mirror the spec's diagnostics where they are
@@ -23,12 +24,17 @@ use crate::types::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Invalid(&'static str),
+    /// Valid but from a feature the validator does not type-check yet. Kept
+    /// distinct from `Invalid` so conformance counts stay honest (a module
+    /// the engine cannot judge reports pending, not invalid).
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Invalid(message) => write!(f, "invalid: {message}"),
+            Error::Unsupported(message) => write!(f, "unsupported: {message}"),
         }
     }
 }
@@ -77,9 +83,25 @@ pub fn validate(module: &Module) -> Result<(), Error> {
 
 fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
     // Resolve every referenced type index once so bodies can index freely.
+    let type_count = module.types.len();
     for (index, ty) in module.types.iter().enumerate() {
-        check_value_types(&ty.params, module.types.len(), index)?;
-        check_value_types(&ty.results, module.types.len(), index)?;
+        if let Some(supertype) = ty.supertypes.first()
+            && *supertype as usize >= type_count
+        {
+            return Err(Error::Invalid("unknown type"));
+        }
+        match &ty.composite {
+            CompositeType::Func(func) => {
+                check_value_types(&func.params, type_count, index)?;
+                check_value_types(&func.results, type_count, index)?;
+            }
+            CompositeType::Struct(fields) => {
+                for field in fields {
+                    check_storage_type(&field.ty, type_count)?;
+                }
+            }
+            CompositeType::Array(field) => check_storage_type(&field.ty, type_count)?,
+        }
     }
 
     let mut funcs = Vec::new();
@@ -173,11 +195,23 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
 }
 
 fn type_at(module: &Module, index: u32) -> Result<FuncType, Error> {
-    module
-        .types
-        .get(index as usize)
-        .cloned()
-        .ok_or(Error::Invalid("unknown type"))
+    match module.types.get(index as usize) {
+        None => Err(Error::Invalid("unknown type")),
+        Some(sub) => match &sub.composite {
+            CompositeType::Func(func) => Ok(func.clone()),
+            _ => Err(Error::Invalid("type mismatch")),
+        },
+    }
+}
+
+fn check_storage_type(storage: &StorageType, type_count: usize) -> Result<(), Error> {
+    if let StorageType::Ref(RefType { heap, .. }) = storage
+        && let HeapType::Type(index) = heap
+        && *index as usize >= type_count
+    {
+        return Err(Error::Invalid("unknown type"));
+    }
+    Ok(())
 }
 
 fn check_value_types(types: &[ValType], type_count: usize, _in: usize) -> Result<(), Error> {
@@ -373,7 +407,11 @@ fn validate_elements(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> 
             };
             // The segment's declared type must fit the target table's
             // element type.
-            if !matches_val(ValType::Ref(table_ty.element), ValType::Ref(element.ty)) {
+            if !val_sub(
+                &module.types,
+                ValType::Ref(table_ty.element),
+                ValType::Ref(element.ty),
+            ) {
                 return Err(Error::Invalid("type mismatch"));
             }
             // The active offset's width follows the table's address type.
@@ -382,7 +420,7 @@ fn validate_elements(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> 
         }
         for item in &element.init {
             let item_type = const_expr_type(item, spaces, spaces.globals.len())?;
-            if !matches_val(ValType::Ref(element.ty), item_type) {
+            if !val_sub(&module.types, ValType::Ref(element.ty), item_type) {
                 return Err(Error::Invalid("type mismatch"));
             }
         }
@@ -442,7 +480,7 @@ fn validate_code(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> {
             check_value_types(std::slice::from_ref(ty), module.types.len(), 0)?;
             init.push(index < signature.params.len() || is_defaultable(*ty));
         }
-        let mut machine = Machine::new();
+        let mut machine = Machine::new(&module.types);
         machine.init = init;
         machine.push_frame(Ctrl::Func, vec![], signature.results.clone());
         machine.validate_body(&body.body, signature, &locals, spaces)?;
@@ -456,29 +494,112 @@ fn is_defaultable(ty: ValType) -> bool {
     !matches!(ty, ValType::Ref(reference) if !reference.nullable)
 }
 
-// ---- value typing helpers ----
+// ---- GC subtyping (spec 3.3): context-aware reference/type matching ----
 
-fn matches_val(expected: ValType, actual: ValType) -> bool {
-    if expected == actual {
+/// The top of a heap type's hierarchy: the abstract type every value of the
+/// hierarchy is a subtype of (`any` for the GC aggregate/i31 hierarchy,
+/// `func`/`extern`/`exn` for theirs). Casts may only target within the same
+/// hierarchy, so this is the operand bound for `ref.test`/`ref.cast`.
+fn top_heap(types: &[SubType], heap: &HeapType) -> HeapType {
+    match heap {
+        HeapType::Func | HeapType::NoFunc => HeapType::Func,
+        HeapType::Extern | HeapType::NoExtern => HeapType::Extern,
+        HeapType::Exn | HeapType::NoExn => HeapType::Exn,
+        HeapType::Any
+        | HeapType::Eq
+        | HeapType::Struct
+        | HeapType::Array
+        | HeapType::I31
+        | HeapType::None => HeapType::Any,
+        HeapType::Type(index) => match types.get(*index as usize) {
+            Some(sub) => match &sub.composite {
+                CompositeType::Func(_) => HeapType::Func,
+                CompositeType::Struct(_) | CompositeType::Array(_) => HeapType::Any,
+            },
+            None => *heap,
+        },
+    }
+}
+
+/// The abstract-supertype lattice (spec 3.3.3): `sub <: sup` between two
+/// abstract heap types.
+fn abs_sub(sub: &HeapType, sup: &HeapType) -> bool {
+    use HeapType::*;
+    if sub == sup {
         return true;
     }
-    match (expected, actual) {
-        (ValType::Ref(e), ValType::Ref(a)) => matches_ref(e, a),
+    match sub {
+        Eq => sup == &Any,
+        I31 => sup == &Eq || sup == &Any,
+        Struct => sup == &Eq || sup == &Any,
+        Array => sup == &Eq || sup == &Any,
+        // `none` is the common subtype of all aggregates.
+        None => matches!(sup, Any | Eq | Struct | Array),
+        NoFunc => sup == &Func,
+        NoExtern => sup == &Extern,
+        NoExn => sup == &Exn,
         _ => false,
     }
 }
 
-fn matches_ref(expected: RefType, actual: RefType) -> bool {
+/// Heap-type subsumption (spec 3.3.3): whether `sub <: sup` under the
+/// module's defined types (a concrete type is below its composite kind's
+/// abstract type and below any declared supertype).
+fn heap_sub(types: &[SubType], sub: &HeapType, sup: &HeapType) -> bool {
+    use HeapType::*;
+    if sub == sup {
+        return true;
+    }
+    match (sub, sup) {
+        (Type(s), Type(t)) => {
+            // `sup` is an ancestor of `sub` through the declared supertype
+            // edges (index equality was handled above).
+            let mut current = *s;
+            for _ in 0..=types.len() {
+                if current == *t {
+                    return true;
+                }
+                let Some(next) = types
+                    .get(current as usize)
+                    .and_then(|st| st.supertypes.first())
+                else {
+                    return false;
+                };
+                current = *next;
+            }
+            false
+        }
+        (Type(s), abstract_sup) => match types.get(*s as usize) {
+            Option::Some(st) => {
+                let kind = match &st.composite {
+                    CompositeType::Struct(_) => Struct,
+                    CompositeType::Array(_) => Array,
+                    CompositeType::Func(_) => Func,
+                };
+                abs_sub(&kind, abstract_sup)
+            }
+            Option::None => false,
+        },
+        (abstract_sub, _) => abs_sub(abstract_sub, sup),
+    }
+}
+
+/// Reference-type subsumption (spec 3.3.5): a value of `actual` type may be
+/// used where `expected` is required.
+fn ref_sub(types: &[SubType], expected: RefType, actual: RefType) -> bool {
     if !expected.nullable && actual.nullable {
         return false;
     }
-    match (expected.heap, actual.heap) {
-        (HeapType::Func, HeapType::Func) => true,
-        (HeapType::Extern, HeapType::Extern) => true,
-        (HeapType::Exn, HeapType::Exn) => true,
-        (HeapType::Type(x), HeapType::Type(y)) => x == y,
-        // A typed function reference is a function reference.
-        (HeapType::Func, HeapType::Type(_)) => true,
+    heap_sub(types, &actual.heap, &expected.heap)
+}
+
+/// Value-type subsumption (spec 3.3.6).
+fn val_sub(types: &[SubType], expected: ValType, actual: ValType) -> bool {
+    if expected == actual {
+        return true;
+    }
+    match (expected, actual) {
+        (ValType::Ref(e), ValType::Ref(a)) => ref_sub(types, e, a),
         _ => false,
     }
 }
@@ -521,10 +642,6 @@ fn is_vec_ty(ty: StackTy) -> bool {
     matches!(ty, StackTy::Bot | StackTy::Known(ValType::V128))
 }
 
-fn is_ref_ty(ty: StackTy) -> bool {
-    matches!(ty, StackTy::Bot | StackTy::Known(ValType::Ref(_)))
-}
-
 struct Frame {
     ctrl: Ctrl,
     start_types: Vec<ValType>,
@@ -536,19 +653,22 @@ struct Frame {
     saved_init: Vec<bool>,
 }
 
-struct Machine {
+struct Machine<'a> {
     vals: Vec<StackTy>,
     frames: Vec<Frame>,
     /// Which locals are currently known to be initialized.
     init: Vec<bool>,
+    /// The module's defined types, for reference subsumption.
+    types: &'a [SubType],
 }
 
-impl Machine {
-    fn new() -> Self {
+impl<'a> Machine<'a> {
+    fn new(types: &'a [SubType]) -> Self {
         Machine {
             vals: Vec::new(),
             frames: Vec::new(),
             init: Vec::new(),
+            types,
         }
     }
 
@@ -618,7 +738,7 @@ impl Machine {
         match self.pop_val()? {
             StackTy::Bot => Ok(()),
             StackTy::Known(actual) => {
-                if matches_val(expected, actual) {
+                if val_sub(self.types, expected, actual) {
                     Ok(())
                 } else {
                     Err(Error::Invalid("type mismatch"))
@@ -662,22 +782,13 @@ impl Machine {
         match self.pop_val()? {
             StackTy::Bot => Ok(StackTy::Bot),
             StackTy::Known(actual) => {
-                if matches_val(expected, actual) {
+                if val_sub(self.types, expected, actual) {
                     Ok(StackTy::Known(actual))
                 } else {
                     Err(Error::Invalid("type mismatch"))
                 }
             }
         }
-    }
-
-    /// Pop a value that must equal `expected` unless either is unknown.
-    fn pop_matching(&mut self, expected: StackTy) -> Result<(), Error> {
-        let actual = self.pop_val()?;
-        if actual == expected || actual == StackTy::Bot || expected == StackTy::Bot {
-            return Ok(());
-        }
-        Err(Error::Invalid("type mismatch"))
     }
 
     fn label_types(&self, index: usize) -> Result<Vec<ValType>, Error> {
@@ -723,7 +834,7 @@ impl Machine {
             || payload
                 .iter()
                 .zip(&types)
-                .any(|(actual, expected)| !matches_val(*expected, *actual))
+                .any(|(actual, expected)| !val_sub(self.types, *expected, *actual))
         {
             return Err(Error::Invalid("type mismatch"));
         }
@@ -873,7 +984,7 @@ impl Machine {
                 table_index,
             } => {
                 let table = table_at(spaces, *table_index as usize)?;
-                if !table_is_func(table) {
+                if !table_is_func(spaces.module, table) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 let ty = type_at(spaces.module, *type_index)?;
@@ -888,7 +999,7 @@ impl Machine {
                 table_index,
             } => {
                 let table = table_at(spaces, *table_index as usize)?;
-                if !table_is_func(table) {
+                if !table_is_func(spaces.module, table) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 let ty = type_at(spaces.module, *type_index)?;
@@ -1048,11 +1159,14 @@ impl Machine {
                 }));
             }
             Instr::RefEq => {
-                let t = self.pop_val()?;
-                if !is_ref_ty(t) {
-                    return Err(Error::Invalid("type mismatch"));
-                }
-                self.pop_matching(t)?;
+                // `ref.eq` needs comparable operands: both types must be
+                // subtypes of `(ref null eq)` (GC aggregates and i31 only).
+                let eq = ValType::Ref(RefType {
+                    nullable: true,
+                    heap: HeapType::Eq,
+                });
+                self.pop_expected(eq)?;
+                self.pop_expected(eq)?;
                 self.push_val(ValType::I32);
             }
             Instr::RefAsNonNull => match self.pop_val()? {
@@ -1152,7 +1266,7 @@ impl Machine {
                 let Some(element) = spaces.module.elements.get(*element_index as usize) else {
                     return Err(Error::Invalid("unknown elem segment"));
                 };
-                if !matches_ref(table_ty.element, element.ty) {
+                if !ref_sub(&spaces.module.types, table_ty.element, element.ty) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 // Operands (bottom to top): dst index, elem offset, length; the
@@ -1171,7 +1285,7 @@ impl Machine {
                 let src_table = table_at(spaces, *src as usize)?;
                 // Copied elements must fit the destination table: the source
                 // element type is a subtype of the destination's.
-                if !matches_ref(dst_table.element, src_table.element) {
+                if !ref_sub(&spaces.module.types, dst_table.element, src_table.element) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 let dst_addr = table_addr_type(spaces, *dst as usize)?;
@@ -1202,6 +1316,247 @@ impl Machine {
                 self.pop_expected(addr)?;
                 self.pop_expected(ValType::Ref(table.element))?;
                 self.pop_expected(addr)?;
+            }
+            // ---- GC aggregates, casts, i31, extern interop (Cut 9) ----
+            Instr::StructNew(type_index) => {
+                let fields = struct_fields(spaces.module, *type_index)?;
+                for field in fields.iter().rev() {
+                    self.pop_expected(field.ty.val())?;
+                }
+                self.push_typed_ref(*type_index);
+            }
+            Instr::StructNewDefault(type_index) => {
+                let fields = struct_fields(spaces.module, *type_index)?;
+                for field in fields {
+                    if matches!(field.ty, StorageType::Ref(reference) if !reference.nullable) {
+                        return Err(Error::Invalid("type mismatch"));
+                    }
+                }
+                self.push_typed_ref(*type_index);
+            }
+            Instr::StructGet { ty, field } => {
+                let fields = struct_fields(spaces.module, *ty)?;
+                let storage = fields
+                    .get(*field as usize)
+                    .ok_or(Error::Invalid("unknown field"))?;
+                if matches!(storage.ty, StorageType::I8 | StorageType::I16) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.pop_expected(nullable_ref(*ty))?;
+                self.push_val(storage.ty.val());
+            }
+            Instr::StructGetS { ty, field } | Instr::StructGetU { ty, field } => {
+                let fields = struct_fields(spaces.module, *ty)?;
+                let storage = fields
+                    .get(*field as usize)
+                    .ok_or(Error::Invalid("unknown field"))?;
+                if !matches!(storage.ty, StorageType::I8 | StorageType::I16) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.pop_expected(nullable_ref(*ty))?;
+                self.push_val(ValType::I32);
+            }
+            Instr::StructSet { ty, field } => {
+                let fields = struct_fields(spaces.module, *ty)?;
+                let storage = fields
+                    .get(*field as usize)
+                    .ok_or(Error::Invalid("unknown field"))?;
+                if !storage.mutable {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.pop_expected(storage.ty.val())?;
+                self.pop_expected(nullable_ref(*ty))?;
+            }
+            Instr::ArrayNew(type_index) => {
+                let field = array_field(spaces.module, *type_index)?;
+                // Operands (bottom to top): the init value, then the length.
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(field.ty.val())?;
+                self.push_typed_ref(*type_index);
+            }
+            Instr::ArrayNewDefault(type_index) => {
+                let field = array_field(spaces.module, *type_index)?;
+                if matches!(field.ty, StorageType::Ref(reference) if !reference.nullable) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.pop_expected(ValType::I32)?;
+                self.push_typed_ref(*type_index);
+            }
+            Instr::ArrayNewFixed { ty, n } => {
+                let field = array_field(spaces.module, *ty)?;
+                for _ in 0..*n {
+                    self.pop_expected(field.ty.val())?;
+                }
+                self.push_typed_ref(*ty);
+            }
+            Instr::ArrayNewData { ty, data } => {
+                let field = array_field(spaces.module, *ty)?;
+                if matches!(field.ty, StorageType::Ref(_)) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.data_index(*data as usize, spaces)?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(ValType::I32)?;
+                self.push_typed_ref(*ty);
+            }
+            Instr::ArrayNewElem { ty, elem } => {
+                let field = array_field(spaces.module, *ty)?;
+                let StorageType::Ref(array_ref) = field.ty else {
+                    return Err(Error::Invalid("type mismatch"));
+                };
+                let elem_ty = element_type_at(spaces, *elem)?;
+                if !ref_sub(&spaces.module.types, array_ref, elem_ty) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(ValType::I32)?;
+                self.push_typed_ref(*ty);
+            }
+            Instr::ArrayGet(ty) => {
+                let field = array_field(spaces.module, *ty)?;
+                if matches!(field.ty, StorageType::I8 | StorageType::I16) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(nullable_ref(*ty))?;
+                self.push_val(field.ty.val());
+            }
+            Instr::ArrayGetS(ty) | Instr::ArrayGetU(ty) => {
+                let field = array_field(spaces.module, *ty)?;
+                if !matches!(field.ty, StorageType::I8 | StorageType::I16) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(nullable_ref(*ty))?;
+                self.push_val(ValType::I32);
+            }
+            Instr::ArraySet(ty) => {
+                let field = array_field_mut(spaces.module, *ty)?;
+                self.pop_expected(field.ty.val())?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(nullable_ref(*ty))?;
+            }
+            Instr::ArrayLen => {
+                let array = ValType::Ref(RefType {
+                    nullable: true,
+                    heap: HeapType::Array,
+                });
+                self.pop_expected(array)?;
+                self.push_val(ValType::I32);
+            }
+            Instr::ArrayFill(ty) => {
+                let field = array_field_mut(spaces.module, *ty)?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(field.ty.val())?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(nullable_ref(*ty))?;
+            }
+            Instr::ArrayCopy { dst, src } => {
+                let dst_field = array_field_mut(spaces.module, *dst)?;
+                let src_field = array_field(spaces.module, *src)?;
+                if !storage_compatible(&spaces.module.types, dst_field.ty, src_field.ty) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(nullable_ref(*src))?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(nullable_ref(*dst))?;
+            }
+            Instr::ArrayInitData { ty, data } => {
+                let field = array_field_mut(spaces.module, *ty)?;
+                if matches!(field.ty, StorageType::Ref(_)) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.data_index(*data as usize, spaces)?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(nullable_ref(*ty))?;
+            }
+            Instr::ArrayInitElem { ty, elem } => {
+                let field = array_field_mut(spaces.module, *ty)?;
+                let StorageType::Ref(array_ref) = field.ty else {
+                    return Err(Error::Invalid("type mismatch"));
+                };
+                let elem_ty = element_type_at(spaces, *elem)?;
+                if !ref_sub(&spaces.module.types, array_ref, elem_ty) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(nullable_ref(*ty))?;
+            }
+            Instr::RefTest { nullable, heap } => {
+                let heap = heap_checked(*heap, spaces)?;
+                let top = top_heap(&spaces.module.types, &heap);
+                self.pop_ref_under(ValType::Ref(RefType {
+                    nullable: true,
+                    heap: top,
+                }))?;
+                self.push_val(ValType::I32);
+                let _ = nullable;
+            }
+            Instr::RefCast { nullable, heap } => {
+                let heap = heap_checked(*heap, spaces)?;
+                let top = top_heap(&spaces.module.types, &heap);
+                self.pop_ref_under(ValType::Ref(RefType {
+                    nullable: true,
+                    heap: top,
+                }))?;
+                self.push_val(ValType::Ref(RefType {
+                    nullable: *nullable,
+                    heap,
+                }));
+            }
+            Instr::BrOnCast { label, from, to } => {
+                self.check_cast_branch(*label, *from, *to, spaces)?;
+            }
+            Instr::BrOnCastFail { label, from, to } => {
+                self.check_cast_branch_fail(*label, *from, *to, spaces)?;
+            }
+            Instr::AnyConvertExtern => {
+                let entry = self.pop_val_of(ValType::Ref(RefType {
+                    nullable: true,
+                    heap: HeapType::Extern,
+                }))?;
+                let nullable = match entry {
+                    StackTy::Known(ValType::Ref(r)) => r.nullable,
+                    _ => true,
+                };
+                self.push_val(ValType::Ref(RefType {
+                    nullable,
+                    heap: HeapType::Any,
+                }));
+            }
+            Instr::ExternConvertAny => {
+                let entry = self.pop_val_of(ValType::Ref(RefType {
+                    nullable: true,
+                    heap: HeapType::Any,
+                }))?;
+                let nullable = match entry {
+                    StackTy::Known(ValType::Ref(r)) => r.nullable,
+                    _ => true,
+                };
+                self.push_val(ValType::Ref(RefType {
+                    nullable,
+                    heap: HeapType::Extern,
+                }));
+            }
+            Instr::RefI31 => {
+                self.pop_expected(ValType::I32)?;
+                self.push_val(ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::I31,
+                }));
+            }
+            Instr::I31GetS | Instr::I31GetU => {
+                self.pop_expected(ValType::Ref(RefType {
+                    nullable: true,
+                    heap: HeapType::I31,
+                }))?;
+                self.push_val(ValType::I32);
             }
             // ---- v128 (Cut 7) ----
             Instr::V128Const(_) => self.push_val(ValType::V128),
@@ -1349,7 +1704,7 @@ impl Machine {
             return Err(Error::Invalid("type mismatch"));
         }
         for (declared, actual) in signature.results.iter().zip(&ty.results) {
-            if !matches_val(*declared, *actual) {
+            if !val_sub(self.types, *declared, *actual) {
                 return Err(Error::Invalid("type mismatch"));
             }
         }
@@ -1367,6 +1722,159 @@ impl Machine {
         }
         Ok(())
     }
+
+    /// Push the (non-null) reference to a defined type.
+    fn push_typed_ref(&mut self, index: u32) {
+        self.push_val(ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(index),
+        }));
+    }
+
+    /// Pop a reference subsumed by `expected` (used as the loose operand
+    /// bound of casts, which may be exercised from any same-hierarchy type).
+    fn pop_ref_under(&mut self, expected: ValType) -> Result<(), Error> {
+        match self.pop_val()? {
+            StackTy::Bot => Ok(()),
+            StackTy::Known(actual) if matches!(actual, ValType::Ref(_)) => {
+                if val_sub(self.types, expected, actual) {
+                    Ok(())
+                } else {
+                    Err(Error::Invalid("type mismatch"))
+                }
+            }
+            StackTy::Known(_) => Err(Error::Invalid("type mismatch")),
+        }
+    }
+
+    /// `br_on_cast l rt1 rt2`: branch when the `rt1`-typed operand casts to
+    /// `rt2`; the branch target's top label type must accept the cast value
+    /// and `rt2` must be a subtype of `rt1`. The fall-through keeps the label
+    /// prefix values plus the cast remainder.
+    fn check_cast_branch(
+        &mut self,
+        label: u32,
+        from: RefType,
+        to: RefType,
+        spaces: &Spaces<'_>,
+    ) -> Result<(), Error> {
+        if !ref_sub(&spaces.module.types, from, to) {
+            return Err(Error::Invalid("type mismatch"));
+        }
+        let types = self.label_types(label as usize)?;
+        let Some((&last, prefix)) = types.split_last() else {
+            return Err(Error::Invalid("type mismatch"));
+        };
+        if !val_sub(self.types, last, ValType::Ref(to)) {
+            return Err(Error::Invalid("type mismatch"));
+        }
+        self.pop_expected(ValType::Ref(from))?;
+        self.pop_vals(prefix)?;
+        self.push_vals(prefix);
+        self.push_val(ValType::Ref(type_difference(from, to)));
+        Ok(())
+    }
+
+    /// `br_on_cast_fail l rt1 rt2`: branch when the operand does *not* cast;
+    /// the branch target's top label type must accept the remainder. The
+    /// fall-through value is the successful cast to `rt2`.
+    fn check_cast_branch_fail(
+        &mut self,
+        label: u32,
+        from: RefType,
+        to: RefType,
+        spaces: &Spaces<'_>,
+    ) -> Result<(), Error> {
+        if !ref_sub(&spaces.module.types, from, to) {
+            return Err(Error::Invalid("type mismatch"));
+        }
+        let remainder = type_difference(from, to);
+        let types = self.label_types(label as usize)?;
+        let Some((&last, prefix)) = types.split_last() else {
+            return Err(Error::Invalid("type mismatch"));
+        };
+        if !val_sub(self.types, last, ValType::Ref(remainder)) {
+            return Err(Error::Invalid("type mismatch"));
+        }
+        self.pop_expected(ValType::Ref(from))?;
+        self.pop_vals(prefix)?;
+        self.push_vals(prefix);
+        self.push_val(ValType::Ref(to));
+        Ok(())
+    }
+}
+
+/// The spec's reference-type difference `rt1 \ rt2` (the type of a value
+/// that is `rt1` but failed a cast to `rt2`): a `rt2`-nullable difference
+/// cannot contain null, so it stays non-nullable; otherwise unchanged.
+fn type_difference(from: RefType, to: RefType) -> RefType {
+    RefType {
+        nullable: if to.nullable { false } else { from.nullable },
+        heap: from.heap,
+    }
+}
+
+/// The fields of the struct type at `index`.
+fn struct_fields(module: &Module, index: u32) -> Result<&[FieldType], Error> {
+    match module.types.get(index as usize) {
+        None => Err(Error::Invalid("unknown type")),
+        Some(sub) => match &sub.composite {
+            CompositeType::Struct(fields) => Ok(fields),
+            _ => Err(Error::Invalid("type mismatch")),
+        },
+    }
+}
+
+/// The element type of the array type at `index` (mutable for the writers).
+fn array_field(module: &Module, index: u32) -> Result<FieldType, Error> {
+    match module.types.get(index as usize) {
+        None => Err(Error::Invalid("unknown type")),
+        Some(sub) => match &sub.composite {
+            CompositeType::Array(field) => Ok(*field),
+            _ => Err(Error::Invalid("type mismatch")),
+        },
+    }
+}
+
+fn array_field_mut(module: &Module, index: u32) -> Result<FieldType, Error> {
+    let field = array_field(module, index)?;
+    if field.mutable {
+        Ok(field)
+    } else {
+        Err(Error::Invalid("type mismatch"))
+    }
+}
+
+/// Whether a source array's storage type fits a destination's (array.copy).
+fn storage_compatible(types: &[SubType], dst: StorageType, src: StorageType) -> bool {
+    match (dst, src) {
+        (StorageType::I8, StorageType::I8)
+        | (StorageType::I16, StorageType::I16)
+        | (StorageType::I32, StorageType::I32)
+        | (StorageType::I64, StorageType::I64)
+        | (StorageType::F32, StorageType::F32)
+        | (StorageType::F64, StorageType::F64)
+        | (StorageType::V128, StorageType::V128) => true,
+        (StorageType::Ref(dst_ref), StorageType::Ref(src_ref)) => ref_sub(types, dst_ref, src_ref),
+        _ => false,
+    }
+}
+
+/// The reference type of an element segment (spec: element items are
+/// `(ref null ht)` when the segment declares the non-null form).
+fn element_type_at(spaces: &Spaces<'_>, index: u32) -> Result<RefType, Error> {
+    let Some(element) = spaces.module.elements.get(index as usize) else {
+        return Err(Error::Invalid("unknown elem segment"));
+    };
+    Ok(element.ty)
+}
+
+/// The nullable reference to a defined type, as aggregate instructions pop.
+fn nullable_ref(index: u32) -> ValType {
+    ValType::Ref(RefType {
+        nullable: true,
+        heap: HeapType::Type(index),
+    })
 }
 
 /// The natural alignment exponent (log2 of bytes) of a v128 load form.
@@ -1496,8 +2004,8 @@ fn memory_access_ok(
     Ok(())
 }
 
-fn table_is_func(table: &TableType) -> bool {
-    matches_ref(RefType::FUNC, table.element)
+fn table_is_func(module: &Module, table: &TableType) -> bool {
+    heap_sub(&module.types, &table.element.heap, &HeapType::Func)
 }
 
 /// The operand a `call_ref`/`return_call_ref` requires: a (nullable)
@@ -1640,6 +2148,101 @@ fn const_expr_type(expr: &[Instr], spaces: &Spaces<'_>, visible: usize) -> Resul
                 }
                 stack.push(t);
             }
+            // GC constant expressions: i31 boxing, extern round-tripping, and
+            // struct/array allocation (spec const-expr rules).
+            Instr::RefI31 => {
+                if stack.pop() != Some(ValType::I32) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                stack.push(ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::I31,
+                }));
+            }
+            Instr::AnyConvertExtern => {
+                let ValType::Ref(entry) = stack.pop().ok_or(Error::Invalid("type mismatch"))?
+                else {
+                    return Err(Error::Invalid("type mismatch"));
+                };
+                if entry.heap != HeapType::Extern {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                stack.push(ValType::Ref(RefType {
+                    nullable: entry.nullable,
+                    heap: HeapType::Any,
+                }));
+            }
+            Instr::ExternConvertAny => {
+                let ValType::Ref(entry) = stack.pop().ok_or(Error::Invalid("type mismatch"))?
+                else {
+                    return Err(Error::Invalid("type mismatch"));
+                };
+                // Internalizing any aggregate (or null) value is fine; extern
+                // values are not `any` and cannot be externalized again.
+                if !heap_sub(&spaces.module.types, &entry.heap, &HeapType::Any) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                stack.push(ValType::Ref(RefType {
+                    nullable: entry.nullable,
+                    heap: HeapType::Extern,
+                }));
+            }
+            Instr::StructNew(type_index) => {
+                let fields = struct_fields(spaces.module, *type_index)?;
+                for field in fields.iter().rev() {
+                    pop_const_sub(&spaces.module.types, &mut stack, field.ty.val())?;
+                }
+                stack.push(ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::Type(*type_index),
+                }));
+            }
+            Instr::StructNewDefault(type_index) => {
+                let fields = struct_fields(spaces.module, *type_index)?;
+                for field in fields {
+                    if matches!(field.ty, StorageType::Ref(reference) if !reference.nullable) {
+                        return Err(Error::Invalid("type mismatch"));
+                    }
+                }
+                stack.push(ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::Type(*type_index),
+                }));
+            }
+            Instr::ArrayNew(type_index) => {
+                let field = array_field(spaces.module, *type_index)?;
+                if stack.pop() != Some(ValType::I32) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                pop_const_sub(&spaces.module.types, &mut stack, field.ty.val())?;
+                stack.push(ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::Type(*type_index),
+                }));
+            }
+            Instr::ArrayNewDefault(type_index) => {
+                let field = array_field(spaces.module, *type_index)?;
+                if matches!(field.ty, StorageType::Ref(reference) if !reference.nullable) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                if stack.pop() != Some(ValType::I32) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
+                stack.push(ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::Type(*type_index),
+                }));
+            }
+            Instr::ArrayNewFixed { ty, n } => {
+                let field = array_field(spaces.module, *ty)?;
+                for _ in 0..*n {
+                    pop_const_sub(&spaces.module.types, &mut stack, field.ty.val())?;
+                }
+                stack.push(ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::Type(*ty),
+                }));
+            }
             _ => return Err(Error::Invalid("constant expression required")),
         }
     }
@@ -1649,6 +2252,20 @@ fn const_expr_type(expr: &[Instr], spaces: &Spaces<'_>, visible: usize) -> Resul
     Ok(stack[0])
 }
 
+/// Pop a constant-expression stack entry that must subsume `expected`.
+fn pop_const_sub(
+    types: &[SubType],
+    stack: &mut Vec<ValType>,
+    expected: ValType,
+) -> Result<(), Error> {
+    let actual = stack.pop().ok_or(Error::Invalid("type mismatch"))?;
+    if val_sub(types, expected, actual) {
+        Ok(())
+    } else {
+        Err(Error::Invalid("type mismatch"))
+    }
+}
+
 fn validate_const_expr(
     expr: &[Instr],
     expected: ValType,
@@ -1656,7 +2273,7 @@ fn validate_const_expr(
     visible_globals: usize,
 ) -> Result<(), Error> {
     let actual = const_expr_type(expr, spaces, visible_globals)?;
-    if !matches_val(expected, actual) {
+    if !val_sub(&spaces.module.types, expected, actual) {
         return Err(Error::Invalid("type mismatch"));
     }
     Ok(())
@@ -1747,6 +2364,92 @@ fn num_signature(op: NumOp) -> (Vec<ValType>, Vec<ValType>) {
 mod tests {
     use super::*;
     use crate::module::{DataMode, DataSegment, FuncBody, Global, Import, ImportDesc};
+    use crate::types::SubType;
+
+    #[test]
+    fn gc_heap_subtyping_hierarchy() {
+        use HeapType::*;
+        // Abstract lattice: none/struct/array/i31 sit under eq under any;
+        // function and extern hierarchies are disjoint from the GC one.
+        assert!(abs_sub(&None, &Eq));
+        assert!(abs_sub(&None, &Any));
+        assert!(abs_sub(&None, &Struct));
+        assert!(!abs_sub(&None, &I31));
+        assert!(abs_sub(&I31, &Eq));
+        assert!(abs_sub(&Struct, &Any));
+        assert!(abs_sub(&NoFunc, &Func));
+        assert!(!abs_sub(&Func, &Eq));
+        assert!(!abs_sub(&Extern, &Any));
+        let types: &[SubType] = &[];
+        // Defined struct/array/func types sit under their kind's abstract
+        // type with no module-defined supertypes.
+        let module = crate::Module {
+            types: vec![
+                SubType::func(vec![], vec![]),
+                SubType {
+                    is_final: true,
+                    supertypes: vec![],
+                    composite: CompositeType::Struct(vec![]),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(heap_sub(&module.types, &Type(1), &Struct));
+        assert!(heap_sub(&module.types, &Type(1), &Any));
+        assert!(heap_sub(&module.types, &Type(0), &Func));
+        assert!(!heap_sub(&module.types, &Type(1), &Func));
+        // A declared supertype chain (type 3 sub 2 sub 0).
+        let module = crate::Module {
+            types: vec![
+                SubType::func(vec![], vec![]),
+                SubType::func(vec![], vec![]),
+                SubType {
+                    is_final: false,
+                    supertypes: vec![0],
+                    composite: CompositeType::Func(FuncType {
+                        params: vec![],
+                        results: vec![],
+                    }),
+                },
+                SubType {
+                    is_final: false,
+                    supertypes: vec![2],
+                    composite: CompositeType::Func(FuncType {
+                        params: vec![],
+                        results: vec![],
+                    }),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(heap_sub(&module.types, &Type(3), &Type(0)));
+        assert!(heap_sub(&module.types, &Type(3), &Type(2)));
+        assert!(!heap_sub(&module.types, &Type(2), &Type(3)));
+        // Nullability: a nullable reference does not fit a non-null slot.
+        assert!(ref_sub(
+            &module.types,
+            RefType {
+                nullable: true,
+                heap: Func
+            },
+            RefType {
+                nullable: false,
+                heap: Type(3)
+            }
+        ));
+        assert!(!ref_sub(
+            &module.types,
+            RefType {
+                nullable: false,
+                heap: Func
+            },
+            RefType {
+                nullable: true,
+                heap: Type(3)
+            }
+        ));
+        let _ = types;
+    }
 
     fn func_type(params: Vec<ValType>, results: Vec<ValType>) -> FuncType {
         FuncType { params, results }
@@ -1755,6 +2458,10 @@ mod tests {
     /// A module with the given types and defined functions `(type idx, locals,
     /// body)`.
     fn module(types: Vec<FuncType>, funcs: Vec<(u32, Vec<ValType>, Vec<Instr>)>) -> Module {
+        let types = types
+            .into_iter()
+            .map(|t| SubType::func(t.params, t.results))
+            .collect();
         Module {
             functions: funcs.iter().map(|(ty, _, _)| *ty).collect(),
             bodies: funcs
@@ -2022,7 +2729,7 @@ mod tests {
     fn tag_imports_need_empty_result_types() {
         // Exception tags refer to function types whose results are empty.
         let ok = Module {
-            types: vec![func_type(vec![], vec![])],
+            types: vec![SubType::func(vec![], vec![])],
             imports: vec![Import {
                 module: "m".into(),
                 name: "t".into(),
@@ -2033,7 +2740,7 @@ mod tests {
         assert!(validate(&ok).is_ok());
 
         let bad = Module {
-            types: vec![func_type(vec![], vec![ValType::I32])],
+            types: vec![SubType::func(vec![], vec![ValType::I32])],
             imports: vec![Import {
                 module: "m".into(),
                 name: "t".into(),

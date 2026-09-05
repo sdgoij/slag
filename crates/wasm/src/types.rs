@@ -4,17 +4,58 @@
 
 use std::fmt;
 
-/// A heap type: an abstract one (`func`, `extern`, `exn`, ...) or a type
-/// index (typed references). GC-era abstract heap types are added with their
-/// cut.
+/// A heap type: an abstract one (`func`, `extern`, `exn`, the GC hierarchy
+/// `any`/`eq`/`i31`/`struct`/`array` and their bottoms) or a type index
+/// (typed references). The abstract forms are encoded as small negative type
+/// indices in the binary format (spec 5.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HeapType {
     Func,
     Extern,
     /// Exception references (`exn`, the `exnref` heap type).
     Exn,
+    /// The common subtype of all external references.
+    NoExtern,
+    /// The common subtype of all function types.
+    NoFunc,
+    /// The common subtype of all exception types.
+    NoExn,
+    /// The common subtype of all aggregate types (`none`).
+    None,
+    /// Any GC object (struct/array/i31).
+    Any,
+    /// Anything `ref.eq` can compare (struct/array/i31).
+    Eq,
+    /// An unboxed scalar reference (`i31`).
+    I31,
+    /// The common supertype of all struct types.
+    Struct,
+    /// The common supertype of all array types.
+    Array,
     /// A user-defined type index (`(ref $t)`), carried as an s33 index.
     Type(u32),
+}
+
+impl HeapType {
+    /// The abstract heap type a negative type index encodes, if any
+    /// (spec 5.3: `func` = -0x10 ... `array` = -0x16).
+    pub const fn from_s33(index: i64) -> Option<HeapType> {
+        Some(match index {
+            -0x10 => HeapType::Func,
+            -0x11 => HeapType::Extern,
+            -0x12 => HeapType::Any,
+            -0x13 => HeapType::Eq,
+            -0x14 => HeapType::I31,
+            -0x15 => HeapType::Struct,
+            -0x16 => HeapType::Array,
+            -0x17 => HeapType::Exn,
+            -0x0f => HeapType::None,
+            -0x0e => HeapType::NoExtern,
+            -0x0d => HeapType::NoFunc,
+            -0x0c => HeapType::NoExn,
+            _ => return None,
+        })
+    }
 }
 
 /// A reference type: nullable/`ref null` or non-null `ref`, over a heap type.
@@ -75,6 +116,15 @@ impl fmt::Display for HeapType {
             HeapType::Func => f.write_str("func"),
             HeapType::Extern => f.write_str("extern"),
             HeapType::Exn => f.write_str("exn"),
+            HeapType::NoFunc => f.write_str("nofunc"),
+            HeapType::NoExtern => f.write_str("noextern"),
+            HeapType::NoExn => f.write_str("noexn"),
+            HeapType::None => f.write_str("none"),
+            HeapType::Any => f.write_str("any"),
+            HeapType::Eq => f.write_str("eq"),
+            HeapType::I31 => f.write_str("i31"),
+            HeapType::Struct => f.write_str("struct"),
+            HeapType::Array => f.write_str("array"),
             HeapType::Type(index) => write!(f, "${index}"),
         }
     }
@@ -103,6 +153,96 @@ impl fmt::Display for ValType {
 pub struct FuncType {
     pub params: Vec<ValType>,
     pub results: Vec<ValType>,
+}
+
+/// A storage type (spec 2.3.7): the type stored in a struct field or array
+/// element, including the packed `i8`/`i16` forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StorageType {
+    I8,
+    I16,
+    I32,
+    I64,
+    F32,
+    F64,
+    V128,
+    Ref(RefType),
+}
+
+impl StorageType {
+    /// The value type read from/written to a field whose storage type is
+    /// wider than a packed integer. Packed fields use the i32 value type.
+    pub fn val(&self) -> ValType {
+        match self {
+            StorageType::I8 | StorageType::I16 | StorageType::I32 => ValType::I32,
+            StorageType::I64 => ValType::I64,
+            StorageType::F32 => ValType::F32,
+            StorageType::F64 => ValType::F64,
+            StorageType::V128 => ValType::V128,
+            StorageType::Ref(r) => ValType::Ref(*r),
+        }
+    }
+}
+
+impl From<ValType> for StorageType {
+    fn from(value: ValType) -> Self {
+        match value {
+            ValType::I32 => StorageType::I32,
+            ValType::I64 => StorageType::I64,
+            ValType::F32 => StorageType::F32,
+            ValType::F64 => StorageType::F64,
+            ValType::V128 => StorageType::V128,
+            ValType::Ref(r) => StorageType::Ref(r),
+        }
+    }
+}
+
+/// A struct field (spec 2.3.7): a storage type plus mutability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FieldType {
+    pub ty: StorageType,
+    pub mutable: bool,
+}
+
+/// A composite type (spec 2.3.9): a function, struct, or array type. The
+/// type-index space of a module is the flat list of its subtypes; a rec
+/// group's members occupy consecutive indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompositeType {
+    Func(FuncType),
+    Struct(Vec<FieldType>),
+    Array(FieldType),
+}
+
+impl CompositeType {
+    pub fn as_func(&self) -> Option<&FuncType> {
+        match self {
+            CompositeType::Func(func) => Some(func),
+            _ => None,
+        }
+    }
+}
+
+/// A defined type (spec 2.3.10): an optionally-final subtype with up to one
+/// supertype, over a composite type. Bare types (no `sub`) are final with no
+/// supertypes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubType {
+    pub is_final: bool,
+    /// Supertype indices within the same module's type space (at most one in
+    /// the GC MVP).
+    pub supertypes: Vec<u32>,
+    pub composite: CompositeType,
+}
+
+impl SubType {
+    pub fn func(params: Vec<ValType>, results: Vec<ValType>) -> SubType {
+        SubType {
+            is_final: true,
+            supertypes: Vec::new(),
+            composite: CompositeType::Func(FuncType { params, results }),
+        }
+    }
 }
 
 /// Limits for tables/memories (spec 2.3.12).

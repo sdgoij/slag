@@ -305,6 +305,17 @@ review, per repo rules hygiene.
   subtyping), so it is sequenced after the interpreter is stable.
 - DoD: `gc/` (17).
 
+Status (Cut 9 waves 1-3 landed): type model + decoder (wave 1), GC
+instruction typing (wave 2), and the GC object runtime — struct/array/i31
+extern values, `struct.*`/`array.*`, `ref.cast/test`/`br_on_cast*` with
+canonical (structural) type matching — land the corpus. `gc/` runs 653
+pass / 0 fail with 16 of 17 files green under the default exclusions
+(`struct.wast` keeps one harness `assert_malformed` quote-text command
+pending; `type-subtyping.wast` stays excluded because its multi-supertype
+fixtures exceed both the `wast` grammar and the decoder's single-supertype
+model). `type-canon.wast` and the bulk-memory/`memory64` `table_init`
+files were un-excluded with the wave.
+
 ### Cut 10 — The JavaScript API (document/js-api)
 
 - `WebAssembly` namespace object and constructors:
@@ -916,20 +927,62 @@ CI check.
 
 ### Cut 9 — GC: converter switch + engine (in progress, 2026-09-05)
 
-The converter switch (ratified above) landed its first step: `wasmtest`
-now depends on the maintained `wast` + `wat` crates (default-features off,
-`wast` with `wasm-module`), and a feasibility probe
-(`crates/wasmtest/examples/gcprobe.rs`) confirms the crate parses the
-pinned GC corpus — `gc/i31.wast`, `gc/struct.wast`, `gc/ref_eq.wast` all
-parse clean, syntaxes wabt 1.0.41 rejects (`sub`/rec, packed `i8/i16`
-fields, `i31ref`, casts). The `wast` tokenizer's NaN-bit resolution
-matches wabt's exactly (`nan:0x200000` → 0x7FA00000 etc.), so converted
-float/v128 values keep bit parity with the old wabt JSONs.
+The converter switch (ratified above) landed first and is complete: the
+in-process `wast`/`wat` crates (default-features off, `wast` with
+`wasm-module`) convert every `.wast` in the pinned corpus to the
+runner's wast2json-shaped JSON + per-module `.wasm`/`.wat` files,
+replacing wabt's `wast2json` (which cannot parse GC text). `WAST2JSON`
+still forces wabt; the converter is exercised as the default in every
+suite run. The `wast` tokenizer's NaN-bit resolution matches wabt's, so
+converted float/v128 values keep bit parity.
 
-Remaining converter work: a `convert` module mapping `Wast` directives to
-the runner's wast2json-shaped JSON (module `.wasm`/`.wat` files,
-invoke/get actions, expected-value entries incl. float NaN patterns and
-v128 lanes), replacing the external-binary path; then Cut 9's engine
-waves: rec/sub + composite-type decode (type section), GC value/heap
-types and subtyping in validation, the struct/array/ref-cast/i31
-instruction surface, and a GC object runtime — against `gc/` (17).
+#### Cut 9 Wave 1 — GC type model + decoder (landed)
+
+- `types.rs`: full heap-type hierarchy (`any`/`eq`/`i31`/`struct`/`array`
+  and bottoms `none`/`nofunc`/`noextern`/`noexn`), storage types (packed
+  `i8`/`i16`), `FieldType`, `CompositeType` (func/struct/array), and
+  `SubType` (final flag, supertypes). `Module.types` is now a
+  `Vec<SubType>` (a rec group occupies consecutive indices); func-type
+  resolution goes through `Module::func_at`.
+- `binary.rs`: the type section decodes rec groups (`0x4e`), `sub`/`sub
+  final` subtypes (`0x50`/`0x4f` + supertype list + composite), struct
+  (`0x5f`) and array (`0x5e`) composite types, packed storage, GC value
+  types (single-byte abstract-heap shorthands and `0x63`/`0x64` typed
+  refs), and s33-encoded heap types. Block types, table elements, and
+  fields all accept the GC forms.
+- Decoder tests round-trip struct/array/sub/rec/gc-valtype encodings.
+- Result: every `gc/` fixture now *decodes and passes module
+  validation*; `type-canon.wast` fully passes, and the pre-Cut-9
+  exclusions (`type-rec`, `type-equivalence`, `ref_null`, GC `table_init`
+  fixtures, `exceptions/tag`) decode cleanly and validate against the
+  engine (only genuine GC typing gaps remain as failures). No regression
+  elsewhere: the non-GC suites keep their prior totals.
+
+#### Cut 9 Wave 2 — GC instruction decode + validation typing (landed)
+
+- `instr.rs`: the full GC aggregate/cast instruction surface (`0xfb`
+  prefix): `struct.*`, `array.*` (incl. `new_fixed`/`new_data`/`new_elem`,
+  `fill`/`copy`/`init_data`/`init_elem`), `ref.test`/`ref.cast`/
+  `br_on_cast`/`br_on_cast_fail`, `ref.i31`/`i31.get_*`, and
+  `any.convert_extern`/`extern.convert_any`.
+- `binary.rs`: decodes the `0xfb` prefix (subopcode + immediates, cast
+  flags for the branching casts).
+- `valid.rs`: context-aware GC subtyping replaces the old context-free
+  reference matching: `heap_sub`/`abs_sub`/`ref_sub`/`val_sub` cover the
+  abstract heap lattice, concrete types under their composite kind's
+  abstract type, and declared supertype chains; `Machine` carries the
+  module types. Every GC instruction is typed per spec (aggregate field
+  mutability/packing rules, `array.new_elem`/`init_elem` element-type
+  subsumption, `array.copy` storage compatibility, cast targets within
+  the same hierarchy, `ref.eq` limited to `eq`-comparable operands, the
+  `br_on_cast` label/difference typing). `valid::Error::Unsupported` was
+  added and the runner counts it as pending, so modules using a feature
+  validation does not yet judge stay honest.
+- Non-GC suites keep identical totals (19949/18 top-level core, zero-fail
+  feature dirs); gc fixtures now classify against the typed validator
+  (assert_invalid and structure tests pass; execution is the next wave).
+
+Remaining Cut 9 engine wave: a GC object runtime in the store
+(struct/array/i31 objects, extern wrappers), the executor for the
+`0xfb` instructions (incl. data/elem segment access and cast
+semantics), and the `gc/` file sweep — against `gc/` (17).

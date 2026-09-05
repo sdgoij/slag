@@ -15,7 +15,8 @@ use crate::module::{
     FuncBody, Global, Import, ImportDesc, Module, Table,
 };
 use crate::types::{
-    BlockType, FuncType, GlobalType, HeapType, Limits, MemType, RefType, TableType, ValType,
+    BlockType, CompositeType, FieldType, FuncType, GlobalType, HeapType, Limits, MemType, RefType,
+    StorageType, SubType, TableType, ValType,
 };
 
 /// A binary-format error. `Malformed` mirrors the spec's diagnostics; the
@@ -177,14 +178,7 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
         SectionId::Type => {
             let count = read_u32(payload, &mut pos)?;
             for _ in 0..count {
-                // GC composite/rec types are valid type-section forms the
-                // engine does not decode yet; report them as unsupported
-                // rather than malformed so conformance counts stay honest.
-                if payload.get(pos) == Some(&0x4e) || matches!(payload.get(pos), Some(0x50..=0x5f))
-                {
-                    return Err(Error::Unsupported("GC composite type"));
-                }
-                module.types.push(decode_func_type(payload, &mut pos)?);
+                decode_rectype(payload, &mut pos, &mut module.types)?;
             }
         }
         SectionId::Import => {
@@ -309,13 +303,143 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
     Ok(())
 }
 
-fn decode_func_type(bytes: &[u8], pos: &mut usize) -> Result<FuncType, Error> {
-    if read_u8(bytes, pos)? != 0x60 {
-        return Err(Error::Malformed("malformed functype"));
+/// A type-section entry (spec 5.3): a recursion group (0x4e followed by its
+/// subtypes) or, as the unary shorthand, a single subtype written bare.
+fn decode_rectype(bytes: &[u8], pos: &mut usize, types: &mut Vec<SubType>) -> Result<(), Error> {
+    if bytes.get(*pos) == Some(&0x4e) {
+        *pos += 1;
+        let count = read_u32(bytes, pos)?;
+        for _ in 0..count {
+            decode_subtype(bytes, pos, types)?;
+        }
+    } else {
+        decode_subtype(bytes, pos, types)?;
     }
-    let params = read_valtype_vec(bytes, pos)?;
-    let results = read_valtype_vec(bytes, pos)?;
-    Ok(FuncType { params, results })
+    Ok(())
+}
+
+/// A defined type (spec 5.3). The 0x4f/0x50 prefixes mark `sub final`/`sub`;
+/// a bare composite type is the shorthand for a final type without
+/// supertypes. Both prefixes are followed by the supertype list (0 or 1 in
+/// the GC MVP), then the composite type.
+fn decode_subtype(bytes: &[u8], pos: &mut usize, types: &mut Vec<SubType>) -> Result<(), Error> {
+    let byte = bytes
+        .get(*pos)
+        .copied()
+        .ok_or(Error::Malformed("unexpected end of section or function"))?;
+    let (is_final, prefixed) = match byte {
+        0x4f => (true, true),
+        0x50 => (false, true),
+        _ => (true, false),
+    };
+    let supertypes = if prefixed {
+        *pos += 1;
+        let count = read_u32(bytes, pos)?;
+        // The GC MVP allows a single supertype; any count is a malformed
+        // module rather than a later feature.
+        if count > 1 {
+            return Err(Error::Malformed("malformed subtype"));
+        }
+        let mut list = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            list.push(read_u32(bytes, pos)?);
+        }
+        list
+    } else {
+        Vec::new()
+    };
+    // The shared/descriptor markers of later proposals are not in the corpus.
+    if bytes.get(*pos) == Some(&0x65) {
+        return Err(Error::Unsupported("shared type"));
+    }
+    let composite = decode_comptype(bytes, pos)?;
+    types.push(SubType {
+        is_final,
+        supertypes,
+        composite,
+    });
+    Ok(())
+}
+
+/// A composite type (spec 5.3): a function, struct, or array type.
+fn decode_comptype(bytes: &[u8], pos: &mut usize) -> Result<CompositeType, Error> {
+    match read_u8(bytes, pos)? {
+        0x60 => {
+            let params = read_valtype_vec(bytes, pos)?;
+            let results = read_valtype_vec(bytes, pos)?;
+            Ok(CompositeType::Func(FuncType { params, results }))
+        }
+        0x5e => Ok(CompositeType::Array(decode_field_type(bytes, pos)?)),
+        0x5f => {
+            let count = read_u32(bytes, pos)?;
+            let mut fields = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                fields.push(decode_field_type(bytes, pos)?);
+            }
+            Ok(CompositeType::Struct(fields))
+        }
+        0x5d => Err(Error::Unsupported("continuation type")),
+        _ => Err(Error::Malformed("malformed composite type")),
+    }
+}
+
+/// A struct field / array element type: a storage type plus a mutability
+/// byte (spec 5.3).
+fn decode_field_type(bytes: &[u8], pos: &mut usize) -> Result<FieldType, Error> {
+    let ty = decode_storage_type(bytes, pos)?;
+    let mutable = match read_u8(bytes, pos)? {
+        0x00 => false,
+        0x01 => true,
+        _ => return Err(Error::Malformed("malformed mutability")),
+    };
+    Ok(FieldType { ty, mutable })
+}
+
+/// A storage type (spec 5.3): the packed i8/i16 forms plus every value type.
+fn decode_storage_type(bytes: &[u8], pos: &mut usize) -> Result<StorageType, Error> {
+    Ok(match read_u8(bytes, pos)? {
+        0x78 => StorageType::I8,
+        0x77 => StorageType::I16,
+        0x7f => StorageType::I32,
+        0x7e => StorageType::I64,
+        0x7d => StorageType::F32,
+        0x7c => StorageType::F64,
+        0x7b => StorageType::V128,
+        0x63 => {
+            let heap = decode_heap_type(bytes, pos)?;
+            return Ok(StorageType::Ref(RefType {
+                nullable: true,
+                heap,
+            }));
+        }
+        0x64 => {
+            let heap = decode_heap_type(bytes, pos)?;
+            return Ok(StorageType::Ref(RefType {
+                nullable: false,
+                heap,
+            }));
+        }
+        byte if abstract_heap_byte(byte).is_some() => StorageType::Ref(RefType {
+            nullable: true,
+            heap: abstract_heap_byte(byte).expect("checked"),
+        }),
+        _ => return Err(Error::Malformed("malformed value type")),
+    })
+}
+
+/// The heap type a single-byte s33 negative encodes, when it is one of the
+/// abstract heap types (spec 5.3). A single-byte s33's sign bit is bit 6.
+fn abstract_heap_byte(byte: u8) -> Option<HeapType> {
+    if byte < 0x80 {
+        let value = if byte & 0x40 != 0 {
+            i64::from(byte) - 128
+        } else {
+            i64::from(byte)
+        };
+        HeapType::from_s33(value)
+    } else {
+        None
+    }
 }
 
 fn read_valtype_vec(bytes: &[u8], pos: &mut usize) -> Result<Vec<ValType>, Error> {
@@ -332,71 +456,34 @@ fn read_valtype_vec(bytes: &[u8], pos: &mut usize) -> Result<Vec<ValType>, Error
 fn decode_valtype(bytes: &[u8], pos: &mut usize) -> Result<ValType, Error> {
     let byte = read_u8(bytes, pos)?;
     match byte {
-        0x63 => {
-            // `(ref null ht)`.
+        0x63 | 0x64 => {
+            // `(ref null ht)` / `(ref ht)`.
             let heap = decode_heap_type(bytes, pos)?;
             Ok(ValType::Ref(RefType {
+                nullable: byte == 0x63,
+                heap,
+            }))
+        }
+        // An abstract heap type byte in value-type position is the nullable
+        // reference shorthand (`anyref` = `(ref null any)`, etc.).
+        _ => match abstract_heap_byte(byte) {
+            Some(heap) => Ok(ValType::Ref(RefType {
                 nullable: true,
                 heap,
-            }))
-        }
-        0x64 => {
-            // `(ref ht)`.
-            let heap = decode_heap_type(bytes, pos)?;
-            Ok(ValType::Ref(RefType {
-                nullable: false,
-                heap,
-            }))
-        }
-        // The GC abstract heap types are valid single-byte value types;
-        // decoding them is a later cut, so they are unsupported rather than
-        // malformed.
-        _ if is_gc_heap_type(byte) => Err(Error::Unsupported("abstract heap type")),
-        _ => ValType::from_byte(byte).ok_or(Error::Malformed("malformed value type")),
+            })),
+            None => ValType::from_byte(byte).ok_or(Error::Malformed("malformed value type")),
+        },
     }
 }
 
-/// A single-byte GC abstract heap type (an `anyref`-style value type or the
-/// heap operand of a `(ref ht)` encoding). Not a type index: indices are
-/// signed LEB128 and always need the continuation bit.
-fn is_gc_heap_type(byte: u8) -> bool {
-    matches!(byte, 0x6a..=0x6e | 0x71..=0x74)
-}
-
+/// A heap type (spec 5.3): a non-negative type index or an abstract heap
+/// type encoded as a negative index.
 fn decode_heap_type(bytes: &[u8], pos: &mut usize) -> Result<HeapType, Error> {
-    let byte = bytes
-        .get(*pos)
-        .copied()
-        .ok_or(Error::Malformed("unexpected end of section or function"))?;
-    match byte {
-        0x70 => {
-            *pos += 1;
-            Ok(HeapType::Func)
-        }
-        0x6f => {
-            *pos += 1;
-            Ok(HeapType::Extern)
-        }
-        0x69 => {
-            // Exception references (`exn`).
-            *pos += 1;
-            Ok(HeapType::Exn)
-        }
-        // Any other heap type: a GC abstract heap type is a later cut and
-        // counts as unsupported, not malformed. A byte >= 0x80 continues as a
-        // signed type index instead.
-        _ if is_gc_heap_type(byte) => {
-            *pos += 1;
-            Err(Error::Unsupported("abstract heap type"))
-        }
-        _ => {
-            let index = read_s33(bytes, pos)?;
-            if index < 0 {
-                Err(Error::Unsupported("abstract heap type"))
-            } else {
-                Ok(HeapType::Type(index as u32))
-            }
-        }
+    let index = read_s33(bytes, pos)?;
+    if index < 0 {
+        HeapType::from_s33(index).ok_or(Error::Unsupported("abstract heap type"))
+    } else {
+        Ok(HeapType::Type(index as u32))
     }
 }
 
@@ -516,7 +603,9 @@ fn decode_block_type(bytes: &[u8], pos: &mut usize) -> Result<BlockType, Error> 
         *pos += 1;
         return Ok(BlockType::Empty);
     }
-    let single_byte_valtype = matches!(byte, 0x7b..=0x7f | 0x70 | 0x6f | 0x69);
+    // Every single-byte value type — the numerics, v128, and the abstract
+    // heap-type reference shorthands (`funcref`, `exnref`, `anyref`, ...).
+    let single_byte_valtype = matches!(byte, 0x7b..=0x7f | 0x69..=0x74);
     if single_byte_valtype || byte == 0x63 || byte == 0x64 {
         return Ok(BlockType::Val(decode_valtype(bytes, pos)?));
     }
@@ -929,6 +1018,7 @@ fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Erro
         0xd6 => Ok(Instr::BrOnNonNull(read_u32(bytes, pos)?)),
         0xfc => decode_fc(bytes, pos),
         0xfd => decode_simd(bytes, pos),
+        0xfb => decode_gc(bytes, pos),
         opcode @ 0x45..=0xc4 => numeric_op(opcode)
             .map(Instr::Num)
             .ok_or(Error::Malformed("illegal opcode")),
@@ -1094,6 +1184,99 @@ fn decode_fc(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
         17 => Ok(Instr::TableFill(read_u32(bytes, pos)?)),
         _ => Err(Error::Unsupported("0xfc subopcode")),
     }
+}
+
+/// Decode the 0xfb GC prefix (spec 5.4.7/5.4.9): aggregate construction and
+/// access, casts/tests, and extern/i31 conversions.
+fn decode_gc(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
+    let sub = read_u32(bytes, pos)?;
+    Ok(match sub {
+        0 => Instr::StructNew(read_u32(bytes, pos)?),
+        1 => Instr::StructNewDefault(read_u32(bytes, pos)?),
+        2..=5 => {
+            let ty = read_u32(bytes, pos)?;
+            let field = read_u32(bytes, pos)?;
+            match sub {
+                2 => Instr::StructGet { ty, field },
+                3 => Instr::StructGetS { ty, field },
+                4 => Instr::StructGetU { ty, field },
+                _ => Instr::StructSet { ty, field },
+            }
+        }
+        6 => Instr::ArrayNew(read_u32(bytes, pos)?),
+        7 => Instr::ArrayNewDefault(read_u32(bytes, pos)?),
+        8 => Instr::ArrayNewFixed {
+            ty: read_u32(bytes, pos)?,
+            n: read_u32(bytes, pos)?,
+        },
+        9 => Instr::ArrayNewData {
+            ty: read_u32(bytes, pos)?,
+            data: read_u32(bytes, pos)?,
+        },
+        10 => Instr::ArrayNewElem {
+            ty: read_u32(bytes, pos)?,
+            elem: read_u32(bytes, pos)?,
+        },
+        11..=14 => {
+            let ty = read_u32(bytes, pos)?;
+            match sub {
+                11 => Instr::ArrayGet(ty),
+                12 => Instr::ArrayGetS(ty),
+                13 => Instr::ArrayGetU(ty),
+                _ => Instr::ArraySet(ty),
+            }
+        }
+        15 => Instr::ArrayLen,
+        16 => Instr::ArrayFill(read_u32(bytes, pos)?),
+        17 => Instr::ArrayCopy {
+            dst: read_u32(bytes, pos)?,
+            src: read_u32(bytes, pos)?,
+        },
+        18 => Instr::ArrayInitData {
+            ty: read_u32(bytes, pos)?,
+            data: read_u32(bytes, pos)?,
+        },
+        19 => Instr::ArrayInitElem {
+            ty: read_u32(bytes, pos)?,
+            elem: read_u32(bytes, pos)?,
+        },
+        20 | 21 => Instr::RefTest {
+            nullable: sub == 21,
+            heap: decode_heap_type(bytes, pos)?,
+        },
+        22 | 23 => Instr::RefCast {
+            nullable: sub == 23,
+            heap: decode_heap_type(bytes, pos)?,
+        },
+        24 | 25 => {
+            let flags = read_u8(bytes, pos)?;
+            if flags & !0x03 != 0 {
+                return Err(Error::Malformed("malformed cast flags"));
+            }
+            let label = read_u32(bytes, pos)?;
+            let from_heap = decode_heap_type(bytes, pos)?;
+            let to_heap = decode_heap_type(bytes, pos)?;
+            let from = RefType {
+                nullable: flags & 0x01 != 0,
+                heap: from_heap,
+            };
+            let to = RefType {
+                nullable: flags & 0x02 != 0,
+                heap: to_heap,
+            };
+            if sub == 24 {
+                Instr::BrOnCast { label, from, to }
+            } else {
+                Instr::BrOnCastFail { label, from, to }
+            }
+        }
+        26 => Instr::AnyConvertExtern,
+        27 => Instr::ExternConvertAny,
+        28 => Instr::RefI31,
+        29 => Instr::I31GetS,
+        30 => Instr::I31GetU,
+        _ => return Err(Error::Unsupported("GC opcode")),
+    })
 }
 
 /// Map a numeric/conversion opcode to its [`NumOp`]. The 0x45..=0xc4 block
@@ -1474,10 +1657,148 @@ mod tests {
         let module = decode(&w.into_module()).unwrap();
         assert_eq!(
             module.types,
-            vec![crate::types::FuncType {
-                params: vec![ValType::I32],
-                results: vec![ValType::I64],
+            vec![crate::types::SubType::func(
+                vec![ValType::I32],
+                vec![ValType::I64]
+            )]
+        );
+    }
+
+    #[test]
+    fn type_section_decodes_struct_array_and_packed_fields() {
+        use crate::types::{CompositeType, FieldType, StorageType, SubType};
+        // struct { (field i32) (field (mut i8)) }
+        let mut w = Writer::header();
+        let mut body = Vec::new();
+        count(1, &mut body);
+        body.extend([0x5f, 0x02, 0x7f, 0x00, 0x78, 0x01]);
+        w.section(1, &body);
+        let module = decode(&w.into_module()).unwrap();
+        assert_eq!(
+            module.types,
+            vec![SubType {
+                is_final: true,
+                supertypes: vec![],
+                composite: CompositeType::Struct(vec![
+                    FieldType {
+                        ty: StorageType::I32,
+                        mutable: false
+                    },
+                    FieldType {
+                        ty: StorageType::I8,
+                        mutable: true
+                    }
+                ]),
             }]
+        );
+
+        // array (mut i16) plus a `sub` non-final func with no supertypes
+        // (`0x50` prefix, zero-length supertype list).
+        let mut w = Writer::header();
+        let mut body = Vec::new();
+        count(2, &mut body);
+        body.extend([0x5e, 0x77, 0x01]);
+        body.extend([0x50, 0x00, 0x60, 0x00, 0x00]);
+        w.section(1, &body);
+        let module = decode(&w.into_module()).unwrap();
+        assert_eq!(module.types.len(), 2);
+        assert_eq!(
+            module.types[0].composite,
+            CompositeType::Array(FieldType {
+                ty: StorageType::I16,
+                mutable: true
+            })
+        );
+        assert!(!module.types[1].is_final);
+    }
+
+    #[test]
+    fn type_section_decodes_sub_final_and_rec_groups() {
+        use crate::types::{CompositeType};
+        // (type $a (func)) then (type $b (sub final $a (func))):
+        // the second subtype is `0x4f` + supertype list `[0]` + a func type.
+        let mut w = Writer::header();
+        let mut body = Vec::new();
+        count(2, &mut body);
+        body.extend([0x60, 0x00, 0x00]);
+        body.extend([0x4f, 0x01, 0x00, 0x60, 0x00, 0x00]);
+        w.section(1, &body);
+        let module = decode(&w.into_module()).unwrap();
+        assert_eq!(module.types.len(), 2);
+        assert!(module.types[1].is_final);
+        assert_eq!(module.types[1].supertypes, vec![0]);
+
+        // A rec group of two unrolled into two consecutive type indices.
+        let mut w = Writer::header();
+        let mut body = Vec::new();
+        count(1, &mut body);
+        body.extend([0x4e, 0x02, 0x5f, 0x00, 0x5e, 0x7e, 0x00]);
+        w.section(1, &body);
+        let module = decode(&w.into_module()).unwrap();
+        assert_eq!(module.types.len(), 2);
+        assert_eq!(module.types[0].composite, CompositeType::Struct(vec![]));
+        assert_eq!(
+            module.types[1].composite,
+            CompositeType::Array(FieldType {
+                ty: StorageType::I64,
+                mutable: false
+            })
+        );
+    }
+
+    #[test]
+    fn gc_value_and_heap_types_decode() {
+        // A func type `(param anyref (ref null 0)) (result (ref i31))` uses
+        // the single-byte `anyref` shorthand, a `0x63` nullable ref to type
+        // index 0, and `0x64` + the i31 heap byte for the non-null result.
+        use crate::types::{CompositeType, RefType};
+        let mut w = Writer::header();
+        let mut body = Vec::new();
+        count(1, &mut body);
+        body.extend([0x60, 0x02, 0x6e, 0x63, 0x00, 0x01, 0x64, 0x6c]);
+        w.section(1, &body);
+        let module = decode(&w.into_module()).unwrap();
+        let CompositeType::Func(func) = &module.types[0].composite else {
+            panic!("expected a func type");
+        };
+        assert_eq!(
+            func.params,
+            vec![
+                ValType::Ref(RefType {
+                    nullable: true,
+                    heap: crate::types::HeapType::Any,
+                }),
+                ValType::Ref(RefType {
+                    nullable: true,
+                    heap: crate::types::HeapType::Type(0),
+                }),
+            ]
+        );
+        assert_eq!(
+            func.results,
+            vec![ValType::Ref(RefType {
+                nullable: false,
+                heap: crate::types::HeapType::I31,
+            })]
+        );
+    }
+
+    #[test]
+    fn type_section_decodes_table_element_gc_refs() {
+        // A table of `anyref` is a bare `0x6e` element byte.
+        let mut w = Writer::header();
+        let mut body = Vec::new();
+        count(1, &mut body);
+        body.extend([0x6e, 0x00, 0x01]); // reftype anyref, limits min 0 max 1
+        w.section(4, &body);
+        let module = decode(&w.into_module()).unwrap();
+        assert_eq!(module.tables.len(), 1);
+        assert_eq!(
+            module.tables[0].ty.element,
+            RefType {
+                nullable: true,
+                heap: crate::types::HeapType::Any,
+            }
         );
     }
 
