@@ -4554,6 +4554,63 @@ mod tests {
     }
 
     #[test]
+    fn loop_leaf_reads_a_capture_through_a_certified_helper() {
+        // Regression: a leaf closure whose LOOP body lowered to a RunRegBody
+        // step reads a binding captured from an enclosing IIFE and is invoked
+        // through a certified top-level helper. leaf_needs_env/leaf_uses_env
+        // were derived only from top-level steps, so this leaf inlined with
+        // no environment installed and resolved the capture against the
+        // caller's body_context, panicking in context_env ("a context slot
+        // without a capture-context env"). The register ops inside the
+        // RunRegBody must count toward the env-use flags.
+        let source = "function ho(fn) { return fn(100); }\n\
+                     var res = (function () {\n\
+                       var o = { a: 2 };\n\
+                       return ho(function (n) {\n\
+                         var r = 0;\n\
+                         for (var i = 0; i < n; i++) { r += o.a; }\n\
+                         return r;\n\
+                       });\n\
+                     })();\n\
+                     res;";
+        assert_eq!(run(source).unwrap(), Value::Number(200.0));
+    }
+
+    #[test]
+    fn loop_leaf_arrow_reads_a_scalar_capture_through_a_certified_helper() {
+        // The same shape with an arrow capturing a scalar binding: the loop
+        // reads the captured value through a Ctx register operand rather than
+        // a top-level LoadContextSlot step.
+        let source = "function ho(fn) { return fn(100); }\n\
+                     var res = (function () {\n\
+                       var a = 3;\n\
+                       return ho((n) => {\n\
+                         var r = 0;\n\
+                         for (var i = 0; i < n; i++) { r += a; }\n\
+                         return r;\n\
+                       });\n\
+                     })();\n\
+                     res;";
+        assert_eq!(run(source).unwrap(), Value::Number(300.0));
+    }
+
+    #[test]
+    fn loop_leaf_writes_a_capture_reaching_the_outer_binding() {
+        // Guard the write side of the same lowering: a loop that only WRITES
+        // a captured `var` (no context read in the leaf) must still land on
+        // the enclosing binding so the IIFE observes the writes after the
+        // certified helper returns.
+        let source = "function ho(fn) { fn(100); }\n\
+                     var res = (function () {\n\
+                       var acc = 0;\n\
+                       ho(function (n) { for (var i = 0; i < n; i++) { acc = i * 2; } });\n\
+                       return acc;\n\
+                     })();\n\
+                     res;";
+        assert_eq!(run(source).unwrap(), Value::Number(198.0));
+    }
+
+    #[test]
     fn fast_path_captured_let_tdz_and_loop_heads() {
         // A captured `let` starts in the TDZ: the closure called before the
         // init throws the ReferenceError.

@@ -19772,6 +19772,58 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
     Some(ops.into_boxed_slice())
 }
 
+/// Whether a register operand is a per-iteration (loop-head) binding read.
+fn reg_operand_is_per_iter(operand: &RegOperand) -> bool {
+    matches!(operand, RegOperand::PerIter { .. })
+}
+
+/// Whether a register operand is a capture-context binding read.
+fn reg_operand_is_ctx(operand: &RegOperand) -> bool {
+    matches!(operand, RegOperand::Ctx { .. })
+}
+
+/// Whether a register op resolves a per-iteration binding against the
+/// leaf's own `lexical_env` (`LoadPerIter`/`BinPerIter`, or an op carrying
+/// a `PerIter` operand that `leaf_operand_value` reads).
+fn leaf_op_reads_per_iter(op: &LeafOp) -> bool {
+    match op {
+        LeafOp::LoadPerIter { .. } | LeafOp::BinPerIter { .. } => true,
+        LeafOp::StoreMemberName { value, .. } => reg_operand_is_per_iter(value),
+        LeafOp::StoreMemberComputed { key, value } => {
+            reg_operand_is_per_iter(key) || reg_operand_is_per_iter(value)
+        }
+        LeafOp::StoreMemberComputedLocal { key, .. }
+        | LeafOp::UpdateMemberComputedLocal { key, .. }
+        | LeafOp::GetMemberComputed { key }
+        | LeafOp::GetMemberComputedLocal { key, .. } => reg_operand_is_per_iter(key),
+        LeafOp::CompoundMemberComputedLocal { key, rhs, .. } => {
+            reg_operand_is_per_iter(key) || reg_operand_is_per_iter(rhs)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a register op resolves a capture-context binding against the
+/// leaf's own `body_context` (`LoadContext`/`BinContext`/`BinCtxReg`, or an
+/// op carrying a `Ctx` operand that `leaf_operand_value` reads).
+fn leaf_op_reads_context(op: &LeafOp) -> bool {
+    match op {
+        LeafOp::LoadContext { .. } | LeafOp::BinContext { .. } | LeafOp::BinCtxReg { .. } => true,
+        LeafOp::StoreMemberName { value, .. } => reg_operand_is_ctx(value),
+        LeafOp::StoreMemberComputed { key, value } => {
+            reg_operand_is_ctx(key) || reg_operand_is_ctx(value)
+        }
+        LeafOp::StoreMemberComputedLocal { key, .. }
+        | LeafOp::UpdateMemberComputedLocal { key, .. }
+        | LeafOp::GetMemberComputed { key }
+        | LeafOp::GetMemberComputedLocal { key, .. } => reg_operand_is_ctx(key),
+        LeafOp::CompoundMemberComputedLocal { key, rhs, .. } => {
+            reg_operand_is_ctx(key) || reg_operand_is_ctx(rhs)
+        }
+        _ => false,
+    }
+}
+
 /// Compile a function body and collect its `this.*` property writes.
 /// Returns `(compiled_body, (count, array))` where the tuple holds the
 /// count of property names and up to 4 AtomIds (empty if the body
@@ -19861,12 +19913,20 @@ pub fn compile_body(
         && !function.is_async
         && !function.is_generator
         && steps_are_leaf(&compiler.steps);
+    // A `RunRegBody` step's register ops can resolve captured/per-iteration
+    // bindings even though the register-lowered loop body left no context
+    // step in the top-level list — scan the ops too, or a leaf whose loop
+    // reads a captured binding would inline with no environment installed
+    // and resolve the CALLER's `body_context`.
     let leaf_needs_env = compiler.steps.iter().any(|step| {
         matches!(
             step,
             Step::LoadPerIteration { .. }
                 | Step::StorePerIteration { .. }
                 | Step::UpdatePerIteration { .. }
+        ) || matches!(
+            step,
+            Step::RunRegBody { ops } if ops.iter().any(leaf_op_reads_per_iter)
         )
     });
     // A leaf reads an environment iff it has context-slot steps
@@ -19879,6 +19939,9 @@ pub fn compile_body(
                 Step::LoadContextSlot { .. }
                     | Step::StoreContextSlot { .. }
                     | Step::UpdateContextSlot { .. }
+            ) || matches!(
+                step,
+                Step::RunRegBody { ops } if ops.iter().any(leaf_op_reads_context)
             )
         });
     let leaf_ops = if leaf {
