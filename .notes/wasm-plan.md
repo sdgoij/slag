@@ -367,10 +367,11 @@ review, per repo rules hygiene.
 
 ## 9. Status
 
-**2026-09-05 — Cut 4 (functions/calls/globals/memory/instantiation)
-landed**; see the Cut 4 entry below. Remaining for a fully-green Cut 4
-DoD: host/`register` import resolution (spectest + cross-module) and the
-`instance.wast` converter gap.
+**2026-09-05 — Cut 4 (functions/calls/globals/memory/instantiation) landed,
+with the spectest/`register` import-machinery follow-up** — `imports.wast`
+is 147-pass/0-fail, `linking.wast` 70-pass with one Cut-5 side-effect fail,
+`start`/`exports`/`memory_grow` are fully green; see the Cut 4 entries
+below. `instance.wast` remains a converter gap (`(module instance …)`).
 
 **2026-09-05 — Cut 2 (validation) green on its gate, plus the module-level
 validity files.**
@@ -486,42 +487,68 @@ validate their module bodies — the validator is ready for Cut 3.
 - Runner: quote-based (`.wat`) modules are reported *pending* — the engine
   has no text parser, so those cannot be judged — instead of the previous
   accidental decode-misclassification.
-- Gate (all 0 fail unless noted; pending = future cuts / import
-  machinery):
+- Gate after the import follow-up below (0 fail unless noted; pending =
+  later cuts):
 
   ```
   func           147 pass /  1 fail / 27 pending   (fail = uninitialized typed local, Cut 5)
   call            88 pass /  0 fail /  3 pending
   forward          5 pass /  0 fail /  0 pending
   fac              8 pass /  0 fail /  0 pending
-  start           15 pass /  0 fail /  5 pending
-  global          50 pass /  0 fail / 74 pending   (needs spectest imports)
+  start           19 pass /  0 fail /  1 pending
+  global          52 pass /  0 fail / 72 pending   (big module has extern/func-ref globals)
   memory          87 pass /  0 fail /  3 pending
   memory_trap    182 pass /  0 fail /  0 pending
   memory_size    42 pass /  0 fail /  0 pending
-  memory_grow    95 pass /  0 fail / 11 pending
+  memory_grow   102 pass /  0 fail /  4 pending
   memory_redund   8 pass /  0 fail /  0 pending
   load            80 pass /  0 fail / 17 pending
   store           61 pass /  0 fail /  7 pending
   address        259 pass /  0 fail /  1 pending
   align          119 pass /  0 fail / 46 pending   (46 = quote text modules)
   endianness     69 pass /  0 fail /  0 pending
-  data            36 pass /  1 fail / 31 pending   (fail = post-memory.init load, Cut 5)
+  data            66 pass /  1 fail /  1 pending   (fail = post-memory.init load, Cut 5)
   float_memory   90 pass /  0 fail /  0 pending
   left-to-right  92 pass /  0 fail /  4 pending
-  exports        92 pass /  0 fail /  5 pending
-  imports         9 pass /  0 fail /209 pending
-  linking         7 pass /  0 fail /156 pending
-  return_call    16 pass /  0 fail / 35 pending
+  exports        97 pass /  0 fail /  0 pending
+  imports       147 pass /  0 fail / 71 pending   (tables/tags/reference globals = Cut 5+)
+  linking        70 pass /  1 fail / 92 pending   (fail = Cut 5 table side effects)
+  return_call    50 pass /  0 fail /  1 pending
   ```
 
-- **Deferred with written taxonomy (Cut 4 remainder):** the host/module
-  *import* machinery — resolving imports from the `spectest` host module
-  and from `register`-named module instances, plus `assert_unlinkable`/
-  `assert_uninstantiable` and `register` themselves. That is what unlocks
-  `global.wast`, `imports.wast`, `linking.wast`, and the register-linked
-  halves of `memory_grow`/`start`/`return_call`/`exports`. `instance.wast`
-  cannot be converted: its `(module instance …)` syntax is beyond wabt
-  1.0.41 (and `wast2json-rs`). Known Cut 5 spillover, counted not
-  hidden: `func.wast`'s uninitialized-typed-local `assert_invalid` and
-  `data.wast`'s post-`memory.init` `assert_return`.
+### Import machinery follow-up (2026-09-05)
+
+The store refactor and host/`register` import resolution landed as a
+follow-up, unlocking `imports.wast`, the import halves of `linking.wast`,
+`start.wast`'s spectest-start modules, and the register-linked pieces of
+`memory_grow`/`exports`/`return_call`.
+
+- `exec.rs` now centers on a [`Store`]: instances share store pools for
+  globals and memories, so imported (even mutable) globals and memories
+  *alias* the exporter's cells — `linking.wast`'s Mg/Ng shared-mutable-global
+  and Mm/Om/Pm shared-memory cases (including growth across instances and
+  data-write persistence through failed instantiations) run exactly. Function
+  imports flatten to a defined body in some instance or a no-op host
+  function (`spectest` `print*`).
+- Import type matching: function and global imports compare exactly
+  (mutability included); memory imports use the post-memory64 subsumption
+  rule with the memory's *current* page count as its minimum (a grown
+  memory satisfies a larger import minimum, per `memory_grow.wast`).
+- Host functions fix two Cut-4-era gaps exposed by the new traffic: a host
+  `call` now advances the caller's pc (it previously re-executed the call
+  and trapped on an empty stack), and spectest's `global_f32/f64` are
+  `666.6`, not `666`.
+- Runner: `Store`-based state with a `(module, field) → ExternVal` registry
+  (spectest + `register`-named modules, keyed by both the registered name
+  and the `$label` actions use); `assert_unlinkable`/`assert_uninstantiable`
+  and `(assert_trap (module …))` instantiation-trap commands judge against
+  `InstantiateError`; modules whose instance could not be created are
+  tracked as *unavailable* so a later `register`/import of them stays
+  pending instead of linking a stale module.
+- Written taxonomy (counted, not hidden): `linking.wast`'s single remaining
+  fail is `get memory[0] = 104` after a module that imports a *table* — its
+  data-segment side effect on the shared memory is skipped because table/
+  element instantiation is Cut 5. `func.wast` (uninitialized typed local)
+  and `data.wast` (post-`memory.init`) stay Cut 5. `instance.wast` cannot be
+  converted: its `(module instance …)` syntax is beyond wabt 1.0.41 (and
+  `wast2json-rs`).

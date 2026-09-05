@@ -1,18 +1,23 @@
-//! The wasm execution machine (spec ch. 4) — Cut 3 scope.
+//! The wasm execution machine (spec ch. 4) over a [`Store`] of module
+//! instances (spec ch. 4.2).
+//!
+//! Instances share the store's mutable state: globals and linear memories are
+//! cells in store-owned pools, so a module that imports another instance's
+//! memory or mutable global aliases the same cell. Function imports bind to a
+//! flattened target (a defined body in some instance, or a host function).
 //!
 //! One shared operand stack plus an explicit stack of function frames (each
-//! with its own pc, locals, and control labels), so call depth is bounded by
-//! a configured limit instead of the host stack. Numeric semantics live in
-//! [`crate::values`].
+//! with its own instance, pc, locals, and control labels) keeps call depth
+//! bounded by a configured limit instead of the host stack. Numeric semantics
+//! live in [`crate::values`].
 //!
-//! Not executed yet (reported as [`ExecFail::Unsupported`]): host imports,
-//! memory/table instructions, reference-typed values, bulk-memory
-//! instructions, and exceptions — those land in later cuts. Internal `call`s
-//! and numeric `global.get/set` work.
+//! Not executed yet ([`ExecFail::Unsupported`]): table instructions and
+//! reference-typed values (Cut 5), bulk memory (Cut 5), exceptions (Cut 6),
+//! SIMD (Cut 7), and memory64 (Cut 8).
 
 use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
 use crate::module::{DataMode, ExportKind, ImportDesc, Module};
-use crate::types::{BlockType, ValType};
+use crate::types::{BlockType, FuncType, GlobalType, Limits, MemType, ValType};
 use crate::values::{Trap, Value, exec_num};
 
 /// How execution stopped.
@@ -26,6 +31,42 @@ pub enum ExecFail {
 impl From<Trap> for ExecFail {
     fn from(trap: Trap) -> Self {
         ExecFail::Trap(trap)
+    }
+}
+
+/// How instantiation stopped, split by the .wast command that asserts it:
+/// [`InstantiateError::Unlinkable`] (import resolution/type failure),
+/// [`InstantiateError::Trap`] (a trap during instantiation), or an
+/// unsupported feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstantiateError {
+    Unlinkable(&'static str),
+    Trap(Trap),
+    Unsupported(&'static str),
+}
+
+impl From<Trap> for InstantiateError {
+    fn from(trap: Trap) -> Self {
+        InstantiateError::Trap(trap)
+    }
+}
+
+impl From<ExecFail> for InstantiateError {
+    fn from(fail: ExecFail) -> Self {
+        match fail {
+            ExecFail::Trap(trap) => InstantiateError::Trap(trap),
+            ExecFail::Unsupported(reason) => InstantiateError::Unsupported(reason),
+        }
+    }
+}
+
+impl std::fmt::Display for InstantiateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstantiateError::Unlinkable(reason) => write!(f, "link error: {reason}"),
+            InstantiateError::Trap(trap) => write!(f, "trap: {trap:?}"),
+            InstantiateError::Unsupported(reason) => write!(f, "unsupported: {reason}"),
+        }
     }
 }
 
@@ -44,14 +85,22 @@ pub struct Memory {
 }
 
 impl Memory {
-    fn pages(&self) -> u64 {
+    /// A zero-filled memory of `min_pages` pages, capped at `max_pages`.
+    pub fn new(min_pages: u64, max_pages: Option<u64>) -> Self {
+        Memory {
+            bytes: vec![0; (min_pages * PAGE_SIZE) as usize],
+            max_pages,
+        }
+    }
+
+    pub fn pages(&self) -> u64 {
         self.bytes.len() as u64 / PAGE_SIZE
     }
 
     /// Grow by `delta` pages; returns the old size in pages, or `-1` when the
     /// growth would exceed the limits (a wasm32 memory is capped at 2^16
     /// pages even without a declared maximum).
-    fn grow(&mut self, delta: u64) -> i32 {
+    pub fn grow(&mut self, delta: u64) -> i32 {
         let old = self.pages();
         let Some(new) = old.checked_add(delta) else {
             return -1;
@@ -65,134 +114,440 @@ impl Memory {
     }
 }
 
-/// A module instance. State per instance: globals and linear memories;
-/// tables arrive in Cut 5.
+/// A value handed to [`Store::instantiate`] for one import. Function, global,
+/// and memory values reference cells/instances that stay alive in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternVal {
+    /// A host function (e.g. the spectest `print*` family).
+    HostFunc(usize),
+    /// The function at `index` in the full function space of `instance`.
+    Func { instance: usize, index: usize },
+    /// A shared global cell.
+    Global(usize),
+    /// A shared memory cell.
+    Memory(usize),
+    /// A shared table cell (Cut 5 has no table runtime yet).
+    Table(usize),
+    /// The value exists but its kind is not executable this cut.
+    Unsupported(&'static str),
+}
+
+/// Where a function index ultimately executes: a host routine or a defined
+/// body of some instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FuncTarget {
+    Host(usize),
+    Owned { instance: usize, defined: usize },
+}
+
+/// A host function: the engine has no host bodies, only signatures (spectest
+/// `print*` return nothing).
+struct HostFunc {
+    ty: FuncType,
+}
+
+/// A module instance: the module (code, types, exports) plus its index
+/// spaces. Globals and memories are cell ids into the owning store, so
+/// imports alias the exporter's cells; functions are flattened [`FuncTarget`]s.
 pub struct Instance {
     module: Module,
-    globals: Vec<Value>,
-    memories: Vec<Memory>,
+    funcs: Vec<FuncTarget>,
+    globals: Vec<usize>,
+    memories: Vec<usize>,
     depth_limit: usize,
 }
 
-/// Instantiate a module. Host imports are unsupported in this cut.
-pub fn instantiate(module: &Module) -> Result<Instance, ExecFail> {
-    if !module.imports.is_empty() {
-        return Err(ExecFail::Trap(Trap::UnsupportedImport));
+/// The store: every live instance plus the shared pools they reference.
+pub struct Store {
+    pub instances: Vec<Instance>,
+    host_funcs: Vec<HostFunc>,
+    globals: Vec<Value>,
+    global_types: Vec<GlobalType>,
+    memories: Vec<Memory>,
+    memory_types: Vec<MemType>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::new()
     }
-    let mut memories = Vec::with_capacity(module.memories.len());
-    for mem in &module.memories {
-        if mem.memory64 {
+}
+
+impl Store {
+    pub fn new() -> Self {
+        Store {
+            instances: Vec::new(),
+            host_funcs: Vec::new(),
+            globals: Vec::new(),
+            global_types: Vec::new(),
+            memories: Vec::new(),
+            memory_types: Vec::new(),
+        }
+    }
+
+    /// Register a host function (spectest `print*` family); returns its id.
+    pub fn host_func(&mut self, ty: FuncType) -> usize {
+        self.host_funcs.push(HostFunc { ty });
+        self.host_funcs.len() - 1
+    }
+
+    /// Register a standalone global cell (spectest values); returns its id.
+    pub fn global(&mut self, ty: GlobalType, value: Value) -> usize {
+        self.global_types.push(ty);
+        self.globals.push(value);
+        self.globals.len() - 1
+    }
+
+    /// Register a standalone memory cell (spectest memory); returns its id.
+    pub fn memory(&mut self, ty: MemType) -> Result<usize, ExecFail> {
+        if ty.memory64 {
             return Err(ExecFail::Unsupported("memory64 (Cut 8)"));
         }
-        let min_bytes = (mem.limits.min * PAGE_SIZE) as usize;
-        memories.push(Memory {
-            bytes: vec![0; min_bytes],
-            max_pages: mem.limits.max,
-        });
+        self.memory_types.push(ty);
+        self.memories
+            .push(Memory::new(ty.limits.min, ty.limits.max));
+        Ok(self.memories.len() - 1)
     }
-    let mut instance = Instance {
-        module: module.clone(),
-        globals: Vec::new(),
-        memories,
-        depth_limit: DEFAULT_DEPTH_LIMIT,
-    };
-    for global in &module.globals {
-        let value = eval_const(&global.init, &instance.globals)?;
-        instance.globals.push(value);
-    }
-    // Apply active data segments in order.
-    for segment in &module.data {
-        if let DataMode::Active { memory, offset } = &segment.mode {
-            let Some(mem) = instance.memories.get_mut(*memory as usize) else {
-                return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
-            };
-            let offset_value = eval_const(offset, &instance.globals)?;
-            let Value::I32(offset) = offset_value else {
-                return Err(ExecFail::Unsupported("non-i32 data offset"));
-            };
-            let start = offset as u32 as usize;
-            let end = start.checked_add(segment.bytes.len());
-            let Some(end) = end else {
-                return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
-            };
-            if end > mem.bytes.len() {
-                return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+
+    /// Instantiate `module`, resolving each import through `resolve` (module
+    /// name, field name) to an [`ExternVal`] or `None` for an unknown import.
+    /// Returns the new instance's id.
+    pub fn instantiate(
+        &mut self,
+        module: &Module,
+        resolve: &mut dyn FnMut(&str, &str) -> Option<ExternVal>,
+    ) -> Result<usize, InstantiateError> {
+        let self_id = self.instances.len();
+        let mut funcs = Vec::with_capacity(module.imports.len() + module.functions.len());
+        let mut globals = Vec::with_capacity(module.imports.len());
+        let mut memories = Vec::with_capacity(module.imports.len());
+
+        for import in &module.imports {
+            match &import.desc {
+                ImportDesc::Func(type_index) => {
+                    let expected = module
+                        .types
+                        .get(*type_index as usize)
+                        .ok_or(InstantiateError::Unlinkable("unknown import"))?;
+                    let value = resolve(&import.module, &import.name)
+                        .ok_or(InstantiateError::Unlinkable("unknown import"))?;
+                    match value {
+                        ExternVal::HostFunc(id) => {
+                            if self.host_funcs[id].ty != *expected {
+                                return Err(InstantiateError::Unlinkable(
+                                    "incompatible import type",
+                                ));
+                            }
+                            funcs.push(FuncTarget::Host(id));
+                        }
+                        ExternVal::Func { instance, index } => {
+                            let target = *self
+                                .instances
+                                .get(instance)
+                                .and_then(|i| i.funcs.get(index))
+                                .ok_or(InstantiateError::Unlinkable("unknown import"))?;
+                            if self.target_type(target) != *expected {
+                                return Err(InstantiateError::Unlinkable(
+                                    "incompatible import type",
+                                ));
+                            }
+                            funcs.push(target);
+                        }
+                        ExternVal::Unsupported(reason) => {
+                            return Err(InstantiateError::Unsupported(reason));
+                        }
+                        _ => {
+                            return Err(InstantiateError::Unlinkable("incompatible import type"));
+                        }
+                    }
+                }
+                ImportDesc::Global(gty) => {
+                    let value = resolve(&import.module, &import.name)
+                        .ok_or(InstantiateError::Unlinkable("unknown import"))?;
+                    match value {
+                        ExternVal::Global(cell) => {
+                            let actual = *self
+                                .global_types
+                                .get(cell)
+                                .ok_or(InstantiateError::Unlinkable("unknown import"))?;
+                            if actual != *gty {
+                                return Err(InstantiateError::Unlinkable(
+                                    "incompatible import type",
+                                ));
+                            }
+                            globals.push(cell);
+                        }
+                        ExternVal::Unsupported(reason) => {
+                            return Err(InstantiateError::Unsupported(reason));
+                        }
+                        _ => {
+                            return Err(InstantiateError::Unlinkable("incompatible import type"));
+                        }
+                    }
+                }
+                ImportDesc::Memory(mt) => {
+                    let value = resolve(&import.module, &import.name)
+                        .ok_or(InstantiateError::Unlinkable("unknown import"))?;
+                    match value {
+                        ExternVal::Memory(cell) => {
+                            let actual = self.memory_type_of(cell);
+                            if !memory_matches(actual, *mt) {
+                                return Err(InstantiateError::Unlinkable(
+                                    "incompatible import type",
+                                ));
+                            }
+                            memories.push(cell);
+                        }
+                        ExternVal::Unsupported(reason) => {
+                            return Err(InstantiateError::Unsupported(reason));
+                        }
+                        _ => {
+                            return Err(InstantiateError::Unlinkable("incompatible import type"));
+                        }
+                    }
+                }
+                ImportDesc::Table(_) => {
+                    // Table imports need a table runtime (Cut 5); only an
+                    // absent export is a real (linkable) unknown.
+                    match resolve(&import.module, &import.name) {
+                        None => return Err(InstantiateError::Unlinkable("unknown import")),
+                        Some(ExternVal::Unsupported(reason)) => {
+                            return Err(InstantiateError::Unsupported(reason));
+                        }
+                        Some(ExternVal::Table(_)) | Some(_) => {
+                            return Err(InstantiateError::Unsupported("tables (Cut 5)"));
+                        }
+                    }
+                }
+                ImportDesc::Tag(_) => match resolve(&import.module, &import.name) {
+                    None => return Err(InstantiateError::Unlinkable("unknown import")),
+                    Some(ExternVal::Unsupported(reason)) => {
+                        return Err(InstantiateError::Unsupported(reason));
+                    }
+                    Some(_) => return Err(InstantiateError::Unsupported("tags (Cut 6)")),
+                },
             }
-            mem.bytes[start..end].copy_from_slice(&segment.bytes);
         }
-    }
-    // Run the start function, if any.
-    if let Some(start) = module.start {
-        instance.run_defined(start as usize, &[])?;
-    }
-    Ok(instance)
-}
 
-fn imported_func_count(module: &Module) -> usize {
-    module
-        .imports
-        .iter()
-        .filter(|i| matches!(i.desc, ImportDesc::Func(_)))
-        .count()
-}
+        for (defined, _) in module.functions.iter().enumerate() {
+            funcs.push(FuncTarget::Owned {
+                instance: self_id,
+                defined,
+            });
+        }
 
-impl Instance {
-    pub fn with_depth_limit(mut self, limit: usize) -> Self {
-        self.depth_limit = limit;
-        self
+        for memory in &module.memories {
+            if memory.memory64 {
+                return Err(InstantiateError::Unsupported("memory64 (Cut 8)"));
+            }
+            self.memory_types.push(*memory);
+            self.memories
+                .push(Memory::new(memory.limits.min, memory.limits.max));
+            memories.push(self.memories.len() - 1);
+        }
+
+        for global in &module.globals {
+            let values = self.global_values(&globals);
+            let value = eval_const(&global.init, &values).map_err(InstantiateError::from)?;
+            self.global_types.push(global.ty);
+            self.globals.push(value);
+            globals.push(self.globals.len() - 1);
+        }
+
+        self.instances.push(Instance {
+            module: module.clone(),
+            funcs,
+            globals,
+            memories,
+            depth_limit: DEFAULT_DEPTH_LIMIT,
+        });
+
+        // Apply active data segments in order. Writes to imported memories
+        // land in the shared cell and persist even if a later segment traps.
+        for segment in &module.data {
+            if let DataMode::Active { memory, offset } = &segment.mode {
+                let memory_index = *memory as usize;
+                let cell = self.instances[self_id]
+                    .memories
+                    .get(memory_index)
+                    .copied()
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))
+                    .map_err(InstantiateError::from)?;
+                let values = self.global_values(&self.instances[self_id].globals);
+                let offset_value = eval_const(offset, &values).map_err(InstantiateError::from)?;
+                let Value::I32(offset) = offset_value else {
+                    return Err(InstantiateError::Unsupported("non-i32 data offset"));
+                };
+                let start = offset as u32 as usize;
+                let end = start
+                    .checked_add(segment.bytes.len())
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))
+                    .map_err(InstantiateError::from)?;
+                let memory = &mut self.memories[cell];
+                if end > memory.bytes.len() {
+                    return Err(InstantiateError::Trap(Trap::OutOfBoundsMemoryAccess));
+                }
+                memory.bytes[start..end].copy_from_slice(&segment.bytes);
+            }
+        }
+
+        // Run the start function, if any.
+        if let Some(start) = module.start {
+            let target = *self.instances[self_id]
+                .funcs
+                .get(start as usize)
+                .ok_or(ExecFail::Trap(Trap::UnknownFunction))
+                .map_err(InstantiateError::from)?;
+            self.run_target(target, &[])
+                .map_err(InstantiateError::from)?;
+        }
+        Ok(self_id)
     }
 
-    /// The full index-space index of exported function `name`, if present.
-    pub fn exported_func(&self, name: &str) -> Option<usize> {
-        self.module.exports.iter().find_map(|export| {
-            (export.name == name && export.kind == ExportKind::Func)
-                .then_some(export.index as usize)
+    /// The export `name` of `instance` as an importable value.
+    pub fn export(&self, instance: usize, name: &str) -> Option<ExternVal> {
+        let inst = self.instances.get(instance)?;
+        let export = inst.module.exports.iter().find(|e| e.name == name)?;
+        Some(match export.kind {
+            ExportKind::Func => ExternVal::Func {
+                instance,
+                index: export.index as usize,
+            },
+            ExportKind::Global => ExternVal::Global(inst.globals[export.index as usize]),
+            ExportKind::Memory => ExternVal::Memory(inst.memories[export.index as usize]),
+            ExportKind::Table => ExternVal::Table(usize::MAX),
+            ExportKind::Tag => ExternVal::Unsupported("tags (Cut 6)"),
         })
     }
 
-    /// Invoke function `index` (full index space, imports first) with `args`.
-    pub fn invoke(&mut self, index: usize, args: &[Value]) -> Result<Vec<Value>, ExecFail> {
-        let imported = imported_func_count(&self.module);
-        if index < imported {
-            return Err(ExecFail::Trap(Trap::UnsupportedImport));
+    /// All exports of `instance`, for `register`-style name resolution.
+    pub fn exports(&self, instance: usize) -> Vec<(String, ExternVal)> {
+        self.instances
+            .get(instance)
+            .map(|inst| {
+                inst.module
+                    .exports
+                    .iter()
+                    .map(|export| {
+                        let value = match export.kind {
+                            ExportKind::Func => ExternVal::Func {
+                                instance,
+                                index: export.index as usize,
+                            },
+                            ExportKind::Global => {
+                                ExternVal::Global(inst.globals[export.index as usize])
+                            }
+                            ExportKind::Memory => {
+                                ExternVal::Memory(inst.memories[export.index as usize])
+                            }
+                            ExportKind::Table => ExternVal::Table(usize::MAX),
+                            ExportKind::Tag => ExternVal::Unsupported("tags (Cut 6)"),
+                        };
+                        (export.name.clone(), value)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The full-space function index of exported function `name`, if any.
+    pub fn exported_func(&self, instance: usize, name: &str) -> Option<usize> {
+        self.instances
+            .get(instance)?
+            .module
+            .exports
+            .iter()
+            .find_map(|export| {
+                (export.name == name && export.kind == ExportKind::Func)
+                    .then_some(export.index as usize)
+            })
+    }
+
+    /// The current value of exported global `name`, if any.
+    pub fn export_global_value(&self, instance: usize, name: &str) -> Option<Value> {
+        let inst = self.instances.get(instance)?;
+        let export = inst
+            .module
+            .exports
+            .iter()
+            .find(|e| e.name == name && e.kind == ExportKind::Global)?;
+        let cell = inst.globals[export.index as usize];
+        self.globals.get(cell).copied()
+    }
+
+    /// Invoke function `index` (full index space) of `instance` with `args`.
+    pub fn invoke(
+        &mut self,
+        instance: usize,
+        index: usize,
+        args: &[Value],
+    ) -> Result<Vec<Value>, ExecFail> {
+        let target = *self
+            .instances
+            .get(instance)
+            .and_then(|i| i.funcs.get(index))
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        self.run_target(target, args)
+    }
+
+    fn run_target(&mut self, target: FuncTarget, args: &[Value]) -> Result<Vec<Value>, ExecFail> {
+        match target {
+            FuncTarget::Owned { instance, defined } => self.run_owned(instance, defined, args),
+            FuncTarget::Host(id) => {
+                let ty = self.host_funcs[id].ty.clone();
+                if ty.params.len() != args.len() {
+                    return Err(ExecFail::Unsupported("host function arity"));
+                }
+                if !ty.results.is_empty() {
+                    return Err(ExecFail::Unsupported("host function results"));
+                }
+                Ok(Vec::new())
+            }
         }
-        self.run_defined(index - imported, args)
     }
 
     /// Run a module-defined function by its index into `Module::bodies`.
-    fn run_defined(&mut self, defined: usize, args: &[Value]) -> Result<Vec<Value>, ExecFail> {
-        let body = self
-            .module
-            .bodies
-            .get(defined)
-            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-        let type_index = self
-            .module
-            .functions
-            .get(defined)
-            .copied()
-            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-        let signature = self
-            .module
-            .types
-            .get(type_index as usize)
-            .cloned()
-            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+    fn run_owned(
+        &mut self,
+        instance: usize,
+        defined: usize,
+        args: &[Value],
+    ) -> Result<Vec<Value>, ExecFail> {
+        let (signature, declared) = {
+            let module = &self.instances[instance].module;
+            let body = module
+                .bodies
+                .get(defined)
+                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+            let type_index = module
+                .functions
+                .get(defined)
+                .copied()
+                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+            let signature = module
+                .types
+                .get(type_index as usize)
+                .cloned()
+                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+            (signature, body.locals.clone())
+        };
         let mut locals = args.to_vec();
-        for ty in &body.locals {
+        for ty in &declared {
             locals.push(default_value(*ty)?);
         }
+        let results = signature.results.len();
         let mut engine = Engine {
-            inst: self,
+            store: self,
             stack: Vec::new(),
             frames: vec![Frame {
+                instance,
                 pc: 0,
                 locals,
                 base: 0,
-                results: signature.results.len(),
+                results,
                 body_index: defined,
                 labels: vec![Label {
-                    arity: signature.results.len(),
+                    arity: results,
                     height: 0,
                     is_loop: false,
                     open: 0,
@@ -201,10 +556,49 @@ impl Instance {
         };
         engine.run()
     }
+
+    fn target_type(&self, target: FuncTarget) -> FuncType {
+        match target {
+            FuncTarget::Host(id) => self.host_funcs[id].ty.clone(),
+            FuncTarget::Owned { instance, defined } => {
+                let module = &self.instances[instance].module;
+                module
+                    .functions
+                    .get(defined)
+                    .and_then(|&ti| module.types.get(ti as usize))
+                    .cloned()
+                    .unwrap_or(FuncType {
+                        params: Vec::new(),
+                        results: Vec::new(),
+                    })
+            }
+        }
+    }
+
+    fn global_values(&self, cells: &[usize]) -> Vec<Value> {
+        cells.iter().map(|&cell| self.globals[cell]).collect()
+    }
+
+    /// A memory cell's type for import matching: the declared maximum but the
+    /// *current* size as the minimum (a grown memory can satisfy a larger
+    /// import minimum).
+    fn memory_type_of(&self, cell: usize) -> MemType {
+        let declared = self.memory_types[cell];
+        MemType {
+            limits: Limits {
+                min: self.memories[cell].pages(),
+                max: declared.limits.max,
+                shared: declared.limits.shared,
+            },
+            memory64: declared.memory64,
+        }
+    }
 }
 
 /// A function frame on the machine's call stack.
 struct Frame {
+    /// The instance whose module (code) and cells this frame executes in.
+    instance: usize,
     pc: usize,
     locals: Vec<Value>,
     /// Operand-stack height when this frame's body started (arguments
@@ -212,7 +606,7 @@ struct Frame {
     base: usize,
     /// Number of result values this function produces.
     results: usize,
-    /// Defined-function index into `Module::bodies`.
+    /// Defined-function index into `Module::bodies` of the frame's instance.
     body_index: usize,
     /// Control labels of the current function (the function label is the
     /// bottom-most entry).
@@ -233,7 +627,7 @@ struct Label {
 }
 
 struct Engine<'a> {
-    inst: &'a mut Instance,
+    store: &'a mut Store,
     stack: Vec<Value>,
     frames: Vec<Frame>,
 }
@@ -280,7 +674,10 @@ fn precompute(body: &[Instr]) -> BodyMap {
 
 impl<'a> Engine<'a> {
     fn body(&self, frame_index: usize) -> &[Instr] {
-        &self.inst.module.bodies[self.frames[frame_index].body_index].body
+        &self.store.instances[self.frames[frame_index].instance]
+            .module
+            .bodies[self.frames[frame_index].body_index]
+            .body
     }
 
     fn pop(&mut self) -> Result<Value, ExecFail> {
@@ -325,7 +722,6 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Settled)
             }
             Instr::Else => {
-                // Only reached by falling out of `then`: exit the `if`.
                 self.exit_if()?;
                 Ok(Ctl::Settled)
             }
@@ -366,10 +762,7 @@ impl<'a> Engine<'a> {
                 self.do_call(index as usize)?;
                 Ok(Ctl::Settled)
             }
-            Instr::ReturnCall(index) => {
-                self.do_tail_call(index as usize)?;
-                Ok(Ctl::Settled)
-            }
+            Instr::ReturnCall(index) => self.do_tail_call(index as usize),
             Instr::ReturnCallIndirect { .. }
             | Instr::ReturnCallRef(_)
             | Instr::CallIndirect { .. }
@@ -402,13 +795,17 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Next)
             }
             Instr::GlobalGet(index) => {
-                let value = self.inst.globals[index as usize];
+                let instance = self.frames[frame_index].instance;
+                let cell = self.store.instances[instance].globals[index as usize];
+                let value = self.store.globals[cell];
                 self.stack.push(value);
                 Ok(Ctl::Next)
             }
             Instr::GlobalSet(index) => {
                 let value = self.pop()?;
-                self.inst.globals[index as usize] = value;
+                let instance = self.frames[frame_index].instance;
+                let cell = self.store.instances[instance].globals[index as usize];
+                self.store.globals[cell] = value;
                 Ok(Ctl::Next)
             }
             Instr::I32Const(v) => {
@@ -438,54 +835,63 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Next)
             }
             Instr::Load { op, offset, .. } => {
+                let instance = self.frames[frame_index].instance;
+                let Some(&cell) = self.store.instances[instance].memories.first() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
                 let addr = self.pop_i32()? as u32 as u64;
                 let size = load_size(op);
                 let ea = addr
                     .checked_add(offset)
                     .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
-                let Some(mem) = self.inst.memories.first() else {
-                    return Err(ExecFail::Unsupported("no memory"));
-                };
-                let len = mem.bytes.len() as u64;
+                let len = self.store.memories[cell].bytes.len() as u64;
                 if ea.checked_add(size as u64).is_none_or(|end| end > len) {
                     return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
                 }
                 let start = ea as usize;
-                let value = read_mem(op, &mem.bytes[start..start + size]);
+                let value = read_mem(op, &self.store.memories[cell].bytes[start..start + size]);
                 self.stack.push(value);
                 Ok(Ctl::Next)
             }
             Instr::Store { op, offset, .. } => {
                 let value = self.pop()?;
                 let addr = self.pop_i32()? as u32 as u64;
+                let instance = self.frames[frame_index].instance;
+                let Some(&cell) = self.store.instances[instance].memories.first() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
                 let size = store_size(op);
                 let ea = addr
                     .checked_add(offset)
                     .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
-                let Some(mem) = self.inst.memories.first_mut() else {
-                    return Err(ExecFail::Unsupported("no memory"));
-                };
-                let len = mem.bytes.len() as u64;
+                let len = self.store.memories[cell].bytes.len() as u64;
                 if ea.checked_add(size as u64).is_none_or(|end| end > len) {
                     return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
                 }
                 let start = ea as usize;
-                write_mem(op, value, &mut mem.bytes[start..start + size]);
+                write_mem(
+                    op,
+                    value,
+                    &mut self.store.memories[cell].bytes[start..start + size],
+                );
                 Ok(Ctl::Next)
             }
             Instr::MemorySize => {
-                let Some(mem) = self.inst.memories.first() else {
+                let instance = self.frames[frame_index].instance;
+                let Some(&cell) = self.store.instances[instance].memories.first() else {
                     return Err(ExecFail::Unsupported("no memory"));
                 };
-                self.stack.push(Value::I32(mem.pages() as i32));
+                let pages = self.store.memories[cell].pages();
+                self.stack.push(Value::I32(pages as i32));
                 Ok(Ctl::Next)
             }
             Instr::MemoryGrow => {
                 let delta = self.pop_i32()? as u32 as u64;
-                let Some(mem) = self.inst.memories.first_mut() else {
+                let instance = self.frames[frame_index].instance;
+                let Some(&cell) = self.store.instances[instance].memories.first() else {
                     return Err(ExecFail::Unsupported("no memory"));
                 };
-                let old = mem.grow(delta);
+                let old = self.store.memories[cell].grow(delta);
                 self.stack.push(Value::I32(old));
                 Ok(Ctl::Next)
             }
@@ -634,135 +1040,188 @@ impl<'a> Engine<'a> {
             BlockType::Empty => Ok((0, 0)),
             BlockType::Val(_) => Ok((0, 1)),
             BlockType::Type(index) => {
+                let frame_index = self.frames.len() - 1;
+                let instance = self.frames[frame_index].instance;
                 let ty = self
-                    .inst
-                    .module
-                    .types
-                    .get(index as usize)
+                    .store
+                    .instances
+                    .get(instance)
+                    .and_then(|i| i.module.types.get(index as usize))
                     .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
                 Ok((ty.params.len(), ty.results.len()))
             }
         }
     }
 
-    /// Make a (direct, non-tail) call from the top frame.
-    fn do_call(&mut self, index: usize) -> Result<(), ExecFail> {
-        if self.frames.len() + 1 > self.inst.depth_limit {
-            return Err(ExecFail::Trap(Trap::CallStackExhausted));
+    /// Run a host function called from the top frame.
+    fn call_host(&mut self, id: usize) -> Result<(), ExecFail> {
+        let ty = self.store.host_funcs[id].ty.clone();
+        if !ty.results.is_empty() {
+            return Err(ExecFail::Unsupported("host function results"));
         }
-        let caller = self.frames.len() - 1;
-        let imported = imported_func_count(&self.inst.module);
-        if index < imported {
-            return Err(ExecFail::Trap(Trap::UnsupportedImport));
+        for _ in 0..ty.params.len() {
+            self.pop()?;
         }
-        let defined = index - imported;
-        let (param_count, result_count, declared) = {
-            let module = &self.inst.module;
-            let body = module
-                .bodies
-                .get(defined)
-                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-            let type_index = *module
-                .functions
-                .get(defined)
-                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-            let signature = module
-                .types
-                .get(type_index as usize)
-                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-            (
-                signature.params.len(),
-                signature.results.len(),
-                body.locals.clone(),
-            )
-        };
-        // Pop arguments (last parameter sits on top), in parameter order.
-        let mut args = Vec::with_capacity(param_count);
-        for _ in 0..param_count {
-            args.push(self.pop()?);
-        }
-        args.reverse();
-        let mut locals = args;
-        for ty in &declared {
-            locals.push(default_value(*ty)?);
-        }
-        let base = self.stack.len();
-        self.frames[caller].pc += 1; // resume after the call
-        self.frames.push(Frame {
-            pc: 0,
-            locals,
-            base,
-            results: result_count,
-            body_index: defined,
-            labels: vec![Label {
-                arity: result_count,
-                height: base,
-                is_loop: false,
-                open: 0,
-            }],
-        });
         Ok(())
     }
 
-    /// Make a tail call (`return_call`) from the top frame: pop the callee's
-    /// arguments, then replace the top frame in place with the callee's frame
-    /// at the same operand-stack base, so the callee's results flow to the
-    /// caller of the (now replaced) frame. Everything else above the base —
-    /// values owned by the tail frame's not-yet-exited labels — is discarded
-    /// when the callee finishes, matching the spec's unwinding of `return_call`.
-    fn do_tail_call(&mut self, index: usize) -> Result<(), ExecFail> {
-        let imported = imported_func_count(&self.inst.module);
-        if index < imported {
-            return Err(ExecFail::Trap(Trap::UnsupportedImport));
+    /// Make a (direct, non-tail) call from the top frame.
+    fn do_call(&mut self, index: usize) -> Result<(), ExecFail> {
+        let caller = self.frames.len() - 1;
+        let instance = self.frames[caller].instance;
+        if self.frames.len() + 1 > self.store.instances[instance].depth_limit {
+            return Err(ExecFail::Trap(Trap::CallStackExhausted));
         }
-        let defined = index - imported;
-        let (param_count, result_count, declared) = {
-            let module = &self.inst.module;
-            let body = module
-                .bodies
-                .get(defined)
-                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-            let type_index = *module
-                .functions
-                .get(defined)
-                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-            let signature = module
-                .types
-                .get(type_index as usize)
-                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-            (
-                signature.params.len(),
-                signature.results.len(),
-                body.locals.clone(),
-            )
-        };
-        // Pop arguments (last parameter sits on top), in parameter order.
-        let mut args = Vec::with_capacity(param_count);
-        for _ in 0..param_count {
-            args.push(self.pop()?);
+        let target = *self
+            .store
+            .instances
+            .get(instance)
+            .and_then(|i| i.funcs.get(index))
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        match target {
+            FuncTarget::Host(id) => {
+                self.call_host(id)?;
+                // A host call returns in place: advance past the call.
+                let caller = self.frames.len() - 1;
+                self.frames[caller].pc += 1;
+                Ok(())
+            }
+            FuncTarget::Owned {
+                instance: own,
+                defined,
+            } => {
+                let (param_count, result_count, declared) = {
+                    let module = &self.store.instances[own].module;
+                    let body = module
+                        .bodies
+                        .get(defined)
+                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                    let type_index = module
+                        .functions
+                        .get(defined)
+                        .copied()
+                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                    let signature = module
+                        .types
+                        .get(type_index as usize)
+                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                    (
+                        signature.params.len(),
+                        signature.results.len(),
+                        body.locals.clone(),
+                    )
+                };
+                // Pop arguments (last parameter sits on top), in parameter order.
+                let mut args = Vec::with_capacity(param_count);
+                for _ in 0..param_count {
+                    args.push(self.pop()?);
+                }
+                args.reverse();
+                let mut locals = args;
+                for ty in &declared {
+                    locals.push(default_value(*ty)?);
+                }
+                let base = self.stack.len();
+                self.frames[caller].pc += 1; // resume after the call
+                self.frames.push(Frame {
+                    instance: own,
+                    pc: 0,
+                    locals,
+                    base,
+                    results: result_count,
+                    body_index: defined,
+                    labels: vec![Label {
+                        arity: result_count,
+                        height: base,
+                        is_loop: false,
+                        open: 0,
+                    }],
+                });
+                Ok(())
+            }
         }
-        args.reverse();
-        let mut locals = args;
-        for ty in &declared {
-            locals.push(default_value(*ty)?);
-        }
+    }
+
+    /// Make a tail call (`return_call`) from the top frame: replace the top
+    /// frame in place with the callee's frame at the same operand-stack base,
+    /// so the callee's results flow to the caller of the (now replaced)
+    /// frame. Everything else above the base — values owned by the tail
+    /// frame's not-yet-exited labels — is discarded when the callee finishes,
+    /// matching the spec's unwinding of `return_call`.
+    fn do_tail_call(&mut self, index: usize) -> Result<Ctl, ExecFail> {
         let top = self.frames.len() - 1;
-        let base = self.frames[top].base;
-        self.frames.pop();
-        self.frames.push(Frame {
-            pc: 0,
-            locals,
-            base,
-            results: result_count,
-            body_index: defined,
-            labels: vec![Label {
-                arity: result_count,
-                height: base,
-                is_loop: false,
-                open: 0,
-            }],
-        });
-        Ok(())
+        let instance = self.frames[top].instance;
+        let target = *self
+            .store
+            .instances
+            .get(instance)
+            .and_then(|i| i.funcs.get(index))
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        match target {
+            FuncTarget::Host(id) => {
+                let ty = self.store.host_funcs[id].ty.clone();
+                if !ty.results.is_empty() {
+                    return Err(ExecFail::Unsupported("host function results"));
+                }
+                for _ in 0..ty.params.len() {
+                    self.pop()?;
+                }
+                self.finish()
+            }
+            FuncTarget::Owned {
+                instance: own,
+                defined,
+            } => {
+                let (param_count, result_count, declared) = {
+                    let module = &self.store.instances[own].module;
+                    let body = module
+                        .bodies
+                        .get(defined)
+                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                    let type_index = module
+                        .functions
+                        .get(defined)
+                        .copied()
+                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                    let signature = module
+                        .types
+                        .get(type_index as usize)
+                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                    (
+                        signature.params.len(),
+                        signature.results.len(),
+                        body.locals.clone(),
+                    )
+                };
+                // Pop arguments (last parameter sits on top), in parameter order.
+                let mut args = Vec::with_capacity(param_count);
+                for _ in 0..param_count {
+                    args.push(self.pop()?);
+                }
+                args.reverse();
+                let mut locals = args;
+                for ty in &declared {
+                    locals.push(default_value(*ty)?);
+                }
+                let base = self.frames[top].base;
+                self.frames.pop();
+                self.frames.push(Frame {
+                    instance: own,
+                    pc: 0,
+                    locals,
+                    base,
+                    results: result_count,
+                    body_index: defined,
+                    labels: vec![Label {
+                        arity: result_count,
+                        height: base,
+                        is_loop: false,
+                        open: 0,
+                    }],
+                });
+                Ok(Ctl::Settled)
+            }
+        }
     }
 
     /// Pop the top frame, transferring its results to its caller. Returns the
@@ -885,7 +1344,7 @@ fn read_mem(op: LoadOp, bytes: &[u8]) -> Value {
 }
 
 /// Store the value's low bits, little-endian, over the memory slice (the
-/// caller slices exactly [`store_size`] bytes).
+/// caller slices exactly `store_size(op)` bytes).
 fn write_mem(_op: StoreOp, value: Value, bytes: &mut [u8]) {
     let bits = match value {
         Value::I32(v) => v as u32 as u64,
@@ -893,11 +1352,23 @@ fn write_mem(_op: StoreOp, value: Value, bytes: &mut [u8]) {
         Value::F32(bits) => bits as u64,
         Value::F64(bits) => bits,
     };
-    // The caller slices exactly `store_size(_op)` bytes, so writing the low
-    // bytes of `bits` little-endian covers every store width.
     for (shift, byte) in bytes.iter_mut().enumerate() {
         *byte = (bits >> (8 * shift)) as u8;
     }
+}
+
+/// Whether an imported memory type is satisfied by a provided one: the
+/// provider must have at least the requested minimum, and no larger a maximum
+/// than the request allows (spec 4.5.2 external-type subsumption).
+fn memory_matches(actual: MemType, requested: MemType) -> bool {
+    !actual.memory64 && !requested.memory64 && limits_match(actual.limits, requested.limits)
+}
+
+fn limits_match(actual: Limits, requested: Limits) -> bool {
+    actual.min >= requested.min
+        && requested
+            .max
+            .is_none_or(|max| actual.max.is_some_and(|a| a <= max))
 }
 
 /// Evaluate a constant initializer expression (no terminating `end`).

@@ -19,8 +19,11 @@ use std::process::{Command, ExitCode};
 
 use serde_json::Value;
 use wasm::Value as WasmValue;
+use wasm::types::{FuncType, GlobalType, Limits, MemType, ValType};
 use wasm::valid::Error as ValidError;
-use wasm::{DecodeError, ExecFail, Instance, Trap, decode, instantiate, validate};
+use wasm::{
+    DecodeError, ExecFail, ExternVal, InstantiateError, Module, Store, Trap, decode, validate,
+};
 
 const USAGE: &str = "\
 wasmtest — WebAssembly conformance runner
@@ -192,10 +195,21 @@ fn run_json(json_path: &Path) -> Tally {
         return tally;
     };
 
-    // Instance state across a file's commands: the most recent module plus
-    // modules given a name by `register`.
-    let mut last: Option<Instance> = None;
-    let mut named: HashMap<String, Instance> = HashMap::new();
+    // Instance state across a file's commands: the store of live instances,
+    // an import registry (spectest plus every `register`-named module), the
+    // most recent module id, and module ids given a name by `register`.
+    let mut store = Store::new();
+    let mut registry = spectest_exports(&mut store);
+    let mut last: Option<usize> = None;
+    let mut named: HashMap<String, usize> = HashMap::new();
+    // The latest module command's outcome: whether `last` is its instance, or
+    // the reason it could not be created (so a following `register` names an
+    // *unavailable* module instead of a stale one).
+    let mut last_defined_ok = false;
+    let mut module_pending: Option<&'static str> = None;
+    // Module names whose instance could not be created (Cut N): imports from
+    // them are pending, not unknown-import failures.
+    let mut unavailable: HashMap<String, &'static str> = HashMap::new();
 
     for command in commands {
         let line = command.get("line").and_then(Value::as_u64).unwrap_or(0);
@@ -207,27 +221,50 @@ fn run_json(json_path: &Path) -> Tally {
             "module" => {
                 let module = command.get("module").unwrap_or(command);
                 match module_source(module, dir) {
-                    ModuleSource::Binary(bytes) => match decode(&bytes) {
-                        Err(error) => Outcome::Fail(format!("module decode: {error}")),
-                        Ok(module) => match validate(&module) {
-                            Err(error) => Outcome::Fail(format!("module invalid: {error}")),
-                            Ok(_) => match instantiate(&module) {
-                                Ok(instance) => {
-                                    last = Some(instance);
-                                    Outcome::Pass
+                    ModuleSource::Binary(bytes) => {
+                        match judge_module(
+                            &mut store,
+                            &registry,
+                            &unavailable,
+                            &bytes,
+                            ModuleExpect::Instantiate,
+                        ) {
+                            Verdict::Id(id) => {
+                                last = Some(id);
+                                last_defined_ok = true;
+                                module_pending = None;
+                                if let Some(label) = command.get("name").and_then(Value::as_str) {
+                                    named.insert(label.to_string(), id);
                                 }
-                                Err(ExecFail::Trap(Trap::UnsupportedImport)) => {
-                                    Outcome::Pending("module imports (Cut 4)")
-                                }
-                                Err(ExecFail::Unsupported(reason)) => Outcome::Pending(reason),
-                                Err(ExecFail::Trap(_)) => {
-                                    Outcome::Fail("module failed to instantiate".into())
-                                }
-                            },
-                        },
-                    },
-                    ModuleSource::Text => Outcome::Pending("quote text module"),
-                    ModuleSource::Missing => Outcome::Pending("module without a file"),
+                                Outcome::Pass
+                            }
+                            Verdict::Pass => {
+                                last_defined_ok = true;
+                                module_pending = None;
+                                Outcome::Pass
+                            }
+                            Verdict::Pending(reason) => {
+                                last_defined_ok = false;
+                                module_pending = Some(reason);
+                                Outcome::Pending(reason)
+                            }
+                            Verdict::Fail(message) => {
+                                last_defined_ok = false;
+                                module_pending = None;
+                                Outcome::Fail(message)
+                            }
+                        }
+                    }
+                    ModuleSource::Text => {
+                        last_defined_ok = false;
+                        module_pending = None;
+                        Outcome::Pending("quote text module")
+                    }
+                    ModuleSource::Missing => {
+                        last_defined_ok = false;
+                        module_pending = None;
+                        Outcome::Pending("module without a file")
+                    }
                 }
             }
             "assert_malformed" => {
@@ -267,86 +304,167 @@ fn run_json(json_path: &Path) -> Tally {
                 }
             }
             "register" => {
-                // The most recent module becomes addressable by name (its
-                // exports can be imported by later modules — Cut 4).
-                if let Some(instance) = last.take()
-                    && let Some(name) = command.get("as").and_then(Value::as_str)
-                {
-                    named.insert(name.to_string(), instance);
+                // The most recent module becomes addressable by name; its
+                // exports become importable under that name.
+                let name = command.get("as").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() {
+                    Outcome::Fail("register without a name".into())
+                } else if last_defined_ok {
+                    if let Some(id) = last {
+                        named.insert(name.to_string(), id);
+                        if let Some(label) = command.get("name").and_then(Value::as_str) {
+                            named.insert(label.to_string(), id);
+                        }
+                        for (field, value) in store.exports(id) {
+                            registry.insert((name.to_string(), field), value);
+                        }
+                    }
+                    Outcome::Pass
+                } else if let Some(reason) = module_pending {
+                    unavailable.insert(name.to_string(), reason);
+                    Outcome::Pending("module unavailable")
+                } else {
+                    Outcome::Pending("no module to register")
                 }
-                Outcome::Pending("register (Cut 4)")
+            }
+            "assert_unlinkable" => {
+                match module_source(command.get("module").unwrap_or(command), dir) {
+                    ModuleSource::Binary(bytes) => judge_module(
+                        &mut store,
+                        &registry,
+                        &unavailable,
+                        &bytes,
+                        ModuleExpect::Unlinkable,
+                    )
+                    .into_outcome(),
+                    ModuleSource::Text => Outcome::Pending("quote text module"),
+                    ModuleSource::Missing => {
+                        Outcome::Pending("assert_unlinkable without a module file")
+                    }
+                }
+            }
+            "assert_uninstantiable" => {
+                match module_source(command.get("module").unwrap_or(command), dir) {
+                    ModuleSource::Binary(bytes) => judge_module(
+                        &mut store,
+                        &registry,
+                        &unavailable,
+                        &bytes,
+                        ModuleExpect::Uninstantiable,
+                    )
+                    .into_outcome(),
+                    ModuleSource::Text => Outcome::Pending("quote text module"),
+                    ModuleSource::Missing => {
+                        Outcome::Pending("assert_uninstantiable without a module file")
+                    }
+                }
             }
             "action" | "assert_return" | "assert_trap" | "assert_exhaustion" => {
-                let action = command.get("action").unwrap_or(command);
-                let instance = if let Some(name) = action.get("module").and_then(Value::as_str) {
-                    named.get_mut(name)
+                if kind == "assert_trap" && command.get("action").is_none() {
+                    // `(assert_trap (module ...))`: instantiation must trap.
+                    let text = command.get("text").and_then(Value::as_str).unwrap_or("");
+                    match module_source(command.get("module").unwrap_or(command), dir) {
+                        ModuleSource::Binary(bytes) => judge_module(
+                            &mut store,
+                            &registry,
+                            &unavailable,
+                            &bytes,
+                            ModuleExpect::InstantiationTrap(text),
+                        )
+                        .into_outcome(),
+                        ModuleSource::Text => Outcome::Pending("quote text module"),
+                        ModuleSource::Missing => {
+                            Outcome::Pending("assert_trap module without a file")
+                        }
+                    }
                 } else {
-                    last.as_mut()
-                };
-                match instance {
-                    None => Outcome::Pending("no module to act on"),
-                    Some(instance) => {
-                        let result = run_action(instance, action);
-                        match kind {
-                            "action" => match result {
-                                Ok(_) => Outcome::Pass,
-                                Err(ActOutcome::Trap(_)) => Outcome::Fail("action trapped".into()),
-                                Err(ActOutcome::Unsupported(reason)) => Outcome::Pending(reason),
-                            },
-                            "assert_return" => match result {
-                                Ok(values) => match command
-                                    .get("expected")
-                                    .and_then(Value::as_array)
-                                {
-                                    Some(expected) => {
-                                        if expected.len() != values.len()
-                                            || expected
-                                                .iter()
-                                                .zip(&values)
-                                                .any(|(e, a)| !matches_expected(e, *a))
-                                        {
-                                            Outcome::Fail("results differ from expected".into())
-                                        } else {
+                    let action = command.get("action").unwrap_or(command);
+                    let instance = if let Some(name) = action.get("module").and_then(Value::as_str)
+                    {
+                        named.get(name).copied()
+                    } else {
+                        last
+                    };
+                    match instance {
+                        None => Outcome::Pending("no module to act on"),
+                        Some(instance) => {
+                            let result = run_action(&mut store, instance, action);
+                            match kind {
+                                "action" => match result {
+                                    Ok(_) => Outcome::Pass,
+                                    Err(ActOutcome::Trap(_)) => {
+                                        Outcome::Fail("action trapped".into())
+                                    }
+                                    Err(ActOutcome::Unsupported(reason)) => {
+                                        Outcome::Pending(reason)
+                                    }
+                                },
+                                "assert_return" => match result {
+                                    Ok(values) => match command
+                                        .get("expected")
+                                        .and_then(Value::as_array)
+                                    {
+                                        Some(expected) => {
+                                            if expected.len() != values.len()
+                                                || expected
+                                                    .iter()
+                                                    .zip(&values)
+                                                    .any(|(e, a)| !matches_expected(e, *a))
+                                            {
+                                                Outcome::Fail("results differ from expected".into())
+                                            } else {
+                                                Outcome::Pass
+                                            }
+                                        }
+                                        None => {
+                                            Outcome::Fail("assert_return without expected".into())
+                                        }
+                                    },
+                                    Err(ActOutcome::Trap(_)) => {
+                                        Outcome::Fail("expected return, trapped".into())
+                                    }
+                                    Err(ActOutcome::Unsupported(reason)) => {
+                                        Outcome::Pending(reason)
+                                    }
+                                },
+                                "assert_trap" => match result {
+                                    Err(ActOutcome::Trap(trap)) => {
+                                        let expected = command
+                                            .get("text")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("");
+                                        if trap_text(trap) == expected {
                                             Outcome::Pass
+                                        } else {
+                                            Outcome::Fail(format!(
+                                                "trapped with {:?}, expected {expected:?}",
+                                                trap
+                                            ))
                                         }
                                     }
-                                    None => Outcome::Fail("assert_return without expected".into()),
-                                },
-                                Err(ActOutcome::Trap(_)) => {
-                                    Outcome::Fail("expected return, trapped".into())
-                                }
-                                Err(ActOutcome::Unsupported(reason)) => Outcome::Pending(reason),
-                            },
-                            "assert_trap" => match result {
-                                Err(ActOutcome::Trap(trap)) => {
-                                    let expected =
-                                        command.get("text").and_then(Value::as_str).unwrap_or("");
-                                    if trap_text(trap) == expected {
-                                        Outcome::Pass
-                                    } else {
-                                        Outcome::Fail(format!(
-                                            "trapped with {:?}, expected {expected:?}",
-                                            trap
-                                        ))
+                                    Ok(_) => Outcome::Fail("expected trap, returned".into()),
+                                    Err(ActOutcome::Unsupported(reason)) => {
+                                        Outcome::Pending(reason)
                                     }
-                                }
-                                Ok(_) => Outcome::Fail("expected trap, returned".into()),
-                                Err(ActOutcome::Unsupported(reason)) => Outcome::Pending(reason),
-                            },
-                            "assert_exhaustion" => match result {
-                                Err(ActOutcome::Trap(Trap::CallStackExhausted)) => Outcome::Pass,
-                                Err(ActOutcome::Trap(_)) => {
-                                    Outcome::Fail("expected exhaustion, other trap".into())
-                                }
-                                Ok(_) => Outcome::Fail("expected exhaustion, returned".into()),
-                                Err(ActOutcome::Unsupported(reason)) => Outcome::Pending(reason),
-                            },
-                            _ => Outcome::Pending("execution (Cut 3)"),
+                                },
+                                "assert_exhaustion" => match result {
+                                    Err(ActOutcome::Trap(Trap::CallStackExhausted)) => {
+                                        Outcome::Pass
+                                    }
+                                    Err(ActOutcome::Trap(_)) => {
+                                        Outcome::Fail("expected exhaustion, other trap".into())
+                                    }
+                                    Ok(_) => Outcome::Fail("expected exhaustion, returned".into()),
+                                    Err(ActOutcome::Unsupported(reason)) => {
+                                        Outcome::Pending(reason)
+                                    }
+                                },
+                                _ => Outcome::Pending("execution (Cut 3)"),
+                            }
                         }
                     }
                 }
             }
-            "assert_unlinkable" | "assert_uninstantiable" => Outcome::Pending("linking (Cut 4)"),
             other => Outcome::Fail(format!("unknown command type {other:?}")),
         };
         match outcome {
@@ -384,14 +502,116 @@ impl From<ExecFail> for ActOutcome {
     }
 }
 
-/// Run an `invoke` (or `get`) action against an instance.
-fn run_action(instance: &mut Instance, action: &Value) -> Result<Vec<WasmValue>, ActOutcome> {
+/// What a module-bearing command expects from instantiation.
+enum ModuleExpect<'a> {
+    /// A plain `module` command: instantiation must succeed.
+    Instantiate,
+    /// `assert_unlinkable`: instantiation must fail at import resolution.
+    Unlinkable,
+    /// `assert_uninstantiable`: instantiation must trap.
+    Uninstantiable,
+    /// `(assert_trap (module ...))`: instantiation must trap with `text`.
+    InstantiationTrap(&'a str),
+}
+
+/// A judged module command.
+enum Verdict {
+    Id(usize),
+    Pass,
+    Pending(&'static str),
+    Fail(String),
+}
+
+impl Verdict {
+    fn into_outcome(self) -> Outcome {
+        match self {
+            Verdict::Id(_) | Verdict::Pass => Outcome::Pass,
+            Verdict::Pending(reason) => Outcome::Pending(reason),
+            Verdict::Fail(message) => Outcome::Fail(message),
+        }
+    }
+}
+
+/// Decode, validate, and instantiate a module through the registry, judging
+/// the outcome against what the command expects.
+fn judge_module(
+    store: &mut Store,
+    registry: &HashMap<(String, String), ExternVal>,
+    unavailable: &HashMap<String, &'static str>,
+    bytes: &[u8],
+    expect: ModuleExpect<'_>,
+) -> Verdict {
+    let module: Module = match decode(bytes) {
+        Err(error) => return Verdict::Fail(format!("module decode: {error}")),
+        Ok(module) => module,
+    };
+    if let Err(error) = validate(&module) {
+        return Verdict::Fail(format!("module invalid: {error}"));
+    }
+    // Instantiation traps driven by table/element machinery (Cut 5) cannot
+    // be judged yet: the engine does not run element segments.
+    let needs_instantiation_trap = matches!(
+        expect,
+        ModuleExpect::Uninstantiable | ModuleExpect::InstantiationTrap(_)
+    );
+    if needs_instantiation_trap && (!module.tables.is_empty() || !module.elements.is_empty()) {
+        return Verdict::Pending("tables/elements (Cut 5)");
+    }
+    let result = {
+        let mut resolve = |m: &str, n: &str| {
+            registry
+                .get(&(m.to_string(), n.to_string()))
+                .copied()
+                .or_else(|| {
+                    unavailable
+                        .get(m)
+                        .map(|&reason| ExternVal::Unsupported(reason))
+                })
+        };
+        store.instantiate(&module, &mut resolve)
+    };
+    match expect {
+        ModuleExpect::Instantiate => match result {
+            Ok(id) => Verdict::Id(id),
+            Err(InstantiateError::Unsupported(reason)) => Verdict::Pending(reason),
+            Err(error) => Verdict::Fail(format!("module did not instantiate: {error}")),
+        },
+        ModuleExpect::Unlinkable => match result {
+            Err(InstantiateError::Unlinkable(_)) => Verdict::Pass,
+            Err(InstantiateError::Unsupported(reason)) => Verdict::Pending(reason),
+            Err(error) => Verdict::Fail(format!("expected unlinkable, got {error}")),
+            Ok(_) => Verdict::Fail("expected unlinkable, module instantiated".into()),
+        },
+        ModuleExpect::Uninstantiable => match result {
+            Err(InstantiateError::Trap(_)) => Verdict::Pass,
+            Err(InstantiateError::Unsupported(reason)) => Verdict::Pending(reason),
+            Err(error) => Verdict::Fail(format!("expected trap, got {error}")),
+            Ok(_) => Verdict::Fail("expected trap, module instantiated".into()),
+        },
+        ModuleExpect::InstantiationTrap(text) => match result {
+            Err(InstantiateError::Trap(trap)) if trap_text(trap) == text => Verdict::Pass,
+            Err(InstantiateError::Trap(trap)) => {
+                Verdict::Fail(format!("trapped with {trap:?}, expected {text:?}"))
+            }
+            Err(InstantiateError::Unsupported(reason)) => Verdict::Pending(reason),
+            Err(error) => Verdict::Fail(format!("expected trap, got {error}")),
+            Ok(_) => Verdict::Fail("expected trap, module instantiated".into()),
+        },
+    }
+}
+
+/// Run an `invoke` or `get` action against an instance.
+fn run_action(
+    store: &mut Store,
+    instance: usize,
+    action: &Value,
+) -> Result<Vec<WasmValue>, ActOutcome> {
     let kind = action.get("type").and_then(Value::as_str).unwrap_or("");
     let field = action.get("field").and_then(Value::as_str).unwrap_or("");
     match kind {
         "invoke" => {
-            let index = instance
-                .exported_func(field)
+            let index = store
+                .exported_func(instance, field)
                 .ok_or(ActOutcome::Unsupported("unknown function export"))?;
             let mut args = Vec::new();
             if let Some(arg_values) = action.get("args").and_then(Value::as_array) {
@@ -401,7 +621,15 @@ fn run_action(instance: &mut Instance, action: &Value) -> Result<Vec<WasmValue>,
                     );
                 }
             }
-            instance.invoke(index, &args).map_err(ActOutcome::from)
+            store
+                .invoke(instance, index, &args)
+                .map_err(ActOutcome::from)
+        }
+        "get" => {
+            let value = store
+                .export_global_value(instance, field)
+                .ok_or(ActOutcome::Unsupported("unknown global export"))?;
+            Ok(vec![value])
         }
         _ => Err(ActOutcome::Unsupported("non-invoke action")),
     }
@@ -474,6 +702,74 @@ fn trap_text(trap: Trap) -> &'static str {
         Trap::UnsupportedImport => "unsupported import",
         Trap::UnknownFunction => "unknown function",
     }
+}
+
+/// The spec's predefined `spectest` host module: no-op `print*` functions,
+/// `global_i32/i64` = 666 and `global_f32/f64` = 666.6, a 1..2-page memory,
+/// and a table that is not executable until Cut 5. Returns the
+/// (module, field) -> value map used by import resolution.
+fn spectest_exports(store: &mut Store) -> HashMap<(String, String), ExternVal> {
+    let mut exports = HashMap::new();
+    let mut host = |store: &mut Store, name: &str, params: Vec<ValType>| {
+        let ty = FuncType {
+            params,
+            results: Vec::new(),
+        };
+        let id = store.host_func(ty);
+        exports.insert(
+            ("spectest".to_string(), name.to_string()),
+            ExternVal::HostFunc(id),
+        );
+    };
+    host(store, "print", vec![]);
+    host(store, "print_i32", vec![ValType::I32]);
+    host(store, "print_i64", vec![ValType::I64]);
+    host(store, "print_f32", vec![ValType::F32]);
+    host(store, "print_f64", vec![ValType::F64]);
+    host(store, "print_i32_f32", vec![ValType::I32, ValType::F32]);
+    host(store, "print_f64_f64", vec![ValType::F64, ValType::F64]);
+
+    for (name, ty, value) in [
+        ("global_i32", ValType::I32, WasmValue::I32(666)),
+        ("global_i64", ValType::I64, WasmValue::I64(666)),
+        (
+            "global_f32",
+            ValType::F32,
+            WasmValue::F32(666.6f32.to_bits()),
+        ),
+        (
+            "global_f64",
+            ValType::F64,
+            WasmValue::F64(666.6f64.to_bits()),
+        ),
+    ] {
+        let cell = store.global(
+            GlobalType {
+                value: ty,
+                mutable: false,
+            },
+            value,
+        );
+        exports.insert(
+            ("spectest".to_string(), name.to_string()),
+            ExternVal::Global(cell),
+        );
+    }
+
+    if let Ok(cell) = store.memory(MemType {
+        limits: Limits::new(1, Some(2)),
+        memory64: false,
+    }) {
+        exports.insert(
+            ("spectest".to_string(), "memory".to_string()),
+            ExternVal::Memory(cell),
+        );
+    }
+    exports.insert(
+        ("spectest".to_string(), "table".to_string()),
+        ExternVal::Unsupported("tables (Cut 5)"),
+    );
+    exports
 }
 
 /// A module command's file, classified by what the runner can do with it:
