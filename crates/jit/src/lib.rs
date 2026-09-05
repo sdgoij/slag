@@ -684,6 +684,7 @@ mod tests {
             global_object: std::ptr::null_mut(),
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
+            member_map_cells: std::ptr::null_mut(),
             clean_chain: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
@@ -1033,6 +1034,7 @@ mod tests {
             global_object: std::ptr::null_mut(),
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
+            member_map_cells: std::ptr::null_mut(),
             clean_chain: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
@@ -1277,6 +1279,7 @@ mod tests {
             global_object: std::ptr::null_mut(),
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
+            member_map_cells: std::ptr::null_mut(),
             clean_chain: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
@@ -1363,6 +1366,7 @@ mod tests {
             global_object: std::ptr::null_mut(),
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
+            member_map_cells: std::ptr::null_mut(),
             clean_chain: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
@@ -1626,6 +1630,33 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(3.0));
         assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_shape_read_serves_cycling_same_shape_objects() {
+        // Slice 1: the compiled `GetMemberName` read falls back to an
+        // inline shape read when the (id, name) value cell misses — probe
+        // the shared (map id, name) cells and read the receiver's
+        // `in_fields` slot at the recorded offset. A 64-object cycling loop
+        // thrashes the 16-entry value cells every pass, so every read would
+        // otherwise call the `get_member_name` helper; the shape path must
+        // serve the same values with no per-object identity (a map id pins
+        // the descriptor layout for every instance of the shape).
+        let source = "function C(v) { this.a = v; this.b = v + 1; }\n\
+                     var os = [];\n\
+                     for (var i = 0; i < 64; i++) { os.push(new C(i)); }\n\
+                     var s = 0;\n\
+                     for (var r = 0; r < 200; r++) { for (var j = 0; j < 64; j++) { s += os[j].b; } }\n\
+                     s;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(value, interp, "the shape read must match the interpreter");
+        assert_eq!(value.as_number(), Some(416000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]

@@ -54,6 +54,12 @@ pub const TAG_FUNCTION: u64 = 8;
 /// escapes (and `kind()`'s reserved-tag `unreachable!` stays unreachable).
 const TAG_UNINITIALIZED: u64 = 9;
 
+/// The raw bits of the frame-slot TDZ / unset-inline-field marker (tag 9 in
+/// the reserved range): `TAG_PREFIX | (9 << 44)`. `pub` so the JIT's inline
+/// `in_fields` hole test compares against the frozen pattern with one load
+/// and one exact-bits compare.
+pub const UNINITIALIZED_BITS: u64 = TAG_PREFIX | (TAG_UNINITIALIZED << 44);
+
 /// An ECMAScript language value (spec 6.1).
 ///
 /// NaN-boxed: a double when the top 16 bits are not `0x7FF8`, otherwise a tag
@@ -94,12 +100,13 @@ impl Value {
         Value(TAG_PREFIX | (TAG_UNDEFINED << 44), std::marker::PhantomData);
     pub const Null: Value = Value(TAG_PREFIX | (TAG_NULL << 44), std::marker::PhantomData);
 
-    /// The frame-slot TDZ marker (see [`crate::value::TAG_UNINITIALIZED`]).
-    pub fn uninitialized() -> Value {
-        Value(
-            TAG_PREFIX | (TAG_UNINITIALIZED << 44),
-            std::marker::PhantomData,
-        )
+    /// The frame-slot TDZ / unset-inline-field marker (see
+    /// [`crate::value::TAG_UNINITIALIZED`]). A stored property value can
+    /// never equal it (the Number constructor canonicalizes doubles whose
+    /// top 16 bits are `TAG_PREFIX` away, and no tagged value uses tag 9),
+    /// so an `in_fields` slot holding it means "never written".
+    pub const fn uninitialized() -> Value {
+        Value(UNINITIALIZED_BITS, std::marker::PhantomData)
     }
 
     pub fn is_uninitialized(&self) -> bool {

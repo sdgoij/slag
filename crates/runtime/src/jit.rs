@@ -232,6 +232,12 @@ pub struct JitCallContext {
     /// `GetMemberName` probe indexes it by `(object_id ^ name) &
     /// (MEMBER_CELLS - 1)` and reads the `#[repr(C)]` cells).
     pub member_value_cells: *mut c_void,
+    /// The `Agent::member_map_cells` array base (the compiled
+    /// `GetMemberName` shape probe indexes it by `(map_id ^ name) &
+    /// (MEMBER_CELLS - 1)` and reads the `#[repr(C)]` cells: a map id pins
+    /// the descriptor layout for every instance of the shape, so a hit needs
+    /// no per-object identity or generation).
+    pub member_map_cells: *mut c_void,
     /// Whether the body's env chain is EXACTLY the global env (no
     /// intermediate envs): the compiled `LoadIdent` probe is sound only then
     /// — a named function expression's self-binding scope, a block/catch
@@ -4630,6 +4636,7 @@ pub(crate) fn run_jit_body(
         global_object: global.as_ptr() as *mut c_void,
         global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
         member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
+        member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
         clean_chain,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
@@ -4858,6 +4865,7 @@ pub(crate) fn run_jit_resume(
         global_object: global.as_ptr() as *mut c_void,
         global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
         member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
+        member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
         clean_chain,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,

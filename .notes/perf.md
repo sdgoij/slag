@@ -4477,6 +4477,66 @@ open structural items remain the L1c shape/storage end-state (true
 defines, the JIT shape-compare end-state, and the chain-member-read
 slice (a) behind it).
 
+### Compiled shape-compare inline member read for map-pinned inline fields — Slice 1 (measured 2026-09-05, HEAD eedd670)
+
+The compiled `GetMemberName` read fast path was ONLY the (id, name,
+generation) 16-entry value-cell probe; a read over a working set bigger
+than the table (any cycling-object loop) missed every iteration and fell to
+the `get_member_name` helper. Gate probe (`scratch/l1c_option3_gate.js`,
+six-field same-shape objects, 2026-09-05): the many-object compiled read
+cliff (~8x: 3.8 → ~30ns/op) is object-count-driven and ordinal-independent
+(ord 5 ≈ ord 1 at every scale), because the JIT has no shape-based read for
+ANY ordinal — so the first slice is a machine shape read for map-pinned
+INLINE fields (ord < INLINE_FIELDS), with no storage migration.
+
+Mechanism: on a value-cell miss the machine code now probes the
+interpreter's shared (map id, name) → slot map cells (`member_map_cells`)
+and, on a match, reads the receiver's `in_fields[slot]` directly. A map id
+pins the descriptor layout for every instance of the shape (maps are
+immutable; a structural change drops the object to dictionary mode or
+transitions it off the map — accessor conversion and mapped-key delete
+drop it), so a hit needs no per-object identity or generation and is exact
+for any object count. Failures fall to the helper: no map (dictionary), an
+unrecorded shape, a recorded slot ≥ INLINE_FIELDS (vector storage), or a
+hole (a boilerplate pre-sized field the body skipped — not an own
+property, so the prototype chain must be consulted).
+
+Supporting changes: `in_fields` became `[Cell<Value>; INLINE_FIELDS]` with
+the reserved tag-9 `Value::uninitialized()` pattern as the frozen "unset"
+marker (a machine read tests presence with one load + one exact-bits
+compare; a stored value can never equal it — the Number constructor
+canonicalizes doubles whose top 16 bits are TAG_PREFIX, and no tagged
+value uses tag 9), and the field is `pub` for `offset_of!`. `MemberMapCell`
+became a `#[repr(C)]` non-`Option` cell with an impossible-id `empty()`
+(map ids start at 1), mirroring `MemberValueCell`, so the compiled probe
+reads the shared cells at fixed offsets (`JitCallContext.member_map_cells`
+added to all three ctx constructors). `crux::map::MAP_ID_OFFSET` and
+`crux::value::UNINITIALIZED_BITS` expose the frozen offset/pattern to the
+JIT.
+
+Measurement (release, both engines, 3-run minima): compiled many-object
+ordinal-1 reads 8192 ~30.5 → ~20ns/op and 16384 ~30.5 → ~21 (~1/3 off) —
+the shape path serves them with no helper call; single-object warm reads
+unchanged at 3.8ns (the value-cell hit path still runs first); ordinal-5
+reads unchanged (~32-33ns — vector keys stay on the helper until the
+backing-store slice); `--jit-bench` rows unchanged within the machine swing
+(property read 22.3/5.26 vs the 26.7/5.69 recorded at 7312c72 — no
+warm-path regression). The literal gate (collapse to the 3.8ns floor) is
+NOT met: the residual ~20ns is the value-cell probe (which misses every
+iteration on a cycling set) plus the shape path's dependent loads,
+latency-bound under Cranelift's scheduler — the interpreter reaches ~4ns
+on the same probe sequence because LLVM overlaps the independent loads.
+Closing the rest needs a cheaper combined probe or a per-site recorded
+shape gate; defer to the write-side / backing-store slice.
+
+Gates: clippy clean; `cargo test --workspace` green (new crux
+`map_described_inline_holes_read_absent_until_written` and jit e2e
+`installed_jit_shape_read_serves_cycling_same_shape_objects`); the L1c edge
+probes (`l1c_option1_edge`, `l1c_store_probe`, `l1c_compound_probe`) pass
+under the JIT and `--jitless`; the three release sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

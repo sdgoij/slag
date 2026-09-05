@@ -688,8 +688,12 @@ pub struct JsObject {
     /// assigns descriptor offsets below `INLINE_FIELDS` into this array; a
     /// descriptor at or above it addresses the property vector at the same
     /// offset. The read path checks the map first and reads from
-    /// `in_fields` when a field offset is present.
-    in_fields: [Cell<Option<Value>>; INLINE_FIELDS],
+    /// `in_fields` when a field offset is present. `pub` so the JIT's inline
+    /// shape read addresses it in place (`offset_of!`). An unset slot holds
+    /// `Value::uninitialized()` (reserved tag 9 — never a stored property
+    /// value), so a machine read tests presence with one load and an
+    /// exact-bits compare.
+    pub in_fields: [Cell<Value>; INLINE_FIELDS],
     /// [[Extensible]].
     pub extensible: Cell<bool>,
     /// Whether this object is an immutable prototype exotic object (spec
@@ -766,8 +770,9 @@ impl Trace for JsObject {
             m.trace(visit);
         }
         for field in &self.in_fields {
-            if let Some(v) = field.get() {
-                v.trace(visit);
+            let value = field.get();
+            if !value.is_uninitialized() {
+                value.trace(visit);
             }
         }
         self.properties.trace(visit);
@@ -854,7 +859,7 @@ impl JsObject {
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(map)),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -892,7 +897,7 @@ impl JsObject {
             std::ptr::write(std::ptr::addr_of_mut!((*this).map), Cell::new(Some(map)));
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).in_fields),
-                [const { Cell::new(None) }; INLINE_FIELDS],
+                [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             );
             std::ptr::write(std::ptr::addr_of_mut!((*this).extensible), Cell::new(true));
             std::ptr::write(
@@ -977,7 +982,7 @@ impl JsObject {
             None => return false,
         };
         if offset < INLINE_FIELDS {
-            self.in_fields[offset].set(Some(value));
+            self.in_fields[offset].set(value);
         }
         true
     }
@@ -992,7 +997,13 @@ impl JsObject {
     /// falls through to the property vector / prototype chain.
     pub fn map_field(&self, slot: usize) -> Option<Value> {
         if slot < INLINE_FIELDS {
-            return self.in_fields.get(slot)?.get();
+            let field = self.in_fields.get(slot)?;
+            let value = field.get();
+            return if value.is_uninitialized() {
+                None
+            } else {
+                Some(value)
+            };
         }
         let props = self.properties.borrow();
         match props.get(slot) {
@@ -1149,7 +1160,7 @@ impl JsObject {
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1173,7 +1184,7 @@ impl JsObject {
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1213,7 +1224,7 @@ impl JsObject {
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1250,7 +1261,7 @@ impl JsObject {
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1285,7 +1296,7 @@ impl JsObject {
             typed_array: Cell::new(None),
             prototype: Cell::new(None),
             map: Cell::new(Some(canonical_empty_map(None))),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1315,7 +1326,7 @@ impl JsObject {
             typed_array: Cell::new(Some(slots_handle)),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1426,7 +1437,7 @@ impl JsObject {
             typed_array: Cell::new(None),
             prototype: Cell::new(None),
             map: Cell::new(Some(canonical_empty_map(None))),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1482,7 +1493,7 @@ impl JsObject {
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -1582,7 +1593,7 @@ impl JsObject {
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
             map: Cell::new(Some(canonical_empty_map(prototype))),
-            in_fields: [const { Cell::new(None) }; INLINE_FIELDS],
+            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
@@ -2648,7 +2659,7 @@ impl JsObject {
             // map id (a mismatched or dropped map falls back to the scan).
             Some((map_id, field)) if field < INLINE_FIELDS => {
                 if self.map.get().is_some_and(|m| m.id() == map_id) {
-                    self.in_fields[field].set(Some(value));
+                    self.in_fields[field].set(value);
                 } else {
                     let _ = self.map_set(key, value);
                 }
@@ -4498,6 +4509,35 @@ pub(crate) fn value_get_method(value: &Value, key: &JsString) -> Result<Option<V
 mod tests {
     use super::*;
     use crate::symbol::Symbol;
+
+    #[test]
+    fn map_described_inline_holes_read_absent_until_written() {
+        // A map can describe inline keys a fresh object has not defined yet
+        // (constructor-boilerplate presize): the `in_fields` slot holds the
+        // `Value::uninitialized()` hole marker, so `map_field` reads the key
+        // as absent (None) until a define mirrors a value into the slot.
+        // Guards the Slice-1 frozen representation (one NaN-boxed `Value`
+        // per slot; the hole is the reserved tag-9 pattern the JIT's inline
+        // shape read compares exactly).
+        let m0 = Map::new_empty(None);
+        let mut m0 = m0;
+        let m1 = m0
+            .get_or_create_child(PropertyKey::from_utf8("a"), MapAttrs::new(true, true, true))
+            .unwrap();
+        let mut m1 = m1;
+        let m2 = m1
+            .get_or_create_child(PropertyKey::from_utf8("b"), MapAttrs::new(true, true, true))
+            .unwrap();
+        let object = JsObject::ordinary_object_create_with_map(None, m2);
+        assert_eq!(object.map.get().unwrap().descriptor_count(), 2);
+        // Presize holes: neither described key is an own property yet.
+        assert_eq!(object.map_field(0), None);
+        assert_eq!(object.map_field(1), None);
+        // Defining the first key mirrors the value into its inline slot.
+        assert!(object.map_set(&PropertyKey::from_utf8("a"), Value::Number(5.0)));
+        assert_eq!(object.map_field(0), Some(Value::Number(5.0)));
+        assert_eq!(object.map_field(1), None);
+    }
 
     #[test]
     fn small_props_inline_spill_remove_order() {

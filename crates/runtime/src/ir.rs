@@ -1973,14 +1973,34 @@ pub struct MemberChainCell {
     pub links: [(u64, u32); 2],
 }
 
-/// Part B, B5.2: map-keyed member cache entry — maps (map_id, name) to a
-/// field offset for the in_fields fast path. The map's shape is immutable,
-/// so a map_id + name match pins the descriptor (and its offset) exactly.
+/// Part B, B5.2: map-keyed read-cell cache `(map_id, name) → slot` — the
+/// fast path for fresh objects whose map describes the property: a map id
+/// pins the descriptor layout, so a match is valid for ANY ordinary object
+/// whose CURRENT map is `map_id` — no per-object identity or generation. The
+/// offset addresses the object's own `in_fields` (shared map, per-object
+/// storage). `#[repr(C)]` with all-scalar fields so the compiled
+/// `GetMemberName` probe reads the shared cells at fixed offsets
+/// (`offset_of!`), mirroring `MemberValueCell`; `empty()`'s impossible map
+/// id never matches.
+#[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct MemberMapCell {
+pub struct MemberMapCell {
     pub map_id: u64,
     pub name: crux::AtomId,
     pub slot: usize,
+}
+
+impl MemberMapCell {
+    /// An empty cell: `map_id` is impossible (map ids start at 1), so the
+    /// compiled probe's validation never matches it and the read falls
+    /// through to the descriptor scan.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            map_id: u64::MAX,
+            name: 0,
+            slot: 0,
+        }
+    }
 }
 
 impl Trace for MemberValueCell {
@@ -3482,8 +3502,8 @@ impl Vm {
         // offset addresses the object's own `in_fields` (shared map,
         // per-object storage).
         let index = Self::member_map_cell_index(map_id, name);
-        if let Some(cell) = &agent.member_map_cells[index]
-            && cell.map_id == map_id
+        let cell = agent.member_map_cells[index];
+        if cell.map_id == map_id
             && cell.name == name
             && let Some(value) = object.map_field(cell.slot)
         {
@@ -3505,7 +3525,7 @@ impl Vm {
         let key = PropertyKey::String(name);
         let slot = map.field_offset(&key)?;
         let value = object.map_field(slot)?;
-        agent.member_map_cells[index] = Some(MemberMapCell { map_id, name, slot });
+        agent.member_map_cells[index] = MemberMapCell { map_id, name, slot };
         agent.member_value_cells[Self::member_cell_index(object.id(), name)] = MemberValueCell {
             id: object.id(),
             name,
@@ -3938,11 +3958,11 @@ impl Vm {
         {
             let map_id = map.id();
             let index = Self::member_map_cell_index(map_id, *atom);
-            agent.member_map_cells[index] = Some(crate::ir::MemberMapCell {
+            agent.member_map_cells[index] = crate::ir::MemberMapCell {
                 map_id,
                 name: *atom,
                 slot,
-            });
+            };
         }
         if ok {
             // Cut 35 slice 32: the store-then-read pattern (a constructor
@@ -11054,6 +11074,7 @@ impl Vm {
             global_object: global.as_ptr() as *mut std::os::raw::c_void,
             global_value_cells: agent.global_value_cells.as_ptr() as *mut std::os::raw::c_void,
             member_value_cells: agent.member_value_cells.as_ptr() as *mut std::os::raw::c_void,
+            member_map_cells: agent.member_map_cells.as_ptr() as *mut std::os::raw::c_void,
             clean_chain,
             buf_end: (buf.as_ptr() as usize + std::mem::size_of_val(buf))
                 as *mut std::os::raw::c_void,

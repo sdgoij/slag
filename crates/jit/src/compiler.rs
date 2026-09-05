@@ -37,8 +37,8 @@ use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
-    ApplyKind, CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberValueCell,
-    RegOperand, RelLimit, ScopeInfo, Step, is_compound_assign,
+    ApplyKind, CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberMapCell,
+    MemberValueCell, RegOperand, RelLimit, ScopeInfo, Step, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JIT_APPLY_MAX_ARGS, JIT_GC_PROBE_INTERVAL,
@@ -1205,6 +1205,10 @@ impl<'a> Lowerer<'a> {
         let probe = self.builder.create_block();
         let slow = self.builder.create_block();
         let merge = self.builder.create_block();
+        let shape = self.builder.create_block();
+        let map_present = self.builder.create_block();
+        let field = self.builder.create_block();
+        let field_hit = self.builder.create_block();
         // The typed-array length probe: only the `length` atom needs it. The
         // machine read (gap-close M6) serves a fixed, live, writable-buffer
         // IntegerIndexed receiver's length straight from the slots; a helper
@@ -1319,7 +1323,125 @@ impl<'a> Lowerer<'a> {
         let id_name_ok = self.builder.ins().band(id_ok, name_ok);
         let ok = self.builder.ins().band(id_name_ok, gen_ok);
         self.builder.def_var(value_var, cell_value);
-        self.builder.ins().brif(ok, merge, &[], slow, &[]);
+        self.builder.ins().brif(ok, merge, &[], shape, &[]);
+        // The shape read (Slice 1): on a value-cell miss, a map-pinned
+        // INLINE field is read directly. Probe the shared (map id, name) map
+        // cells (recorded by the interpreter's own-property reads and fresh
+        // stores) and on a match read the receiver's `in_fields` slot at the
+        // recorded offset. A map id pins the descriptor layout for every
+        // instance of the shape (maps are immutable; a structural change
+        // transitions or drops the object off the map), so a hit is valid
+        // for ANY object count with no per-object identity or generation —
+        // the cycling-object loop stops falling to the helper on every read.
+        // Falls through to the slow path when the object has no map
+        // (dictionary mode), the cells do not record the shape, the recorded
+        // slot is at or above `INLINE_FIELDS` (vector storage — not
+        // machine-addressable), or the inline field is a hole (a boilerplate
+        // pre-sized field the body skipped — not an own property, so the
+        // prototype chain must be consulted).
+        self.builder.switch_to_block(shape);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let map_handle = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
+        );
+        let has_map = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, map_handle, 0);
+        self.builder
+            .ins()
+            .brif(has_map, map_present, &[], slow, &[]);
+        self.builder.switch_to_block(map_present);
+        let map_data = self
+            .builder
+            .ins()
+            .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let map_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            map_data,
+            Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+        );
+        let map_cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_map_cells) as i32),
+        );
+        let cell_slot = self.builder.ins().bxor(map_id, name_imm);
+        let cell_slot = self
+            .builder
+            .ins()
+            .band_imm_u(cell_slot, (MEMBER_CELLS - 1) as i64);
+        let index_bytes = self
+            .builder
+            .ins()
+            .imul_imm_s(cell_slot, std::mem::size_of::<MemberMapCell>() as i64);
+        let cell = self.builder.ins().iadd(map_cells, index_bytes);
+        let cell_map_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, map_id) as i32),
+        );
+        let cell_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, name) as i32),
+        );
+        let field_slot = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, slot) as i32),
+        );
+        let map_ok = self.builder.ins().icmp(IntCC::Equal, cell_map_id, map_id);
+        let name_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, cell_name, name as i64);
+        let slot_ok = self.builder.ins().icmp_imm_u(
+            IntCC::UnsignedLessThan,
+            field_slot,
+            crux::object::INLINE_FIELDS as i64,
+        );
+        let id_name_ok = self.builder.ins().band(map_ok, name_ok);
+        let cell_ok = self.builder.ins().band(id_name_ok, slot_ok);
+        self.builder.ins().brif(cell_ok, field, &[], slow, &[]);
+        self.builder.switch_to_block(field);
+        let field_bytes = self.builder.ins().ishl_imm_u(field_slot, 3);
+        let field_base = self.builder.ins().iadd_imm_s(
+            obj_ptr,
+            std::mem::offset_of!(crux::JsObject, in_fields) as i64,
+        );
+        let field_addr = self.builder.ins().iadd(field_base, field_bytes);
+        let value_bits = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            field_addr,
+            Offset32::new(0),
+        );
+        let is_hole = self.builder.ins().icmp_imm_u(
+            IntCC::Equal,
+            value_bits,
+            crux::value::UNINITIALIZED_BITS as i64,
+        );
+        self.builder.ins().brif(is_hole, slow, &[], field_hit, &[]);
+        self.builder.switch_to_block(field_hit);
+        self.builder.def_var(value_var, value_bits);
+        self.builder.ins().jump(merge, &[]);
         // The slow path: the full Get (which also re-resolves and
         // repopulates the cell for the next read).
         self.builder.switch_to_block(slow);

@@ -244,7 +244,10 @@ pub struct Agent {
     pub(crate) member_proto_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     /// Part B, B5.2: map-keyed read-cell cache `(map_id, name) → slot` —
     /// the fast path for fresh objects whose map describes the property.
-    pub(crate) member_map_cells: [Option<crate::ir::MemberMapCell>; crate::ir::MEMBER_CELLS],
+    /// Non-`Option` with an impossible-id `MemberMapCell::empty()` (map ids
+    /// start at 1) so the compiled `GetMemberName` probe reads the
+    /// `#[repr(C)]` cells directly at fixed offsets.
+    pub(crate) member_map_cells: [crate::ir::MemberMapCell; crate::ir::MEMBER_CELLS],
     pub(crate) array_element_cells:
         [Option<(u64, u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     /// The write-side chain cache (Cut 22): "the chain from this prototype
@@ -773,7 +776,8 @@ impl Agent {
             array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
             array_length_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],
-            member_map_cells: [const { None }; crate::ir::MEMBER_CELLS],
+            member_map_cells: [const { crate::ir::MemberMapCell::empty() };
+                crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
             for_of_fast_cells: std::array::from_fn(|_| None),

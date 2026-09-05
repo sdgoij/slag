@@ -80,6 +80,13 @@ pub struct Map {
 /// Global monotonic counter for map identities.
 static MAP_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// The byte offset of `Map::id` inside the map box's data region. The JIT's
+/// inline shape read loads a `Handle<Map>` from the object's `map` cell,
+/// adds `GCBOX_DATA_OFFSET` to reach the map data, and reads the id at this
+/// offset — the machine shape-compare pins the descriptor layout on the id.
+/// `pub` because the `id` field itself is private.
+pub const MAP_ID_OFFSET: usize = std::mem::offset_of!(Map, id);
+
 impl PartialEq for Map {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
