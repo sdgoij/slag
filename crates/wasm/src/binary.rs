@@ -44,6 +44,10 @@ impl std::error::Error for Error {}
 const MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6d];
 const VERSION: u32 = 1;
 
+/// Sanity bound on expanded locals per function body; generous enough for
+/// any real module while keeping hostile count fields from exhausting memory.
+const MAX_LOCALS: usize = 1 << 20;
+
 /// Section ids and the order the spec requires (custom sections may appear
 /// anywhere; the tag section sits between memory and global; `DataCount`
 /// between element and code). Ordering for the "sections in order" check is
@@ -309,7 +313,9 @@ fn decode_func_type(bytes: &[u8], pos: &mut usize) -> Result<FuncType, Error> {
 
 fn read_valtype_vec(bytes: &[u8], pos: &mut usize) -> Result<Vec<ValType>, Error> {
     let count = read_u32(bytes, pos)?;
-    let mut out = Vec::with_capacity(count as usize);
+    // No preallocation from an untrusted count: a malformed length would
+    // otherwise allocate before the bounds check rejects it.
+    let mut out = Vec::new();
     for _ in 0..count {
         out.push(decode_valtype(bytes, pos)?);
     }
@@ -433,20 +439,23 @@ fn decode_ref_type(bytes: &[u8], pos: &mut usize) -> Result<RefType, Error> {
 }
 
 fn decode_block_type(bytes: &[u8], pos: &mut usize) -> Result<BlockType, Error> {
-    if bytes.get(*pos) == Some(&0x40) {
+    // Spec 5.3: `0x40`, a full value type, or a type index (s33 >= 0).
+    let Some(&byte) = bytes.get(*pos) else {
+        return Err(Error::Malformed("unexpected end of section or function"));
+    };
+    if byte == 0x40 {
         *pos += 1;
         return Ok(BlockType::Empty);
     }
-    let value = read_s33(bytes, pos)?;
-    if value >= 0 {
-        return Ok(BlockType::Type(value as u32));
+    let single_byte_valtype = matches!(byte, 0x7b..=0x7f | 0x70 | 0x6f);
+    if single_byte_valtype || byte == 0x63 || byte == 0x64 {
+        return Ok(BlockType::Val(decode_valtype(bytes, pos)?));
     }
-    // Negative s33 values encode a value type: byte = value + 128.
-    let byte = (value + 128) as u8;
-    match ValType::from_byte(byte) {
-        Some(val) => Ok(BlockType::Val(val)),
-        None => Err(Error::Malformed("malformed block type")),
+    let index = read_s33(bytes, pos)?;
+    if index < 0 {
+        return Err(Error::Malformed("malformed block type"));
     }
+    Ok(BlockType::Type(index as u32))
 }
 
 fn decode_element(bytes: &[u8], pos: &mut usize) -> Result<ElementSegment, Error> {
@@ -558,7 +567,7 @@ fn decode_func_indices(
     pos: &mut usize,
     count: u32,
 ) -> Result<Vec<Vec<Instr>>, Error> {
-    let mut init = Vec::with_capacity(count as usize);
+    let mut init = Vec::new();
     for _ in 0..count {
         let index = read_u32(bytes, pos)?;
         init.push(vec![Instr::RefFunc(index)]);
@@ -567,7 +576,7 @@ fn decode_func_indices(
 }
 
 fn decode_expressions(bytes: &[u8], pos: &mut usize, count: u32) -> Result<Vec<Vec<Instr>>, Error> {
-    let mut init = Vec::with_capacity(count as usize);
+    let mut init = Vec::new();
     for _ in 0..count {
         init.push(decode_expr(bytes, pos)?);
     }
@@ -636,9 +645,14 @@ fn decode_body(body: &[u8]) -> Result<FuncBody, Error> {
     for _ in 0..group_count {
         let count = read_u32(body, &mut pos)?;
         let ty = decode_valtype(body, &mut pos)?;
-        for _ in 0..count {
-            locals.push(ty);
+        // A local group compresses many locals into a few bytes; cap the
+        // expansion so a hostile count cannot exhaust memory before
+        // validation runs.
+        let remaining = locals.len().saturating_add(count as usize);
+        if remaining > MAX_LOCALS {
+            return Err(Error::Malformed("too many locals"));
         }
+        locals.resize(remaining, ty);
     }
     let instructions = decode_expr(body, &mut pos)?;
     Ok(FuncBody {
@@ -693,7 +707,7 @@ fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Erro
         0x0d => Ok(Instr::BrIf(read_u32(bytes, pos)?)),
         0x0e => {
             let count = read_u32(bytes, pos)?;
-            let mut targets = Vec::with_capacity(count as usize);
+            let mut targets = Vec::new();
             for _ in 0..count {
                 targets.push(read_u32(bytes, pos)?);
             }

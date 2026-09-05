@@ -565,9 +565,9 @@ impl Machine {
     }
 
     fn label_types(&self, index: usize) -> Result<Vec<ValType>, Error> {
-        // Labels target the enclosing blocks; the function frame is not a
-        // branch target.
-        if index >= self.frames.len() - 1 {
+        // Labels count every enclosing frame including the function's
+        // implicit label (whose types are the function results).
+        if index >= self.frames.len() {
             return Err(Error::Invalid("unknown label"));
         }
         let frame = &self.frames[self.frames.len() - 1 - index];
@@ -642,6 +642,12 @@ impl Machine {
                     // frame so outer validation still sees it.
                     self.frames.push(frame);
                 } else {
+                    if frame.ctrl == Ctrl::If && frame.end_types != frame.start_types {
+                        // An `if` without an `else` leaves the block's
+                        // parameters as its results on the false path, so the
+                        // block type must be the identity.
+                        return Err(Error::Invalid("type mismatch"));
+                    }
                     // The block's results become the enclosing frame's
                     // operands.
                     self.push_vals(&frame.end_types);
@@ -1437,6 +1443,69 @@ mod tests {
         let stray = vec![Instr::I32Const(7)];
         let m = module(vec![func_type(vec![], vec![])], vec![(0, vec![], stray)]);
         assert!(validate(&m).is_err());
+    }
+
+    #[test]
+    fn function_implicit_label_is_a_branch_target() {
+        // `(func (br 0))` branches to the function's own label.
+        let body = vec![Instr::Br(0)];
+        let m = module(vec![func_type(vec![], vec![])], vec![(0, vec![], body)]);
+        assert!(validate(&m).is_ok());
+
+        // Branching needs the function's results on the stack.
+        let body = vec![Instr::I32Const(1), Instr::Br(0)];
+        let m = module(
+            vec![func_type(vec![], vec![ValType::I32])],
+            vec![(0, vec![], body)],
+        );
+        assert!(validate(&m).is_ok());
+        let missing = vec![Instr::Br(0)];
+        let m = module(
+            vec![func_type(vec![], vec![ValType::I32])],
+            vec![(0, vec![], missing)],
+        );
+        assert!(validate(&m).is_err());
+
+        // Label 1 from inside a block targets the function label too.
+        let deep = vec![Instr::Block(BlockType::Empty), Instr::Br(1), Instr::End];
+        let m = module(vec![func_type(vec![], vec![])], vec![(0, vec![], deep)]);
+        assert!(validate(&m).is_ok());
+    }
+
+    #[test]
+    fn if_without_else_must_be_identity_typed() {
+        // `(if (result i32) (then (i32.const 1)))` cannot feed the false
+        // path, so it is invalid.
+        let body = vec![
+            Instr::I32Const(1),
+            Instr::If(BlockType::Val(ValType::I32)),
+            Instr::I32Const(1),
+            Instr::End,
+        ];
+        let m = module(
+            vec![func_type(vec![], vec![ValType::I32])],
+            vec![(0, vec![], body)],
+        );
+        assert!(validate(&m).is_err());
+
+        // But an else-less `if (param i32 i32) (result i32 i32)` is the
+        // identity on the false path and is valid.
+        let identity = func_type(
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32, ValType::I32],
+        );
+        let body = vec![
+            Instr::I32Const(1),
+            Instr::I32Const(2),
+            Instr::I32Const(0), // condition
+            Instr::If(BlockType::Type(0)),
+            Instr::End,
+        ];
+        let m = module(vec![identity], vec![(0, vec![], body)]);
+        assert!(
+            validate(&m).is_ok(),
+            "identity if without else should validate"
+        );
     }
 
     #[test]

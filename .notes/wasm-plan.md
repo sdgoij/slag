@@ -395,3 +395,35 @@ validity files.**
   `type-rec.wast`, `type-canon.wast` use `(rec …)` type-section text that
   wabt 1.0.41 cannot parse (recursive types + canonicalization are Cut 9).
   Revisit with a GC-capable converter and the Cut 9 rec-type decoder.
+
+### Top-level suite survey (2026-09-05, Cut 3 lead-in)
+
+Ran the whole convertible top-level corpus (91 of 97 files) through the
+runner: **3987 pass / 73 fail / 17683 pending** (pending = execution,
+linking, and JS-boundary commands — later cuts). Converters cannot parse
+6 files (`annotations` text-only, `instance` module-linking-style
+instantiation syntax, `ref_null`/`type-*` GC/`(rec)` text).
+
+Systemic fixes landed during the survey:
+- Decoder: bounded preallocation from untrusted LEB counts (48 GiB OOM on
+  a `binary.wast` malformed fixture); `if`-frame End; no-else-if identity
+  rule; function implicit label is a branch target (labels now include the
+  function frame); block types embed full `valtype`s (`0x63`/`0x64` forms),
+  not just single-byte value types.
+
+Failures by owner:
+- **Cut 1 backlog (decoder structural checks):** `binary.wast` (22),
+  `binary-leb128.wast` (4), `align.wast` (4), `custom.wast` (1),
+  `address.wast` (1) — mostly `assert_malformed` fixtures our decoder
+  accepts.
+- **Memory/table limits validation:** `memory.wast` (13, limits ≤ 2¹⁶,
+  u64/LEB bounds), `table.wast` (9) — Cuts 4/5/8.
+- **Typed function references / non-defaultable locals (Cut 5):**
+  `br_on_non_null` (3 module bodies), `ref` (5), `ref_func` (2),
+  `call_ref` (1), `local_init` (3), `func.wast` uninitialized-typed-local
+  (1), `return_call`/`return_call_indirect`/`return_call_ref` (tail-call
+  operand typing).
+
+All Cut-3 gate families (`block`, `loop`, `if`, `br`, `br_if`, `br_table`,
+`switch`, `return`, `labels`, `nop`, `unreachable`, `local_get/set/tee`)
+validate their module bodies — the validator is ready for Cut 3.
