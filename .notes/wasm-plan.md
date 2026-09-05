@@ -367,6 +367,11 @@ review, per repo rules hygiene.
 
 ## 9. Status
 
+**2026-09-05 — Cut 4 (functions/calls/globals/memory/instantiation)
+landed**; see the Cut 4 entry below. Remaining for a fully-green Cut 4
+DoD: host/`register` import resolution (spectest + cross-module) and the
+`instance.wast` converter gap.
+
 **2026-09-05 — Cut 2 (validation) green on its gate, plus the module-level
 validity files.**
 
@@ -454,3 +459,69 @@ validate their module bodies — the validator is ready for Cut 3.
   `traps`, `skip-stack-guard-page`. `local_init` stays excluded (typed,
   non-defaultable locals are Cut 5); `traps`' remaining memory cases and
   the `call_indirect`/memory "as-argument" assertions pend on Cuts 4-5.
+
+### Cut 4 — functions, calls, globals, memory, instantiation (2026-09-05)
+
+- `exec.rs` grows linear memory: `Memory { bytes, max_pages }` with
+  `memory.size`/`memory.grow` (wasm32 capped at 2¹⁶ pages even without a
+  declared max), LE load/store for every width with the extend forms, and
+  OOB trapping on effective-address overflow. Active data segments are
+  copied at instantiation (before the start function); `instantiate` runs
+  the start function. `return_call` replaces the top frame in place at the
+  same operand-stack base (tail position reuses the slot, so tail
+  recursion does not consume the depth budget).
+- Validator/decoder fixes this cut, all driven by the gate:
+  - Tail calls validate with subsumption, not equality: a callee may
+    produce `(ref null $t)` where `funcref` was declared (`return_call.wast`
+    `type-funcref`).
+  - Memory limits decode as **u64 LEB** (wabt encodes page counts beyond
+    2³² for the `assert_invalid` fixtures) and validation bounds memory32
+    at 2¹⁶ pages — imported memory types too (`memory.wast` size limits).
+  - Memargs are the post-memory64 form: a single flags byte (low 6 bits
+    alignment exponent, bit 6 = explicit memory index, >= 0x80 malformed)
+    then a u64 LEB offset; validation rejects offsets > 2³²-1 as "offset
+    out of range" and keeps alignment <= natural. `Load`/`Store` offsets
+    are `u64` in the instruction model (`align.wast` malformed-flags and
+    `offset=2⁶⁴-1` fixtures).
+- Runner: quote-based (`.wat`) modules are reported *pending* — the engine
+  has no text parser, so those cannot be judged — instead of the previous
+  accidental decode-misclassification.
+- Gate (all 0 fail unless noted; pending = future cuts / import
+  machinery):
+
+  ```
+  func           147 pass /  1 fail / 27 pending   (fail = uninitialized typed local, Cut 5)
+  call            88 pass /  0 fail /  3 pending
+  forward          5 pass /  0 fail /  0 pending
+  fac              8 pass /  0 fail /  0 pending
+  start           15 pass /  0 fail /  5 pending
+  global          50 pass /  0 fail / 74 pending   (needs spectest imports)
+  memory          87 pass /  0 fail /  3 pending
+  memory_trap    182 pass /  0 fail /  0 pending
+  memory_size    42 pass /  0 fail /  0 pending
+  memory_grow    95 pass /  0 fail / 11 pending
+  memory_redund   8 pass /  0 fail /  0 pending
+  load            80 pass /  0 fail / 17 pending
+  store           61 pass /  0 fail /  7 pending
+  address        259 pass /  0 fail /  1 pending
+  align          119 pass /  0 fail / 46 pending   (46 = quote text modules)
+  endianness     69 pass /  0 fail /  0 pending
+  data            36 pass /  1 fail / 31 pending   (fail = post-memory.init load, Cut 5)
+  float_memory   90 pass /  0 fail /  0 pending
+  left-to-right  92 pass /  0 fail /  4 pending
+  exports        92 pass /  0 fail /  5 pending
+  imports         9 pass /  0 fail /209 pending
+  linking         7 pass /  0 fail /156 pending
+  return_call    16 pass /  0 fail / 35 pending
+  ```
+
+- **Deferred with written taxonomy (Cut 4 remainder):** the host/module
+  *import* machinery — resolving imports from the `spectest` host module
+  and from `register`-named module instances, plus `assert_unlinkable`/
+  `assert_uninstantiable` and `register` themselves. That is what unlocks
+  `global.wast`, `imports.wast`, `linking.wast`, and the register-linked
+  halves of `memory_grow`/`start`/`return_call`/`exports`. `instance.wast`
+  cannot be converted: its `(module instance …)` syntax is beyond wabt
+  1.0.41 (and `wast2json-rs`). Known Cut 5 spillover, counted not
+  hidden: `func.wast`'s uninitialized-typed-local `assert_invalid` and
+  `data.wast`'s post-`memory.init` `assert_return`.

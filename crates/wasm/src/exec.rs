@@ -10,8 +10,8 @@
 //! instructions, and exceptions — those land in later cuts. Internal `call`s
 //! and numeric `global.get/set` work.
 
-use crate::instr::{Instr, NumOp};
-use crate::module::{ExportKind, ImportDesc, Module};
+use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
+use crate::module::{DataMode, ExportKind, ImportDesc, Module};
 use crate::types::{BlockType, ValType};
 use crate::values::{Trap, Value, exec_num};
 
@@ -33,29 +33,99 @@ impl From<Trap> for ExecFail {
 /// bounded stack).
 pub const DEFAULT_DEPTH_LIMIT: usize = 4096;
 
-/// A module instance. Cut 3 state is the globals only; memories/tables are
-/// allocated in later cuts.
+/// The page size of linear memory, in bytes.
+pub const PAGE_SIZE: u64 = 65536;
+
+/// A linear memory: growable byte storage plus its declared maximum.
+#[derive(Debug)]
+pub struct Memory {
+    pub bytes: Vec<u8>,
+    max_pages: Option<u64>,
+}
+
+impl Memory {
+    fn pages(&self) -> u64 {
+        self.bytes.len() as u64 / PAGE_SIZE
+    }
+
+    /// Grow by `delta` pages; returns the old size in pages, or `-1` when the
+    /// growth would exceed the limits (a wasm32 memory is capped at 2^16
+    /// pages even without a declared maximum).
+    fn grow(&mut self, delta: u64) -> i32 {
+        let old = self.pages();
+        let Some(new) = old.checked_add(delta) else {
+            return -1;
+        };
+        let cap = self.max_pages.unwrap_or(1 << 16);
+        if new > cap {
+            return -1;
+        }
+        self.bytes.resize((new * PAGE_SIZE) as usize, 0);
+        old as i32
+    }
+}
+
+/// A module instance. State per instance: globals and linear memories;
+/// tables arrive in Cut 5.
 pub struct Instance {
     module: Module,
     globals: Vec<Value>,
+    memories: Vec<Memory>,
     depth_limit: usize,
 }
 
-/// Instantiate a module. Host imports and reference-typed globals are
-/// unsupported in this cut.
+/// Instantiate a module. Host imports are unsupported in this cut.
 pub fn instantiate(module: &Module) -> Result<Instance, ExecFail> {
     if !module.imports.is_empty() {
         return Err(ExecFail::Trap(Trap::UnsupportedImport));
     }
-    let mut globals = Vec::with_capacity(module.globals.len());
-    for global in &module.globals {
-        globals.push(eval_const(&global.init, &globals)?);
+    let mut memories = Vec::with_capacity(module.memories.len());
+    for mem in &module.memories {
+        if mem.memory64 {
+            return Err(ExecFail::Unsupported("memory64 (Cut 8)"));
+        }
+        let min_bytes = (mem.limits.min * PAGE_SIZE) as usize;
+        memories.push(Memory {
+            bytes: vec![0; min_bytes],
+            max_pages: mem.limits.max,
+        });
     }
-    Ok(Instance {
+    let mut instance = Instance {
         module: module.clone(),
-        globals,
+        globals: Vec::new(),
+        memories,
         depth_limit: DEFAULT_DEPTH_LIMIT,
-    })
+    };
+    for global in &module.globals {
+        let value = eval_const(&global.init, &instance.globals)?;
+        instance.globals.push(value);
+    }
+    // Apply active data segments in order.
+    for segment in &module.data {
+        if let DataMode::Active { memory, offset } = &segment.mode {
+            let Some(mem) = instance.memories.get_mut(*memory as usize) else {
+                return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+            };
+            let offset_value = eval_const(offset, &instance.globals)?;
+            let Value::I32(offset) = offset_value else {
+                return Err(ExecFail::Unsupported("non-i32 data offset"));
+            };
+            let start = offset as u32 as usize;
+            let end = start.checked_add(segment.bytes.len());
+            let Some(end) = end else {
+                return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+            };
+            if end > mem.bytes.len() {
+                return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+            }
+            mem.bytes[start..end].copy_from_slice(&segment.bytes);
+        }
+    }
+    // Run the start function, if any.
+    if let Some(start) = module.start {
+        instance.run_defined(start as usize, &[])?;
+    }
+    Ok(instance)
 }
 
 fn imported_func_count(module: &Module) -> usize {
@@ -86,7 +156,11 @@ impl Instance {
         if index < imported {
             return Err(ExecFail::Trap(Trap::UnsupportedImport));
         }
-        let defined = index - imported;
+        self.run_defined(index - imported, args)
+    }
+
+    /// Run a module-defined function by its index into `Module::bodies`.
+    fn run_defined(&mut self, defined: usize, args: &[Value]) -> Result<Vec<Value>, ExecFail> {
         let body = self
             .module
             .bodies
@@ -292,11 +366,14 @@ impl<'a> Engine<'a> {
                 self.do_call(index as usize)?;
                 Ok(Ctl::Settled)
             }
-            Instr::ReturnCall(_)
-            | Instr::ReturnCallIndirect { .. }
+            Instr::ReturnCall(index) => {
+                self.do_tail_call(index as usize)?;
+                Ok(Ctl::Settled)
+            }
+            Instr::ReturnCallIndirect { .. }
             | Instr::ReturnCallRef(_)
             | Instr::CallIndirect { .. }
-            | Instr::CallRef(_) => Err(ExecFail::Unsupported("indirect/tail calls (Cuts 4-5)")),
+            | Instr::CallRef(_) => Err(ExecFail::Unsupported("indirect calls (Cut 5)")),
             Instr::Drop => {
                 self.pop()?;
                 Ok(Ctl::Next)
@@ -360,6 +437,64 @@ impl<'a> Engine<'a> {
                 self.stack.push(exec_num(op, &operands)?);
                 Ok(Ctl::Next)
             }
+            Instr::Load { op, offset, .. } => {
+                let addr = self.pop_i32()? as u32 as u64;
+                let size = load_size(op);
+                let ea = addr
+                    .checked_add(offset)
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+                let Some(mem) = self.inst.memories.first() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
+                let len = mem.bytes.len() as u64;
+                if ea.checked_add(size as u64).is_none_or(|end| end > len) {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+                }
+                let start = ea as usize;
+                let value = read_mem(op, &mem.bytes[start..start + size]);
+                self.stack.push(value);
+                Ok(Ctl::Next)
+            }
+            Instr::Store { op, offset, .. } => {
+                let value = self.pop()?;
+                let addr = self.pop_i32()? as u32 as u64;
+                let size = store_size(op);
+                let ea = addr
+                    .checked_add(offset)
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+                let Some(mem) = self.inst.memories.first_mut() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
+                let len = mem.bytes.len() as u64;
+                if ea.checked_add(size as u64).is_none_or(|end| end > len) {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+                }
+                let start = ea as usize;
+                write_mem(op, value, &mut mem.bytes[start..start + size]);
+                Ok(Ctl::Next)
+            }
+            Instr::MemorySize => {
+                let Some(mem) = self.inst.memories.first() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
+                self.stack.push(Value::I32(mem.pages() as i32));
+                Ok(Ctl::Next)
+            }
+            Instr::MemoryGrow => {
+                let delta = self.pop_i32()? as u32 as u64;
+                let Some(mem) = self.inst.memories.first_mut() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
+                let old = mem.grow(delta);
+                self.stack.push(Value::I32(old));
+                Ok(Ctl::Next)
+            }
+            Instr::MemoryInit { data_index: _, .. } | Instr::DataDrop(_) => {
+                Err(ExecFail::Unsupported("bulk memory (Cut 5)"))
+            }
+            Instr::MemoryCopy | Instr::MemoryFill => {
+                Err(ExecFail::Unsupported("bulk memory (Cut 5)"))
+            }
             Instr::RefNull(_)
             | Instr::RefIsNull
             | Instr::RefFunc(_)
@@ -369,20 +504,12 @@ impl<'a> Engine<'a> {
             | Instr::BrOnNonNull(_) => Err(ExecFail::Unsupported("reference values (Cut 5)")),
             Instr::TableGet(_)
             | Instr::TableSet(_)
-            | Instr::Load { .. }
-            | Instr::Store { .. }
-            | Instr::MemorySize
-            | Instr::MemoryGrow
-            | Instr::MemoryInit { .. }
-            | Instr::DataDrop(_)
-            | Instr::MemoryCopy
-            | Instr::MemoryFill
             | Instr::TableInit { .. }
             | Instr::ElemDrop(_)
             | Instr::TableCopy
             | Instr::TableGrow
             | Instr::TableSize
-            | Instr::TableFill => Err(ExecFail::Unsupported("memory/table (Cuts 4-5)")),
+            | Instr::TableFill => Err(ExecFail::Unsupported("tables (Cut 5)")),
         }
     }
 
@@ -577,6 +704,67 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// Make a tail call (`return_call`) from the top frame: pop the callee's
+    /// arguments, then replace the top frame in place with the callee's frame
+    /// at the same operand-stack base, so the callee's results flow to the
+    /// caller of the (now replaced) frame. Everything else above the base —
+    /// values owned by the tail frame's not-yet-exited labels — is discarded
+    /// when the callee finishes, matching the spec's unwinding of `return_call`.
+    fn do_tail_call(&mut self, index: usize) -> Result<(), ExecFail> {
+        let imported = imported_func_count(&self.inst.module);
+        if index < imported {
+            return Err(ExecFail::Trap(Trap::UnsupportedImport));
+        }
+        let defined = index - imported;
+        let (param_count, result_count, declared) = {
+            let module = &self.inst.module;
+            let body = module
+                .bodies
+                .get(defined)
+                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+            let type_index = *module
+                .functions
+                .get(defined)
+                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+            let signature = module
+                .types
+                .get(type_index as usize)
+                .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+            (
+                signature.params.len(),
+                signature.results.len(),
+                body.locals.clone(),
+            )
+        };
+        // Pop arguments (last parameter sits on top), in parameter order.
+        let mut args = Vec::with_capacity(param_count);
+        for _ in 0..param_count {
+            args.push(self.pop()?);
+        }
+        args.reverse();
+        let mut locals = args;
+        for ty in &declared {
+            locals.push(default_value(*ty)?);
+        }
+        let top = self.frames.len() - 1;
+        let base = self.frames[top].base;
+        self.frames.pop();
+        self.frames.push(Frame {
+            pc: 0,
+            locals,
+            base,
+            results: result_count,
+            body_index: defined,
+            labels: vec![Label {
+                arity: result_count,
+                height: base,
+                is_loop: false,
+                open: 0,
+            }],
+        });
+        Ok(())
+    }
+
     /// Pop the top frame, transferring its results to its caller. Returns the
     /// results when the popped frame was the outermost one.
     fn finish_top(&mut self) -> Result<Option<Vec<Value>>, ExecFail> {
@@ -636,6 +824,79 @@ fn num_inputs(op: NumOp) -> usize {
         | I32TruncSatF32U | I32TruncSatF64S | I32TruncSatF64U | I64TruncSatF32S
         | I64TruncSatF32U | I64TruncSatF64S | I64TruncSatF64U => 1,
         _ => 2,
+    }
+}
+
+/// Bytes an `iN.load*` reads from memory (spec 2.4.5).
+fn load_size(op: LoadOp) -> usize {
+    use LoadOp::*;
+    match op {
+        I32 | F32 => 4,
+        I64 | F64 => 8,
+        I32Load8S | I32Load8U | I64Load8S | I64Load8U => 1,
+        I32Load16S | I32Load16U | I64Load16S | I64Load16U => 2,
+        I64Load32S | I64Load32U => 4,
+    }
+}
+
+/// Bytes an `iN.store*` writes to memory.
+fn store_size(op: StoreOp) -> usize {
+    use StoreOp::*;
+    match op {
+        I32 | F32 => 4,
+        I64 | F64 => 8,
+        I32Store8 | I64Store8 => 1,
+        I32Store16 | I64Store16 => 2,
+        I64Store32 => 4,
+    }
+}
+
+/// Little-endian read of `bytes` as a u64 (the caller slices exactly
+/// [`load_size`] bytes; unused high bytes are zero).
+fn le_u64(bytes: &[u8]) -> u64 {
+    let mut value = 0u64;
+    for (shift, &byte) in bytes.iter().enumerate() {
+        value |= u64::from(byte) << (8 * shift);
+    }
+    value
+}
+
+/// Interpret the memory slice as the loaded value (with the load's sign or
+/// zero extension).
+fn read_mem(op: LoadOp, bytes: &[u8]) -> Value {
+    use LoadOp::*;
+    let raw = le_u64(bytes);
+    match op {
+        I32 => Value::I32(raw as u32 as i32),
+        I64 => Value::I64(raw as i64),
+        F32 => Value::F32(raw as u32),
+        F64 => Value::F64(raw),
+        I32Load8S => Value::I32((raw as u8) as i8 as i32),
+        I32Load8U => Value::I32((raw as u8) as i32),
+        I32Load16S => Value::I32((raw as u16) as i16 as i32),
+        I32Load16U => Value::I32((raw as u16) as i32),
+        I64Load8S => Value::I64((raw as u8) as i8 as i64),
+        I64Load8U => Value::I64((raw as u8) as i64),
+        I64Load16S => Value::I64((raw as u16) as i16 as i64),
+        I64Load16U => Value::I64((raw as u16) as i64),
+        I64Load32S => Value::I64((raw as u32) as i32 as i64),
+        I64Load32U => Value::I64((raw as u32) as i64),
+    }
+}
+
+/// Store the value's low bits, little-endian, over the memory slice (the
+/// caller slices exactly [`store_size`] bytes).
+fn write_mem(_op: StoreOp, value: Value, bytes: &mut [u8]) {
+    let bits = match value {
+        Value::I32(v) => v as u32 as u64,
+        Value::I64(v) => v as u64,
+        Value::F32(bits) => bits as u64,
+        Value::F64(bits) => bits,
+    };
+    // The caller slices exactly `store_size(_op)` bytes, so writing the low
+    // bytes of `bits` little-endian covers every store width.
+    for (shift, byte) in bytes.iter_mut().enumerate() {
+        *byte = (bits >> (8 * shift)) as u8;
     }
 }
 

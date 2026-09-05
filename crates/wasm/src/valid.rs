@@ -87,7 +87,10 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
                 validate_table_type(ty, module.types.len())?;
                 tables.push(*ty);
             }
-            ImportDesc::Memory(ty) => memories.push(*ty),
+            ImportDesc::Memory(ty) => {
+                validate_mem_type(ty)?;
+                memories.push(*ty)
+            }
             ImportDesc::Global(ty) => {
                 check_value_types(&[ty.value], module.types.len(), 0)?;
                 globals.push(*ty);
@@ -174,10 +177,28 @@ fn validate_limits(limits: &Limits) -> Result<(), Error> {
     Ok(())
 }
 
+/// A memory type must have ordered limits and, for wasm32 (the only form this
+/// engine decodes), page counts within 2^16 (4 GiB).
+fn validate_mem_type(memory: &MemType) -> Result<(), Error> {
+    validate_limits(&memory.limits)?;
+    if !memory.memory64 {
+        const MAX_MEM32_PAGES: u64 = 1 << 16;
+        let within = memory.limits.min <= MAX_MEM32_PAGES
+            && memory.limits.max.is_none_or(|max| max <= MAX_MEM32_PAGES);
+        if !within {
+            return Err(Error::Invalid("memory size"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_module_limits(module: &Module) -> Result<(), Error> {
     if module.memories.len() > 1 {
         // Baseline: at most one memory (multi-memory is a later cut).
         return Err(Error::Invalid("multiple memories"));
+    }
+    for memory in &module.memories {
+        validate_mem_type(memory)?;
     }
     if let Some(count) = module.data_count
         && count as usize != module.data.len()
@@ -806,12 +827,12 @@ impl Machine {
                 self.pop_expected(ValType::Ref(table.element))?;
                 self.pop_expected(ValType::I32)?;
             }
-            Instr::Load {
-                op,
-                align,
-                offset: _,
-            } => {
+            Instr::Load { op, align, offset } => {
                 memory_ok(spaces)?;
+                if *offset > u64::from(u32::MAX) {
+                    // Memory32 memarg offsets must fit the address type.
+                    return Err(Error::Invalid("offset out of range"));
+                }
                 let natural = load_natural(*op);
                 if *align > natural {
                     return Err(Error::Invalid("alignment must not be larger than natural"));
@@ -819,12 +840,11 @@ impl Machine {
                 self.pop_expected(ValType::I32)?;
                 self.push_val(load_result(*op));
             }
-            Instr::Store {
-                op,
-                align,
-                offset: _,
-            } => {
+            Instr::Store { op, align, offset } => {
                 memory_ok(spaces)?;
+                if *offset > u64::from(u32::MAX) {
+                    return Err(Error::Invalid("offset out of range"));
+                }
                 let natural = store_natural(*op);
                 if *align > natural {
                     return Err(Error::Invalid("alignment must not be larger than natural"));
@@ -989,8 +1009,16 @@ impl Machine {
 
     fn tail_call(&mut self, ty: FuncType, signature: &FuncType) -> Result<(), Error> {
         self.pop_vals(&ty.params)?;
-        if ty.results != signature.results {
+        // The callee's results become this function's results, so each must
+        // be a subtype of the declared result type (typed references: a
+        // callee may produce `(ref null $t)` where `funcref` was declared).
+        if ty.results.len() != signature.results.len() {
             return Err(Error::Invalid("type mismatch"));
+        }
+        for (declared, actual) in signature.results.iter().zip(&ty.results) {
+            if !matches_val(*declared, *actual) {
+                return Err(Error::Invalid("type mismatch"));
+            }
         }
         self.unreachable();
         Ok(())

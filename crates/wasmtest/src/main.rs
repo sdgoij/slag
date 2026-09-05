@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use serde_json::Value;
-use wasm::valid::Error as ValidError;
 use wasm::Value as WasmValue;
+use wasm::valid::Error as ValidError;
 use wasm::{DecodeError, ExecFail, Instance, Trap, decode, instantiate, validate};
 
 const USAGE: &str = "\
@@ -206,8 +206,8 @@ fn run_json(json_path: &Path) -> Tally {
         let outcome = match kind {
             "module" => {
                 let module = command.get("module").unwrap_or(command);
-                match module_file(module, dir) {
-                    Some((_, bytes)) => match decode(&bytes) {
+                match module_source(module, dir) {
+                    ModuleSource::Binary(bytes) => match decode(&bytes) {
                         Err(error) => Outcome::Fail(format!("module decode: {error}")),
                         Ok(module) => match validate(&module) {
                             Err(error) => Outcome::Fail(format!("module invalid: {error}")),
@@ -226,37 +226,46 @@ fn run_json(json_path: &Path) -> Tally {
                             },
                         },
                     },
-                    None => Outcome::Pending("module without a file"),
+                    ModuleSource::Text => Outcome::Pending("quote text module"),
+                    ModuleSource::Missing => Outcome::Pending("module without a file"),
                 }
             }
             "assert_malformed" => {
                 let module = command.get("module").unwrap_or(command);
-                match module_file(module, dir) {
-                    Some((_, bytes)) => match decode(&bytes) {
+                match module_source(module, dir) {
+                    ModuleSource::Binary(bytes) => match decode(&bytes) {
                         Err(DecodeError::Malformed(_)) => Outcome::Pass,
                         Err(DecodeError::Unsupported(_)) => Outcome::Fail(
                             "expected malformed, decoder hit unsupported feature".into(),
                         ),
                         Ok(_) => Outcome::Fail("expected malformed, module decoded".into()),
                     },
-                    None => Outcome::Pending("assert_malformed without a module file"),
+                    ModuleSource::Text => Outcome::Pending("quote text module"),
+                    ModuleSource::Missing => {
+                        Outcome::Pending("assert_malformed without a module file")
+                    }
                 }
             }
-            "assert_invalid" => match module_file(command.get("module").unwrap_or(command), dir) {
-                Some((_, bytes)) => match decode(&bytes) {
-                    Err(DecodeError::Malformed(message)) => Outcome::Fail(format!(
-                        "expected invalid, decoder says malformed: {message}"
-                    )),
-                    Err(DecodeError::Unsupported(_)) => {
-                        Outcome::Fail("expected invalid, decoder hit unsupported feature".into())
-                    }
-                    Ok(module) => match validate(&module) {
-                        Err(ValidError::Invalid(_)) => Outcome::Pass,
-                        Ok(_) => Outcome::Fail("expected invalid, module validated".into()),
+            "assert_invalid" => {
+                match module_source(command.get("module").unwrap_or(command), dir) {
+                    ModuleSource::Binary(bytes) => match decode(&bytes) {
+                        Err(DecodeError::Malformed(message)) => Outcome::Fail(format!(
+                            "expected invalid, decoder says malformed: {message}"
+                        )),
+                        Err(DecodeError::Unsupported(_)) => Outcome::Fail(
+                            "expected invalid, decoder hit unsupported feature".into(),
+                        ),
+                        Ok(module) => match validate(&module) {
+                            Err(ValidError::Invalid(_)) => Outcome::Pass,
+                            Ok(_) => Outcome::Fail("expected invalid, module validated".into()),
+                        },
                     },
-                },
-                None => Outcome::Pending("assert_invalid without a module file"),
-            },
+                    ModuleSource::Text => Outcome::Pending("quote text module"),
+                    ModuleSource::Missing => {
+                        Outcome::Pending("assert_invalid without a module file")
+                    }
+                }
+            }
             "register" => {
                 // The most recent module becomes addressable by name (its
                 // exports can be imported by later modules — Cut 4).
@@ -285,7 +294,9 @@ fn run_json(json_path: &Path) -> Tally {
                                 Err(ActOutcome::Unsupported(reason)) => Outcome::Pending(reason),
                             },
                             "assert_return" => match result {
-                                Ok(values) => match command.get("expected").and_then(Value::as_array)
+                                Ok(values) => match command
+                                    .get("expected")
+                                    .and_then(Value::as_array)
                                 {
                                     Some(expected) => {
                                         if expected.len() != values.len()
@@ -385,9 +396,9 @@ fn run_action(instance: &mut Instance, action: &Value) -> Result<Vec<WasmValue>,
             let mut args = Vec::new();
             if let Some(arg_values) = action.get("args").and_then(Value::as_array) {
                 for arg in arg_values {
-                    args.push(parse_const(arg).ok_or(ActOutcome::Unsupported(
-                        "unparseable argument",
-                    ))?);
+                    args.push(
+                        parse_const(arg).ok_or(ActOutcome::Unsupported("unparseable argument"))?,
+                    );
                 }
             }
             instance.invoke(index, &args).map_err(ActOutcome::from)
@@ -465,6 +476,25 @@ fn trap_text(trap: Trap) -> &'static str {
     }
 }
 
+/// A module command's file, classified by what the runner can do with it:
+/// binary `.wasm` (decodable) versus quote `.wat` text, which needs a text
+/// parser the engine does not have (reported pending at the call sites).
+enum ModuleSource {
+    Binary(Vec<u8>),
+    Text,
+    Missing,
+}
+
+fn module_source(command: &Value, dir: &Path) -> ModuleSource {
+    match module_file(command, dir) {
+        Some((path, _bytes)) if path.extension().is_some_and(|ext| ext == "wat") => {
+            ModuleSource::Text
+        }
+        Some((_, bytes)) => ModuleSource::Binary(bytes),
+        None => ModuleSource::Missing,
+    }
+}
+
 /// Resolve a command's module reference (either a top-level `filename` or a
 /// nested `module.filename`) to its bytes.
 fn module_file(command: &Value, dir: &Path) -> Option<(PathBuf, Vec<u8>)> {
@@ -472,7 +502,6 @@ fn module_file(command: &Value, dir: &Path) -> Option<(PathBuf, Vec<u8>)> {
     let path = dir.join(filename);
     fs::read(&path).ok().map(|bytes| (path, bytes))
 }
-
 
 // ---- conversion (wast2json-rs, wabt fallback) ----
 

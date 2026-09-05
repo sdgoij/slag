@@ -374,8 +374,8 @@ fn decode_heap_type(bytes: &[u8], pos: &mut usize) -> Result<HeapType, Error> {
 
 fn decode_limits(bytes: &[u8], pos: &mut usize) -> Result<Limits, Error> {
     let flags = read_u32(bytes, pos)?;
-    // 0x00 min, 0x01 min+max. Shared memories (0x02/0x03) and memory64
-    // (0x04/0x05) are later cuts.
+    // 0x00 min, 0x01 min+max. Shared tables (0x02/0x03) are a later cut.
+    // Table limits stay u32-sized; see `decode_memory_limits` for memories.
     match flags {
         0 => {
             let min = u64::from(read_u32(bytes, pos)?);
@@ -384,6 +384,27 @@ fn decode_limits(bytes: &[u8], pos: &mut usize) -> Result<Limits, Error> {
         1 => {
             let min = u64::from(read_u32(bytes, pos)?);
             let max = Some(u64::from(read_u32(bytes, pos)?));
+            Ok(Limits::new(min, max))
+        }
+        _ => Err(Error::Unsupported("shared limits")),
+    }
+}
+
+/// Memory limits (spec 5.3.12): the limit values are u64 LEB128 even for
+/// 32-bit memories, so out-of-range page counts (e.g. 2^32) still decode and
+/// are rejected by validation instead.
+fn decode_memory_limits(bytes: &[u8], pos: &mut usize) -> Result<Limits, Error> {
+    let flags = read_u32(bytes, pos)?;
+    // 0x00 min, 0x01 min+max (memory32). Shared memories (0x02/0x03) and
+    // memory64 (0x04/0x05) are later cuts.
+    match flags {
+        0 => {
+            let min = read_leb(bytes, pos, 10)?;
+            Ok(Limits::new(min, None))
+        }
+        1 => {
+            let min = read_leb(bytes, pos, 10)?;
+            let max = Some(read_leb(bytes, pos, 10)?);
             Ok(Limits::new(min, max))
         }
         _ => Err(Error::Unsupported("shared or memory64 limits")),
@@ -412,11 +433,31 @@ fn decode_table_entry(bytes: &[u8], pos: &mut usize) -> Result<Table, Error> {
 }
 
 fn decode_mem_type(bytes: &[u8], pos: &mut usize) -> Result<MemType, Error> {
-    let limits = decode_limits(bytes, pos)?;
+    let limits = decode_memory_limits(bytes, pos)?;
     Ok(MemType {
         limits,
         memory64: false,
     })
+}
+
+/// A load/store memarg (spec 5.4.5): a single flags byte holding the
+/// alignment exponent (low 6 bits) and a memory-index marker (bit 6), then a
+/// u64 LEB offset. Flags >= 0x80 are malformed.
+fn decode_memarg(bytes: &[u8], pos: &mut usize) -> Result<(u32, u64), Error> {
+    let flags = read_u8(bytes, pos)?;
+    if flags & 0x80 != 0 {
+        return Err(Error::Malformed("malformed memop flags"));
+    }
+    let align = u32::from(flags & 0x3f);
+    if flags & 0x40 != 0 {
+        // Multi-memory encoding: an explicit memory index follows.
+        let memory = read_u32(bytes, pos)?;
+        if memory != 0 {
+            return Err(Error::Unsupported("multi-memory"));
+        }
+    }
+    let offset = read_leb(bytes, pos, 10)?;
+    Ok((align, offset))
 }
 
 fn decode_global_type(bytes: &[u8], pos: &mut usize) -> Result<GlobalType, Error> {
@@ -765,8 +806,7 @@ fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Erro
                 0x34 => (LoadOp::I64Load32S, 4),
                 _ => (LoadOp::I64Load32U, 4),
             };
-            let align = read_u32(bytes, pos)?;
-            let offset = read_u32(bytes, pos)?;
+            let (align, offset) = decode_memarg(bytes, pos)?;
             Ok(Instr::Load { op, align, offset })
         }
         0x36..=0x3e => {
@@ -781,8 +821,7 @@ fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Erro
                 0x3d => StoreOp::I64Store16,
                 _ => StoreOp::I64Store32,
             };
-            let align = read_u32(bytes, pos)?;
-            let offset = read_u32(bytes, pos)?;
+            let (align, offset) = decode_memarg(bytes, pos)?;
             Ok(Instr::Store { op, align, offset })
         }
         0x3f => {

@@ -235,12 +235,12 @@ pub enum Instr {
     Load {
         op: LoadOp,
         align: u32,
-        offset: u32,
+        offset: u64,
     },
     Store {
         op: StoreOp,
         align: u32,
-        offset: u32,
+        offset: u64,
     },
     MemorySize,
     MemoryGrow,
