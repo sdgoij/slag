@@ -10,14 +10,18 @@
 //! decoded module; Cut 3+ executes it.
 
 pub mod binary;
+pub mod exec;
 pub mod instr;
 pub mod module;
 pub mod types;
 pub mod valid;
+pub mod values;
 
 pub use binary::{Error as DecodeError, decode};
+pub use exec::{ExecFail, Instance, instantiate};
 pub use module::Module;
 pub use valid::validate;
+pub use values::{Trap, Value};
 
 /// The decoder's error type, re-exported under its phase's name for clarity
 /// next to `valid::Error`.

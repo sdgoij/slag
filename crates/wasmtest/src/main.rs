@@ -7,18 +7,20 @@
 //! `.notes/wasm-plan.md` for the cut plan.
 //!
 //! Command outcomes are classified by what the current engine can judge:
-//! module decodes and `assert_malformed` are decidable now (Cut 1);
-//! `assert_invalid` needs validation (Cut 2) and invocations/`assert_return`
-//! need execution (Cut 3) — those count as *pending*, not pass or fail, so
-//! the runner stays honest as cuts land.
+//! decoding/validation/`assert_invalid` are Cut 1-2; instantiating modules
+//! and running `assert_return`/`assert_trap`/`assert_exhaustion` are Cut 3+.
+//! Anything behind a later cut counts as *pending*, not pass or fail, so the
+//! runner stays honest as cuts land.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use serde_json::Value;
 use wasm::valid::Error as ValidError;
-use wasm::{DecodeError, decode, validate};
+use wasm::Value as WasmValue;
+use wasm::{DecodeError, ExecFail, Instance, Trap, decode, instantiate, validate};
 
 const USAGE: &str = "\
 wasmtest — WebAssembly conformance runner
@@ -190,6 +192,11 @@ fn run_json(json_path: &Path) -> Tally {
         return tally;
     };
 
+    // Instance state across a file's commands: the most recent module plus
+    // modules given a name by `register`.
+    let mut last: Option<Instance> = None;
+    let mut named: HashMap<String, Instance> = HashMap::new();
+
     for command in commands {
         let line = command.get("line").and_then(Value::as_u64).unwrap_or(0);
         let kind = command
@@ -203,8 +210,20 @@ fn run_json(json_path: &Path) -> Tally {
                     Some((_, bytes)) => match decode(&bytes) {
                         Err(error) => Outcome::Fail(format!("module decode: {error}")),
                         Ok(module) => match validate(&module) {
-                            Ok(_) => Outcome::Pass,
                             Err(error) => Outcome::Fail(format!("module invalid: {error}")),
+                            Ok(_) => match instantiate(&module) {
+                                Ok(instance) => {
+                                    last = Some(instance);
+                                    Outcome::Pass
+                                }
+                                Err(ExecFail::Trap(Trap::UnsupportedImport)) => {
+                                    Outcome::Pending("module imports (Cut 4)")
+                                }
+                                Err(ExecFail::Unsupported(reason)) => Outcome::Pending(reason),
+                                Err(ExecFail::Trap(_)) => {
+                                    Outcome::Fail("module failed to instantiate".into())
+                                }
+                            },
                         },
                     },
                     None => Outcome::Pending("module without a file"),
@@ -238,13 +257,85 @@ fn run_json(json_path: &Path) -> Tally {
                 },
                 None => Outcome::Pending("assert_invalid without a module file"),
             },
-            "assert_unlinkable" => Outcome::Pending("linking (Cut 4)"),
-            "register"
-            | "action"
-            | "assert_return"
-            | "assert_trap"
-            | "assert_exhaustion"
-            | "assert_uninstantiable" => Outcome::Pending("execution (Cut 3)"),
+            "register" => {
+                // The most recent module becomes addressable by name (its
+                // exports can be imported by later modules — Cut 4).
+                if let Some(instance) = last.take()
+                    && let Some(name) = command.get("as").and_then(Value::as_str)
+                {
+                    named.insert(name.to_string(), instance);
+                }
+                Outcome::Pending("register (Cut 4)")
+            }
+            "action" | "assert_return" | "assert_trap" | "assert_exhaustion" => {
+                let action = command.get("action").unwrap_or(command);
+                let instance = if let Some(name) = action.get("module").and_then(Value::as_str) {
+                    named.get_mut(name)
+                } else {
+                    last.as_mut()
+                };
+                match instance {
+                    None => Outcome::Pending("no module to act on"),
+                    Some(instance) => {
+                        let result = run_action(instance, action);
+                        match kind {
+                            "action" => match result {
+                                Ok(_) => Outcome::Pass,
+                                Err(ActOutcome::Trap(_)) => Outcome::Fail("action trapped".into()),
+                                Err(ActOutcome::Unsupported(reason)) => Outcome::Pending(reason),
+                            },
+                            "assert_return" => match result {
+                                Ok(values) => match command.get("expected").and_then(Value::as_array)
+                                {
+                                    Some(expected) => {
+                                        if expected.len() != values.len()
+                                            || expected
+                                                .iter()
+                                                .zip(&values)
+                                                .any(|(e, a)| !matches_expected(e, *a))
+                                        {
+                                            Outcome::Fail("results differ from expected".into())
+                                        } else {
+                                            Outcome::Pass
+                                        }
+                                    }
+                                    None => Outcome::Fail("assert_return without expected".into()),
+                                },
+                                Err(ActOutcome::Trap(_)) => {
+                                    Outcome::Fail("expected return, trapped".into())
+                                }
+                                Err(ActOutcome::Unsupported(reason)) => Outcome::Pending(reason),
+                            },
+                            "assert_trap" => match result {
+                                Err(ActOutcome::Trap(trap)) => {
+                                    let expected =
+                                        command.get("text").and_then(Value::as_str).unwrap_or("");
+                                    if trap_text(trap) == expected {
+                                        Outcome::Pass
+                                    } else {
+                                        Outcome::Fail(format!(
+                                            "trapped with {:?}, expected {expected:?}",
+                                            trap
+                                        ))
+                                    }
+                                }
+                                Ok(_) => Outcome::Fail("expected trap, returned".into()),
+                                Err(ActOutcome::Unsupported(reason)) => Outcome::Pending(reason),
+                            },
+                            "assert_exhaustion" => match result {
+                                Err(ActOutcome::Trap(Trap::CallStackExhausted)) => Outcome::Pass,
+                                Err(ActOutcome::Trap(_)) => {
+                                    Outcome::Fail("expected exhaustion, other trap".into())
+                                }
+                                Ok(_) => Outcome::Fail("expected exhaustion, returned".into()),
+                                Err(ActOutcome::Unsupported(reason)) => Outcome::Pending(reason),
+                            },
+                            _ => Outcome::Pending("execution (Cut 3)"),
+                        }
+                    }
+                }
+            }
+            "assert_unlinkable" | "assert_uninstantiable" => Outcome::Pending("linking (Cut 4)"),
             other => Outcome::Fail(format!("unknown command type {other:?}")),
         };
         match outcome {
@@ -268,6 +359,112 @@ enum Outcome {
     Fail(String),
 }
 
+enum ActOutcome {
+    Trap(Trap),
+    Unsupported(&'static str),
+}
+
+impl From<ExecFail> for ActOutcome {
+    fn from(fail: ExecFail) -> Self {
+        match fail {
+            ExecFail::Trap(trap) => ActOutcome::Trap(trap),
+            ExecFail::Unsupported(reason) => ActOutcome::Unsupported(reason),
+        }
+    }
+}
+
+/// Run an `invoke` (or `get`) action against an instance.
+fn run_action(instance: &mut Instance, action: &Value) -> Result<Vec<WasmValue>, ActOutcome> {
+    let kind = action.get("type").and_then(Value::as_str).unwrap_or("");
+    let field = action.get("field").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "invoke" => {
+            let index = instance
+                .exported_func(field)
+                .ok_or(ActOutcome::Unsupported("unknown function export"))?;
+            let mut args = Vec::new();
+            if let Some(arg_values) = action.get("args").and_then(Value::as_array) {
+                for arg in arg_values {
+                    args.push(parse_const(arg).ok_or(ActOutcome::Unsupported(
+                        "unparseable argument",
+                    ))?);
+                }
+            }
+            instance.invoke(index, &args).map_err(ActOutcome::from)
+        }
+        _ => Err(ActOutcome::Unsupported("non-invoke action")),
+    }
+}
+
+/// Parse a JSON const (or expected) entry `{"type": ..., "value": ...}` into
+/// a runtime value. NaN patterns are only legal in expectations.
+fn parse_const(entry: &serde_json::Value) -> Option<WasmValue> {
+    let ty = entry.get("type").and_then(Value::as_str)?;
+    let value = entry.get("value").and_then(Value::as_str)?;
+    if value.starts_with("nan:") {
+        return None;
+    }
+    let bits = value.parse::<u64>().ok()?;
+    Some(match ty {
+        "i32" => WasmValue::I32(bits as i32),
+        "i64" => WasmValue::I64(bits as i64),
+        "f32" => WasmValue::F32(bits as u32),
+        "f64" => WasmValue::F64(bits),
+        _ => return None,
+    })
+}
+
+/// Whether an actual result value satisfies an expected entry (which may be
+/// a NaN pattern).
+fn matches_expected(expected: &serde_json::Value, actual: WasmValue) -> bool {
+    let ty = expected.get("type").and_then(Value::as_str);
+    let value = expected.get("value").and_then(Value::as_str);
+    let (ty, value) = match (ty, value) {
+        (Some(ty), Some(value)) => (ty, value),
+        _ => return false,
+    };
+    let bits = match actual {
+        WasmValue::I32(v) => v as u32 as u64,
+        WasmValue::I64(v) => v as u64,
+        WasmValue::F32(v) => v as u64,
+        WasmValue::F64(v) => v,
+    };
+    match value {
+        "nan:canonical" => match ty {
+            "f32" => bits & 0x7fff_ffff == 0x7fc0_0000,
+            "f64" => bits & 0x7fff_ffff_ffff_ffff == 0x7ff8_0000_0000_0000,
+            _ => false,
+        },
+        "nan:arithmetic" => match ty {
+            "f32" => bits & 0x7f80_0000 == 0x7f80_0000 && bits & 0x007f_ffff >= 0x0040_0000,
+            "f64" => {
+                bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+                    && bits & 0x000f_ffff_ffff_ffff >= 0x0008_0000_0000_0000
+            }
+            _ => false,
+        },
+        _ => parse_const(expected) == Some(actual),
+    }
+}
+
+/// The spec's trap message for each trap kind, for `assert_trap` text checks.
+fn trap_text(trap: Trap) -> &'static str {
+    match trap {
+        Trap::Unreachable => "unreachable",
+        Trap::IntegerDivideByZero => "integer divide by zero",
+        Trap::IntegerOverflow => "integer overflow",
+        Trap::InvalidConversionToInteger => "invalid conversion to integer",
+        Trap::OutOfBoundsMemoryAccess => "out of bounds memory access",
+        Trap::IndirectCallTypeMismatch => "indirect call type mismatch",
+        Trap::UndefinedElement => "undefined element",
+        Trap::CallStackExhausted => "call stack exhausted",
+        Trap::UninitializedElement => "uninitialized element",
+        Trap::NullReference => "null reference",
+        Trap::UnsupportedImport => "unsupported import",
+        Trap::UnknownFunction => "unknown function",
+    }
+}
+
 /// Resolve a command's module reference (either a top-level `filename` or a
 /// nested `module.filename`) to its bytes.
 fn module_file(command: &Value, dir: &Path) -> Option<(PathBuf, Vec<u8>)> {
@@ -275,6 +472,7 @@ fn module_file(command: &Value, dir: &Path) -> Option<(PathBuf, Vec<u8>)> {
     let path = dir.join(filename);
     fs::read(&path).ok().map(|bytes| (path, bytes))
 }
+
 
 // ---- conversion (wast2json-rs, wabt fallback) ----
 

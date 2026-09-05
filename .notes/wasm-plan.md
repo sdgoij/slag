@@ -427,3 +427,30 @@ Failures by owner:
 All Cut-3 gate families (`block`, `loop`, `if`, `br`, `br_if`, `br_table`,
 `switch`, `return`, `labels`, `nop`, `unreachable`, `local_get/set/tee`)
 validate their module bodies — the validator is ready for Cut 3.
+
+### Cut 3 — execution core green (2026-09-05)
+
+- `values.rs`: the value space plus the full ch. 4.3 numeric semantics —
+  wrapping integer arithmetic, masked shifts/rotates, div/rem traps,
+  truncating and saturating conversions, float ops with spec `min`/`max`
+  signed-zero rules, `nearest` ties-to-even, and the canonical-quiet-NaN
+  policy (bit-wise `abs`/`neg`/`copysign` preserve payloads).
+- `exec.rs`: a flat-pc machine on one shared operand stack with explicit
+  function frames (locals + control labels) and a depth-limited call stack,
+  so deep recursion (`skip-stack-guard-page.wast`) never touches the host
+  stack. Instances own their globals; `instantiate`/`invoke` are exported.
+  Unsupported paths (memory/table instructions, reference values, host
+  imports, indirect/tail calls) report `ExecFail::Unsupported` so the
+  runner counts them *pending*, not failed.
+- Runner: `module` commands now instantiate; `register` names modules;
+  `action`/`assert_return`/`assert_trap`/`assert_exhaustion` execute and
+  compare results, including `nan:canonical`/`nan:arithmetic` expectations
+  and the spec trap messages.
+- Gate: 0 failures across `i32`, `i64`, `f32`, `f32_bitwise`, `f32_cmp`,
+  `f64`, `f64_bitwise`, `f64_cmp`, `conversions`, `const`, `int_exprs`,
+  `int_literals`, `float_exprs`, `float_literals`, `float_misc`, `block`,
+  `loop`, `if`, `br`, `br_if`, `br_table`, `switch`, `return`, `labels`,
+  `nop`, `unreachable`, `stack`, `local_get`, `local_set`, `local_tee`,
+  `traps`, `skip-stack-guard-page`. `local_init` stays excluded (typed,
+  non-defaultable locals are Cut 5); `traps`' remaining memory cases and
+  the `call_indirect`/memory "as-argument" assertions pend on Cuts 4-5.
