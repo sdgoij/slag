@@ -15,7 +15,7 @@
 //! Not executed yet ([`ExecFail::Unsupported`]): SIMD (Cut 7), memory64
 //! (Cut 8), and GC reference operations (Cut 9).
 
-use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp};
+use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
 use crate::types::{BlockType, FuncType, GlobalType, Limits, MemType, RefType, TableType, ValType};
 use crate::values::{FuncAddr, RefValue, Trap, Value, exec_num};
@@ -1246,6 +1246,124 @@ impl<'a> Engine<'a> {
                 self.stack.push(exec_num(op, &operands)?);
                 Ok(Ctl::Next)
             }
+            // ---- v128 (Cut 7) ----
+            Instr::V128Const(bits) => {
+                self.stack.push(Value::V128(bits));
+                Ok(Ctl::Next)
+            }
+            Instr::VecLoad { op, offset, .. } => {
+                let instance = self.frames[frame_index].instance;
+                let Some(&cell) = self.store.instances[instance].memories.first() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
+                let addr = self.pop_i32()? as u32 as u64;
+                let size = vec_load_bytes(op) as u64;
+                let ea = addr
+                    .checked_add(offset)
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+                let len = self.store.memories[cell].bytes.len() as u64;
+                if ea.checked_add(size).is_none_or(|end| end > len) {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+                }
+                let start = ea as usize;
+                let bytes = &self.store.memories[cell].bytes[start..start + size as usize];
+                let value = load_vec(op, bytes).ok_or(ExecFail::Unsupported("simd load form"))?;
+                self.stack.push(Value::V128(value));
+                Ok(Ctl::Next)
+            }
+            Instr::VecStore { offset, .. } => {
+                let value = self.pop()?;
+                let addr = self.pop_i32()? as u32 as u64;
+                let instance = self.frames[frame_index].instance;
+                let Some(&cell) = self.store.instances[instance].memories.first() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
+                let Value::V128(bits) = value else {
+                    return Err(ExecFail::Unsupported("non-v128 store"));
+                };
+                let ea = addr
+                    .checked_add(offset)
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+                let len = self.store.memories[cell].bytes.len() as u64;
+                if ea.checked_add(16).is_none_or(|end| end > len) {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+                }
+                let start = ea as usize;
+                self.store.memories[cell].bytes[start..start + 16]
+                    .copy_from_slice(&bits.to_le_bytes());
+                Ok(Ctl::Next)
+            }
+            Instr::VecLaneLoad {
+                size, offset, lane, ..
+            } => {
+                let vector = self.pop_v128()?;
+                let addr = self.pop_i32()? as u32 as u64;
+                let instance = self.frames[frame_index].instance;
+                let Some(&cell) = self.store.instances[instance].memories.first() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
+                let size = size as u64;
+                let ea = addr
+                    .checked_add(offset)
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+                let len = self.store.memories[cell].bytes.len() as u64;
+                if ea.checked_add(size).is_none_or(|end| end > len) {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+                }
+                let start = ea as usize;
+                let mut bits = 0u64;
+                for (i, &byte) in self.store.memories[cell].bytes[start..start + size as usize]
+                    .iter()
+                    .enumerate()
+                {
+                    bits |= u64::from(byte) << (8 * i);
+                }
+                let out = crate::simd::set_lane(vector, lane as usize, size as usize, bits);
+                self.stack.push(Value::V128(out));
+                Ok(Ctl::Next)
+            }
+            Instr::VecLaneStore {
+                size, offset, lane, ..
+            } => {
+                let vector = self.pop_v128()?;
+                let addr = self.pop_i32()? as u32 as u64;
+                let instance = self.frames[frame_index].instance;
+                let Some(&cell) = self.store.instances[instance].memories.first() else {
+                    return Err(ExecFail::Unsupported("no memory"));
+                };
+                let size = size as u64;
+                let ea = addr
+                    .checked_add(offset)
+                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+                let len = self.store.memories[cell].bytes.len() as u64;
+                if ea.checked_add(size).is_none_or(|end| end > len) {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+                }
+                let start = ea as usize;
+                let bits = crate::simd::lane_bits(vector, lane as usize, size as usize);
+                for (i, byte) in self.store.memories[cell].bytes[start..start + size as usize]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *byte = (bits >> (8 * i)) as u8;
+                }
+                Ok(Ctl::Next)
+            }
+            Instr::VecShuffle(lanes) => {
+                let b = self.pop_v128()?;
+                let a = self.pop_v128()?;
+                let mut out = 0u128;
+                for (i, &lane) in lanes.iter().enumerate() {
+                    let source = if lane < 16 { a } else { b };
+                    let index = (lane & 15) as usize;
+                    let byte = crate::simd::lane_bits(source, index, 1);
+                    out = crate::simd::set_lane(out, i, 1, byte);
+                }
+                self.stack.push(Value::V128(out));
+                Ok(Ctl::Next)
+            }
+            Instr::Vec(sub) => self.simd_exec(sub, None),
+            Instr::VecLane { op, lane } => self.simd_exec(op, Some(lane)),
             Instr::Load { op, offset, .. } => {
                 let instance = self.frames[frame_index].instance;
                 let Some(&cell) = self.store.instances[instance].memories.first() else {
@@ -1580,6 +1698,86 @@ impl<'a> Engine<'a> {
     fn advance(&mut self, next: usize) {
         let frame_index = self.frames.len() - 1;
         self.frames[frame_index].pc = next;
+    }
+
+    /// Pop a v128 value (validated code only ever has one here).
+    fn pop_v128(&mut self) -> Result<u128, ExecFail> {
+        match self.pop()? {
+            Value::V128(value) => Ok(value),
+            _ => Err(ExecFail::Unsupported("expected v128 operand")),
+        }
+    }
+
+    /// Execute a pure-register (or lane-immediate) v128 op. `lane` is present
+    /// for the extract/replace forms.
+    fn simd_exec(&mut self, sub: u16, lane: Option<u8>) -> Result<Ctl, ExecFail> {
+        use crate::simd::VecSig;
+        let unsupported = || ExecFail::Unsupported("simd opcode");
+        match crate::simd::sig(sub) {
+            Some(VecSig::Not) => {
+                let v = self.pop_v128()?;
+                self.stack.push(Value::V128(crate::simd::exec_not(v)));
+            }
+            Some(VecSig::Unop) => {
+                let v = self.pop_v128()?;
+                let out = crate::simd::exec_unop(sub, v).ok_or_else(unsupported)?;
+                self.stack.push(Value::V128(out));
+            }
+            Some(VecSig::Binop) => {
+                let b = self.pop_v128()?;
+                let a = self.pop_v128()?;
+                let out = crate::simd::exec_binop(sub, a, b).ok_or_else(unsupported)?;
+                self.stack.push(Value::V128(out));
+            }
+            Some(VecSig::Ternop) => {
+                let c = self.pop_v128()?;
+                let b = self.pop_v128()?;
+                let a = self.pop_v128()?;
+                self.stack
+                    .push(Value::V128(crate::simd::exec_bitselect(a, b, c)));
+            }
+            Some(VecSig::Shift) => {
+                let count = self.pop_i32()? as u32;
+                let v = self.pop_v128()?;
+                let out = crate::simd::exec_shift(sub, v, count).ok_or_else(unsupported)?;
+                self.stack.push(Value::V128(out));
+            }
+            Some(VecSig::Splat(kind)) => {
+                let scalar = self.pop()?;
+                let bits =
+                    crate::simd::scalar_to_lane_bits(scalar, kind).ok_or_else(unsupported)?;
+                let out = crate::simd::exec_splat(sub, bits).ok_or_else(unsupported)?;
+                self.stack.push(Value::V128(out));
+            }
+            Some(VecSig::ExtractS(kind) | VecSig::ExtractU(kind) | VecSig::Extract(kind)) => {
+                let v = self.pop_v128()?;
+                let index = lane.ok_or_else(unsupported)? as usize;
+                let value = crate::simd::exec_extract(sub, v, index).ok_or_else(unsupported)?;
+                let _ = kind;
+                self.stack.push(value);
+            }
+            Some(VecSig::Replace(kind)) => {
+                let scalar = self.pop()?;
+                let bits =
+                    crate::simd::scalar_to_lane_bits(scalar, kind).ok_or_else(unsupported)?;
+                let v = self.pop_v128()?;
+                let index = lane.ok_or_else(unsupported)? as usize;
+                let out = crate::simd::exec_replace(sub, v, index, bits).ok_or_else(unsupported)?;
+                self.stack.push(Value::V128(out));
+            }
+            Some(VecSig::Test) => {
+                let v = self.pop_v128()?;
+                let out = crate::simd::exec_any_all_true(sub, v).ok_or_else(unsupported)?;
+                self.stack.push(Value::I32(out));
+            }
+            Some(VecSig::Bitmask) => {
+                let v = self.pop_v128()?;
+                let out = crate::simd::exec_bitmask(sub, v).ok_or_else(unsupported)?;
+                self.stack.push(Value::I32(out));
+            }
+            None => return Err(unsupported()),
+        }
+        Ok(Ctl::Next)
     }
 
     /// Enter a `block`/`loop`/`if` at `pc` (which is the top frame's pc).
@@ -2046,7 +2244,7 @@ fn default_value(ty: ValType) -> Result<Value, ExecFail> {
         ValType::I64 => Value::I64(0),
         ValType::F32 => Value::F32(0),
         ValType::F64 => Value::F64(0),
-        ValType::V128 => return Err(ExecFail::Unsupported("v128 (Cut 7)")),
+        ValType::V128 => Value::V128(0),
         // Non-defaultable (non-null) reference locals are validated as
         // initialized-before-use; the null placeholder below is never read by
         // a valid module.
@@ -2082,6 +2280,105 @@ fn load_size(op: LoadOp) -> usize {
         I32Load16S | I32Load16U | I64Load16S | I64Load16U => 2,
         I64Load32S | I64Load32U => 4,
     }
+}
+
+/// Bytes a `v128.load*` reads (spec 2.4.5).
+fn vec_load_bytes(op: VecLoadOp) -> usize {
+    match op {
+        VecLoadOp::V128 => 16,
+        VecLoadOp::I8x8S
+        | VecLoadOp::I8x8U
+        | VecLoadOp::I16x4S
+        | VecLoadOp::I16x4U
+        | VecLoadOp::I32x2S
+        | VecLoadOp::I32x2U
+        | VecLoadOp::I64Splat
+        | VecLoadOp::I64Zero => 8,
+        VecLoadOp::I8Splat => 1,
+        VecLoadOp::I16Splat => 2,
+        VecLoadOp::I32Splat | VecLoadOp::I32Zero => 4,
+    }
+}
+
+/// Materialize a v128 from a `v128.load*` memory slice.
+fn load_vec(op: VecLoadOp, bytes: &[u8]) -> Option<u128> {
+    use crate::simd::set_lane;
+    let le = |bytes: &[u8]| -> u64 {
+        let mut out = 0u64;
+        for (i, &b) in bytes.iter().enumerate() {
+            out |= u64::from(b) << (8 * i);
+        }
+        out
+    };
+    let mut out = 0u128;
+    match op {
+        VecLoadOp::V128 => out = u128::from_le_bytes(bytes.try_into().ok()?),
+        VecLoadOp::I8x8S | VecLoadOp::I8x8U => {
+            let signed = matches!(op, VecLoadOp::I8x8S);
+            for (i, &b) in bytes.iter().enumerate() {
+                let wide = if signed {
+                    (b as i8) as i16 as u16 as u64
+                } else {
+                    u64::from(b)
+                };
+                out = set_lane(out, i, 2, wide);
+            }
+        }
+        VecLoadOp::I16x4S | VecLoadOp::I16x4U => {
+            let signed = matches!(op, VecLoadOp::I16x4S);
+            for i in 0..4 {
+                let raw = le(&bytes[2 * i..2 * i + 2]) as u16;
+                let wide = if signed {
+                    (raw as i16) as i32 as u32 as u64
+                } else {
+                    u64::from(raw)
+                };
+                out = set_lane(out, i, 4, wide);
+            }
+        }
+        VecLoadOp::I32x2S | VecLoadOp::I32x2U => {
+            let signed = matches!(op, VecLoadOp::I32x2S);
+            for i in 0..2 {
+                let raw = le(&bytes[4 * i..4 * i + 4]) as u32;
+                let wide = if signed {
+                    (raw as i32) as i64 as u64
+                } else {
+                    u64::from(raw)
+                };
+                out = set_lane(out, i, 8, wide);
+            }
+        }
+        VecLoadOp::I8Splat => {
+            for i in 0..16 {
+                out = set_lane(out, i, 1, u64::from(bytes[0]));
+            }
+        }
+        VecLoadOp::I16Splat => {
+            let raw = le(&bytes[0..2]);
+            for i in 0..8 {
+                out = set_lane(out, i, 2, raw);
+            }
+        }
+        VecLoadOp::I32Splat => {
+            let raw = le(&bytes[0..4]);
+            for i in 0..4 {
+                out = set_lane(out, i, 4, raw);
+            }
+        }
+        VecLoadOp::I64Splat => {
+            let raw = le(&bytes[0..8]);
+            for i in 0..2 {
+                out = set_lane(out, i, 8, raw);
+            }
+        }
+        VecLoadOp::I32Zero => {
+            out = set_lane(0, 0, 4, le(&bytes[0..4]));
+        }
+        VecLoadOp::I64Zero => {
+            out = set_lane(0, 0, 8, le(&bytes[0..8]));
+        }
+    }
+    Some(out)
 }
 
 /// Bytes an `iN.store*` writes to memory.
@@ -2137,6 +2434,7 @@ fn write_mem(_op: StoreOp, value: Value, bytes: &mut [u8]) {
         Value::I64(v) => v as u64,
         Value::F32(bits) => bits as u64,
         Value::F64(bits) => bits,
+        Value::V128(bits) => bits as u64,
         Value::Ref(_) => 0,
     };
     for (shift, byte) in bytes.iter_mut().enumerate() {
@@ -2203,6 +2501,7 @@ fn eval_const(expr: &[Instr], globals: &[Value], func_instance: usize) -> Result
             Instr::I64Const(v) => stack.push(Value::I64(*v)),
             Instr::F32Const(bits) => stack.push(Value::F32(*bits)),
             Instr::F64Const(bits) => stack.push(Value::F64(*bits)),
+            Instr::V128Const(bits) => stack.push(Value::V128(*bits)),
             Instr::GlobalGet(index) => {
                 let value = *globals
                     .get(*index as usize)

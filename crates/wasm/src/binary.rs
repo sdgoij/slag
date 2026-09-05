@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp};
+use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{
     CustomSection, DataMode, DataSegment, ElementMode, ElementSegment, Export, ExportKind,
     FuncBody, Global, Import, ImportDesc, Module, Table,
@@ -895,10 +895,116 @@ fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Erro
         0xd5 => Ok(Instr::BrOnNull(read_u32(bytes, pos)?)),
         0xd6 => Ok(Instr::BrOnNonNull(read_u32(bytes, pos)?)),
         0xfc => decode_fc(bytes, pos),
+        0xfd => decode_simd(bytes, pos),
         opcode @ 0x45..=0xc4 => numeric_op(opcode)
             .map(Instr::Num)
             .ok_or(Error::Malformed("illegal opcode")),
         _ => Err(Error::Unsupported("instruction")),
+    }
+}
+
+/// Map a 0xfd load-form subopcode to its [`VecLoadOp`].
+fn vec_load_op(sub: u16) -> VecLoadOp {
+    use VecLoadOp::*;
+    match sub {
+        0x00 => V128,
+        0x01 => I8x8S,
+        0x02 => I8x8U,
+        0x03 => I16x4S,
+        0x04 => I16x4U,
+        0x05 => I32x2S,
+        0x06 => I32x2U,
+        0x07 => I8Splat,
+        0x08 => I16Splat,
+        0x09 => I32Splat,
+        0x0a => I64Splat,
+        0x5c => I32Zero,
+        0x5d => I64Zero,
+        _ => V128,
+    }
+}
+
+/// Decode the 0xfd SIMD prefix (spec 5.4). The wave of opcodes with full
+/// decode+validate+exec support is handled; everything else stays
+/// [`Error::Unsupported`] so its modules count as pending, not wrong.
+fn decode_simd(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
+    let sub = read_u32(bytes, pos)?;
+    if sub > u32::from(u16::MAX) {
+        return Err(Error::Unsupported("simd opcode"));
+    }
+    let sub = sub as u16;
+    match sub {
+        0x00..=0x0a => {
+            let (align, offset) = decode_memarg(bytes, pos)?;
+            Ok(Instr::VecLoad {
+                op: vec_load_op(sub),
+                align,
+                offset,
+            })
+        }
+        0x0b => {
+            let (align, offset) = decode_memarg(bytes, pos)?;
+            Ok(Instr::VecStore { align, offset })
+        }
+        0x5c | 0x5d => {
+            let (align, offset) = decode_memarg(bytes, pos)?;
+            Ok(Instr::VecLoad {
+                op: vec_load_op(sub),
+                align,
+                offset,
+            })
+        }
+        0x0c => {
+            // `v128.const`: sixteen little-endian bytes.
+            let mut raw = [0u8; 16];
+            for slot in &mut raw {
+                *slot = read_u8(bytes, pos)?;
+            }
+            Ok(Instr::V128Const(u128::from_le_bytes(raw)))
+        }
+        0x0d => {
+            // `i8x16.shuffle`: sixteen lane-index bytes.
+            let mut lanes = [0u8; 16];
+            for slot in &mut lanes {
+                *slot = read_u8(bytes, pos)?;
+            }
+            Ok(Instr::VecShuffle(lanes))
+        }
+        0x54..=0x5b => {
+            // v128 lane loads (0x54-0x57) and stores (0x58-0x5b).
+            let (align, offset) = decode_memarg(bytes, pos)?;
+            let lane = read_u8(bytes, pos)?;
+            let size = match sub {
+                0x54 | 0x58 => 1u8,
+                0x55 | 0x59 => 2,
+                0x56 | 0x5a => 4,
+                _ => 8,
+            };
+            if sub < 0x58 {
+                Ok(Instr::VecLaneLoad {
+                    size,
+                    align,
+                    offset,
+                    lane,
+                })
+            } else {
+                Ok(Instr::VecLaneStore {
+                    size,
+                    align,
+                    offset,
+                    lane,
+                })
+            }
+        }
+        _ if crate::simd::sig(sub).is_some() => {
+            if (0x15..=0x22).contains(&sub) {
+                let lane = read_u8(bytes, pos)?;
+                Ok(Instr::VecLane { op: sub, lane })
+            } else {
+                Ok(Instr::Vec(sub))
+            }
+        }
+        _ => Err(Error::Unsupported("simd opcode")),
     }
 }
 

@@ -207,6 +207,25 @@ pub enum Catch {
     AllRef { label: u32 },
 }
 
+/// The v128 memory load forms (spec 2.4.5): plain, sign/zero-extending
+/// narrow loads, splat loads, and zero loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VecLoadOp {
+    V128,
+    I8x8S,
+    I8x8U,
+    I16x4S,
+    I16x4U,
+    I32x2S,
+    I32x2U,
+    I8Splat,
+    I16Splat,
+    I32Splat,
+    I64Splat,
+    I32Zero,
+    I64Zero,
+}
+
 /// A decoded instruction. The list produced by the code-section decoder is
 /// flat: structured control keeps its `Block`/`Loop`/`If`/`TryTable`/`Else`/`End`
 /// markers so validation can re-derive nesting.
@@ -278,6 +297,44 @@ pub enum Instr {
     BrOnNonNull(u32),
     Throw(u32),
     ThrowRef,
+    /// `v128.const` (0xfd 0x0c): the 16 little-endian bytes of the vector.
+    V128Const(u128),
+    /// A v128 load (0xfd 0x00-0x0a, 0x5c-0x5d).
+    VecLoad {
+        op: VecLoadOp,
+        align: u32,
+        offset: u64,
+    },
+    /// `v128.store` (0xfd 0x0b).
+    VecStore {
+        align: u32,
+        offset: u64,
+    },
+    /// A v128 lane load/store (0xfd 0x54-0x5b): `size` is the lane's byte
+    /// width.
+    VecLaneLoad {
+        size: u8,
+        align: u32,
+        offset: u64,
+        lane: u8,
+    },
+    VecLaneStore {
+        size: u8,
+        align: u32,
+        offset: u64,
+        lane: u8,
+    },
+    /// `i8x16.shuffle` (0xfd 0x0d): the 16 lane indices (0-31).
+    VecShuffle([u8; 16]),
+    /// A pure register-to-register v128 op (0xfd), keyed by its subopcode;
+    /// `simd::sig` types it and the executor dispatches it.
+    Vec(u16),
+    /// A v128 lane op with a lane immediate: extract/replace forms
+    /// (0xfd 0x15-0x22).
+    VecLane {
+        op: u16,
+        lane: u8,
+    },
     MemoryInit {
         data_index: u32,
         memory: u32,

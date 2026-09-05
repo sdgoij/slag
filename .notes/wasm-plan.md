@@ -670,3 +670,96 @@ more empty `(block …)` makes the same function wrongly reject; no green
 corpus fixture exercises the rejected shape. A later cleanup should
 propagate the unreachable flag outward at `End` instead of faking the
 ended frame's result types.
+
+### Cut 7a — SIMD wave 1: substrate + const/lane/memory/bitwise/compare (2026-09-05)
+
+The v128 substrate landed: `Value::V128(u128)` (little-endian lanes, lane
+0 low), the runner's v128 const parsing/compare (per-lane, with
+`nan:canonical`/`nan:arithmetic` patterns and u64-range lanes), and a new
+`simd.rs` semantic module. The 0xfd space decodes: `v128.const`/load/
+store, the lane loads/stores, `i8x16.shuffle`/`swizzle`, all splats and
+extract/replace lanes, every integer and float comparison, the bitwise
+ops (`not/and/andnot/or/xor/bitselect`), `any_true`/`all_true`/`bitmask`,
+and the integer shifts and add/sub (i8x16/i16x8/i32x4/i64x2).
+`v128.const` is a valid constant expression (globals/instantiation).
+
+Green (0 fail): `simd_const` 577, `simd_lane` 369, `simd_bitwise` 169,
+`simd_boolean` 273, `simd_bit_shift` 237, `simd_select` 7, `simd_store`
+25, the lane load/store files (52/36/24/16 each), and the comparison
+suites `simd_i8x16_cmp` 445, `simd_i16x8_cmp` 465, `simd_i32x4_cmp` 465,
+`simd_i64x2_cmp` 113, `simd_f32x4_cmp` 2601, `simd_f64x2_cmp` 2679
+(≈6 800 assertions). No regression anywhere else. Two traps found:
+8-byte lane masks must not special-case `u128::MAX` (it clears the whole
+register on lane-0 replace), and i64x2 comparisons have no unsigned
+forms so they map to a 6-op table, not the 10-op table of the smaller
+shapes.
+
+**Remaining (Cut 7b)**: the arithmetic families (`*_arith*`, sat arith,
+min/max/avgr, narrow, q15mulr, abs/neg/popcnt unops), `*_arith2` files'
+extmul/extadd/dot, the conversions (trunc_sat, convert, promote/demote,
+`simd_int_to_int_extend`, `simd_splat`), the extend/splat/zero load
+forms (`simd_load*`), and `relaxed-simd/`. Most of those files' modules
+decode as unsupported today (honest pending); a few `assert_invalid`
+modules whose assertions need decoding count as fails until the opcodes
+land.
+
+### Cut 7b — SIMD wave 2: arithmetic + conversions (2026-09-05)
+
+The rest of the non-relaxed 0xfd register surface landed in `simd.rs`:
+integer arithmetic (wrapping add/sub for all four shapes, i8x16/i16x8
+saturating add/sub s/u, i8x16/i16x8 avgr_u, i16x8.q15mulr_sat_s, the
+narrow i16x8→i8x16 and i32x4→i16x8 forms, min/max s/u, mul for
+i16x8/i32x4/i64x2, abs/neg/popcnt unops, extmul low/high, extadd
+pairwise, i32x4.dot_i16x8_s), the float arithmetic (add/sub/mul/div/
+min/max/pmin/pmax routed through `values::exec_num` so NaN
+canonicalization matches the scalar paths), the float unops
+(ceil/floor/trunc/nearest/sqrt/abs/neg for f32x4 and f64x2), the
+conversions (trunc_sat f32/f64→s/u, convert i32x4→f32/f64 low forms,
+demote/promote), and the load forms (extend 8×8/16×4/32×2, splat
+8/16/32/64, zero 32/64) with per-form lane sizing. `valid.rs` types
+`VecSig::Unop`/`Not` and accepts `v128.const` in constant expressions;
+`exec.rs` runs the whole family through `simd_exec` with a single
+load-form reader.
+
+Green across the whole `simd/` corpus (59 files): **25 478 pass,
+0 fail, 512 pending** — the pending are the `assert_malformed`
+`(module quote …)` fixtures plus the single `multi-memory` module,
+which the runner now counts as pending: a plain `module` action whose
+decode hits `Error::Unsupported` (a behind-a-cut feature such as
+multi-memory, memory64, or GC) is *pending*, not fail (`assert_*`
+commands that hit unsupported decode stay fails by design). Green
+counts (all 0 fail): arith i8x16 131 / i16x8 194 / i32x4 194 /
+i64x2 200; arith2 i8x16 205 / i16x8 170 / i32x4 137 / i64x2 25;
+sat i8x16 202 / i16x8 218; q15mulr 30; extadd_pairwise 21+21;
+extmul i16x8/i32x4/i64x2 117 each; dot 32; splat 184; the load forms
+(load 36, load_extend 98, load_splat 122, load_zero 33);
+int_to_int_extend 253; conversions 252; rounding f32x4 185 /
+f64x2 185.
+
+Traps fixed this wave:
+- **`narrow` loop bounds**: the kernel iterated `16/out_size` times
+  over each input but read `in_size`-wide lanes — a 2-byte-input
+  narrowing read past the register and shifted a `u128` by ≥128 bits
+  (debug panic). It must iterate `16/in_size` input lanes per operand,
+  writing output lanes `i` and `i + 16/in_size`.
+- **`f64x2.floor` (0x75) missing from `simd::sig`**: its rounding
+  siblings 0x74 (ceil), 0x7a (trunc), 0x94 (nearest) were routed, but
+  0x75 sat inside the i8x16/i16x8 min/max spans in the real opcode
+  table and was dropped, so any module exporting floor decoded as
+  unsupported.
+- **`vec_load_bytes`/`vec_load_natural` splat widths**: `I16Splat` was
+  sized 4 (it reads 2 bytes), false-trapping `load16_splat`/`v16x8`
+  loads at the top of a 64 KiB page (addr 65534 + 2 = page end); and
+  the validator's natural alignment for the splat/zero load forms used
+  8 bytes regardless of form (`load8_splat` align 2, `load16_splat`
+  align 4, `load32_splat` align 8 were wrongly accepted). Both tables
+  now mirror the true access widths: 1/2/4/8 for 8/16/32/64-bit
+  splats, 4 for `load32_zero`, 8 for the widen/`I64Splat`/`I64Zero`
+  forms.
+
+Still failing (pre-existing, out of Cut 7 scope): the three
+GC-`rec`-bag modules — `type-canon` (2), `exceptions/tag` (3), and one
+module in `bulk-memory/table_init` (1) — decode the `rec`/subtype
+type-section encoding (0x4e/0x50) that the GC binary format (Cut 9)
+introduces; today the decoder reports those as malformed functypes.
+`relaxed-simd/` is untouched.

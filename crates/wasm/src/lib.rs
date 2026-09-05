@@ -13,6 +13,7 @@ pub mod binary;
 pub mod exec;
 pub mod instr;
 pub mod module;
+pub mod simd;
 pub mod types;
 pub mod valid;
 pub mod values;

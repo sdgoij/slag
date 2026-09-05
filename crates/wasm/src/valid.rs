@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp};
+use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
 use crate::types::{
     BlockType, FuncType, GlobalType, HeapType, Limits, MemType, RefType, TableType, ValType,
@@ -1172,6 +1172,114 @@ impl Machine {
                 self.pop_expected(ValType::Ref(table.element))?;
                 self.pop_expected(ValType::I32)?;
             }
+            // ---- v128 (Cut 7) ----
+            Instr::V128Const(_) => self.push_val(ValType::V128),
+            Instr::VecLoad { op, align, offset } => {
+                vec_memory_ok(spaces, vec_load_natural(*op), *align, *offset)?;
+                self.pop_expected(ValType::I32)?;
+                self.push_val(ValType::V128);
+            }
+            Instr::VecStore { align, offset } => {
+                vec_memory_ok(spaces, 4, *align, *offset)?;
+                self.pop_expected(ValType::V128)?;
+                self.pop_expected(ValType::I32)?;
+            }
+            Instr::VecLaneLoad {
+                size,
+                align,
+                offset,
+                lane,
+            } => {
+                if *lane as usize >= 16 / *size as usize {
+                    return Err(Error::Invalid("invalid lane index"));
+                }
+                vec_memory_ok(spaces, size.trailing_zeros(), *align, *offset)?;
+                self.pop_expected(ValType::V128)?;
+                self.pop_expected(ValType::I32)?;
+                self.push_val(ValType::V128);
+            }
+            Instr::VecLaneStore {
+                size,
+                align,
+                offset,
+                lane,
+            } => {
+                if *lane as usize >= 16 / *size as usize {
+                    return Err(Error::Invalid("invalid lane index"));
+                }
+                vec_memory_ok(spaces, size.trailing_zeros(), *align, *offset)?;
+                self.pop_expected(ValType::V128)?;
+                self.pop_expected(ValType::I32)?;
+            }
+            Instr::VecShuffle(lanes) => {
+                if lanes.iter().any(|&lane| lane >= 32) {
+                    return Err(Error::Invalid("invalid lane index"));
+                }
+                self.pop_expected(ValType::V128)?;
+                self.pop_expected(ValType::V128)?;
+                self.push_val(ValType::V128);
+            }
+            Instr::Vec(sub) => self.simd_reg(*sub, None)?,
+            Instr::VecLane { op, lane } => self.simd_reg(*op, Some(*lane))?,
+        }
+        Ok(())
+    }
+
+    /// Type a pure-register (or lane-immediate) v128 op by its signature.
+    fn simd_reg(&mut self, sub: u16, lane: Option<u8>) -> Result<(), Error> {
+        use crate::simd::VecSig;
+        let sig = crate::simd::sig(sub).ok_or(Error::Invalid("unknown simd opcode"))?;
+        let pop_v = |machine: &mut Self, n: usize| -> Result<(), Error> {
+            for _ in 0..n {
+                machine.pop_expected(ValType::V128)?;
+            }
+            Ok(())
+        };
+        match sig {
+            VecSig::Unop | VecSig::Not => {
+                pop_v(self, 1)?;
+                self.push_val(ValType::V128);
+            }
+            VecSig::Binop => {
+                pop_v(self, 2)?;
+                self.push_val(ValType::V128);
+            }
+            VecSig::Ternop => {
+                pop_v(self, 3)?;
+                self.push_val(ValType::V128);
+            }
+            VecSig::Shift => {
+                self.pop_expected(ValType::I32)?;
+                self.pop_expected(ValType::V128)?;
+                self.push_val(ValType::V128);
+            }
+            VecSig::Splat(kind) => {
+                self.pop_expected(lane_valtype(kind))?;
+                self.push_val(ValType::V128);
+            }
+            VecSig::ExtractS(kind) | VecSig::ExtractU(kind) | VecSig::Extract(kind) => {
+                if let Some(lane) = lane
+                    && lane as usize >= crate::simd::lane_count(kind)
+                {
+                    return Err(Error::Invalid("invalid lane index"));
+                }
+                self.pop_expected(ValType::V128)?;
+                self.push_val(lane_valtype(kind));
+            }
+            VecSig::Replace(kind) => {
+                if let Some(lane) = lane
+                    && lane as usize >= crate::simd::lane_count(kind)
+                {
+                    return Err(Error::Invalid("invalid lane index"));
+                }
+                self.pop_expected(lane_valtype(kind))?;
+                self.pop_expected(ValType::V128)?;
+                self.push_val(ValType::V128);
+            }
+            VecSig::Test | VecSig::Bitmask => {
+                pop_v(self, 1)?;
+                self.push_val(ValType::I32);
+            }
         }
         Ok(())
     }
@@ -1212,6 +1320,51 @@ impl Machine {
             self.push_val(ty);
         }
         Ok(())
+    }
+}
+
+/// A v128 memory instruction's type constraints: a memory must exist, the
+/// offset must fit the address type, and the alignment must not exceed the
+/// natural alignment of the access.
+fn vec_memory_ok(spaces: &Spaces<'_>, natural: u32, align: u32, offset: u64) -> Result<(), Error> {
+    memory_ok(spaces)?;
+    if offset > u64::from(u32::MAX) {
+        return Err(Error::Invalid("offset out of range"));
+    }
+    if align > natural {
+        return Err(Error::Invalid("alignment must not be larger than natural"));
+    }
+    Ok(())
+}
+
+/// The natural alignment exponent (log2 of bytes) of a v128 load form.
+fn vec_load_natural(op: VecLoadOp) -> u32 {
+    let bytes = match op {
+        VecLoadOp::V128 => 16u32,
+        VecLoadOp::I8x8S
+        | VecLoadOp::I8x8U
+        | VecLoadOp::I16x4S
+        | VecLoadOp::I16x4U
+        | VecLoadOp::I32x2S
+        | VecLoadOp::I32x2U
+        | VecLoadOp::I64Splat
+        | VecLoadOp::I64Zero => 8,
+        VecLoadOp::I8Splat => 1,
+        VecLoadOp::I16Splat => 2,
+        VecLoadOp::I32Splat | VecLoadOp::I32Zero => 4,
+    };
+    bytes.trailing_zeros()
+}
+
+/// The scalar type of a lane kind.
+fn lane_valtype(kind: crate::simd::LaneKind) -> ValType {
+    match kind {
+        crate::simd::LaneKind::I8 | crate::simd::LaneKind::I16 | crate::simd::LaneKind::I32 => {
+            ValType::I32
+        }
+        crate::simd::LaneKind::I64 => ValType::I64,
+        crate::simd::LaneKind::F32 => ValType::F32,
+        crate::simd::LaneKind::F64 => ValType::F64,
     }
 }
 
@@ -1373,6 +1526,7 @@ fn const_expr_type(expr: &[Instr], spaces: &Spaces<'_>, visible: usize) -> Resul
             Instr::I64Const(_) => stack.push(ValType::I64),
             Instr::F32Const(_) => stack.push(ValType::F32),
             Instr::F64Const(_) => stack.push(ValType::F64),
+            Instr::V128Const(_) => stack.push(ValType::V128),
             Instr::RefNull(heap) => stack.push(ValType::Ref(RefType {
                 nullable: true,
                 heap: heap_checked(*heap, spaces)?,

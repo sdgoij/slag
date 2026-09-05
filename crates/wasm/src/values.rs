@@ -29,13 +29,15 @@ pub enum RefValue {
     Exn(usize),
 }
 
-/// A runtime value. Floats are their IEEE bit patterns.
+/// A runtime value. Floats are their IEEE bit patterns; v128 vectors are the
+/// 128-bit little-endian concatenation of their lanes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
     I32(i32),
     I64(i64),
     F32(u32),
     F64(u64),
+    V128(u128),
     Ref(RefValue),
 }
 

@@ -230,6 +230,7 @@ fn run_json(json_path: &Path) -> Tally {
                             // only — never instantiate (its tables/memories
                             // may be huge).
                             match decode(&bytes) {
+                                Err(DecodeError::Unsupported(reason)) => Outcome::Pending(reason),
                                 Err(error) => Outcome::Fail(format!("module decode: {error}")),
                                 Ok(module) => match validate(&module) {
                                     Err(error) => Outcome::Fail(format!("module invalid: {error}")),
@@ -584,6 +585,7 @@ fn judge_module(
     expect: ModuleExpect<'_>,
 ) -> Verdict {
     let module: Module = match decode(bytes) {
+        Err(DecodeError::Unsupported(reason)) => return Verdict::Pending(reason),
         Err(error) => return Verdict::Fail(format!("module decode: {error}")),
         Ok(module) => module,
     };
@@ -672,6 +674,9 @@ fn run_action(
 /// a runtime value. NaN patterns are only legal in expectations.
 fn parse_const(entry: &serde_json::Value) -> Option<WasmValue> {
     let ty = entry.get("type").and_then(Value::as_str)?;
+    if ty == "v128" {
+        return Some(WasmValue::V128(v128_lanes_to_bits(entry)?));
+    }
     let value = entry.get("value").and_then(Value::as_str)?;
     if value.starts_with("nan:") {
         return None;
@@ -709,10 +714,18 @@ fn parse_const(entry: &serde_json::Value) -> Option<WasmValue> {
 /// a NaN pattern).
 fn matches_expected(expected: &serde_json::Value, actual: WasmValue, module: usize) -> bool {
     let ty = expected.get("type").and_then(Value::as_str);
+    let Some(ty) = ty else {
+        return false;
+    };
+    if ty == "v128" {
+        let WasmValue::V128(bits) = actual else {
+            return false;
+        };
+        return matches_v128_lanes(expected, bits);
+    }
     let value = expected.get("value").and_then(Value::as_str);
-    let (ty, value) = match (ty, value) {
-        (Some(ty), Some(value)) => (ty, value),
-        _ => return false,
+    let Some(value) = value else {
+        return false;
     };
     if ty == "funcref" {
         // wast2json encodes the `(ref.func)` non-null pattern as value "0":
@@ -738,6 +751,8 @@ fn matches_expected(expected: &serde_json::Value, actual: WasmValue, module: usi
         WasmValue::I64(v) => v as u64,
         WasmValue::F32(v) => v as u64,
         WasmValue::F64(v) => v,
+        // v128 expectations are handled above.
+        WasmValue::V128(_) => return false,
         WasmValue::Ref(_) => return false,
     };
     match value {
@@ -756,6 +771,93 @@ fn matches_expected(expected: &serde_json::Value, actual: WasmValue, module: usi
         },
         _ => parse_const(expected) == Some(actual),
     }
+}
+
+/// The byte width of a JSON v128 `lane_type`.
+fn v128_lane_bytes(lane_type: &str) -> Option<usize> {
+    Some(match lane_type {
+        "i8" => 1,
+        "i16" => 2,
+        "i32" | "f32" => 4,
+        "i64" | "f64" => 8,
+        _ => return None,
+    })
+}
+
+/// Assemble a concrete v128 from a JSON const's lane list. Every lane must be
+/// a plain bit string (no NaN patterns); small int lanes may be negative.
+fn v128_lanes_to_bits(entry: &serde_json::Value) -> Option<u128> {
+    let lane_type = entry.get("lane_type").and_then(Value::as_str)?;
+    let lanes = entry.get("value").and_then(Value::as_array)?;
+    let size = v128_lane_bytes(lane_type)?;
+    if lanes.len() != 16 / size {
+        return None;
+    }
+    let mut out = 0u128;
+    for (i, lane) in lanes.iter().enumerate() {
+        let raw = lane.as_str()?;
+        if raw.starts_with("nan:") {
+            return None;
+        }
+        // i128 parsing covers negative integer lanes and the full u64 range
+        // of float/integer bit patterns.
+        let bits = raw.parse::<i128>().ok()? as u64;
+        out |= lane_mask(size, bits) << (i * size * 8);
+    }
+    Some(out)
+}
+
+#[inline]
+fn lane_mask(size: usize, bits: u64) -> u128 {
+    if size == 8 {
+        bits as u128
+    } else {
+        (bits as u128) & ((1u128 << (size * 8)) - 1)
+    }
+}
+
+/// Whether an actual v128 satisfies an expected v128 entry: per-lane bit
+/// equality, or the canonical/arithmetic NaN patterns for float lanes.
+fn matches_v128_lanes(expected: &serde_json::Value, actual: u128) -> bool {
+    let lane_type = expected.get("lane_type").and_then(Value::as_str);
+    let lanes = expected.get("value").and_then(Value::as_array);
+    let (Some(lane_type), Some(lanes)) = (lane_type, lanes) else {
+        return false;
+    };
+    let Some(size) = v128_lane_bytes(lane_type) else {
+        return false;
+    };
+    if lanes.len() != 16 / size {
+        return false;
+    }
+    lanes.iter().enumerate().all(|(i, lane)| {
+        let raw = match lane.as_str() {
+            Some(raw) => raw,
+            None => return false,
+        };
+        let bits = ((actual >> (i * size * 8)) as u64)
+            & if size == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (size * 8)) - 1
+            };
+        match raw {
+            "nan:canonical" => match size {
+                4 => bits & 0x7fff_ffff == 0x7fc0_0000,
+                8 => bits & 0x7fff_ffff_ffff_ffff == 0x7ff8_0000_0000_0000,
+                _ => false,
+            },
+            "nan:arithmetic" => match size {
+                4 => bits & 0x7f80_0000 == 0x7f80_0000 && bits & 0x007f_ffff >= 0x0040_0000,
+                8 => {
+                    bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+                        && bits & 0x000f_ffff_ffff_ffff >= 0x0008_0000_0000_0000
+                }
+                _ => false,
+            },
+            _ => raw.parse::<i128>().map(|v| v as u64) == Ok(bits),
+        }
+    })
 }
 
 /// The spec's trap message for each trap kind, for `assert_trap` text checks.
