@@ -2225,6 +2225,33 @@ mod tests {
     }
 
     #[test]
+    fn stores_over_many_same_shape_objects_stay_exact() {
+        // The L2 shape-keyed store cells: a store loop over MORE distinct
+        // objects than MEMBER_WRITE_CELLS (4096) thrashes the (id, name)
+        // write table, so a same-shape working set falls back to the
+        // (map id, name) cell — one entry serves every instance of the
+        // shape at the map-pinned slot. The hazard a shape-keyed slot
+        // shares is cross-object corruption (a wrong slot from a stale
+        // shape), so drive 9000 same-shape instances with distinct values
+        // and interleaved structural changes (extra props that transition
+        // the map, deletes that drop it to dictionary mode) and read every
+        // value back.
+        let source = "(function(){ var os = [];\n\
+                     for (var i = 0; i < 9000; i++) { os[i] = { x: 0 }; }\n\
+                     for (var i = 0; i < 9000; i++) { os[i].x = i; }\n\
+                     for (var i = 0; i < 9000; i++) { if (os[i].x !== i) { return 'bad ' + i; } }\n\
+                     for (var i = 0; i < 100; i++) { os[i].y = i; }\n\
+                     for (var i = 8900; i < 9000; i++) { delete os[i].x; }\n\
+                     for (var i = 0; i < 9000; i++) { os[i].x = i * 2; }\n\
+                     for (var i = 0; i < 9000; i++) { if (os[i].x !== i * 2) { return 'bad2 ' + i + ':' + os[i].x; } }\n\
+                     return 'ok'; })()\n";
+        assert_eq!(
+            run(source).unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("ok")))
+        );
+    }
+
+    #[test]
     fn chain_reads_observe_warm_value_writes_to_the_found_link() {
         // The prototype-chain read cache re-reads the found property LIVE
         // (through the found link's member value cell when warm, else the

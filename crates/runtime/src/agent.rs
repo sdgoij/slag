@@ -210,6 +210,14 @@ pub struct Agent {
     /// Index-only — no trace edges. Boxed per the Cut 27 lesson.
     pub(crate) member_write_cells:
         Box<[Option<crate::ir::MemberWriteCell>; crate::ir::MEMBER_WRITE_CELLS]>,
+    /// The L2 shape-keyed store cells: (map id, name) -> slot/field for any
+    /// ordinary object whose CURRENT map is `map_id` (see
+    /// [`crate::ir::MemberMapWriteCell`]). Probed when the (id, name) cell
+    /// misses — a store loop whose object working set exceeds
+    /// `MEMBER_WRITE_CELLS` thrashes the identity table but shares one map,
+    /// so the shape-keyed hit stays O(1). Index-only — no trace edges.
+    pub(crate) member_write_map_cells:
+        Box<[Option<crate::ir::MemberMapWriteCell>; crate::ir::MEMBER_MAP_WRITE_CELLS]>,
     /// The prototype-chain read cache (2026-09-01): (receiver id, name,
     /// receiver generation, the found property's vector slot, the walked
     /// links' (id, generation)) — a hit re-reads the found property LIVE
@@ -749,6 +757,17 @@ impl Agent {
                     .into_boxed_slice()
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("sized exactly MEMBER_WRITE_CELLS"))
+            },
+            member_write_map_cells: {
+                // Same heap-direct construction as the identity write table
+                // (the boxed array must not sit on a small native stack).
+                let mut cells: Vec<Option<crate::ir::MemberMapWriteCell>> =
+                    Vec::with_capacity(crate::ir::MEMBER_MAP_WRITE_CELLS);
+                cells.resize_with(crate::ir::MEMBER_MAP_WRITE_CELLS, || None);
+                cells
+                    .into_boxed_slice()
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("sized exactly MEMBER_MAP_WRITE_CELLS"))
             },
             member_chain_cells: Box::new(std::array::from_fn(|_| None)),
             array_element_value_cells: Box::new(std::array::from_fn(|_| None)),

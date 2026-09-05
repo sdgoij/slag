@@ -1868,6 +1868,11 @@ impl MemberValueCell {
 /// the cell was recorded (a vector-only property).
 pub(crate) const MEMBER_WRITE_FIELD_NONE: u8 = u8::MAX;
 
+/// The number of shape-keyed store cells ([`MemberMapWriteCell`], L2): the
+/// same direct-mapped capacity as the (id, name) write table. Power of two
+/// so the index is a mask.
+pub(crate) const MEMBER_MAP_WRITE_CELLS: usize = MEMBER_WRITE_CELLS;
+
 /// The write-side value-cache entry (L1a warm-store fast path): (id,
 /// name, generation, slot) — "at this generation, `name` is an own
 /// writable data property of `id` at property-vector `slot`". A member
@@ -1899,6 +1904,30 @@ pub(crate) struct MemberWriteCell {
     pub map_id: u64,
     /// The in-object field offset of the mirrored property, or
     /// `MEMBER_WRITE_FIELD_NONE` when no mirror is pinned.
+    pub field: u8,
+}
+
+/// The shape-keyed store cell (L2): `(map id, name)` -> the property's
+/// vector slot and inline-field mirror, valid for ANY ordinary object whose
+/// CURRENT map is `map_id`. A map id pins the descriptor layout (maps are
+/// immutable after creation; a structural change transitions the object off
+/// the map or drops it), so a hit needs no per-object identity or
+/// generation — a store loop over any number of same-shape instances is
+/// O(1), where the (id, name)-keyed `member_write_cells` table thrashes
+/// once the object working set exceeds its size. Probed only after the
+/// (id, name) cell misses, and recorded only for keys the map describes as
+/// an inline field: a vector-only (spilled or non-transitionable) property
+/// is NOT map-pinned — two objects can share a live map yet hold different
+/// vectors after it, so their slot for such a key is per-object and only
+/// the (id, name) cell is safe.
+#[derive(Clone, Copy)]
+pub(crate) struct MemberMapWriteCell {
+    pub map_id: u64,
+    pub name: crux::AtomId,
+    pub slot: usize,
+    /// The in-object field offset of the mirrored property. Always a real
+    /// field (never `MEMBER_WRITE_FIELD_NONE`): only map-described inline
+    /// keys are recorded, so the write's pinned mirror is always valid.
     pub field: u8,
 }
 
@@ -3374,6 +3403,13 @@ impl Vm {
         (object_id as usize ^ name as usize) & (MEMBER_WRITE_CELLS - 1)
     }
 
+    /// The direct-mapped cache index for the L2 shape-keyed store cells
+    /// ([`MEMBER_MAP_WRITE_CELLS`]): hashed on the map id, so every instance
+    /// of a shape shares one cell.
+    fn member_write_map_cell_index(map_id: u64, name: crux::AtomId) -> usize {
+        (map_id as usize ^ name as usize) & (MEMBER_MAP_WRITE_CELLS - 1)
+    }
+
     /// The direct-mapped cache index for (map id, name atom). Part B, B5.2.
     fn member_map_cell_index(map_id: u64, name: crux::AtomId) -> usize {
         (map_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
@@ -4001,10 +4037,10 @@ impl Vm {
         };
         let index = Self::member_write_cell_index(object.id(), name);
         let Some(cell) = agent.member_write_cells[index] else {
-            return false;
+            return Self::warm_store_map_put(agent, &object, name, value);
         };
         if cell.id != object.id() || cell.name != name || cell.generation != object.generation() {
-            return false;
+            return Self::warm_store_map_put(agent, &object, name, value);
         }
         // The cell pinned the inline-field mirror (map id + offset) when it
         // was recorded under the same generation gate that pins the slot; a
@@ -4044,6 +4080,70 @@ impl Vm {
             generation,
             value,
         };
+        true
+    }
+
+    /// The L2 shape-keyed fallback of [`Self::warm_store_put`]: a store
+    /// loop whose object working set exceeds `MEMBER_WRITE_CELLS` thrashes
+    /// the (id, name) write table, but every instance of one shape shares
+    /// its (map id, name) cell. A hit stores directly at the recorded slot
+    /// with the pinned inline-field mirror, exactly like the identity path
+    /// (an own writable data property shadows the whole chain, spec 7.3.3;
+    /// the map-id compare pins the layout — a structural change transitions
+    /// the object off the recorded map, so a miss falls back). Only
+    /// map-described inline keys are ever recorded, so the pinned mirror is
+    /// always real. Returns true when the store happened; false falls back
+    /// to the full [[Set]].
+    fn warm_store_map_put(
+        agent: &mut Agent,
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+        value: Value,
+    ) -> bool {
+        let Some(map_id) = object.map.get().map(|m| m.id()) else {
+            return false;
+        };
+        let index = Self::member_write_map_cell_index(map_id, name);
+        let Some(cell) = agent.member_write_map_cells[index] else {
+            return false;
+        };
+        if cell.map_id != map_id || cell.name != name {
+            return false;
+        }
+        let pinned_field = Some((cell.map_id, cell.field as usize));
+        if !object.write_data_property_slot(
+            &PropertyKey::String(name),
+            cell.slot,
+            value,
+            pinned_field,
+        ) {
+            return false;
+        }
+        // The L1c record discipline, as on the identity path: an in-place
+        // VALUE write does not bump the generation; front the read-side
+        // value cell (the SMALL table's index — the compiled probe masks by
+        // MEMBER_CELLS - 1) so the next read and the compiled `GetMemberName`
+        // hit without a vector access.
+        let generation = object.generation();
+        let read_index = Self::member_cell_index(object.id(), name);
+        agent.member_value_cells[read_index] = MemberValueCell {
+            id: object.id(),
+            name,
+            generation,
+            value,
+        };
+        // Re-key the (id, name) cell for this object too, so the next store
+        // to the SAME instance takes the cheaper identity probe (the value
+        // write kept the generation, so the record is immediately valid).
+        let write_index = Self::member_write_cell_index(object.id(), name);
+        agent.member_write_cells[write_index] = Some(MemberWriteCell {
+            id: object.id(),
+            name,
+            generation,
+            slot: cell.slot,
+            map_id: cell.map_id,
+            field: cell.field,
+        });
         true
     }
 
@@ -4095,6 +4195,21 @@ impl Vm {
             map_id,
             field,
         });
+        // L2: also record the shape-keyed cell when the key is a
+        // map-described inline field (the layout a map id pins is shared by
+        // every instance of the shape, so a store loop over many same-shape
+        // objects hits this cell after the (id, name) table thrashes).
+        // Vector-only keys are deliberately not recorded — their slot is
+        // per-object, not map-pinned.
+        if field != MEMBER_WRITE_FIELD_NONE && map_id != 0 {
+            let map_index = Self::member_write_map_cell_index(map_id, name);
+            agent.member_write_map_cells[map_index] = Some(MemberMapWriteCell {
+                map_id,
+                name,
+                slot,
+                field,
+            });
+        }
         // The read-side value cell keeps the SMALL table's index.
         let read_index = Self::member_cell_index(object.id(), name);
         agent.member_value_cells[read_index] = MemberValueCell {

@@ -4349,6 +4349,67 @@ no probe has shown hot (Date, typed-array, iterator, ...); the
 structural levers revert to the L2 per-site IC slices (a)/(b) behind
 the L1c shape representation.
 
+### Shape-keyed store cells: the >4096-object store cliff (L2 slice b) (measured 2026-09-04)
+
+The first L2 slice lands on the write side. The L1a store cells
+(`MEMBER_WRITE_CELLS`, 4096 entries) are keyed by (object id, name), so
+a store loop whose object working set exceeds the table thrashes and
+every store falls back to the full [[Set]] — even when all the objects
+share ONE shape. Probe (200k-call rows, fresh release build of parent
+`ebe30cc`): 64- and 1024-object store rows ~56ns/store interp (~40 jit),
+8192 ~181ns (~162 jit) and 16384 ~182ns — a ~3.2x cliff that the object
+count, not the shape count, drives.
+
+**The mechanism.** Every instance of a shape shares the object's map,
+and a map id pins its descriptor layout (maps are immutable after
+creation; a structural change transitions the object off the map), so a
+store cell keyed by (map id, name) is valid for ANY ordinary object
+whose current map matches — no per-object identity or generation. A
+second direct-mapped table `member_write_map_cells` (same 4096 size,
+heap-direct like the identity table) is probed only when the (id, name)
+cell misses (`warm_store_put`'s fallback); a hit stores through
+`write_data_property_slot` with the pinned inline mirror, re-keys the
+(id, name) cell so the same instance's next store keeps the cheaper
+identity probe, and fronts the read-side value cell under the L1c
+no-bump discipline — byte-identical to the identity fast path.
+
+**The one safety gate**: a vector-only property (a spilled or
+non-transitionable key on a live map) is NOT map-pinned — two objects
+can share a live map yet hold different vectors after it — so only
+map-described inline keys are ever recorded (`warm_store_record` records
+the map cell when `map_store_field` pins a field). The pinned mirror is
+therefore always real, and `write_data_property_slot`'s stored-key
+recheck backstops a stale slot.
+
+**Measurement** (fresh release builds, parent `ebe30cc` + probe rows vs
+this tree, 200k-call rows, both engines):
+
+| row | parent (ebe30cc) | this |
+|---|---|---|
+| store 64 (64 objects) | ~11.3ms (~56ns/store) | ~11.3ms |
+| store 1024 | ~11.2ms (~56ns/store) | ~11.2ms |
+| store 8192 | ~36.2ms (~181ns/store) | ~11.6ms (~58ns/store) |
+| store 16384 | ~36.4ms (~182ns/store) | ~13.4ms (~67ns/store) |
+| store same 16384 (1 object) | ~3.8ms | ~3.9ms |
+
+The 8192/16384 rows drop ~3x (interp ~181-182ns -> ~58-67ns/store; jit
+~162 -> ~44ns) and now sit AT the 64/1024 warm level — the object-count
+cliff is gone for same-shape working sets of any size (the ~13ms row for
+16384 still pays one identity-table miss + one map-cell probe per
+store). The single-object warm row is unchanged — no warm regression.
+
+**Gates**: clippy clean; `cargo test --workspace` green (new
+`stores_over_many_same_shape_objects_stay_exact` — 9000 same-shape
+instances written distinct values with interleaved map transitions and
+deletes dropped to dictionary mode, every value read back — pinning
+that the shape-keyed slot never crosses objects); the three release
+sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086, zero fail/crash/hang). Residual: vector-only keys on
+shared maps (a hot 5th+ field of a many-field shape) still take the
+(id, name) table and cliff beyond 4096 objects — that is the per-STEP
+store IC (tasklist 1.2), and the chain-member-read slice (a) stays
+behind L1c's shape end-state.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
