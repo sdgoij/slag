@@ -595,6 +595,86 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The O(1) dispatch table for the DataView members that need the agent:
+/// `Intrinsics::define` registers each builtin function's id against its
+/// native handler so a warm call dispatches by function id instead of
+/// scanning the module's identity chain (`dispatch_call` — the get/set arms
+/// each scan two 11-name arrays of `intrinsics.get`). See the String
+/// `handler_for` note (4.2) for the measured cost the registration removes.
+/// The per-method handlers bind the element type (the `read_element`/
+/// `write_element` codecs take it by value); the getter accessors and the
+/// constructor's call-without-new error are direct adapters.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        DATA_VIEW => Some(|_, _, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "DataView must be called with 'new'".into(),
+            ))
+        }),
+        DV_BUFFER => Some(get_buffer),
+        DV_BYTE_LENGTH => Some(get_byte_length),
+        DV_BYTE_OFFSET => Some(get_byte_offset),
+        "getInt8" => Some(|agent, this, args| read_element(agent, this, args, ElementType::Int8)),
+        "getUint8" => Some(|agent, this, args| read_element(agent, this, args, ElementType::Uint8)),
+        "getInt16" => Some(|agent, this, args| read_element(agent, this, args, ElementType::Int16)),
+        "getUint16" => {
+            Some(|agent, this, args| read_element(agent, this, args, ElementType::Uint16))
+        }
+        "getInt32" => Some(|agent, this, args| read_element(agent, this, args, ElementType::Int32)),
+        "getUint32" => {
+            Some(|agent, this, args| read_element(agent, this, args, ElementType::Uint32))
+        }
+        "getFloat16" => {
+            Some(|agent, this, args| read_element(agent, this, args, ElementType::Float16))
+        }
+        "getFloat32" => {
+            Some(|agent, this, args| read_element(agent, this, args, ElementType::Float32))
+        }
+        "getFloat64" => {
+            Some(|agent, this, args| read_element(agent, this, args, ElementType::Float64))
+        }
+        "getBigInt64" => {
+            Some(|agent, this, args| read_element(agent, this, args, ElementType::BigInt64))
+        }
+        "getBigUint64" => {
+            Some(|agent, this, args| read_element(agent, this, args, ElementType::BigUint64))
+        }
+        "setInt8" => Some(|agent, this, args| write_element(agent, this, args, ElementType::Int8)),
+        "setUint8" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::Uint8))
+        }
+        "setInt16" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::Int16))
+        }
+        "setUint16" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::Uint16))
+        }
+        "setInt32" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::Int32))
+        }
+        "setUint32" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::Uint32))
+        }
+        "setFloat16" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::Float16))
+        }
+        "setFloat32" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::Float32))
+        }
+        "setFloat64" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::Float64))
+        }
+        "setBigInt64" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::BigInt64))
+        }
+        "setBigUint64" => {
+            Some(|agent, this, args| write_element(agent, this, args, ElementType::BigUint64))
+        }
+        _ => None,
+    }
+}
+
 /// The DataView members that need the agent, dispatched by intrinsic identity
 /// from `runtime::function::call`/`construct`.
 pub fn dispatch_call(

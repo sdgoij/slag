@@ -4295,6 +4295,60 @@ their measured hotness — the (c) probe's residual was Object's (its
 `dispatch_call` arms are inline closures, so registration needs a
 named-handler refactor first) and DataView's; extend per probe.
 
+### Object and DataView builtins register O(1): the (c) registration arc closes (measured 2026-09-04)
+
+The last chain-bound modules the (c) probe measured hot were Object's
+~40-intrinsic chain (Object.hasOwn ~5µs/call at arm ~35 — every
+`intrinsics.get` allocates a JsString + hash-lookup) and DataView's
+(getUint8 ~630-720ns/call). Object's dispatch arms were INLINE
+closures, which the 4.2 registration pattern cannot wrap, so each is
+now extracted into a named `(agent, this, args)` handler
+(`prototype_has_own_property`, `prototype_is_prototype_of`,
+`prototype_property_is_enumerable`, `prototype_to_locale_string`,
+`object_create`, `object_define_property`, `object_entries`/`values`/
+`keys`, `object_get_own_property_descriptor(s)`, `object_has_own`, the
+integrity-level statics, ...) and the dispatch arms call those fns —
+the linear chain and the new `object::handler_for` share one
+implementation. DataView's 22 element get/set codecs register per
+element type (the handlers bind `ElementType`; the codec fns take it by
+value) and its buffer/byteLength/byteOffset accessors and the
+constructor's call-without-new error register directly. Both modules
+wire into `Intrinsics::define`; the chain stays for anything
+unregistered (aliases, prototype patches, cross-realm function
+objects), so behavior is identical — only the dispatch is shorter.
+
+**Measurement** (fresh release builds of parent `9f9cb54` + probe rows
+vs this tree, 200k-call rows):
+
+| row | chain-only (9f9cb54) | + registration |
+|---|---|---|
+| Object.hasOwn | ~1085ms (~5.4µs/call) | ~126ms (~632ns/call) |
+| hasOwnProperty | ~283ms (~1.4µs/call) | ~150ms (~751ns/call) |
+| DataView.getUint8 | (c)-probe ~630-720ns/call | ~291ns/call |
+| DataView.getFloat64 | — | ~286ns/call |
+
+~8.6x on Object.hasOwn (the late-arm extreme the probe measured at
+~5µs); hasOwnProperty is an early arm (arm ~3) and its row is mostly
+real work, so ~1.9x; DataView reads drop to ~290ns/call (~2.2-2.5x vs
+the recorded probe — its residual is the view-state/check work, not a
+chain). Object.keys' row is allocation-bound (a 64-key object builds 64
+fresh key-string boxes per call) and unchanged. Candidate (c) is now
+CLOSED: every module whose methods a probe showed hot — String /
+Number / Boolean / BigInt / Keyed / Object / DataView — dispatches
+warm calls in O(1) by function id.
+
+**Gates**: clippy clean; `cargo test --workspace` green (new
+`object_and_dataview_builtins_dispatch_via_registered_handlers` pinning
+the registered handlers behave exactly like the chain arms — statics,
+receiver coercion, integrity levels, __proto__/legacy accessors,
+groupBy/fromEntries, the DataView codecs + accessors, and error
+surfacing); the three release sweeps at baseline (language 23721/3
+skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang). Next: the remaining linear chains belong to modules
+no probe has shown hot (Date, typed-array, iterator, ...); the
+structural levers revert to the L2 per-site IC slices (a)/(b) behind
+the L1c shape representation.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

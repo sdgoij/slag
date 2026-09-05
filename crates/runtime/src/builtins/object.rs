@@ -640,81 +640,16 @@ pub fn dispatch_call(
         return Some(to_object(agent, this));
     }
     if intrinsics.get(PROTO_HAS_OWN).as_ref() == Some(callee) {
-        return Some((|| {
-            let key = crate::context::to_property_key(agent, &arg(args, 0))?;
-            let object = to_object(agent, this)?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
-            })?;
-            // A deferred namespace's [[HasProperty]] triggers its module's
-            // evaluation for non-symbol-like keys (import-defer).
-            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
-            let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
-                // [[HasProperty]] reads the descriptor, whose value comes
-                // from the live binding: an uninitialized export throws a
-                // ReferenceError (spec 9.4.6.4 step 4).
-                match obj.get_own_property_key(&key)? {
-                    Some(prop) => {
-                        namespace_live_descriptor(agent, &obj, &key, &prop)?;
-                        true
-                    }
-                    None => false,
-                }
-            } else {
-                obj.has_own_property_key(&key)?
-            };
-            Ok(Value::Boolean(present))
-        })());
+        return Some(prototype_has_own_property(agent, this, args));
     }
     if intrinsics.get(PROTO_IS_PROTO_OF).as_ref() == Some(callee) {
-        return Some((|| {
-            let candidate = arg(args, 0);
-            let Some(candidate_obj) = crate::context::as_object(&candidate) else {
-                return Ok(Value::Boolean(false));
-            };
-            let object = to_object(agent, this)?;
-            let Some(this_obj) = crate::context::as_object(&object) else {
-                return Ok(Value::Boolean(false));
-            };
-            let mut proto = candidate_obj.get_prototype_of()?;
-            while let Some(p) = proto {
-                if Handle::ptr_eq(p, this_obj) {
-                    return Ok(Value::Boolean(true));
-                }
-                proto = p.get_prototype_of()?;
-            }
-            Ok(Value::Boolean(false))
-        })());
+        return Some(prototype_is_prototype_of(agent, this, args));
     }
     if intrinsics.get(PROTO_PROP_IS_ENUM).as_ref() == Some(callee) {
-        return Some((|| {
-            let key = crate::context::to_property_key(agent, &arg(args, 0))?;
-            let object = to_object(agent, this)?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
-            })?;
-            // A deferred namespace's [[GetOwnProperty]] triggers for
-            // non-symbol-like keys (import-defer).
-            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
-            let enumerable = match obj.get_own_property_key(&key)? {
-                Some(prop) => {
-                    // A module namespace descriptor reads the live binding
-                    // (throwing on uninitialized exports, spec 9.4.6.4
-                    // step 4).
-                    let desc = namespace_live_descriptor(agent, &obj, &key, &prop)?;
-                    desc.enumerable.unwrap_or(false)
-                }
-                None => false,
-            };
-            Ok(Value::Boolean(enumerable))
-        })());
+        return Some(prototype_property_is_enumerable(agent, this, args));
     }
     if intrinsics.get(PROTO_TO_LOCALE).as_ref() == Some(callee) {
-        return Some((|| {
-            let method =
-                crate::context::get_property(agent, this, &JsString::from_utf8("toString"), *this)?;
-            crate::function::call(agent, &method, *this, &[])
-        })());
+        return Some(prototype_to_locale_string(agent, this, args));
     }
     if intrinsics.get(PROTO_GET_PROTO).as_ref() == Some(callee) {
         return Some(get_prototype_of(agent, this));
@@ -738,71 +673,10 @@ pub fn dispatch_call(
         return Some(object_assign(agent, args));
     }
     if intrinsics.get(CREATE).as_ref() == Some(callee) {
-        return Some((|| {
-            let proto_value = arg(args, 0);
-            let proto = match proto_value.kind() {
-                ValueKind::Object(obj) => Some(obj),
-                ValueKind::Null => None,
-                _ => {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Object prototype may only be an Object or null".into(),
-                    ));
-                }
-            };
-            let obj = JsObject::ordinary_object_create(proto);
-            let value = Value::Object(obj);
-            // spec 20.1.2.2 step 3: undefined Properties are skipped.
-            if args.len() > 1 {
-                let properties = arg(args, 1);
-                if !matches!(properties.kind(), ValueKind::Undefined) {
-                    object_define_properties(agent, &value, &properties)?;
-                }
-            }
-            Ok(value)
-        })());
+        return Some(object_create(agent, args));
     }
     if intrinsics.get(DEFINE_PROPERTY).as_ref() == Some(callee) {
-        return Some((|| {
-            // spec 20.1.2.4 step 1: a primitive receiver throws (functions
-            // are objects, so `as_object` accepts them).
-            let receiver = arg(args, 0);
-            let obj = as_object(&receiver).ok_or_else(|| {
-                JsError::new(
-                    ErrorKind::TypeError,
-                    "Object.defineProperty called on non-object".into(),
-                )
-            })?;
-            let key = crate::context::to_property_key(agent, &arg(args, 1))?;
-            // A deferred namespace's [[DefineOwnProperty]] triggers its
-            // module's evaluation for non-symbol-like keys (import-defer).
-            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
-            let mut desc = crux::property::to_property_descriptor(&arg(args, 2))?;
-            // ArraySetLength coerces an object [[Value]] twice (ToUint32 and
-            // ToNumber, spec 10.4.2.4 steps 3-4) before the descriptor
-            // validation; crux cannot invoke user valueOf, so both coercions
-            // run here through the agent (their side effects are observable,
-            // define-own-prop-length-coercion-order.js).
-            if matches!(obj.kind, crux::object::ObjectKind::Array(_))
-                && key == PropertyKey::from_utf8("length")
-                && let Some(value) = &desc.value
-                && matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_))
-            {
-                let number = crate::context::to_number(agent, value)?;
-                let _ = crate::context::to_number(agent, value)?;
-                desc.value = Some(Value::Number(number));
-            }
-            if !obj.define_property_key(&key, &desc)? {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    format!(
-                        "Cannot define property {} on a non-extensible object",
-                        key.display_string()
-                    ),
-                ));
-            }
-            Ok(receiver)
-        })());
+        return Some(object_define_property(agent, args));
     }
     if intrinsics.get(DEFINE_PROPERTIES).as_ref() == Some(callee) {
         return Some(object_define_properties(
@@ -812,89 +686,13 @@ pub fn dispatch_call(
         ));
     }
     if intrinsics.get(ENTRIES).as_ref() == Some(callee) {
-        return Some((|| {
-            let object = to_object(agent, &arg(args, 0))?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
-            })?;
-            // GC-2: the freshly-created pair objects accumulate in a local
-            // Vec the stack scan cannot see while the next pair's creation
-            // allocates — suppress `--gc-stress` for the build so the
-            // half-built Vec cannot be swept (the per-key descriptor re-read
-            // makes a count-first pass unsound: getters may hide later keys).
-            let _stress = crate::ir::StressSuppress::new();
-            let mut entries = Vec::new();
-            for key in obj.own_property_keys()? {
-                // EnumerableOwnProperties (spec 7.3.26): the descriptor's
-                // enumerability is re-read for every key, so a getter hit for
-                // an earlier key can hide a later one (getter-making-future-
-                // key-nonenumerable.js).
-                let PropertyKey::String(id) = key else {
-                    continue;
-                };
-                let key = PropertyKey::String(id);
-                if !obj
-                    .get_own_property_key(&key)?
-                    .is_some_and(|prop| prop.enumerable)
-                {
-                    continue;
-                }
-                let text = crux::lookup(id);
-                let value = crate::context::get_property(agent, &object, &text, object)?;
-                let pair = crate::builtins::array::array_create(agent, 2.0)?;
-                pair.create_data_property(&JsString::from_utf8("0"), str(&text.to_string_lossy()))?;
-                pair.create_data_property(&JsString::from_utf8("1"), value)?;
-                entries.push(Value::Object(pair));
-            }
-            array_of(agent, &entries)
-        })());
+        return Some(object_entries(agent, args));
     }
     if intrinsics.get(VALUES).as_ref() == Some(callee) {
-        return Some((|| {
-            let object = to_object(agent, &arg(args, 0))?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
-            })?;
-            let mut values = Vec::new();
-            // GC-2: the values (freshly-boxed for a primitive-string receiver)
-            // accumulate in a local Vec the stack scan cannot see while the
-            // next property read allocates — suppress `--gc-stress` for the
-            // build so the half-built Vec cannot be swept.
-            let _stress = crate::ir::StressSuppress::new();
-            for key in obj.own_property_keys()? {
-                // EnumerableOwnProperties re-reads each descriptor, so a
-                // getter for an earlier key can hide a later one.
-                let PropertyKey::String(id) = key else {
-                    continue;
-                };
-                let key = PropertyKey::String(id);
-                if !obj
-                    .get_own_property_key(&key)?
-                    .is_some_and(|prop| prop.enumerable)
-                {
-                    continue;
-                }
-                let text = crux::lookup(id);
-                let value = crate::context::get_property(agent, &object, &text, object)?;
-                values.push(value);
-            }
-            array_of(agent, &values)
-        })());
+        return Some(object_values(agent, args));
     }
     if intrinsics.get(KEYS).as_ref() == Some(callee) {
-        return Some((|| {
-            let keys = enumerable_string_keys(agent, &arg(args, 0))?;
-            // GC-2: the freshly-boxed key strings accumulate in a local Vec
-            // the stack scan cannot see while the next `Handle::new` fires a
-            // stress collection — suppress the window so the half-built Vec
-            // cannot be swept (the array is built by `array_of` after).
-            let _stress = crate::ir::StressSuppress::new();
-            let values: Vec<Value> = keys
-                .into_iter()
-                .map(|key| str(&key.to_string_lossy()))
-                .collect();
-            array_of(agent, &values)
-        })());
+        return Some(object_keys(agent, args));
     }
     if intrinsics.get(GET_OWN_NAMES).as_ref() == Some(callee) {
         return Some(own_keys_of(agent, &arg(args, 0), false));
@@ -906,54 +704,10 @@ pub fn dispatch_call(
         return Some(object_group_by(agent, args));
     }
     if intrinsics.get(GET_OWN_DESC).as_ref() == Some(callee) {
-        return Some((|| {
-            let object = to_object(agent, &arg(args, 0))?;
-            let key = crate::context::to_property_key(agent, &arg(args, 1))?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
-            })?;
-            // A deferred namespace's [[GetOwnProperty]] triggers for
-            // non-symbol-like keys (import-defer).
-            crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
-            let Some(prop) = obj.get_own_property_key(&key)? else {
-                return Ok(Value::Undefined);
-            };
-            let desc = namespace_live_descriptor(agent, &obj, &key, &prop)?;
-            crux::property::from_property_descriptor(
-                &desc,
-                realm
-                    .intrinsics
-                    .get(OBJECT_PROTO)
-                    .and_then(|v| as_object(&v)),
-            )
-        })());
+        return Some(object_get_own_property_descriptor(agent, args));
     }
     if intrinsics.get(GET_OWN_DESCS).as_ref() == Some(callee) {
-        return Some((|| {
-            let object = to_object(agent, &arg(args, 0))?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
-            })?;
-            let result = JsObject::ordinary_object_create(
-                realm
-                    .intrinsics
-                    .get(OBJECT_PROTO)
-                    .and_then(|v| as_object(&v)),
-            );
-            for key in obj.own_property_keys()? {
-                if let Some(prop) = obj.get_own_property_key(&key)? {
-                    let desc = crux::property::from_property_descriptor(
-                        &namespace_live_descriptor(agent, &obj, &key, &prop)?,
-                        realm
-                            .intrinsics
-                            .get(OBJECT_PROTO)
-                            .and_then(|v| as_object(&v)),
-                    )?;
-                    result.create_data_property_key(&key, desc)?;
-                }
-            }
-            Ok(Value::Object(result))
-        })());
+        return Some(object_get_own_property_descriptors(agent, args));
     }
     if intrinsics.get(GET_PROTO).as_ref() == Some(callee) {
         return Some(get_prototype_of(agent, &arg(args, 0)));
@@ -962,58 +716,16 @@ pub fn dispatch_call(
         return Some(set_prototype_of(agent, &arg(args, 0), &arg(args, 1)));
     }
     if intrinsics.get(HAS_OWN).as_ref() == Some(callee) {
-        return Some((|| {
-            let object = to_object(agent, &arg(args, 0))?;
-            let key = crate::context::to_property_key(agent, &arg(args, 1))?;
-            let obj = as_object(&object).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "value is not an object".into())
-            })?;
-            let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
-                // The descriptor reads the live binding: an uninitialized
-                // export throws a ReferenceError (spec 9.4.6.4 step 4).
-                match obj.get_own_property_key(&key)? {
-                    Some(prop) => {
-                        namespace_live_descriptor(agent, &obj, &key, &prop)?;
-                        true
-                    }
-                    None => false,
-                }
-            } else {
-                obj.has_own_property_key(&key)?
-            };
-            Ok(Value::Boolean(present))
-        })());
+        return Some(object_has_own(agent, args));
     }
     if intrinsics.get(IS).as_ref() == Some(callee) {
         return Some(Ok(Value::Boolean(same_value(&arg(args, 0), &arg(args, 1)))));
     }
     if intrinsics.get(IS_EXTENSIBLE).as_ref() == Some(callee) {
-        return Some((|| {
-            // spec 20.1.2.13 step 1: a non-object is trivially not extensible
-            // (undefined/null included — no RequireObjectCoercible).
-            let Some(obj) = as_object(&arg(args, 0)) else {
-                return Ok(Value::Boolean(false));
-            };
-            Ok(Value::Boolean(obj.is_extensible()?))
-        })());
+        return Some(object_is_extensible(agent, args));
     }
     if intrinsics.get(PREVENT_EXTENSIONS).as_ref() == Some(callee) {
-        return Some((|| {
-            // spec 20.1.2.18 step 1: a non-object is returned unchanged.
-            let value = arg(args, 0);
-            let Some(obj) = as_object(&value) else {
-                return Ok(value);
-            };
-            // spec step 4: a failed [[PreventExtensions]] (e.g. a proxy trap
-            // returning false) is a TypeError.
-            if !obj.prevent_extensions()? {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "Cannot prevent extensions of the object".into(),
-                ));
-            }
-            Ok(value)
-        })());
+        return Some(object_prevent_extensions(agent, args));
     }
     if intrinsics.get(FREEZE).as_ref() == Some(callee) {
         return Some(freeze_or_seal(&arg(args, 0), true));
@@ -1022,27 +734,452 @@ pub fn dispatch_call(
         return Some(freeze_or_seal(&arg(args, 0), false));
     }
     if intrinsics.get(IS_FROZEN).as_ref() == Some(callee) {
-        return Some((|| {
-            Ok(Value::Boolean(test_integrity_level(
-                agent,
-                &arg(args, 0),
-                true,
-            )?))
-        })());
+        return Some(object_is_frozen(agent, args));
     }
     if intrinsics.get(IS_SEALED).as_ref() == Some(callee) {
-        return Some((|| {
-            Ok(Value::Boolean(test_integrity_level(
-                agent,
-                &arg(args, 0),
-                false,
-            )?))
-        })());
+        return Some(object_is_sealed(agent, args));
     }
     if intrinsics.get(FROM_ENTRIES).as_ref() == Some(callee) {
         return Some(from_entries(agent, &arg(args, 0)));
     }
     None
+}
+
+/// The O(1) dispatch table for the Object members that need the agent:
+/// `Intrinsics::define` registers each builtin function's id against its
+/// native handler so a warm call dispatches by function id instead of
+/// scanning this module's ~40-intrinsic identity chain (`dispatch_call`
+/// above — every `intrinsics.get` arm allocates a JsString + hash-lookup;
+/// the probe measured Object.hasOwn ~5µs/call at arm ~35 and
+/// hasOwnProperty ~950ns at arm ~3). The dispatch arms were inline
+/// closures; this slice extracts each into a named `(agent, this, args)`
+/// handler (the shape 4.2's pattern wants) so the chain and the table
+/// share one implementation. See the String `handler_for` note (4.2) for
+/// the measured cost the registration removes.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        OBJECT => Some(|agent, _this, args| {
+            object_constructor(agent, &Value::Undefined, args, &Value::Undefined)
+        }),
+        PROTO_TO_STRING => Some(|agent, this, _args| prototype_to_string(agent, this)),
+        PROTO_VALUE_OF => Some(|agent, this, _args| to_object(agent, this)),
+        PROTO_HAS_OWN => Some(prototype_has_own_property),
+        PROTO_IS_PROTO_OF => Some(prototype_is_prototype_of),
+        PROTO_PROP_IS_ENUM => Some(prototype_property_is_enumerable),
+        PROTO_TO_LOCALE => Some(prototype_to_locale_string),
+        PROTO_GET_PROTO => Some(|agent, this, _args| get_prototype_of(agent, this)),
+        PROTO_SET_PROTO => Some(|_agent, this, args| proto_setter(this, &arg(args, 0))),
+        PROTO_DEFINE_GETTER => {
+            Some(|agent, this, args| define_legacy_accessor(agent, this, args, true))
+        }
+        PROTO_DEFINE_SETTER => {
+            Some(|agent, this, args| define_legacy_accessor(agent, this, args, false))
+        }
+        PROTO_LOOKUP_GETTER => {
+            Some(|agent, this, args| lookup_legacy_accessor(agent, this, &arg(args, 0), true))
+        }
+        PROTO_LOOKUP_SETTER => {
+            Some(|agent, this, args| lookup_legacy_accessor(agent, this, &arg(args, 0), false))
+        }
+        ASSIGN => Some(|agent, _this, args| object_assign(agent, args)),
+        CREATE => Some(|agent, _this, args| object_create(agent, args)),
+        DEFINE_PROPERTIES => {
+            Some(|agent, _this, args| object_define_properties(agent, &arg(args, 0), &arg(args, 1)))
+        }
+        DEFINE_PROPERTY => Some(|agent, _this, args| object_define_property(agent, args)),
+        ENTRIES => Some(|agent, _this, args| object_entries(agent, args)),
+        FREEZE => Some(|_agent, _this, args| freeze_or_seal(&arg(args, 0), true)),
+        FROM_ENTRIES => Some(|agent, _this, args| from_entries(agent, &arg(args, 0))),
+        GET_OWN_DESC => Some(|agent, _this, args| object_get_own_property_descriptor(agent, args)),
+        GET_OWN_DESCS => {
+            Some(|agent, _this, args| object_get_own_property_descriptors(agent, args))
+        }
+        GET_OWN_NAMES => Some(|agent, _this, args| own_keys_of(agent, &arg(args, 0), false)),
+        GET_OWN_SYMBOLS => Some(|agent, _this, args| own_keys_of(agent, &arg(args, 0), true)),
+        GROUP_BY => Some(|agent, _this, args| object_group_by(agent, args)),
+        GET_PROTO => Some(|agent, _this, args| get_prototype_of(agent, &arg(args, 0))),
+        HAS_OWN => Some(|agent, _this, args| object_has_own(agent, args)),
+        IS => {
+            Some(|_agent, _this, args| Ok(Value::Boolean(same_value(&arg(args, 0), &arg(args, 1)))))
+        }
+        IS_EXTENSIBLE => Some(|agent, _this, args| object_is_extensible(agent, args)),
+        IS_FROZEN => Some(|agent, _this, args| object_is_frozen(agent, args)),
+        IS_SEALED => Some(|agent, _this, args| object_is_sealed(agent, args)),
+        KEYS => Some(|agent, _this, args| object_keys(agent, args)),
+        PREVENT_EXTENSIONS => Some(|agent, _this, args| object_prevent_extensions(agent, args)),
+        SEAL => Some(|_agent, _this, args| freeze_or_seal(&arg(args, 0), false)),
+        SET_PROTO => {
+            Some(|agent, _this, args| set_prototype_of(agent, &arg(args, 0), &arg(args, 1)))
+        }
+        VALUES => Some(|agent, _this, args| object_values(agent, args)),
+        _ => None,
+    }
+}
+
+/// Object.prototype.hasOwnProperty (spec 20.1.3.4): [[HasOwnProperty]] on
+/// the ToObject'd receiver, with the deferred-namespace and live-binding
+/// handling for module namespace objects.
+fn prototype_has_own_property(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let key = crate::context::to_property_key(agent, &arg(args, 0))?;
+    let object = to_object(agent, this)?;
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    // A deferred namespace's [[HasProperty]] triggers its module's
+    // evaluation for non-symbol-like keys (import-defer).
+    crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
+    let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
+        // [[HasProperty]] reads the descriptor, whose value comes
+        // from the live binding: an uninitialized export throws a
+        // ReferenceError (spec 9.4.6.4 step 4).
+        match obj.get_own_property_key(&key)? {
+            Some(prop) => {
+                namespace_live_descriptor(agent, &obj, &key, &prop)?;
+                true
+            }
+            None => false,
+        }
+    } else {
+        obj.has_own_property_key(&key)?
+    };
+    Ok(Value::Boolean(present))
+}
+
+/// Object.prototype.isPrototypeOf (spec 20.1.3.5): walk `candidate`'s
+/// prototype chain for the receiver.
+fn prototype_is_prototype_of(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let candidate = arg(args, 0);
+    let Some(candidate_obj) = crate::context::as_object(&candidate) else {
+        return Ok(Value::Boolean(false));
+    };
+    let object = to_object(agent, this)?;
+    let Some(this_obj) = crate::context::as_object(&object) else {
+        return Ok(Value::Boolean(false));
+    };
+    let mut proto = candidate_obj.get_prototype_of()?;
+    while let Some(p) = proto {
+        if Handle::ptr_eq(p, this_obj) {
+            return Ok(Value::Boolean(true));
+        }
+        proto = p.get_prototype_of()?;
+    }
+    Ok(Value::Boolean(false))
+}
+
+/// Object.prototype.propertyIsEnumerable (spec 20.1.3.8).
+fn prototype_property_is_enumerable(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let key = crate::context::to_property_key(agent, &arg(args, 0))?;
+    let object = to_object(agent, this)?;
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    // A deferred namespace's [[GetOwnProperty]] triggers for
+    // non-symbol-like keys (import-defer).
+    crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
+    let enumerable = match obj.get_own_property_key(&key)? {
+        Some(prop) => {
+            // A module namespace descriptor reads the live binding
+            // (throwing on uninitialized exports, spec 9.4.6.4 step 4).
+            let desc = namespace_live_descriptor(agent, &obj, &key, &prop)?;
+            desc.enumerable.unwrap_or(false)
+        }
+        None => false,
+    };
+    Ok(Value::Boolean(enumerable))
+}
+
+/// Object.prototype.toLocaleString (spec 20.1.3.7): call `toString`.
+fn prototype_to_locale_string(
+    agent: &mut Agent,
+    this: &Value,
+    _args: &[Value],
+) -> Result<Value, JsError> {
+    let method =
+        crate::context::get_property(agent, this, &JsString::from_utf8("toString"), *this)?;
+    crate::function::call(agent, &method, *this, &[])
+}
+
+/// Object.create (spec 20.1.2.2): an ordinary object with the given
+/// prototype, optionally with Properties defined.
+fn object_create(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let proto_value = arg(args, 0);
+    let proto = match proto_value.kind() {
+        ValueKind::Object(obj) => Some(obj),
+        ValueKind::Null => None,
+        _ => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Object prototype may only be an Object or null".into(),
+            ));
+        }
+    };
+    let obj = JsObject::ordinary_object_create(proto);
+    let value = Value::Object(obj);
+    // spec 20.1.2.2 step 3: undefined Properties are skipped.
+    if args.len() > 1 {
+        let properties = arg(args, 1);
+        if !matches!(properties.kind(), ValueKind::Undefined) {
+            object_define_properties(agent, &value, &properties)?;
+        }
+    }
+    Ok(value)
+}
+
+/// Object.defineProperty (spec 20.1.2.4).
+fn object_define_property(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    // spec 20.1.2.4 step 1: a primitive receiver throws (functions
+    // are objects, so `as_object` accepts them).
+    let receiver = arg(args, 0);
+    let obj = as_object(&receiver).ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "Object.defineProperty called on non-object".into(),
+        )
+    })?;
+    let key = crate::context::to_property_key(agent, &arg(args, 1))?;
+    // A deferred namespace's [[DefineOwnProperty]] triggers its
+    // module's evaluation for non-symbol-like keys (import-defer).
+    crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
+    let mut desc = crux::property::to_property_descriptor(&arg(args, 2))?;
+    // ArraySetLength coerces an object [[Value]] twice (ToUint32 and
+    // ToNumber, spec 10.4.2.4 steps 3-4) before the descriptor
+    // validation; crux cannot invoke user valueOf, so both coercions
+    // run here through the agent (their side effects are observable,
+    // define-own-prop-length-coercion-order.js).
+    if matches!(obj.kind, crux::object::ObjectKind::Array(_))
+        && key == PropertyKey::from_utf8("length")
+        && let Some(value) = &desc.value
+        && matches!(value.kind(), ValueKind::Object(_) | ValueKind::Function(_))
+    {
+        let number = crate::context::to_number(agent, value)?;
+        let _ = crate::context::to_number(agent, value)?;
+        desc.value = Some(Value::Number(number));
+    }
+    if !obj.define_property_key(&key, &desc)? {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "Cannot define property {} on a non-extensible object",
+                key.display_string()
+            ),
+        ));
+    }
+    Ok(receiver)
+}
+
+/// Object.entries (spec 20.1.2.5): the enumerable string-keyed [key, value]
+/// pairs as an array.
+fn object_entries(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let object = to_object(agent, &arg(args, 0))?;
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    // GC-2: the freshly-created pair objects accumulate in a local
+    // Vec the stack scan cannot see while the next pair's creation
+    // allocates — suppress `--gc-stress` for the build so the
+    // half-built Vec cannot be swept (the per-key descriptor re-read
+    // makes a count-first pass unsound: getters may hide later keys).
+    let _stress = crate::ir::StressSuppress::new();
+    let mut entries = Vec::new();
+    for key in obj.own_property_keys()? {
+        // EnumerableOwnProperties (spec 7.3.26): the descriptor's
+        // enumerability is re-read for every key, so a getter hit for
+        // an earlier key can hide a later one (getter-making-future-
+        // key-nonenumerable.js).
+        let PropertyKey::String(id) = key else {
+            continue;
+        };
+        let key = PropertyKey::String(id);
+        if !obj
+            .get_own_property_key(&key)?
+            .is_some_and(|prop| prop.enumerable)
+        {
+            continue;
+        }
+        let text = crux::lookup(id);
+        let value = crate::context::get_property(agent, &object, &text, object)?;
+        let pair = crate::builtins::array::array_create(agent, 2.0)?;
+        pair.create_data_property(&JsString::from_utf8("0"), str(&text.to_string_lossy()))?;
+        pair.create_data_property(&JsString::from_utf8("1"), value)?;
+        entries.push(Value::Object(pair));
+    }
+    array_of(agent, &entries)
+}
+
+/// Object.values (spec 20.1.2.24): the enumerable string-keyed values.
+fn object_values(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let object = to_object(agent, &arg(args, 0))?;
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    let mut values = Vec::new();
+    // GC-2: the values (freshly-boxed for a primitive-string receiver)
+    // accumulate in a local Vec the stack scan cannot see while the
+    // next property read allocates — suppress `--gc-stress` for the
+    // build so the half-built Vec cannot be swept.
+    let _stress = crate::ir::StressSuppress::new();
+    for key in obj.own_property_keys()? {
+        // EnumerableOwnProperties re-reads each descriptor, so a
+        // getter for an earlier key can hide a later one.
+        let PropertyKey::String(id) = key else {
+            continue;
+        };
+        let key = PropertyKey::String(id);
+        if !obj
+            .get_own_property_key(&key)?
+            .is_some_and(|prop| prop.enumerable)
+        {
+            continue;
+        }
+        let text = crux::lookup(id);
+        let value = crate::context::get_property(agent, &object, &text, object)?;
+        values.push(value);
+    }
+    array_of(agent, &values)
+}
+
+/// Object.keys (spec 20.1.2.18): the enumerable own string keys.
+fn object_keys(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let keys = enumerable_string_keys(agent, &arg(args, 0))?;
+    // GC-2: the freshly-boxed key strings accumulate in a local Vec
+    // the stack scan cannot see while the next `Handle::new` fires a
+    // stress collection — suppress the window so the half-built Vec
+    // cannot be swept (the array is built by `array_of` after).
+    let _stress = crate::ir::StressSuppress::new();
+    let values: Vec<Value> = keys
+        .into_iter()
+        .map(|key| str(&key.to_string_lossy()))
+        .collect();
+    array_of(agent, &values)
+}
+
+/// Object.getOwnPropertyDescriptor (spec 20.1.2.8).
+fn object_get_own_property_descriptor(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let object = to_object(agent, &arg(args, 0))?;
+    let key = crate::context::to_property_key(agent, &arg(args, 1))?;
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    // A deferred namespace's [[GetOwnProperty]] triggers for
+    // non-symbol-like keys (import-defer).
+    crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
+    let Some(prop) = obj.get_own_property_key(&key)? else {
+        return Ok(Value::Undefined);
+    };
+    let desc = namespace_live_descriptor(agent, &obj, &key, &prop)?;
+    let realm = agent.current_realm()?;
+    crux::property::from_property_descriptor(
+        &desc,
+        realm
+            .intrinsics
+            .get(OBJECT_PROTO)
+            .and_then(|v| as_object(&v)),
+    )
+}
+
+/// Object.getOwnPropertyDescriptors (spec 20.1.2.10).
+fn object_get_own_property_descriptors(
+    agent: &mut Agent,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let object = to_object(agent, &arg(args, 0))?;
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    let realm = agent.current_realm()?;
+    let result = JsObject::ordinary_object_create(
+        realm
+            .intrinsics
+            .get(OBJECT_PROTO)
+            .and_then(|v| as_object(&v)),
+    );
+    for key in obj.own_property_keys()? {
+        if let Some(prop) = obj.get_own_property_key(&key)? {
+            let desc = crux::property::from_property_descriptor(
+                &namespace_live_descriptor(agent, &obj, &key, &prop)?,
+                realm
+                    .intrinsics
+                    .get(OBJECT_PROTO)
+                    .and_then(|v| as_object(&v)),
+            )?;
+            result.create_data_property_key(&key, desc)?;
+        }
+    }
+    Ok(Value::Object(result))
+}
+
+/// Object.hasOwn (spec 20.1.2.11).
+fn object_has_own(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let object = to_object(agent, &arg(args, 0))?;
+    let key = crate::context::to_property_key(agent, &arg(args, 1))?;
+    let obj = as_object(&object)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
+        // The descriptor reads the live binding: an uninitialized
+        // export throws a ReferenceError (spec 9.4.6.4 step 4).
+        match obj.get_own_property_key(&key)? {
+            Some(prop) => {
+                namespace_live_descriptor(agent, &obj, &key, &prop)?;
+                true
+            }
+            None => false,
+        }
+    } else {
+        obj.has_own_property_key(&key)?
+    };
+    Ok(Value::Boolean(present))
+}
+
+/// Object.isExtensible (spec 20.1.2.15).
+fn object_is_extensible(_agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    // spec 20.1.2.13 step 1: a non-object is trivially not extensible
+    // (undefined/null included — no RequireObjectCoercible).
+    let Some(obj) = as_object(&arg(args, 0)) else {
+        return Ok(Value::Boolean(false));
+    };
+    Ok(Value::Boolean(obj.is_extensible()?))
+}
+
+/// Object.preventExtensions (spec 20.1.2.19).
+fn object_prevent_extensions(_agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    // spec 20.1.2.18 step 1: a non-object is returned unchanged.
+    let value = arg(args, 0);
+    let Some(obj) = as_object(&value) else {
+        return Ok(value);
+    };
+    // spec step 4: a failed [[PreventExtensions]] (e.g. a proxy trap
+    // returning false) is a TypeError.
+    if !obj.prevent_extensions()? {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Cannot prevent extensions of the object".into(),
+        ));
+    }
+    Ok(value)
+}
+
+/// Object.isFrozen (spec 20.1.2.14).
+fn object_is_frozen(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Boolean(test_integrity_level(
+        agent,
+        &arg(args, 0),
+        true,
+    )?))
+}
+
+/// Object.isSealed (spec 20.1.2.16).
+fn object_is_sealed(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Boolean(test_integrity_level(
+        agent,
+        &arg(args, 0),
+        false,
+    )?))
 }
 
 /// Construct `new Object(...)` (spec 20.1.1.1): same wrapping behaviour as

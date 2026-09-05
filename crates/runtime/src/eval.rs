@@ -5510,6 +5510,62 @@ mod tests {
     }
 
     #[test]
+    fn object_and_dataview_builtins_dispatch_via_registered_handlers() {
+        // The Object (~40-intrinsic) and DataView chains scanned by identity
+        // per warm call (Object.hasOwn ~5µs/call at arm ~35 — every
+        // `intrinsics.get` allocates a JsString + hash-lookup). Object's
+        // dispatch arms were INLINE closures, so this slice extracted each
+        // into a named handler and registered both modules in the O(1)
+        // per-function-id table. These asserts pin that the registered
+        // handlers behave exactly like the chain arms: statics, prototype
+        // methods (receiver coercion), integrity levels, and the DataView
+        // element get/set codecs + accessors.
+        let text = |src: &str| -> String {
+            match run(src).unwrap().kind() {
+                ValueKind::String(s) => s.to_string_lossy(),
+                other => panic!("expected a string, got {other:?}"),
+            }
+        };
+        // Object statics through the handlers.
+        assert_eq!(
+            text(
+                "(function(){ var o = { a: 1, b: 2 }; var keys = Object.keys(o).join(','); var ent = Object.entries(o)[0].join(':'); var vals = Object.values(o).join(','); var assigned = Object.assign({}, o).b; var created = Object.create(o).a; return keys + '|' + ent + '|' + vals + '|' + assigned + '|' + created + '|' + Object.hasOwn(o, 'a') + '|' + Object.getOwnPropertyDescriptor(o, 'a').value; })()"
+            ),
+            "a,b|a:1|1,2|2|1|true|1"
+        );
+        // Integrity-level statics and prototype methods with coercion.
+        assert_eq!(
+            text(
+                "(function(){ var o = { x: 1 }; var ext = Object.isExtensible(o); var f = Object.freeze(o); var s = Object.seal({ y: 2 }); var d = Object.defineProperty({}, 'k', { value: 3, enumerable: true }); var proto = { z: 4 }; var pe = {}; return Object.isFrozen(f) + ':' + Object.isSealed(s) + ':' + ext + ':' + (Object.preventExtensions(pe) === pe) + ':' + d.k + ':' + Object.is(1, 1) + ':' + ({}).hasOwnProperty.call(d, 'k') + ':' + d.propertyIsEnumerable('k') + ':' + proto.isPrototypeOf(Object.create(proto)); })()"
+            ),
+            "true:true:true:true:3:true:true:true:true"
+        );
+        // __proto__ / legacy accessors / groupBy / fromEntries through the
+        // handlers, and a prototype patch is read live.
+        assert_eq!(
+            text(
+                "(function(){ var p = { m: 1 }; var o = {}; o.__proto__ = p; var g = Object.fromEntries([['a', 1]]); var grp = Object.groupBy([1, 2, 3], function (v) { return v % 2; }); var lk = {}; lk.__defineGetter__('x', function () { return 9; }); var orig = Object.prototype.hasOwnProperty; Object.prototype.hasOwnProperty = function () { return 'patched'; }; var patched = o.hasOwnProperty('nope'); Object.prototype.hasOwnProperty = orig; return o.m + ':' + (o.__proto__ === p) + ':' + g.a + ':' + grp[1] + ':' + lk.x + ':' + patched + ':' + o.hasOwnProperty('m'); })()"
+            ),
+            "1:true:1:1,3:9:patched:false"
+        );
+        // DataView element codecs + the buffer/byteLength/byteOffset
+        // accessors through the handlers.
+        assert_eq!(
+            text(
+                "(function(){ var dv = new DataView(new ArrayBuffer(24)); dv.setInt16(0, 0x1234); dv.setUint8(2, 255); dv.setFloat64(4, 1.5); dv.setBigInt64(12, 8n); return dv.getInt16(0).toString(16) + ':' + dv.getUint8(2) + ':' + dv.getFloat64(4) + ':' + dv.getBigInt64(12) + ':' + dv.byteLength + ':' + dv.byteOffset + ':' + (dv.buffer instanceof ArrayBuffer); })()"
+            ),
+            "1234:255:1.5:8:24:0:true"
+        );
+        // Receiver/incompatibility errors still surface through the handlers.
+        assert_eq!(
+            text(
+                "(function(){ var e = []; try { DataView(); } catch (x) { e.push(x.name); } try { Object.prototype.hasOwnProperty.call(null, 'a'); } catch (x) { e.push(x.name); } try { DataView.prototype.getInt8.call({}, 0); } catch (x) { e.push(x.name); } return e.join(','); })()"
+            ),
+            "TypeError,TypeError,TypeError"
+        );
+    }
+
+    #[test]
     fn fast_path_annex_b_block_functions() {
         // Cut 6 first slice (Annex B): a block-level function declaration
         // in a sloppy body certifies — the block binding is a frame slot
