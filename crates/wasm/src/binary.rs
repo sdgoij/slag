@@ -890,22 +890,13 @@ fn decode_fc(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
         }
         13 => Ok(Instr::ElemDrop(read_u32(bytes, pos)?)),
         14 => {
-            let _dst = read_u32(bytes, pos)?;
-            let _src = read_u32(bytes, pos)?;
-            Ok(Instr::TableCopy)
+            let dst = read_u32(bytes, pos)?;
+            let src = read_u32(bytes, pos)?;
+            Ok(Instr::TableCopy { dst, src })
         }
-        15 => {
-            let _table = read_u32(bytes, pos)?;
-            Ok(Instr::TableGrow)
-        }
-        16 => {
-            let _table = read_u32(bytes, pos)?;
-            Ok(Instr::TableSize)
-        }
-        17 => {
-            let _table = read_u32(bytes, pos)?;
-            Ok(Instr::TableFill)
-        }
+        15 => Ok(Instr::TableGrow(read_u32(bytes, pos)?)),
+        16 => Ok(Instr::TableSize(read_u32(bytes, pos)?)),
+        17 => Ok(Instr::TableFill(read_u32(bytes, pos)?)),
         _ => Err(Error::Unsupported("0xfc subopcode")),
     }
 }

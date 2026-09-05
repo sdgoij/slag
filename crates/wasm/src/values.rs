@@ -7,6 +7,26 @@
 
 use crate::instr::NumOp;
 
+/// Where a function reference points: the full function index space of a
+/// store instance. The instance stays alive for the life of the store, so
+/// references imported by later modules remain valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuncAddr {
+    pub instance: usize,
+    pub index: usize,
+}
+
+/// A runtime reference (spec 2.2.5 / 4.2.1). Only nulls, function
+/// references, and host extern payloads (`ref.extern n`, passed in as
+/// arguments) exist before the GC cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefValue {
+    Null,
+    Func(FuncAddr),
+    /// A host extern reference wrapping an integer payload (`ref.extern`).
+    Extern(u32),
+}
+
 /// A runtime value. Floats are their IEEE bit patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
@@ -14,6 +34,7 @@ pub enum Value {
     I64(i64),
     F32(u32),
     F64(u64),
+    Ref(RefValue),
 }
 
 impl Value {
@@ -38,11 +59,13 @@ pub enum Trap {
     IntegerOverflow,
     InvalidConversionToInteger,
     OutOfBoundsMemoryAccess,
+    OutOfBoundsTableAccess,
     IndirectCallTypeMismatch,
     UndefinedElement,
-    CallStackExhausted,
     UninitializedElement,
     NullReference,
+    NullFunctionReference,
+    CallStackExhausted,
     UnsupportedImport,
     UnknownFunction,
 }

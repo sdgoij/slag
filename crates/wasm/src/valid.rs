@@ -50,6 +50,11 @@ struct Spaces<'a> {
     tables: Vec<TableType>,
     /// Full memory index space.
     memories: Vec<MemType>,
+    /// Function indices a `ref.func` may reference (spec's "declared"
+    /// functions): those appearing in an element/global/table initializer or
+    /// exported. Function bodies and the start function declare nothing, so a
+    /// body-internal `ref.func` only passes when the target is declared here.
+    declared: Vec<bool>,
 }
 
 /// Validate a whole module.
@@ -115,6 +120,36 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
         globals.push(global.ty);
     }
 
+    // Declared functions: `ref.func x` is valid only when `x` is declared by
+    // an element segment item, a global/table initializer, or an export.
+    let mut declared = vec![false; funcs.len()];
+    for export in &module.exports {
+        if export.kind == ExportKind::Func
+            && let Some(slot) = declared.get_mut(export.index as usize)
+        {
+            *slot = true;
+        }
+    }
+    let initializer_refs = module
+        .elements
+        .iter()
+        .flat_map(|element| element.init.iter().flatten())
+        .chain(module.globals.iter().flat_map(|global| global.init.iter()))
+        .chain(
+            module
+                .tables
+                .iter()
+                .filter_map(|table| table.init.as_ref())
+                .flatten(),
+        );
+    for instr in initializer_refs {
+        if let Instr::RefFunc(index) = instr
+            && let Some(slot) = declared.get_mut(*index as usize)
+        {
+            *slot = true;
+        }
+    }
+
     Ok(Spaces {
         module,
         funcs,
@@ -122,6 +157,7 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
         imported_globals,
         tables,
         memories,
+        declared,
     })
 }
 
@@ -224,13 +260,16 @@ fn validate_tags(module: &Module) -> Result<(), Error> {
 /// the globals, so only imported globals are visible to those expressions.
 fn validate_tables(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> {
     for table in &module.tables {
+        let element = table.ty.element;
+        if !element.nullable {
+            // A non-nullable table has no default value: the table-with-
+            // initializer encoding must supply one.
+            if table.init.is_none() {
+                return Err(Error::Invalid("type mismatch"));
+            }
+        }
         if let Some(init) = &table.init {
-            validate_const_expr(
-                init,
-                ValType::Ref(table.ty.element),
-                spaces,
-                spaces.imported_globals,
-            )?;
+            validate_const_expr(init, ValType::Ref(element), spaces, spaces.imported_globals)?;
         }
     }
     Ok(())
@@ -303,6 +342,11 @@ fn validate_globals(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> {
 
 fn validate_elements(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> {
     for element in &module.elements {
+        if let HeapType::Type(index) = element.ty.heap
+            && index as usize >= module.types.len()
+        {
+            return Err(Error::Invalid("unknown type"));
+        }
         if let ElementMode::Active { table, offset } = &element.mode {
             let Some(table_ty) = spaces.tables.get(*table as usize) else {
                 return Err(Error::Invalid("unknown table"));
@@ -364,13 +408,27 @@ fn validate_code(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> {
             .count()
             + defined_index;
         let signature = &spaces.funcs[func_index];
-        let mut machine = Machine::new();
-        machine.push_frame(Ctrl::Func, vec![], signature.results.clone());
+        // Locals: parameters arrive initialized from the caller; declared
+        // locals are initialized iff their type is defaultable.
         let mut locals = signature.params.clone();
         locals.extend_from_slice(&body.locals);
+        let mut init = Vec::with_capacity(locals.len());
+        for (index, ty) in locals.iter().enumerate() {
+            check_value_types(std::slice::from_ref(ty), module.types.len(), 0)?;
+            init.push(index < signature.params.len() || is_defaultable(*ty));
+        }
+        let mut machine = Machine::new();
+        machine.init = init;
+        machine.push_frame(Ctrl::Func, vec![], signature.results.clone());
         machine.validate_body(&body.body, signature, &locals, spaces)?;
     }
     Ok(())
+}
+
+/// Whether a value type has a default value (only non-null reference types do
+/// not, which makes them require explicit initialization).
+fn is_defaultable(ty: ValType) -> bool {
+    !matches!(ty, ValType::Ref(reference) if !reference.nullable)
 }
 
 // ---- value typing helpers ----
@@ -444,11 +502,16 @@ struct Frame {
     end_types: Vec<ValType>,
     height: usize,
     unreachable: bool,
+    /// Locals initialized when this frame was entered; restored at `End` so
+    /// initialization inside a structured construct does not escape it.
+    saved_init: Vec<bool>,
 }
 
 struct Machine {
     vals: Vec<StackTy>,
     frames: Vec<Frame>,
+    /// Which locals are currently known to be initialized.
+    init: Vec<bool>,
 }
 
 impl Machine {
@@ -456,11 +519,13 @@ impl Machine {
         Machine {
             vals: Vec::new(),
             frames: Vec::new(),
+            init: Vec::new(),
         }
     }
 
     fn push_frame(&mut self, ctrl: Ctrl, start: Vec<ValType>, end: Vec<ValType>) {
         let height = self.vals.len();
+        let saved_init = self.init.clone();
         self.push_vals(&start);
         self.frames.push(Frame {
             ctrl,
@@ -468,6 +533,7 @@ impl Machine {
             end_types: end,
             height,
             unreachable: false,
+            saved_init,
         });
     }
 
@@ -653,7 +719,8 @@ impl Machine {
                 if frame.ctrl != Ctrl::If {
                     return Err(Error::Invalid("else instruction outside of an if block"));
                 }
-                // The else arm re-sees the if's block parameters.
+                // The else arm starts from the if's entry initialization.
+                self.init = frame.saved_init;
                 self.push_frame(Ctrl::Else, frame.start_types, frame.end_types);
             }
             Instr::End => {
@@ -663,6 +730,9 @@ impl Machine {
                     // frame so outer validation still sees it.
                     self.frames.push(frame);
                 } else {
+                    // Structured control scopes local initialization: locals
+                    // first initialized inside the construct do not escape it.
+                    self.init = frame.saved_init;
                     if frame.ctrl == Ctrl::If && frame.end_types != frame.start_types {
                         // An `if` without an `else` leaves the block's
                         // parameters as its results on the false path, so the
@@ -750,12 +820,12 @@ impl Machine {
             }
             Instr::ReturnCallRef(type_index) => {
                 let ty = type_at(spaces.module, *type_index)?;
-                self.pop_expected(ref_of_func())?;
+                self.pop_expected(typed_ref_of(*type_index))?;
                 self.tail_call(ty, signature)?;
             }
             Instr::CallRef(type_index) => {
                 let ty = type_at(spaces.module, *type_index)?;
-                self.pop_expected(ref_of_func())?;
+                self.pop_expected(typed_ref_of(*type_index))?;
                 self.pop_vals(&ty.params)?;
                 for result in &ty.results {
                     self.push_val(*result);
@@ -782,6 +852,7 @@ impl Machine {
                 let [t] = types.as_slice() else {
                     return Err(Error::Invalid("invalid result arity"));
                 };
+                check_value_types(types, spaces.module.types.len(), 0)?;
                 self.pop_expected(ValType::I32)?;
                 self.pop_expected(*t)?;
                 self.pop_expected(*t)?;
@@ -791,6 +862,10 @@ impl Machine {
                 let ty = *locals
                     .get(*index as usize)
                     .ok_or(Error::Invalid("unknown local"))?;
+                if !is_defaultable(ty) && !self.init.get(*index as usize).copied().unwrap_or(false)
+                {
+                    return Err(Error::Invalid("uninitialized local"));
+                }
                 self.push_val(ty);
             }
             Instr::LocalSet(index) => {
@@ -798,12 +873,18 @@ impl Machine {
                     .get(*index as usize)
                     .ok_or(Error::Invalid("unknown local"))?;
                 self.pop_expected(ty)?;
+                if let Some(slot) = self.init.get_mut(*index as usize) {
+                    *slot = true;
+                }
             }
             Instr::LocalTee(index) => {
                 let ty = *locals
                     .get(*index as usize)
                     .ok_or(Error::Invalid("unknown local"))?;
                 self.pop_val_of(ty)?;
+                if let Some(slot) = self.init.get_mut(*index as usize) {
+                    *slot = true;
+                }
                 self.push_val(ty);
             }
             Instr::GlobalGet(index) => {
@@ -878,6 +959,14 @@ impl Machine {
                 if *index as usize >= spaces.funcs.len() {
                     return Err(Error::Invalid("unknown function"));
                 }
+                if !spaces
+                    .declared
+                    .get(*index as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return Err(Error::Invalid("undeclared function reference"));
+                }
                 let type_index = func_type_of(spaces, *index as usize)?;
                 self.push_val(ValType::Ref(RefType {
                     nullable: false,
@@ -921,14 +1010,22 @@ impl Machine {
                 }
             }
             Instr::BrOnNonNull(label) => {
-                let operand = self.pop_val()?;
-                if !is_ref_ty(operand) {
-                    return Err(Error::Invalid("type mismatch"));
-                }
                 let types = self.label_types(*label as usize)?;
-                self.pop_vals(&types)?;
-                self.push_vals(&types);
-                self.push(operand);
+                // The branch carries the label values with the (non-null) ref
+                // as the last one; the null fall-through consumes the operand
+                // and keeps the preceding label values.
+                let Some((&last, ts0)) = types.split_last() else {
+                    return Err(Error::Invalid("type mismatch"));
+                };
+                let ValType::Ref(reference) = last else {
+                    return Err(Error::Invalid("type mismatch"));
+                };
+                self.pop_expected(ValType::Ref(RefType {
+                    nullable: true,
+                    heap: reference.heap,
+                }))?;
+                self.pop_vals(ts0)?;
+                self.push_vals(ts0);
             }
             Instr::MemoryInit { data_index, .. } => {
                 self.data_index(*data_index as usize, spaces)?;
@@ -970,28 +1067,33 @@ impl Machine {
                     return Err(Error::Invalid("unknown elem segment"));
                 }
             }
-            Instr::TableCopy => {
-                table_at(spaces, 0)?;
-                table_at(spaces, 0)?;
+            Instr::TableCopy { dst, src } => {
+                let dst_table = table_at(spaces, *dst as usize)?;
+                let src_table = table_at(spaces, *src as usize)?;
+                // Copied elements must fit the destination table: the source
+                // element type is a subtype of the destination's.
+                if !matches_ref(dst_table.element, src_table.element) {
+                    return Err(Error::Invalid("type mismatch"));
+                }
                 self.pop_expected(ValType::I32)?;
                 self.pop_expected(ValType::I32)?;
                 self.pop_expected(ValType::I32)?;
             }
-            Instr::TableGrow => {
-                let table = table_at(spaces, 0)?;
+            Instr::TableGrow(table) => {
+                let table = table_at(spaces, *table as usize)?;
                 self.pop_expected(ValType::I32)?;
                 self.pop_expected(ValType::Ref(table.element))?;
                 self.push_val(ValType::I32);
             }
-            Instr::TableSize => {
-                table_at(spaces, 0)?;
+            Instr::TableSize(table) => {
+                table_at(spaces, *table as usize)?;
                 self.push_val(ValType::I32);
             }
-            Instr::TableFill => {
-                let table = table_at(spaces, 0)?;
-                self.pop_expected(ValType::I32)?;
+            Instr::TableFill(table) => {
+                let table = table_at(spaces, *table as usize)?;
                 self.pop_expected(ValType::I32)?;
                 self.pop_expected(ValType::Ref(table.element))?;
+                self.pop_expected(ValType::I32)?;
             }
         }
         Ok(())
@@ -1042,7 +1144,12 @@ fn resolve_block_type(
 ) -> Result<(Vec<ValType>, Vec<ValType>), Error> {
     Ok(match bt {
         BlockType::Empty => (vec![], vec![]),
-        BlockType::Val(ty) => (vec![], vec![*ty]),
+        BlockType::Val(ty) => {
+            // An inline block-type value may be a typed reference to a
+            // user-defined type index that must resolve.
+            check_value_types(std::slice::from_ref(ty), spaces.module.types.len(), 0)?;
+            (vec![], vec![*ty])
+        }
         BlockType::Type(index) => {
             let ty = type_at(spaces.module, *index)?;
             (ty.params, ty.results)
@@ -1082,10 +1189,13 @@ fn table_is_func(table: &TableType) -> bool {
     matches_ref(RefType::FUNC, table.element)
 }
 
-fn ref_of_func() -> ValType {
+/// The operand a `call_ref`/`return_call_ref` requires: a (nullable)
+/// reference to the *defined function type* named by `type_index`, not a
+/// generic `funcref`, which carries no type information.
+fn typed_ref_of(type_index: u32) -> ValType {
     ValType::Ref(RefType {
         nullable: true,
-        heap: HeapType::Func,
+        heap: HeapType::Type(type_index),
     })
 }
 

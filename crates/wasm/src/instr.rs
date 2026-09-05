@@ -268,8 +268,11 @@ pub enum Instr {
         table: u32,
     },
     ElemDrop(u32),
-    TableCopy,
-    TableGrow,
-    TableSize,
-    TableFill,
+    TableCopy {
+        dst: u32,
+        src: u32,
+    },
+    TableGrow(u32),
+    TableSize(u32),
+    TableFill(u32),
 }

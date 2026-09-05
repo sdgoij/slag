@@ -1,24 +1,24 @@
 //! The wasm execution machine (spec ch. 4) over a [`Store`] of module
 //! instances (spec ch. 4.2).
 //!
-//! Instances share the store's mutable state: globals and linear memories are
-//! cells in store-owned pools, so a module that imports another instance's
-//! memory or mutable global aliases the same cell. Function imports bind to a
-//! flattened target (a defined body in some instance, or a host function).
+//! Instances share the store's mutable state: globals, linear memories, and
+//! tables are cells in store-owned pools, so a module that imports another
+//! instance's memory, mutable global, or table aliases the same cell. Function
+//! imports bind to a flattened target (a defined body in some instance, or a
+//! host function).
 //!
 //! One shared operand stack plus an explicit stack of function frames (each
 //! with its own instance, pc, locals, and control labels) keeps call depth
 //! bounded by a configured limit instead of the host stack. Numeric semantics
 //! live in [`crate::values`].
 //!
-//! Not executed yet ([`ExecFail::Unsupported`]): table instructions and
-//! reference-typed values (Cut 5), bulk memory (Cut 5), exceptions (Cut 6),
-//! SIMD (Cut 7), and memory64 (Cut 8).
+//! Not executed yet ([`ExecFail::Unsupported`]): exceptions (Cut 6), SIMD
+//! (Cut 7), memory64 (Cut 8), and GC reference operations (Cut 9).
 
 use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
-use crate::module::{DataMode, ExportKind, ImportDesc, Module};
-use crate::types::{BlockType, FuncType, GlobalType, Limits, MemType, ValType};
-use crate::values::{Trap, Value, exec_num};
+use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
+use crate::types::{BlockType, FuncType, GlobalType, Limits, MemType, RefType, TableType, ValType};
+use crate::values::{FuncAddr, RefValue, Trap, Value, exec_num};
 
 /// How execution stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,8 +114,44 @@ impl Memory {
     }
 }
 
+/// A table instance: reference slots plus its declared maximum.
+#[derive(Debug)]
+pub struct TableInst {
+    elements: Vec<RefValue>,
+    max: Option<u64>,
+}
+
+impl TableInst {
+    fn new(min: u64, max: Option<u64>, init: RefValue) -> Self {
+        TableInst {
+            elements: vec![init; min as usize],
+            max,
+        }
+    }
+
+    fn size(&self) -> u32 {
+        self.elements.len() as u32
+    }
+
+    /// Grow by `delta` slots, filling with `init`; returns the old size as an
+    /// `i32`, or `-1` when the growth would exceed the limits.
+    fn grow(&mut self, delta: u64, init: RefValue) -> i32 {
+        let old = self.size() as u64;
+        let Some(new) = old.checked_add(delta) else {
+            return -1;
+        };
+        let cap = self.max.unwrap_or(u64::from(u32::MAX));
+        if new > cap {
+            return -1;
+        }
+        self.elements.resize(new as usize, init);
+        old as i32
+    }
+}
+
 /// A value handed to [`Store::instantiate`] for one import. Function, global,
-/// and memory values reference cells/instances that stay alive in the store.
+/// memory, and table values reference cells/instances that stay alive in the
+/// store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternVal {
     /// A host function (e.g. the spectest `print*` family).
@@ -126,7 +162,7 @@ pub enum ExternVal {
     Global(usize),
     /// A shared memory cell.
     Memory(usize),
-    /// A shared table cell (Cut 5 has no table runtime yet).
+    /// A shared table cell.
     Table(usize),
     /// The value exists but its kind is not executable this cut.
     Unsupported(&'static str),
@@ -147,13 +183,18 @@ struct HostFunc {
 }
 
 /// A module instance: the module (code, types, exports) plus its index
-/// spaces. Globals and memories are cell ids into the owning store, so
-/// imports alias the exporter's cells; functions are flattened [`FuncTarget`]s.
+/// spaces. Globals, memories, and tables are cell ids into the owning store,
+/// so imports alias the exporter's cells; functions are flattened
+/// [`FuncTarget`]s. Data and element segments are retained per instance for
+/// the bulk-memory instructions (active segments are dropped after use).
 pub struct Instance {
     module: Module,
     funcs: Vec<FuncTarget>,
+    tables: Vec<usize>,
     globals: Vec<usize>,
     memories: Vec<usize>,
+    element_segments: Vec<Option<Vec<RefValue>>>,
+    data_segments: Vec<Option<Vec<u8>>>,
     depth_limit: usize,
 }
 
@@ -165,6 +206,8 @@ pub struct Store {
     global_types: Vec<GlobalType>,
     memories: Vec<Memory>,
     memory_types: Vec<MemType>,
+    tables: Vec<TableInst>,
+    table_types: Vec<TableType>,
 }
 
 impl Default for Store {
@@ -182,6 +225,8 @@ impl Store {
             global_types: Vec::new(),
             memories: Vec::new(),
             memory_types: Vec::new(),
+            tables: Vec::new(),
+            table_types: Vec::new(),
         }
     }
 
@@ -209,6 +254,14 @@ impl Store {
         Ok(self.memories.len() - 1)
     }
 
+    /// Register a standalone table cell (spectest table); returns its id.
+    pub fn table(&mut self, ty: TableType, init: RefValue) -> Result<usize, ExecFail> {
+        self.table_types.push(ty);
+        self.tables
+            .push(TableInst::new(ty.limits.min, ty.limits.max, init));
+        Ok(self.tables.len() - 1)
+    }
+
     /// Instantiate `module`, resolving each import through `resolve` (module
     /// name, field name) to an [`ExternVal`] or `None` for an unknown import.
     /// Returns the new instance's id.
@@ -219,6 +272,7 @@ impl Store {
     ) -> Result<usize, InstantiateError> {
         let self_id = self.instances.len();
         let mut funcs = Vec::with_capacity(module.imports.len() + module.functions.len());
+        let mut tables = Vec::with_capacity(module.imports.len());
         let mut globals = Vec::with_capacity(module.imports.len());
         let mut memories = Vec::with_capacity(module.imports.len());
 
@@ -270,7 +324,18 @@ impl Store {
                                 .global_types
                                 .get(cell)
                                 .ok_or(InstantiateError::Unlinkable("unknown import"))?;
-                            if actual != *gty {
+                            // Mutability must match exactly. An immutable
+                            // import's value type may subsume (a non-null
+                            // `(ref func)` satisfies `funcref`), but a mutable
+                            // global is an invariant container: the importer
+                            // could write into it, so the value type must be
+                            // identical.
+                            let value_ok = if gty.mutable {
+                                gty.value == actual.value
+                            } else {
+                                matches_val(gty.value, actual.value)
+                            };
+                            if actual.mutable != gty.mutable || !value_ok {
                                 return Err(InstantiateError::Unlinkable(
                                     "incompatible import type",
                                 ));
@@ -306,16 +371,24 @@ impl Store {
                         }
                     }
                 }
-                ImportDesc::Table(_) => {
-                    // Table imports need a table runtime (Cut 5); only an
-                    // absent export is a real (linkable) unknown.
-                    match resolve(&import.module, &import.name) {
-                        None => return Err(InstantiateError::Unlinkable("unknown import")),
-                        Some(ExternVal::Unsupported(reason)) => {
+                ImportDesc::Table(tt) => {
+                    let value = resolve(&import.module, &import.name)
+                        .ok_or(InstantiateError::Unlinkable("unknown import"))?;
+                    match value {
+                        ExternVal::Table(cell) => {
+                            let actual = self.table_type_of(cell);
+                            if !table_matches(actual, *tt) {
+                                return Err(InstantiateError::Unlinkable(
+                                    "incompatible import type",
+                                ));
+                            }
+                            tables.push(cell);
+                        }
+                        ExternVal::Unsupported(reason) => {
                             return Err(InstantiateError::Unsupported(reason));
                         }
-                        Some(ExternVal::Table(_)) | Some(_) => {
-                            return Err(InstantiateError::Unsupported("tables (Cut 5)"));
+                        _ => {
+                            return Err(InstantiateError::Unlinkable("incompatible import type"));
                         }
                     }
                 }
@@ -336,6 +409,22 @@ impl Store {
             });
         }
 
+        for table in &module.tables {
+            let init = if let Some(init_expr) = &table.init {
+                let values = self.global_values(&globals);
+                eval_ref_const(init_expr, &values, self_id)?
+            } else {
+                RefValue::Null
+            };
+            self.table_types.push(table.ty);
+            self.tables.push(TableInst::new(
+                table.ty.limits.min,
+                table.ty.limits.max,
+                init,
+            ));
+            tables.push(self.tables.len() - 1);
+        }
+
         for memory in &module.memories {
             if memory.memory64 {
                 return Err(InstantiateError::Unsupported("memory64 (Cut 8)"));
@@ -348,7 +437,8 @@ impl Store {
 
         for global in &module.globals {
             let values = self.global_values(&globals);
-            let value = eval_const(&global.init, &values).map_err(InstantiateError::from)?;
+            let value =
+                eval_const(&global.init, &values, self_id).map_err(InstantiateError::from)?;
             self.global_types.push(global.ty);
             self.globals.push(value);
             globals.push(self.globals.len() - 1);
@@ -357,13 +447,56 @@ impl Store {
         self.instances.push(Instance {
             module: module.clone(),
             funcs,
+            tables,
             globals,
             memories,
+            element_segments: Vec::new(),
+            data_segments: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
         });
 
-        // Apply active data segments in order. Writes to imported memories
-        // land in the shared cell and persist even if a later segment traps.
+        // Instantiate element segments in order (all elements before data),
+        // then data segments. Writes to imported tables/memories land in the
+        // shared cells and persist even if a later segment traps.
+        for segment in &module.elements {
+            let values = self.global_values(&self.instances[self_id].globals);
+            let items: Vec<RefValue> = segment
+                .init
+                .iter()
+                .map(|item| eval_ref_const(item, &values, self_id))
+                .collect::<Result<_, _>>()?;
+            match &segment.mode {
+                ElementMode::Active { table, offset } => {
+                    let cell = self.instances[self_id]
+                        .tables
+                        .get(*table as usize)
+                        .copied()
+                        .ok_or(InstantiateError::Trap(Trap::OutOfBoundsTableAccess))?;
+                    let offset_value =
+                        eval_const(offset, &values, self_id).map_err(InstantiateError::from)?;
+                    let Value::I32(offset) = offset_value else {
+                        return Err(InstantiateError::Unsupported("non-i32 table offset"));
+                    };
+                    let start = offset as u32 as usize;
+                    let end = start
+                        .checked_add(items.len())
+                        .ok_or(InstantiateError::Trap(Trap::OutOfBoundsTableAccess))?;
+                    let table = &mut self.tables[cell];
+                    if end > table.elements.len() {
+                        return Err(InstantiateError::Trap(Trap::OutOfBoundsTableAccess));
+                    }
+                    table.elements[start..end].copy_from_slice(&items);
+                    self.instances[self_id].element_segments.push(None);
+                }
+                ElementMode::Passive => {
+                    self.instances[self_id].element_segments.push(Some(items));
+                }
+                ElementMode::Declarative => {
+                    self.instances[self_id].element_segments.push(None);
+                }
+            }
+        }
+
         for segment in &module.data {
             if let DataMode::Active { memory, offset } = &segment.mode {
                 let memory_index = *memory as usize;
@@ -374,7 +507,8 @@ impl Store {
                     .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))
                     .map_err(InstantiateError::from)?;
                 let values = self.global_values(&self.instances[self_id].globals);
-                let offset_value = eval_const(offset, &values).map_err(InstantiateError::from)?;
+                let offset_value =
+                    eval_const(offset, &values, self_id).map_err(InstantiateError::from)?;
                 let Value::I32(offset) = offset_value else {
                     return Err(InstantiateError::Unsupported("non-i32 data offset"));
                 };
@@ -388,6 +522,11 @@ impl Store {
                     return Err(InstantiateError::Trap(Trap::OutOfBoundsMemoryAccess));
                 }
                 memory.bytes[start..end].copy_from_slice(&segment.bytes);
+                self.instances[self_id].data_segments.push(None);
+            } else {
+                self.instances[self_id]
+                    .data_segments
+                    .push(Some(segment.bytes.clone()));
             }
         }
 
@@ -415,7 +554,7 @@ impl Store {
             },
             ExportKind::Global => ExternVal::Global(inst.globals[export.index as usize]),
             ExportKind::Memory => ExternVal::Memory(inst.memories[export.index as usize]),
-            ExportKind::Table => ExternVal::Table(usize::MAX),
+            ExportKind::Table => ExternVal::Table(inst.tables[export.index as usize]),
             ExportKind::Tag => ExternVal::Unsupported("tags (Cut 6)"),
         })
     }
@@ -440,7 +579,9 @@ impl Store {
                             ExportKind::Memory => {
                                 ExternVal::Memory(inst.memories[export.index as usize])
                             }
-                            ExportKind::Table => ExternVal::Table(usize::MAX),
+                            ExportKind::Table => {
+                                ExternVal::Table(inst.tables[export.index as usize])
+                            }
                             ExportKind::Tag => ExternVal::Unsupported("tags (Cut 6)"),
                         };
                         (export.name.clone(), value)
@@ -593,6 +734,19 @@ impl Store {
             memory64: declared.memory64,
         }
     }
+
+    /// A table cell's type for import matching (current size as the minimum).
+    fn table_type_of(&self, cell: usize) -> TableType {
+        let declared = self.table_types[cell];
+        TableType {
+            element: declared.element,
+            limits: Limits {
+                min: self.tables[cell].elements.len() as u64,
+                max: declared.limits.max,
+                shared: declared.limits.shared,
+            },
+        }
+    }
 }
 
 /// A function frame on the machine's call stack.
@@ -691,6 +845,17 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The table cell the top frame addresses at `table_index` (0 when the
+    /// instruction's immediate was discarded by the single-table decoder).
+    fn table_cell(&self, frame_index: usize, table_index: usize) -> Result<usize, ExecFail> {
+        let instance = self.frames[frame_index].instance;
+        self.store.instances[instance]
+            .tables
+            .get(table_index)
+            .copied()
+            .ok_or(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
+    }
+
     /// Run until the outermost frame returns.
     fn run(&mut self) -> Result<Vec<Value>, ExecFail> {
         loop {
@@ -709,7 +874,6 @@ impl<'a> Engine<'a> {
     fn step(&mut self) -> Result<Ctl, ExecFail> {
         let frame_index = self.frames.len() - 1;
         if self.frames[frame_index].pc >= self.body(frame_index).len() {
-            // Fall off the end of the function: return its results.
             return self.finish();
         }
         let pc = self.frames[frame_index].pc;
@@ -763,10 +927,22 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Settled)
             }
             Instr::ReturnCall(index) => self.do_tail_call(index as usize),
-            Instr::ReturnCallIndirect { .. }
-            | Instr::ReturnCallRef(_)
-            | Instr::CallIndirect { .. }
-            | Instr::CallRef(_) => Err(ExecFail::Unsupported("indirect calls (Cut 5)")),
+            Instr::CallIndirect {
+                type_index,
+                table_index,
+            } => {
+                self.call_indirect(type_index as usize, table_index as usize)?;
+                Ok(Ctl::Settled)
+            }
+            Instr::ReturnCallIndirect {
+                type_index,
+                table_index,
+            } => self.return_call_indirect(type_index as usize, table_index as usize),
+            Instr::CallRef(type_index) => {
+                self.call_ref(type_index as usize)?;
+                Ok(Ctl::Settled)
+            }
+            Instr::ReturnCallRef(type_index) => self.return_call_ref(type_index as usize),
             Instr::Drop => {
                 self.pop()?;
                 Ok(Ctl::Next)
@@ -806,6 +982,31 @@ impl<'a> Engine<'a> {
                 let instance = self.frames[frame_index].instance;
                 let cell = self.store.instances[instance].globals[index as usize];
                 self.store.globals[cell] = value;
+                Ok(Ctl::Next)
+            }
+            Instr::TableGet(table) => {
+                let index = self.pop_i32()?;
+                let cell = self.table_cell(frame_index, table as usize)?;
+                let elements = &self.store.tables[cell].elements;
+                if index < 0 || index as u32 >= elements.len() as u32 {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
+                }
+                let value = Value::Ref(elements[index as usize]);
+                self.stack.push(value);
+                Ok(Ctl::Next)
+            }
+            Instr::TableSet(table) => {
+                let value = self.pop()?;
+                let index = self.pop_i32()?;
+                let cell = self.table_cell(frame_index, table as usize)?;
+                let elements = &mut self.store.tables[cell].elements;
+                if index < 0 || index as u32 >= elements.len() as u32 {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
+                }
+                let Value::Ref(reference) = value else {
+                    return Err(ExecFail::Unsupported("non-reference table value"));
+                };
+                elements[index as usize] = reference;
                 Ok(Ctl::Next)
             }
             Instr::I32Const(v) => {
@@ -895,28 +1096,249 @@ impl<'a> Engine<'a> {
                 self.stack.push(Value::I32(old));
                 Ok(Ctl::Next)
             }
-            Instr::MemoryInit { data_index: _, .. } | Instr::DataDrop(_) => {
-                Err(ExecFail::Unsupported("bulk memory (Cut 5)"))
+            Instr::MemoryInit { data_index, .. } => self.memory_init(data_index as usize),
+            Instr::DataDrop(data_index) => {
+                let instance = self.frames[frame_index].instance;
+                self.store.instances[instance].data_segments[data_index as usize] = None;
+                Ok(Ctl::Next)
             }
-            Instr::MemoryCopy | Instr::MemoryFill => {
-                Err(ExecFail::Unsupported("bulk memory (Cut 5)"))
+            Instr::MemoryCopy => self.memory_copy(),
+            Instr::MemoryFill => self.memory_fill(),
+            Instr::RefNull(_) => {
+                self.stack.push(Value::Ref(RefValue::Null));
+                Ok(Ctl::Next)
             }
-            Instr::RefNull(_)
-            | Instr::RefIsNull
-            | Instr::RefFunc(_)
-            | Instr::RefEq
-            | Instr::RefAsNonNull
-            | Instr::BrOnNull(_)
-            | Instr::BrOnNonNull(_) => Err(ExecFail::Unsupported("reference values (Cut 5)")),
-            Instr::TableGet(_)
-            | Instr::TableSet(_)
-            | Instr::TableInit { .. }
-            | Instr::ElemDrop(_)
-            | Instr::TableCopy
-            | Instr::TableGrow
-            | Instr::TableSize
-            | Instr::TableFill => Err(ExecFail::Unsupported("tables (Cut 5)")),
+            Instr::RefIsNull => {
+                let value = self.pop()?;
+                let is_null = matches!(value, Value::Ref(RefValue::Null));
+                self.stack.push(Value::I32(i32::from(is_null)));
+                Ok(Ctl::Next)
+            }
+            Instr::RefFunc(index) => {
+                let instance = self.frames[frame_index].instance;
+                let value = Value::Ref(RefValue::Func(FuncAddr {
+                    instance,
+                    index: index as usize,
+                }));
+                self.stack.push(value);
+                Ok(Ctl::Next)
+            }
+            Instr::RefEq => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let equal = match (a, b) {
+                    (Value::Ref(x), Value::Ref(y)) => x == y,
+                    _ => return Err(ExecFail::Unsupported("ref.eq on non-reference")),
+                };
+                self.stack.push(Value::I32(i32::from(equal)));
+                Ok(Ctl::Next)
+            }
+            Instr::RefAsNonNull => {
+                let value = self.pop()?;
+                match value {
+                    Value::Ref(RefValue::Null) => Err(ExecFail::Trap(Trap::NullReference)),
+                    reference => {
+                        self.stack.push(reference);
+                        Ok(Ctl::Next)
+                    }
+                }
+            }
+            Instr::BrOnNull(label) => {
+                let value = self.pop()?;
+                if matches!(value, Value::Ref(RefValue::Null)) {
+                    if self.branch_to(label as usize)? {
+                        return self.finish();
+                    }
+                    Ok(Ctl::Settled)
+                } else {
+                    self.stack.push(value);
+                    Ok(Ctl::Next)
+                }
+            }
+            Instr::BrOnNonNull(label) => {
+                let value = self.pop()?;
+                if !matches!(value, Value::Ref(RefValue::Null)) {
+                    self.stack.push(value);
+                    if self.branch_to(label as usize)? {
+                        return self.finish();
+                    }
+                    Ok(Ctl::Settled)
+                } else {
+                    // The null is consumed: the branch is not taken and the
+                    // value does not continue on the fall-through path.
+                    Ok(Ctl::Next)
+                }
+            }
+            Instr::TableInit {
+                element_index,
+                table,
+            } => self.table_init(element_index as usize, table as usize),
+            Instr::ElemDrop(element_index) => {
+                let instance = self.frames[frame_index].instance;
+                self.store.instances[instance].element_segments[element_index as usize] = None;
+                Ok(Ctl::Next)
+            }
+            Instr::TableCopy { dst, src } => self.table_copy(dst as usize, src as usize),
+            Instr::TableGrow(table) => self.table_grow(table as usize),
+            Instr::TableSize(table) => self.table_size(table as usize),
+            Instr::TableFill(table) => self.table_fill(table as usize),
         }
+    }
+
+    // ---- bulk memory ----
+
+    fn memory_init(&mut self, data_index: usize) -> Result<Ctl, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        let len = self.pop_i32()? as u32 as usize;
+        let src = self.pop_i32()? as u32 as usize;
+        let dst = self.pop_i32()? as u32 as usize;
+        let instance = self.frames[frame_index].instance;
+        let Some(&cell) = self.store.instances[instance].memories.first() else {
+            return Err(ExecFail::Unsupported("no memory"));
+        };
+        let Some(segment) = self.store.instances[instance].data_segments.get(data_index) else {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+        };
+        let source = segment.as_deref().unwrap_or(&[]);
+        let ok = dst
+            .checked_add(len)
+            .is_some_and(|end| end <= self.store.memories[cell].bytes.len())
+            && src.checked_add(len).is_some_and(|end| end <= source.len());
+        if !ok {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+        }
+        let bytes = &mut self.store.memories[cell].bytes;
+        bytes[dst..dst + len].copy_from_slice(&source[src..src + len]);
+        Ok(Ctl::Next)
+    }
+
+    fn memory_copy(&mut self) -> Result<Ctl, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        let len = self.pop_i32()? as u32 as usize;
+        let src = self.pop_i32()? as u32 as usize;
+        let dst = self.pop_i32()? as u32 as usize;
+        let instance = self.frames[frame_index].instance;
+        let Some(&cell) = self.store.instances[instance].memories.first() else {
+            return Err(ExecFail::Unsupported("no memory"));
+        };
+        let bytes = &self.store.memories[cell].bytes;
+        let size = bytes.len();
+        if dst.checked_add(len).is_none_or(|end| end > size)
+            || src.checked_add(len).is_none_or(|end| end > size)
+        {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+        }
+        let bytes = &mut self.store.memories[cell].bytes;
+        bytes.copy_within(src..src + len, dst);
+        Ok(Ctl::Next)
+    }
+
+    fn memory_fill(&mut self) -> Result<Ctl, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        let len = self.pop_i32()? as u32 as usize;
+        let value = self.pop_i32()? as u8;
+        let dst = self.pop_i32()? as u32 as usize;
+        let instance = self.frames[frame_index].instance;
+        let Some(&cell) = self.store.instances[instance].memories.first() else {
+            return Err(ExecFail::Unsupported("no memory"));
+        };
+        let bytes = &mut self.store.memories[cell].bytes;
+        if dst.checked_add(len).is_none_or(|end| end > bytes.len()) {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+        }
+        bytes[dst..dst + len].fill(value);
+        Ok(Ctl::Next)
+    }
+
+    // ---- table instructions ----
+
+    fn table_init(&mut self, element_index: usize, table: usize) -> Result<Ctl, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        let len = self.pop_i32()? as u32 as usize;
+        let src = self.pop_i32()? as u32 as usize;
+        let dst = self.pop_i32()? as u32 as usize;
+        let instance = self.frames[frame_index].instance;
+        let cell = self.table_cell(frame_index, table)?;
+        let Some(segment) = self.store.instances[instance]
+            .element_segments
+            .get(element_index)
+        else {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
+        };
+        let source = segment.as_deref().unwrap_or(&[]);
+        let size = self.store.tables[cell].elements.len();
+        let ok = dst.checked_add(len).is_some_and(|end| end <= size)
+            && src.checked_add(len).is_some_and(|end| end <= source.len());
+        if !ok {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
+        }
+        let elements = &mut self.store.tables[cell].elements;
+        elements[dst..dst + len].copy_from_slice(&source[src..src + len]);
+        Ok(Ctl::Next)
+    }
+
+    fn table_copy(&mut self, dst_table: usize, src_table: usize) -> Result<Ctl, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        let len = self.pop_i32()? as u32 as usize;
+        let src = self.pop_i32()? as u32 as usize;
+        let dst = self.pop_i32()? as u32 as usize;
+        let dst_cell = self.table_cell(frame_index, dst_table)?;
+        let src_cell = self.table_cell(frame_index, src_table)?;
+        let dst_size = self.store.tables[dst_cell].elements.len();
+        let src_size = self.store.tables[src_cell].elements.len();
+        if dst.checked_add(len).is_none_or(|end| end > dst_size)
+            || src.checked_add(len).is_none_or(|end| end > src_size)
+        {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
+        }
+        if dst_cell == src_cell {
+            // Copy as if through a temporary, so overlapping regions behave
+            // like a memmove (Vec::copy_within does exactly that).
+            let elements = &mut self.store.tables[dst_cell].elements;
+            elements.copy_within(src..src + len, dst);
+        } else {
+            let source = self.store.tables[src_cell].elements[src..src + len].to_vec();
+            self.store.tables[dst_cell].elements[dst..dst + len].copy_from_slice(&source);
+        }
+        Ok(Ctl::Next)
+    }
+
+    fn table_grow(&mut self, table: usize) -> Result<Ctl, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        let delta = self.pop_i32()? as u32 as u64;
+        let init = self.pop()?;
+        let Value::Ref(init) = init else {
+            return Err(ExecFail::Unsupported("non-reference table value"));
+        };
+        let cell = self.table_cell(frame_index, table)?;
+        let old = self.store.tables[cell].grow(delta, init);
+        self.stack.push(Value::I32(old));
+        Ok(Ctl::Next)
+    }
+
+    fn table_size(&mut self, table: usize) -> Result<Ctl, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        let cell = self.table_cell(frame_index, table)?;
+        let size = self.store.tables[cell].size() as i32;
+        self.stack.push(Value::I32(size));
+        Ok(Ctl::Next)
+    }
+
+    fn table_fill(&mut self, table: usize) -> Result<Ctl, ExecFail> {
+        let frame_index = self.frames.len() - 1;
+        let len = self.pop_i32()? as u32 as usize;
+        let value = self.pop()?;
+        let Value::Ref(value) = value else {
+            return Err(ExecFail::Unsupported("non-reference table value"));
+        };
+        let dst = self.pop_i32()? as u32 as usize;
+        let cell = self.table_cell(frame_index, table)?;
+        let elements = &mut self.store.tables[cell].elements;
+        if dst.checked_add(len).is_none_or(|end| end > elements.len()) {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
+        }
+        elements[dst..dst + len].fill(value);
+        Ok(Ctl::Next)
     }
 
     fn advance(&mut self, next: usize) {
@@ -969,7 +1391,6 @@ impl<'a> Engine<'a> {
                     });
                     self.advance(else_pc + 1);
                 } else {
-                    // No else, condition false: skip the whole `if`.
                     self.advance(map.end[pc] + 1);
                 }
             }
@@ -1053,6 +1474,124 @@ impl<'a> Engine<'a> {
         }
     }
 
+    fn resolve_target(&self, address: FuncAddr) -> Result<FuncTarget, ExecFail> {
+        self.store
+            .instances
+            .get(address.instance)
+            .and_then(|i| i.funcs.get(address.index))
+            .copied()
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))
+    }
+
+    /// Pop a function reference from the operand stack.
+    fn pop_func_ref(&mut self) -> Result<FuncAddr, ExecFail> {
+        match self.pop()? {
+            Value::Ref(RefValue::Func(address)) => Ok(address),
+            Value::Ref(RefValue::Null) => Err(ExecFail::Trap(Trap::NullFunctionReference)),
+            _ => Err(ExecFail::Trap(Trap::NullFunctionReference)),
+        }
+    }
+
+    fn call_indirect(&mut self, type_index: usize, table_index: usize) -> Result<(), ExecFail> {
+        let index = self.pop_i32()?;
+        let frame_index = self.frames.len() - 1;
+        let instance = self.frames[frame_index].instance;
+        if self.frames.len() + 1 > self.store.instances[instance].depth_limit {
+            return Err(ExecFail::Trap(Trap::CallStackExhausted));
+        }
+        let cell = self.table_cell(frame_index, table_index)?;
+        let elements = &self.store.tables[cell].elements;
+        if index < 0 || index as u32 >= elements.len() as u32 {
+            return Err(ExecFail::Trap(Trap::UndefinedElement));
+        }
+        let entry = elements[index as usize];
+        let RefValue::Func(address) = entry else {
+            return Err(ExecFail::Trap(Trap::UninitializedElement));
+        };
+        let target = self.resolve_target(address)?;
+        let expected = self
+            .store
+            .instances
+            .get(instance)
+            .and_then(|i| i.module.types.get(type_index))
+            .cloned()
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        if self.store.target_type(target) != expected {
+            return Err(ExecFail::Trap(Trap::IndirectCallTypeMismatch));
+        }
+        self.call_target(target)
+    }
+
+    fn return_call_indirect(
+        &mut self,
+        type_index: usize,
+        table_index: usize,
+    ) -> Result<Ctl, ExecFail> {
+        let index = self.pop_i32()?;
+        let frame_index = self.frames.len() - 1;
+        let instance = self.frames[frame_index].instance;
+        let cell = self.table_cell(frame_index, table_index)?;
+        let elements = &self.store.tables[cell].elements;
+        if index < 0 || index as u32 >= elements.len() as u32 {
+            return Err(ExecFail::Trap(Trap::UndefinedElement));
+        }
+        let entry = elements[index as usize];
+        let RefValue::Func(address) = entry else {
+            return Err(ExecFail::Trap(Trap::UninitializedElement));
+        };
+        let target = self.resolve_target(address)?;
+        let expected = self
+            .store
+            .instances
+            .get(instance)
+            .and_then(|i| i.module.types.get(type_index))
+            .cloned()
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        if self.store.target_type(target) != expected {
+            return Err(ExecFail::Trap(Trap::IndirectCallTypeMismatch));
+        }
+        self.tail_target(target)
+    }
+
+    fn call_ref(&mut self, type_index: usize) -> Result<(), ExecFail> {
+        let address = self.pop_func_ref()?;
+        let frame_index = self.frames.len() - 1;
+        let instance = self.frames[frame_index].instance;
+        if self.frames.len() + 1 > self.store.instances[instance].depth_limit {
+            return Err(ExecFail::Trap(Trap::CallStackExhausted));
+        }
+        let target = self.resolve_target(address)?;
+        let expected = self
+            .store
+            .instances
+            .get(instance)
+            .and_then(|i| i.module.types.get(type_index))
+            .cloned()
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        if self.store.target_type(target) != expected {
+            return Err(ExecFail::Trap(Trap::IndirectCallTypeMismatch));
+        }
+        self.call_target(target)
+    }
+
+    fn return_call_ref(&mut self, type_index: usize) -> Result<Ctl, ExecFail> {
+        let address = self.pop_func_ref()?;
+        let frame_index = self.frames.len() - 1;
+        let instance = self.frames[frame_index].instance;
+        let target = self.resolve_target(address)?;
+        let expected = self
+            .store
+            .instances
+            .get(instance)
+            .and_then(|i| i.module.types.get(type_index))
+            .cloned()
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        if self.store.target_type(target) != expected {
+            return Err(ExecFail::Trap(Trap::IndirectCallTypeMismatch));
+        }
+        self.tail_target(target)
+    }
+
     /// Run a host function called from the top frame.
     fn call_host(&mut self, id: usize) -> Result<(), ExecFail> {
         let ty = self.store.host_funcs[id].ty.clone();
@@ -1065,23 +1604,13 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Make a (direct, non-tail) call from the top frame.
-    fn do_call(&mut self, index: usize) -> Result<(), ExecFail> {
+    /// Call `target` from the top frame: pop its arguments, push its frame (or
+    /// run the host body), and advance past the call.
+    fn call_target(&mut self, target: FuncTarget) -> Result<(), ExecFail> {
         let caller = self.frames.len() - 1;
-        let instance = self.frames[caller].instance;
-        if self.frames.len() + 1 > self.store.instances[instance].depth_limit {
-            return Err(ExecFail::Trap(Trap::CallStackExhausted));
-        }
-        let target = *self
-            .store
-            .instances
-            .get(instance)
-            .and_then(|i| i.funcs.get(index))
-            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
         match target {
             FuncTarget::Host(id) => {
                 self.call_host(id)?;
-                // A host call returns in place: advance past the call.
                 let caller = self.frames.len() - 1;
                 self.frames[caller].pc += 1;
                 Ok(())
@@ -1111,7 +1640,6 @@ impl<'a> Engine<'a> {
                         body.locals.clone(),
                     )
                 };
-                // Pop arguments (last parameter sits on top), in parameter order.
                 let mut args = Vec::with_capacity(param_count);
                 for _ in 0..param_count {
                     args.push(self.pop()?);
@@ -1122,7 +1650,7 @@ impl<'a> Engine<'a> {
                     locals.push(default_value(*ty)?);
                 }
                 let base = self.stack.len();
-                self.frames[caller].pc += 1; // resume after the call
+                self.frames[caller].pc += 1;
                 self.frames.push(Frame {
                     instance: own,
                     pc: 0,
@@ -1142,21 +1670,27 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Make a tail call (`return_call`) from the top frame: replace the top
-    /// frame in place with the callee's frame at the same operand-stack base,
-    /// so the callee's results flow to the caller of the (now replaced)
-    /// frame. Everything else above the base — values owned by the tail
-    /// frame's not-yet-exited labels — is discarded when the callee finishes,
-    /// matching the spec's unwinding of `return_call`.
-    fn do_tail_call(&mut self, index: usize) -> Result<Ctl, ExecFail> {
-        let top = self.frames.len() - 1;
-        let instance = self.frames[top].instance;
+    /// Make a (direct, non-tail) call from the top frame.
+    fn do_call(&mut self, index: usize) -> Result<(), ExecFail> {
+        let caller = self.frames.len() - 1;
+        let instance = self.frames[caller].instance;
+        if self.frames.len() + 1 > self.store.instances[instance].depth_limit {
+            return Err(ExecFail::Trap(Trap::CallStackExhausted));
+        }
         let target = *self
             .store
             .instances
             .get(instance)
             .and_then(|i| i.funcs.get(index))
             .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        self.call_target(target)
+    }
+
+    /// Tail-call `target`: replace the top frame in place at the same
+    /// operand-stack base, so the callee's results flow to the caller of the
+    /// (now replaced) frame.
+    fn tail_target(&mut self, target: FuncTarget) -> Result<Ctl, ExecFail> {
+        let top = self.frames.len() - 1;
         match target {
             FuncTarget::Host(id) => {
                 let ty = self.store.host_funcs[id].ty.clone();
@@ -1193,7 +1727,6 @@ impl<'a> Engine<'a> {
                         body.locals.clone(),
                     )
                 };
-                // Pop arguments (last parameter sits on top), in parameter order.
                 let mut args = Vec::with_capacity(param_count);
                 for _ in 0..param_count {
                     args.push(self.pop()?);
@@ -1222,6 +1755,19 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Settled)
             }
         }
+    }
+
+    /// Make a tail call (`return_call`) from the top frame.
+    fn do_tail_call(&mut self, index: usize) -> Result<Ctl, ExecFail> {
+        let top = self.frames.len() - 1;
+        let instance = self.frames[top].instance;
+        let target = *self
+            .store
+            .instances
+            .get(instance)
+            .and_then(|i| i.funcs.get(index))
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        self.tail_target(target)
     }
 
     /// Pop the top frame, transferring its results to its caller. Returns the
@@ -1264,7 +1810,10 @@ fn default_value(ty: ValType) -> Result<Value, ExecFail> {
         ValType::F32 => Value::F32(0),
         ValType::F64 => Value::F64(0),
         ValType::V128 => return Err(ExecFail::Unsupported("v128 (Cut 7)")),
-        ValType::Ref(_) => return Err(ExecFail::Unsupported("reference values (Cut 5)")),
+        // Non-defaultable (non-null) reference locals are validated as
+        // initialized-before-use; the null placeholder below is never read by
+        // a valid module.
+        ValType::Ref(_) => Value::Ref(RefValue::Null),
     })
 }
 
@@ -1351,6 +1900,7 @@ fn write_mem(_op: StoreOp, value: Value, bytes: &mut [u8]) {
         Value::I64(v) => v as u64,
         Value::F32(bits) => bits as u64,
         Value::F64(bits) => bits,
+        Value::Ref(_) => 0,
     };
     for (shift, byte) in bytes.iter_mut().enumerate() {
         *byte = (bits >> (8 * shift)) as u8;
@@ -1364,6 +1914,13 @@ fn memory_matches(actual: MemType, requested: MemType) -> bool {
     !actual.memory64 && !requested.memory64 && limits_match(actual.limits, requested.limits)
 }
 
+/// Whether an imported table type is satisfied by a provided one: element
+/// reference types must be identical (tables are invariant containers) and
+/// limits subsume.
+fn table_matches(actual: TableType, requested: TableType) -> bool {
+    actual.element == requested.element && limits_match(actual.limits, requested.limits)
+}
+
 fn limits_match(actual: Limits, requested: Limits) -> bool {
     actual.min >= requested.min
         && requested
@@ -1371,8 +1928,36 @@ fn limits_match(actual: Limits, requested: Limits) -> bool {
             .is_none_or(|max| actual.max.is_some_and(|a| a <= max))
 }
 
+fn matches_ref(expected: RefType, actual: RefType) -> bool {
+    if !expected.nullable && actual.nullable {
+        return false;
+    }
+    match (expected.heap, actual.heap) {
+        (crate::types::HeapType::Func, crate::types::HeapType::Func) => true,
+        (crate::types::HeapType::Extern, crate::types::HeapType::Extern) => true,
+        (crate::types::HeapType::Type(x), crate::types::HeapType::Type(y)) => x == y,
+        // A typed function reference is a function reference.
+        (crate::types::HeapType::Func, crate::types::HeapType::Type(_)) => true,
+        _ => false,
+    }
+}
+
+/// Whether `actual` value type fits an `expected` value type (reference
+/// subtyping for refs, equality otherwise).
+fn matches_val(expected: ValType, actual: ValType) -> bool {
+    if expected == actual {
+        return true;
+    }
+    match (expected, actual) {
+        (ValType::Ref(e), ValType::Ref(a)) => matches_ref(e, a),
+        _ => false,
+    }
+}
+
 /// Evaluate a constant initializer expression (no terminating `end`).
-fn eval_const(expr: &[Instr], globals: &[Value]) -> Result<Value, ExecFail> {
+/// `func_instance` is the instance whose function space a `ref.func` refers
+/// to.
+fn eval_const(expr: &[Instr], globals: &[Value], func_instance: usize) -> Result<Value, ExecFail> {
     let mut stack: Vec<Value> = Vec::new();
     for instr in expr {
         match instr {
@@ -1399,13 +1984,27 @@ fn eval_const(expr: &[Instr], globals: &[Value]) -> Result<Value, ExecFail> {
                 operands.reverse();
                 stack.push(exec_num(*op, &operands)?);
             }
-            Instr::RefNull(_) | Instr::RefFunc(_) => {
-                return Err(ExecFail::Unsupported("reference-typed globals (Cut 5)"));
-            }
+            Instr::RefNull(_) => stack.push(Value::Ref(RefValue::Null)),
+            Instr::RefFunc(index) => stack.push(Value::Ref(RefValue::Func(FuncAddr {
+                instance: func_instance,
+                index: *index as usize,
+            }))),
             _ => return Err(ExecFail::Unsupported("constant expression")),
         }
     }
     stack
         .pop()
         .ok_or(ExecFail::Unsupported("empty constant expression"))
+}
+
+/// Evaluate a constant expression that must produce a reference value.
+fn eval_ref_const(
+    expr: &[Instr],
+    globals: &[Value],
+    func_instance: usize,
+) -> Result<RefValue, InstantiateError> {
+    match eval_const(expr, globals, func_instance)? {
+        Value::Ref(reference) => Ok(reference),
+        _ => Err(InstantiateError::Unsupported("non-reference constant")),
+    }
 }

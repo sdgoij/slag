@@ -367,11 +367,14 @@ review, per repo rules hygiene.
 
 ## 9. Status
 
-**2026-09-05 — Cut 4 (functions/calls/globals/memory/instantiation) landed,
-with the spectest/`register` import-machinery follow-up** — `imports.wast`
-is 147-pass/0-fail, `linking.wast` 70-pass with one Cut-5 side-effect fail,
-`start`/`exports`/`memory_grow` are fully green; see the Cut 4 entries
-below. `instance.wast` remains a converter gap (`(module instance …)`).
+**2026-09-05 — Cut 4 + import follow-up landed, and Cut 5's reference/table
+runtime is in** (tables, reference values, `call_indirect`, `call_ref`, bulk
+memory). `imports.wast`/`start`/`exports`/`memory_grow` and now
+`func_ptrs`/`elem`/`table*`/`call_indirect`/`br_on_null`/`ref_is_null` and
+four bulk-memory files are green; `linking.wast` is fully green (163/0).
+Remaining: the typed-function-reference *validation* rules (see the Cut 5
+entry below), plus converter gaps (`instance.wast`, `ref_null.wast`,
+`table_init.wast` GC text).
 
 **2026-09-05 — Cut 2 (validation) green on its gate, plus the module-level
 validity files.**
@@ -545,10 +548,74 @@ follow-up, unlocking `imports.wast`, the import halves of `linking.wast`,
   `InstantiateError`; modules whose instance could not be created are
   tracked as *unavailable* so a later `register`/import of them stays
   pending instead of linking a stale module.
-- Written taxonomy (counted, not hidden): `linking.wast`'s single remaining
-  fail is `get memory[0] = 104` after a module that imports a *table* — its
-  data-segment side effect on the shared memory is skipped because table/
-  element instantiation is Cut 5. `func.wast` (uninitialized typed local)
-  and `data.wast` (post-`memory.init`) stay Cut 5. `instance.wast` cannot be
-  converted: its `(module instance …)` syntax is beyond wabt 1.0.41 (and
-  `wast2json-rs`).
+- Written taxonomy (counted, not hidden): `linking.wast` is now fully green
+  (163 pass / 0 fail) once tables/elements landed in Cut 5. `func.wast`
+  (uninitialized typed local) and `data.wast` (post-`memory.init`) stay Cut 5.
+  `instance.wast` cannot be converted: its `(module instance …)` syntax is
+  beyond wabt 1.0.41 (and `wast2json-rs`).
+
+### Cut 5 — runtime: tables, reference values, indirect/ref calls, bulk memory (2026-09-05)
+
+The reference/table runtime landed: `ref` values (`ref.null/func`, host
+`ref.extern` payloads, `ref.is_null`, `ref.as_non_null`, `br_on_null/…`),
+table cells shared across instances, element segments (active writes +
+passive retention for `table.init`/`elem.drop`), `call_indirect` /
+`return_call_indirect`, `call_ref` / `return_call_ref` through function
+references, the table instructions (`get/set/size/grow/fill/copy/init`,
+`elem.drop`), and bulk memory (`memory.copy/fill/init`, `data.drop`) with
+per-instance passive data/elem segments.
+
+Gate highlights (0 fail):
+
+```
+func_ptrs 36, table 40, table_get 16, table_set 26, table_size 39,
+table_grow 58, elem 154, call_indirect 161 (11 pending),
+ref_is_null 22, ref_as_non_null 7, br_on_null 10,
+bulk: memory_copy 4450, memory_fill 100, memory_init 250,
+table_copy 1728, table_fill 45, table-sub 3
+```
+
+`linking.wast` became fully green (163/0). Fixes along the way: table
+instructions keep their table indices; `table.copy`/`table.fill` typing
+(source element ⊑ destination; fill operand order); non-nullable tables
+must carry an initializer; `(module definition …)` commands are
+validated but never instantiated (wabt writes `definition` as a JSON
+string); import matching lets immutable reference globals subsume while
+mutable globals and tables stay invariant; the `(ref.func)` result
+pattern (wast2json value `0`) means "any non-null function".
+
+**Cut 5 tail closed (typed function references):** the remaining
+*validation* rules for typed refs landed and the top-level reference suite
+is fully green. New rules:
+- **Unknown type indices in inline value types** are rejected wherever a
+  typed reference appears: block/loop/if block-type results
+  (`resolve_block_type`), `select` result types, elem-segment element
+  types, and (with the uninitialized-local work) every function
+  param/local (`validate_code` per-local check). `ref.wast` 13/0.
+- **`ref.func` requires a *declared* function**: the validator computes
+  the module's declared set (elem items of any mode, global/table
+  initializers, exports — bodies and `start` declare nothing, matching
+  the reference interpreter's `Free.module_` over `funcs = []`, `start =
+  None`) and rejects `ref.func` of an undeclared function inside a body.
+  `ref_func.wast` 17/0.
+- **Uninitialized typed locals**: a non-nullable reference local must be
+  `local.set`/`local.tee` before `local.get`; the `Machine` tracks
+  per-frame init bits, restoring them at `Else`/`End` so initialization
+  inside a structured construct does not escape it. `func.wast`
+  (uninitialized local) and `local_init.wast` are green.
+- **`br_on_non_null` typing**: the null fall-through consumes the operand
+  (it is *not* re-pushed), keeping only the preceding label values; the
+  branch carries the operand as the label's final value, which must be a
+  reference of the operand's heap type. The executor's null path now also
+  drops the operand. `br_on_non_null.wast` 12/0.
+- **`call_ref`/`return_call_ref` operands must be *typed* function
+  references**: the popped reference is checked against `(ref null
+  <type-index>)`, not `funcref`, so a generic `funcref` operand is
+  rejected (`call_ref.wast` 35/0, `return_call_ref.wast` 53/0).
+- **Trap text**: the runner accepts the spec's suffixed
+  `uninitialized element N` (and `undefined element N`) form for the
+  index-less engine traps; `bulk.wast` 117/0.
+
+`ref_null.wast` and `table_init.wast` still cannot be converted: their GC
+text (`any`/`anyref`, `array.new_default`) is beyond wabt 1.0.41 (and
+`instance.wast` needs `(module instance …)`).

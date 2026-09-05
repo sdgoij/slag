@@ -19,8 +19,10 @@ use std::process::{Command, ExitCode};
 
 use serde_json::Value;
 use wasm::Value as WasmValue;
-use wasm::types::{FuncType, GlobalType, Limits, MemType, ValType};
+use wasm::types::{FuncType, GlobalType, Limits, MemType, RefType, TableType, ValType};
 use wasm::valid::Error as ValidError;
+use wasm::values::FuncAddr;
+use wasm::values::RefValue;
 use wasm::{
     DecodeError, ExecFail, ExternVal, InstantiateError, Module, Store, Trap, decode, validate,
 };
@@ -220,38 +222,53 @@ fn run_json(json_path: &Path) -> Tally {
         let outcome = match kind {
             "module" => {
                 let module = command.get("module").unwrap_or(command);
+                let definition_only = command.get("definition").and_then(Value::as_str);
                 match module_source(module, dir) {
                     ModuleSource::Binary(bytes) => {
-                        match judge_module(
-                            &mut store,
-                            &registry,
-                            &unavailable,
-                            &bytes,
-                            ModuleExpect::Instantiate,
-                        ) {
-                            Verdict::Id(id) => {
-                                last = Some(id);
-                                last_defined_ok = true;
-                                module_pending = None;
-                                if let Some(label) = command.get("name").and_then(Value::as_str) {
-                                    named.insert(label.to_string(), id);
+                        if definition_only == Some("true") {
+                            // `(module definition ...)`: decode and validate
+                            // only — never instantiate (its tables/memories
+                            // may be huge).
+                            match decode(&bytes) {
+                                Err(error) => Outcome::Fail(format!("module decode: {error}")),
+                                Ok(module) => match validate(&module) {
+                                    Err(error) => Outcome::Fail(format!("module invalid: {error}")),
+                                    Ok(_) => Outcome::Pass,
+                                },
+                            }
+                        } else {
+                            match judge_module(
+                                &mut store,
+                                &registry,
+                                &unavailable,
+                                &bytes,
+                                ModuleExpect::Instantiate,
+                            ) {
+                                Verdict::Id(id) => {
+                                    last = Some(id);
+                                    last_defined_ok = true;
+                                    module_pending = None;
+                                    if let Some(label) = command.get("name").and_then(Value::as_str)
+                                    {
+                                        named.insert(label.to_string(), id);
+                                    }
+                                    Outcome::Pass
                                 }
-                                Outcome::Pass
-                            }
-                            Verdict::Pass => {
-                                last_defined_ok = true;
-                                module_pending = None;
-                                Outcome::Pass
-                            }
-                            Verdict::Pending(reason) => {
-                                last_defined_ok = false;
-                                module_pending = Some(reason);
-                                Outcome::Pending(reason)
-                            }
-                            Verdict::Fail(message) => {
-                                last_defined_ok = false;
-                                module_pending = None;
-                                Outcome::Fail(message)
+                                Verdict::Pass => {
+                                    last_defined_ok = true;
+                                    module_pending = None;
+                                    Outcome::Pass
+                                }
+                                Verdict::Pending(reason) => {
+                                    last_defined_ok = false;
+                                    module_pending = Some(reason);
+                                    Outcome::Pending(reason)
+                                }
+                                Verdict::Fail(message) => {
+                                    last_defined_ok = false;
+                                    module_pending = None;
+                                    Outcome::Fail(message)
+                                }
                             }
                         }
                     }
@@ -406,10 +423,9 @@ fn run_json(json_path: &Path) -> Tally {
                                     {
                                         Some(expected) => {
                                             if expected.len() != values.len()
-                                                || expected
-                                                    .iter()
-                                                    .zip(&values)
-                                                    .any(|(e, a)| !matches_expected(e, *a))
+                                                || expected.iter().zip(&values).any(|(e, a)| {
+                                                    !matches_expected(e, *a, instance)
+                                                })
                                             {
                                                 Outcome::Fail("results differ from expected".into())
                                             } else {
@@ -433,7 +449,7 @@ fn run_json(json_path: &Path) -> Tally {
                                             .get("text")
                                             .and_then(Value::as_str)
                                             .unwrap_or("");
-                                        if trap_text(trap) == expected {
+                                        if trap_text_matches(trap, expected) {
                                             Outcome::Pass
                                         } else {
                                             Outcome::Fail(format!(
@@ -548,15 +564,6 @@ fn judge_module(
     if let Err(error) = validate(&module) {
         return Verdict::Fail(format!("module invalid: {error}"));
     }
-    // Instantiation traps driven by table/element machinery (Cut 5) cannot
-    // be judged yet: the engine does not run element segments.
-    let needs_instantiation_trap = matches!(
-        expect,
-        ModuleExpect::Uninstantiable | ModuleExpect::InstantiationTrap(_)
-    );
-    if needs_instantiation_trap && (!module.tables.is_empty() || !module.elements.is_empty()) {
-        return Verdict::Pending("tables/elements (Cut 5)");
-    }
     let result = {
         let mut resolve = |m: &str, n: &str| {
             registry
@@ -589,7 +596,7 @@ fn judge_module(
             Ok(_) => Verdict::Fail("expected trap, module instantiated".into()),
         },
         ModuleExpect::InstantiationTrap(text) => match result {
-            Err(InstantiateError::Trap(trap)) if trap_text(trap) == text => Verdict::Pass,
+            Err(InstantiateError::Trap(trap)) if trap_text_matches(trap, text) => Verdict::Pass,
             Err(InstantiateError::Trap(trap)) => {
                 Verdict::Fail(format!("trapped with {trap:?}, expected {text:?}"))
             }
@@ -643,30 +650,69 @@ fn parse_const(entry: &serde_json::Value) -> Option<WasmValue> {
     if value.starts_with("nan:") {
         return None;
     }
-    let bits = value.parse::<u64>().ok()?;
-    Some(match ty {
-        "i32" => WasmValue::I32(bits as i32),
-        "i64" => WasmValue::I64(bits as i64),
-        "f32" => WasmValue::F32(bits as u32),
-        "f64" => WasmValue::F64(bits),
-        _ => return None,
-    })
+    match ty {
+        "funcref" => {
+            if value == "null" {
+                Some(WasmValue::Ref(RefValue::Null))
+            } else {
+                None
+            }
+        }
+        "externref" => {
+            let reference = if value == "null" {
+                RefValue::Null
+            } else {
+                RefValue::Extern(value.parse::<u64>().ok()? as u32)
+            };
+            Some(WasmValue::Ref(reference))
+        }
+        _ => {
+            let bits = value.parse::<u64>().ok()?;
+            Some(match ty {
+                "i32" => WasmValue::I32(bits as i32),
+                "i64" => WasmValue::I64(bits as i64),
+                "f32" => WasmValue::F32(bits as u32),
+                "f64" => WasmValue::F64(bits),
+                _ => return None,
+            })
+        }
+    }
 }
 
 /// Whether an actual result value satisfies an expected entry (which may be
 /// a NaN pattern).
-fn matches_expected(expected: &serde_json::Value, actual: WasmValue) -> bool {
+fn matches_expected(expected: &serde_json::Value, actual: WasmValue, module: usize) -> bool {
     let ty = expected.get("type").and_then(Value::as_str);
     let value = expected.get("value").and_then(Value::as_str);
     let (ty, value) = match (ty, value) {
         (Some(ty), Some(value)) => (ty, value),
         _ => return false,
     };
+    if ty == "funcref" {
+        // wast2json encodes the `(ref.func)` non-null pattern as value "0":
+        // any non-null function reference.
+        if value == "0" {
+            return matches!(actual, WasmValue::Ref(RefValue::Func(_)));
+        }
+        if let Ok(index) = value.parse::<u64>() {
+            let expected = FuncAddr {
+                instance: module,
+                index: index as usize,
+            };
+            return actual == WasmValue::Ref(RefValue::Func(expected));
+        }
+        return value == "null" && matches!(actual, WasmValue::Ref(RefValue::Null));
+    }
+    if ty == "externref" {
+        return parse_const(expected) == Some(actual)
+            || (value == "null" && matches!(actual, WasmValue::Ref(RefValue::Null)));
+    }
     let bits = match actual {
         WasmValue::I32(v) => v as u32 as u64,
         WasmValue::I64(v) => v as u64,
         WasmValue::F32(v) => v as u64,
         WasmValue::F64(v) => v,
+        WasmValue::Ref(_) => return false,
     };
     match value {
         "nan:canonical" => match ty {
@@ -694,20 +740,41 @@ fn trap_text(trap: Trap) -> &'static str {
         Trap::IntegerOverflow => "integer overflow",
         Trap::InvalidConversionToInteger => "invalid conversion to integer",
         Trap::OutOfBoundsMemoryAccess => "out of bounds memory access",
+        Trap::OutOfBoundsTableAccess => "out of bounds table access",
         Trap::IndirectCallTypeMismatch => "indirect call type mismatch",
         Trap::UndefinedElement => "undefined element",
         Trap::CallStackExhausted => "call stack exhausted",
         Trap::UninitializedElement => "uninitialized element",
         Trap::NullReference => "null reference",
+        Trap::NullFunctionReference => "null function reference",
         Trap::UnsupportedImport => "unsupported import",
         Trap::UnknownFunction => "unknown function",
     }
 }
 
+/// Compare a trap against an expected `assert_trap` text. The spec reports
+/// `uninitialized element <index>` (and `undefined element <index>`) with the
+/// offending table index; the engine's trap only records the kind, so accept
+/// the suffixed form for those kinds. `bulk.wast` expects
+/// `"uninitialized element 2"`, the single corpus occurrence of a suffix.
+fn trap_text_matches(trap: Trap, expected: &str) -> bool {
+    if trap_text(trap) == expected {
+        return true;
+    }
+    let index_suffix = match trap {
+        Trap::UninitializedElement => "uninitialized element ",
+        Trap::UndefinedElement => "undefined element ",
+        _ => return false,
+    };
+    expected
+        .strip_prefix(index_suffix)
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// The spec's predefined `spectest` host module: no-op `print*` functions,
 /// `global_i32/i64` = 666 and `global_f32/f64` = 666.6, a 1..2-page memory,
-/// and a table that is not executable until Cut 5. Returns the
-/// (module, field) -> value map used by import resolution.
+/// and a 10..20-slot funcref table. Returns the (module, field) -> value map
+/// used by import resolution.
 fn spectest_exports(store: &mut Store) -> HashMap<(String, String), ExternVal> {
     let mut exports = HashMap::new();
     let mut host = |store: &mut Store, name: &str, params: Vec<ValType>| {
@@ -765,10 +832,18 @@ fn spectest_exports(store: &mut Store) -> HashMap<(String, String), ExternVal> {
             ExternVal::Memory(cell),
         );
     }
-    exports.insert(
-        ("spectest".to_string(), "table".to_string()),
-        ExternVal::Unsupported("tables (Cut 5)"),
-    );
+    if let Ok(cell) = store.table(
+        TableType {
+            element: RefType::FUNC,
+            limits: Limits::new(10, Some(20)),
+        },
+        RefValue::Null,
+    ) {
+        exports.insert(
+            ("spectest".to_string(), "table".to_string()),
+            ExternVal::Table(cell),
+        );
+    }
     exports
 }
 
