@@ -377,49 +377,54 @@ fn decode_heap_type(bytes: &[u8], pos: &mut usize) -> Result<HeapType, Error> {
     }
 }
 
-fn decode_limits(bytes: &[u8], pos: &mut usize) -> Result<Limits, Error> {
-    let flags = read_u32(bytes, pos)?;
-    // 0x00 min, 0x01 min+max. Shared tables (0x02/0x03) are a later cut.
-    // Table limits stay u32-sized; see `decode_memory_limits` for memories.
-    match flags {
-        0 => {
-            let min = u64::from(read_u32(bytes, pos)?);
-            Ok(Limits::new(min, None))
-        }
-        1 => {
-            let min = u64::from(read_u32(bytes, pos)?);
-            let max = Some(u64::from(read_u32(bytes, pos)?));
-            Ok(Limits::new(min, max))
-        }
-        _ => Err(Error::Unsupported("shared limits")),
+/// A table's limits (spec 5.3.16): a flags byte whose bit 0 marks a maximum
+/// and bit 2 selects a table64 (an i64 index type), then u64 LEB limits; every
+/// other flag bit is malformed.
+fn decode_limits(bytes: &[u8], pos: &mut usize) -> Result<(Limits, bool), Error> {
+    let flags = read_u8(bytes, pos)?;
+    if flags & 0xfa != 0 {
+        return Err(Error::Malformed("malformed limits flags"));
     }
+    let table64 = flags & 0x04 != 0;
+    let min = read_leb(bytes, pos, 10)?;
+    let max = if flags & 0x01 != 0 {
+        Some(read_leb(bytes, pos, 10)?)
+    } else {
+        None
+    };
+    Ok((Limits::new(min, max), table64))
 }
 
 /// Memory limits (spec 5.3.12): the limit values are u64 LEB128 even for
 /// 32-bit memories, so out-of-range page counts (e.g. 2^32) still decode and
-/// are rejected by validation instead.
-fn decode_memory_limits(bytes: &[u8], pos: &mut usize) -> Result<Limits, Error> {
-    let flags = read_u32(bytes, pos)?;
-    // 0x00 min, 0x01 min+max (memory32). Shared memories (0x02/0x03) and
-    // memory64 (0x04/0x05) are later cuts.
-    match flags {
-        0 => {
-            let min = read_leb(bytes, pos, 10)?;
-            Ok(Limits::new(min, None))
-        }
-        1 => {
-            let min = read_leb(bytes, pos, 10)?;
-            let max = Some(read_leb(bytes, pos, 10)?);
-            Ok(Limits::new(min, max))
-        }
-        _ => Err(Error::Unsupported("shared or memory64 limits")),
+/// are rejected by validation instead. The flags byte's bit 0 marks a
+/// maximum, bit 2 selects memory64; every other bit is malformed.
+fn decode_memory_limits(bytes: &[u8], pos: &mut usize) -> Result<MemType, Error> {
+    let flags = read_u8(bytes, pos)?;
+    if flags & 0xfa != 0 {
+        return Err(Error::Malformed("malformed limits flags"));
     }
+    let memory64 = flags & 0x04 != 0;
+    let min = read_leb(bytes, pos, 10)?;
+    let max = if flags & 0x01 != 0 {
+        Some(read_leb(bytes, pos, 10)?)
+    } else {
+        None
+    };
+    Ok(MemType {
+        limits: Limits::new(min, max),
+        memory64,
+    })
 }
 
 fn decode_table_type(bytes: &[u8], pos: &mut usize) -> Result<TableType, Error> {
     let element = decode_ref_type(bytes, pos)?;
-    let limits = decode_limits(bytes, pos)?;
-    Ok(TableType { element, limits })
+    let (limits, table64) = decode_limits(bytes, pos)?;
+    Ok(TableType {
+        element,
+        limits,
+        table64,
+    })
 }
 
 /// A table-section entry (spec 5.4): a table type, prefixed by `0x40 0x00`
@@ -438,31 +443,26 @@ fn decode_table_entry(bytes: &[u8], pos: &mut usize) -> Result<Table, Error> {
 }
 
 fn decode_mem_type(bytes: &[u8], pos: &mut usize) -> Result<MemType, Error> {
-    let limits = decode_memory_limits(bytes, pos)?;
-    Ok(MemType {
-        limits,
-        memory64: false,
-    })
+    decode_memory_limits(bytes, pos)
 }
 
 /// A load/store memarg (spec 5.4.5): a single flags byte holding the
-/// alignment exponent (low 6 bits) and a memory-index marker (bit 6), then a
-/// u64 LEB offset. Flags >= 0x80 are malformed.
-fn decode_memarg(bytes: &[u8], pos: &mut usize) -> Result<(u32, u64), Error> {
+/// alignment exponent (low 6 bits), a memory-index marker (bit 6, which makes
+/// an explicit `memidx` follow), then a u64 LEB offset. Flags >= 0x80 are
+/// malformed.
+fn decode_memarg(bytes: &[u8], pos: &mut usize) -> Result<(u32, u32, u64), Error> {
     let flags = read_u8(bytes, pos)?;
     if flags & 0x80 != 0 {
         return Err(Error::Malformed("malformed memop flags"));
     }
     let align = u32::from(flags & 0x3f);
-    if flags & 0x40 != 0 {
-        // Multi-memory encoding: an explicit memory index follows.
-        let memory = read_u32(bytes, pos)?;
-        if memory != 0 {
-            return Err(Error::Unsupported("multi-memory"));
-        }
-    }
+    let memory = if flags & 0x40 != 0 {
+        read_u32(bytes, pos)?
+    } else {
+        0
+    };
     let offset = read_leb(bytes, pos, 10)?;
-    Ok((align, offset))
+    Ok((memory, align, offset))
 }
 
 fn decode_global_type(bytes: &[u8], pos: &mut usize) -> Result<GlobalType, Error> {
@@ -854,8 +854,13 @@ fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Erro
                 0x34 => (LoadOp::I64Load32S, 4),
                 _ => (LoadOp::I64Load32U, 4),
             };
-            let (align, offset) = decode_memarg(bytes, pos)?;
-            Ok(Instr::Load { op, align, offset })
+            let (memory, align, offset) = decode_memarg(bytes, pos)?;
+            Ok(Instr::Load {
+                memory,
+                op,
+                align,
+                offset,
+            })
         }
         0x36..=0x3e => {
             let op = match opcode {
@@ -869,16 +874,21 @@ fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Erro
                 0x3d => StoreOp::I64Store16,
                 _ => StoreOp::I64Store32,
             };
-            let (align, offset) = decode_memarg(bytes, pos)?;
-            Ok(Instr::Store { op, align, offset })
+            let (memory, align, offset) = decode_memarg(bytes, pos)?;
+            Ok(Instr::Store {
+                memory,
+                op,
+                align,
+                offset,
+            })
         }
         0x3f => {
-            let _memory = read_u32(bytes, pos)?;
-            Ok(Instr::MemorySize)
+            let memory = read_u32(bytes, pos)?;
+            Ok(Instr::MemorySize(memory))
         }
         0x40 => {
-            let _memory = read_u32(bytes, pos)?;
-            Ok(Instr::MemoryGrow)
+            let memory = read_u32(bytes, pos)?;
+            Ok(Instr::MemoryGrow(memory))
         }
         0x41 => Ok(Instr::I32Const(read_s32(bytes, pos)?)),
         0x42 => Ok(Instr::I64Const(read_s64(bytes, pos)?)),
@@ -935,20 +945,26 @@ fn decode_simd(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
     let sub = sub as u16;
     match sub {
         0x00..=0x0a => {
-            let (align, offset) = decode_memarg(bytes, pos)?;
+            let (memory, align, offset) = decode_memarg(bytes, pos)?;
             Ok(Instr::VecLoad {
+                memory,
                 op: vec_load_op(sub),
                 align,
                 offset,
             })
         }
         0x0b => {
-            let (align, offset) = decode_memarg(bytes, pos)?;
-            Ok(Instr::VecStore { align, offset })
+            let (memory, align, offset) = decode_memarg(bytes, pos)?;
+            Ok(Instr::VecStore {
+                memory,
+                align,
+                offset,
+            })
         }
         0x5c | 0x5d => {
-            let (align, offset) = decode_memarg(bytes, pos)?;
+            let (memory, align, offset) = decode_memarg(bytes, pos)?;
             Ok(Instr::VecLoad {
+                memory,
                 op: vec_load_op(sub),
                 align,
                 offset,
@@ -972,7 +988,7 @@ fn decode_simd(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
         }
         0x54..=0x5b => {
             // v128 lane loads (0x54-0x57) and stores (0x58-0x5b).
-            let (align, offset) = decode_memarg(bytes, pos)?;
+            let (memory, align, offset) = decode_memarg(bytes, pos)?;
             let lane = read_u8(bytes, pos)?;
             let size = match sub {
                 0x54 | 0x58 => 1u8,
@@ -982,6 +998,7 @@ fn decode_simd(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
             };
             if sub < 0x58 {
                 Ok(Instr::VecLaneLoad {
+                    memory,
                     size,
                     align,
                     offset,
@@ -989,6 +1006,7 @@ fn decode_simd(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
                 })
             } else {
                 Ok(Instr::VecLaneStore {
+                    memory,
                     size,
                     align,
                     offset,
@@ -1026,13 +1044,13 @@ fn decode_fc(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
         }
         9 => Ok(Instr::DataDrop(read_u32(bytes, pos)?)),
         10 => {
-            let _dst = read_u32(bytes, pos)?;
-            let _src = read_u32(bytes, pos)?;
-            Ok(Instr::MemoryCopy)
+            let dst = read_u32(bytes, pos)?;
+            let src = read_u32(bytes, pos)?;
+            Ok(Instr::MemoryCopy { dst, src })
         }
         11 => {
-            let _memory = read_u32(bytes, pos)?;
-            Ok(Instr::MemoryFill)
+            let memory = read_u32(bytes, pos)?;
+            Ok(Instr::MemoryFill(memory))
         }
         12 => {
             let element_index = read_u32(bytes, pos)?;
@@ -1203,7 +1221,9 @@ fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8, Error> {
 }
 
 /// Read an unsigned LEB128 of at most `max_bytes` bytes, advancing `pos`.
-/// Non-minimal encodings (trailing zero groups) are legal.
+/// Non-minimal encodings (trailing zero groups) are legal, but a u64 LEB that
+/// needs its full 10 bytes may set only bit 0 of the final byte — any other
+/// bit there would exceed 64 bits.
 fn read_leb(bytes: &[u8], pos: &mut usize, max_bytes: u32) -> Result<u64, Error> {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
@@ -1211,6 +1231,10 @@ fn read_leb(bytes: &[u8], pos: &mut usize, max_bytes: u32) -> Result<u64, Error>
         let byte = read_u8(bytes, pos)?;
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
+            if max_bytes == 10 && index + 1 == 10 && byte & 0x7e != 0 {
+                // The 10th byte of a u64 LEB carries only bit 63.
+                return Err(Error::Malformed("integer too large"));
+            }
             return Ok(value);
         }
         shift += 7;

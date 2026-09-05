@@ -124,11 +124,13 @@ impl Limits {
     }
 }
 
-/// A table type: element reference type plus limits (spec 2.3.16).
+/// A table type: element reference type plus limits (spec 2.3.16). `table64`
+/// selects an i64 address/index type (mirroring memory64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableType {
     pub element: RefType,
     pub limits: Limits,
+    pub table64: bool,
 }
 
 /// A memory type (spec 2.3.15). Memory64 uses a 64-bit index type; the

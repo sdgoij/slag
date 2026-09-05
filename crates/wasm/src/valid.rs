@@ -200,7 +200,16 @@ fn validate_table_type(ty: &TableType, type_count: usize) -> Result<(), Error> {
     {
         return Err(Error::Invalid("unknown type"));
     }
-    validate_limits(&ty.limits)
+    validate_limits(&ty.limits)?;
+    // Table sizes are bounded by the address type: 2^32-1 entries for a
+    // 32-bit table, 2^64-1 for a table64.
+    if !ty.table64 {
+        let cap = u64::from(u32::MAX);
+        if ty.limits.min > cap || ty.limits.max.is_some_and(|max| max > cap) {
+            return Err(Error::Invalid("table size"));
+        }
+    }
+    Ok(())
 }
 
 /// A tag's type use must resolve to a function type whose results are empty;
@@ -224,26 +233,26 @@ fn validate_limits(limits: &Limits) -> Result<(), Error> {
     Ok(())
 }
 
-/// A memory type must have ordered limits and, for wasm32 (the only form this
-/// engine decodes), page counts within 2^16 (4 GiB).
+/// A memory type must have ordered limits and page counts within its address
+/// space: 2^16 pages (4 GiB) for a memory32, 2^48 pages (2^64 bytes) for a
+/// memory64.
 fn validate_mem_type(memory: &MemType) -> Result<(), Error> {
     validate_limits(&memory.limits)?;
-    if !memory.memory64 {
-        const MAX_MEM32_PAGES: u64 = 1 << 16;
-        let within = memory.limits.min <= MAX_MEM32_PAGES
-            && memory.limits.max.is_none_or(|max| max <= MAX_MEM32_PAGES);
-        if !within {
-            return Err(Error::Invalid("memory size"));
-        }
+    const MAX_MEM32_PAGES: u64 = 1 << 16;
+    const MAX_MEM64_PAGES: u64 = 1 << 48;
+    let cap = if memory.memory64 {
+        MAX_MEM64_PAGES
+    } else {
+        MAX_MEM32_PAGES
+    };
+    let within = memory.limits.min <= cap && memory.limits.max.is_none_or(|max| max <= cap);
+    if !within {
+        return Err(Error::Invalid("memory size"));
     }
     Ok(())
 }
 
 fn validate_module_limits(module: &Module) -> Result<(), Error> {
-    if module.memories.len() > 1 {
-        // Baseline: at most one memory (multi-memory is a later cut).
-        return Err(Error::Invalid("multiple memories"));
-    }
     for memory in &module.memories {
         validate_mem_type(memory)?;
     }
@@ -367,7 +376,9 @@ fn validate_elements(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> 
             if !matches_val(ValType::Ref(table_ty.element), ValType::Ref(element.ty)) {
                 return Err(Error::Invalid("type mismatch"));
             }
-            validate_const_expr(offset, ValType::I32, spaces, spaces.globals.len())?;
+            // The active offset's width follows the table's address type.
+            let addr = table_addr_type(spaces, *table as usize)?;
+            validate_const_expr(offset, addr, spaces, spaces.globals.len())?;
         }
         for item in &element.init {
             let item_type = const_expr_type(item, spaces, spaces.globals.len())?;
@@ -385,7 +396,10 @@ fn validate_data(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> {
             if *memory as usize >= spaces.memories.len() {
                 return Err(Error::Invalid("unknown memory"));
             }
-            validate_const_expr(offset, ValType::I32, spaces, spaces.globals.len())?;
+            // The active offset's width follows the memory's address type
+            // (i32 for a memory32, i64 for a memory64).
+            let addr = memory_addr_type(spaces, *memory)?;
+            validate_const_expr(offset, addr, spaces, spaces.globals.len())?;
         }
     }
     Ok(())
@@ -863,7 +877,7 @@ impl Machine {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 let ty = type_at(spaces.module, *type_index)?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(table_addr_type(spaces, *table_index as usize)?)?;
                 self.pop_vals(&ty.params)?;
                 for result in &ty.results {
                     self.push_val(*result);
@@ -878,7 +892,7 @@ impl Machine {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 let ty = type_at(spaces.module, *type_index)?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(table_addr_type(spaces, *table_index as usize)?)?;
                 self.tail_call(ty, signature)?;
             }
             Instr::ReturnCallRef(type_index) => {
@@ -963,47 +977,44 @@ impl Machine {
             }
             Instr::TableGet(index) => {
                 let table = table_at(spaces, *index as usize)?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(table_addr_type(spaces, *index as usize)?)?;
                 self.push_val(ValType::Ref(table.element));
             }
             Instr::TableSet(index) => {
                 let table = table_at(spaces, *index as usize)?;
                 self.pop_expected(ValType::Ref(table.element))?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(table_addr_type(spaces, *index as usize)?)?;
             }
-            Instr::Load { op, align, offset } => {
-                memory_ok(spaces)?;
-                if *offset > u64::from(u32::MAX) {
-                    // Memory32 memarg offsets must fit the address type.
-                    return Err(Error::Invalid("offset out of range"));
-                }
-                let natural = load_natural(*op);
-                if *align > natural {
-                    return Err(Error::Invalid("alignment must not be larger than natural"));
-                }
-                self.pop_expected(ValType::I32)?;
+            Instr::Load {
+                memory,
+                op,
+                align,
+                offset,
+            } => {
+                let addr = memory_addr_type(spaces, *memory)?;
+                memory_access_ok(spaces, *memory, load_natural(*op), *align, *offset)?;
+                self.pop_expected(addr)?;
                 self.push_val(load_result(*op));
             }
-            Instr::Store { op, align, offset } => {
-                memory_ok(spaces)?;
-                if *offset > u64::from(u32::MAX) {
-                    return Err(Error::Invalid("offset out of range"));
-                }
-                let natural = store_natural(*op);
-                if *align > natural {
-                    return Err(Error::Invalid("alignment must not be larger than natural"));
-                }
+            Instr::Store {
+                memory,
+                op,
+                align,
+                offset,
+            } => {
+                let addr = memory_addr_type(spaces, *memory)?;
+                memory_access_ok(spaces, *memory, store_natural(*op), *align, *offset)?;
                 self.pop_expected(store_value(*op))?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(addr)?;
             }
-            Instr::MemorySize => {
-                memory_ok(spaces)?;
-                self.push_val(ValType::I32);
+            Instr::MemorySize(memory) => {
+                let addr = memory_addr_type(spaces, *memory)?;
+                self.push_val(addr);
             }
-            Instr::MemoryGrow => {
-                memory_ok(spaces)?;
-                self.pop_expected(ValType::I32)?;
-                self.push_val(ValType::I32);
+            Instr::MemoryGrow(memory) => {
+                let addr = memory_addr_type(spaces, *memory)?;
+                self.pop_expected(addr)?;
+                self.push_val(addr);
             }
             Instr::I32Const(_) => self.push_val(ValType::I32),
             Instr::I64Const(_) => self.push_val(ValType::I64),
@@ -1104,25 +1115,34 @@ impl Machine {
                 }))?;
                 self.unreachable();
             }
-            Instr::MemoryInit { data_index, .. } => {
+            Instr::MemoryInit { data_index, memory } => {
                 self.data_index(*data_index as usize, spaces)?;
-                memory_ok(spaces)?;
+                let addr = memory_addr_type(spaces, *memory)?;
+                // Operands (bottom to top): dst address, data offset, length;
+                // the data offset and length are i32 in both address models.
                 self.pop_expected(ValType::I32)?;
                 self.pop_expected(ValType::I32)?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(addr)?;
             }
             Instr::DataDrop(data_index) => self.data_index(*data_index as usize, spaces)?,
-            Instr::MemoryCopy => {
-                memory_ok(spaces)?;
-                self.pop_expected(ValType::I32)?;
-                self.pop_expected(ValType::I32)?;
-                self.pop_expected(ValType::I32)?;
+            Instr::MemoryCopy { dst, src } => {
+                let dst_addr = memory_addr_type(spaces, *dst)?;
+                let src_addr = memory_addr_type(spaces, *src)?;
+                // The length is the smaller of the two address types.
+                let len_addr = match (dst_addr, src_addr) {
+                    (ValType::I64, ValType::I64) => ValType::I64,
+                    _ => ValType::I32,
+                };
+                self.pop_expected(len_addr)?;
+                self.pop_expected(src_addr)?;
+                self.pop_expected(dst_addr)?;
             }
-            Instr::MemoryFill => {
-                memory_ok(spaces)?;
+            Instr::MemoryFill(memory) => {
+                let addr = memory_addr_type(spaces, *memory)?;
+                // Operands: dst address, byte value (i32), length.
+                self.pop_expected(addr)?;
                 self.pop_expected(ValType::I32)?;
-                self.pop_expected(ValType::I32)?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(addr)?;
             }
             Instr::TableInit {
                 element_index,
@@ -1135,9 +1155,11 @@ impl Machine {
                 if !matches_ref(table_ty.element, element.ty) {
                     return Err(Error::Invalid("type mismatch"));
                 }
+                // Operands (bottom to top): dst index, elem offset, length; the
+                // elem offset and length are i32 in both table address models.
                 self.pop_expected(ValType::I32)?;
                 self.pop_expected(ValType::I32)?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(table_addr_type(spaces, *table as usize)?)?;
             }
             Instr::ElemDrop(element_index) => {
                 if *element_index as usize >= spaces.module.elements.len() {
@@ -1152,39 +1174,60 @@ impl Machine {
                 if !matches_ref(dst_table.element, src_table.element) {
                     return Err(Error::Invalid("type mismatch"));
                 }
-                self.pop_expected(ValType::I32)?;
-                self.pop_expected(ValType::I32)?;
-                self.pop_expected(ValType::I32)?;
+                let dst_addr = table_addr_type(spaces, *dst as usize)?;
+                let src_addr = table_addr_type(spaces, *src as usize)?;
+                // The length is the smaller of the two address types.
+                let len_addr = match (dst_addr, src_addr) {
+                    (ValType::I64, ValType::I64) => ValType::I64,
+                    _ => ValType::I32,
+                };
+                self.pop_expected(len_addr)?;
+                self.pop_expected(src_addr)?;
+                self.pop_expected(dst_addr)?;
             }
-            Instr::TableGrow(table) => {
-                let table = table_at(spaces, *table as usize)?;
-                self.pop_expected(ValType::I32)?;
+            Instr::TableGrow(index) => {
+                let table = table_at(spaces, *index as usize)?;
+                let addr = table_addr_type(spaces, *index as usize)?;
+                self.pop_expected(addr)?;
                 self.pop_expected(ValType::Ref(table.element))?;
-                self.push_val(ValType::I32);
+                self.push_val(addr);
             }
-            Instr::TableSize(table) => {
-                table_at(spaces, *table as usize)?;
-                self.push_val(ValType::I32);
+            Instr::TableSize(index) => {
+                table_at(spaces, *index as usize)?;
+                self.push_val(table_addr_type(spaces, *index as usize)?);
             }
-            Instr::TableFill(table) => {
-                let table = table_at(spaces, *table as usize)?;
-                self.pop_expected(ValType::I32)?;
+            Instr::TableFill(index) => {
+                let table = table_at(spaces, *index as usize)?;
+                let addr = table_addr_type(spaces, *index as usize)?;
+                self.pop_expected(addr)?;
                 self.pop_expected(ValType::Ref(table.element))?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(addr)?;
             }
             // ---- v128 (Cut 7) ----
             Instr::V128Const(_) => self.push_val(ValType::V128),
-            Instr::VecLoad { op, align, offset } => {
-                vec_memory_ok(spaces, vec_load_natural(*op), *align, *offset)?;
-                self.pop_expected(ValType::I32)?;
+            Instr::VecLoad {
+                memory,
+                op,
+                align,
+                offset,
+            } => {
+                let addr = memory_addr_type(spaces, *memory)?;
+                memory_access_ok(spaces, *memory, vec_load_natural(*op), *align, *offset)?;
+                self.pop_expected(addr)?;
                 self.push_val(ValType::V128);
             }
-            Instr::VecStore { align, offset } => {
-                vec_memory_ok(spaces, 4, *align, *offset)?;
+            Instr::VecStore {
+                memory,
+                align,
+                offset,
+            } => {
+                let addr = memory_addr_type(spaces, *memory)?;
+                memory_access_ok(spaces, *memory, 4, *align, *offset)?;
                 self.pop_expected(ValType::V128)?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(addr)?;
             }
             Instr::VecLaneLoad {
+                memory,
                 size,
                 align,
                 offset,
@@ -1193,12 +1236,14 @@ impl Machine {
                 if *lane as usize >= 16 / *size as usize {
                     return Err(Error::Invalid("invalid lane index"));
                 }
-                vec_memory_ok(spaces, size.trailing_zeros(), *align, *offset)?;
+                let addr = memory_addr_type(spaces, *memory)?;
+                memory_access_ok(spaces, *memory, size.trailing_zeros(), *align, *offset)?;
                 self.pop_expected(ValType::V128)?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(addr)?;
                 self.push_val(ValType::V128);
             }
             Instr::VecLaneStore {
+                memory,
                 size,
                 align,
                 offset,
@@ -1207,9 +1252,10 @@ impl Machine {
                 if *lane as usize >= 16 / *size as usize {
                     return Err(Error::Invalid("invalid lane index"));
                 }
-                vec_memory_ok(spaces, size.trailing_zeros(), *align, *offset)?;
+                let addr = memory_addr_type(spaces, *memory)?;
+                memory_access_ok(spaces, *memory, size.trailing_zeros(), *align, *offset)?;
                 self.pop_expected(ValType::V128)?;
-                self.pop_expected(ValType::I32)?;
+                self.pop_expected(addr)?;
             }
             Instr::VecShuffle(lanes) => {
                 if lanes.iter().any(|&lane| lane >= 32) {
@@ -1323,20 +1369,6 @@ impl Machine {
     }
 }
 
-/// A v128 memory instruction's type constraints: a memory must exist, the
-/// offset must fit the address type, and the alignment must not exceed the
-/// natural alignment of the access.
-fn vec_memory_ok(spaces: &Spaces<'_>, natural: u32, align: u32, offset: u64) -> Result<(), Error> {
-    memory_ok(spaces)?;
-    if offset > u64::from(u32::MAX) {
-        return Err(Error::Invalid("offset out of range"));
-    }
-    if align > natural {
-        return Err(Error::Invalid("alignment must not be larger than natural"));
-    }
-    Ok(())
-}
-
 /// The natural alignment exponent (log2 of bytes) of a v128 load form.
 fn vec_load_natural(op: VecLoadOp) -> u32 {
     let bytes = match op {
@@ -1412,9 +1444,54 @@ fn table_at<'s>(spaces: &'s Spaces<'_>, index: usize) -> Result<&'s TableType, E
         .ok_or(Error::Invalid("unknown table"))
 }
 
-fn memory_ok(spaces: &Spaces<'_>) -> Result<(), Error> {
-    if spaces.memories.is_empty() {
-        return Err(Error::Invalid("unknown memory"));
+/// The value type of a table's address operand: `i32` for a 32-bit table,
+/// `i64` for a table64.
+fn table_addr_type(spaces: &Spaces<'_>, index: usize) -> Result<ValType, Error> {
+    let table = table_at(spaces, index)?;
+    Ok(if table.table64 {
+        ValType::I64
+    } else {
+        ValType::I32
+    })
+}
+
+/// The memory type at an instruction's index.
+fn memory_at(spaces: &Spaces<'_>, index: u32) -> Result<MemType, Error> {
+    spaces
+        .memories
+        .get(index as usize)
+        .copied()
+        .ok_or(Error::Invalid("unknown memory"))
+}
+
+/// The value type of a memory's address operand: `i32` for a memory32, `i64`
+/// for a memory64.
+fn memory_addr_type(spaces: &Spaces<'_>, index: u32) -> Result<ValType, Error> {
+    let memory = memory_at(spaces, index)?;
+    Ok(if memory.memory64 {
+        ValType::I64
+    } else {
+        ValType::I32
+    })
+}
+
+/// A memory instruction's type constraints: the referenced memory exists, the
+/// memarg offset fits the memory's address type, and the alignment exponent
+/// does not exceed the natural alignment of the access.
+fn memory_access_ok(
+    spaces: &Spaces<'_>,
+    memory: u32,
+    natural: u32,
+    align: u32,
+    offset: u64,
+) -> Result<(), Error> {
+    let memory = memory_at(spaces, memory)?;
+    if !memory.memory64 && offset > u64::from(u32::MAX) {
+        // Memory32 memarg offsets must fit the address type.
+        return Err(Error::Invalid("offset out of range"));
+    }
+    if align > natural {
+        return Err(Error::Invalid("alignment must not be larger than natural"));
     }
     Ok(())
 }

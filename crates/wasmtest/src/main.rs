@@ -2,7 +2,7 @@
 //!
 //! Drives the pinned `waspec/test/core` corpus through the `crates/wasm`
 //! engine. The corpus is `.wast` (text + assertions); the engine never
-//! parses text, so `wast2json` (wabt; or the Rust wast2json-rs) turns each
+//! parses text, so `wast2json` (wabt) turns each
 //! file into one `.wasm` per module plus a `.json` of commands. See
 //! `.notes/wasm-plan.md` for the cut plan.
 //!
@@ -31,9 +31,19 @@ const USAGE: &str = "\
 wasmtest — WebAssembly conformance runner
 
 usage:
-  wasmtest check <file.wasm|dir>   decode modules and report per-file status
-  wasmtest convert <file.wast>     compile a .wast with wast2json (wabt)
-  wasmtest run <wast|json|dir>     convert (if needed) and run a suite
+  wasmtest check <file.wasm|dir>       decode modules and report per-file status
+  wasmtest convert <file.wast>         compile a .wast with wast2json (wabt)
+  wasmtest run <wast|json|dir>...      convert (if needed) and run suites;
+                                      exits nonzero when any suite reports a fail
+
+run accepts several paths; a directory is walked recursively for `.wast`
+and `.json` files. Files listed in the exclusion manifest (default
+`crates/wasmtest/wasm-exclusions.txt`, or `$WASM_EXCLUSIONS`) print as
+`skip` and are not failures — the cut's written taxonomy.
+
+environment:
+  $WAST2JSON        path to wabt's wast2json executable when it is not on PATH
+  $WASM_EXCLUSIONS  exclusion manifest path (default: crates/wasmtest/wasm-exclusions.txt)
 ";
 
 fn main() -> ExitCode {
@@ -67,11 +77,12 @@ fn main() -> ExitCode {
             }
         }
         "run" => {
-            let Some(path) = args.next() else {
+            let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
+            if paths.is_empty() {
                 eprintln!("wasmtest run: missing path\n\n{USAGE}");
                 return ExitCode::from(2);
-            };
-            run(Path::new(&path))
+            }
+            run(&paths)
         }
         _ => {
             eprintln!("unknown command {command:?}\n\n{USAGE}");
@@ -123,53 +134,168 @@ struct Tally {
     pass: usize,
     fail: usize,
     pending: usize,
+    skipped: usize,
 }
 
-fn run(path: &Path) -> ExitCode {
-    let mut jsons = Vec::new();
-    if path.extension().is_some_and(|ext| ext == "json") {
-        jsons.push(path.to_path_buf());
-    } else if path.extension().is_some_and(|ext| ext == "wast") {
-        match convert_wast(path) {
-            Ok(json) => jsons.push(json),
-            Err(message) => {
-                eprintln!("{message}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else if path.is_dir() {
-        collect_json(path, &mut jsons);
-    } else {
-        eprintln!("wasmtest run: expected a .wast, a .json, or a directory of jsons");
-        return ExitCode::from(2);
+/// Run every suite named on the command line, converting `.wast` on the fly
+/// (skipping the exclusion manifest's entries) and executing converted or
+/// cached `.json` files. Exits nonzero when any suite reports a fail.
+fn run(paths: &[PathBuf]) -> ExitCode {
+    let exclusions = load_exclusions();
+    let mut items: Vec<(PathBuf, bool)> = Vec::new();
+    for path in paths {
+        collect_run_items(path, &mut items);
     }
-
-    if jsons.is_empty() {
-        eprintln!("wasmtest run: no suites found at {path:?}");
+    // A directory walk may surface the same suite twice; run each path once.
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items.dedup_by(|a, b| a.0 == b.0);
+    if items.is_empty() {
+        eprintln!("wasmtest run: no suites found at {paths:?}");
         return ExitCode::FAILURE;
     }
 
+    // The flat conversion cache keys on the file name: two `.wast` sources
+    // with the same name in one invocation would clobber each other's output.
+    let mut seen: HashMap<String, PathBuf> = HashMap::new();
+    for (source, _) in &items {
+        let Some(name) = source.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if let Some(previous) = seen.insert(name, source.clone())
+            && previous != *source
+        {
+            eprintln!(
+                "wasmtest run: {} and {} share the cache name {}; run them separately",
+                previous.display(),
+                source.display(),
+                source.file_name().unwrap().to_string_lossy()
+            );
+            return ExitCode::from(2);
+        }
+    }
+
     let mut totals = Tally::default();
-    for json in jsons {
+    for (source, is_json) in items {
+        if is_json {
+            let tally = run_json(&source);
+            println!(
+                "\n{}: {} pass, {} fail, {} pending",
+                source.display(),
+                tally.pass,
+                tally.fail,
+                tally.pending
+            );
+            totals.pass += tally.pass;
+            totals.fail += tally.fail;
+            totals.pending += tally.pending;
+            continue;
+        }
+        if let Some(reason) = excluded(&source, &exclusions) {
+            println!("skip  {}: {reason}", source.display());
+            totals.skipped += 1;
+            continue;
+        }
+        let json = match convert_wast(&source) {
+            Ok(json) => json,
+            Err(message) => {
+                println!("error {}: {message}", source.display());
+                totals.fail += 1;
+                continue;
+            }
+        };
         let tally = run_json(&json);
-        let label = json.display();
         println!(
-            "\n{label}: {} pass, {} fail, {} pending",
-            tally.pass, tally.fail, tally.pending
+            "\n{}: {} pass, {} fail, {} pending",
+            json.display(),
+            tally.pass,
+            tally.fail,
+            tally.pending
         );
         totals.pass += tally.pass;
         totals.fail += tally.fail;
         totals.pending += tally.pending;
     }
     println!(
-        "\ntotal: {} pass, {} fail, {} pending",
-        totals.pass, totals.fail, totals.pending
+        "\ntotal: {} pass, {} fail, {} pending, {} skipped",
+        totals.pass, totals.fail, totals.pending, totals.skipped
     );
     if totals.fail == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Collect a path's runnable suites: `.json` files directly, `.wast` files to
+/// convert (a directory is walked recursively).
+fn collect_run_items(path: &Path, out: &mut Vec<(PathBuf, bool)>) {
+    if path.is_file() {
+        let ext = path.extension().and_then(|e| e.to_str());
+        match ext {
+            Some("json") => out.push((path.to_path_buf(), true)),
+            Some("wast") => out.push((path.to_path_buf(), false)),
+            _ => {}
+        }
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_run_items(&entry_path, out);
+        } else {
+            files.push(entry_path);
+        }
+    }
+    files.sort();
+    for file in files {
+        let ext = file.extension().and_then(|e| e.to_str());
+        if ext == Some("json") {
+            out.push((file, true));
+        } else if ext == Some("wast") {
+            out.push((file, false));
+        }
+    }
+}
+
+/// The exclusion manifest: lines of `path :: reason` (blank lines and `#`
+/// comments ignored). Loaded from `$WASM_EXCLUSIONS` when set, otherwise the
+/// manifest shipped next to the runner.
+fn load_exclusions() -> Vec<(String, String)> {
+    let path = std::env::var_os("WASM_EXCLUSIONS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("crates/wasmtest/wasm-exclusions.txt"));
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| match line.split_once("::") {
+            Some((key, reason)) => (key.trim().to_string(), reason.trim().to_string()),
+            None => (line.to_string(), String::from("excluded")),
+        })
+        .collect()
+}
+
+/// Whether `source` matches an exclusion-manifest key (by file name or by
+/// path suffix).
+fn excluded(source: &Path, exclusions: &[(String, String)]) -> Option<String> {
+    let name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())?;
+    let path = source.to_string_lossy().replace('\\', "/");
+    for (key, reason) in exclusions {
+        let key = key.replace('\\', "/");
+        let matches = name == key || path == key || path.ends_with(&format!("/{key}"));
+        if matches {
+            return Some(reason.clone());
+        }
+    }
+    None
 }
 
 fn run_json(json_path: &Path) -> Tally {
@@ -965,11 +1091,25 @@ fn spectest_exports(store: &mut Store) -> HashMap<(String, String), ExternVal> {
         TableType {
             element: RefType::FUNC,
             limits: Limits::new(10, Some(20)),
+            table64: false,
         },
         RefValue::Null,
     ) {
         exports.insert(
             ("spectest".to_string(), "table".to_string()),
+            ExternVal::Table(cell),
+        );
+    }
+    if let Ok(cell) = store.table(
+        TableType {
+            element: RefType::FUNC,
+            limits: Limits::new(10, Some(20)),
+            table64: true,
+        },
+        RefValue::Null,
+    ) {
+        exports.insert(
+            ("spectest".to_string(), "table64".to_string()),
             ExternVal::Table(cell),
         );
     }
@@ -1003,20 +1143,29 @@ fn module_file(command: &Value, dir: &Path) -> Option<(PathBuf, Vec<u8>)> {
     fs::read(&path).ok().map(|bytes| (path, bytes))
 }
 
-// ---- conversion (wast2json-rs, wabt fallback) ----
+// ---- conversion ($WAST2JSON, then wabt fallbacks) ----
 
 const TOOL_HINT: &str = "\
 Install wabt's wast2json (https://github.com/WebAssembly/wabt) and retry, or set
-WAST2JSON to its path. The Rust wast2json-rs (cargo install wast2json-rs) is
-also accepted but parses a smaller feature set.";
+WAST2JSON to its path.";
 
 fn convert_wast(wast: &Path) -> Result<PathBuf, String> {
     let out_dir = Path::new("target").join("wastest");
     fs::create_dir_all(&out_dir)
         .map_err(|error| format!("cannot create {}: {error}", out_dir.display()))?;
     let json_path = out_dir.join(json_name(wast));
-    for (tool, form) in converter_tools() {
-        if let Some(result) = run_converter(&tool, form, wast, &json_path) {
+    // A set-but-unrunnable WAST2JSON is a configuration error: surface it
+    // instead of silently falling back to another converter.
+    if let Ok(path) = std::env::var("WAST2JSON")
+        && !path.trim().is_empty()
+        && Command::new(&path).arg("--version").output().is_err()
+    {
+        return Err(format!(
+            "WAST2JSON is set to {path:?}, but that executable cannot be run.\n{TOOL_HINT}"
+        ));
+    }
+    for tool in converter_tools() {
+        if let Some(result) = run_converter(&tool, wast, &json_path) {
             result?;
             return Ok(json_path);
         }
@@ -1024,44 +1173,27 @@ fn convert_wast(wast: &Path) -> Result<PathBuf, String> {
     Err(format!("no wast2json converter available.\n{TOOL_HINT}"))
 }
 
-/// Whether a converter speaks wabt's CLI (feature flags, no `-c`) or the
-/// Rust reimplementation's CLI (`-c` for compact JSON).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConverterForm {
-    Wabt,
-    Rust,
-}
-
 /// Converter candidates in order of preference: a wabt build named by
-/// `WAST2JSON`, wabt's `wast2json` on PATH, the Rust `wast2json-rs` on PATH,
-/// then this machine's wabt build as a last resort.
-fn converter_tools() -> Vec<(String, ConverterForm)> {
+/// `WAST2JSON`, wabt's `wast2json` on PATH, then this machine's wabt build as
+/// a last resort.
+fn converter_tools() -> Vec<String> {
     let mut tools = Vec::new();
     if let Ok(path) = std::env::var("WAST2JSON")
         && !path.is_empty()
     {
-        tools.push((path, ConverterForm::Wabt));
+        tools.push(path);
     }
-    tools.push((String::from("wast2json"), ConverterForm::Wabt));
-    tools.push((String::from("wast2json-rs"), ConverterForm::Rust));
+    tools.push(String::from("wast2json"));
     let wabt_default = Path::new("C:\\Users\\T\\Desktop\\wabt\\build\\Release\\wast2json.exe");
     if wabt_default.exists() {
-        tools.push((
-            wabt_default.to_string_lossy().into_owned(),
-            ConverterForm::Wabt,
-        ));
+        tools.push(wabt_default.to_string_lossy().into_owned());
     }
     tools
 }
 
 /// Try a converter; returns `None` when it is not runnable, `Some` with the
 /// outcome otherwise.
-fn run_converter(
-    tool: &str,
-    form: ConverterForm,
-    wast: &Path,
-    out_json: &Path,
-) -> Option<Result<(), String>> {
+fn run_converter(tool: &str, wast: &Path, out_json: &Path) -> Option<Result<(), String>> {
     let Ok(probe) = Command::new(tool).arg("--version").output() else {
         return None;
     };
@@ -1070,21 +1202,14 @@ fn run_converter(
         String::from_utf8_lossy(&probe.stdout).trim()
     );
     let mut command = Command::new(tool);
-    match form {
-        ConverterForm::Wabt => {
-            // Enable the proposal features the corpus exercises but wabt
-            // leaves off by default. Not `--enable-all`: compact-imports
-            // rewrites the import section encoding of *every* module, and
-            // the spec tests are written for the standard layout.
-            for feature in ["--enable-function-references", "--enable-gc"] {
-                command.arg(feature);
-            }
-            command.arg(wast).arg("-o").arg(out_json);
-        }
-        ConverterForm::Rust => {
-            command.arg("-c").arg(wast).arg("-o").arg(out_json);
-        }
+    // Enable the proposal features the corpus exercises but wabt leaves off
+    // by default. Not `--enable-all`: compact-imports rewrites the import
+    // section encoding of *every* module, and the spec tests are written for
+    // the standard layout.
+    for feature in ["--enable-function-references", "--enable-gc"] {
+        command.arg(feature);
     }
+    command.arg(wast).arg("-o").arg(out_json);
     match command.status() {
         Ok(status) if status.success() => Some(Ok(())),
         Ok(status) => Some(Err(format!("{tool} exited with {status}"))),
@@ -1114,21 +1239,6 @@ fn collect_wasm(path: &Path, out: &mut Vec<PathBuf>) {
         if path.is_dir() {
             collect_wasm(&path, out);
         } else if path.extension().is_some_and(|ext| ext == "wasm") {
-            files.push(path);
-        }
-    }
-    files.sort();
-    out.extend(files);
-}
-
-fn collect_json(path: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    let mut files = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
             files.push(path);
         }
     }

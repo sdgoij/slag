@@ -1,0 +1,18 @@
+# wasmtest run exclusions — the written taxonomy for the wasm cuts.
+#
+# A `.wast` listed here prints as `skip` when a suite is run, so a file the
+# pinned converter (wabt 1.0.41, `wast2json`) cannot parse does not fail the
+# CI gate. Each entry names the file and why it is excluded; a file belongs
+# here only while a later cut owns its feature. When the converter changes,
+# revisit every entry.
+
+waspec/test/core/annotations.wast :: wabt 1.0.41 cannot parse annotation directives (custom-section tooling)
+waspec/test/core/instance.wast :: wabt 1.0.41 cannot parse module-linking `(instance ...)` syntax
+waspec/test/core/ref_null.wast :: wabt 1.0.41 cannot parse the GC abstract heap type `anyref` (Cut 9)
+waspec/test/core/type-canon.wast :: wabt 1.0.41 cannot parse GC `rec` type bags (Cut 9)
+waspec/test/core/type-equivalence.wast :: wabt 1.0.41 cannot parse GC `rec` type bags (Cut 9)
+waspec/test/core/type-rec.wast :: wabt 1.0.41 cannot parse recursive GC type groups (Cut 9)
+waspec/test/core/exceptions/tag.wast :: wabt 1.0.41 cannot parse the `rec`-typed tag fixtures (Cut 9)
+waspec/test/core/exceptions/try_table.wast :: wabt 1.0.41 has only the legacy EH syntax, not the `exn` catch forms
+waspec/test/core/bulk-memory/table_init.wast :: wabt 1.0.41 cannot parse GC `arrayref` element items (Cut 9)
+waspec/test/core/memory64/table_init64.wast :: wabt 1.0.41 cannot parse GC `arrayref` element items (Cut 9)

@@ -272,17 +272,19 @@ pub enum Instr {
     TableGet(u32),
     TableSet(u32),
     Load {
+        memory: u32,
         op: LoadOp,
         align: u32,
         offset: u64,
     },
     Store {
+        memory: u32,
         op: StoreOp,
         align: u32,
         offset: u64,
     },
-    MemorySize,
-    MemoryGrow,
+    MemorySize(u32),
+    MemoryGrow(u32),
     I32Const(i32),
     I64Const(i64),
     F32Const(u32),
@@ -301,24 +303,28 @@ pub enum Instr {
     V128Const(u128),
     /// A v128 load (0xfd 0x00-0x0a, 0x5c-0x5d).
     VecLoad {
+        memory: u32,
         op: VecLoadOp,
         align: u32,
         offset: u64,
     },
     /// `v128.store` (0xfd 0x0b).
     VecStore {
+        memory: u32,
         align: u32,
         offset: u64,
     },
     /// A v128 lane load/store (0xfd 0x54-0x5b): `size` is the lane's byte
     /// width.
     VecLaneLoad {
+        memory: u32,
         size: u8,
         align: u32,
         offset: u64,
         lane: u8,
     },
     VecLaneStore {
+        memory: u32,
         size: u8,
         align: u32,
         offset: u64,
@@ -340,8 +346,11 @@ pub enum Instr {
         memory: u32,
     },
     DataDrop(u32),
-    MemoryCopy,
-    MemoryFill,
+    MemoryCopy {
+        dst: u32,
+        src: u32,
+    },
+    MemoryFill(u32),
     TableInit {
         element_index: u32,
         table: u32,

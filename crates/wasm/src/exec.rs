@@ -12,8 +12,8 @@
 //! bounded by a configured limit instead of the host stack. Numeric semantics
 //! live in [`crate::values`].
 //!
-//! Not executed yet ([`ExecFail::Unsupported`]): SIMD (Cut 7), memory64
-//! (Cut 8), and GC reference operations (Cut 9).
+//! Not executed yet ([`ExecFail::Unsupported`]): GC reference operations
+//! (Cut 9) and threads/shared memory.
 
 use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
@@ -105,20 +105,27 @@ impl Memory {
         self.bytes.len() as u64 / PAGE_SIZE
     }
 
-    /// Grow by `delta` pages; returns the old size in pages, or `-1` when the
-    /// growth would exceed the limits (a wasm32 memory is capped at 2^16
-    /// pages even without a declared maximum).
-    pub fn grow(&mut self, delta: u64) -> i32 {
+    /// Grow by `delta` pages; returns the old size in pages, or `None` when
+    /// the growth would exceed the declared maximum (a memory32 is also
+    /// capped at 2^16 pages — 4 GiB — even without a declared maximum;
+    /// memory64 is only bounded by what a byte vector can address).
+    pub fn grow(&mut self, delta: u64, memory64: bool) -> Option<u64> {
         let old = self.pages();
-        let Some(new) = old.checked_add(delta) else {
-            return -1;
+        let new = old.checked_add(delta)?;
+        let cap = match self.max_pages {
+            Some(max) => max,
+            None if memory64 => (usize::MAX / PAGE_SIZE as usize) as u64,
+            None => 1 << 16,
         };
-        let cap = self.max_pages.unwrap_or(1 << 16);
         if new > cap {
-            return -1;
+            return None;
         }
-        self.bytes.resize((new * PAGE_SIZE) as usize, 0);
-        old as i32
+        let byte_len = new.checked_mul(PAGE_SIZE)?;
+        let Ok(byte_len) = usize::try_from(byte_len) else {
+            return None;
+        };
+        self.bytes.resize(byte_len, 0);
+        Some(old)
     }
 }
 
@@ -137,23 +144,22 @@ impl TableInst {
         }
     }
 
-    fn size(&self) -> u32 {
-        self.elements.len() as u32
-    }
-
-    /// Grow by `delta` slots, filling with `init`; returns the old size as an
-    /// `i32`, or `-1` when the growth would exceed the limits.
-    fn grow(&mut self, delta: u64, init: RefValue) -> i32 {
-        let old = self.size() as u64;
-        let Some(new) = old.checked_add(delta) else {
-            return -1;
-        };
-        let cap = self.max.unwrap_or(u64::from(u32::MAX));
+    /// Grow by `delta` slots, filling with `init`; returns the old size, or
+    /// `None` when the growth would exceed the limits (a 32-bit table is
+    /// capped at 2^32-1 slots even without a declared maximum).
+    fn grow(&mut self, delta: u64, init: RefValue, table64: bool) -> Option<u64> {
+        let old = self.elements.len() as u64;
+        let new = old.checked_add(delta)?;
+        let cap = self.max.unwrap_or(if table64 {
+            usize::MAX as u64
+        } else {
+            u64::from(u32::MAX)
+        });
         if new > cap {
-            return -1;
+            return None;
         }
         self.elements.resize(new as usize, init);
-        old as i32
+        Some(old)
     }
 }
 
@@ -276,9 +282,6 @@ impl Store {
 
     /// Register a standalone memory cell (spectest memory); returns its id.
     pub fn memory(&mut self, ty: MemType) -> Result<usize, ExecFail> {
-        if ty.memory64 {
-            return Err(ExecFail::Unsupported("memory64 (Cut 8)"));
-        }
         self.memory_types.push(ty);
         self.memories
             .push(Memory::new(ty.limits.min, ty.limits.max));
@@ -486,9 +489,6 @@ impl Store {
         }
 
         for memory in &module.memories {
-            if memory.memory64 {
-                return Err(InstantiateError::Unsupported("memory64 (Cut 8)"));
-            }
             self.memory_types.push(*memory);
             self.memories
                 .push(Memory::new(memory.limits.min, memory.limits.max));
@@ -535,10 +535,15 @@ impl Store {
                         .ok_or(InstantiateError::Trap(Trap::OutOfBoundsTableAccess))?;
                     let offset_value =
                         eval_const(offset, &values, self_id).map_err(InstantiateError::from)?;
-                    let Value::I32(offset) = offset_value else {
-                        return Err(InstantiateError::Unsupported("non-i32 table offset"));
+                    // The active offset's width follows the table's address
+                    // type: i32 for a 32-bit table, i64 for a table64.
+                    let start = match offset_value {
+                        Value::I32(offset) => offset as u32 as usize,
+                        Value::I64(offset) => offset as u64 as usize,
+                        _ => {
+                            return Err(InstantiateError::Unsupported("non-address table offset"));
+                        }
                     };
-                    let start = offset as u32 as usize;
                     let end = start
                         .checked_add(items.len())
                         .ok_or(InstantiateError::Trap(Trap::OutOfBoundsTableAccess))?;
@@ -570,10 +575,15 @@ impl Store {
                 let values = self.global_values(&self.instances[self_id].globals);
                 let offset_value =
                     eval_const(offset, &values, self_id).map_err(InstantiateError::from)?;
-                let Value::I32(offset) = offset_value else {
-                    return Err(InstantiateError::Unsupported("non-i32 data offset"));
+                // The active offset's width follows the memory's address type:
+                // i32 for a memory32, i64 for a memory64.
+                let start = match offset_value {
+                    Value::I32(offset) => offset as u32 as usize,
+                    Value::I64(offset) => offset as u64 as usize,
+                    _ => {
+                        return Err(InstantiateError::Unsupported("non-address data offset"));
+                    }
                 };
-                let start = offset as u32 as usize;
                 let end = start
                     .checked_add(segment.bytes.len())
                     .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))
@@ -806,6 +816,7 @@ impl Store {
                 max: declared.limits.max,
                 shared: declared.limits.shared,
             },
+            table64: declared.table64,
         }
     }
 }
@@ -918,8 +929,41 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The table cell the top frame addresses at `table_index` (0 when the
-    /// instruction's immediate was discarded by the single-table decoder).
+    fn pop_i64(&mut self) -> Result<i64, ExecFail> {
+        match self.pop()? {
+            Value::I64(v) => Ok(v),
+            _ => Err(ExecFail::Trap(Trap::Unreachable)),
+        }
+    }
+
+    /// The store cell a memory instruction's `memidx` resolves to.
+    fn mem_cell(&self, instance: usize, memory: u32) -> Result<usize, ExecFail> {
+        self.store.instances[instance]
+            .memories
+            .get(memory as usize)
+            .copied()
+            .ok_or(ExecFail::Unsupported("no memory"))
+    }
+
+    /// Whether the memory at `memidx` is a memory64 (its address operand and
+    /// `memory.size/grow` values are i64).
+    fn memory_is64(&self, instance: usize, memory: u32) -> Result<bool, ExecFail> {
+        let cell = self.mem_cell(instance, memory)?;
+        Ok(self.store.memory_types[cell].memory64)
+    }
+
+    /// Pop a memory instruction's address operand, sized by the referenced
+    /// memory's index type (i32 for a memory32, i64 for a memory64), widened
+    /// to the unsigned u64 used for effective-address arithmetic.
+    fn pop_mem_addr(&mut self, instance: usize, memory: u32) -> Result<u64, ExecFail> {
+        if self.memory_is64(instance, memory)? {
+            Ok(self.pop_i64()? as u64)
+        } else {
+            Ok(self.pop_i32()? as u32 as u64)
+        }
+    }
+
+    /// The table cell the top frame addresses at `table_index`.
     fn table_cell(&self, frame_index: usize, table_index: usize) -> Result<usize, ExecFail> {
         let instance = self.frames[frame_index].instance;
         self.store.instances[instance]
@@ -927,6 +971,24 @@ impl<'a> Engine<'a> {
             .get(table_index)
             .copied()
             .ok_or(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
+    }
+
+    /// Whether the table at `table_index` is a table64 (its address operands
+    /// and `table.size/grow` values are i64).
+    fn table_is64(&self, frame_index: usize, table_index: usize) -> Result<bool, ExecFail> {
+        let cell = self.table_cell(frame_index, table_index)?;
+        Ok(self.store.table_types[cell].table64)
+    }
+
+    /// Pop a table instruction's address operand, sized by the referenced
+    /// table's index type (i32 for a 32-bit table, i64 for a table64),
+    /// widened to the unsigned u64 used for bounds checks.
+    fn pop_table_addr(&mut self, frame_index: usize, table_index: usize) -> Result<u64, ExecFail> {
+        if self.table_is64(frame_index, table_index)? {
+            Ok(self.pop_i64()? as u64)
+        } else {
+            Ok(self.pop_i32()? as u32 as u64)
+        }
     }
 
     /// Run until the outermost frame returns. A `throw`/`throw_ref` inside
@@ -1196,10 +1258,11 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Next)
             }
             Instr::TableGet(table) => {
-                let index = self.pop_i32()?;
+                let frame_index = self.frames.len() - 1;
+                let index = self.pop_table_addr(frame_index, table as usize)?;
                 let cell = self.table_cell(frame_index, table as usize)?;
                 let elements = &self.store.tables[cell].elements;
-                if index < 0 || index as u32 >= elements.len() as u32 {
+                if index >= elements.len() as u64 {
                     return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
                 }
                 let value = Value::Ref(elements[index as usize]);
@@ -1208,10 +1271,11 @@ impl<'a> Engine<'a> {
             }
             Instr::TableSet(table) => {
                 let value = self.pop()?;
-                let index = self.pop_i32()?;
+                let frame_index = self.frames.len() - 1;
+                let index = self.pop_table_addr(frame_index, table as usize)?;
                 let cell = self.table_cell(frame_index, table as usize)?;
                 let elements = &mut self.store.tables[cell].elements;
-                if index < 0 || index as u32 >= elements.len() as u32 {
+                if index >= elements.len() as u64 {
                     return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
                 }
                 let Value::Ref(reference) = value else {
@@ -1251,12 +1315,12 @@ impl<'a> Engine<'a> {
                 self.stack.push(Value::V128(bits));
                 Ok(Ctl::Next)
             }
-            Instr::VecLoad { op, offset, .. } => {
+            Instr::VecLoad {
+                memory, op, offset, ..
+            } => {
                 let instance = self.frames[frame_index].instance;
-                let Some(&cell) = self.store.instances[instance].memories.first() else {
-                    return Err(ExecFail::Unsupported("no memory"));
-                };
-                let addr = self.pop_i32()? as u32 as u64;
+                let cell = self.mem_cell(instance, memory)?;
+                let addr = self.pop_mem_addr(instance, memory)?;
                 let size = vec_load_bytes(op) as u64;
                 let ea = addr
                     .checked_add(offset)
@@ -1271,13 +1335,11 @@ impl<'a> Engine<'a> {
                 self.stack.push(Value::V128(value));
                 Ok(Ctl::Next)
             }
-            Instr::VecStore { offset, .. } => {
+            Instr::VecStore { memory, offset, .. } => {
                 let value = self.pop()?;
-                let addr = self.pop_i32()? as u32 as u64;
                 let instance = self.frames[frame_index].instance;
-                let Some(&cell) = self.store.instances[instance].memories.first() else {
-                    return Err(ExecFail::Unsupported("no memory"));
-                };
+                let cell = self.mem_cell(instance, memory)?;
+                let addr = self.pop_mem_addr(instance, memory)?;
                 let Value::V128(bits) = value else {
                     return Err(ExecFail::Unsupported("non-v128 store"));
                 };
@@ -1294,14 +1356,16 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Next)
             }
             Instr::VecLaneLoad {
-                size, offset, lane, ..
+                memory,
+                size,
+                offset,
+                lane,
+                ..
             } => {
                 let vector = self.pop_v128()?;
-                let addr = self.pop_i32()? as u32 as u64;
                 let instance = self.frames[frame_index].instance;
-                let Some(&cell) = self.store.instances[instance].memories.first() else {
-                    return Err(ExecFail::Unsupported("no memory"));
-                };
+                let cell = self.mem_cell(instance, memory)?;
+                let addr = self.pop_mem_addr(instance, memory)?;
                 let size = size as u64;
                 let ea = addr
                     .checked_add(offset)
@@ -1323,14 +1387,16 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Next)
             }
             Instr::VecLaneStore {
-                size, offset, lane, ..
+                memory,
+                size,
+                offset,
+                lane,
+                ..
             } => {
                 let vector = self.pop_v128()?;
-                let addr = self.pop_i32()? as u32 as u64;
                 let instance = self.frames[frame_index].instance;
-                let Some(&cell) = self.store.instances[instance].memories.first() else {
-                    return Err(ExecFail::Unsupported("no memory"));
-                };
+                let cell = self.mem_cell(instance, memory)?;
+                let addr = self.pop_mem_addr(instance, memory)?;
                 let size = size as u64;
                 let ea = addr
                     .checked_add(offset)
@@ -1364,12 +1430,12 @@ impl<'a> Engine<'a> {
             }
             Instr::Vec(sub) => self.simd_exec(sub, None),
             Instr::VecLane { op, lane } => self.simd_exec(op, Some(lane)),
-            Instr::Load { op, offset, .. } => {
+            Instr::Load {
+                memory, op, offset, ..
+            } => {
                 let instance = self.frames[frame_index].instance;
-                let Some(&cell) = self.store.instances[instance].memories.first() else {
-                    return Err(ExecFail::Unsupported("no memory"));
-                };
-                let addr = self.pop_i32()? as u32 as u64;
+                let cell = self.mem_cell(instance, memory)?;
+                let addr = self.pop_mem_addr(instance, memory)?;
                 let size = load_size(op);
                 let ea = addr
                     .checked_add(offset)
@@ -1383,13 +1449,13 @@ impl<'a> Engine<'a> {
                 self.stack.push(value);
                 Ok(Ctl::Next)
             }
-            Instr::Store { op, offset, .. } => {
+            Instr::Store {
+                memory, op, offset, ..
+            } => {
                 let value = self.pop()?;
-                let addr = self.pop_i32()? as u32 as u64;
                 let instance = self.frames[frame_index].instance;
-                let Some(&cell) = self.store.instances[instance].memories.first() else {
-                    return Err(ExecFail::Unsupported("no memory"));
-                };
+                let cell = self.mem_cell(instance, memory)?;
+                let addr = self.pop_mem_addr(instance, memory)?;
                 let size = store_size(op);
                 let ea = addr
                     .checked_add(offset)
@@ -1406,33 +1472,45 @@ impl<'a> Engine<'a> {
                 );
                 Ok(Ctl::Next)
             }
-            Instr::MemorySize => {
+            Instr::MemorySize(memory) => {
                 let instance = self.frames[frame_index].instance;
-                let Some(&cell) = self.store.instances[instance].memories.first() else {
-                    return Err(ExecFail::Unsupported("no memory"));
-                };
+                let cell = self.mem_cell(instance, memory)?;
                 let pages = self.store.memories[cell].pages();
-                self.stack.push(Value::I32(pages as i32));
+                if self.store.memory_types[cell].memory64 {
+                    self.stack.push(Value::I64(pages as i64));
+                } else {
+                    self.stack.push(Value::I32(pages as i32));
+                }
                 Ok(Ctl::Next)
             }
-            Instr::MemoryGrow => {
-                let delta = self.pop_i32()? as u32 as u64;
+            Instr::MemoryGrow(memory) => {
                 let instance = self.frames[frame_index].instance;
-                let Some(&cell) = self.store.instances[instance].memories.first() else {
-                    return Err(ExecFail::Unsupported("no memory"));
+                let cell = self.mem_cell(instance, memory)?;
+                let memory64 = self.store.memory_types[cell].memory64;
+                let delta = if memory64 {
+                    self.pop_i64()? as u64
+                } else {
+                    self.pop_i32()? as u32 as u64
                 };
-                let old = self.store.memories[cell].grow(delta);
-                self.stack.push(Value::I32(old));
+                let old = self.store.memories[cell].grow(delta, memory64);
+                match old {
+                    Some(old) if memory64 => self.stack.push(Value::I64(old as i64)),
+                    Some(old) => self.stack.push(Value::I32(old as i32)),
+                    None if memory64 => self.stack.push(Value::I64(-1)),
+                    None => self.stack.push(Value::I32(-1)),
+                }
                 Ok(Ctl::Next)
             }
-            Instr::MemoryInit { data_index, .. } => self.memory_init(data_index as usize),
+            Instr::MemoryInit { data_index, memory } => {
+                self.memory_init(data_index as usize, frame_index, memory)
+            }
             Instr::DataDrop(data_index) => {
                 let instance = self.frames[frame_index].instance;
                 self.store.instances[instance].data_segments[data_index as usize] = None;
                 Ok(Ctl::Next)
             }
-            Instr::MemoryCopy => self.memory_copy(),
-            Instr::MemoryFill => self.memory_fill(),
+            Instr::MemoryCopy { dst, src } => self.memory_copy(frame_index, dst, src),
+            Instr::MemoryFill(memory) => self.memory_fill(frame_index, memory),
             Instr::RefNull(_) => {
                 self.stack.push(Value::Ref(RefValue::Null));
                 Ok(Ctl::Next)
@@ -1541,15 +1619,19 @@ impl<'a> Engine<'a> {
 
     // ---- bulk memory ----
 
-    fn memory_init(&mut self, data_index: usize) -> Result<Ctl, ExecFail> {
-        let frame_index = self.frames.len() - 1;
+    fn memory_init(
+        &mut self,
+        data_index: usize,
+        frame_index: usize,
+        memory: u32,
+    ) -> Result<Ctl, ExecFail> {
+        // Operands (bottom to top): dst address, data offset, length; the
+        // data offset and length are i32 in both address models.
         let len = self.pop_i32()? as u32 as usize;
         let src = self.pop_i32()? as u32 as usize;
-        let dst = self.pop_i32()? as u32 as usize;
         let instance = self.frames[frame_index].instance;
-        let Some(&cell) = self.store.instances[instance].memories.first() else {
-            return Err(ExecFail::Unsupported("no memory"));
-        };
+        let cell = self.mem_cell(instance, memory)?;
+        let dst = self.pop_mem_addr(instance, memory)? as usize;
         let Some(segment) = self.store.instances[instance].data_segments.get(data_index) else {
             return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
         };
@@ -1566,36 +1648,54 @@ impl<'a> Engine<'a> {
         Ok(Ctl::Next)
     }
 
-    fn memory_copy(&mut self) -> Result<Ctl, ExecFail> {
-        let frame_index = self.frames.len() - 1;
-        let len = self.pop_i32()? as u32 as usize;
-        let src = self.pop_i32()? as u32 as usize;
-        let dst = self.pop_i32()? as u32 as usize;
+    fn memory_copy(
+        &mut self,
+        frame_index: usize,
+        dst_memory: u32,
+        src_memory: u32,
+    ) -> Result<Ctl, ExecFail> {
         let instance = self.frames[frame_index].instance;
-        let Some(&cell) = self.store.instances[instance].memories.first() else {
-            return Err(ExecFail::Unsupported("no memory"));
-        };
-        let bytes = &self.store.memories[cell].bytes;
-        let size = bytes.len();
-        if dst.checked_add(len).is_none_or(|end| end > size)
-            || src.checked_add(len).is_none_or(|end| end > size)
+        // The length is the smaller of the two memories' address types.
+        let len =
+            if self.memory_is64(instance, dst_memory)? && self.memory_is64(instance, src_memory)? {
+                self.pop_i64()? as u64
+            } else {
+                u64::from(self.pop_i32()? as u32)
+            };
+        let src = self.pop_mem_addr(instance, src_memory)?;
+        let dst = self.pop_mem_addr(instance, dst_memory)?;
+        let dst_cell = self.mem_cell(instance, dst_memory)?;
+        let src_cell = self.mem_cell(instance, src_memory)?;
+        let dst_size = self.store.memories[dst_cell].bytes.len() as u64;
+        let src_size = self.store.memories[src_cell].bytes.len() as u64;
+        if dst.checked_add(len).is_none_or(|end| end > dst_size)
+            || src.checked_add(len).is_none_or(|end| end > src_size)
         {
             return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
         }
-        let bytes = &mut self.store.memories[cell].bytes;
-        bytes.copy_within(src..src + len, dst);
+        let dst = dst as usize;
+        let src = src as usize;
+        let len = len as usize;
+        if dst_cell == src_cell {
+            // Copy as if through a temporary, so overlapping regions behave
+            // like a memmove (Vec::copy_within does exactly that).
+            let bytes = &mut self.store.memories[dst_cell].bytes;
+            bytes.copy_within(src..src + len, dst);
+        } else {
+            let source = self.store.memories[src_cell].bytes[src..src + len].to_vec();
+            self.store.memories[dst_cell].bytes[dst..dst + len].copy_from_slice(&source);
+        }
         Ok(Ctl::Next)
     }
 
-    fn memory_fill(&mut self) -> Result<Ctl, ExecFail> {
-        let frame_index = self.frames.len() - 1;
-        let len = self.pop_i32()? as u32 as usize;
-        let value = self.pop_i32()? as u8;
-        let dst = self.pop_i32()? as u32 as usize;
+    fn memory_fill(&mut self, frame_index: usize, memory: u32) -> Result<Ctl, ExecFail> {
         let instance = self.frames[frame_index].instance;
-        let Some(&cell) = self.store.instances[instance].memories.first() else {
-            return Err(ExecFail::Unsupported("no memory"));
-        };
+        let cell = self.mem_cell(instance, memory)?;
+        // Operands (bottom to top): dst address, byte value, length; all of
+        // the address type except the value, which is i32.
+        let len = self.pop_mem_addr(instance, memory)? as usize;
+        let value = self.pop_i32()? as u8;
+        let dst = self.pop_mem_addr(instance, memory)? as usize;
         let bytes = &mut self.store.memories[cell].bytes;
         if dst.checked_add(len).is_none_or(|end| end > bytes.len()) {
             return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
@@ -1608,9 +1708,11 @@ impl<'a> Engine<'a> {
 
     fn table_init(&mut self, element_index: usize, table: usize) -> Result<Ctl, ExecFail> {
         let frame_index = self.frames.len() - 1;
-        let len = self.pop_i32()? as u32 as usize;
-        let src = self.pop_i32()? as u32 as usize;
-        let dst = self.pop_i32()? as u32 as usize;
+        // Operands (bottom to top): dst index, elem offset, length; the elem
+        // offset and length are i32 in both table address models.
+        let len = self.pop_i32()? as u32 as u64;
+        let src = self.pop_i32()? as u32 as u64;
+        let dst = self.pop_table_addr(frame_index, table)?;
         let instance = self.frames[frame_index].instance;
         let cell = self.table_cell(frame_index, table)?;
         let Some(segment) = self.store.instances[instance]
@@ -1620,12 +1722,17 @@ impl<'a> Engine<'a> {
             return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
         };
         let source = segment.as_deref().unwrap_or(&[]);
-        let size = self.store.tables[cell].elements.len();
+        let size = self.store.tables[cell].elements.len() as u64;
         let ok = dst.checked_add(len).is_some_and(|end| end <= size)
-            && src.checked_add(len).is_some_and(|end| end <= source.len());
+            && src
+                .checked_add(len)
+                .is_some_and(|end| end <= source.len() as u64);
         if !ok {
             return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
         }
+        let dst = dst as usize;
+        let src = src as usize;
+        let len = len as usize;
         let elements = &mut self.store.tables[cell].elements;
         elements[dst..dst + len].copy_from_slice(&source[src..src + len]);
         Ok(Ctl::Next)
@@ -1633,18 +1740,28 @@ impl<'a> Engine<'a> {
 
     fn table_copy(&mut self, dst_table: usize, src_table: usize) -> Result<Ctl, ExecFail> {
         let frame_index = self.frames.len() - 1;
-        let len = self.pop_i32()? as u32 as usize;
-        let src = self.pop_i32()? as u32 as usize;
-        let dst = self.pop_i32()? as u32 as usize;
+        // The length is the smaller of the two tables' address types.
+        let len = if self.table_is64(frame_index, dst_table)?
+            && self.table_is64(frame_index, src_table)?
+        {
+            self.pop_i64()? as u64
+        } else {
+            u64::from(self.pop_i32()? as u32)
+        };
+        let src = self.pop_table_addr(frame_index, src_table)?;
+        let dst = self.pop_table_addr(frame_index, dst_table)?;
         let dst_cell = self.table_cell(frame_index, dst_table)?;
         let src_cell = self.table_cell(frame_index, src_table)?;
-        let dst_size = self.store.tables[dst_cell].elements.len();
-        let src_size = self.store.tables[src_cell].elements.len();
+        let dst_size = self.store.tables[dst_cell].elements.len() as u64;
+        let src_size = self.store.tables[src_cell].elements.len() as u64;
         if dst.checked_add(len).is_none_or(|end| end > dst_size)
             || src.checked_add(len).is_none_or(|end| end > src_size)
         {
             return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
         }
+        let dst = dst as usize;
+        let src = src as usize;
+        let len = len as usize;
         if dst_cell == src_cell {
             // Copy as if through a temporary, so overlapping regions behave
             // like a memmove (Vec::copy_within does exactly that).
@@ -1659,33 +1776,47 @@ impl<'a> Engine<'a> {
 
     fn table_grow(&mut self, table: usize) -> Result<Ctl, ExecFail> {
         let frame_index = self.frames.len() - 1;
-        let delta = self.pop_i32()? as u32 as u64;
+        let table64 = self.table_is64(frame_index, table)?;
+        let delta = if table64 {
+            self.pop_i64()? as u64
+        } else {
+            u64::from(self.pop_i32()? as u32)
+        };
         let init = self.pop()?;
         let Value::Ref(init) = init else {
             return Err(ExecFail::Unsupported("non-reference table value"));
         };
         let cell = self.table_cell(frame_index, table)?;
-        let old = self.store.tables[cell].grow(delta, init);
-        self.stack.push(Value::I32(old));
+        let old = self.store.tables[cell].grow(delta, init, table64);
+        match old {
+            Some(old) if table64 => self.stack.push(Value::I64(old as i64)),
+            Some(old) => self.stack.push(Value::I32(old as i32)),
+            None if table64 => self.stack.push(Value::I64(-1)),
+            None => self.stack.push(Value::I32(-1)),
+        }
         Ok(Ctl::Next)
     }
 
     fn table_size(&mut self, table: usize) -> Result<Ctl, ExecFail> {
         let frame_index = self.frames.len() - 1;
         let cell = self.table_cell(frame_index, table)?;
-        let size = self.store.tables[cell].size() as i32;
-        self.stack.push(Value::I32(size));
+        let size = self.store.tables[cell].elements.len() as u64;
+        if self.table_is64(frame_index, table)? {
+            self.stack.push(Value::I64(size as i64));
+        } else {
+            self.stack.push(Value::I32(size as i32));
+        }
         Ok(Ctl::Next)
     }
 
     fn table_fill(&mut self, table: usize) -> Result<Ctl, ExecFail> {
         let frame_index = self.frames.len() - 1;
-        let len = self.pop_i32()? as u32 as usize;
+        let len = self.pop_table_addr(frame_index, table)? as usize;
         let value = self.pop()?;
         let Value::Ref(value) = value else {
             return Err(ExecFail::Unsupported("non-reference table value"));
         };
-        let dst = self.pop_i32()? as u32 as usize;
+        let dst = self.pop_table_addr(frame_index, table)? as usize;
         let cell = self.table_cell(frame_index, table)?;
         let elements = &mut self.store.tables[cell].elements;
         if dst.checked_add(len).is_none_or(|end| end > elements.len()) {
@@ -1928,15 +2059,15 @@ impl<'a> Engine<'a> {
     }
 
     fn call_indirect(&mut self, type_index: usize, table_index: usize) -> Result<(), ExecFail> {
-        let index = self.pop_i32()?;
         let frame_index = self.frames.len() - 1;
+        let index = self.pop_table_addr(frame_index, table_index)?;
         let instance = self.frames[frame_index].instance;
         if self.frames.len() + 1 > self.store.instances[instance].depth_limit {
             return Err(ExecFail::Trap(Trap::CallStackExhausted));
         }
         let cell = self.table_cell(frame_index, table_index)?;
         let elements = &self.store.tables[cell].elements;
-        if index < 0 || index as u32 >= elements.len() as u32 {
+        if index >= elements.len() as u64 {
             return Err(ExecFail::Trap(Trap::UndefinedElement));
         }
         let entry = elements[index as usize];
@@ -1962,12 +2093,12 @@ impl<'a> Engine<'a> {
         type_index: usize,
         table_index: usize,
     ) -> Result<Ctl, ExecFail> {
-        let index = self.pop_i32()?;
         let frame_index = self.frames.len() - 1;
+        let index = self.pop_table_addr(frame_index, table_index)?;
         let instance = self.frames[frame_index].instance;
         let cell = self.table_cell(frame_index, table_index)?;
         let elements = &self.store.tables[cell].elements;
-        if index < 0 || index as u32 >= elements.len() as u32 {
+        if index >= elements.len() as u64 {
             return Err(ExecFail::Trap(Trap::UndefinedElement));
         }
         let entry = elements[index as usize];
@@ -2446,14 +2577,16 @@ fn write_mem(_op: StoreOp, value: Value, bytes: &mut [u8]) {
 /// provider must have at least the requested minimum, and no larger a maximum
 /// than the request allows (spec 4.5.2 external-type subsumption).
 fn memory_matches(actual: MemType, requested: MemType) -> bool {
-    !actual.memory64 && !requested.memory64 && limits_match(actual.limits, requested.limits)
+    actual.memory64 == requested.memory64 && limits_match(actual.limits, requested.limits)
 }
 
 /// Whether an imported table type is satisfied by a provided one: element
 /// reference types must be identical (tables are invariant containers) and
 /// limits subsume.
 fn table_matches(actual: TableType, requested: TableType) -> bool {
-    actual.element == requested.element && limits_match(actual.limits, requested.limits)
+    actual.table64 == requested.table64
+        && actual.element == requested.element
+        && limits_match(actual.limits, requested.limits)
 }
 
 fn limits_match(actual: Limits, requested: Limits) -> bool {

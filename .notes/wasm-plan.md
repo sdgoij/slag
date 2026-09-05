@@ -31,15 +31,14 @@ for the conformance harness, canonical quiet NaN, post-Cut-5 ordering,
 `crates/wasm` + `wasm` feature wiring). Cut 1's decoders are implemented and
 unit-tested (module sections + the full baseline instruction stream; 10
 unit tests green, full workspace clippy clean, the real 7 MB demo module
-decodes end to end). `wasmtest run` now converts suites with `wast2json-rs`
-(fallback `wast2json`) and executes commands, classifying outcomes by what
-the current engine can judge (decode/`assert_malformed` now;
-`assert_invalid` pending validation in Cut 2; invocations pending execution
-in Cut 3) — `utf8-invalid-encoding.wast` is 176/176 pass. Tool caveat:
-`wast2json-rs` 0.1.0 cannot parse inline-`binary` modules inside
-`assert_malformed` (binary.wast, utf8-custom-section-id.wast) and can
-silently truncate some suites (type.wast), so the full Cut-1 gate needs a
-more complete converter (wabt) or a runner-side fallback for those files.
+decodes end to end). `wasmtest run` now converts suites with wabt's
+`wast2json` (env `WAST2JSON`, then PATH) and executes commands, classifying
+outcomes by what the current engine can judge (decode/`assert_malformed`
+now; `assert_invalid` pending validation in Cut 2; invocations pending
+execution in Cut 3) — `utf8-invalid-encoding.wast` is 176/176 pass. Files
+wabt cannot parse (GC type bags and element items, module-linking/`instance`
+syntax) are tracked in the runner's exclusion manifest rather than failing
+the gate.
 
 ## 1. The conformance surface (measured)
 
@@ -393,8 +392,8 @@ validity files.**
   as `funcref`), table entries accept the `0x40 0x00`-prefixed initializer
   form.
 - `wasmtest` runner: prefers wabt's `wast2json` (env `WAST2JSON`, then
-  `wast2json` on PATH, then this machine's wabt build, then the Rust
-  `wast2json-rs`), invoked with `--enable-function-references --enable-gc`.
+  `wast2json` on PATH, then this machine's wabt build), invoked with
+  `--enable-function-references --enable-gc`.
   Deliberately **not** `--enable-all`: it turns on compact-imports, which
   re-encodes every import section and breaks the corpus's standard layout.
 - Gate results (0 fail): `type`, `unreached-invalid`, `unreached-valid`,
@@ -552,7 +551,7 @@ follow-up, unlocking `imports.wast`, the import halves of `linking.wast`,
   (163 pass / 0 fail) once tables/elements landed in Cut 5. `func.wast`
   (uninitialized typed local) and `data.wast` (post-`memory.init`) stay Cut 5.
   `instance.wast` cannot be converted: its `(module instance …)` syntax is
-  beyond wabt 1.0.41 (and `wast2json-rs`).
+  beyond wabt 1.0.41 (module-linking, tracked in the exclusion manifest).
 
 ### Cut 5 — runtime: tables, reference values, indirect/ref calls, bulk memory (2026-09-05)
 
@@ -763,3 +762,148 @@ module in `bulk-memory/table_init` (1) — decode the `rec`/subtype
 type-section encoding (0x4e/0x50) that the GC binary format (Cut 9)
 introduces; today the decoder reports those as malformed functypes.
 `relaxed-simd/` is untouched.
+
+### Cut 8 — memory64, multi-memory, and table64 (2026-09-05)
+
+The address model landed: every memory instruction now carries its
+memory index, memories and tables select an i32 or i64 address type,
+and modules may declare any number of memories. The whole `memory64/`
+(25) and `multi-memory/` (41) suites are green except the two files the
+converter cannot handle.
+
+- **Decoder** (`binary.rs`): memory/table limits flags take bit 0 (max)
+  and bit 2 (`i64` address type — memory64/table64); any other flag bit
+  is malformed, and the limit values are u64 LEBs. `memarg` returns the
+  memory index (the flags byte's bit 6 makes an explicit `memidx`
+  follow), threaded through every scalar/vector load/store, lane
+  load/store, `memory.size/grow`, `memory.init`, `memory.copy` (dst,
+  src), and `memory.fill`. `read_leb` rejects a 10-byte u64 LEB whose
+  final byte sets any bit past bit 63.
+- **Validation** (`valid.rs`): each memory instruction resolves its
+  index to the memory's address type — the address operand and
+  `memory.size/grow` are i64 for a memory64, and memarg offsets must fit
+  the address type (memory32 offsets are capped at 2^32-1).
+  `memory.copy`'s length is the smaller of the two memories' address
+  types; `memory.init`'s data offset/length stay i32. The single-memory
+  limit is gone, and size caps follow the address type: memories 2^16
+  pages (memory32) / 2^48 pages (memory64), tables 2^32-1 / 2^64-1
+  slots. The same address-type treatment applies to the table
+  instructions (`table.get/set/size/grow/fill/copy/init`,
+  `call_indirect`), active data/element segment offsets, and import
+  matching (a memory64 only matches a memory64, a table64 a table64).
+- **Execution** (`exec.rs`): memory and table cells resolve by index
+  across the instance's pools (multi-memory/table instances were always
+  vectors), effective addresses are computed at the memory's width
+  (i32 bits zero-extended, or i64) with overflow trapping, and
+  `memory.size/grow` and `table.size/grow` return the address type. A
+  memory64 grows against a 2^48-page ceiling, a memory32 against 2^16;
+  a declared maximum always wins for a table64 (a first pass ignored it
+  and grew table64s past their max). Active data/element offsets accept
+  an i64 const when the target is 64-bit.
+- **Runner**: `spectest` gained the spec's `table64` export (a funcref
+  table64, 10..20) that `table64.wast` imports.
+
+Green: `multi-memory/` 41/41, and `memory64/` 24/25 — `table_init64`
+never converts because wabt 1.0.41 cannot parse the GC `array.new_default`
+element items in it (Cut 9, written exclusion). `simd_memory-multi`
+(which exercises multi-memory lane forms) flipped from pending to green.
+Combined simd + memory64 + multi-memory: 34 153 pass, 0 fail, 570
+pending (the pending are `assert_malformed` `(module quote …)`
+fixtures). Full sweep of the six convert-with-wabt suites (core root,
+exceptions, bulk-memory, simd, memory64, multi-memory — 234 files):
+224 run, 61 309 pass, 20 fail, 1 168 pending; the 20 fails are
+pre-existing decode gaps outside this cut (`binary.wast` 15 structural
+malformed checks, `binary-leb128.wast` 4 `i64.const` canonicality,
+`custom.wast` 1 data-count decode check). Ten files never convert under
+wabt (annotations/instance/ref_null/`type-*`/tag/try_table/table_init/
+table_init64 — GC rec bags, GC elem items, or new module-linking
+syntax); each is listed in the runner's exclusion manifest.
+
+#### Cut 8 taxonomy and CI gate
+
+`wasmtest run` now accepts several paths and walks directories
+recursively for `.wast`/`.json`, converting on the fly and exiting
+nonzero when any suite reports a fail — the CI-style gate. Files the
+pinned converter cannot parse live in `crates/wasmtest/wasm-exclusions.txt`
+(`path :: reason`, overridable via `$WASM_EXCLUSIONS`); they print as
+`skip` and are not failures. The gate for this cut:
+
+```
+wasmtest run waspec/test/core/multi-memory waspec/test/core/memory64
+# total: 8674 pass, 0 fail, 59 pending, 1 skipped
+```
+
+| suite | file | pass / fail / pending |
+|---|---|---|---|
+| memory64 | address64 | 242 / 0 / 0 |
+| memory64 | align64 | 111 / 0 / 46 |
+| memory64 | binary_leb128_64 | 2 / 0 / 0 |
+| memory64 | bulk64 | 70 / 0 / 0 |
+| memory64 | call_indirect64 | 2 / 0 / 0 |
+| memory64 | endianness64 | 69 / 0 / 0 |
+| memory64 | float_memory64 | 90 / 0 / 0 |
+| memory64 | load64 | 85 / 0 / 13 |
+| memory64 | memory64 | 69 / 0 / 0 |
+| memory64 | memory64-imports | 78 / 0 / 0 |
+| memory64 | memory_copy64 | 4450 / 0 / 0 |
+| memory64 | memory_fill64 | 100 / 0 / 0 |
+| memory64 | memory_grow64 | 49 / 0 / 0 |
+| memory64 | memory_init64 | 250 / 0 / 0 |
+| memory64 | memory_redundancy64 | 8 / 0 / 0 |
+| memory64 | memory_trap64 | 172 / 0 / 0 |
+| memory64 | table64 | 14 / 0 / 0 |
+| memory64 | table_copy64 | 1728 / 0 / 0 |
+| memory64 | table_copy_mixed | 4 / 0 / 0 |
+| memory64 | table_fill64 | 80 / 0 / 0 |
+| memory64 | table_get64 | 11 / 0 / 0 |
+| memory64 | table_grow64 | 22 / 0 / 0 |
+| memory64 | table_init64 | skip — GC `arrayref` element items (Cut 9) |
+| memory64 | table_set64 | 19 / 0 / 0 |
+| memory64 | table_size64 | 37 / 0 / 0 |
+| multi-memory | address0 | 92 / 0 / 0 |
+| multi-memory | address1 | 127 / 0 / 0 |
+| multi-memory | align0 | 5 / 0 / 0 |
+| multi-memory | binary0 | 7 / 0 / 0 |
+| multi-memory | data0 | 7 / 0 / 0 |
+| multi-memory | data1 | 14 / 0 / 0 |
+| multi-memory | data_drop0 | 11 / 0 / 0 |
+| multi-memory | exports0 | 8 / 0 / 0 |
+| multi-memory | float_exprs0 | 14 / 0 / 0 |
+| multi-memory | float_exprs1 | 3 / 0 / 0 |
+| multi-memory | float_memory0 | 30 / 0 / 0 |
+| multi-memory | imports0 | 8 / 0 / 0 |
+| multi-memory | imports1 | 5 / 0 / 0 |
+| multi-memory | imports2 | 20 / 0 / 0 |
+| multi-memory | imports3 | 10 / 0 / 0 |
+| multi-memory | imports4 | 16 / 0 / 0 |
+| multi-memory | linking0 | 6 / 0 / 0 |
+| multi-memory | linking1 | 14 / 0 / 0 |
+| multi-memory | linking2 | 11 / 0 / 0 |
+| multi-memory | linking3 | 14 / 0 / 0 |
+| multi-memory | load0 | 3 / 0 / 0 |
+| multi-memory | load1 | 18 / 0 / 0 |
+| multi-memory | load2 | 38 / 0 / 0 |
+| multi-memory | memory-multi | 6 / 0 / 0 |
+| multi-memory | memory_copy0 | 29 / 0 / 0 |
+| multi-memory | memory_copy1 | 14 / 0 / 0 |
+| multi-memory | memory_fill0 | 16 / 0 / 0 |
+| multi-memory | memory_grow | 51 / 0 / 0 |
+| multi-memory | memory_init0 | 13 / 0 / 0 |
+| multi-memory | memory_size0 | 8 / 0 / 0 |
+| multi-memory | memory_size1 | 15 / 0 / 0 |
+| multi-memory | memory_size2 | 21 / 0 / 0 |
+| multi-memory | memory_size3 | 2 / 0 / 0 |
+| multi-memory | memory_size_import | 7 / 0 / 0 |
+| multi-memory | memory_trap0 | 14 / 0 / 0 |
+| multi-memory | memory_trap1 | 168 / 0 / 0 |
+| multi-memory | start0 | 9 / 0 / 0 |
+| multi-memory | store0 | 5 / 0 / 0 |
+| multi-memory | store1 | 13 / 0 / 0 |
+| multi-memory | store2 | 25 / 0 / 0 |
+| multi-memory | traps0 | 15 / 0 / 0 |
+
+All 59 pending across the gate are `assert_malformed (module quote …)`
+text fixtures (the engine has no `.wat` parser); the single skip is the
+documented `table_init64` converter exclusion. The exit code is nonzero
+the moment any suite reports a fail, so the command doubles as the cut's
+CI check.
