@@ -14,18 +14,29 @@
 //!   (`performance.now()`) for `setTimeout` deadlines
 //! - `slag_host_console(level, ptr, len)` — a console line (0 log, 1 info,
 //!   2 warn, 3 error, 4 debug, 5 unhandled rejection)
+//! - `slag_host_has_dom()` — whether the embedding wants the DOM bridge
+//!   installed (`document`/`localStorage`/`__host`); the dogfood sandbox
+//!   engine runs with it off so user scripts cannot touch the page.
 //!
 //! Exports: `slag_alloc`/`slag_dealloc` (caller-writable byte buffers),
 //! `slag_eval(ptr, len)`, `slag_drain`, `slag_next_timeout_ms`, `slag_reset`,
 //! and the `slag_result_*` trio (the last outcome's UTF-8 text, valid until
-//! the next call). On native hosts `main` runs the same eval path as a
-//! self-test: `cargo run -p slag --example wasm_binding`.
+//! the next call). The dogfood demo runs its UI in one engine instance and
+//! user scripts in a *second* instance of this same module (a separate agent,
+//! so Clear can drop it entirely); the instances never share state. On
+//! native hosts `main` runs the same eval path as a self-test: `cargo run -p
+//! slag --example wasm_binding`.
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::ptr;
 use std::slice;
 
 use slag::{Context, HostCallbacks};
+
+/// The browser DOM bridge (`dom.rs`) — compiled only for wasm, where the
+/// demo page is driven from inside the engine. Kept out of `crates/runtime`.
+#[cfg(target_arch = "wasm32")]
+mod dom;
 
 /// One script's outcome, kept until the next export call replaces it.
 struct Outcome {
@@ -37,11 +48,13 @@ static mut CONTEXT: *mut Context = ptr::null_mut();
 static mut OUTCOME: Option<Outcome> = None;
 static mut RESULT_TYPE: u32 = 0;
 
-// Imported from the embedding JS (`env.slag_host_console`).
+// Imported from the embedding JS (`env.slag_host_console`,
+// `env.slag_host_has_dom`).
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
     fn slag_host_console(level: i32, ptr: u32, len: u32);
+    fn slag_host_has_dom() -> i32;
 }
 
 /// A console-line sink that hands the text to the embedding JS.
@@ -90,6 +103,10 @@ fn with_context(body: impl FnOnce(&mut Context) -> Result<(), String>) -> Result
         if CONTEXT.is_null() {
             let mut context = Context::new().map_err(|error| error.to_string())?;
             context.set_host_callbacks(host_callbacks());
+            #[cfg(target_arch = "wasm32")]
+            if slag_host_has_dom() != 0 {
+                dom::install(&mut context, dom::dom_host())?;
+            }
             CONTEXT = Box::into_raw(Box::new(context));
         }
         &mut *CONTEXT
@@ -293,6 +310,54 @@ pub extern "C" fn slag_next_timeout_ms() -> f64 {
     existing_context()
         .and_then(|context| context.next_timeout_ms())
         .unwrap_or(-1.0)
+}
+
+/// Fire a native DOM event into the engine: `id` is the element handle,
+/// `type_ptr`/`type_len` the UTF-8 event type, and `props_ptr`/`props_len`
+/// an encoded property buffer (name + typed value pairs, see `dom.rs`).
+/// Returns 0 (not prevented), 1 (a listener called `preventDefault()`), or
+/// -1 when running a listener failed (the outcome carries the message).
+///
+/// # Safety
+/// `type_ptr`/`type_len` and `props_ptr`/`props_len` must point at valid
+/// bytes in linear memory.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_dom_event(
+    id: u32,
+    type_ptr: u32,
+    type_len: u32,
+    props_ptr: u32,
+    props_len: u32,
+) -> i32 {
+    let result = (|| {
+        let type_bytes = if type_len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: the caller guarantees `type_len` readable bytes.
+            unsafe { slice::from_raw_parts(type_ptr as *const u8, type_len as usize) }
+        };
+        let props = if props_len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: the caller guarantees `props_len` readable bytes.
+            unsafe { slice::from_raw_parts(props_ptr as *const u8, props_len as usize) }
+        };
+        let event_type = std::str::from_utf8(type_bytes)
+            .map_err(|_| "event type is not valid UTF-8".to_string())?
+            .to_string();
+        let Some(context) = existing_context() else {
+            return Ok(false);
+        };
+        dom::fire(context, id, &event_type, props)
+    })();
+    match result {
+        Ok(prevented) => i32::from(prevented),
+        Err(message) => {
+            set_outcome(true, message);
+            -1
+        }
+    }
 }
 
 /// Drop the current context; the next `slag_eval` starts a fresh realm.

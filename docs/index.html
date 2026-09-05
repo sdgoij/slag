@@ -605,734 +605,109 @@ python -m http.server    # then open the served docs/index.html</code></pre>
       </footer>
     </div>
 
-    <script type="module">
-      import { fromUrl } from './slag.js';
+        <script type="module">
+      // The whole demo UI runs *inside* Slag (app.js): the browser only
+      // hosts the engine + DOM bridge. User scripts run in a *second* engine
+      // instance (its own agent/realm, no DOM), so Clear can drop that
+      // engine — globals and pending timers included — without tearing down
+      // the UI.
+      import { instantiate } from './slag.js';
 
-      const status = document.getElementById('status');
-      const src = document.getElementById('src');
-      const runBtn = document.getElementById('run');
-      const runModeEl = document.getElementById('run-mode');
-      const clearBtn = document.getElementById('clear');
-      const themeBtn = document.getElementById('theme');
-      const modeBtns = Array.from(document.querySelectorAll('.seg[data-mode]'));
-      const scriptView = document.getElementById('script-view');
-      const replView = document.getElementById('repl-view');
-      const scriptOut = document.getElementById('out');
-      const replOut = document.getElementById('repl-out');
-      const replForm = document.getElementById('repl-form');
-      const replInput = document.getElementById('repl-input');
-      const replPrompt = document.getElementById('repl-prompt');
-      const replClearBtn = document.getElementById('repl-clear');
-      const replCopyBtn = document.getElementById('repl-copy');
-      const copyBtn = document.getElementById('copy');
-      const exampleEl = document.getElementById('example');
-      const srcHl = document.getElementById('src-hl');
-
-      let slag = null;      // engine binding, set once wasm loads
-      let activeOut = scriptOut;
-      let mode = 'script';
-
-      // ---- theme: auto (follow the OS) → light → dark, persisted. ----
-      const THEMES = ['auto', 'light', 'dark'];
-      const THEME_GLYPH = { auto: '◐', light: '☀', dark: '☾' };
-      const THEME_LABEL = { auto: 'Theme: follow system', light: 'Theme: light', dark: 'Theme: dark' };
-      const applyTheme = (theme) => {
-        document.documentElement.dataset.theme = theme;
-        localStorage.setItem('slag-theme', theme);
-        themeBtn.textContent = THEME_GLYPH[theme];
-        themeBtn.title = THEME_LABEL[theme];
-      };
-      themeBtn.addEventListener('click', () => {
-        const next = THEMES[(THEMES.indexOf(document.documentElement.dataset.theme) + 1) % THEMES.length];
-        applyTheme(next);
-      });
-      applyTheme(document.documentElement.dataset.theme);
-
-      const setStatus = (state, text) => {
-        status.className = `status ${state}`;
-        status.innerHTML = `<i class="dot"></i>${text}`;
-      };
-
-      // ---- console rendering (one buffer per pane; emit follows the mode) ----
-      const lineInto = (host, kind, tag, text) => {
-        const el = document.createElement('div');
-        el.className = `line ${kind}`;
-        if (tag) {
-          const tagEl = document.createElement('span');
-          tagEl.className = 'tag';
-          tagEl.textContent = tag;
-          el.appendChild(tagEl);
-        }
-        el.appendChild(document.createTextNode(text));
-        host.appendChild(el);
-        host.scrollTop = host.scrollHeight;
-      };
-      const clearInto = (host) => { host.textContent = ''; };
-      const emit = (kind, tag, text) =>
-        lineInto(activeOut, kind, activeOut === replOut ? null : tag, text);
-
-      // ---- copy output to the clipboard ----
-      const copyText = async (text) => {
-        if (navigator.clipboard && window.isSecureContext) {
-          try {
-            await navigator.clipboard.writeText(text);
-            return true;
-          } catch {
-            // Fall through to the legacy path (e.g. permissions denied).
-          }
-        }
-        const helper = document.createElement('textarea');
-        helper.value = text;
-        helper.setAttribute('readonly', '');
-        helper.style.position = 'fixed';
-        helper.style.opacity = '0';
-        document.body.appendChild(helper);
-        helper.select();
-        let ok = false;
-        try {
-          ok = document.execCommand('copy');
-        } catch {
-          ok = false;
-        }
-        helper.remove();
-        return ok;
-      };
-      const flashCopy = async (button, host) => {
-        const lines = Array.from(host.querySelectorAll('.line'));
-        const text = lines.length > 0
-          ? lines.map((line) => line.textContent).join('\n')
-          : host.textContent;
-        const ok = await copyText(text);
-        const previous = button.textContent;
-        button.textContent = ok ? 'Copied' : 'Copy failed';
-        button.disabled = true;
-        setTimeout(() => {
-          button.textContent = previous;
-          button.disabled = false;
-        }, 1200);
-      };
-      copyBtn.addEventListener('click', () => flashCopy(copyBtn, scriptOut));
-      replCopyBtn.addEventListener('click', () => flashCopy(replCopyBtn, replOut));
-
-      // A wasm trap (deep recursion / stack limit) leaves the engine context
-      // unusable; reset it so the next evaluation starts fresh.
-      const handleEvalError = (error) => {
-        if (error && error.slag === true) {
-          emit('error', '✗', error.message);
-          return;
-        }
-        const message = (error && error.message) || 'engine error';
-        emit('error', '✗', message);
-        emit('system', null, 'the wasm stack limit was hit — engine context reset');
-        if (slag) slag.reset();
-        setStatus('ready', 'ready');
-      };
-
-      // ---- mode switching ----
-      const setMode = (next) => {
-        mode = next;
-        modeBtns.forEach((btn) => {
-          const active = btn.dataset.mode === next;
-          btn.classList.toggle('active', active);
-          btn.setAttribute('aria-pressed', String(active));
-        });
-        scriptView.hidden = next !== 'script';
-        replView.hidden = next !== 'repl';
-        activeOut = next === 'repl' ? replOut : scriptOut;
-        resetRepl();
-        if (next === 'repl') {
-          greetRepl();
-          replInput.disabled = slag === null;
-          replInput.focus();
-        }
-      };
-      modeBtns.forEach((btn) => btn.addEventListener('click', () => setMode(btn.dataset.mode)));
-
-      // ---- repl ----
-      let replBuffer = '';
-      let replHistory = [];
-      let replHistPos = 0;
-      let replDraft = '';
-      let replGreeted = false;
-
-      const renderReplPrompt = () => {
-        replPrompt.textContent = replBuffer ? '...' : '>';
-      };
-      const greetRepl = () => {
-        if (replGreeted) return;
-        replGreeted = true;
-        lineInto(replOut, 'system', null, 'Welcome to Slag — JavaScript in your browser');
-        lineInto(replOut, 'system', null, 'Type ".help" for more information.');
-      };
-      const resetRepl = () => {
-        replBuffer = '';
-        replHistPos = replHistory.length;
-        replDraft = '';
-        replInput.value = '';
-        renderReplPrompt();
-      };
-
-      // Mirror of the CLI REPL: only evaluate once strings/templates/comments
-      // are closed and bracket depth is back to zero (so blocks can span
-      // several entered lines).
-      const inputComplete = (source) => {
-        const chars = Array.from(source);
-        let depth = 0;
-        let inString = null;
-        let lineComment = false;
-        let blockComment = false;
-        let i = 0;
-        while (i < chars.length) {
-          const c = chars[i];
-          if (lineComment) {
-            if (c === '\n') lineComment = false;
-            i += 1;
-            continue;
-          }
-          if (blockComment) {
-            if (c === '*' && chars[i + 1] === '/') {
-              blockComment = false;
-              i += 2;
-            } else {
-              i += 1;
-            }
-            continue;
-          }
-          if (inString) {
-            if (c === '\\') {
-              i += 2;
-              continue;
-            }
-            if (c === inString) inString = null;
-            i += 1;
-            continue;
-          }
-          if (c === '/' && chars[i + 1] === '/') {
-            lineComment = true;
-            i += 2;
-            continue;
-          }
-          if (c === '/' && chars[i + 1] === '*') {
-            blockComment = true;
-            i += 2;
-            continue;
-          }
-          if (c === "'" || c === '"' || c === '`') {
-            inString = c;
-          } else if (c === '(' || c === '[' || c === '{') {
-            depth += 1;
-          } else if (c === ')' || c === ']' || c === '}') {
-            depth -= 1;
-          }
-          i += 1;
-        }
-        return depth <= 0 && inString === null && !lineComment && !blockComment;
-      };
-
-      // Node-style dot commands, handled before anything is evaluated.
-      const runDotCommand = (command) => {
-        switch (command) {
-          case '.help':
-            lineInto(replOut, 'system', null, '.break   cancel the current multi-line input');
-            lineInto(replOut, 'system', null, '.clear   clear the console and reset the engine context');
-            lineInto(replOut, 'system', null, '.exit    leave the REPL and return to Script mode');
-            lineInto(replOut, 'system', null, '.help    print this help message');
-            break;
-          case '.clear':
-            clearInto(replOut);
-            if (slag) slag.reset();
-            setStatus('ready', 'ready');
-            break;
-          case '.break':
-            replBuffer = '';
-            renderReplPrompt();
-            break;
-          case '.exit':
-            setMode('script');
-            break;
-          default:
-            // Node's own response to an unknown keyword.
-            lineInto(replOut, 'error', null, 'Invalid REPL keyword');
-        }
-        replOut.scrollTop = replOut.scrollHeight;
-      };
-
-      replForm.addEventListener('submit', (event) => {
-        event.preventDefault();
-        if (slag === null) return;
-        const raw = replInput.value;
-        if (!replBuffer && raw.trim() === '') {
-          replInput.value = '';
-          replInput.focus();
-          return;
-        }
-        lineInto(replOut, 'input', replBuffer ? '...' : '>', raw);
-        replInput.value = '';
-        const trimmed = raw.trim();
-        const midMultiLineCommand = trimmed === '.break' || trimmed === '.exit';
-        if (trimmed.startsWith('.') && (!replBuffer || midMultiLineCommand)) {
-          runDotCommand(trimmed);
-          replInput.focus();
-          return;
-        }
-        replBuffer = replBuffer ? `${replBuffer}\n${raw}` : raw;
-        if (!inputComplete(replBuffer)) {
-          renderReplPrompt();
-          replInput.focus();
-          return;
-        }
-        const source = replBuffer;
-        replBuffer = '';
-        renderReplPrompt();
-        if (source.trim() !== '') {
-          replHistory.push(source);
-          replHistPos = replHistory.length;
-          try {
-            const result = slag.eval(source);
-            const type = slag.resultType();
-            // Like Node: show every completion, even `undefined` (e.g. after
-            // `const x = 1;`), and quote string completions.
-            const shown = type === 5 ? quoteString(result) : result;
-            lineInto(replOut, type === 1 ? 'out-void' : 'out', null, shown);
-          } catch (error) {
-            handleEvalError(error);
-          }
-        }
-        replOut.scrollTop = replOut.scrollHeight;
-        replInput.focus();
-      });
-
-      // Up/down walk the history (only at the top level of a submission).
-      replInput.addEventListener('keydown', (event) => {
-        if (replBuffer) return;
-        if (event.key === 'ArrowUp') {
-          event.preventDefault();
-          if (replHistory.length === 0) return;
-          if (replHistPos === replHistory.length) replDraft = replInput.value;
-          if (replHistPos > 0) {
-            replHistPos -= 1;
-            replInput.value = replHistory[replHistPos];
-          }
-        } else if (event.key === 'ArrowDown') {
-          event.preventDefault();
-          if (replHistPos < replHistory.length) {
-            replHistPos += 1;
-            replInput.value = replHistPos === replHistory.length ? replDraft : replHistory[replHistPos];
-          } else {
-            replInput.value = replDraft;
-          }
-        }
-      });
-
-      replClearBtn.addEventListener('click', () => {
-        clearInto(replOut);
-        resetRepl();
-        if (slag) slag.reset();
-        setStatus('ready', 'ready');
-        lineInto(replOut, 'system', null, 'console cleared · engine context reset');
-        replInput.focus();
-      });
-
-      // ---- editor syntax highlighting ----
-      const SYN_KEYWORDS = new Set([
-        'async', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue',
-        'debugger', 'default', 'delete', 'do', 'else', 'export', 'extends', 'false',
-        'finally', 'for', 'function', 'get', 'if', 'import', 'in', 'instanceof',
-        'let', 'new', 'null', 'of', 'return', 'set', 'static', 'super', 'switch',
-        'this', 'throw', 'true', 'try', 'typeof', 'var', 'void', 'while', 'with',
-        'yield',
-      ]);
-      const isWordStart = (c) => /[A-Za-z_$]/.test(c) || c.charCodeAt(0) > 127;
-      const isWordChar = (c) => /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) > 127;
-
-      const skipQuote = (code, start) => {
-        const quote = code[start];
-        let i = start + 1;
-        while (i < code.length) {
-          const ch = code[i];
-          if (ch === '\\') { i += 2; continue; }
-          if (ch === quote) return i + 1;
-          if (ch === '\n') return i;
-          i += 1;
-        }
-        return code.length;
-      };
-
-      const skipTemplate = (code, start) => {
-        let i = start + 1;
-        while (i < code.length) {
-          const ch = code[i];
-          if (ch === '\\') { i += 2; continue; }
-          if (ch === '`') return i + 1;
-          if (ch === '$' && code[i + 1] === '{') {
-            i = findHoleEnd(code, i + 2) + 1;
-            continue;
-          }
-          i += 1;
-        }
-        return code.length;
-      };
-
-      const findHoleEnd = (code, from) => {
-        // `from` is just past `${` in a template literal; return the index of
-        // its matching `}` (strings, comments, and nested templates ignored).
-        let depth = 1;
-        let i = from;
-        while (i < code.length) {
-          const c = code[i];
-          if (c === '\\') { i += 2; continue; }
-          if (c === "'" || c === '"') { i = skipQuote(code, i); continue; }
-          if (c === '`') { i = skipTemplate(code, i); continue; }
-          if (c === '/' && code[i + 1] === '/') {
-            const nl = code.indexOf('\n', i);
-            i = nl === -1 ? code.length : nl;
-            continue;
-          }
-          if (c === '/' && code[i + 1] === '*') {
-            const end = code.indexOf('*/', i + 2);
-            i = end === -1 ? code.length : end + 2;
-            continue;
-          }
-          if (c === '{') depth += 1;
-          else if (c === '}') {
-            depth -= 1;
-            if (depth === 0) return i;
-          }
-          i += 1;
-        }
-        return code.length;
-      };
-
-      const scanNumber = (code, start) => {
-        const c = code[start];
-        const c1 = code[start + 1] || '';
-        let i = start;
-        if (c === '0' && /[xX]/.test(c1)) {
-          i = start + 2;
-          while (i < code.length && /[0-9a-fA-F_]/.test(code[i])) i += 1;
-        } else if (c === '0' && /[bB]/.test(c1)) {
-          i = start + 2;
-          while (i < code.length && /[01_]/.test(code[i])) i += 1;
-        } else if (c === '0' && /[oO]/.test(c1)) {
-          i = start + 2;
-          while (i < code.length && /[0-7_]/.test(code[i])) i += 1;
-        } else {
-          while (i < code.length && /[0-9_]/.test(code[i])) i += 1;
-          if (code[i] === '.') {
-            i += 1;
-            while (i < code.length && /[0-9_]/.test(code[i])) i += 1;
-          }
-          if (i < code.length && /[eE]/.test(code[i])) {
-            const k = i;
-            let j = i + 1;
-            if (j < code.length && /[+-]/.test(code[j])) j += 1;
-            if (j < code.length && /[0-9]/.test(code[j])) {
-              i = j;
-              while (i < code.length && /[0-9_]/.test(code[i])) i += 1;
-            } else {
-              i = k;
-            }
-          }
-        }
-        if (code[i] === 'n') i += 1;
-        return i;
-      };
-
-      const tokenize = (code) => {
-        const spans = [];
-        const push = (cls, text) => {
-          if (!text) return;
-          const last = spans[spans.length - 1];
-          if (last && last.cls === cls) last.text += text;
-          else spans.push({ cls, text });
-        };
-        let i = 0;
-        while (i < code.length) {
-          const c = code[i];
-          if (/\s/.test(c)) {
-            let j = i + 1;
-            while (j < code.length && /\s/.test(code[j])) j += 1;
-            push(null, code.slice(i, j));
-            i = j;
-            continue;
-          }
-          if (c === '/' && code[i + 1] === '/') {
-            let j = i + 2;
-            while (j < code.length && code[j] !== '\n') j += 1;
-            push('tok-comment', code.slice(i, j));
-            i = j;
-            continue;
-          }
-          if (c === '/' && code[i + 1] === '*') {
-            const end = code.indexOf('*/', i + 2);
-            const j = end === -1 ? code.length : end + 2;
-            push('tok-comment', code.slice(i, j));
-            i = j;
-            continue;
-          }
-          if (c === '"' || c === "'") {
-            const j = skipQuote(code, i);
-            push('tok-string', code.slice(i, j));
-            i = j;
-            continue;
-          }
-          if (c === '`') {
-            // Template literal: `${ expr }` holes are tokenized as code so
-            // braces and strings inside them keep their own colors.
-            let j = i + 1;
-            let seg = i;
-            while (j < code.length) {
-              const ch = code[j];
-              if (ch === '\\') { j += 2; continue; }
-              if (ch === '`') { j += 1; break; }
-              if (ch === '$' && code[j + 1] === '{') {
-                const end = findHoleEnd(code, j + 2);
-                push('tok-string', code.slice(seg, j));
-                push('tok-string', '${');
-                for (const inner of tokenize(code.slice(j + 2, end))) {
-                  push(inner.cls, inner.text);
-                }
-                if (end < code.length) push('tok-string', '}');
-                j = end + 1;
-                seg = j;
-                continue;
-              }
-              j += 1;
-            }
-            push('tok-string', code.slice(seg, j));
-            i = j;
-            continue;
-          }
-          if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(code[i + 1] || ''))) {
-            const j = scanNumber(code, i);
-            push('tok-number', code.slice(i, j));
-            i = j;
-            continue;
-          }
-          if (isWordStart(c)) {
-            let j = i + 1;
-            while (j < code.length && isWordChar(code[j])) j += 1;
-            const word = code.slice(i, j);
-            if (SYN_KEYWORDS.has(word)) {
-              push('tok-keyword', word);
-            } else {
-              let k = j;
-              while (k < code.length && /\s/.test(code[k])) k += 1;
-              push(code[k] === '(' ? 'tok-func' : null, word);
-            }
-            i = j;
-            continue;
-          }
-          push(null, c);
-          i += 1;
-        }
-        return spans;
-      };
-
-      const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-      const escHtml = (text) => text.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
-
-      const alignHighlight = () => {
-        // The overlay must wrap exactly where the textarea does; give it the
-        // same padding plus whatever scrollbar gutter the textarea reserves.
-        const gutter = Math.max(0, src.offsetWidth - src.clientWidth);
-        srcHl.style.paddingRight = gutter > 0 ? `calc(1.1rem + ${gutter}px)` : '';
-      };
-      const paintHighlight = () => {
-        let html = '';
-        for (const { cls, text } of tokenize(src.value)) {
-          const safe = escHtml(text);
-          html += cls ? `<span class="${cls}">${safe}</span>` : safe;
-        }
-        srcHl.innerHTML = html;
-        alignHighlight();
-        srcHl.scrollTop = src.scrollTop;
-        srcHl.scrollLeft = src.scrollLeft;
-      };
-      src.addEventListener('input', paintHighlight);
-      src.addEventListener('scroll', () => {
-        srcHl.scrollTop = src.scrollTop;
-        srcHl.scrollLeft = src.scrollLeft;
-      });
-      new ResizeObserver(alignHighlight).observe(src);
-      paintHighlight(); // paint the initial sample while the engine loads
-
-      // ---- ready-made example snippets ----
-      const EXAMPLES = {
-        objects: `// Objects, classes, JSON, destructuring, and accessors.
-
-class Point {
-  constructor(x, y) {
-    this.x = x;
-    this.y = y;
-  }
-  norm() {
-    return Math.hypot(this.x, this.y);
-  }
-}
-const p = new Point(3, 4);
-console.log('norm of (3, 4):', p.norm());
-
-const record = {
-  name: 'slag',
-  tags: ['spec', 'faithful'],
-  meta: { edition: 2026 },
-};
-console.log('JSON:', JSON.stringify(record));
-console.log('keys:', Object.keys(record).join(', '));
-console.log('round trip:', JSON.parse(JSON.stringify(record)).meta.edition);
-
-const { name, meta: { edition } } = record;
-console.log('destructured:', name, edition);
-
-const counter = {
-  _n: 0,
-  get n() {
-    return this._n;
-  },
-  set n(value) {
-    this._n = value;
-  },
-};
-counter.n = 41;
-console.log('getter/setter:', counter.n + 1);
-`,
-        async: `// Promises, microtasks, and real timers (the glue drains the engine).
-
-console.log('1: sync start');
-
-Promise.resolve('2: microtask').then(console.log);
-
-setTimeout(() => console.log('5: macrotask after ~100ms'), 100);
-
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function demo() {
-  console.log('3: async body');
-  await delay(150);
-  console.log('6: after await ~150ms');
-}
-demo();
-
-console.log('4: sync end');
-`,
-        regexp: String.raw`// Regular expressions with full ECMAScript semantics.
-
-const re = /^(?<area>\d{3})-(?<exch>\d{3})-(?<num>\d{4})$/;
-const match = re.exec('800-555-0199');
-console.log('named groups:', match.groups);
-
-console.log('unicode property:', /^\p{Script=Greek}+$/u.test('αβγ'));
-
-console.log('lookahead:', /foo(?=bar)/.test('foobar'));
-
-console.log('backreference:', /^(ab)\1$/.test('abab'));
-
-console.log('replace:', 'a1b2c3'.replace(/\d/g, (digit) => Number(digit) * 10));
-
-console.log('split:', 'The quick brown fox'.split(/\s+/).join('|'));
-`,
-      };
-
-      // The engine hands completion values back as bare text; show string
-      // completions quoted the way Node's REPL does.
-      const quoteString = (text) => {
-        let out = "'";
-        for (const ch of text) {
-          switch (ch) {
-            case '\\': out += '\\\\'; break;
-            case "'": out += "\\'"; break;
-            case '\n': out += '\\n'; break;
-            case '\r': out += '\\r'; break;
-            case '\t': out += '\\t'; break;
-            case '\b': out += '\\b'; break;
-            case '\f': out += '\\f'; break;
-            case '\v': out += '\\v'; break;
-            default: {
-              const point = ch.codePointAt(0);
-              if (point < 0x20 || (point >= 0x7f && point < 0xa0)) {
-                out += '\\x' + point.toString(16).padStart(2, '0');
-              } else {
-                out += ch;
-              }
-            }
-          }
-        }
-        return out + "'";
-      };
-
-      // ---- engine boot ----
+      const bootLog = document.getElementById('out');
       try {
-        slag = await fromUrl('slag.wasm', {
+        const response = await fetch('slag.wasm');
+        if (!response.ok) throw new Error(`fetch slag.wasm: ${response.status}`);
+        const bytes = await response.arrayBuffer();
+        const silent = {
+          log: () => {},
+          info: () => {},
+          warn: () => {},
+          error: () => {},
+          debug: () => {},
+        };
+
+        // Requests from the app (in the UI engine) arrive through
+        // __host.userRun/userReset and are queued here. Ops run on a
+        // microtask — after the current UI event has returned — in FIFO order
+        // (a Clear queued before a Run resets first).
+        const sandboxOps = [];
+        let sandboxOpsScheduled = false;
+        let ui = null;
+        let sandbox = null;
+
+        const deliverLine = (level, typeCode, text) => {
+          if (!ui) return;
+          try {
+            // The snippet runs inside the UI engine, so sandbox output flows
+            // through the app's __userLine sink (rendering + copy buffers).
+            ui.eval(
+              `globalThis.__userLine(${level},${typeCode},${JSON.stringify(text)})`
+            );
+          } catch (error) {
+            console.error(
+              '[ui line failed]',
+              error && error.message ? error.message : error
+            );
+          }
+        };
+        const pumpSandboxOps = () => {
+          sandboxOpsScheduled = false;
+          while (sandboxOps.length > 0) {
+            const op = sandboxOps.shift();
+            try {
+              if (op.kind === 'run') {
+                const text = sandbox.eval(op.source);
+                deliverLine(6, sandbox.resultType(), text);
+              } else {
+                sandbox.reset();
+              }
+            } catch (error) {
+              if (op.kind === 'run') {
+                deliverLine(7, 0, error && error.message ? error.message : String(error));
+              } else {
+                bootLog.textContent = `sandbox reset failed: ${error.message}`;
+              }
+            }
+          }
+        };
+        const scheduleSandboxOps = () => {
+          if (!sandboxOpsScheduled) {
+            sandboxOpsScheduled = true;
+            queueMicrotask(pumpSandboxOps);
+          }
+        };
+        const userRun = (source) => {
+          sandboxOps.push({ kind: 'run', source });
+          scheduleSandboxOps();
+        };
+        const userReset = () => {
+          sandboxOps.push({ kind: 'reset' });
+          scheduleSandboxOps();
+        };
+
+        ui = await instantiate(bytes, {
+          console: silent,
+          userRun,
+          userReset,
+        });
+        sandbox = await instantiate(bytes, {
+          dom: false,
           console: {
-            log: (text) => emit('js', '[js]', text),
-            info: (text) => emit('info', '[info]', text),
-            warn: (text) => emit('warn', '[warn]', text),
-            error: (text) => emit('error', '[error]', text),
-            debug: (text) => emit('debug', '[debug]', text),
+            log: () => {},
+            info: () => {},
+            warn: () => {},
+            error: () => {},
+            debug: () => {},
+            // Receive the level (0-4 console, 5 rejection) so the UI can
+            // render rejections distinctly from console.error.
+            __raw: (level, text) => deliverLine(level, 0, text),
           },
         });
-        setStatus('ready', 'ready');
-        replInput.disabled = false;
 
-        const runScript = () => {
-          clearInto(scriptOut);
-          const source = src.value;
-          const runMode = runModeEl.value;
-          try {
-            if (runMode === 'execute') {
-              const result = slag.eval(source);
-              // String completions are quoted, Node-style.
-              const shown = slag.resultType() === 5 ? quoteString(result) : result;
-              if (shown) lineInto(activeOut, 'result', '→', shown);
-            } else {
-              const kind = runMode === 'tokens' ? 0 : runMode === 'ast' ? 1 : 2;
-              const text = slag.dump(kind, source);
-              if (text) lineInto(activeOut, 'out', null, text);
-            }
-          } catch (error) {
-            handleEvalError(error);
-          }
-        };
-        runBtn.addEventListener('click', runScript);
-        src.addEventListener('keydown', (event) => {
-          if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-            event.preventDefault();
-            runScript();
-          }
-        });
-        // Example snippets: replace the editor text and reset the realm so
-        // top-level declarations from a previous run cannot collide.
-        const loadExample = (value) => {
-          const source = value === 'default' ? src.defaultValue : EXAMPLES[value];
-          if (source === undefined) return;
-          src.value = source;
-          clearInto(scriptOut);
-          if (slag) slag.reset();
-          setStatus('ready', 'ready');
-          paintHighlight();
-          const label = exampleEl.options[exampleEl.selectedIndex]?.text ?? value;
-          lineInto(scriptOut, 'system', null, `loaded “${label}” · engine context reset`);
-        };
-        exampleEl.addEventListener('change', () => loadExample(exampleEl.value));
-
-        // Clear wipes the console AND resets the engine realm, so the
-        // sample (top-level `const`) can be run again from scratch.
-        clearBtn.addEventListener('click', () => {
-          clearInto(scriptOut);
-          slag.reset();
-          lineInto(scriptOut, 'system', null, 'console cleared · engine context reset');
-        });
-
-        // The embedded sample runs once on load so the page is alive
-        // immediately; clicking Run re-evaluates it.
-        setMode('script');
-        runScript();
+        const app = await (await fetch('./app.js')).text();
+        ui.eval(app);
       } catch (error) {
-        clearInto(scriptOut);
-        setStatus('error', 'failed');
-        lineInto(scriptOut, 'error', '✗', `Could not start the engine: ${error.message}`);
-        lineInto(scriptOut, 'system', null, 'Make sure docs/slag.wasm is served next to this page.');
+        bootLog.textContent = `Could not start the engine:: ${error.message}`;
       }
     </script>
   </body>
