@@ -333,6 +333,7 @@ fn runtime_helpers() -> JitHelpers {
         tdz_error: Some(rt.tdz_error),
         gc_safepoint: Some(rt.gc_safepoint),
         get_member_name: Some(rt.get_member_name),
+        get_member_map_slot: Some(rt.get_member_map_slot),
         get_member_computed: Some(rt.get_member_computed),
         set_member_name: Some(rt.set_member_name),
         set_member_computed: Some(rt.set_member_computed),
@@ -541,6 +542,7 @@ mod tests {
             tdz_error: Some(helpers::test_tdz_error),
             gc_safepoint: Some(helpers::test_gc_safepoint),
             get_member_name: Some(helpers::test_get_member_name),
+            get_member_map_slot: Some(helpers::test_get_member_map_slot),
             get_member_computed: Some(helpers::test_get_member_computed),
             set_member_name: Some(helpers::test_set_member_name),
             set_member_computed: Some(helpers::test_set_member_computed),
@@ -1656,6 +1658,37 @@ mod tests {
         let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
         assert_eq!(value, interp, "the shape read must match the interpreter");
         assert_eq!(value.as_number(), Some(416000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_shape_read_serves_cycling_overflow_fields() {
+        // Slice 3: a map-described key at an ordinal >= INLINE_FIELDS (a
+        // six-field shape's `.f`) has no machine-addressable inline storage,
+        // so the shape gate routes it through the narrow map-slot helper
+        // (the machine validated the (map id, name) cells first). A
+        // 64-object cycling loop thrashes the value cells every pass; the
+        // narrow helper must serve the same values as the interpreter.
+        let source = "function C(v) { this.a = v; this.b = v + 1; this.c = v + 2; this.d = v + 3; this.e = v + 4; this.f = v + 5; }\n\
+                     var os = [];\n\
+                     for (var i = 0; i < 64; i++) { os.push(new C(i)); }\n\
+                     var s = 0;\n\
+                     for (var r = 0; r < 200; r++) { for (var j = 0; j < 64; j++) { s += os[j].f; } }\n\
+                     s;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the overflow shape read must match the interpreter"
+        );
+        assert_eq!(
+            value.as_number(),
+            Some(200.0 * (64.0 * 63.0 / 2.0 + 5.0 * 64.0))
+        );
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

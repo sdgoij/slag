@@ -4588,6 +4588,93 @@ edge probes (`l1c_store_probe`, `l1c_compound_probe`, `l1c_option1_edge`,
 sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip,
 annexB 1086/1086, zero fail/crash/hang).
 
+### The ordinal >= INLINE_FIELDS compiled read: a narrow map-slot helper (Slice 3, measured 2026-09-05)
+
+The Slice-1 shape gate served only ordinals < `INLINE_FIELDS` inline; a
+map-described ordinal at or above it (vector storage — no
+machine-addressable inline field) fell to the FULL `get_member_name`
+helper on every read (~30-33ns/op at scale vs ~20 for an inline ordinal,
+an ~12ns ordinal gap on the compiled column). The Option-3 backing store
+(an out-of-line overflow mirror) was the assumed fix, but scoping it
+showed the machine inline read through a mirrored `Box` would be
+indirection-bound (object → overflow handle → box → values box →
+element), gaining little over a call; and the full field-authoritative
+migration is blocked by insertion-order (the vector is the only place
+described and vector-only keys interleave). The measurement-first step:
+route the shape gate's map-and-name hit with `slot >= INLINE_FIELDS` to a
+NEW narrow helper (`get_member_map_slot`), which the machine probe has
+already validated — it reads the map-described vector slot live (no
+full-Get re-derivation) and warms the value cell like the interpreter's
+map-path hit; a hole or a divergent shape falls back to the full Get
+inside the helper. The usual four-file helper mirror
+(`runtime/jit.rs` field + extern fn + `JIT_SLOW_PATHS`, `helpers.rs`
+enum/name/field/none/get/test double, `lib.rs` runtime_helpers and
+helpers_all, the compiler's shape block reroute + the `set_member_slot`
+3-arg sig reuse).
+
+Measurement (release, the gate probe's `.f` rows, 3-run minima):
+cycling 64/8192/16384 same-shape ordinal-5 reads drop ~30.5-33.4 →
+~23.0-24.8ns/op (~25%) — the ordinal gap over the inline ~20ns collapses
+from ~12ns to ~3-5ns (the residual is the machine call vs the inline
+field read). Single-object ordinal-5 reads unchanged at 3.7ns (the
+value-cell hit path warms and serves them). Stores and the inline rows
+unchanged; `--jit-bench` flat; the edge probes pass under both engines.
+
+The measured verdict for the Option-3 backing store: its remaining
+JIT-read ceiling is now ~4ns/op at scale (call vs inline), the machine
+inline read of a mirrored overflow `Box` is indirection-bound, and the
+store side already serves ordinals >= 4 through the Slice-2 shape gate's
+`set_member_slot` routing — so the field-authoritative/overflow-mirror
+migration is NOT justified by any measured JIT row. Its remaining
+rationale would be the interpreter's per-read vector borrow (~5ns from
+the 2026-09-03 attribution probe) or a future per-site IC needing
+offset-addressed storage — both small/deferred.
+
+Gates: clippy clean; `cargo test --workspace` green (new jit e2e
+`installed_jit_shape_read_serves_cycling_overflow_fields`); the L1c edge
+probes pass under the JIT and `--jitless`; the three release sweeps at
+baseline (language 23721/3 skip, built-ins 23657/155 skip, annexB
+1086/1086, zero fail/crash/hang).
+
+### Per-site member-IC gate for own reads: measured flat, reverted (Slice 4, measured 2026-09-05)
+
+The remaining cycling same-shape compiled-read gap over the single-object
+floor is the shared-probe work on a value-cell miss: index the (map id,
+name) map cells, validate map-and-name, then read the slot. Slice 4
+tried to remove that shared probe from a monomorphic site's steady
+state with a per-call-site IC: a direct-mapped `MemberIcCell` (128
+entries, indexed by a deterministic per-body site id) recorded a site's
+LAST own-data resolution (receiver map id + key slot + name), and a
+compiled read that missed the value cell validated the receiver's LIVE
+map id and name against the record and served the recorded slot inline
+(or via `get_member_map_slot` past the inline fields), bypassing the
+map-cell probe; a one-link chain variant (kind 2) was designed
+alongside it. One real soundness bug surfaced while wiring the gate: a
+site index alone does not identify a property — every compiled body's
+sites start at 0, so a collision could serve ANOTHER property's slot.
+The cell was fixed to store and validate the read `name`; any future
+per-site member IC MUST validate name the same way.
+
+Measurement (release, the gate probe's cycling same-shape `.f` rows,
+interleaved, vs the Slice-3 parent): reads stayed ~19-23ns/op — FLAT
+against the map-cell table path it replaced. Root cause: the cycling
+cost is dependent-load latency, not a lookup — the map probe's chain
+(map handle → map data → map id → cell → slot) and the value-cell probe
+are serial dependent loads that Cranelift's scheduler does not overlap,
+and the per-site gate's own validation loads (site cell → kind/name/a
+→ the receiver's live map id) are a comparable dependent chain that
+ADDS its own latency. Chain reads are latency-bound the same way (a
+machine one-link fast path would be per-link dependent loads +
+validation, low ceiling), so the chain variant was dropped with the
+whole gate. Verdict: per the measurement-first discipline the gate did
+not pay and was reverted wholesale (tree restored to the Slice-3 state);
+no gate record was kept. The remaining ~8-16ns over the ~4ns
+single-object floor on this path is dependent-load latency, targetable
+only by cutting probe depth (the shape-end-state offset model where a
+single validated map id serves slot arithmetic inline) or by the
+interpreter-vs-JIT record-discipline redesign, not by another cache
+front.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

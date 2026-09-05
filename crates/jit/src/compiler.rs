@@ -1209,6 +1209,8 @@ impl<'a> Lowerer<'a> {
         let map_present = self.builder.create_block();
         let field = self.builder.create_block();
         let field_hit = self.builder.create_block();
+        let map_hit = self.builder.create_block();
+        let overflow = self.builder.create_block();
         // The typed-array length probe: only the `length` atom needs it. The
         // machine read (gap-close M6) serves a fixed, live, writable-buffer
         // IntegerIndexed receiver's length straight from the slots; a helper
@@ -1324,21 +1326,22 @@ impl<'a> Lowerer<'a> {
         let ok = self.builder.ins().band(id_name_ok, gen_ok);
         self.builder.def_var(value_var, cell_value);
         self.builder.ins().brif(ok, merge, &[], shape, &[]);
-        // The shape read (Slice 1): on a value-cell miss, a map-pinned
-        // INLINE field is read directly. Probe the shared (map id, name) map
-        // cells (recorded by the interpreter's own-property reads and fresh
-        // stores) and on a match read the receiver's `in_fields` slot at the
-        // recorded offset. A map id pins the descriptor layout for every
-        // instance of the shape (maps are immutable; a structural change
-        // transitions or drops the object off the map), so a hit is valid
-        // for ANY object count with no per-object identity or generation —
-        // the cycling-object loop stops falling to the helper on every read.
-        // Falls through to the slow path when the object has no map
-        // (dictionary mode), the cells do not record the shape, the recorded
-        // slot is at or above `INLINE_FIELDS` (vector storage — not
-        // machine-addressable), or the inline field is a hole (a boilerplate
-        // pre-sized field the body skipped — not an own property, so the
-        // prototype chain must be consulted).
+        // The shape read (Slice 1 + 3): on a value-cell miss, a map-pinned
+        // key is served by shape. Probe the shared (map id, name) map cells
+        // (recorded by the interpreter's own-property reads and fresh
+        // stores); on a match an ordinal below `INLINE_FIELDS` reads the
+        // receiver's `in_fields` slot at the recorded offset INLINE, and an
+        // ordinal at or above it (vector storage — not machine-addressable)
+        // reads through the narrow map-slot helper. A map id pins the
+        // descriptor layout for every instance of the shape (maps are
+        // immutable; a structural change transitions or drops the object off
+        // the map), so a hit is valid for ANY object count with no
+        // per-object identity or generation — the cycling-object loop stops
+        // falling to the full helper on every read. Falls through to the
+        // slow path when the object has no map (dictionary mode), the cells
+        // do not record the shape, or the inline field is a hole (a
+        // boilerplate pre-sized field the body skipped — not an own property,
+        // so the prototype chain must be consulted).
         self.builder.switch_to_block(shape);
         let obj_ptr = self
             .builder
@@ -1412,14 +1415,30 @@ impl<'a> Lowerer<'a> {
             .builder
             .ins()
             .icmp_imm_u(IntCC::Equal, cell_name, name as i64);
-        let slot_ok = self.builder.ins().icmp_imm_u(
+        let slot_inline = self.builder.ins().icmp_imm_u(
             IntCC::UnsignedLessThan,
             field_slot,
             crux::object::INLINE_FIELDS as i64,
         );
-        let id_name_ok = self.builder.ins().band(map_ok, name_ok);
-        let cell_ok = self.builder.ins().band(id_name_ok, slot_ok);
-        self.builder.ins().brif(cell_ok, field, &[], slow, &[]);
+        let described = self.builder.ins().band(map_ok, name_ok);
+        self.builder.ins().brif(described, map_hit, &[], slow, &[]);
+        // A map-described key: an ordinal below `INLINE_FIELDS` reads the
+        // in-object field inline; an ordinal at or above it (vector storage —
+        // not machine-addressable without the backing store) reads through
+        // the narrow map-slot helper, which the shape gate has already
+        // validated (no full-Get re-derivation).
+        self.builder.switch_to_block(map_hit);
+        self.builder
+            .ins()
+            .brif(slot_inline, field, &[], overflow, &[]);
+        self.builder.switch_to_block(overflow);
+        let slot_res = self.call_slow(
+            self.sig_set_name,
+            Helper::GetMemberMapSlot,
+            &[object, name_imm, field_slot],
+        )?;
+        self.builder.def_var(value_var, slot_res);
+        self.builder.ins().jump(merge, &[]);
         self.builder.switch_to_block(field);
         let field_bytes = self.builder.ins().ishl_imm_u(field_slot, 3);
         let field_base = self.builder.ins().iadd_imm_s(

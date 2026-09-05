@@ -420,6 +420,13 @@ pub struct JitSlowPaths {
     pub gc_safepoint: extern "C" fn(ctx: *mut c_void) -> u64,
     /// `Get(o, name)`; `name` is an `AtomId`.
     pub get_member_name: extern "C" fn(ctx: *mut c_void, object: u64, name: u64) -> u64,
+    /// A compiled member read whose map-cell hit recorded an ordinal at or
+    /// above `INLINE_FIELDS` (Slice 3): the machine validated the shape, so
+    /// read the map-described vector slot live (skipping the full-Get
+    /// machinery); a hole or a divergent shape falls back to the full `Get`.
+    /// `slot` is the map cell's recorded vector slot.
+    pub get_member_map_slot:
+        extern "C" fn(ctx: *mut c_void, object: u64, name: u64, slot: u64) -> u64,
     /// `Get(o, key)` with a computed key.
     pub get_member_computed: extern "C" fn(ctx: *mut c_void, object: u64, key: u64) -> u64,
     /// `Set(o, name, v)` (plain assignment); returns the stored value.
@@ -927,6 +934,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     tdz_error,
     gc_safepoint,
     get_member_name,
+    get_member_map_slot,
     get_member_computed,
     set_member_name,
     set_member_computed,
@@ -1230,6 +1238,39 @@ extern "C" fn get_member_name(ctx: *mut c_void, object: u64, name: u64) -> u64 {
     let vm = unsafe { &mut *ctx.vm };
     let object = Value::from_bits(object);
     match vm.get_member_name(agent, object, name as crux::AtomId) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn get_member_map_slot(ctx: *mut c_void, object: u64, name: u64, slot: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let object = Value::from_bits(object);
+    let name = name as crux::AtomId;
+    // The compiled shape probe validated the receiver's CURRENT map describes
+    // `name` at `slot` (an ordinal >= INLINE_FIELDS; a map id pins the
+    // descriptor layout, and the transition discipline puts the described
+    // key's vector entry at the ordinal on every map-carrying object), so
+    // read the map-described vector slot live — no full-Get re-derivation.
+    // Warm the value cell like the map path's hit (the next read — and the
+    // compiled probe — serves from it). A hole (a boilerplate pre-sized
+    // field the body skipped — not an own property) or a divergent shape
+    // falls back to the full Get (the prototype chain must be consulted).
+    if let Some(obj) = object.as_object()
+        && let Some(value) = obj.map_field(slot as usize)
+    {
+        agent.member_value_cells[(obj.id() as usize ^ name as usize) & (MEMBER_CELLS - 1)] =
+            MemberValueCell {
+                id: obj.id(),
+                name,
+                generation: obj.generation(),
+                value,
+            };
+        return value.bits();
+    }
+    match vm.get_member_name(agent, object, name) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
     }

@@ -29,6 +29,7 @@ pub enum Helper {
     TdzError,
     GcSafepoint,
     GetMemberName,
+    GetMemberMapSlot,
     GetMemberComputed,
     SetMemberName,
     SetMemberComputed,
@@ -170,6 +171,7 @@ impl Helper {
             Helper::TdzError => "tdz_error",
             Helper::GcSafepoint => "gc_safepoint",
             Helper::GetMemberName => "get_member_name",
+            Helper::GetMemberMapSlot => "get_member_map_slot",
             Helper::GetMemberComputed => "get_member_computed",
             Helper::SetMemberName => "set_member_name",
             Helper::SetMemberComputed => "set_member_computed",
@@ -355,6 +357,11 @@ pub struct JitHelpers {
     pub gc_safepoint: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     /// `Get(o, name)`: `name` is an `AtomId`; returns the value.
     pub get_member_name: Option<extern "C" fn(vm: *mut c_void, object: u64, name: u64) -> u64>,
+    /// A compiled member read whose map-cell hit recorded an ordinal at or
+    /// above `INLINE_FIELDS` (Slice 3): the machine validated the shape, so
+    /// read the map-described vector slot live; a hole or a divergent shape
+    /// falls back to the full `Get`. `slot` is the recorded vector slot.
+    pub get_member_map_slot: Option<extern "C" fn(vm: *mut c_void, object: u64, name: u64, slot: u64) -> u64>,
     /// `Get(o, key)` with a computed key value.
     pub get_member_computed: Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64) -> u64>,
     /// `Set(o, name, v)` (plain assignment); returns the stored value.
@@ -727,6 +734,7 @@ impl JitHelpers {
             tdz_error: None,
             gc_safepoint: None,
             get_member_name: None,
+            get_member_map_slot: None,
             get_member_computed: None,
             set_member_name: None,
             set_member_computed: None,
@@ -855,6 +863,7 @@ impl JitHelpers {
             Helper::TdzError => self.tdz_error.map(|f| f as usize as u64),
             Helper::GcSafepoint => self.gc_safepoint.map(|f| f as usize as u64),
             Helper::GetMemberName => self.get_member_name.map(|f| f as usize as u64),
+            Helper::GetMemberMapSlot => self.get_member_map_slot.map(|f| f as usize as u64),
             Helper::GetMemberComputed => self.get_member_computed.map(|f| f as usize as u64),
             Helper::SetMemberName => self.set_member_name.map(|f| f as usize as u64),
             Helper::SetMemberComputed => self.set_member_computed.map(|f| f as usize as u64),
@@ -1025,6 +1034,15 @@ pub extern "C" fn test_gc_safepoint(_vm: *mut c_void) -> u64 {
 }
 
 pub extern "C" fn test_get_member_name(_vm: *mut c_void, _object: u64, _name: u64) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_get_member_map_slot(
+    _vm: *mut c_void,
+    _object: u64,
+    _name: u64,
+    _slot: u64,
+) -> u64 {
     Value::Undefined.bits()
 }
 
