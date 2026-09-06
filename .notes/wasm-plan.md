@@ -679,6 +679,22 @@ intrinsic identity like every other agent-dependent builtin.
   Corpus: the sweep is fully green — 44 fixture-files pass / 0 fail, 982
   tests pass / 0 fail (the excluded proposals and `limits.any.js` run on
   demand). Runtime suite: 728 tests pass.
+- Wave 5 slice 14 (landed): shared-memory JS-API semantics. A
+  `WebAssembly.Memory` descriptor with `shared: true` (a maximum is
+  required) now allocates a shared engine cell whose `buffer` is a
+  SharedArrayBuffer over a per-cell byte block; `Memory.prototype.grow` on
+  a shared memory keeps the previous buffer attached and pointing `buffer`
+  at a fresh SAB over the same resized block, so old and new buffers keep
+  aliasing the memory (the JS-API shared grow-detach rule — only an
+  unshared grow detaches). The wasm-side refresh path (a shared memory
+  that grew inside a run) does the same instead of detaching. This also
+  fixed a general spec gap: SharedArrayBuffer instances are now
+  nonextensible (`Object.isFrozen` true, spec 25.3.3).
+  `memory/grow.any.js` is fully green (19/19) and left the exclusions.
+  Corpus: 1001 tests pass / 0 fail, 45 fixture-files green of the runnable
+  set (`limits.any.js` stays excluded: embedder-limit conformance whose
+  `maxMemories = 1` subtest conflicts with the landed multi-memory
+  support). Runtime suite: 729 tests pass.
 
 ## 6. Verification workflow
 

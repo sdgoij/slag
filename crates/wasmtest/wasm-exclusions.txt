@@ -39,9 +39,3 @@ waspec/test/js-api/gc/casts.tentative.any.js :: GC proposal (out of scope)
 waspec/test/js-api/gc/default-value.tentative.any.js :: GC proposal (out of scope)
 waspec/test/js-api/gc/exported-object.tentative.any.js :: GC proposal (out of scope)
 waspec/test/js-api/gc/i31.tentative.any.js :: GC proposal (out of scope)
-
-# memory/grow.any.js runs 18/19; its one failing test is the shared-memory
-# grow-detach rule (growing a shared memory does not detach the old buffer),
-# which needs the shared-memory proposal (a SharedArrayBuffer-backed wasm
-# memory) that no planned cut owns.
-waspec/test/js-api/memory/grow.any.js :: the remaining fail is the shared-memory grow-detach rule (shared-memory proposal, not planned); run on demand

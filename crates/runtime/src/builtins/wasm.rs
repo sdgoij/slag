@@ -17,6 +17,7 @@ use crux::handle::Handle;
 use crux::object::{JsObject, ObjectKind};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
+use crux::typed_array::SharedBuffer;
 use crux::value::{Value, ValueKind};
 use wasm::Value as WasmValue;
 use wasm::exec::RunProgress;
@@ -1100,12 +1101,32 @@ fn memory_cell_bytes(agent: &Agent, cell: usize) -> Result<Vec<u8>, JsError> {
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "memory cell vanished".into()))
 }
 
+/// Whether a memory cell is a JS-API shared memory (its buffer is a
+/// SharedArrayBuffer whose block survives grows; only an unshared grow
+/// detaches the previous buffer).
+fn memory_is_shared(agent: &Agent, cell: usize) -> bool {
+    agent
+        .wasm_store
+        .borrow()
+        .memory_type(cell)
+        .map(|ty| ty.limits.shared)
+        .unwrap_or(false)
+}
+
 /// Materialize the current buffer of a memory cell: a fresh ArrayBuffer the
 /// cell's bytes are copied into, registered as the cell's live buffer so
-/// `buffer` keeps object identity until the memory grows.
+/// `buffer` keeps object identity until the memory grows. A shared memory's
+/// buffer is a SharedArrayBuffer over a per-cell block that every grow-sized
+/// view aliases (the JS-API shared-memory buffer rule).
 fn materialize_memory_buffer(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
     let bytes = memory_cell_bytes(agent, cell)?;
-    let buffer = array_buffer_of(agent, &bytes)?;
+    let buffer = if memory_is_shared(agent, cell) {
+        let block = SharedBuffer::new(bytes.len());
+        block.write(0, &bytes)?;
+        array_buffer::shared_array_buffer_from_block(agent, block, bytes.len())?
+    } else {
+        array_buffer_of(agent, &bytes)?
+    };
     agent.wasm_memory_buffers.insert(cell, buffer);
     Ok(buffer)
 }
@@ -1219,7 +1240,7 @@ fn optional_pages(
 fn memory_limits(
     agent: &mut Agent,
     descriptor: &Value,
-) -> Result<(Address, u64, Option<u64>), JsError> {
+) -> Result<(Address, u64, Option<u64>, bool), JsError> {
     let ValueKind::Object(_) = descriptor.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1268,13 +1289,17 @@ fn memory_limits(
         &JsString::from_utf8("shared"),
         *descriptor,
     )?;
-    if to_boolean(&shared_value) {
+    let shared = to_boolean(&shared_value);
+    // A shared memory (a SharedArrayBuffer-backed linear memory) must declare
+    // a maximum page count: the wasm shared-memory type requires one, and the
+    // JS-API enforces it at the descriptor.
+    if shared && maximum.is_none() {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "shared memories are not supported in Cut 10 yet".into(),
+            "a shared memory requires a 'maximum' page count".into(),
         ));
     }
-    Ok((address, initial, maximum))
+    Ok((address, initial, maximum, shared))
 }
 
 /// `new WebAssembly.Memory(descriptor)` (JS-API spec 4.4.1): allocate a
@@ -1286,12 +1311,12 @@ fn memory_construct(
     new_target: &Value,
 ) -> Result<Value, JsError> {
     let descriptor = args.first().cloned().unwrap_or(Value::Undefined);
-    let (address, initial, maximum) = memory_limits(agent, &descriptor)?;
+    let (address, initial, maximum, shared) = memory_limits(agent, &descriptor)?;
     let mem_type = wasm::types::MemType {
         limits: wasm::types::Limits {
             min: initial,
             max: maximum,
-            shared: false,
+            shared,
         },
         memory64: address == Address::I64,
     };
@@ -1314,7 +1339,9 @@ fn memory_construct(
 }
 
 /// `get Memory.prototype.buffer` (JS-API spec 4.4.2): the memory's current
-/// ArrayBuffer (the same object until the memory grows).
+/// ArrayBuffer (SharedArrayBuffer when shared). The same object is returned
+/// until the memory grows; an unshared grow detaches the old one, a shared
+/// grow returns a fresh view over the same block.
 fn memory_buffer_get(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let cell = memory_cell(agent, this)?;
     if let Some(buffer) = agent.wasm_memory_buffers.get(&cell) {
@@ -1325,9 +1352,11 @@ fn memory_buffer_get(agent: &mut Agent, this: &Value) -> Result<Value, JsError> 
 
 /// `Memory.prototype.grow(delta)` (JS-API spec 4.4.3): grow the cell by
 /// `delta` pages (a Number for an i32-address memory, a BigInt for an
-/// i64-address one) and return the old page count in the same domain. The
-/// previous buffers detach; the next `buffer` access materializes a fresh
-/// ArrayBuffer.
+/// i64-address one) and return the old page count in the same domain. An
+/// unshared grow detaches the previous buffer and materializes a fresh one on
+/// the next `buffer` access; a shared grow keeps the old buffer attached and
+/// points `buffer` at a fresh SharedArrayBuffer over the same (resized) block,
+/// so old and new buffers keep aliasing the memory.
 fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let cell = memory_cell(agent, this)?;
     let address = agent
@@ -1350,10 +1379,33 @@ fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             "Unable to grow instance memory".into(),
         )
     })?;
-    if let Some(buffer) = agent.wasm_memory_buffers.remove(&cell)
-        && let ValueKind::Object(object) = buffer.kind()
-    {
-        array_buffer::detach_array_buffer(agent, object.id());
+    if let Some(buffer) = agent.wasm_memory_buffers.get(&cell).copied() {
+        let ValueKind::Object(object) = buffer.kind() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "memory buffer is not an object".into(),
+            ));
+        };
+        let id = object.id();
+        if memory_is_shared(agent, cell) {
+            let new_pages = old.checked_add(delta).ok_or_else(|| {
+                JsError::new(ErrorKind::RangeError, "memory grow overflow".into())
+            })?;
+            let new_len = usize::try_from(new_pages.saturating_mul(wasm::exec::PAGE_SIZE))
+                .map_err(|_| JsError::new(ErrorKind::RangeError, "memory grow overflow".into()))?;
+            let mut block = {
+                let state = agent.buffer_data.get(&id).ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, "memory buffer state vanished".into())
+                })?;
+                state.borrow().shared.clone()
+            };
+            block.resize(new_len)?;
+            let fresh = array_buffer::shared_array_buffer_from_block(agent, block, new_len)?;
+            agent.wasm_memory_buffers.insert(cell, fresh);
+        } else {
+            agent.wasm_memory_buffers.remove(&cell);
+            array_buffer::detach_array_buffer(agent, id);
+        }
     }
     if address {
         Ok(Value::BigInt(Handle::new(crux::BigInt::from(old))))
@@ -1364,13 +1416,15 @@ fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 
 // ---- the JS <-> wasm memory bridge (Cut 10 wave 3b, slice 1) ----
 //
-// A `WebAssembly.Memory`'s ArrayBuffer is a cache of its engine cell: JS
-// writes through ArrayBuffer views land in the buffer, wasm writes land in
-// the cell. The two are reconciled around every wasm run — the buffer is
-// flushed into the cell first, then refreshed from it — so at every JS
-// boundary the buffer shows the memory exactly. A cell that outgrew its
-// buffer (a `memory.grow` inside wasm) replaces the buffer, detaching the
-// stale one, matching the JS-API detach-on-grow rule.
+// A `WebAssembly.Memory`'s ArrayBuffer (SharedArrayBuffer for a shared
+// memory) is a cache of its engine cell: JS writes through buffer views land
+// in the buffer, wasm writes land in the cell. The two are reconciled around
+// every wasm run — the buffer is flushed into the cell first, then refreshed
+// from it — so at every JS boundary the buffer shows the memory exactly. A
+// cell that outgrew its buffer (a `memory.grow` inside wasm) replaces the
+// buffer, detaching the stale one for an unshared memory (the JS-API
+// detach-on-grow rule); a shared memory keeps every prior buffer attached,
+// resizing the shared block so old and new views keep aliasing.
 
 /// Push every live memory buffer into its engine cell (before wasm runs).
 fn memory_buffers_to_store(agent: &mut Agent) -> Result<(), JsError> {
@@ -1434,6 +1488,20 @@ fn memory_buffers_from_store(agent: &mut Agent) -> Result<(), JsError> {
                 .shared
                 .clone();
             shared.write(0, &bytes)?;
+        } else if memory_is_shared(agent, cell) {
+            // A shared memory that grew inside wasm: resize the block and
+            // point `buffer` at a fresh SAB over it; the stale buffer stays
+            // attached and keeps aliasing the memory.
+            let mut block = agent
+                .buffer_data
+                .get(&id)
+                .expect("buffer present")
+                .borrow()
+                .shared
+                .clone();
+            block.resize(byte_len)?;
+            let fresh = array_buffer::shared_array_buffer_from_block(agent, block, byte_len)?;
+            agent.wasm_memory_buffers.insert(cell, fresh);
         } else {
             array_buffer::detach_array_buffer(agent, id);
             agent.wasm_memory_buffers.remove(&cell);
@@ -3480,6 +3548,51 @@ mod tests {
                 " try { new WebAssembly.Memory({ maximum: 2 }); return false; } catch (e) { if (!(e instanceof TypeError)) return false; }",
                 " try { new WebAssembly.Memory({ initial: 3, maximum: 2 }); return false; } catch (e) { return e instanceof RangeError; }",
                 "})()"
+            ),
+        );
+        // A shared memory is a frozen SharedArrayBuffer whose grow keeps the
+        // old buffer attached and aliasing (the JS-API shared grow rule).
+        eval_true(
+            &mut context,
+            concat!(
+                "(function(){ const m = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true });",
+                " const sab = m.buffer;",
+                " if (Object.prototype.toString.call(sab) !== '[object SharedArrayBuffer]') return false;",
+                " if (!Object.isFrozen(sab) || Object.isExtensible(sab)) return false;",
+                " if (m.grow(1) !== 1) return false;",
+                " const cur = m.buffer;",
+                " if (sab === cur || sab.byteLength !== 65536 || cur.byteLength !== 131072) return false;",
+                " const a = new Uint8Array(sab); const b = new Uint8Array(cur);",
+                " a[0] = 5;",
+                " return b[0] === 5 && a[0] === 5; })()"
+            ),
+        );
+        // A shared memory still reads and writes through wasm (the bridge
+        // aliases the block).
+        let shared_io = wat_module_bytes(concat!(
+            "(module",
+            "  (import \"js\" \"mem\" (memory 1))",
+            "  (func (export \"store\") (param i32 i32)",
+            "    local.get 0",
+            "    local.get 1",
+            "    i32.store)",
+            "  (func (export \"load\") (param i32) (result i32)",
+            "    local.get 0",
+            "    i32.load))"
+        ));
+        eval_true(
+            &mut context,
+            &format!(
+                concat!(
+                    "(function(){{ const mem = new WebAssembly.Memory({{ initial: 1, maximum: 2, shared: true }});",
+                    " const i = new WebAssembly.Instance(new Uint8Array({shared_io}), {{ js: {{ mem }} }});",
+                    " const view = new Int32Array(mem.buffer);",
+                    " i.exports.store(0, 77);",
+                    " if (view[0] !== 77) return false;",
+                    " view[1] = 88;",
+                    " return i.exports.load(4) === 88; }})()"
+                ),
+                shared_io = shared_io,
             ),
         );
         // The `buffer` accessor brand-checks its receiver.
