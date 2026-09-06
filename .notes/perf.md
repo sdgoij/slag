@@ -5165,6 +5165,48 @@ single validated map id serves slot arithmetic inline) or by the
 interpreter-vs-JIT record-discipline redesign, not by another cache
 front.
 
+### Dense Array push/pop fast paths and the chain-read shadow scan (measured 2026-09-06)
+
+Corpus probe (`push_pop`-family probes, both engines): `Array.prototype
+.push`/`.pop` member calls cost ~1.7/2.3µs per call even on a fast dense
+Array, ~40-80x the direct dense-append cost (`a[l++] = i` ~30-45ns), and
+the compiled column matched the interpreter (jit ~= jitless) — a pure
+native-call row. Two landings, one commit each:
+
+1. **Dense handler fast paths** (`dfb4ab1`): `push` read a dense Array's
+   length from the cell (skipping the LengthOfArrayLike [[Get]]) and
+   skipped the redundant trailing [[Set]] of `length` when every argument
+   appended through `array_element_write` (which already maintains the
+   length + mirror); `pop` fast-pathed a dense Array whose last slot is an
+   own data element as a truncate (`array_pop_dense`). Also fixed a latent
+   dense-append placement bug: after `a.length = N` grows the length past
+   the (short) buffer, an append now stores the element at its real index,
+   materializing the intervening holes. push ~101-105 -> ~53-57ms,
+   pop ~139-144 -> ~53-55ms per 60k ops.
+2. **The chain-read shadow scan** (this commit): the residual ~700ns was
+   NOT the call — the per-iteration member read `a.push` re-resolved the
+   prototype chain because every dense append bumps the receiver's
+   generation, thrashing `member_chain_cells` (receiver-generation-keyed;
+   probes: reading the method through the receiver ~52ms/60k vs through a
+   stable `Array.prototype` ~11.5ms, in both engines). `member_chain_get`
+   now accepts a mismatched receiver generation for an Array receiver
+   when the map is still empty (Array defines bypass the map), the name
+   is not an array index (dense elements are buffer-owned, invisible to
+   the vector scan), the own-key set is small (<= 32), and the name is
+   absent from the properties vector — an authoritative, generation-free
+   shadow check, since dense element writes bump the generation but never
+   touch the vector's names. push/pop member calls drop to ~225-270ns/call
+   (the registered-call floor); the push+pop corpus row 250 -> ~26ms jit /
+   ~30ms jitless (~9.4x) with values unchanged.
+
+Gates (both commits): clippy clean; workspace tests green (new crux
+dense_append_after_length_growth test); a 19-case push/pop/chain edge
+battery (dense paths, own shadows mid-loop, delete-restore, string-index
+reads after pop, spill, frozen/non-writable, array-likes, subclass)
+matches node on both engines; test262 sweeps at baseline — built-ins
+Array 3082/3082 in jit and jitless, annexB 1086/1086, language 23721/3
+skip, zero fail/crash/hang.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -3642,7 +3642,20 @@ impl Vm {
         let object = Self::cell_object(object)?;
         let index = Self::member_chain_index(object.id(), name);
         let cell = agent.member_chain_cells[index].as_ref()?;
-        if cell.id != object.id() || cell.name != name || cell.generation != object.generation() {
+        if cell.id != object.id() || cell.name != name {
+            return None;
+        }
+        // The receiver generation is the cheap proof that no own `name`
+        // appeared since the resolution was recorded — but dense element
+        // writes (push/pop/length ops) bump it too, so a stack built with
+        // `push` re-resolves its method reads on every iteration even
+        // though the writes never touch the vector's string keys. For an
+        // Array whose own non-index names live only in the (small)
+        // properties vector, absence of the name is authoritative and
+        // generation-free, so a mismatched stamp need not miss.
+        if cell.generation != object.generation()
+            && !Self::chain_shadow_free_without_generation(&object, name)
+        {
             return None;
         }
         let mut link = object.get_prototype_of().ok().flatten();
@@ -3682,6 +3695,38 @@ impl Vm {
             // have missed; this is the exact fallback for a missed bump.
             _ => None,
         }
+    }
+
+    /// Whether an own `name` on `object` is ruled out WITHOUT the object's
+    /// generation stamp: an Array's map never describes keys (Array defines
+    /// bypass the map machinery), so an Array owns a non-index name only in
+    /// the properties vector — an absent name there is authoritative, and a
+    /// dense element write (which bumps the generation but never touches the
+    /// vector's names) cannot have introduced it. Index names are excluded: a
+    /// dense element is an own property that lives in the buffer, invisible
+    /// to the vector scan. A large property set bails to the generation stamp
+    /// rather than pay a long scan per read. See `member_chain_get`.
+    fn chain_shadow_free_without_generation(
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+    ) -> bool {
+        if !matches!(object.kind, crux::object::ObjectKind::Array(_)) {
+            return false;
+        }
+        // The Array map is the canonical empty map by construction; if it
+        // ever describes keys the vector scan is not authoritative.
+        if object.map.get().is_some_and(|m| m.descriptor_count() != 0) {
+            return false;
+        }
+        let key = PropertyKey::String(name);
+        if crux::object::array_index_of(&key).is_some() {
+            return false;
+        }
+        const MAX_OWN_FOR_SCAN: usize = 32;
+        if object.properties.borrow().len() > MAX_OWN_FOR_SCAN {
+            return false;
+        }
+        !object.has_own_property_atom(name)
     }
 
     /// Record a prototype-chain read for `(object, name)` resolved by the
