@@ -1761,6 +1761,101 @@ pub(crate) fn for_in_generation_tracked(obj: &Handle<crux::object::JsObject>) ->
     )
 }
 
+/// The direct-mapped size of the Agent's for-in enumeration cache.
+pub(crate) const FOR_IN_CELLS: usize = 64;
+
+/// A cached for-in enumeration (the ForInBegin cache): the (level, key)
+/// list of a base whose WHOLE prototype chain was generation-tracked
+/// (ordinary/array/External/IsHTMLDDA) when the cache was built — an exotic
+/// link's own-key state can change without a generation bump, so its
+/// enumeration is never cached. The entry retains the base (traced), which
+/// also keeps the chain reachable, so no chain object's arena id can be
+/// recycled while the entry lives; a probe re-walks the LIVE chain
+/// comparing every (id, generation), and an exact match means the cached
+/// list is still the chain's enumeration (the Cut-22 generation bumps on
+/// any own-property or prototype change). Direct-mapped on the base id and
+/// boxed so the Agent's hot-field footprint stays small (the Cut 27
+/// lesson).
+pub struct ForInEnumCache {
+    pub(crate) base: Handle<crux::object::JsObject>,
+    chain: Vec<(u64, u32)>,
+    keys: Vec<(usize, Value)>,
+}
+
+impl Trace for ForInEnumCache {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.base.trace(visit);
+        for (_, key) in &self.keys {
+            key.trace(visit);
+        }
+    }
+}
+
+/// The (id, generation) of every object in `obj`'s prototype chain, when
+/// every link is generation-tracked (`None` otherwise — such a chain must
+/// not be cached).
+fn for_in_chain_snapshot(
+    obj: &Handle<crux::object::JsObject>,
+) -> Result<Option<Vec<(u64, u32)>>, JsError> {
+    let mut chain = Vec::new();
+    let mut current = Some(*obj);
+    while let Some(link) = current {
+        if !for_in_generation_tracked(&link) {
+            return Ok(None);
+        }
+        chain.push((link.id(), link.generation.get()));
+        current = link.get_prototype_of()?;
+    }
+    Ok(Some(chain))
+}
+
+/// The cached enumeration of `obj`'s chain, when the live chain still
+/// matches the snapshot exactly (identity and generation of every link).
+pub(crate) fn for_in_cache_keys(
+    agent: &Agent,
+    obj: &Handle<crux::object::JsObject>,
+) -> Result<Option<Vec<(usize, Value)>>, JsError> {
+    let Some(entry) = agent.for_in_cells[obj.id() as usize & (FOR_IN_CELLS - 1)].as_ref() else {
+        return Ok(None);
+    };
+    if entry.base.id() != obj.id() {
+        return Ok(None);
+    }
+    let mut current = Some(*obj);
+    for &(id, generation) in &entry.chain {
+        let Some(link) = current else {
+            return Ok(None); // the chain shortened
+        };
+        if link.id() != id || link.generation.get() != generation {
+            return Ok(None); // a link changed
+        }
+        current = link.get_prototype_of()?;
+    }
+    if current.is_some() {
+        return Ok(None); // the chain grew past the snapshot
+    }
+    Ok(Some(entry.keys.clone()))
+}
+
+/// Cache `keys` as the enumeration of `obj`'s chain (only when the whole
+/// chain is generation-tracked).
+pub(crate) fn for_in_cache_put(
+    agent: &mut Agent,
+    obj: &Handle<crux::object::JsObject>,
+    keys: &[(usize, Value)],
+) -> Result<(), JsError> {
+    let Some(chain) = for_in_chain_snapshot(obj)? else {
+        return Ok(());
+    };
+    let slot = obj.id() as usize & (FOR_IN_CELLS - 1);
+    agent.for_in_cells[slot] = Some(ForInEnumCache {
+        base: *obj,
+        chain,
+        keys: keys.to_vec(),
+    });
+    Ok(())
+}
+
 /// Frame slots for small layouts live in a fixed inline array so a fast
 /// call allocates nothing (the bench's simple-param functions are ≤ 8
 /// slots); larger layouts fall back to the heap.
@@ -7170,7 +7265,22 @@ impl Vm {
                         let obj = crate::context::as_object(&obj).ok_or_else(|| {
                             JsError::new(ErrorKind::TypeError, "for-in over a non-object".into())
                         })?;
-                        let keys = crate::eval::for_in_key_levels(agent, &rhs)?;
+                        // A generation-tracked base re-enters the same
+                        // unchanged chain cheaply: the cached enumeration is
+                        // reused when the live chain still matches its
+                        // (id, generation) snapshot.
+                        let keys = if for_in_generation_tracked(&obj) {
+                            match for_in_cache_keys(agent, &obj)? {
+                                Some(keys) => keys,
+                                None => {
+                                    let keys = crate::eval::for_in_key_levels(agent, &rhs)?;
+                                    for_in_cache_put(agent, &obj, &keys)?;
+                                    keys
+                                }
+                            }
+                        } else {
+                            crate::eval::for_in_key_levels(agent, &rhs)?
+                        };
                         let fast = for_in_generation_tracked(&obj)
                             && keys.iter().all(|(level, _)| *level == 0);
                         self.for_in_stack.push(ForInState {

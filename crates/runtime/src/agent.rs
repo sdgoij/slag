@@ -314,6 +314,17 @@ pub struct Agent {
     /// does not bloat the Agent struct's hot-field cache footprint (an
     /// inline copy regressed the leaf-call path by ~10ns/call).
     pub(crate) for_of_array_cells: Box<[Option<(u64, u32, u64)>; crate::ir::MEMBER_CELLS]>,
+    /// The for-in enumeration cache (this landing): base id -> the
+    /// enumerated (level, key) list + the full chain snapshot for a base
+    /// whose whole prototype chain is generation-tracked (see
+    /// [`crate::ir::ForInEnumCache`]). Direct-mapped on the base id and
+    /// traced (each entry retains its base — and through it the chain —
+    /// plus the key Values). A ForInBegin probe re-walks the LIVE chain
+    /// comparing (id, generation); an unchanged chain reuses the cached
+    /// list instead of re-enumerating (own_property_keys + per-key
+    /// descriptor reads + key boxing) on every re-entry. Boxed per the Cut
+    /// 27 lesson.
+    pub(crate) for_in_cells: Box<[Option<crate::ir::ForInEnumCache>; crate::ir::FOR_IN_CELLS]>,
     /// The leaf-inline cache (Cut 34): function id → the record data
     /// `do_call_fast` needs (compiled ir, strictness, closure env), so a hot
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
@@ -830,6 +841,7 @@ impl Agent {
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
             for_of_fast_cells: std::array::from_fn(|_| None),
             for_of_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
+            for_in_cells: Box::new(std::array::from_fn(|_| None)),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             construct_maps: Box::new(std::array::from_fn(|_| None)),
@@ -1243,6 +1255,9 @@ impl Agent {
             cell.trace(visit);
         }
         for cell in self.for_of_fast_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.for_in_cells.iter() {
             cell.trace(visit);
         }
         for cell in self.global_leaf_cells.iter() {

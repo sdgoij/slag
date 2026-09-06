@@ -3327,9 +3327,26 @@ extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
             );
         }
     };
-    let keys = match crate::eval::for_in_key_levels(agent, &rhs) {
-        Ok(keys) => keys,
-        Err(error) => return slow_error(ctx, error),
+    let keys = if crate::ir::for_in_generation_tracked(&obj) {
+        match crate::ir::for_in_cache_keys(agent, &obj) {
+            Ok(Some(keys)) => keys,
+            Ok(None) => {
+                let keys = match crate::eval::for_in_key_levels(agent, &rhs) {
+                    Ok(keys) => keys,
+                    Err(error) => return slow_error(ctx, error),
+                };
+                if let Err(error) = crate::ir::for_in_cache_put(agent, &obj, &keys) {
+                    return slow_error(ctx, error);
+                }
+                keys
+            }
+            Err(error) => return slow_error(ctx, error),
+        }
+    } else {
+        match crate::eval::for_in_key_levels(agent, &rhs) {
+            Ok(keys) => keys,
+            Err(error) => return slow_error(ctx, error),
+        }
     };
     let fast =
         crate::ir::for_in_generation_tracked(&obj) && keys.iter().all(|(level, _)| *level == 0);

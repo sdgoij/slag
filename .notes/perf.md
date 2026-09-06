@@ -5326,6 +5326,40 @@ produced a,c / a,p on the attr-flip cases. Gates: clippy clean;
 workspace tests green; test262 sweeps at baseline — language 23721/3
 skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
 
+### The ForInBegin enumeration cache: repeated for-in stops re-enumerating (measured + landed 2026-09-06)
+
+The per-key slice's probe decomposition showed ~90% of the `control/for_in`
+row is `ForInBegin` itself: every re-entry of `for (k in o)` re-enumerates
+the whole chain (own_property_keys + a per-key descriptor read for the
+enumerable flag + HashSet/Vec/key-box allocations) — ~1.7µs per 5-key
+begin, and ~1.75µs even when only one key is consumed (the whole
+Object.prototype walk happens regardless). Landing: an Agent-level,
+direct-mapped (`FOR_IN_CELLS` 64) for-in enumeration cache
+(`ForInEnumCache`, mirroring the `for_of_array_cells` Cut-27 table pattern
+and traced like `ForOfFastVerdict`). Each entry holds the base handle
+(traced — it retains the base and, through the prototype cell, the whole
+chain, so no chain object's arena id can be recycled under the entry), the
+full chain's (id, generation) snapshot, and the enumerated (level, key)
+list. A cache is built only when the base and EVERY chain link are
+generation-tracked (ordinary/array/External/IsHTMLDDA — an exotic link's
+[[GetOwnProperty]] can change without a bump, so proxies/module
+namespaces/arguments/typed arrays are never cached). Each ForInBegin
+probe re-walks the live chain comparing every (id, generation): an exact
+match reuses the cached list; any own-property or prototype change
+anywhere in the chain misses and re-enumerates. Both engine copies
+(interpreter `ForInBegin`, JIT `for_in_begin`) probe and fill it. The
+ForInNext generation-skip (previous slice) remains the per-iteration
+companion: with begin now ~a chain walk + list copy, the per-key check is
+what the skip eliminates. `control/for_in` ~323 -> ~39.5ms jit / ~325 ->
+~54.0ms jl (~8x / ~6x); node-jl gap ~33x -> ~5.4x (the residue is the
+member reads + push/bind, not enumeration). A 20-case battery — mid-loop
+deletes/adds/shadowing on base and protos, a proto gaining an enumerable
+key between re-entries, 8/64/256 rotating objects (direct-map pressure),
+re-entry with mutation, sparse arrays, gc-stress — is byte-identical to
+node in jit, jitless, and `--gc-stress`. Gates: clippy clean; workspace
+tests green; test262 sweeps at baseline — language 23721/3 skip, built-
+ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
