@@ -16304,16 +16304,30 @@ impl Compiler {
         self.compile_expr(discriminant)?;
         self.emit(Step::SwitchDisc);
         let all_stmts: Vec<Stmt> = cases.iter().flat_map(|c| c.consequent.clone()).collect();
-        self.emit(Step::EnterBlock {
-            decls: Self::block_decls(&all_stmts),
-        });
+        let switch_decls = Self::block_decls(&all_stmts);
+        // A switch with no lexical declarations (no let/const/function/class/
+        // using in any consequent) needs no runtime block environment — the
+        // cases' closures resolve captures through the static context chain,
+        // and the env is pure scaffolding otherwise. Skipping the
+        // EnterBlock/LeaveBlock pair keeps a hot `switch` in a loop from
+        // allocating a declarative environment on every execution (the
+        // interpreter path, where the register executor does not fuse
+        // switch steps). The scope_count/break_count bookkeeping must match
+        // (no env -> no pop on break/return), as in the fast-block path.
+        let needs_scope = !switch_decls.is_empty();
+        let break_count = self.scope_count;
+        if needs_scope {
+            self.emit(Step::EnterBlock {
+                decls: switch_decls,
+            });
+            self.scope_count += 1;
+        }
         self.emit(Step::ListBegin);
-        self.scope_count += 1;
         let end_label = self.new_label();
         let default_label = self.new_label();
         self.scope_stack.push(Scope::Switch {
             break_target: end_label,
-            break_count: self.scope_count - 1,
+            break_count,
         });
         let mut case_labels = Vec::new();
         for _case in cases {
@@ -16343,8 +16357,10 @@ impl Compiler {
             self.place(default_label);
         }
         self.scope_stack.pop();
-        self.scope_count -= 1;
-        self.emit(Step::LeaveBlock);
+        if needs_scope {
+            self.scope_count -= 1;
+            self.emit(Step::LeaveBlock);
+        }
         self.emit(Step::ListEnd);
         self.place(end_label);
         self.emit(Step::NormalizeCompletion);

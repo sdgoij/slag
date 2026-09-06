@@ -5466,6 +5466,7 @@ path or the result is not dense it still runs).
 
 Results (30k calls, jitless): `a.concat(b)` 261 -> ~141ms (~1.85x),
 `a.concat()` 175 -> ~114ms, `a.concat(9)` 214 -> ~104ms; per-element
+result ~141ms (~1.85x), `a.concat()` 175 -> ~114ms, `a.concat(9)` 214 -> ~104ms; per-element
 drops ~1µs -> dense (~30ns), residual fixed cost is the species create +
 per-arg @@isConcatSpreadable/LengthOfArrayLike reads + dispatch. A
 15-case node-differential battery (nested/sparse/array-like/non-array
@@ -5480,6 +5481,46 @@ and flip to load-classified `hang`s under sustained batch load across
 runs — pre-existing, unrelated to these array changes; they pass
 individually and clean runs record 0 hang. Follow-up: the shared ~3-4µs
 species create (slice/concat/map/filter) is now the dominant residual.
+
+### Switch dispatch: the empty block env was per-execution allocation (measured + landed 2026-09-06)
+
+The corpus `control/switch_dispatch` row (a 3M-iteration `switch (i & 7)`
+with eight arithmetic cases) sat ~7x over the equivalent if-chain: the
+handoff probe measured it jitless ~1546ms/full-corpus run (~515ns/iter)
+vs the if-chain's ~55ns/iter, flat in case count — a fixed per-switch
+cost, suspected to be the block/env machinery. `compile_switch` emitted
+`EnterBlock`/`LeaveBlock` (a fresh declarative environment + scope_count
+bump) around EVERY switch, whether or not any case consequent contained a
+lexical declaration. Spec `CaseBlockEvaluation` (14.13.4 step 2) creates
+the environment only when the case block HAS a lexical declaration — an
+empty-decls switch needs no env at all, exactly the block/`fast_block`
+discipline.
+
+Landing: gate the env on `!block_decls(flattened consequents).is_empty()`
+(no let/const/function/class/using anywhere in the cases). When skipped,
+the scope_count increment AND the recorded `Scope::Switch` break_count
+are also skipped — the break/return unwinding emits `LeaveBlock` steps
+from `scope_count`, so a no-env switch must contribute no pop (the
+original draft kept `scope_count += 1` unconditionally, which would have
+popped a never-pushed env on every `break` out of such a switch — the
+benchmark's cases all break, so this was caught before building).
+`scope_count`/`break_count` for the env-ful path are unchanged.
+
+Results (isolated interleaved A/B, 3 runs each): jitless ~2696 -> ~238ms
+(~11x); jit ~289 -> ~110ms (~2.6x). The full-corpus row moved 1637 ->
+234ms jitless. Both engines improve because both execute the same step
+stream; the win is per-iteration declarative-environment allocation
+(plus its GC churn) disappearing. Correctness: a 12-case node-differential
+battery is byte-identical in jit, jitless, and `--gc-stress` — `let`
+shared across cases (binding visible after fall-through), TDZ across
+cases, class decls, function decls (env kept), var hoisting, return/
+continue/break through cases, labeled break past the switch, nested
+switches, and direct `eval` with `let` inside a no-decl switch (binds to
+the function env — no switch env exists). Full corpus (37 workloads, jit
+and jitless) result-identical. Gates: clippy clean; workspace tests
+green; test262 sweeps at baseline — language 23721/3 skip, built-ins
+23657/155 skip, annexB 1086/1086, zero fail/crash/hang. All 13
+`--jit-bench` rows result-ok.
 
 ## Deferred milestones
 
