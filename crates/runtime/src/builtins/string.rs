@@ -87,9 +87,9 @@ fn require_object_coercible(value: &Value) -> Result<(), JsError> {
 /// String exotic carries `[[StringData]]` in its kind).
 fn this_string_value(this: &Value) -> Result<JsString, JsError> {
     match this.kind() {
-        ValueKind::String(s) => Ok(s.as_ref().clone()),
+        ValueKind::String(s) => Ok(JsString::owned_of(&s)),
         ValueKind::Object(obj) => match &obj.kind {
-            crux::object::ObjectKind::String(s) => Ok(s.as_ref().clone()),
+            crux::object::ObjectKind::String(s) => Ok(JsString::owned_of(s)),
             _ => Err(JsError::new(
                 ErrorKind::TypeError,
                 "String.prototype method called on an incompatible receiver".into(),

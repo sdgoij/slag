@@ -74,6 +74,14 @@ enum FlattenLeaf<'a> {
     String(&'a JsString),
 }
 
+/// The flatten cache of a rope node, if `s` is one.
+fn rope_cache(s: &JsString) -> Option<&OnceLock<Arc<[u16]>>> {
+    match s {
+        JsString::ConsString { flat, .. } | JsString::Rope { flat, .. } => Some(flat),
+        _ => None,
+    }
+}
+
 /// Concatenations whose total length is at or below this stay flat: the rope
 /// machinery (a node allocation plus a later flatten) only pays off once the
 /// string is large enough that repeated copies would dominate.
@@ -253,6 +261,33 @@ impl JsString {
 
     pub fn code_unit(&self, index: usize) -> Option<u16> {
         self.as_slice().get(index).copied()
+    }
+
+    /// An owned copy of `handle`'s string. Leaves clone O(1) (Arc bump /
+    /// inline copy); a rope's owned copy shares the box's children, and the
+    /// box's flatten cache is materialized HERE and seeded into the copy —
+    /// the value `to_string` hands a string builtin for a rope `this` would
+    /// otherwise re-flatten the rope on every use (each owned clone carries a
+    /// fresh `OnceLock`). Content is immutable, so seeding the copy with the
+    /// box's buffer is exact, and the box flattens only once for its lifetime.
+    pub fn owned_of(handle: &Handle<JsString>) -> JsString {
+        match &**handle {
+            JsString::Flat(units) => JsString::Flat(units.clone()),
+            JsString::Small { len, units } => JsString::Small {
+                len: *len,
+                units: *units,
+            },
+            JsString::ConsString { .. } | JsString::Rope { .. } => {
+                let _ = handle.as_slice(); // flatten + cache in the box (once)
+                let copy = (**handle).clone();
+                if let Some(boxed) = rope_cache(handle).and_then(|cache| cache.get())
+                    && let Some(fresh) = rope_cache(&copy)
+                {
+                    let _ = fresh.set(boxed.clone());
+                }
+                copy
+            }
+        }
     }
 
     /// spec 6.1.4.3 CodePointAt: `(code point, is unpaired surrogate, code units consumed)`.
@@ -782,6 +817,38 @@ mod tests {
         let cloned = left;
         assert_eq!(cloned.as_slice(), left.as_slice());
         assert_eq!(cloned.as_slice().len(), left.as_slice().len());
+    }
+
+    #[test]
+    fn owned_of_seeds_the_owned_copy_from_the_box_flatten_cache() {
+        // `to_string` on a String primitive hands a string builtin an OWNED
+        // copy of the rope box (`JsString::owned_of`). The copy must not
+        // re-flatten the rope on every use: owned_of materializes the box once
+        // and seeds the copy's fresh cache with the same buffer, so a per-call
+        // `this` conversion reads the rope at leaf cost after the first call.
+        let mut s = Handle::new(JsString::from_utf8(""));
+        let x = Handle::new(JsString::from_utf8("x"));
+        for _ in 0..200 {
+            s = JsString::concat(&s, &x);
+        }
+        assert!(matches!(
+            *s,
+            JsString::ConsString { .. } | JsString::Rope { .. }
+        ));
+        assert!(rope_cache(&s).is_some_and(|c| c.get().is_none()));
+        // The owned copy a builtin would receive for `this`.
+        let owned = JsString::owned_of(&s);
+        assert_eq!(owned.len(), 200);
+        assert_eq!(owned.code_unit(0), Some(b'x' as u16));
+        // The materialization happened in the box's cache (once), not per copy.
+        assert!(rope_cache(&s).is_some_and(|c| c.get().is_some()));
+        assert_eq!(
+            rope_cache(&owned).and_then(|c| c.get().map(|a| a.len())),
+            Some(200)
+        );
+        // A second owned copy sees the box already flat and reads at leaf cost.
+        let again = JsString::owned_of(&s);
+        assert_eq!(again.as_slice(), owned.as_slice());
     }
 
     #[test]

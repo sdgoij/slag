@@ -498,7 +498,7 @@ pub fn to_numeric(value: &Value) -> Result<Value, JsError> {
 /// ToString (spec 7.1.13) for the primitive types.
 pub fn to_string(value: &Value) -> Result<JsString, JsError> {
     match value.kind() {
-        ValueKind::String(s) => Ok(s.as_ref().clone()),
+        ValueKind::String(s) => Ok(JsString::owned_of(&s)),
         ValueKind::Undefined => Ok(JsString::from_utf8("undefined")),
         ValueKind::Null => Ok(JsString::from_utf8("null")),
         ValueKind::Boolean(true) => Ok(JsString::from_utf8("true")),

@@ -57,6 +57,18 @@ measurement that killed or bounded it, and its disposition.
   validation in machine code measured SLOWER than the helper call; the
   chain read's cost is the fixed `member_chain_get` validation, and no
   machine copy of it paid.
+- **A shared per-node rope flatten cache** (2026-09-06, the charCodeAt
+  re-flatten fix's first draft). Making the `JsString` rope/ConsString
+  flatten cache `Rc<OnceLock<Arc<[u16]>>>` (a clone SHARES the box's
+  cache, so a per-call owned clone never re-flattens) measured a ~2x
+  REGRESSION on append-heavy rows in an isolated A/B: every `s += 'x'`
+  past the flat threshold allocates a ConsString node, and the `Rc` adds
+  a second allocation per node. concat_loop (200k appends, isolated)
+  jitless 8.4ms -> 16.1ms (jit 11.7-12.4 -> 13.3-26.4, bimodal) vs the
+  parent; the charCodeAt gain was identical to the shipped fix. Reverted;
+  the shipped fix instead keeps the inline cache and seeds the owned
+  clone at the handle->owned conversion sites (`JsString::owned_of`),
+  which costs nothing on node construction.
 
 ### Premises falsified by probe (never paid)
 
@@ -5197,6 +5209,7 @@ native-call row. Two landings, one commit each:
    shadow check, since dense element writes bump the generation but never
    touch the vector's names. push/pop member calls drop to ~225-270ns/call
    (the registered-call floor); the push+pop corpus row 250 -> ~26ms jit /
+   push+pop corpus row 250 -> ~26ms jit /
    ~30ms jitless (~9.4x) with values unchanged.
 
 Gates (both commits): clippy clean; workspace tests green (new crux
@@ -5206,6 +5219,47 @@ reads after pop, spill, frozen/non-writable, array-likes, subclass)
 matches node on both engines; test262 sweeps at baseline — built-ins
 Array 3082/3082 in jit and jitless, annexB 1086/1086, language 23721/3
 skip, zero fail/crash/hang.
+
+### The rope flatten-cache defect: per-call owned clones re-flattened (measured + landed 2026-09-06)
+
+The corpus re-baseline after the chain-read landing showed the `strings`
+family as the outlier (mean jit gap ~310x vs node; every other family
+< 140x), led by `char_ops` ~1145x jit (~458.8ms / 300k
+`s.charCodeAt(i & 255)` calls, ~1.5µs/call, JIT == jitless — a shared
+native-helper cost, not dispatch). Probe (rope-built 256-unit string vs
+the same content forced flat via one `slice`, both engines): rope ~416ms
+jit / ~411ms jl vs flat ~104 / ~110 — a ~4x flatten penalty. Cause: a
+string builtin gets `this` through `to_string`, which hands back an OWNED
+`JsString::clone` of the rope box — and a clone's `OnceLock` flatten
+cache is FRESH, so every `charCodeAt` re-flattened a 256-unit transient
+(Vec + Arc alloc + node walk per call); the boxed original's own cache
+never engaged. (First fix draft — an `Rc`-shared per-node cache —
+measured a ~2x regression on `+=` rows; see Failed experiments.)
+
+Fix: `JsString::owned_of(handle)` — leaves clone O(1) as before, but for a
+rope it materializes the BOX's cache once and seeds the owned copy's
+fresh cache with the same `Arc` (content is immutable, so the seed is
+exact). The three handle->owned conversion sites use it: crux
+`convert::to_string` (the String-receiver arm every `to_string(agent,
+this)` reaches) and runtime `this_string_value` (String primitive +
+String-wrapper object). A per-call `this` conversion now reads a rope at
+leaf cost from the second call on; node construction is untouched.
+
+Results (corpus, both engines): `char_ops` 458.8 -> ~107ms jit /
+424.5 -> ~113ms jl (~4.3x / ~3.8x, now AT the flat-string floor — the
+residual ~350ns/call is the registered-method-call floor, tracked as
+open); `search_slice` 386.6 -> ~94-101ms jit / 401.6 -> ~97-108ms jl
+(~3.8-4.1x — `indexOf`/`slice` had been re-flattening the 1200-unit
+`hay` per call); `concat_loop`/`coercion_concat`/`split_join` and every
+non-string row within cross-run noise (isolated `concat_loop` A/B vs the
+parent: jit 11.7-12.4 -> 12.3-12.6ms, jitless 8.4-8.6 -> 8.4-9.0 — no
+append cost). Corpus overall mean-jit gap 109.39 -> ~79.6, zero parity
+mismatches.
+
+Gates: clippy clean; workspace tests green (new crux test
+`owned_of_seeds_the_owned_copy_from_the_box_flatten_cache`); test262
+sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086, zero fail/crash/hang.
 
 ## Deferred milestones
 
