@@ -1070,6 +1070,14 @@ dependencies = [
 [[package]]
 name = "wasm"
 version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-control",
+ "cranelift-frontend",
+ "cranelift-native",
+ "region",
+ "target-lexicon",
+]
 
 [[package]]
 name = "wasm-encoder"

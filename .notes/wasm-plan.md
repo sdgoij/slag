@@ -742,6 +742,58 @@ compares outcomes bit-for-bit (results, trap kinds, NaN patterns,
 exceptions). Compiled-only runs must reproduce the Cut 10 totals
 (baseline core 20,662 / 0 / 0 and the feature dirs).
 
+#### Cut 11 wave breakdown (2026-09-06)
+
+The interpreter (`Engine::step`, flat stack machine over a decoded
+`Vec<Instr>`, store-pool instances/frames, resumable host boundary) stays
+the oracle; each wave adds a lowerable subset and lands with the
+equivalence gate green over it plus clippy clean. `crates/jit` is bound
+to the JS `Step` VM and is not reused; the wasm compiler lives in
+`crates/wasm` behind an optional `compile` feature pulling
+cranelift-codegen/frontend 0.134.3 (the pinned workspace version).
+
+- **Wave 0 — substrate + equivalence gate.** Compile pass after
+  `validate`: per-module, per-defined-function compiled entries held by
+  the `Instance`/`Store`. `wasmtest` gains a compile-forced mode that runs
+  corpus actions through compiled bodies (supported modules) and
+  interpreter bodies (unsupported, so totals stay comparable) and asserts
+  bit-for-bit equality on every action where the path was compiled.
+  Gate: equality holds on the supported subset and the interpreter's
+  corpus totals are reproduced.
+- **Wave 1 — numeric leaf core.** Lower `const`/`Num`/`local.*`/`drop`/
+  `select`/`block`/`loop`/`if`/`else`/`br`/`br_if`/`br_table`/`return`/
+  `nop`/`unreachable`; no memory, globals, calls, refs. Leaf functions
+  only (callee-free), so no host boundary yet. Value model: params and
+  locals are Cranelift SSA values (native i32/i64/f32/f64), not
+  interpreter `Value`s. Canonical-quiet-NaN arithmetic policy must be
+  reproduced exactly (Cranelift does not canonicalize): NaN canonicalized
+  after ops via an explicit mask/or or a helper. Trap-raising ops
+  (`unreachable`, integer div-by-zero/overflow) lower to trap-code
+  returns, not Cranelift `trap`.
+- **Wave 2 — memory, globals, tables.** Loads/stores with OOB traps,
+  `memory.size`/`grow`, memory64/multi-memory, `global.*`, and the
+  `table.*`/`call_indirect`/`ref.func` family. Compiled code gets a
+  context pointer (store + instance + memory/table cells) and calls
+  helpers for the operations that cannot inline safely.
+- **Wave 3 — calls and the host boundary.** Direct wasm-to-wasm calls
+  stay native when both sides compile (trampolines marshal args/results
+  where a compiled/interpreter boundary is crossed). Functions whose
+  callee graph can reach a resumable external host import are not
+  compiled (fall back to the interpreter's parked-run protocol), keeping
+  one host-call mechanism.
+- **Wave 4 — traps, exceptions, refs, GC, SIMD.** `throw`/`try_table`
+  unwinding across compiled frames (compiled frames return a trap/exn
+  status to their caller; only frames enclosing a `catch` stay
+  interpreter-side initially), then pool-id ref values, GC struct/array
+  and i31, and v128/relaxed ops (the interpreter's `simd_exec` semantics
+  are the oracle).
+
+Open design points to ratify as waves start (mirroring the JIT's
+conventions): the compiled entry ABI (values by Cranelift signature;
+results + i32 trap-code return; context pointer for store access), the
+module/function compile threshold, and whether compiled bodies keep the
+`DEFAULT_DEPTH_LIMIT` via an explicit depth counter or a native guard.
+
 ## 6. Verification workflow
 
 - Per-cut: `cargo test -p wasm` (unit tests for decode/validation/exec
@@ -1568,3 +1620,58 @@ pages (`browser/demo.html`, `docs/index.html`) and `wasm_binding` were
 left untouched — wasm correctness is already verified by the `wasmtest`
 CLI corpora, and the dogfood UI is for the JS engine, not a wasm
 showcase.
+
+### Cut 11 planning: wave breakdown written; Wave 0/1 next (2026-09-06)
+
+Cut 11's scope section now carries a wave breakdown (substrate +
+equivalence gate → numeric leaf core → memory/globals/tables → calls
+and the host boundary → traps/exceptions/refs/GC/SIMD) grounded in the
+interpreter's actual model: flat `Vec<Instr>` stack machine, store-pool
+frames/instances, resumable host calls, precise NaN/trap semantics (the
+equivalence harness oracle). The compiler will live in `crates/wasm`
+behind an optional `compile` feature (cranelift 0.134.3, the workspace-
+pinned version), not in `crates/jit` (bound to the JS `Step` VM). Wave 0
+wires the gate (`wasmtest` compile-forced equivalence mode); Wave 1
+lowers the numeric leaf core (const/num/local/structured control/
+return) with a trap-code-returning entry ABI.
+
+### Cut 11 Wave 0/1 first slice landed (2026-09-06)
+
+The substrate and the first lowering slice are in (feature `compile`,
+off by default):
+- `crates/wasm` gains the optional `compile` feature and cranelift
+  0.134.3 deps; `lib.rs` gates `pub mod compile` on it.
+- `compile.rs`: the u64-slot entry ABI (`fn(*const u64, u64, *mut u64,
+  u64) -> i32`, trap code 0 = ok), `run_compiled` marshaling
+  interpreter `Value`s, `compile_module`, a cached native `Engine`, and a
+  Cranelift lowering for the integer leaf subset: `const`, `local.*`,
+  `drop`, `select`, `unreachable`, `return`, and the i32/i64 `Num`
+  arithmetic/comparison/shift/popcnt ops plus `i64.wrap_i32`. Traps
+  (`unreachable`, integer div-by-zero, `MIN/-1` overflow) return codes
+  through guarded branches — no Cranelift `trap`. `MIN % -1` is 0 per
+  spec (the divisor is masked to 1 for `srem`). Floats, structured
+  control, memory, globals, tables, calls, refs, SIMD, and GC are not
+  lowered yet (whole body bails to the interpreter).
+- `exec.rs`: `Instance` carries `compiled: Vec<Option<CompiledFunc>>`
+  (parallel to `Module::bodies`, populated at instantiation), and
+  `start_owned` runs the compiled entry when present — synchronous and
+  never resumable in this subset, so it returns `Finished` directly.
+- Gate so far: six unit tests drive modules through the store and check
+  results and trap kinds (add, select, div traps, rem `MIN%-1`, and a
+  call-bearing function falling back to the interpreter). `cargo test -p
+  wasm` 36 pass default / 42 with `--features compile`; clippy clean in
+  both configurations. The corpus-wide `wasmtest` compile-forced
+  equivalence mode is the next Wave 0 item.
+
+Follow-up increment: a store-level interpreter-forcing toggle
+(`Store::set_compile(false)`, feature-gated) turns the unit tests into a
+real equivalence harness (`assert_equiv` compares compiled vs
+interpreter outcomes bit-for-bit, values and trap kinds, over the same
+store path). Coverage now sweeps every lowered op over edge input sets:
+all i32/i64 binary arithmetic/comparison/shift ops (shifts and rotations
+mask their count explicitly, never trusting the backend), `popcnt`,
+`eqz`, `i64.wrap_i32`, `select`, and locals/tee — 10 compile tests, 46
+total
+with the feature, clippy clean in both configurations. Remaining Wave 1
+work: structured control flow (`block`/`loop`/`if`/`br*`), then floats
+with exact canonical-NaN semantics, before the corpus-wide gate.

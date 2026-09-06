@@ -10,6 +10,8 @@
 //! decoded module; Cut 3+ executes it.
 
 pub mod binary;
+#[cfg(feature = "compile")]
+pub mod compile;
 pub mod exec;
 pub mod instr;
 pub mod module;

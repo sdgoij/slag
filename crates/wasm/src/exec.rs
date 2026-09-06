@@ -297,6 +297,10 @@ pub struct Instance {
     element_segments: Vec<Option<Vec<RefValue>>>,
     data_segments: Vec<Option<Vec<u8>>>,
     depth_limit: usize,
+    /// Cut 11: one optional compiled entry per module-defined function
+    /// (parallel to `Module::bodies`); `None` keeps the interpreter path.
+    #[cfg(feature = "compile")]
+    compiled: Vec<Option<crate::compile::CompiledFunc>>,
 }
 
 /// The store: every live instance plus the shared pools they reference.
@@ -317,6 +321,10 @@ pub struct Store {
     /// Runs suspended at an external-host-call boundary, innermost last
     /// ([`Store::start`] parks here; [`Store::resume`] pops and continues).
     suspended: Vec<Suspended>,
+    /// Cut 11 test hook: when true, even compiled bodies run on the
+    /// interpreter (lets the equivalence tests compare both paths).
+    #[cfg(feature = "compile")]
+    compile_off: bool,
 }
 
 impl Default for Store {
@@ -340,7 +348,17 @@ impl Store {
             exceptions: Vec::new(),
             objects: Vec::new(),
             suspended: Vec::new(),
+            #[cfg(feature = "compile")]
+            compile_off: false,
         }
+    }
+
+    /// Force (or re-enable) the interpreter for this store's invocations,
+    /// bypassing compiled bodies. Cut 11 equivalence tests compare the two
+    /// paths on the same module.
+    #[cfg(feature = "compile")]
+    pub fn set_compile(&mut self, enabled: bool) {
+        self.compile_off = !enabled;
     }
 
     /// Register a type-only host function (spectest `print*` family); returns
@@ -625,6 +643,8 @@ impl Store {
             element_segments: Vec::new(),
             data_segments: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
+            #[cfg(feature = "compile")]
+            compiled: crate::compile::compile_module(module),
         });
 
         // Instantiate element segments in order (all elements before data),
@@ -1036,6 +1056,20 @@ impl Store {
             let signature = signature.ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
             (signature, body.locals.clone())
         };
+        // Cut 11: a compiled leaf entry runs synchronously (no host boundary
+        // in the current subset), so it is a `Finished` run like an
+        // interpreter run that never suspends. `set_compile(false)` forces
+        // the interpreter for equivalence testing.
+        #[cfg(feature = "compile")]
+        if !self.compile_off
+            && let Some(func) = self.instances[instance]
+                .compiled
+                .get(defined)
+                .and_then(|entry| entry.as_ref())
+        {
+            let results = crate::compile::run_compiled(func, &signature, args)?;
+            return Ok(RunProgress::Finished(results));
+        }
         let mut locals = args.to_vec();
         for ty in &declared {
             locals.push(default_value(*ty)?);

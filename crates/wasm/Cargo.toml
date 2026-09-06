@@ -4,4 +4,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Cut 11 (wasm-to-native via Cranelift): an optional second execution path.
+# Off by default; the interpreter stays the shipped path until the
+# equivalence gate holds corpus-wide.
+compile = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-control",
+    "dep:cranelift-frontend",
+    "dep:cranelift-native",
+    "dep:region",
+    "dep:target-lexicon",
+]
+
 [dependencies]
+cranelift-codegen = { version = "=0.134.3", optional = true }
+cranelift-control = { version = "=0.134.3", optional = true }
+cranelift-frontend = { version = "=0.134.3", optional = true }
+cranelift-native = { version = "=0.134.3", optional = true }
+region = { version = "4", optional = true }
+target-lexicon = { version = "0.13", optional = true }
