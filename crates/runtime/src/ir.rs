@@ -5003,6 +5003,13 @@ impl Vm {
     }
 
     fn run_inner(&mut self, agent: &mut Agent, body: &CompiledBody) -> Result<VmOutcome, JsError> {
+        // Every JS body activation funnels through here (start/run/run_abrupt
+        // all call it once per activation), so this is the interpreter side of
+        // the stack-exhaustion guard: refuse to start an activation whose
+        // entry would descend into the reserved bottom margin, surfacing a
+        // catchable RangeError instead of overflowing the native stack (the
+        // JIT side checks in `run_jit_body`).
+        crate::stack::enter_js(agent)?;
         // Cut 36 mirror: whether the running context's env chain is exactly
         // the global env — a certified body's `LoadIdent` then resolves at
         // the global env, so the read can serve the warmed global-value cell

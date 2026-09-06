@@ -4613,6 +4613,11 @@ pub(crate) fn run_jit_body(
     if agent.jit_depth >= MAX_JIT_DEPTH {
         return Ok(JitRunOutcome::Interp);
     }
+    // The JIT side of the JS stack-exhaustion guard (the interpreter checks
+    // in `run_inner`): refuse to start a compiled activation that would
+    // descend into the reserved bottom margin, throwing a catchable
+    // RangeError instead of overflowing the native stack.
+    crate::stack::enter_js(agent)?;
     let info_ptr = lookup_info(hook, ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
         return Ok(JitRunOutcome::Interp);

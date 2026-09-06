@@ -16,6 +16,10 @@ regexp = { path = "../regexp" }
 syntax = { path = "../syntax" }
 unicode = { path = "../unicode" }
 
+# The stack-exhaustion guard's thread-stack query (unix platforms).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # `default-features = false` above drops raylib-sys's default `GLFW_BUILD_X11`,
 # and raylib's cmake aborts on Linux desktops when both GLFW platform backends
 # are off ("Cannot disable both Wayland and X11"), so Linux must enable one

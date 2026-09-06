@@ -1734,6 +1734,23 @@ mod tests {
             .expect("the deep-recursion thread panicked")
     }
 
+    /// Unbounded JS recursion must surface as a catchable `RangeError`
+    /// rather than overflow the native stack and kill the process (the
+    /// `crate::stack` guard). Runs on the deep-recursion thread so the
+    /// guard — not the thread size — is what trips.
+    #[test]
+    fn runaway_recursion_is_a_catchable_range_error() {
+        assert!(
+            run_deep(
+                "try { function f(){ return g(); } function g(){ return f(); } f(); 'unreachable'; } catch (e) { e && e.name; }",
+                |value| value
+                    .as_string()
+                    .is_some_and(|name| name.to_string_lossy() == "RangeError"),
+            ),
+            "runaway recursion must throw a catchable RangeError"
+        );
+    }
+
     #[test]
     fn evaluates_a_trivial_script_to_a_value() {
         let mut agent = Agent::new();

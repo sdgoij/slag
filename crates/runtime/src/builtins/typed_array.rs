@@ -610,12 +610,121 @@ fn typed_array_construct(
             return iterate_source(agent, prototype, element_type, first);
         }
     }
-    // Multiple arguments: the argument list is the element list (spec step 7).
+    // Multiple arguments: the argument list is the element list (spec step
+    // 7). The destination is a fresh typed array, so each element is coerced
+    // and written straight into the backing buffer (no per-element decimal
+    // key string or integer-indexed exotic [[Set]]).
     let dst = allocate_typed_array_buffer(agent, prototype, element_type, args.len())?;
+    let dst_slots = typed_array_slots(&dst).expect("fresh typed array");
     for (k, value) in args.iter().enumerate() {
-        set_property(&dst, &key(k as u64), *value)?;
+        write_fresh_element(agent, &dst_slots, k as u64, *value)?;
     }
     Ok(dst)
+}
+
+/// A dense Array source the TypedArray constructor can iterate by index
+/// (spec 25.2.2.1 step 5.c): `method` (already resolved by GetMethod) is the
+/// realm's stock `%Array.prototype.values%`, the receiver is a plain dense
+/// Array whose every index `0..length` is an own data element, and the stock
+/// iterator's `next` is unpatched. Draining the stock iterator over such an
+/// array is exactly `Get(items, k)` for each index (spec 23.1.5.2.1 reads
+/// each element through [[Get]], holes included) with no iterator object or
+/// per-step protocol machinery, so `Some(values)` collects the raw elements
+/// without running any user code; `None` falls back to the caller's generic
+/// iterator-protocol path.
+fn typed_array_fast_source(
+    agent: &mut Agent,
+    items: &Value,
+    method: &Value,
+) -> Result<Option<Vec<Value>>, JsError> {
+    let ValueKind::Object(object) = items.kind() else {
+        return Ok(None);
+    };
+    let ObjectKind::Array(slots) = &object.kind else {
+        return Ok(None);
+    };
+    let Some(realm) = agent.current_realm().ok() else {
+        return Ok(None);
+    };
+    if realm
+        .intrinsics
+        .get("%Array.prototype[Symbol.iterator]%")
+        .as_ref()
+        != Some(method)
+    {
+        return Ok(None);
+    }
+    // GetIterator reads the iterator's `next` once, before any element, so a
+    // patched %ArrayIteratorPrototype%.next must keep the generic path.
+    let Some(aip) = realm
+        .intrinsics
+        .get("%ArrayIteratorPrototype%")
+        .and_then(|value| match value.kind() {
+            ValueKind::Object(aip) => Some(aip),
+            _ => None,
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(aip_next) = aip
+        .get_own_property_key(&PropertyKey::from_utf8("next"))?
+        .and_then(|property| property.value())
+    else {
+        return Ok(None);
+    };
+    if realm
+        .intrinsics
+        .get("%ArrayIteratorPrototype.next%")
+        .as_ref()
+        != Some(&aip_next)
+    {
+        return Ok(None);
+    }
+    if !slots.dense.get() {
+        return Ok(None);
+    }
+    let length = slots.length.get() as u64;
+    let elements = slots.elements.borrow();
+    if length as usize > elements.len() {
+        // A trailing hole region (a length grown past the elements) reads
+        // the prototype chain for the missing indices.
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(length as usize);
+    for slot in elements.iter().take(length as usize) {
+        // A mid-array hole would read the chain, not the slot.
+        let Some(value) = slot else {
+            return Ok(None);
+        };
+        values.push(*value);
+    }
+    Ok(Some(values))
+}
+
+/// Write `value` to element `index` of a freshly allocated typed array:
+/// coerce once for the content type (the agent-aware ToNumber/ToBigInt of
+/// spec 25.2.2.1 step 5.c/step 7) and write the encoded bytes straight into
+/// the backing buffer. The destination is a fresh in-bounds view, so no
+/// index/bounds validation or per-element decimal key string and
+/// integer-indexed exotic [[Set]] is needed (the `fill` fast-path pattern).
+fn write_fresh_element(
+    agent: &mut Agent,
+    slots: &TypedArraySlots,
+    index: u64,
+    value: Value,
+) -> Result<(), JsError> {
+    let value = match slots.element_type.content_type() {
+        ContentType::BigInt => {
+            Value::BigInt(Handle::new(crate::context::to_big_int(agent, &value)?))
+        }
+        ContentType::Number => Value::Number(crate::context::to_number(agent, &value)?),
+    };
+    let mut bytes = [0u8; crux::typed_array::MAX_ELEMENT_SIZE];
+    let size = crux::typed_array::encode_element_into(slots.element_type, &value, &mut bytes)?;
+    slots.buffer.write(
+        slots.byte_offset + index as usize * slots.element_type.size(),
+        &bytes[..size],
+    )
 }
 
 /// The single-object path of the TypedArray constructor: iterate (or treat
@@ -627,6 +736,27 @@ fn iterate_source(
     items: &Value,
 ) -> Result<Value, JsError> {
     if let Some(method) = get_method(agent, items, "@@iterator")? {
+        // The dense fast path: a plain dense Array whose @@iterator is the
+        // stock `%Array.prototype.values%` iterates by index with no iterator
+        // object or per-step protocol machinery (the fixture cost — a
+        // per-element `next()` call and key-string write — is what this
+        // skips). The raw values are all read before any coercion, which
+        // preserves the spec's IteratorToList-then-fill ordering: a
+        // coercion's valueOf observes the source as it was before any element
+        // was converted.
+        if let Some(values) = typed_array_fast_source(agent, items, &method)? {
+            // GC-2: the collected element Values sit in a local Vec the stack
+            // scan cannot see while the destination allocation and the
+            // per-element coercions (user code) allocate — suppress
+            // `--gc-stress` so they cannot be swept.
+            let _stress = crate::ir::StressSuppress::new();
+            let dst = allocate_typed_array_buffer(agent, prototype, element_type, values.len())?;
+            let dst_slots = typed_array_slots(&dst).expect("fresh typed array");
+            for (k, value) in values.into_iter().enumerate() {
+                write_fresh_element(agent, &dst_slots, k as u64, value)?;
+            }
+            return Ok(dst);
+        }
         let iterator = crate::function::call(agent, &method, *items, &[])?;
         let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
         if !is_callable(&next) {
@@ -645,17 +775,19 @@ fn iterate_source(
             values.push(value);
         }
         let dst = allocate_typed_array_buffer(agent, prototype, element_type, values.len())?;
+        let dst_slots = typed_array_slots(&dst).expect("fresh typed array");
         for (k, value) in values.into_iter().enumerate() {
-            set_property(&dst, &key(k as u64), value)?;
+            write_fresh_element(agent, &dst_slots, k as u64, value)?;
         }
         return Ok(dst);
     }
     let array_like = crate::context::to_object(agent, items)?;
     let length = length_of_array_like(agent, &array_like)? as usize;
     let dst = allocate_typed_array_buffer(agent, prototype, element_type, length)?;
+    let dst_slots = typed_array_slots(&dst).expect("fresh typed array");
     for k in 0..length {
         let value = get(agent, &array_like, &key(k as u64))?;
-        set_property(&dst, &key(k as u64), value)?;
+        write_fresh_element(agent, &dst_slots, k as u64, value)?;
     }
     Ok(dst)
 }
@@ -3240,6 +3372,57 @@ mod tests {
         assert!(run("new BigInt64Array([1])").is_err());
         assert_eq!(text("new BigInt64Array([1n, 2n]).join(',')"), "1,2");
         assert!(run("new BigInt64Array([1.5])").is_err());
+    }
+
+    #[test]
+    fn constructor_from_dense_array_semantics() {
+        // The dense fast path must be observably identical to the generic
+        // iterator protocol, which these shapes exercise (each `run` uses a
+        // fresh realm, so the shared prototypes can be patched per snippet).
+        // A length grown past the elements (trailing holes) reads undefined.
+        assert_eq!(
+            text(
+                "(function(){ var a = [1, 2]; a.length = 5; return new Int8Array(a).join(','); })()"
+            ),
+            "1,2,0,0,0"
+        );
+        // IteratorToList runs before any coercion: a valueOf that mutates the
+        // source must not change the already-read later elements.
+        assert_eq!(
+            text(
+                "(function(){ var a = [{ valueOf() { a[1] = 9; return 3; } }, 5]; return new Int8Array(a).join(','); })()"
+            ),
+            "3,5"
+        );
+        // A patched @@iterator keeps the generic path (and wins).
+        assert_eq!(
+            text(
+                "(function(){ Array.prototype[Symbol.iterator] = function*(){ yield 7; yield 8; }; return new Int8Array([1, 2, 3]).join(','); })()"
+            ),
+            "7,8"
+        );
+        // A dense subclass instance inherits the stock @@iterator and still
+        // constructs by index.
+        assert_eq!(
+            text(
+                "(function(){ class A extends Array {}; var a = A.of(4, 5); return new Int8Array(a).join(','); })()"
+            ),
+            "4,5"
+        );
+        // Object elements coerce through the agent (valueOf runs) in order.
+        assert_eq!(
+            text(
+                "(function(){ var log = []; var a = [{ valueOf() { log.push(1); return 10; } }, { valueOf() { log.push(2); return 20; } }]; var t = new Int8Array(a); return t.join(',') + ':' + log.join(','); })()"
+            ),
+            "10,20:1,2"
+        );
+        // The array-like path coerces too.
+        assert_eq!(
+            text("new Int8Array({length: 2, 0: 7, 1: {valueOf() { return 8; }}}).join(',')"),
+            "7,8"
+        );
+        // BigInt content types keep working on the fast path.
+        assert_eq!(text("new BigInt64Array([1n, 2n, 3n]).join(',')"), "1,2,3");
     }
 
     #[test]

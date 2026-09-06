@@ -292,6 +292,12 @@ pub struct Agent {
     /// buffers (`runtime::jit::MAX_JIT_DEPTH`), and the cache's in-flight
     /// signal: eviction is disabled while any frame runs.
     pub jit_depth: usize,
+    /// The JS stack-exhaustion watermark: the address below which a new JS
+    /// body activation must not start (`crate::stack::stack_guard_limit`,
+    /// sampled at agent creation — the agent is not `Send`, so its thread is
+    /// fixed). Zero when the platform cannot report the thread's stack
+    /// bounds; the guard is disabled then.
+    pub(crate) stack_guard_limit: usize,
     pub(crate) promise_jobs: VecDeque<Job>,
     pub(crate) generic_jobs: VecDeque<Job>,
     pub(crate) timeout_jobs: VecDeque<(u64, Job)>,
@@ -788,6 +794,7 @@ impl Agent {
             vm_pool: Vec::new(),
             jit_hook: None,
             jit_depth: 0,
+            stack_guard_limit: crate::stack::stack_guard_limit().unwrap_or(0),
             promise_jobs: VecDeque::new(),
             generic_jobs: VecDeque::new(),
             timeout_jobs: VecDeque::new(),
