@@ -526,6 +526,62 @@ intrinsic identity like every other agent-dependent builtin.
   globals, the `js-string`/`gc` suites (out-of-scope JSString proposal /
   `WebAssembly.Function` typed-function wrappers), and per-file gaps now
   visible per-fixture.
+- Wave 5 slice 5 (landed): the i64 value-conversion half of the BigInt
+  wave. JS↔wasm `i64` now converts through ToBigInt (wrapping modulo
+  2^64; `crux::BigInt::to_i64_wrapping`) for value results, and BigInt
+  results convert back — unlocking `WebAssembly.Global` i64 (default 0n,
+  value get/set, ToBigInt constructor conversions incl. objects),
+  `WebAssembly.Tag`/`Exception` i64 parameters and payloads, and i64
+  function-import/export arguments. Corpus: 793 tests pass / 297 fail
+  (was 501/273), with `global/constructor.any.js` 60/62,
+  `global/value-get-set.any.js` 68/69, `exception/constructor.tentative`
+  and `exception/getArg` fully green, and the previously-eval-failing
+  `constructor/instantiate-bad-imports.any.js` now running its 212 tests
+  (176/36). Remaining BigInt-wave work: memory64/table64 `address`
+  descriptors, BigInt page limits and grow, the grow EnforceRange error
+  kind, plus the separate follow-up classes surfaced by the run:
+  null-prototype/immutable `Instance.exports`, primitive and `anyfunc`
+  global/table import linking, `customSections` array shape, externref
+  globals, multi-value results, and shared memory.
+- Wave 5 slice 6 (landed): the memory64/table64 half of the BigInt wave.
+  `Memory`/`Table` descriptors now read the `address` member ("i32"/"i64",
+  default i32) first and convert `initial`/`maximum`/grow/indices in the
+  address's index domain — EnforceRange u32 Numbers for i32, WebIDL-`bigint`
+  u64 for i64 (`crux::BigInt::to_u64`; an unparseable string is a TypeError,
+  matching WebIDL rather than ToBigInt's SyntaxError). Memory64/table64
+  cells carry the engine's `memory64`/`table64` flags (new `Store::memory_type`/
+  `table_type` accessors); `length` and `grow` results are BigInts for
+  i64-address objects, and the grow argument errors are TypeErrors
+  (EnforceRange) rather than the old RangeError. New green files:
+  `memory/constructor.any.js` (29/29), `memory/constructor-memory64.any.js`
+  (10/10), `memory/grow-memory64.any.js` (8/8), `table/constructor-memory64.any.js`
+  (12/12), `table/grow.any.js` (18/18); `memory/grow.any.js` 18/19 (the one
+  fail is the shared-memory detach test, threads out of scope),
+  `table/constructor.any.js` 40/41 (externref table), `table/get-set.any.js`
+  39/41 (externref/closure elements). Corpus: 849 tests pass / 241 fail
+  (was 793/297), 30 fixture-files green of 53. The BigInt/memory64 wave is
+  done; what remains is the follow-up classes: externref/reference JS
+  values (globals, tables, `WebAssembly.Function` closures), instance
+  linking/exports shape, multi-value results, `customSections`, shared
+  memory, and the out-of-scope `js-string`/`gc` suites.
+- Wave 5 slice 7 (landed): instance shape, global-import linking, exported
+  function objects, and a harness fix. `Instance.exports` is now a
+  null-prototype, non-extensible object with non-writable,
+  non-configurable, enumerable data properties (the JS-API module-exports
+  shape). Global imports accept a `WebAssembly.Global` wrapper (the engine
+  type-checks it) or — for an immutable import only — a value of the exact
+  JS kind for the type (Number for i32/f32/f64, BigInt for i64), any other
+  value being a LinkError (not a TypeError). Exported-function wrappers now
+  chain to `%Function.prototype%` (they only use WebAssembly.Function's
+  prototype when that interface exists) and carry the function's index as
+  their `name` (the wrapper is shared across export names). The shim's
+  `assert_array_equals` accepts array-likes (typed arrays), fixing
+  `module/customSections.any.js`. Newly green: `instance/constructor.any.js`
+  (29/29), `module/customSections.any.js` (9/9); `instance/exports`,
+  `module/exports`, `module/imports` stay green. `constructor/instantiate.any.js`
+  30/63 (the remaining fails are the instantiate result-object overload
+  checks and option handling). Corpus: 898 tests pass / 192 fail (was
+  849/241), 32 fixture-files green of 53.
 
 ## 6. Verification workflow
 

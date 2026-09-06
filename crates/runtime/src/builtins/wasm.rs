@@ -1089,19 +1089,10 @@ fn materialize_memory_buffer(agent: &mut Agent, cell: usize) -> Result<Value, Js
     Ok(buffer)
 }
 
-/// A JS-API `[EnforceRange] unsigned long`-shaped value (a whole number in
-/// [0, 2^32)), or `None` for an absent/undefined optional field. BigInt
-/// values are the memory64 index type and are not in this cut.
-fn range_u32(value: &Value, what: &str) -> Result<Option<u64>, JsError> {
-    if matches!(value.kind(), ValueKind::Undefined) {
-        return Ok(None);
-    }
-    if matches!(value.kind(), ValueKind::BigInt(_)) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            format!("{what} (BigInt) is not supported in Cut 10 wave 3b yet"),
-        ));
-    }
+/// A JS-API `[EnforceRange] unsigned long`-shaped whole number in [0, 2^32)
+/// (the i32-address index domain). A BigInt is a TypeError (ToNumber of a
+/// BigInt throws).
+fn enforce_u32(value: &Value, what: &str) -> Result<u64, JsError> {
     let number = to_number(value)?;
     if !number.is_finite() || number < 0.0 || number.fract() != 0.0 || number >= 4_294_967_296.0 {
         return Err(JsError::new(
@@ -1109,38 +1100,132 @@ fn range_u32(value: &Value, what: &str) -> Result<Option<u64>, JsError> {
             format!("{what} is out of range"),
         ));
     }
-    Ok(Some(number as u64))
+    Ok(number as u64)
 }
 
-/// The descriptor of a `Memory` (JS-API 4.4.1): the required `initial` and
-/// optional `maximum` page counts. A page count whose bytes would exceed the
-/// host's ArrayBuffer limit is rejected up front.
-fn memory_limits(agent: &mut Agent, descriptor: &Value) -> Result<(u64, Option<u64>), JsError> {
+/// The address-space flavor of a JS `Memory`/`Table` (the descriptor's
+/// `address` member, defaulting to `"i32"`). Memory64/table64 objects index
+/// with BigInts and hold 64-bit page counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Address {
+    I32,
+    I64,
+}
+
+/// Read a descriptor's `address` member (`"i32"` when absent; anything else
+/// is a TypeError).
+fn descriptor_address(agent: &mut Agent, descriptor: &Value) -> Result<Address, JsError> {
+    let value = crate::context::get_property(
+        agent,
+        descriptor,
+        &JsString::from_utf8("address"),
+        *descriptor,
+    )?;
+    if matches!(value.kind(), ValueKind::Undefined) {
+        return Ok(Address::I32);
+    }
+    match js_string_text(&value_to_string(&value)?).as_str() {
+        "i32" => Ok(Address::I32),
+        "i64" => Ok(Address::I64),
+        other => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("'{other}' is not a valid memory/table address; expected \"i32\" or \"i64\""),
+        )),
+    }
+}
+
+/// A page count or index in the address's domain: i32-address values are
+/// `[EnforceRange]` Numbers in [0, 2^32); i64-address values are BigInts
+/// (through ToBigInt) in [0, 2^64). Required members (a missing/`undefined`
+/// value) are a TypeError.
+fn required_pages(
+    agent: &mut Agent,
+    address: Address,
+    value: &Value,
+    what: &str,
+) -> Result<u64, JsError> {
+    match address {
+        Address::I32 => enforce_u32(value, what),
+        Address::I64 => {
+            let big = webidl_bigint(agent, value)?;
+            big.to_u64().ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, format!("{what} is out of range"))
+            })
+        }
+    }
+}
+
+/// WebIDL `bigint` conversion for the wasm JS-API: like ToBigInt, except an
+/// unparseable string is a TypeError (WebIDL StringToBigInt) rather than the
+/// SyntaxError the JS `ToBigInt` abstract operation throws.
+fn webidl_bigint(agent: &mut Agent, value: &Value) -> Result<crux::BigInt, JsError> {
+    let type_error = |what: &str| JsError::new(ErrorKind::TypeError, what.into());
+    let prim = crate::context::to_primitive(agent, value, crux::convert::ToPrimitiveHint::Number)?;
+    match prim.kind() {
+        ValueKind::Undefined | ValueKind::Null => {
+            Err(type_error("Cannot convert undefined or null to a BigInt"))
+        }
+        ValueKind::Boolean(true) => Ok(crux::BigInt::from(1u64)),
+        ValueKind::Boolean(false) => Ok(crux::BigInt::from(0u64)),
+        ValueKind::BigInt(b) => Ok(b.as_ref().clone()),
+        ValueKind::String(s) => crux::convert::string_to_bigint(&s)
+            .ok_or_else(|| type_error("Cannot convert the string to a BigInt")),
+        ValueKind::Number(_) => Err(type_error("Cannot convert a Number to a BigInt")),
+        ValueKind::Symbol(_) => Err(type_error("Cannot convert a Symbol to a BigInt")),
+        ValueKind::Object(_) | ValueKind::Function(_) => {
+            Err(type_error("Cannot convert an object to a BigInt"))
+        }
+    }
+}
+
+/// An optional page count (`initial`/`maximum`): `undefined` is `None`.
+fn optional_pages(
+    agent: &mut Agent,
+    address: Address,
+    value: &Value,
+    what: &str,
+) -> Result<Option<u64>, JsError> {
+    if matches!(value.kind(), ValueKind::Undefined) {
+        return Ok(None);
+    }
+    Ok(Some(required_pages(agent, address, value, what)?))
+}
+
+/// The descriptor of a `Memory` (JS-API 4.4.1): its address flavor plus the
+/// required `initial` and optional `maximum` page counts (read in spec order:
+/// `address`, then `initial`, then `maximum`). A page count whose bytes would
+/// exceed the host's ArrayBuffer limit is rejected up front.
+fn memory_limits(
+    agent: &mut Agent,
+    descriptor: &Value,
+) -> Result<(Address, u64, Option<u64>), JsError> {
     let ValueKind::Object(_) = descriptor.kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Memory descriptor is not an object".into(),
         ));
     };
+    let address = descriptor_address(agent, descriptor)?;
     let initial_value = crate::context::get_property(
         agent,
         descriptor,
         &JsString::from_utf8("initial"),
         *descriptor,
     )?;
-    let initial = range_u32(&initial_value, "Memory initial")?.ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "Memory requires an 'initial' page count".into(),
-        )
-    })?;
+    let initial =
+        optional_pages(agent, address, &initial_value, "Memory initial")?.ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Memory requires an 'initial' page count".into(),
+            )
+        })?;
     let maximum_value = crate::context::get_property(
         agent,
         descriptor,
         &JsString::from_utf8("maximum"),
         *descriptor,
     )?;
-    let maximum = range_u32(&maximum_value, "Memory maximum")?;
+    let maximum = optional_pages(agent, address, &maximum_value, "Memory maximum")?;
     if maximum.is_some_and(|maximum| maximum < initial) {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -1168,7 +1253,7 @@ fn memory_limits(agent: &mut Agent, descriptor: &Value) -> Result<(u64, Option<u
             "shared memories are not supported in Cut 10 yet".into(),
         ));
     }
-    Ok((initial, maximum))
+    Ok((address, initial, maximum))
 }
 
 /// `new WebAssembly.Memory(descriptor)` (JS-API spec 4.4.1): allocate a
@@ -1180,14 +1265,14 @@ fn memory_construct(
     new_target: &Value,
 ) -> Result<Value, JsError> {
     let descriptor = args.first().cloned().unwrap_or(Value::Undefined);
-    let (initial, maximum) = memory_limits(agent, &descriptor)?;
+    let (address, initial, maximum) = memory_limits(agent, &descriptor)?;
     let mem_type = wasm::types::MemType {
         limits: wasm::types::Limits {
             min: initial,
             max: maximum,
             shared: false,
         },
-        memory64: false,
+        memory64: address == Address::I64,
     };
     let cell = agent
         .wasm_store
@@ -1205,24 +1290,6 @@ fn memory_construct(
     Ok(Value::Object(object))
 }
 
-/// The `delta` of a `Memory.prototype.grow` call: a whole number of pages.
-fn grow_delta(value: &Value) -> Result<u64, JsError> {
-    if matches!(value.kind(), ValueKind::BigInt(_)) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "BigInt grow deltas are not supported in Cut 10 wave 3b yet".into(),
-        ));
-    }
-    let number = to_number(value)?;
-    if !number.is_finite() || number < 0.0 || number.fract() != 0.0 {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "grow delta must be a whole number of pages".into(),
-        ));
-    }
-    Ok(number as u64)
-}
-
 /// `get Memory.prototype.buffer` (JS-API spec 4.4.2): the memory's current
 /// ArrayBuffer (the same object until the memory grows).
 fn memory_buffer_get(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
@@ -1234,12 +1301,25 @@ fn memory_buffer_get(agent: &mut Agent, this: &Value) -> Result<Value, JsError> 
 }
 
 /// `Memory.prototype.grow(delta)` (JS-API spec 4.4.3): grow the cell by
-/// `delta` pages and return the old page count. The previous buffers detach;
-/// the next `buffer` access materializes a fresh ArrayBuffer.
+/// `delta` pages (a Number for an i32-address memory, a BigInt for an
+/// i64-address one) and return the old page count in the same domain. The
+/// previous buffers detach; the next `buffer` access materializes a fresh
+/// ArrayBuffer.
 fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let cell = memory_cell(agent, this)?;
+    let address = agent
+        .wasm_store
+        .borrow()
+        .memory_type(cell)
+        .map(|ty| ty.memory64)
+        .unwrap_or(false);
     let delta_value = args.first().cloned().unwrap_or(Value::Undefined);
-    let delta = grow_delta(&delta_value)?;
+    let delta = required_pages(
+        agent,
+        if address { Address::I64 } else { Address::I32 },
+        &delta_value,
+        "Memory.grow delta",
+    )?;
     let old = agent.wasm_store.borrow_mut().grow_memory(cell, delta);
     let old = old.ok_or_else(|| {
         JsError::new(
@@ -1252,7 +1332,11 @@ fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     {
         array_buffer::detach_array_buffer(agent, object.id());
     }
-    Ok(Value::Number(old as f64))
+    if address {
+        Ok(Value::BigInt(Handle::new(crux::BigInt::from(old))))
+    } else {
+        Ok(Value::Number(old as f64))
+    }
 }
 
 // ---- the JS <-> wasm memory bridge (Cut 10 wave 3b, slice 1) ----
@@ -1395,22 +1479,14 @@ fn tag_wrapper_memo(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
     Ok(value)
 }
 
-/// One `WebAssembly.Tag` parameter value type (the numeric types this cut
-/// converts; `i64` needs the BigInt conversion wave, references/v128 are not
-/// exception payloads yet).
+/// One `WebAssembly.Tag` parameter value type (the numeric types; references/
+/// v128 are not exception payloads yet).
 fn tag_parameter_type(text: &str) -> Result<ValType, JsError> {
     Ok(match text {
         "i32" => ValType::I32,
+        "i64" => ValType::I64,
         "f32" => ValType::F32,
         "f64" => ValType::F64,
-        "i64" => {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "WebAssembly.Tag i64 parameters need BigInt conversions, not supported in \
-                 Cut 10 wave 4 yet"
-                    .into(),
-            ));
-        }
         other => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1539,7 +1615,7 @@ fn exception_construct(
     }
     let mut engine_args = Vec::with_capacity(elements.len());
     for (element, param) in elements.iter().zip(&params) {
-        engine_args.push(wasm_arg(param, element)?);
+        engine_args.push(wasm_arg(agent, param, element)?);
     }
     let proto = instance_proto(agent, new_target, "%WebAssembly.Exception.prototype%")?;
     let object = JsObject::ordinary_object_create(proto);
@@ -1803,21 +1879,13 @@ fn global_cell(agent: &Agent, this: &Value) -> Result<usize, JsError> {
 }
 
 /// The `value` type of a Global descriptor: the numeric value types this cut
-/// converts (`i64` needs the BigInt conversion wave; references/v128 are not
-/// JS-API globals).
+/// converts (references/v128 are not JS-API globals).
 fn global_value_type(text: &str) -> Result<ValType, JsError> {
     Ok(match text {
         "i32" => ValType::I32,
+        "i64" => ValType::I64,
         "f32" => ValType::F32,
         "f64" => ValType::F64,
-        "i64" => {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "WebAssembly.Global i64 values need BigInt conversions, not supported in \
-                 Cut 10 wave 3b yet"
-                    .into(),
-            ));
-        }
         other => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1834,6 +1902,7 @@ fn global_value_type(text: &str) -> Result<ValType, JsError> {
 fn default_wasm_value(ty: &ValType) -> WasmValue {
     match ty {
         ValType::I32 => WasmValue::I32(0),
+        ValType::I64 => WasmValue::I64(0),
         ValType::F32 => WasmValue::F32(0),
         ValType::F64 => WasmValue::F64(0),
         _ => WasmValue::I32(0),
@@ -1881,7 +1950,7 @@ fn global_construct(
     let initial = if matches!(initial_value.kind(), ValueKind::Undefined) {
         default_wasm_value(&value_type)
     } else {
-        wasm_arg(&value_type, &initial_value)?
+        wasm_arg(agent, &value_type, &initial_value)?
     };
     let ty = wasm::types::GlobalType {
         value: value_type,
@@ -1923,6 +1992,7 @@ fn global_value_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         ));
     }
     let new_value = wasm_arg(
+        agent,
         &ty.value,
         &args.first().cloned().unwrap_or(Value::Undefined),
     )?;
@@ -1936,10 +2006,10 @@ fn global_value_of(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     global_value_get(agent, this)
 }
 
-/// A required `[EnforceRange] unsigned long` argument (table indices).
+/// A required `[EnforceRange] unsigned long` argument (table indices,
+/// exception payload indices): a whole number in [0, 2^32).
 fn u32_argument(value: &Value, what: &str) -> Result<u64, JsError> {
-    range_u32(value, what)?
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, format!("{what} is required")))
+    enforce_u32(value, what)
 }
 
 /// One JS table element → funcref: null, or an exported-wasm-function wrapper.
@@ -2011,18 +2081,20 @@ fn table_construct(
             ));
         }
     }
+    let address = descriptor_address(agent, &descriptor)?;
     let initial_value = crate::context::get_property(
         agent,
         &descriptor,
         &JsString::from_utf8("initial"),
         descriptor,
     )?;
-    let initial = range_u32(&initial_value, "Table initial")?.ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "Table requires an 'initial' length".into(),
-        )
-    })?;
+    let initial =
+        optional_pages(agent, address, &initial_value, "Table initial")?.ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Table requires an 'initial' length".into(),
+            )
+        })?;
     if initial > MAX_JS_TABLE_ELEMENTS {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -2035,7 +2107,7 @@ fn table_construct(
         &JsString::from_utf8("maximum"),
         descriptor,
     )?;
-    let maximum = range_u32(&maximum_value, "Table maximum")?;
+    let maximum = optional_pages(agent, address, &maximum_value, "Table maximum")?;
     if maximum.is_some_and(|maximum| maximum < initial) {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -2055,7 +2127,7 @@ fn table_construct(
             max: maximum,
             shared: false,
         },
-        table64: false,
+        table64: address == Address::I64,
     };
     let cell = agent
         .wasm_store
@@ -2073,21 +2145,40 @@ fn table_construct(
     Ok(Value::Object(object))
 }
 
-/// `get Table.prototype.length`: the table's current length.
+/// `get Table.prototype.length`: the table's current length (a BigInt for a
+/// table64 table).
 fn table_length(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let cell = table_cell(agent, this)?;
+    let table64 = agent
+        .wasm_store
+        .borrow()
+        .table_type(cell)
+        .map(|ty| ty.table64)
+        .unwrap_or(false);
     let size = agent
         .wasm_store
         .borrow()
         .table_size(cell)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "table cell vanished".into()))?;
-    Ok(Value::Number(size as f64))
+    if table64 {
+        Ok(Value::BigInt(Handle::new(crux::BigInt::from(size))))
+    } else {
+        Ok(Value::Number(size as f64))
+    }
 }
 
 /// `Table.prototype.get(index)`: the element at `index` (a function or null).
 fn table_get_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let cell = table_cell(agent, this)?;
-    let index = u32_argument(
+    let table64 = agent
+        .wasm_store
+        .borrow()
+        .table_type(cell)
+        .map(|ty| ty.table64)
+        .unwrap_or(false);
+    let index = required_pages(
+        agent,
+        if table64 { Address::I64 } else { Address::I32 },
         &args.first().cloned().unwrap_or(Value::Undefined),
         "table index",
     )?;
@@ -2103,7 +2194,15 @@ fn table_get_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
 /// `Table.prototype.set(index, value)`: store a function or null at `index`.
 fn table_set_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let cell = table_cell(agent, this)?;
-    let index = u32_argument(
+    let table64 = agent
+        .wasm_store
+        .borrow()
+        .table_type(cell)
+        .map(|ty| ty.table64)
+        .unwrap_or(false);
+    let index = required_pages(
+        agent,
+        if table64 { Address::I64 } else { Address::I32 },
         &args.first().cloned().unwrap_or(Value::Undefined),
         "table index",
     )?;
@@ -2118,11 +2217,23 @@ fn table_set_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
 }
 
 /// `Table.prototype.grow(delta, init)`: grow by `delta` slots (filled with
-/// `init`, null by default) and return the old length.
+/// `init`, null by default) and return the old length (a BigInt for a table64
+/// table).
 fn table_grow_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let cell = table_cell(agent, this)?;
+    let table64 = agent
+        .wasm_store
+        .borrow()
+        .table_type(cell)
+        .map(|ty| ty.table64)
+        .unwrap_or(false);
     let delta_value = args.first().cloned().unwrap_or(Value::Undefined);
-    let delta = grow_delta(&delta_value)?;
+    let delta = required_pages(
+        agent,
+        if table64 { Address::I64 } else { Address::I32 },
+        &delta_value,
+        "Table.grow delta",
+    )?;
     let fill_value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let fill = if matches!(fill_value.kind(), ValueKind::Undefined | ValueKind::Null) {
         RefValue::Null
@@ -2134,7 +2245,11 @@ fn table_grow_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result
         .borrow_mut()
         .grow_table(cell, delta, fill)
         .ok_or_else(|| JsError::new(ErrorKind::RangeError, "Unable to grow table".into()))?;
-    Ok(Value::Number(old as f64))
+    if table64 {
+        Ok(Value::BigInt(Handle::new(crux::BigInt::from(old))))
+    } else {
+        Ok(Value::Number(old as f64))
+    }
 }
 
 /// `new WebAssembly.Instance(module, imports)` (JS-API spec 4.3.1): compile
@@ -2185,8 +2300,6 @@ fn instantiate_module(
     proto: Option<Handle<JsObject>>,
 ) -> Result<Value, JsError> {
     let object = JsObject::ordinary_object_create(proto);
-    let realm = agent.current_realm()?;
-    let object_proto = object_proto(&realm);
 
     let needs_imports = !module.imports.is_empty();
     if needs_imports && matches!(imports_value.kind(), ValueKind::Undefined | ValueKind::Null) {
@@ -2238,10 +2351,12 @@ fn instantiate_module(
             .collect()
     };
 
-    // The exports object: one own data property per export. Function
-    // wrappers are memoized by engine function; memory/table/global exports
-    // get a fresh wrapper over the instance's cell. Store access ends here.
-    let exports = JsObject::ordinary_object_create(object_proto);
+    // The exports object: a null-prototype, non-extensible object with one
+    // non-writable, non-configurable, enumerable data property per export
+    // (the JS-API module-exports shape). Function wrappers are memoized by
+    // engine function; memory/table/global exports get a fresh wrapper over
+    // the instance's cell. Store access ends here.
+    let exports = JsObject::ordinary_object_create(None);
     for (name, value) in exported {
         let property_value = match value {
             wasm::ExternVal::Func { instance, index } => {
@@ -2258,8 +2373,9 @@ fn instantiate_module(
                 ));
             }
         };
-        define_data(&exports, &name, property_value, true, true, true)?;
+        define_data(&exports, &name, property_value, false, true, false)?;
     }
+    exports.prevent_extensions()?;
     let exports_value = Value::Object(exports);
     agent
         .wasm_instance_exports
@@ -2308,19 +2424,28 @@ fn function_wrapper(
         return Ok(*existing);
     }
     // Exported functions take the module function's parameter count as
-    // their `length`.
+    // their `length` and chain to %Function.prototype% (the JS-API only
+    // gives them WebAssembly.Function.prototype when `WebAssembly.Function`
+    // exists, which it does not in this engine). Their `name` is the
+    // function's index in the module's function index space (the same
+    // wrapper object is shared by every export name for the function).
     let length = agent
         .wasm_store
         .borrow()
         .func_params(instance, index)
         .map(|params| params.len() as u64)
         .unwrap_or(0);
+    let function_proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|value| as_object(&value));
     let function = Function::create_builtin(
-        Some(JsString::from_utf8(name)),
+        Some(JsString::from_utf8(&index.to_string())),
         length,
         placeholder(&format!("{name} export")),
         None,
-        None,
+        function_proto,
     )?;
     let id = function.id();
     agent.wasm_exports.insert(id, (instance, index));
@@ -2451,20 +2576,49 @@ fn build_imports(
                     }
                 }
             }
-            wasm::module::ImportDesc::Global(_) => {
-                let ValueKind::Object(object) = name_value.kind() else {
-                    return Err(link_failure(
-                        agent,
-                        &format!("import '{}' is not a WebAssembly.Global", import.name),
-                    )?);
+            wasm::module::ImportDesc::Global(declared) => {
+                // A `WebAssembly.Global` wrapper aliases its cell (the engine
+                // type-checks the match). Any other value is converted by the
+                // declared type and wrapped in a fresh *immutable* global
+                // (JS-API: a non-Global import value may only satisfy an
+                // immutable global import).
+                let wrapper_cell = match name_value.kind() {
+                    ValueKind::Object(object) => agent.wasm_globals.get(&object.id()).copied(),
+                    _ => None,
                 };
-                match agent.wasm_globals.get(&object.id()) {
-                    Some(cell) => wasm::ExternVal::Global(*cell),
-                    None => {
+                match wrapper_cell {
+                    Some(cell) => wasm::ExternVal::Global(cell),
+                    None if declared.mutable => {
                         return Err(link_failure(
                             agent,
                             &format!("import '{}' is not a WebAssembly.Global", import.name),
                         )?);
+                    }
+                    None => {
+                        // A non-Global value may only satisfy an immutable
+                        // global import, and only with the exact JS kind for
+                        // the value type (Number for i32/f32/f64, BigInt for
+                        // i64); anything else is a LinkError, not a TypeError.
+                        let kind_ok = match declared.value {
+                            ValType::I32 | ValType::F32 | ValType::F64 => {
+                                matches!(name_value.kind(), ValueKind::Number(_))
+                            }
+                            ValType::I64 => matches!(name_value.kind(), ValueKind::BigInt(_)),
+                            _ => false,
+                        };
+                        if !kind_ok {
+                            return Err(link_failure(
+                                agent,
+                                &format!("import '{}' is not a WebAssembly.Global", import.name),
+                            )?);
+                        }
+                        let value = wasm_arg(agent, &declared.value, &name_value)?;
+                        let ty = wasm::types::GlobalType {
+                            value: declared.value,
+                            mutable: false,
+                        };
+                        let cell = agent.wasm_store.borrow_mut().global(ty, value);
+                        wasm::ExternVal::Global(cell)
                     }
                 }
             }
@@ -2483,9 +2637,10 @@ fn build_imports(
     Ok(resolved)
 }
 
-/// One JS argument → wasm value (the numeric types convert; i64 needs the
-/// BigInt conversion wave, references/v128 are not JS-API values yet).
-fn wasm_arg(param: &ValType, value: &Value) -> Result<WasmValue, JsError> {
+/// One JS argument → wasm value. i64 converts through ToBigInt (wrapping
+/// modulo 2^64); the numeric types convert by ToNumber; references/v128 are
+/// not JS-API values yet.
+fn wasm_arg(agent: &mut Agent, param: &ValType, value: &Value) -> Result<WasmValue, JsError> {
     let unsupported = |name: &str| {
         JsError::new(
             ErrorKind::TypeError,
@@ -2497,7 +2652,10 @@ fn wasm_arg(param: &ValType, value: &Value) -> Result<WasmValue, JsError> {
             let number = to_number(value)?;
             WasmValue::I32(to_int32(number))
         }
-        ValType::I64 => return Err(unsupported("i64")),
+        ValType::I64 => {
+            let big = webidl_bigint(agent, value)?;
+            WasmValue::I64(big.to_i64_wrapping())
+        }
         ValType::F32 => {
             let number = to_number(value)? as f32;
             WasmValue::F32(number.to_bits())
@@ -2508,16 +2666,18 @@ fn wasm_arg(param: &ValType, value: &Value) -> Result<WasmValue, JsError> {
     })
 }
 
-/// One wasm result value → JS (numeric types only this wave).
+/// One wasm result value → JS (i64 becomes a BigInt; the numeric types are
+/// numbers).
 fn wasm_result(value: WasmValue) -> Result<Value, JsError> {
     Ok(match value {
         WasmValue::I32(v) => Value::Number(f64::from(v)),
+        WasmValue::I64(v) => Value::BigInt(Handle::new(crux::BigInt::from(v))),
         WasmValue::F32(bits) => Value::Number(f64::from(f32::from_bits(bits))),
         WasmValue::F64(bits) => Value::Number(f64::from_bits(bits)),
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
-                "wasm i64/reference results are not supported yet (Cut 10 wave 3b)".into(),
+                "wasm v128/reference results are not supported yet (Cut 10 wave 3b)".into(),
             ));
         }
     })
@@ -2601,7 +2761,7 @@ fn invoke_export(
     let mut wasm_args = Vec::with_capacity(args.len());
     for (position, argument) in args.iter().enumerate() {
         let param = ty.params.get(position).cloned().unwrap_or(ValType::I32);
-        wasm_args.push(wasm_arg(&param, argument)?);
+        wasm_args.push(wasm_arg(agent, &param, argument)?);
     }
     memory_buffers_to_store(agent)?;
     let mut progress = {
@@ -2643,7 +2803,7 @@ fn invoke_export(
                     Ok((value, fty)) => {
                         let mut wasm_results = Vec::new();
                         if let Some(result_type) = fty.results.first() {
-                            wasm_results.push(wasm_arg(result_type, &value)?);
+                            wasm_results.push(wasm_arg(agent, result_type, &value)?);
                         }
                         progress = {
                             let mut store = agent.wasm_store.borrow_mut();
@@ -3024,6 +3184,45 @@ mod tests {
     }
 
     #[test]
+    fn memory64_and_table64_index_objects() {
+        // Memory64/table64 descriptors (`address: "i64"`) use BigInt page
+        // counts and grow deltas; grow returns a BigInt. Grow/limit argument
+        // errors are TypeErrors (WebIDL EnforceRange), exceeding a maximum a
+        // RangeError; i32-address grow rejects BigInts and out-of-range
+        // Numbers with a TypeError.
+        let mut context = Context::new().unwrap();
+        eval_true(
+            &mut context,
+            concat!(
+                "(function(){",
+                " const m = new WebAssembly.Memory({ address: 'i64', initial: 1n, maximum: 3n });",
+                " if (m.buffer.byteLength !== 65536) return false;",
+                " if (m.grow(1n) !== 1n) return false;",
+                " if (m.buffer.byteLength !== 131072) return false;",
+                " try { m.grow(4n); return false; } catch (e) { if (!(e instanceof RangeError)) return false; }",
+                " try { m.grow(-1n); return false; } catch (e) { if (!(e instanceof TypeError)) return false; }",
+                " try { m.grow(2); return false; } catch (e) { if (!(e instanceof TypeError)) return false; }",
+                " const t = new WebAssembly.Table({ element: 'funcref', address: 'i64', initial: 2n });",
+                " if (t.length !== 2n) return false;",
+                " if (t.get(0n) !== null) return false;",
+                " if (t.grow(1n) !== 2n) return false;",
+                " if (t.length !== 3n) return false;",
+                " try { t.set(0n, 42); return false; } catch (e) { if (!(e instanceof TypeError)) return false; }",
+                " try { t.get(3n); return false; } catch (e) { if (!(e instanceof RangeError)) return false; }",
+                " try { new WebAssembly.Table({ element: 'funcref', address: 'i64', initial: 2n, maximum: 1n }); return false; }",
+                " catch (e) { if (!(e instanceof RangeError)) return false; }",
+                " try { new WebAssembly.Memory({ address: 'bogus', initial: 0 }); return false; }",
+                " catch (e) { if (!(e instanceof TypeError)) return false; }",
+                " const g32 = new WebAssembly.Memory({ initial: 0 });",
+                " try { g32.grow(); return false; } catch (e) { if (!(e instanceof TypeError)) return false; }",
+                " try { g32.grow(-1); return false; } catch (e) { if (!(e instanceof TypeError)) return false; }",
+                " try { g32.grow(1n); return false; } catch (e) { if (!(e instanceof TypeError)) return false; }",
+                " return true; })()"
+            ),
+        );
+    }
+
+    #[test]
     fn memory_export_roundtrips_bytes_with_wasm() {
         let mut context = Context::new().unwrap();
         let module = wat_module_bytes(concat!(
@@ -3151,8 +3350,14 @@ mod tests {
                 " try { im.value = { valueOf: function () { converted = true; return 2; } }; return false; }",
                 " catch (e) { if (!(e instanceof TypeError)) return false; }",
                 " if (converted || im.value !== 0) return false;",
-                " try { new WebAssembly.Global({ value: 'i64' }, 1n); return false; }",
-                " catch (e) { return e instanceof TypeError; }",
+                // i64 globals convert their initial value through ToBigInt.
+                " const big = new WebAssembly.Global({ value: 'i64' }, 1n);",
+                " if (big.value !== 1n || big.valueOf() !== 1n) return false;",
+                " const bigDefault = new WebAssembly.Global({ value: 'i64' });",
+                " if (bigDefault.value !== 0n) return false;",
+                " try { new WebAssembly.Global({ value: 'i64' }, 1); return false; }",
+                " catch (e) { if (!(e instanceof TypeError)) return false; }",
+                " return true;",
                 "})()"
             ),
         );
@@ -3551,7 +3756,12 @@ mod tests {
                 " try { e.getArg(tag, 1); return false; } catch (err) { if (!(err instanceof RangeError)) return false; }",
                 " try { new WebAssembly.Exception(tag, [1, 2]); return false; } catch (err) { if (!(err instanceof TypeError)) return false; }",
                 " try { new WebAssembly.Tag({}); return false; } catch (err) { if (!(err instanceof TypeError)) return false; }",
-                " try { new WebAssembly.Tag({ parameters: ['i64'] }); return false; } catch (err) { if (!(err instanceof TypeError)) return false; }",
+                // i64 tag parameters convert payloads through BigInt.
+                " const i64Tag = new WebAssembly.Tag({ parameters: ['i64'] });",
+                " const i64e = new WebAssembly.Exception(i64Tag, [42n]);",
+                " if (i64e.getArg(i64Tag, 0) !== 42n) return false;",
+                " try { new WebAssembly.Exception(i64Tag, [42]); return false; }",
+                " catch (err) { if (!(err instanceof TypeError)) return false; }",
                 " try { new WebAssembly.Exception({}, [1]); return false; } catch (err) { if (!(err instanceof TypeError)) return false; }",
                 " return true;",
                 "})()"

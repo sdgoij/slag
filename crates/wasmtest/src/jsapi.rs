@@ -46,14 +46,23 @@ const SHIM: &str = r#"
   function assert_unreached(description) {
     fail(description || "unreachable code was reached");
   }
+  // WPT's `assert_array_equals` compares array-likes (real arrays and typed
+  // arrays alike): both sides must have a numeric `length`, and elements are
+  // compared recursively when the expected element is itself array-like.
+  function array_like(x) {
+    return x !== null && typeof x === "object" && typeof x.length === "number";
+  }
   function assert_array_equals(actual, expected, description) {
-    if (Object.prototype.toString.call(actual) !== "[object Array]") {
-      fail((description ? description + ": " : "") + "expected an array, got " + Object.prototype.toString.call(actual));
+    if (!array_like(actual)) {
+      fail((description ? description + ": " : "") + "expected an array-like, got " + Object.prototype.toString.call(actual));
+    }
+    if (!array_like(expected)) {
+      fail((description ? description + ": " : "") + "expected an array-like");
     }
     assert_equals(actual.length, expected.length, description ? description + ": length" : "array length");
     for (var index = 0; index < expected.length; index++) {
       var expected_element = expected[index];
-      if (Array.isArray(expected_element)) {
+      if (array_like(expected_element)) {
         assert_array_equals(actual[index], expected_element, (description ? description + ": " : "") + "element " + index);
       } else {
         assert_equals(actual[index], expected_element, (description ? description + ": " : "") + "element " + index);

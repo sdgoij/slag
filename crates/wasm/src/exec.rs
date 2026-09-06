@@ -1075,6 +1075,16 @@ impl Store {
         self.global_types.get(cell).copied()
     }
 
+    /// A memory cell's declared type.
+    pub fn memory_type(&self, cell: usize) -> Option<MemType> {
+        self.memory_types.get(cell).copied()
+    }
+
+    /// A table cell's declared type.
+    pub fn table_type(&self, cell: usize) -> Option<TableType> {
+        self.table_types.get(cell).copied()
+    }
+
     /// A global cell's current value.
     pub fn global_value(&self, cell: usize) -> Option<Value> {
         self.globals.get(cell).copied()

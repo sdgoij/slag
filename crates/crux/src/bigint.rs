@@ -48,6 +48,23 @@ impl BigInt {
         self.0.sign() == num_bigint::Sign::NoSign
     }
 
+    /// The value's low 64 bits as a signed i64 (wrapping modulo 2^64): the
+    /// JS-API conversion of a BigInt to a wasm i64 value.
+    pub fn to_i64_wrapping(&self) -> i64 {
+        let wrapped = as_int_n(self, 64);
+        // as_int_n(x, 64) always lands in [-2^63, 2^63), so the decimal
+        // expansion parses back to an exact i64.
+        to_string(&wrapped, 10)
+            .parse()
+            .expect("as_int_n(64) always fits in an i64")
+    }
+
+    /// The value as a u64 when it lies in [0, 2^64); `None` for a negative
+    /// or `>= 2^64` value (the JS-API memory64/table64 page-count range).
+    pub fn to_u64(&self) -> Option<u64> {
+        num_traits::ToPrimitive::to_u64(&self.0)
+    }
+
     /// Correctly rounded `f64` conversion; the exact decimal expansion is a
     /// valid, correctly parsed float literal.
     pub fn to_f64(&self) -> f64 {
