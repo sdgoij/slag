@@ -81,6 +81,30 @@ impl std::fmt::Display for InstantiateError {
     }
 }
 
+/// A host call the resumable driver must resolve: an *external* host function
+/// (registered by [`Store::external_host`] — a JS-API function import) was
+/// called from running wasm. The driver runs the embedder's function with
+/// `args` while the store is not borrowed, then hands the results back to
+/// [`Store::resume`].
+#[derive(Debug)]
+pub struct HostRequest {
+    /// The token [`Store::external_host`] was registered with; the JS-API
+    /// maps it back to the JS function it wraps.
+    pub token: u64,
+    /// The function's arguments, in parameter order.
+    pub args: Vec<Value>,
+}
+
+/// What a resumable run produced at its next host-call boundary (or the
+/// end).
+#[derive(Debug)]
+pub enum RunProgress {
+    /// The invocation finished with these results.
+    Finished(Vec<Value>),
+    /// The invocation needs an external host call (see [`HostRequest`]).
+    Host(HostRequest),
+}
+
 /// Default call-depth budget (the corpus's `assert_exhaustion` expects a
 /// bounded stack).
 pub const DEFAULT_DEPTH_LIMIT: usize = 4096;
@@ -233,10 +257,13 @@ enum FuncTarget {
     Owned { instance: usize, defined: usize },
 }
 
-/// A host function: the engine has no host bodies, only signatures (spectest
-/// `print*` return nothing).
+/// A host function: the spectest `print*` family is type-only (no body, no
+/// results), while the JS-API's function imports are *external* — their
+/// results come from the embedder when a resumable run reaches a
+/// [`HostRequest`].
 struct HostFunc {
     ty: FuncType,
+    token: Option<u64>,
 }
 
 /// A module instance: the module (code, types, exports) plus its index
@@ -271,6 +298,9 @@ pub struct Store {
     /// Live GC struct/array objects; ids double as `RefValue::Struct/Array`
     /// payloads.
     objects: Vec<GcObject>,
+    /// Runs suspended at an external-host-call boundary, innermost last
+    /// ([`Store::start`] parks here; [`Store::resume`] pops and continues).
+    suspended: Vec<Suspended>,
 }
 
 impl Default for Store {
@@ -293,13 +323,34 @@ impl Store {
             tags: Vec::new(),
             exceptions: Vec::new(),
             objects: Vec::new(),
+            suspended: Vec::new(),
         }
     }
 
-    /// Register a host function (spectest `print*` family); returns its id.
+    /// Register a type-only host function (spectest `print*` family); returns
+    /// its id.
     pub fn host_func(&mut self, ty: FuncType) -> usize {
-        self.host_funcs.push(HostFunc { ty });
+        self.host_funcs.push(HostFunc { ty, token: None });
         self.host_funcs.len() - 1
+    }
+
+    /// Register an *external* host function — one whose results the caller of
+    /// a resumable run supplies via [`Store::resume`]. The JS-API registers a
+    /// JS closure import this way, keyed by an embedder `token`. Returns its
+    /// id.
+    pub fn external_host(&mut self, ty: FuncType, token: u64) -> usize {
+        self.host_funcs.push(HostFunc {
+            ty,
+            token: Some(token),
+        });
+        self.host_funcs.len() - 1
+    }
+
+    /// Register a standalone tag cell (a JS-API `WebAssembly.Tag`); returns
+    /// its id. The payload shape is the tag's function type (parameters only).
+    pub fn tag(&mut self, ty: FuncType) -> usize {
+        self.tags.push(TagInst { ty });
+        self.tags.len() - 1
     }
 
     /// Register a standalone global cell (spectest values); returns its id.
@@ -747,6 +798,9 @@ impl Store {
     }
 
     /// Invoke function `index` (full index space) of `instance` with `args`.
+    /// Non-resumable: an external host function reached mid-run (possible only
+    /// when a module imported a JS-API closure) fails as unsupported here —
+    /// the JS-API uses [`Store::start`]/[`Store::resume`] instead.
     pub fn invoke(
         &mut self,
         instance: usize,
@@ -761,10 +815,85 @@ impl Store {
         self.run_target(target, args)
     }
 
+    /// Start a resumable invocation of function `index` (full index space) of
+    /// `instance` with `args`, running until the next external-host-call
+    /// boundary or completion. A [`RunProgress::Host`] result parks the run
+    /// inside the store; the caller runs the embedder host function with the
+    /// store unborrowed and passes its results to [`Store::resume`]. Reentrant
+    /// invocations simply nest: each suspension pushes, each resume pops.
+    pub fn start(
+        &mut self,
+        instance: usize,
+        index: usize,
+        args: &[Value],
+    ) -> Result<RunProgress, ExecFail> {
+        let target = *self
+            .instances
+            .get(instance)
+            .and_then(|i| i.funcs.get(index))
+            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        self.start_target(target, args)
+    }
+
+    /// Resume the most recently suspended run with an external host function's
+    /// results (or an error, which abandons that run and propagates).
+    pub fn resume(&mut self, reply: Result<Vec<Value>, ExecFail>) -> Result<RunProgress, ExecFail> {
+        let suspended = self
+            .suspended
+            .pop()
+            .ok_or(ExecFail::Unsupported("resume without a suspended run"))?;
+        let results = reply?;
+        let mut engine = Engine {
+            store: self,
+            stack: suspended.stack,
+            frames: suspended.frames,
+        };
+        engine.stack.extend(results);
+        engine.run()
+    }
+
+    /// Discard the most recently suspended run (its external host function
+    /// threw and the caller abandons the invocation it was part of). Returns
+    /// whether there was a run to discard.
+    pub fn abandon(&mut self) -> bool {
+        self.suspended.pop().is_some()
+    }
+
+    /// Resume the most recently suspended run with an in-flight exception
+    /// instead of host results: the exception unwinds inside wasm (a matching
+    /// `try_table` catches it, or it escapes to this caller as
+    /// [`ExecFail::Exception`]). Used when an imported JS function throws a
+    /// `WebAssembly.Exception` whose tag the wasm frames can catch.
+    pub fn resume_exception(&mut self, exn: usize) -> Result<RunProgress, ExecFail> {
+        let suspended = self
+            .suspended
+            .pop()
+            .ok_or(ExecFail::Unsupported("resume without a suspended run"))?;
+        let mut engine = Engine {
+            store: self,
+            stack: suspended.stack,
+            frames: suspended.frames,
+        };
+        // No wasm frames are left to catch (a top-level external-host call or
+        // an outermost tail call): the exception escapes immediately.
+        if engine.frames.is_empty() {
+            return Err(ExecFail::Exception(exn));
+        }
+        match engine.unwind(exn)? {
+            Some(results) => Ok(RunProgress::Finished(results)),
+            None => engine.run(),
+        }
+    }
+
     fn run_target(&mut self, target: FuncTarget, args: &[Value]) -> Result<Vec<Value>, ExecFail> {
         match target {
             FuncTarget::Owned { instance, defined } => self.run_owned(instance, defined, args),
             FuncTarget::Host(id) => {
+                if self.host_funcs[id].token.is_some() {
+                    return Err(ExecFail::Unsupported(
+                        "external host function needs a resumable run",
+                    ));
+                }
                 let ty = self.host_funcs[id].ty.clone();
                 if ty.params.len() != args.len() {
                     return Err(ExecFail::Unsupported("host function arity"));
@@ -777,6 +906,43 @@ impl Store {
         }
     }
 
+    /// Start a resumable run against `target`. An external host target parks
+    /// an empty run so [`Store::resume`] delivers its results directly as the
+    /// invocation's; a type-only host target finishes immediately.
+    fn start_target(
+        &mut self,
+        target: FuncTarget,
+        args: &[Value],
+    ) -> Result<RunProgress, ExecFail> {
+        match target {
+            FuncTarget::Owned { instance, defined } => self.start_owned(instance, defined, args),
+            FuncTarget::Host(id) => {
+                let ty = self.host_funcs[id].ty.clone();
+                if ty.params.len() != args.len() {
+                    return Err(ExecFail::Unsupported("host function arity"));
+                }
+                match self.host_funcs[id].token {
+                    Some(token) => {
+                        self.suspended.push(Suspended {
+                            stack: Vec::new(),
+                            frames: Vec::new(),
+                        });
+                        Ok(RunProgress::Host(HostRequest {
+                            token,
+                            args: args.to_vec(),
+                        }))
+                    }
+                    None => {
+                        if !ty.results.is_empty() {
+                            return Err(ExecFail::Unsupported("host function results"));
+                        }
+                        Ok(RunProgress::Finished(Vec::new()))
+                    }
+                }
+            }
+        }
+    }
+
     /// Run a module-defined function by its index into `Module::bodies`.
     fn run_owned(
         &mut self,
@@ -784,6 +950,28 @@ impl Store {
         defined: usize,
         args: &[Value],
     ) -> Result<Vec<Value>, ExecFail> {
+        match self.start_owned(instance, defined, args)? {
+            RunProgress::Finished(results) => Ok(results),
+            // A non-resumable caller reached an external host function (only
+            // possible through an instance start function): discard the parked
+            // run and report the limitation.
+            RunProgress::Host(_) => {
+                self.suspended.pop();
+                Err(ExecFail::Unsupported(
+                    "external host function in a non-resumable run",
+                ))
+            }
+        }
+    }
+
+    /// Construct and run a root frame for `defined` of `instance`, parking at
+    /// the next external-host boundary instead of failing.
+    fn start_owned(
+        &mut self,
+        instance: usize,
+        defined: usize,
+        args: &[Value],
+    ) -> Result<RunProgress, ExecFail> {
         let (signature, declared) = {
             let module = &self.instances[instance].module;
             let body = module
@@ -875,6 +1063,140 @@ impl Store {
             table64: declared.table64,
         }
     }
+
+    // ---- cell accessors for the JS-API wrapper objects (Cut 10 wave 3b) ----
+    //
+    // The runtime's `WebAssembly.Memory`/`Table`/`Global` wrappers hold these
+    // store cell ids and read/write the shared cells through this surface so
+    // imports alias the exporter's state.
+
+    /// A global cell's declared type.
+    pub fn global_type(&self, cell: usize) -> Option<GlobalType> {
+        self.global_types.get(cell).copied()
+    }
+
+    /// A global cell's current value.
+    pub fn global_value(&self, cell: usize) -> Option<Value> {
+        self.globals.get(cell).copied()
+    }
+
+    /// Overwrite a global cell. The caller is responsible for checking
+    /// mutability and value-type compatibility first.
+    pub fn set_global(&mut self, cell: usize, value: Value) -> bool {
+        match self.globals.get_mut(cell) {
+            Some(slot) => {
+                *slot = value;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A tag cell's declared payload type.
+    pub fn tag_type(&self, cell: usize) -> Option<FuncType> {
+        self.tags.get(cell).map(|tag| tag.ty.clone())
+    }
+
+    /// Allocate a thrown exception instance carrying `tag`'s payload `args`;
+    /// returns the exception id an escaping run reports. Used both by the
+    /// interpreter's `throw` and by the JS-API when a JS-thrown
+    /// `WebAssembly.Exception` enters wasm.
+    pub fn new_exception(&mut self, tag: usize, args: Vec<Value>) -> usize {
+        self.exceptions.push(ExceptionInst { tag, args });
+        self.exceptions.len() - 1
+    }
+
+    /// The tag cell an exception instance was thrown with.
+    pub fn exception_tag(&self, id: usize) -> Option<usize> {
+        self.exceptions.get(id).map(|exception| exception.tag)
+    }
+
+    /// The payload of an exception instance.
+    pub fn exception_args(&self, id: usize) -> Option<Vec<Value>> {
+        self.exceptions
+            .get(id)
+            .map(|exception| exception.args.clone())
+    }
+
+    /// A memory cell's current size in pages.
+    pub fn memory_size(&self, cell: usize) -> Option<u64> {
+        self.memories.get(cell).map(Memory::pages)
+    }
+
+    /// Grow a memory cell by `delta` pages, enforcing the cell's declared
+    /// maximum (and the memory32 2^16-page cap); the old size in pages on
+    /// success.
+    pub fn grow_memory(&mut self, cell: usize, delta: u64) -> Option<u64> {
+        let memory64 = self.memory_types.get(cell)?.memory64;
+        self.memories.get_mut(cell)?.grow(delta, memory64)
+    }
+
+    /// A memory cell's current bytes (the whole linear memory).
+    pub fn memory_bytes(&self, cell: usize) -> Option<&[u8]> {
+        self.memories
+            .get(cell)
+            .map(|memory| memory.bytes.as_slice())
+    }
+
+    /// Overwrite a whole memory cell. The caller matches lengths; returns
+    /// false when the cell is unknown or the byte slice does not fill it.
+    pub fn write_memory(&mut self, cell: usize, bytes: &[u8]) -> bool {
+        match self.memories.get_mut(cell) {
+            Some(memory) if memory.bytes.len() == bytes.len() => {
+                memory.bytes.copy_from_slice(bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A table cell's current length.
+    pub fn table_size(&self, cell: usize) -> Option<u64> {
+        self.tables
+            .get(cell)
+            .map(|table| table.elements.len() as u64)
+    }
+
+    /// Read one table slot (an out-of-bounds index is a table-access trap).
+    pub fn table_get(&self, cell: usize, index: u64) -> Option<Result<RefValue, Trap>> {
+        let table = self.tables.get(cell)?;
+        Some(match table.elements.get(index as usize) {
+            Some(value) => Ok(*value),
+            None => Err(Trap::OutOfBoundsTableAccess),
+        })
+    }
+
+    /// Write one table slot (an out-of-bounds index is a table-access trap).
+    pub fn table_set(
+        &mut self,
+        cell: usize,
+        index: u64,
+        value: RefValue,
+    ) -> Option<Result<(), Trap>> {
+        let table = self.tables.get_mut(cell)?;
+        Some(match table.elements.get_mut(index as usize) {
+            Some(slot) => {
+                *slot = value;
+                Ok(())
+            }
+            None => Err(Trap::OutOfBoundsTableAccess),
+        })
+    }
+
+    /// Grow a table cell by `delta` slots, filling with `init`; the old
+    /// length on success (a 32-bit table caps at 2^32-1 slots).
+    pub fn grow_table(&mut self, cell: usize, delta: u64, init: RefValue) -> Option<u64> {
+        let table64 = self.table_types.get(cell)?.table64;
+        self.tables.get_mut(cell)?.grow(delta, init, table64)
+    }
+}
+
+/// One invocation parked at an external-host-call boundary: the operand and
+/// frame stacks exactly as the engine left them ([`Store::resume`] pops the
+/// entry, pushes the host results, and continues).
+struct Suspended {
+    stack: Vec<Value>,
+    frames: Vec<Frame>,
 }
 
 /// A function frame on the machine's call stack.
@@ -922,6 +1244,9 @@ enum Ctl {
     Settled,
     /// The whole invocation finished.
     Finished(Vec<Value>),
+    /// An external host function was called: the run must park and let the
+    /// resumable driver supply its results (`token`, `args`).
+    Host { token: u64, args: Vec<Value> },
 }
 
 /// Where an in-flight exception's unwind stopped.
@@ -1047,16 +1372,24 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Run until the outermost frame returns. A `throw`/`throw_ref` inside
-    /// any frame becomes an in-flight exception that unwinds to the nearest
-    /// matching `try_table` catch clause (across call frames); only an
-    /// exception no handler matches reaches the caller of `run`.
-    fn run(&mut self) -> Result<Vec<Value>, ExecFail> {
+    /// Run until the outermost frame returns (or an external host function is
+    /// reached, parking the run so the resumable driver can supply its
+    /// results). A `throw`/`throw_ref` inside any frame becomes an in-flight
+    /// exception that unwinds to the nearest matching `try_table` catch
+    /// clause (across call frames); only an exception no handler matches
+    /// reaches the caller of `run`.
+    fn run(&mut self) -> Result<RunProgress, ExecFail> {
         loop {
+            // A parked run with no frames left (a top-level external-host
+            // invocation, or an outermost tail call to one) is done: the
+            // operand stack holds the results.
+            if self.frames.is_empty() {
+                return Ok(RunProgress::Finished(self.stack.split_off(0)));
+            }
             let ctl = match self.step() {
                 Ok(ctl) => ctl,
                 Err(ExecFail::Exception(exn)) => match self.unwind(exn)? {
-                    Some(results) => return Ok(results),
+                    Some(results) => return Ok(RunProgress::Finished(results)),
                     None => continue,
                 },
                 Err(error) => return Err(error),
@@ -1067,7 +1400,14 @@ impl<'a> Engine<'a> {
                     self.frames[top].pc += 1;
                 }
                 Ctl::Settled => {}
-                Ctl::Finished(results) => return Ok(results),
+                Ctl::Finished(results) => return Ok(RunProgress::Finished(results)),
+                Ctl::Host { token, args } => {
+                    self.store.suspended.push(Suspended {
+                        stack: std::mem::take(&mut self.stack),
+                        frames: std::mem::take(&mut self.frames),
+                    });
+                    return Ok(RunProgress::Host(HostRequest { token, args }));
+                }
             }
         }
     }
@@ -1251,26 +1591,17 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Settled)
             }
             Instr::Return => self.finish(),
-            Instr::Call(index) => {
-                self.do_call(index as usize)?;
-                Ok(Ctl::Settled)
-            }
+            Instr::Call(index) => self.do_call(index as usize),
             Instr::ReturnCall(index) => self.do_tail_call(index as usize),
             Instr::CallIndirect {
                 type_index,
                 table_index,
-            } => {
-                self.call_indirect(type_index as usize, table_index as usize)?;
-                Ok(Ctl::Settled)
-            }
+            } => self.call_indirect(type_index as usize, table_index as usize),
             Instr::ReturnCallIndirect {
                 type_index,
                 table_index,
             } => self.return_call_indirect(type_index as usize, table_index as usize),
-            Instr::CallRef(type_index) => {
-                self.call_ref(type_index as usize)?;
-                Ok(Ctl::Settled)
-            }
+            Instr::CallRef(type_index) => self.call_ref(type_index as usize),
             Instr::ReturnCallRef(type_index) => self.return_call_ref(type_index as usize),
             Instr::Drop => {
                 self.pop()?;
@@ -2738,7 +3069,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn call_indirect(&mut self, type_index: usize, table_index: usize) -> Result<(), ExecFail> {
+    fn call_indirect(&mut self, type_index: usize, table_index: usize) -> Result<Ctl, ExecFail> {
         let frame_index = self.frames.len() - 1;
         let index = self.pop_table_addr(frame_index, table_index)?;
         let instance = self.frames[frame_index].instance;
@@ -2799,7 +3130,7 @@ impl<'a> Engine<'a> {
         self.tail_target(target)
     }
 
-    fn call_ref(&mut self, type_index: usize) -> Result<(), ExecFail> {
+    fn call_ref(&mut self, type_index: usize) -> Result<Ctl, ExecFail> {
         let address = self.pop_func_ref()?;
         let frame_index = self.frames.len() - 1;
         let instance = self.frames[frame_index].instance;
@@ -2850,16 +3181,31 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Call `target` from the top frame: pop its arguments, push its frame (or
-    /// run the host body), and advance past the call.
-    fn call_target(&mut self, target: FuncTarget) -> Result<(), ExecFail> {
+    /// Call `target` from the top frame: pop its arguments, push its frame,
+    /// run a type-only host body, or suspend for an external host call — and
+    /// advance past the call.
+    fn call_target(&mut self, target: FuncTarget) -> Result<Ctl, ExecFail> {
         let caller = self.frames.len() - 1;
         match target {
             FuncTarget::Host(id) => {
-                self.call_host(id)?;
-                let caller = self.frames.len() - 1;
-                self.frames[caller].pc += 1;
-                Ok(())
+                let ty = self.store.host_funcs[id].ty.clone();
+                match self.store.host_funcs[id].token {
+                    Some(token) => {
+                        let mut args = Vec::with_capacity(ty.params.len());
+                        for _ in 0..ty.params.len() {
+                            args.push(self.pop()?);
+                        }
+                        args.reverse();
+                        self.frames[caller].pc += 1;
+                        Ok(Ctl::Host { token, args })
+                    }
+                    None => {
+                        self.call_host(id)?;
+                        let caller = self.frames.len() - 1;
+                        self.frames[caller].pc += 1;
+                        Ok(Ctl::Settled)
+                    }
+                }
             }
             FuncTarget::Owned {
                 instance: own,
@@ -2910,13 +3256,13 @@ impl<'a> Engine<'a> {
                         open: 0,
                     }],
                 });
-                Ok(())
+                Ok(Ctl::Settled)
             }
         }
     }
 
     /// Make a (direct, non-tail) call from the top frame.
-    fn do_call(&mut self, index: usize) -> Result<(), ExecFail> {
+    fn do_call(&mut self, index: usize) -> Result<Ctl, ExecFail> {
         let caller = self.frames.len() - 1;
         let instance = self.frames[caller].instance;
         if self.frames.len() + 1 > self.store.instances[instance].depth_limit {
@@ -2939,13 +3285,32 @@ impl<'a> Engine<'a> {
         match target {
             FuncTarget::Host(id) => {
                 let ty = self.store.host_funcs[id].ty.clone();
-                if !ty.results.is_empty() {
-                    return Err(ExecFail::Unsupported("host function results"));
+                match self.store.host_funcs[id].token {
+                    Some(token) => {
+                        let mut args = Vec::with_capacity(ty.params.len());
+                        for _ in 0..ty.params.len() {
+                            args.push(self.pop()?);
+                        }
+                        args.reverse();
+                        // The tail-called frame ends now: its results will be
+                        // the host reply, delivered to its caller (or, for the
+                        // outermost frame, as the invocation's results) when
+                        // the run resumes.
+                        let base = self.frames[top].base;
+                        self.stack.truncate(base);
+                        self.frames.pop();
+                        Ok(Ctl::Host { token, args })
+                    }
+                    None => {
+                        if !ty.results.is_empty() {
+                            return Err(ExecFail::Unsupported("host function results"));
+                        }
+                        for _ in 0..ty.params.len() {
+                            self.pop()?;
+                        }
+                        self.finish()
+                    }
                 }
-                for _ in 0..ty.params.len() {
-                    self.pop()?;
-                }
-                self.finish()
             }
             FuncTarget::Owned {
                 instance: own,

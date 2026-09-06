@@ -8,6 +8,7 @@ license.workspace = true
 crux = { path = "../crux" }
 lexer = { path = "../lexer" }
 parser = { path = "../parser" }
+wasm = { path = "../wasm" }
 # Trimmed raylib build. Keep `SUPPORT_WINMM_HIGHRES_TIMER`: without it,
 # raylib's Windows frame limiter uses the ~15.6ms Sleep granularity and
 # `SetTargetFPS(60)` paces at ~30ms/frame instead of 16.6.
@@ -50,3 +51,8 @@ raylib = ["dep:raylib-sys"]
 # raylib.rs. Implies `raylib`; a raygui build without the window/drawing
 # surface would have nothing to attach controls to.
 raygui = ["raylib", "raylib-sys/raygui"]
+
+[dev-dependencies]
+# Compile `.wat` module text to wasm bytes for the JS-API tests (the same
+# in-process encoder wasmtest uses for the conformance corpus).
+wast = { version = "258.0.0", default-features = false, features = ["wasm-module"] }

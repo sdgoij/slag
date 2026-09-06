@@ -33,4 +33,5 @@ pub mod string;
 pub mod symbol;
 pub mod temporal;
 pub mod typed_array;
+pub mod wasm;
 pub mod weakref;

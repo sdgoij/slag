@@ -733,6 +733,56 @@ pub struct Agent {
     /// identity (read by the `%Error.prototype.stack%` accessor; the property
     /// itself is not an own data property, spec 20.5.3.4).
     pub error_stack: std::collections::HashMap<u64, crux::string::JsString>,
+    /// The compiled module of `WebAssembly.Module` instances, keyed by object
+    /// identity (JS-API spec: the [[Module]] internal slot; Wave 2 of Cut 10).
+    pub wasm_modules: std::collections::HashMap<u64, wasm::Module>,
+    /// The shared wasm engine store every `WebAssembly.Instance` in this
+    /// agent instantiates into (so imports alias cells across instances).
+    pub wasm_store: std::cell::RefCell<wasm::Store>,
+    /// Exported-function wrappers: function id -> engine (instance, index).
+    pub wasm_exports: std::collections::HashMap<u64, (usize, usize)>,
+    /// The prebuilt `exports` object of each Instance, keyed by instance
+    /// object identity (read by the `exports` accessor).
+    pub wasm_instance_exports: std::collections::HashMap<u64, Value>,
+    /// One JS wrapper per engine function (instance, index), so a function
+    /// surfaced through several exports or table slots keeps object identity
+    /// (JS-API [[FuncObj]] memoization; Cut 10 wave 3b).
+    pub wasm_func_objects: std::collections::HashMap<(usize, usize), Value>,
+    /// The memory-cell registry of `WebAssembly.Memory` wrapper objects:
+    /// wrapper object id -> engine store cell (Cut 10 wave 3b).
+    pub wasm_memories: std::collections::HashMap<u64, usize>,
+    /// The live ArrayBuffer of each engine memory cell that has materialized
+    /// one: cell -> buffer. `Memory.prototype.buffer` returns the same object
+    /// until a grow detaches it, and the cell's bytes are bridged into it at
+    /// every JS<->wasm call boundary.
+    pub wasm_memory_buffers: std::collections::HashMap<usize, Value>,
+    /// The table-cell registry of `WebAssembly.Table` wrapper objects: wrapper
+    /// object id -> engine store cell (Cut 10 wave 3b).
+    pub wasm_tables: std::collections::HashMap<u64, usize>,
+    /// The global-cell registry of `WebAssembly.Global` wrapper objects:
+    /// wrapper object id -> engine store cell (Cut 10 wave 3b).
+    pub wasm_globals: std::collections::HashMap<u64, usize>,
+    /// The JS functions backing the agent's *external* engine host functions
+    /// (raw JS closures imported into a module), keyed by the token handed to
+    /// `Store::external_host`, with the function type the engine matched.
+    pub wasm_host_functions: std::collections::HashMap<u64, (Value, wasm::types::FuncType)>,
+    /// The next external-host token (monotonic within the agent).
+    pub wasm_host_seq: u64,
+    /// The tag-cell registry of `WebAssembly.Tag` wrapper objects: wrapper
+    /// object id -> engine store cell (Cut 10 wave 4).
+    pub wasm_tags: std::collections::HashMap<u64, usize>,
+    /// One `WebAssembly.Tag` wrapper per engine tag cell, memoized so a tag
+    /// surfaced through a constructor, an import, or several exports keeps
+    /// object identity (Cut 10 wave 4).
+    pub wasm_tag_objects: std::collections::HashMap<usize, Value>,
+    /// The payload of `WebAssembly.Exception` objects, keyed by object id:
+    /// the exception's tag cell and its arguments as engine values (Cut 10
+    /// wave 4).
+    pub wasm_exceptions: std::collections::HashMap<u64, (usize, Vec<wasm::Value>)>,
+    /// JS exception values that entered wasm through an imported function and
+    /// escaped uncaught: engine exception id -> the original JS value, so the
+    /// boundary rethrows it with identity preserved (Cut 10 wave 4).
+    pub wasm_js_exceptions: std::collections::HashMap<usize, Value>,
     /// [[WeakRefTarget]] of WeakRef instances, keyed by object identity
     /// (spec 26.1.1: the target is held weakly — `deref` returns it while it
     /// is reachable, `undefined` once a collection clears it; GC-4).
@@ -1001,6 +1051,21 @@ impl Agent {
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
             error_stack: std::collections::HashMap::new(),
+            wasm_modules: std::collections::HashMap::new(),
+            wasm_store: std::cell::RefCell::new(wasm::Store::new()),
+            wasm_exports: std::collections::HashMap::new(),
+            wasm_instance_exports: std::collections::HashMap::new(),
+            wasm_func_objects: std::collections::HashMap::new(),
+            wasm_memories: std::collections::HashMap::new(),
+            wasm_memory_buffers: std::collections::HashMap::new(),
+            wasm_tables: std::collections::HashMap::new(),
+            wasm_globals: std::collections::HashMap::new(),
+            wasm_host_functions: std::collections::HashMap::new(),
+            wasm_host_seq: 0,
+            wasm_tags: std::collections::HashMap::new(),
+            wasm_tag_objects: std::collections::HashMap::new(),
+            wasm_exceptions: std::collections::HashMap::new(),
+            wasm_js_exceptions: std::collections::HashMap::new(),
             weak_ref_targets: std::cell::RefCell::new(std::collections::HashMap::new()),
             kept_during_job: std::cell::RefCell::new(Vec::new()),
             pending_cleanup_jobs: std::cell::RefCell::new(Vec::new()),

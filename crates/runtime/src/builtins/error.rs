@@ -398,8 +398,10 @@ pub fn dispatch_construct(
 /// Error(native) constructors (spec 20.5.1.1, 20.5.6.1.1, 20.5.7.1,
 /// 20.5.8.1): a fresh [[ErrorData]] object whose prototype comes from
 /// GetPrototypeFromConstructor, with `message`, `cause`, `stack` (and
-/// `errors`/`error`/`suppressed` for the exotic shapes).
-fn error_construct(
+/// `errors`/`error`/`suppressed` for the exotic shapes). Also used by the
+/// WebAssembly error interfaces (`WebAssembly.CompileError` & co), whose
+/// prototypes chain to `%Error.prototype%`.
+pub(crate) fn error_construct(
     agent: &mut Agent,
     args: &[Value],
     new_target: Value,

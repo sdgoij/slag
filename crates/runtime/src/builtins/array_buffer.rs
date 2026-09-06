@@ -166,7 +166,7 @@ fn max_byte_length_option(agent: &mut Agent, options: &Value) -> Result<Option<u
 
 /// AllocateArrayBuffer (spec 25.1.2.2): the byte block plus the agent-side
 /// `BufferState` entry.
-fn allocate_array_buffer(
+pub(crate) fn allocate_array_buffer(
     agent: &mut Agent,
     object: &Handle<JsObject>,
     byte_length: usize,
@@ -254,7 +254,7 @@ fn allocate_shared_array_buffer(
 /// must be guarded by `IsDetachedBuffer`; the crux `SharedBuffer` carries
 /// the same flag so Integer-Indexed access from the object model rejects
 /// views too.
-fn detach_array_buffer(agent: &mut Agent, id: u64) {
+pub(crate) fn detach_array_buffer(agent: &mut Agent, id: u64) {
     if let Some(cell) = agent.buffer_data.get(&id) {
         let mut state = cell.borrow_mut();
         state.shared.mark_detached();

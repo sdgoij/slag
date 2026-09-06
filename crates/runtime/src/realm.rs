@@ -399,6 +399,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::date::install(realm)?;
     crate::builtins::symbol::install(realm)?;
     crate::builtins::error::install(realm)?;
+    crate::builtins::wasm::install(realm)?;
     crate::builtins::global::install(realm)?;
     crate::builtins::math::install(realm)?;
     crate::builtins::number::install(realm)?;

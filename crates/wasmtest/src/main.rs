@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod convert;
+mod jsapi;
 
 use serde_json::Value;
 use wasm::Value as WasmValue;
@@ -38,6 +39,10 @@ usage:
                                     converter (JSON + per-module .wasm/.wat)
   wasmtest run <wast|json|dir>...      convert (if needed) and run suites;
                                     exits nonzero when any suite reports a fail
+  wasmtest jsapi <file.js|dir>...     run the WebAssembly JS-API fixtures
+                                    (waspec/test/js-api) through the Slag
+                                    embed; exits nonzero when any fixture
+                                    reports a failing test
 
 run accepts several paths; a directory is walked recursively for `.wast`
 and `.json` files. Files listed in the exclusion manifest (default
@@ -97,6 +102,14 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
             run(&paths)
+        }
+        "jsapi" => {
+            let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
+            if paths.is_empty() {
+                eprintln!("wasmtest jsapi: missing path\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            jsapi::run(&paths)
         }
         _ => {
             eprintln!("unknown command {command:?}\n\n{USAGE}");
@@ -278,7 +291,7 @@ fn collect_run_items(path: &Path, out: &mut Vec<(PathBuf, bool)>) {
 /// The exclusion manifest: lines of `path :: reason` (blank lines and `#`
 /// comments ignored). Loaded from `$WASM_EXCLUSIONS` when set, otherwise the
 /// manifest shipped next to the runner.
-fn load_exclusions() -> Vec<(String, String)> {
+pub(crate) fn load_exclusions() -> Vec<(String, String)> {
     let path = std::env::var_os("WASM_EXCLUSIONS")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("crates/wasmtest/wasm-exclusions.txt"));
@@ -297,7 +310,7 @@ fn load_exclusions() -> Vec<(String, String)> {
 
 /// Whether `source` matches an exclusion-manifest key (by file name or by
 /// path suffix).
-fn excluded(source: &Path, exclusions: &[(String, String)]) -> Option<String> {
+pub(crate) fn excluded(source: &Path, exclusions: &[(String, String)]) -> Option<String> {
     let name = source
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())?;

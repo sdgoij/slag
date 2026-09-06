@@ -22,3 +22,9 @@ waspec/test/core/exceptions/tag.wast :: the `rec`-typed tag fixtures use GC type
 # `wast` grammar (and the decoder's single-supertype model) rejects; the rest
 # of the directory runs green as of Cut 9 wave 3.
 waspec/test/core/gc/type-subtyping.wast :: multi-supertype fixtures the `wast` grammar rejects (Cut 9)
+
+# JS-API fixtures (`wasmtest jsapi`). `limits.any.js` is the embedder-limit
+# conformance file (WPT marks it `timeout=long`): it builds and validates
+# million-element modules, which takes minutes or more in the debug engine
+# (which enforces no embedder limits); it is run on demand, not in a sweep.
+waspec/test/js-api/limits.any.js :: embedder-limit conformance builds 1M-element modules (WPT timeout=long); run on demand
