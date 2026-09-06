@@ -627,6 +627,20 @@ intrinsic identity like every other agent-dependent builtin.
   (106/106) and `constructor/instantiate-bad-imports.any.js` (212/212).
   Corpus: 990 tests pass / 100 fail (was 936/154), 38 fixture-files
   green of 53.
+- Wave 5 slice 11 (landed): wasm-exception reification and wrapper-identity
+  caching. An escaping tagged wasm exception now always reifies as a
+  `WebAssembly.Exception` — JS needs no `WebAssembly.Tag` wrapper for the
+  tag, so an internal tag that was neither imported nor exported surfaces
+  as one too (previously RuntimeError). `exception/basic.tentative.any.js`
+  is fully green (6/6). The JS-API wrapper memos now key on the underlying
+  engine identity rather than the surface: exported-function wrappers key
+  by the canonical engine function (`Store::func_key` resolves imported
+  aliases to their defining instance), and memory/table/global wrappers get
+  a per-cell memo registered by the constructors too — so a module
+  re-exporting a function/global/memory/table it imported surfaces the very
+  same JS objects the importer passed in. `instance/constructor-caching`
+  is green (1/1). Corpus: 994 tests pass / 96 fail (was 990/100), 40
+  fixture-files green of 53. Runtime suite: 725 tests pass.
 
 ## 6. Verification workflow
 

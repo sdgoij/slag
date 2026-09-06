@@ -1040,14 +1040,21 @@ fn memory_proto(agent: &Agent) -> Result<Handle<JsObject>, JsError> {
         })
 }
 
-/// A fresh `WebAssembly.Memory` wrapper object over engine cell `cell`, with
-/// the wrapper registered (object id -> cell) so the `buffer` accessor, the
-/// imports linking, and Instance exports share one registry.
+/// A `WebAssembly.Memory` wrapper object over engine cell `cell`: memoized
+/// per cell so a memory surfaced through a constructor, an import, or several
+/// exports keeps object identity, and registered (object id -> cell) so the
+/// `buffer` accessor, the imports linking, and Instance exports share one
+/// registry.
 fn memory_wrapper(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
+    if let Some(existing) = agent.wasm_memory_objects.get(&cell) {
+        return Ok(*existing);
+    }
     let proto = memory_proto(agent)?;
     let object = JsObject::ordinary_object_create(Some(proto));
     agent.wasm_memories.insert(object.id(), cell);
-    Ok(Value::Object(object))
+    let value = Value::Object(object);
+    agent.wasm_memory_objects.insert(cell, value);
+    Ok(value)
 }
 
 /// The engine cell of a `WebAssembly.Memory` receiver (the brand check shared
@@ -1287,7 +1294,9 @@ fn memory_construct(
     let proto = instance_proto(agent, new_target, "%WebAssembly.Memory.prototype%")?;
     let object = JsObject::ordinary_object_create(proto);
     agent.wasm_memories.insert(object.id(), cell);
-    Ok(Value::Object(object))
+    let value = Value::Object(object);
+    agent.wasm_memory_objects.insert(cell, value);
+    Ok(value)
 }
 
 /// `get Memory.prototype.buffer` (JS-API spec 4.4.2): the memory's current
@@ -1865,21 +1874,33 @@ fn js_string_text(text: &JsString) -> String {
     out
 }
 
-/// A fresh `WebAssembly.Table` wrapper over engine cell `cell`, registered so
-/// the prototype methods, imports, and Instance exports resolve it.
+/// A `WebAssembly.Table` wrapper over engine cell `cell`: memoized per cell
+/// (a constructor, an import, or several exports surface one object), and
+/// registered (object id -> cell) so the prototype methods, imports, and
+/// Instance exports resolve it.
 fn table_wrapper(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
+    if let Some(existing) = agent.wasm_table_objects.get(&cell) {
+        return Ok(*existing);
+    }
     let proto = table_proto(agent)?;
     let object = JsObject::ordinary_object_create(Some(proto));
     agent.wasm_tables.insert(object.id(), cell);
-    Ok(Value::Object(object))
+    let value = Value::Object(object);
+    agent.wasm_table_objects.insert(cell, value);
+    Ok(value)
 }
 
 /// A fresh `WebAssembly.Global` wrapper over engine cell `cell`.
 fn global_wrapper(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
+    if let Some(existing) = agent.wasm_global_objects.get(&cell) {
+        return Ok(*existing);
+    }
     let proto = global_proto(agent)?;
     let object = JsObject::ordinary_object_create(Some(proto));
     agent.wasm_globals.insert(object.id(), cell);
-    Ok(Value::Object(object))
+    let value = Value::Object(object);
+    agent.wasm_global_objects.insert(cell, value);
+    Ok(value)
 }
 
 /// The engine cell of a `WebAssembly.Table` receiver (the brand check).
@@ -2007,7 +2028,9 @@ fn global_construct(
     let proto = instance_proto(agent, new_target, "%WebAssembly.Global.prototype%")?;
     let object = JsObject::ordinary_object_create(proto);
     agent.wasm_globals.insert(object.id(), cell);
-    Ok(Value::Object(object))
+    let value = Value::Object(object);
+    agent.wasm_global_objects.insert(cell, value);
+    Ok(value)
 }
 
 /// `get Global.prototype.value`: the cell's current value converted to JS.
@@ -2224,7 +2247,9 @@ fn table_construct(
     let proto = instance_proto(agent, new_target, "%WebAssembly.Table.prototype%")?;
     let object = JsObject::ordinary_object_create(proto);
     agent.wasm_tables.insert(object.id(), cell);
-    Ok(Value::Object(object))
+    let value = Value::Object(object);
+    agent.wasm_table_objects.insert(cell, value);
+    Ok(value)
 }
 
 /// `get Table.prototype.length`: the table's current length (a BigInt for a
@@ -2481,8 +2506,10 @@ fn instantiate_module(
     // The exports object: a null-prototype, non-extensible object with one
     // non-writable, non-configurable, enumerable data property per export
     // (the JS-API module-exports shape). Function wrappers are memoized by
-    // engine function; memory/table/global exports get a fresh wrapper over
-    // the instance's cell. Store access ends here.
+    // canonical engine function; memory/table/global exports get the cell's
+    // memoized wrapper (constructor-, import-, or export-created), so an
+    // import/re-export chain surfaces one object per underlying cell. Store
+    // access ends here.
     let exports = JsObject::ordinary_object_create(None);
     for (name, value) in exported {
         let property_value = match value {
@@ -2538,16 +2565,22 @@ fn exported_function_target(agent: &Agent, value: &Value) -> Option<(usize, usiz
     agent.wasm_exports.get(&function.id()).copied()
 }
 
-/// One memoized JS wrapper per engine function: the same (instance, index)
-/// surfaced through instance exports and (later) table slots is one Function
-/// object, and stays importable by later instances.
+/// One memoized JS wrapper per engine function, keyed by the function's
+/// canonical [`wasm::FuncKey`]: the same function surfaced through instance
+/// exports, table slots, and import/re-export chains is one Function object
+/// (JS-API [[FuncObj]] memoization).
 fn function_wrapper(
     agent: &mut Agent,
     instance: usize,
     index: usize,
     name: &str,
 ) -> Result<Value, JsError> {
-    if let Some(existing) = agent.wasm_func_objects.get(&(instance, index)) {
+    let key = agent
+        .wasm_store
+        .borrow()
+        .func_key(instance, index)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "unknown wasm function".into()))?;
+    if let Some(existing) = agent.wasm_func_objects.get(&key) {
         return Ok(*existing);
     }
     // Exported functions take the module function's parameter count as
@@ -2577,7 +2610,7 @@ fn function_wrapper(
     let id = function.id();
     agent.wasm_exports.insert(id, (instance, index));
     let value = Value::Function(function);
-    agent.wasm_func_objects.insert((instance, index), value);
+    agent.wasm_func_objects.insert(key, value);
     Ok(value)
 }
 
@@ -2819,12 +2852,11 @@ fn wasm_result(agent: &Agent, value: WasmValue) -> Result<Value, JsError> {
 /// Call an exported wasm function from JS: flush the memory buffers in,
 /// convert the arguments by the function's declared type, run it in the
 /// agent's engine store, refresh the buffers, and convert the results back.
-/// Turn an engine run failure into a JS exception: wasm traps and exceptions
-/// whose tag JS cannot name surface as `WebAssembly.RuntimeError`; a wasm
-/// exception whose tag has a JS `WebAssembly.Tag` wrapper surfaces as a
-/// `WebAssembly.Exception`; an engine exception that re-entered wasm from a
-/// JS throw rethrows the original JS value; unsupported features stay
-/// TypeErrors.
+/// Turn an engine run failure into a JS exception: wasm traps surface as
+/// `WebAssembly.RuntimeError`; a tagged wasm exception reifies as a
+/// `WebAssembly.Exception` (its tag needs no JS wrapper); an engine exception
+/// that re-entered wasm from a JS throw rethrows the original JS value;
+/// unsupported features stay TypeErrors.
 fn run_failure(agent: &mut Agent, fail: wasm::ExecFail) -> Result<JsError, JsError> {
     let message = format!("{fail:?}");
     let runtime_error = |agent: &mut Agent, reason: &str| {
@@ -2851,21 +2883,15 @@ fn run_failure(agent: &mut Agent, fail: wasm::ExecFail) -> Result<JsError, JsErr
                 return Ok(JsError::new(ErrorKind::TypeError, message)
                     .with_value(runtime_error(agent, "wasm threw an unknown exception")?));
             };
-            // Only a tag JS knows (imported from a `WebAssembly.Tag` or
-            // exported as one) can surface as a `WebAssembly.Exception`;
-            // internal tags surface as RuntimeError.
-            if agent.wasm_tag_objects.contains_key(&cell) {
-                let args = args.unwrap_or_default();
-                let value = exception_object(agent, cell, args)?;
-                Ok(JsError::new(ErrorKind::TypeError, "wasm exception".into()).with_value(value))
-            } else {
-                Ok(
-                    JsError::new(ErrorKind::TypeError, message).with_value(runtime_error(
-                        agent,
-                        "wasm threw an exception with an internal tag",
-                    )?),
-                )
-            }
+            // Any tagged wasm exception reifies as a `WebAssembly.Exception`
+            // (JS-API): JS needs no `WebAssembly.Tag` wrapper for the tag — an
+            // internal tag that was neither imported nor exported is simply
+            // one JS cannot name, so `.is`/`.getArg` on the reified object
+            // stay usable only through a matching wrapper. Escaping
+            // untagged/unknown engine exceptions surface as RuntimeError.
+            let args = args.unwrap_or_default();
+            let value = exception_object(agent, cell, args)?;
+            Ok(JsError::new(ErrorKind::TypeError, "wasm exception".into()).with_value(value))
         }
         other => Ok(JsError::new(
             ErrorKind::TypeError,
@@ -3962,6 +3988,27 @@ mod tests {
                 own_tag = own_tag,
             ),
         );
+        // A module-private tag (declared but neither imported nor exported)
+        // still reifies as a WebAssembly.Exception when its throw escapes:
+        // JS needs no Tag wrapper to catch it as one.
+        let private_tag = wat_module_bytes(concat!(
+            "(module",
+            "  (tag $t (param i32))",
+            "  (func (export \"run\") (param i32)",
+            "    local.get 0",
+            "    throw $t))"
+        ));
+        eval_true(
+            &mut context,
+            &format!(
+                concat!(
+                    "(function(){{ const i = new WebAssembly.Instance(new Uint8Array({private_tag}));",
+                    " try {{ i.exports.run(7); return false; }}",
+                    " catch (e) {{ return e instanceof WebAssembly.Exception; }} }})()"
+                ),
+                private_tag = private_tag,
+            ),
+        );
         // A JS-thrown WebAssembly.Exception that wasm does not catch passes
         // through with its identity preserved.
         let passthrough = wat_module_bytes(concat!(
@@ -4010,5 +4057,53 @@ mod tests {
                 catcher = catcher,
             ),
         );
+    }
+
+    #[test]
+    fn reexport_wrappers_keep_object_identity() {
+        let mut context = Context::new().unwrap();
+        // JS-API wrapper caching: a module re-exporting a function/global/
+        // memory/table it imported from another instance surfaces the same JS
+        // objects the importer passed in (constructor-caching fixture).
+        let a = wat_module_bytes(concat!(
+            "(module",
+            "  (func (export \"fn\"))",
+            "  (global (export \"global\") i32 (i32.const 0))",
+            "  (memory (export \"memory\") 1)",
+            "  (table (export \"table\") 1 funcref))"
+        ));
+        let b = wat_module_bytes(concat!(
+            "(module",
+            "  (import \"m\" \"fn\" (func))",
+            "  (import \"m\" \"global\" (global i32))",
+            "  (import \"m\" \"memory\" (memory 1))",
+            "  (import \"m\" \"table\" (table 1 funcref))",
+            "  (export \"fn\" (func 0))",
+            "  (export \"global\" (global 0))",
+            "  (export \"memory\" (memory 0))",
+            "  (export \"table\" (table 0)))"
+        ));
+        for expr in [
+            "b.exports.fn === a.exports.fn",
+            "b.exports.global === a.exports.global",
+            "b.exports.memory === a.exports.memory",
+            "b.exports.table === a.exports.table",
+        ] {
+            eval_true(
+                &mut context,
+                &format!(
+                    concat!(
+                        "(function(){{ const a = new WebAssembly.Instance(new Uint8Array({a}));",
+                        " const b = new WebAssembly.Instance(new Uint8Array({b}),",
+                        "   {{ m: {{ fn: a.exports.fn, global: a.exports.global,",
+                        "     memory: a.exports.memory, table: a.exports.table }} }});",
+                        " return {expr}; }})()"
+                    ),
+                    a = a,
+                    b = b,
+                    expr = expr,
+                ),
+            );
+        }
     }
 }

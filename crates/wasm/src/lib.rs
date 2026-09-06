@@ -19,7 +19,7 @@ pub mod valid;
 pub mod values;
 
 pub use binary::{Error as DecodeError, decode};
-pub use exec::{ExecFail, ExternVal, Instance, InstantiateError, Memory, Store};
+pub use exec::{ExecFail, ExternVal, FuncKey, Instance, InstantiateError, Memory, Store};
 pub use module::Module;
 pub use valid::validate;
 pub use values::{Trap, Value};

@@ -744,13 +744,18 @@ pub struct Agent {
     /// The prebuilt `exports` object of each Instance, keyed by instance
     /// object identity (read by the `exports` accessor).
     pub wasm_instance_exports: std::collections::HashMap<u64, Value>,
-    /// One JS wrapper per engine function (instance, index), so a function
-    /// surfaced through several exports or table slots keeps object identity
-    /// (JS-API [[FuncObj]] memoization; Cut 10 wave 3b).
-    pub wasm_func_objects: std::collections::HashMap<(usize, usize), Value>,
+    /// One JS wrapper per engine function, keyed by the function's canonical
+    /// engine identity ([`wasm::FuncKey`]), so a function surfaced through
+    /// several exports, table slots, or import/re-export chains keeps object
+    /// identity (JS-API [[FuncObj]] memoization; Cut 10 wave 3b).
+    pub wasm_func_objects: std::collections::HashMap<wasm::FuncKey, Value>,
     /// The memory-cell registry of `WebAssembly.Memory` wrapper objects:
     /// wrapper object id -> engine store cell (Cut 10 wave 3b).
     pub wasm_memories: std::collections::HashMap<u64, usize>,
+    /// One `WebAssembly.Memory` wrapper per engine memory cell, memoized so a
+    /// memory surfaced through a constructor, an import, or several exports
+    /// keeps object identity (JS-API [[Memory]] memoization).
+    pub wasm_memory_objects: std::collections::HashMap<usize, Value>,
     /// The live ArrayBuffer of each engine memory cell that has materialized
     /// one: cell -> buffer. `Memory.prototype.buffer` returns the same object
     /// until a grow detaches it, and the cell's bytes are bridged into it at
@@ -759,9 +764,17 @@ pub struct Agent {
     /// The table-cell registry of `WebAssembly.Table` wrapper objects: wrapper
     /// object id -> engine store cell (Cut 10 wave 3b).
     pub wasm_tables: std::collections::HashMap<u64, usize>,
+    /// One `WebAssembly.Table` wrapper per engine table cell, memoized so a
+    /// table surfaced through a constructor, an import, or several exports
+    /// keeps object identity (JS-API [[Table]] memoization).
+    pub wasm_table_objects: std::collections::HashMap<usize, Value>,
     /// The global-cell registry of `WebAssembly.Global` wrapper objects:
     /// wrapper object id -> engine store cell (Cut 10 wave 3b).
     pub wasm_globals: std::collections::HashMap<u64, usize>,
+    /// One `WebAssembly.Global` wrapper per engine global cell, memoized so a
+    /// global surfaced through a constructor, an import, or several exports
+    /// keeps object identity (JS-API [[Global]] memoization).
+    pub wasm_global_objects: std::collections::HashMap<usize, Value>,
     /// The JS functions backing the agent's *external* engine host functions
     /// (raw JS closures imported into a module), keyed by the token handed to
     /// `Store::external_host`, with the function type the engine matched.
@@ -1064,9 +1077,12 @@ impl Agent {
             wasm_instance_exports: std::collections::HashMap::new(),
             wasm_func_objects: std::collections::HashMap::new(),
             wasm_memories: std::collections::HashMap::new(),
+            wasm_memory_objects: std::collections::HashMap::new(),
             wasm_memory_buffers: std::collections::HashMap::new(),
             wasm_tables: std::collections::HashMap::new(),
+            wasm_table_objects: std::collections::HashMap::new(),
             wasm_globals: std::collections::HashMap::new(),
+            wasm_global_objects: std::collections::HashMap::new(),
             wasm_host_functions: std::collections::HashMap::new(),
             wasm_host_seq: 0,
             wasm_tags: std::collections::HashMap::new(),
@@ -1481,7 +1497,16 @@ impl Agent {
         for value in self.wasm_func_objects.values() {
             value.trace(visit);
         }
+        for value in self.wasm_memory_objects.values() {
+            value.trace(visit);
+        }
         for value in self.wasm_memory_buffers.values() {
+            value.trace(visit);
+        }
+        for value in self.wasm_table_objects.values() {
+            value.trace(visit);
+        }
+        for value in self.wasm_global_objects.values() {
             value.trace(visit);
         }
         for (_, (value, _)) in self.wasm_host_functions.iter() {

@@ -249,6 +249,18 @@ pub enum ExternVal {
     Unsupported(&'static str),
 }
 
+/// The canonical identity of a function: instance function spaces alias the
+/// target they resolve to, so one function surfaced through any number of
+/// import/export chains shares a key (the JS-API's wrapper-object memo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FuncKey {
+    /// A host function (the spectest `print*` family or an external JS
+    /// closure registered through [`Store::external_host`]).
+    Host(usize),
+    /// The `defined`-th function declared by `instance`.
+    Owned { instance: usize, defined: usize },
+}
+
 /// Where a function index ultimately executes: a host routine or a defined
 /// body of some instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -750,6 +762,21 @@ impl Store {
                 (export.name == name && export.kind == ExportKind::Func)
                     .then_some(export.index as usize)
             })
+    }
+
+    /// The canonical identity of the function at full-space `index` of
+    /// `instance`: imports alias the target they resolve to, so a function
+    /// re-exported through later instances keeps its defining instance's key.
+    pub fn func_key(&self, instance: usize, index: usize) -> Option<FuncKey> {
+        let inst = self.instances.get(instance)?;
+        let target = inst.funcs.get(index)?;
+        Some(match target {
+            FuncTarget::Host(id) => FuncKey::Host(*id),
+            FuncTarget::Owned { instance, defined } => FuncKey::Owned {
+                instance: *instance,
+                defined: *defined,
+            },
+        })
     }
 
     /// The current value of exported global `name`, if any.
