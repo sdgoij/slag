@@ -3369,11 +3369,11 @@ extern "C" fn for_in_next(ctx: *mut c_void, stack: u64) -> u64 {
         return 0;
     }
     while state.index < state.keys.len() {
-        let (level, key) = state.keys[state.index];
+        let (_, key) = state.keys[state.index];
         state.index += 1;
         // A key deleted during enumeration is skipped (spec
         // EnumerateObjectProperties step 5.a.v).
-        match crate::eval::key_enumerable_at_level(&state.base, level, &key) {
+        match crate::eval::for_in_key_still_visited(&state.base, &key) {
             Ok(true) => {
                 // SAFETY: the machine code passes its live working-stack
                 // pointer with room for one slot.

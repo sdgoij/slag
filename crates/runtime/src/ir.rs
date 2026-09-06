@@ -7207,11 +7207,11 @@ impl Vm {
                     } else {
                         let mut pushed = false;
                         while state.index < state.keys.len() {
-                            let (level, key) = state.keys[state.index];
+                            let (_, key) = state.keys[state.index];
                             state.index += 1;
                             // A key deleted during enumeration is skipped (spec
                             // EnumerateObjectProperties step 5.a.v).
-                            if crate::eval::key_enumerable_at_level(&state.base, level, &key)? {
+                            if crate::eval::for_in_key_still_visited(&state.base, &key)? {
                                 self.stack.push(key);
                                 pushed = true;
                                 break;

@@ -1135,12 +1135,18 @@ fn for_in_key_levels_inner(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize,
     Ok(keys)
 }
 
-/// Whether `key` (a string value) is still an enumerable own property of the
-/// `level`-th object in `obj`'s prototype chain (a key deleted during
-/// enumeration is skipped — spec EnumerateObjectProperties step 5.a.v).
-pub(crate) fn key_enumerable_at_level(
+/// Whether `key` (a for-in snapshot key) is still visited at its turn:
+/// mirrors V8's for-in filter (`Runtime_ForInHasProperty` →
+/// `HasEnumerableProperty`, runtime-forin.cc). Walk `obj`'s CURRENT
+/// prototype chain and let the first object that owns `key` decide:
+/// ordinary holders (incl. Arrays) visit regardless of the property's
+/// current enumerability — it was fixed when the key was collected — while
+/// a Proxy holder consults its [[GetOwnProperty]] trap and visits only an
+/// ENUMERABLE own property (a non-enumerable proxy own property shadows
+/// deeper links, since proxies cannot rely on a snapshot). Absent from the
+/// whole chain means the key was deleted before its turn: skip.
+pub(crate) fn for_in_key_still_visited(
     obj: &Handle<crux::object::JsObject>,
-    level: usize,
     key: &Value,
 ) -> Result<bool, JsError> {
     let ValueKind::String(key) = key.kind() else {
@@ -1148,19 +1154,24 @@ pub(crate) fn key_enumerable_at_level(
     };
     let key = PropertyKey::from_js_string(key.as_ref());
     let mut current = Some(*obj);
-    for _ in 0..level {
-        let Some(next) = current else {
-            return Ok(false);
-        };
-        current = next.get_prototype_of()?;
+    while let Some(object) = current {
+        let own = object.get_own_property_key(&key)?;
+        match object.kind {
+            crux::object::ObjectKind::Proxy(_) => {
+                // A non-enumerable proxy own property shadows deeper links.
+                if let Some(property) = own {
+                    return Ok(property.enumerable);
+                }
+            }
+            _ => {
+                if own.is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+        current = object.get_prototype_of()?;
     }
-    let Some(obj) = current else {
-        return Ok(false);
-    };
-    match obj.get_own_property_key(&key)? {
-        Some(property) => Ok(property.enumerable),
-        None => Ok(false),
-    }
+    Ok(false)
 }
 
 /// ForIn/OfHeadEvaluation (spec 14.7.5.5): the RHS runs in a TDZ environment
@@ -1225,9 +1236,9 @@ fn eval_for_in(
     // which allocate — suppress `--gc-stress` for the loop so the not-yet-
     // consumed keys cannot be swept.
     let _stress = crate::ir::StressSuppress::new();
-    for (level, key) in keys {
+    for (_, key) in keys {
         if let Some(base) = &base_object
-            && !key_enumerable_at_level(base, level, &key)?
+            && !for_in_key_still_visited(base, &key)?
         {
             continue;
         }

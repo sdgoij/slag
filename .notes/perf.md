@@ -5289,11 +5289,42 @@ workspace tests green; test262 sweeps at baseline — language 23721/3
 skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
 The remaining ~90% of the row is the ForInBegin re-enumeration itself —
 the next slice is a per-object/generation-validated enumeration cache
-(mirrors the per-array for-of fast verdict). Note (pre-existing, not
-fixed): on `defineProperty` flipping a not-yet-visited key non-enumerable
-mid-loop, slag's per-key check skips it (a,c) while node yields it
-(a,b,c) — the check should skip only absent (deleted) keys, not
-attr-flipped ones; out of scope for this perf slice.
+(mirrors the per-array for-of fast verdict).
+
+### For-in deleted-key filter matches V8: presence in the CURRENT chain, not enumerability (measured + landed 2026-09-06, follow-up)
+
+The slice above left a pre-existing divergence the node-differential
+battery exposed: `defineProperty` flipping a not-yet-visited key
+non-enumerable mid-loop — slag skipped it (a,c), node/V8 yields it
+(a,b,c). Probing the full mutation matrix (attr flips at own and proto
+levels, delete-only, delete+re-add enumerable/non-enumerable/accessor,
+lower-level shadows added before a pending higher key's turn, prototype
+swap-away/swap-keep, own delete revealing a same-named proto/ancestor
+key) showed the reference is V8's `ForInFilter`
+(`Runtime_ForInHasProperty` → `HasEnumerableProperty`, runtime-forin.cc):
+walk the receiver's CURRENT prototype chain and let the FIRST object that
+owns the key decide — ordinary holders visit regardless of the property's
+present enumerability (it was fixed when the key was collected), a Proxy
+holder consults its [[GetOwnProperty]] trap and visits only an enumerable
+own property (non-enumerable proxy-own shadows deeper links), and a key
+absent from the whole chain was deleted before its turn and is skipped.
+So a deleted own key is visited if a same-named enumerable key is later
+revealed anywhere in the chain (node: delete own b -> proto's b visited),
+which the old check-at-the-recorded-level could not produce.
+
+Fix: `key_enumerable_at_level` (obj, level, key) became
+`for_in_key_still_visited` (obj, key) with the chain-wide presence
+semantics above; the recorded level no longer participates (all three
+call sites — the interpreter `Step::ForInNext`, the JIT `for_in_next`
+helper, and the AST `eval_for_in` — updated). The generation-skip fast
+path stays sound: an unchanged generation-tracked base still owns its
+level-0 keys, so the filter would find them at level 0.
+Node differentials: the 11-case attr-flip/shadow/swap matrix plus the
+13-case regression battery (incl. proxy attr-flip and delete-via-trap)
+are byte-identical to node in both engines, where slag previously
+produced a,c / a,p on the attr-flip cases. Gates: clippy clean;
+workspace tests green; test262 sweeps at baseline — language 23721/3
+skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
 
 ## Deferred milestones
 
