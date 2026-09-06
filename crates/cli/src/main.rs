@@ -43,6 +43,15 @@ struct Options {
     jit_bench: bool,
     #[cfg(feature = "jit")]
     jitless: bool,
+    /// `--corpus DIR`: time every `*.js` workload under DIR (recursive; each
+    /// file defines `function bench() {...}` and ends with `bench();`) with
+    /// the same steady-state protocol as `--jit-bench`. Prints one machine-
+    /// readable line per workload:
+    /// `bench\t<jit|jitless>\t<relpath>\t<ms>\t<result>`. Combined with
+    /// `--jitless` to select which mode to measure (the corpus runner is the
+    /// slag side of the tools/corpus cross-engine suite).
+    #[cfg(feature = "jit")]
+    corpus: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -73,6 +82,11 @@ fn parse(args: &[String]) -> Command {
             "--print-bytecode" => options.print_bytecode = true,
             #[cfg(feature = "jit")]
             "--jit-bench" => options.jit_bench = true,
+            #[cfg(feature = "jit")]
+            "--corpus" => {
+                index += 1;
+                options.corpus = args.get(index).map(std::path::PathBuf::from);
+            }
             #[cfg(feature = "jit")]
             "--jitless" => options.jitless = true,
             "--stack-size" => {
@@ -132,6 +146,10 @@ fn run(command: Command) -> Result<(), u8> {
             );
             #[cfg(feature = "jit")]
             eprintln!("  --jit-bench                JIT vs interpreter comparison");
+            #[cfg(feature = "jit")]
+            eprintln!(
+                "  --corpus DIR               time every workload under DIR (one mode per run; see tools/corpus)"
+            );
             eprintln!("  --print-bytecode");
             eprintln!("  --stack-size N            (no-op)");
             eprintln!("  --max-old-space N         (no-op)");
@@ -151,6 +169,9 @@ fn run(command: Command) -> Result<(), u8> {
             {
                 if options.jit_bench {
                     return run_jit_benchmarks();
+                }
+                if let Some(dir) = &options.corpus {
+                    return run_corpus(dir, !options.jitless);
                 }
             }
             if options.bench {
@@ -594,8 +615,8 @@ fn run_jit_benchmarks() -> Result<(), u8> {
     println!("slag {VERSION} JIT vs interpreter micro-benchmarks");
     println!("(ratio < 1 means the JIT is faster; ~1 means the body did not JIT)");
     for (name, source) in benchmarks {
-        let (interp, interp_result) = bench_once(source, false)?;
-        let (jit, jit_result) = bench_once(source, true)?;
+        let (interp, interp_result) = bench_once(source, false, None)?;
+        let (jit, jit_result) = bench_once(source, true, None)?;
         let ratio = jit.as_secs_f64() / interp.as_secs_f64();
         let agrees = interp_result == jit_result;
         if agrees {
@@ -604,6 +625,70 @@ fn run_jit_benchmarks() -> Result<(), u8> {
             println!(
                 "{name:18} interp {interp:12?}  jit {jit:12?}  ratio {ratio:5.2}  MISMATCH interp={interp_result:?} jit={jit_result:?}"
             );
+        }
+    }
+    Ok(())
+}
+
+/// Time every workload under `dir` in one mode. Each workload file defines
+/// `function bench() {...}` and ends with `bench();` (the `--jit-bench` row
+/// format); the steady-state protocol is `bench_once`'s (definition evaluated
+/// once, warmed, min of timed calls). One `bench\t<mode>\t<relpath>\t<ms>\t
+/// <result>` line per workload so a cross-engine runner can join the modes.
+#[cfg(feature = "jit")]
+fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
+    // Timed samples should clear this floor on EVERY engine (a too-fast row
+    // is quantization-dominated); bench_once batches calls to reach it and
+    // reports the per-call min.
+    const TIMING_FLOOR: std::time::Duration = std::time::Duration::from_millis(20);
+    let mut files = Vec::new();
+    collect_workloads(dir, &mut files)?;
+    let mode = if jit { "jit" } else { "jitless" };
+    for path in &files {
+        let source = std::fs::read_to_string(path).map_err(|e| {
+            eprintln!("slag: {}: {e}", path.display());
+            1
+        })?;
+        if source.trim().is_empty() {
+            continue;
+        }
+        let name = path
+            .strip_prefix(dir)
+            .map(|rel| rel.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string())
+            .replace('\\', "/");
+        let (elapsed, result) = bench_once(&source, jit, Some(TIMING_FLOOR))?;
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        match result {
+            Some(value) => println!("bench\t{mode}\t{name}\t{ms}\t{value}"),
+            None => println!("bench\t{mode}\t{name}\t{ms}\tNA"),
+        }
+    }
+    Ok(())
+}
+
+/// Recursively collect `*.js` files under `dir`, sorted for a stable order.
+#[cfg(feature = "jit")]
+fn collect_workloads(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), u8> {
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| {
+            eprintln!("slag: {}: {e}", dir.display());
+            1
+        })?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| {
+            eprintln!("slag: {}: {e}", dir.display());
+            1
+        })?
+        .into_iter()
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_workloads(&path, out)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("js") {
+            out.push(path);
         }
     }
     Ok(())
@@ -620,12 +705,31 @@ fn run_jit_benchmarks() -> Result<(), u8> {
 /// ~7ns/call steady on the call rows). The binding evaluates the ARGS
 /// exactly once, so function-literal arguments stay the SAME object across
 /// the timed calls (their bodies stay compiled and the per-site leaf cache
-/// stays warm). Returns the per-call mean and the completion value's number
+/// stays warm).
+///
+/// `batch_target`: when Some, a single call may be far below the timing
+/// floor (corpus workloads that are tiny under a fast engine), so the
+/// timed samples run BATCHES of calls sized so one sample is >= the
+/// target, and the returned duration is the min PER-CALL time (batch /
+/// reps). `--jit-bench` passes None (reps = 1, unchanged); the corpus
+/// runner passes a floor so no row is quantization-dominated on any
+/// engine. Returns the per-call min and the completion value's number
 /// (the suite's snippets all complete with a Number).
 #[cfg(feature = "jit")]
-fn bench_once(source: &str, jit: bool) -> Result<(std::time::Duration, Option<f64>), u8> {
+fn bench_once(
+    source: &str,
+    jit: bool,
+    batch_target: Option<std::time::Duration>,
+) -> Result<(std::time::Duration, Option<f64>), u8> {
     const WARMUP: u32 = 2;
     const TIMED: u32 = 3;
+    // A batch-size cap so a pathological (closed-form-folded) workload
+    // cannot blow up the run.
+    const MAX_REPS: u64 = 1 << 20;
+    // The arg split below assumes the source ends `);` — trim trailing
+    // whitespace so corpus files (which end with a newline after `bench();`)
+    // split the same way as the in-table rows.
+    let source = source.trim_end();
     let mut context = Context::new().map_err(report)?;
     if jit {
         jit::install(context.agent_mut()).map_err(report)?;
@@ -672,20 +776,39 @@ fn bench_once(source: &str, jit: bool) -> Result<(std::time::Duration, Option<f6
     for _ in 0..WARMUP {
         context.call(&bench_fn, &this, &args).map_err(report)?;
     }
-    // Timed calls: the MIN per-call time (the mean is skewed by the GC
+    // Batch sizing: probe one call and, when it is below the target floor,
+    // time batches of `reps` calls instead so each sample clears the floor
+    // (a warm batch also absorbs any steady-state transition).
+    let mut reps: u64 = 1;
+    if let Some(target) = batch_target {
+        let probe = Instant::now();
+        context.call(&bench_fn, &this, &args).map_err(report)?;
+        let single = probe.elapsed().as_nanos().max(1);
+        if single < target.as_nanos() {
+            reps = ((target.as_nanos() / single).clamp(1, MAX_REPS as u128)) as u64;
+        }
+        if reps > 1 {
+            for _ in 0..reps {
+                context.call(&bench_fn, &this, &args).map_err(report)?;
+            }
+        }
+    }
+    // Timed samples: the MIN per-call time (the mean is skewed by the GC
     // pressure the previous timed calls' garbage creates on allocation-heavy
     // rows like the rope builds).
-    let mut best = std::time::Duration::MAX;
+    let mut best = f64::INFINITY;
     let mut value = JsValue::undefined();
     for _ in 0..TIMED {
         let start = Instant::now();
-        value = context.call(&bench_fn, &this, &args).map_err(report)?;
-        let elapsed = start.elapsed();
-        if elapsed < best {
-            best = elapsed;
+        for _ in 0..reps {
+            value = context.call(&bench_fn, &this, &args).map_err(report)?;
+        }
+        let per_call = start.elapsed().as_secs_f64() / reps as f64;
+        if per_call < best {
+            best = per_call;
         }
     }
-    Ok((best, value.as_number()))
+    Ok((std::time::Duration::from_secs_f64(best), value.as_number()))
 }
 
 #[cfg(test)]
@@ -757,6 +880,19 @@ mod tests {
             ..Options::default()
         };
         assert_eq!(parse(&["--jit-bench".into()]), Command::Repl(options));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn corpus_flag_takes_a_directory() {
+        let options = Options {
+            corpus: Some("tools/corpus/workloads".into()),
+            ..Options::default()
+        };
+        assert_eq!(
+            parse(&["--corpus".into(), "tools/corpus/workloads".into()]),
+            Command::Repl(options)
+        );
     }
 
     #[cfg(not(feature = "jit"))]
