@@ -783,6 +783,13 @@ pub struct Agent {
     /// escaped uncaught: engine exception id -> the original JS value, so the
     /// boundary rethrows it with identity preserved (Cut 10 wave 4).
     pub wasm_js_exceptions: std::collections::HashMap<usize, Value>,
+    /// The JS value behind each wasm *externref* host payload (the JS-API
+    /// represents an externref as an arbitrary JS value — including null and
+    /// undefined, which round-trip distinctly): host token -> the JS value.
+    /// The token is an opaque `ExternInner::Host` payload to the engine.
+    pub wasm_extern_values: std::collections::HashMap<u32, Value>,
+    /// The next externref host token (monotonic within the agent).
+    pub wasm_extern_seq: u32,
     /// [[WeakRefTarget]] of WeakRef instances, keyed by object identity
     /// (spec 26.1.1: the target is held weakly — `deref` returns it while it
     /// is reachable, `undefined` once a collection clears it; GC-4).
@@ -1066,6 +1073,8 @@ impl Agent {
             wasm_tag_objects: std::collections::HashMap::new(),
             wasm_exceptions: std::collections::HashMap::new(),
             wasm_js_exceptions: std::collections::HashMap::new(),
+            wasm_extern_values: std::collections::HashMap::new(),
+            wasm_extern_seq: 0,
             weak_ref_targets: std::cell::RefCell::new(std::collections::HashMap::new()),
             kept_during_job: std::cell::RefCell::new(Vec::new()),
             pending_cleanup_jobs: std::cell::RefCell::new(Vec::new()),
@@ -1462,6 +1471,31 @@ impl Agent {
         self.disposable_async_drivers.trace(visit);
         self.disposable_async_caps.trace(visit);
         self.async_body_disposal.trace(visit);
+        // The wasm JS-API wrapper tables (Cut 10): their values are heap
+        // edges and must survive a collection (an untraced `Value` here is
+        // freed and its object id reused, so a later lookup returns the wrong
+        // object — e.g. `Instance.exports` yielding a Promise).
+        for value in self.wasm_instance_exports.values() {
+            value.trace(visit);
+        }
+        for value in self.wasm_func_objects.values() {
+            value.trace(visit);
+        }
+        for value in self.wasm_memory_buffers.values() {
+            value.trace(visit);
+        }
+        for (_, (value, _)) in self.wasm_host_functions.iter() {
+            value.trace(visit);
+        }
+        for value in self.wasm_tag_objects.values() {
+            value.trace(visit);
+        }
+        for value in self.wasm_js_exceptions.values() {
+            value.trace(visit);
+        }
+        for value in self.wasm_extern_values.values() {
+            value.trace(visit);
+        }
         // `host_modules` is keyed by JsString: keys are heap edges too, so
         // trace the whole cell manually (the generic HashMap trace visits
         // values only).

@@ -579,9 +579,40 @@ intrinsic identity like every other agent-dependent builtin.
   `module/customSections.any.js`. Newly green: `instance/constructor.any.js`
   (29/29), `module/customSections.any.js` (9/9); `instance/exports`,
   `module/exports`, `module/imports` stay green. `constructor/instantiate.any.js`
-  30/63 (the remaining fails are the instantiate result-object overload
+  (30/63 — the remaining fails are the instantiate result-object overload
   checks and option handling). Corpus: 898 tests pass / 192 fail (was
   849/241), 32 fixture-files green of 53.
+- Wave 5 slice 8 (landed): the `instantiate` overloads and a GC liveness
+  fix. `Agent::trace_roots` now traces the wasm JS-API value tables
+  (`wasm_instance_exports`, `wasm_func_objects`, `wasm_memory_buffers`,
+  `wasm_host_functions`, `wasm_tag_objects`, `wasm_js_exceptions`): an
+  untraced `Value` there was freed by a collection and its object id
+  reused, so a later `Instance.exports` (or wrapper) lookup returned a
+  foreign object (a Promise/function/instance) once a fixture registered
+  enough instances to trigger a GC mid-file. `WebAssembly.instantiate`'s
+  BufferSource overload now defers its compile + imports-reading to a
+  microtask (a `deferred_operation` generic job; the byte argument is
+  copied synchronously) per the JS-API's synchronous-options rules, while
+  the Module overload keeps reading imports synchronously.
+  `constructor/instantiate.any.js` is fully green (63/63). Corpus: 931
+  tests pass / 159 fail (was 898/192), 33 fixture-files green of 53.
+  Remaining: externref/reference JS values, multi-value results, shared
+  memory, the `table/grow-memory64` nulls-coupling fixtures, the residual
+  bad-imports/exception gaps, and the out-of-scope `js-string`/`gc`
+  suites.
+- Wave 5 slice 9 (landed): externref JS values. The JS-API `externref` is
+  an arbitrary JS value (null and undefined included, round-tripping
+  distinctly); the agent keeps each one alive behind an opaque
+  `ExternInner::Host` token (`wasm_extern_values`, traced in
+  `Agent::trace_roots`) and the boundary converts through it.
+  `WebAssembly.Global` accepts `externref` (default `undefined`; value
+  get/set round-trips any JS value) and `WebAssembly.Table` accepts an
+  `externref` element (initial/fill, get/set, grow). Newly green:
+  `global/constructor.any.js` (62/62), `global/value-get-set.any.js`
+  (69/69), `table/constructor.any.js` (41/41); `table/get-set.any.js`
+  40/41 (the last fail is raw-JS-closure funcref elements, which need
+  typed `WebAssembly.Function` wrappers). Corpus: 936 tests pass / 154
+  fail (was 931/159), 36 fixture-files green of 53.
 
 ## 6. Verification workflow
 

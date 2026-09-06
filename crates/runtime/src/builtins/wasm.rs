@@ -21,7 +21,7 @@ use crux::value::{Value, ValueKind};
 use wasm::Value as WasmValue;
 use wasm::exec::RunProgress;
 use wasm::types::ValType;
-use wasm::values::{FuncAddr, RefValue};
+use wasm::values::{ExternInner, FuncAddr, RefValue};
 
 use crate::agent::Agent;
 use crate::builtins::array::array_from_values;
@@ -1668,7 +1668,7 @@ fn exception_get_arg(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
             )
         })?;
     match values.get(index as usize) {
-        Some(value) => wasm_result(*value),
+        Some(value) => wasm_result(agent, *value),
         None => Err(JsError::new(
             ErrorKind::RangeError,
             "exception payload index is out of bounds".into(),
@@ -1721,6 +1721,37 @@ fn async_operation(
     Ok(capability.promise)
 }
 
+/// Like [`async_operation`], but the body runs in a later generic job (a
+/// microtask), not on the current synchronous turn. The JS-API bytes
+/// overloads must not touch their `imports` object until then (the
+/// `Synchronous options handling` fixtures); the caller copies the byte
+/// argument before enqueueing so a later in-place mutation cannot affect it.
+fn deferred_operation(
+    agent: &mut Agent,
+    body: impl FnOnce(&mut Agent) -> Result<Value, JsError> + 'static,
+) -> Result<Value, JsError> {
+    let realm = agent.current_realm()?;
+    let promise_ctor = realm
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
+    let resolve = capability.resolve;
+    let reject = capability.reject;
+    agent.enqueue_generic_job(Some(realm), move |agent| match body(agent) {
+        Ok(value) => {
+            crate::function::call(agent, &resolve, Value::Undefined, &[value])?;
+            Ok(Value::Undefined)
+        }
+        Err(error) => {
+            let reason = crate::promise::error_value(agent, &error);
+            crate::function::call(agent, &reject, Value::Undefined, &[reason])?;
+            Ok(Value::Undefined)
+        }
+    });
+    Ok(capability.promise)
+}
+
 /// `WebAssembly.compile(bytes)` (JS-API spec 4.1.2): compile the bytes into a
 /// `WebAssembly.Module`. The returned promise resolves with the module or
 /// rejects with CompileError (TypeError for a non-BufferSource argument).
@@ -1739,18 +1770,27 @@ fn wasm_compile(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 /// resolving with the `Instance`. Failures reject the returned promise
 /// (CompileError, LinkError, RuntimeError, or TypeError for a bad argument).
 fn wasm_instantiate(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    async_operation(agent, |agent| {
-        let first = args.first().cloned().unwrap_or(Value::Undefined);
-        let imports = args.get(1).cloned().unwrap_or(Value::Undefined);
-        // Module-object overload: instantiate it directly.
-        if let ValueKind::Object(object) = first.kind()
-            && let Some(module) = agent.wasm_modules.get(&object.id()).cloned()
-        {
+    let first = args.first().cloned().unwrap_or(Value::Undefined);
+    let imports = args.get(1).cloned().unwrap_or(Value::Undefined);
+    // Module-object overload: instantiate it directly (its imports are read
+    // synchronously, per the JS-API).
+    if let ValueKind::Object(object) = first.kind()
+        && let Some(module) = agent.wasm_modules.get(&object.id()).cloned()
+    {
+        return async_operation(agent, move |agent| {
             let proto = instance_proto_default(agent)?;
-            return instantiate_module(agent, &module, &imports, Some(proto));
+            instantiate_module(agent, &module, &imports, Some(proto))
+        });
+    }
+    // BufferSource overload: copy the bytes now, then compile and instantiate
+    // (and read `imports`) in a later microtask, resolving with the pair.
+    let bytes = match buffer_source_bytes(agent, &first) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return deferred_operation(agent, move |_agent| Err(error));
         }
-        // BufferSource overload: compile, instantiate, resolve with the pair.
-        let bytes = buffer_source_bytes(agent, &first)?;
+    };
+    deferred_operation(agent, move |agent| {
         let module_value = {
             let proto = module_proto(agent)?;
             compile_module_bytes(agent, &bytes, Some(proto))?
@@ -1878,14 +1918,15 @@ fn global_cell(agent: &Agent, this: &Value) -> Result<usize, JsError> {
         .ok_or_else(error)
 }
 
-/// The `value` type of a Global descriptor: the numeric value types this cut
-/// converts (references/v128 are not JS-API globals).
+/// The `value` type of a Global descriptor: the numeric value types plus
+/// `externref` (references/v128 are not JS-API globals).
 fn global_value_type(text: &str) -> Result<ValType, JsError> {
     Ok(match text {
         "i32" => ValType::I32,
         "i64" => ValType::I64,
         "f32" => ValType::F32,
         "f64" => ValType::F64,
+        "externref" => ValType::Ref(wasm::types::RefType::EXTERN),
         other => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1948,7 +1989,13 @@ fn global_construct(
     let value_type = global_value_type(&js_string_text(&value_to_string(&type_value)?))?;
     let initial_value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let initial = if matches!(initial_value.kind(), ValueKind::Undefined) {
-        default_wasm_value(&value_type)
+        // An externref global defaults to `undefined` (the JS-API's externref
+        // is a JS-value cell; a wasm null reference is not its default).
+        if matches!(value_type, ValType::Ref(wasm::types::RefType::EXTERN)) {
+            WasmValue::Ref(to_externref(agent, Value::Undefined))
+        } else {
+            default_wasm_value(&value_type)
+        }
     } else {
         wasm_arg(agent, &value_type, &initial_value)?
     };
@@ -1971,7 +2018,7 @@ fn global_value_get(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
         .borrow()
         .global_value(cell)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "global cell vanished".into()))?;
-    wasm_result(value)
+    wasm_result(agent, value)
 }
 
 /// `set Global.prototype.value`: convert the argument by the cell's value
@@ -2042,6 +2089,34 @@ fn funcref_to_js(agent: &mut Agent, reference: RefValue) -> Result<Value, JsErro
     }
 }
 
+/// Store a JS value as a wasm externref — the JS-API's `externref` is an
+/// arbitrary JS value (null and undefined included, round-tripping
+/// distinctly), kept alive by the agent — and return the engine reference
+/// (an opaque `ExternInner::Host` payload).
+fn to_externref(agent: &mut Agent, value: Value) -> RefValue {
+    let token = agent.wasm_extern_seq;
+    agent.wasm_extern_seq = agent.wasm_extern_seq.wrapping_add(1);
+    agent.wasm_extern_values.insert(token, value);
+    RefValue::Extern(ExternInner::Host(token))
+}
+
+/// One wasm externref → the JS value it holds (a null reference is JS null;
+/// an internal GC or function reference is not a JS-API value yet).
+fn externref_to_js(agent: &Agent, reference: RefValue) -> Result<Value, JsError> {
+    match reference {
+        RefValue::Null => Ok(Value::Null),
+        RefValue::Extern(ExternInner::Host(token)) => agent
+            .wasm_extern_values
+            .get(&token)
+            .copied()
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "unknown externref payload".into())),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "only externref references are supported at the JS boundary".into(),
+        )),
+    }
+}
+
 /// `new WebAssembly.Table(descriptor, init)` (JS-API spec 4.6.1): allocate a
 /// standalone funcref table cell of `initial` (optionally `maximum`) slots,
 /// filled with `init` (null by default).
@@ -2069,18 +2144,19 @@ fn table_construct(
             "Table descriptor requires an 'element' type".into(),
         ));
     }
-    match js_string_text(&value_to_string(&element_value)?).as_str() {
-        "funcref" | "anyfunc" => {}
+    let element = match js_string_text(&value_to_string(&element_value)?).as_str() {
+        "funcref" | "anyfunc" => wasm::types::RefType::FUNC,
+        "externref" => wasm::types::RefType::EXTERN,
         other => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 format!(
                     "'{other}' tables are not supported in Cut 10 wave 3b yet \
-                     (only funcref)"
+                     (only funcref/externref)"
                 ),
             ));
         }
-    }
+    };
     let address = descriptor_address(agent, &descriptor)?;
     let initial_value = crate::context::get_property(
         agent,
@@ -2115,13 +2191,19 @@ fn table_construct(
         ));
     }
     let fill_value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let fill = if matches!(fill_value.kind(), ValueKind::Undefined | ValueKind::Null) {
+    let fill = if element == wasm::types::RefType::EXTERN {
+        if matches!(fill_value.kind(), ValueKind::Undefined) {
+            RefValue::Null
+        } else {
+            to_externref(agent, fill_value)
+        }
+    } else if matches!(fill_value.kind(), ValueKind::Undefined | ValueKind::Null) {
         RefValue::Null
     } else {
         js_to_funcref(agent, &fill_value)?
     };
     let table_type = wasm::types::TableType {
-        element: wasm::types::RefType::FUNC,
+        element,
         limits: wasm::types::Limits {
             min: initial,
             max: maximum,
@@ -2188,7 +2270,17 @@ fn table_get_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
         .table_get(cell, index)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "table cell vanished".into()))?
         .map_err(|_| JsError::new(ErrorKind::RangeError, "table index is out of bounds".into()))?;
-    funcref_to_js(agent, entry)
+    let element = agent
+        .wasm_store
+        .borrow()
+        .table_type(cell)
+        .map(|ty| ty.element)
+        .unwrap_or(wasm::types::RefType::FUNC);
+    if element == wasm::types::RefType::EXTERN {
+        externref_to_js(agent, entry)
+    } else {
+        funcref_to_js(agent, entry)
+    }
 }
 
 /// `Table.prototype.set(index, value)`: store a function or null at `index`.
@@ -2207,7 +2299,17 @@ fn table_set_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
         "table index",
     )?;
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let reference = js_to_funcref(agent, &value)?;
+    let element = agent
+        .wasm_store
+        .borrow()
+        .table_type(cell)
+        .map(|ty| ty.element)
+        .unwrap_or(wasm::types::RefType::FUNC);
+    let reference = if element == wasm::types::RefType::EXTERN {
+        to_externref(agent, value)
+    } else {
+        js_to_funcref(agent, &value)?
+    };
     let mut store = agent.wasm_store.borrow_mut();
     let slot = store
         .table_set(cell, index, reference)
@@ -2235,7 +2337,19 @@ fn table_grow_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result
         "Table.grow delta",
     )?;
     let fill_value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let fill = if matches!(fill_value.kind(), ValueKind::Undefined | ValueKind::Null) {
+    let element = agent
+        .wasm_store
+        .borrow()
+        .table_type(cell)
+        .map(|ty| ty.element)
+        .unwrap_or(wasm::types::RefType::FUNC);
+    let fill = if element == wasm::types::RefType::EXTERN {
+        if matches!(fill_value.kind(), ValueKind::Undefined) {
+            RefValue::Null
+        } else {
+            to_externref(agent, fill_value)
+        }
+    } else if matches!(fill_value.kind(), ValueKind::Undefined | ValueKind::Null) {
         RefValue::Null
     } else {
         js_to_funcref(agent, &fill_value)?
@@ -2662,18 +2776,22 @@ fn wasm_arg(agent: &mut Agent, param: &ValType, value: &Value) -> Result<WasmVal
         }
         ValType::F64 => WasmValue::F64(to_number(value)?.to_bits()),
         ValType::V128 => return Err(unsupported("v128")),
+        ValType::Ref(reference) if *reference == wasm::types::RefType::EXTERN => {
+            WasmValue::Ref(to_externref(agent, *value))
+        }
         ValType::Ref(_) => return Err(unsupported("reference")),
     })
 }
 
 /// One wasm result value → JS (i64 becomes a BigInt; the numeric types are
-/// numbers).
-fn wasm_result(value: WasmValue) -> Result<Value, JsError> {
+/// numbers; externref becomes the JS value it holds).
+fn wasm_result(agent: &Agent, value: WasmValue) -> Result<Value, JsError> {
     Ok(match value {
         WasmValue::I32(v) => Value::Number(f64::from(v)),
         WasmValue::I64(v) => Value::BigInt(Handle::new(crux::BigInt::from(v))),
         WasmValue::F32(bits) => Value::Number(f64::from(f32::from_bits(bits))),
         WasmValue::F64(bits) => Value::Number(f64::from_bits(bits)),
+        WasmValue::Ref(reference) => return externref_to_js(agent, reference),
         _ => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -2793,7 +2911,7 @@ fn invoke_export(
                         })?;
                     let mut js_args = Vec::with_capacity(request.args.len());
                     for value in &request.args {
-                        js_args.push(wasm_result(*value)?);
+                        js_args.push(wasm_result(agent, *value)?);
                     }
                     crate::function::call(agent, &function, Value::Undefined, &js_args)
                         .map(|value| (value, fty))
@@ -2849,7 +2967,7 @@ fn invoke_export(
     memory_buffers_from_store(agent)?;
     match results.as_slice() {
         [] => Ok(Value::Undefined),
-        [single] => wasm_result(*single),
+        [single] => wasm_result(agent, *single),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "multi-value wasm results are not supported yet (Cut 10 wave 3b)".into(),
@@ -3444,9 +3562,22 @@ mod tests {
                 " if (t.get(0) !== null) return false;",
                 " if (t.grow(2) !== 1 || t.length !== 3) return false;",
                 " try { t.set(0, 42); return false; } catch (e) { if (!(e instanceof TypeError)) return false; }",
-                " try { new WebAssembly.Table({ element: 'externref', initial: 1 }); return false; }",
-                " catch (e) { return e instanceof TypeError; }",
-                "})()"
+                " return true; })()"
+            ),
+        );
+        // An externref table holds JS values (identity preserved), with null
+        // as the initial element and undefined round-tripping distinctly.
+        eval_true(
+            &mut context,
+            concat!(
+                "(function(){ const et = new WebAssembly.Table({ element: 'externref', initial: 1 });",
+                " if (et.get(0) !== null) return false;",
+                " const obj = { x: 1 };",
+                " et.set(0, obj);",
+                " if (et.get(0) !== obj) return false;",
+                " et.set(0, undefined);",
+                " if (et.get(0) !== undefined) return false;",
+                " return true; })()"
             ),
         );
         let producer = wat_module_bytes(concat!(
