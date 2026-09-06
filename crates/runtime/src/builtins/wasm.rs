@@ -2416,8 +2416,21 @@ fn instantiate_module(
     let object = JsObject::ordinary_object_create(proto);
 
     let needs_imports = !module.imports.is_empty();
-    if needs_imports && matches!(imports_value.kind(), ValueKind::Undefined | ValueKind::Null) {
-        return Err(link_failure(agent, "module requires an imports object")?);
+    // The imports argument must be an object when present; a module that
+    // declares imports requires one (JS-API argument checks are TypeErrors,
+    // not link failures).
+    if matches!(imports_value.kind(), ValueKind::Undefined) {
+        if needs_imports {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "module requires an imports object".into(),
+            ));
+        }
+    } else if !matches!(imports_value.kind(), ValueKind::Object(_)) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "imports argument must be an object".into(),
+        ));
     }
     let resolutions = if needs_imports {
         build_imports(agent, module, imports_value)?
@@ -2600,11 +2613,13 @@ fn build_imports(
             &JsString::from_utf8(&import.module),
             *imports,
         )?;
-        if matches!(module_value.kind(), ValueKind::Undefined) {
-            return Err(link_failure(
-                agent,
-                &format!("module import '{}' is not provided", import.module),
-            )?);
+        // An import's module namespace must be an object: a missing or
+        // primitive namespace value is a TypeError (spec), not a LinkError.
+        if !matches!(module_value.kind(), ValueKind::Object(_)) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                format!("import module '{}' is not an object", import.module),
+            ));
         }
         let name_value = crate::context::get_property(
             agent,
@@ -3428,15 +3443,16 @@ mod tests {
                 importer = importer,
             ),
         );
-        // A module with imports needs an imports object (LinkError), and a
-        // non-memory import value is a LinkError too.
+        // A module with imports needs an imports object (TypeError per the
+        // JS-API argument checks); an import value of the wrong kind is a
+        // LinkError.
         eval_true(
             &mut context,
             &format!(
                 concat!(
                     "(function(){{ const m = new WebAssembly.Module(new Uint8Array({importer}));",
                     " try {{ new WebAssembly.Instance(m); return false; }}",
-                    " catch (e) {{ if (!(e instanceof WebAssembly.LinkError)) return false; }}",
+                    " catch (e) {{ if (!(e instanceof TypeError)) return false; }}",
                     " try {{ new WebAssembly.Instance(m, {{ js: {{ mem: 42 }} }}); return false; }}",
                     " catch (e) {{ return e instanceof WebAssembly.LinkError; }} }})()"
                 ),
@@ -3818,8 +3834,9 @@ mod tests {
             ),
         );
         eval_true(&mut context, "globalThis.__w === 'ok'");
-        // instantiate(bytes, imports) links JS closures and rejects with
-        // LinkError when the imports are missing.
+        // instantiate(bytes, imports) links JS closures. A module that
+        // declares imports but is instantiated with no imports argument
+        // rejects with a TypeError (JS-API argument check).
         eval_ok(
             &mut context,
             &format!(
@@ -3839,7 +3856,7 @@ mod tests {
                 concat!(
                     "globalThis.__e = 'none';",
                     "(async () => {{ try {{ await WebAssembly.instantiate(new Uint8Array({import_module})); }}",
-                    " catch (e) {{ globalThis.__e = e instanceof WebAssembly.LinkError ? 'ok' : 'bad'; }} }})();"
+                    " catch (e) {{ globalThis.__e = e instanceof TypeError ? 'ok' : 'bad'; }} }})();"
                 ),
                 import_module = import_module,
             ),

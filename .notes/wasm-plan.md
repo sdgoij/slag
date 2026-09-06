@@ -613,6 +613,20 @@ intrinsic identity like every other agent-dependent builtin.
   40/41 (the last fail is raw-JS-closure funcref elements, which need
   typed `WebAssembly.Function` wrappers). Corpus: 936 tests pass / 154
   fail (was 931/159), 36 fixture-files green of 53.
+- Wave 5 slice 10 (landed): JS-API import-argument validation. Per the
+  spec's argument checks (as the `bad-imports.js` corpus shared by
+  `instance/constructor-bad-imports` and `constructor/instantiate-bad-
+  imports` exercises): a missing imports argument on a module that
+  declares imports, a non-object imports argument, and a missing or
+  non-object module namespace are TypeErrors; only a missing import name
+  inside a present object namespace (or a present but wrong-typed value)
+  is a LinkError. Previously all of those were LinkErrors. The two
+  runtime engine tests that asserted the old behavior for the
+  missing-imports cases now expect TypeError (the wrong-kind cases stay
+  LinkError). Newly green: `instance/constructor-bad-imports.any.js`
+  (106/106) and `constructor/instantiate-bad-imports.any.js` (212/212).
+  Corpus: 990 tests pass / 100 fail (was 936/154), 38 fixture-files
+  green of 53.
 
 ## 6. Verification workflow
 
