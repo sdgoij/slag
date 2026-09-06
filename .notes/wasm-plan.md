@@ -1461,3 +1461,36 @@ Measured: baseline `core/*.wast` 20,603 / 0 / 0 / 5 skip
 isorecursive rec-group canonicalization wave (`type-equivalence`,
 `type-rec`, `exceptions/tag`), the `wast`-grammar multi-supertype limit
 (`gc/type-subtyping`), and harness tooling (`annotations`/`instance`/`names`).
+
+### Isorecursive rec-group type equivalence (2026-09-06)
+
+The last engine-gap exclusions closed. `Module` now records its type
+section's rec-group lengths (`rec_groups`), and type equality is the
+spec's isorecursive equivalence: two type indices are equal iff their
+rec groups have equal length and are structurally identical
+member-for-member, with in-group references mapping by offset and
+references to earlier (closed) groups comparing the referenced types
+(`crates/wasm/src/module.rs`). This makes two *separate* but isomorphic
+rec groups — including cross-module ones at link time — denote the same
+type, while non-isomorphic groups (same shape, different member count
+or alignment) stay distinct.
+
+Where it plugs in:
+- `valid.rs`: reference subsumption (`heap_sub`) treats equivalent
+  types as equal before following declared supertype edges, and a type
+  definition's references are scoped to its rec group (`unknown type`
+  for a forward reference into a later group). The subtyping helpers
+  now take the whole `Module`.
+- `exec.rs`: function imports, tag imports, and the indirect-call /
+  `call_ref` runtime checks compare across the two modules' type spaces
+  by equivalence (tags record their declaring instance); runtime
+  `ref.cast`/`ref.test` concrete targets compare across modules too.
+- `binary.rs`: rec-group lengths are recorded during type-section
+  decode.
+
+Measured: baseline `core/*.wast` 20,662 / 0 / 0 / 3 skip;
+`exceptions/` (incl. `tag.wast`) 105 / 0 / 0; `gc/` 654 / 0 / 0 with the
+single remaining skip the `wast`-grammar multi-supertype file
+(`gc/type-subtyping`). Remaining core skips are harness tooling
+(`annotations`/`instance`/`names`) and that one converter limit. The
+JS-API corpus is unchanged at 1001 / 0.

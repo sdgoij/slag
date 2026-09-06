@@ -11,13 +11,6 @@ waspec/test/core/annotations.wast :: annotation directives are harness tooling, 
 waspec/test/core/instance.wast :: module-linking `(instance ...)` is outside the supported corpus
 waspec/test/core/names.wast :: export names use confusing-unicode strings the `wast` lexer rejects
 
-# GC-era type sections and heap types still behind the Cut 9 residual
-# (isorecursive rec-group canonicalization: cross-module type equality must
-# respect rec-group shape, not just structure).
-waspec/test/core/type-equivalence.wast :: GC `rec` type bags and subtyping (Cut 9)
-waspec/test/core/type-rec.wast :: recursive GC type groups (Cut 9)
-waspec/test/core/exceptions/tag.wast :: the `rec`-typed tag fixtures use GC type groups (Cut 9)
-
 # The GC proposal corpus: one remaining file uses multi-supertype fixtures the
 # `wast` grammar (and the decoder's single-supertype model) rejects; the rest
 # of the directory runs green as of Cut 9 wave 3.

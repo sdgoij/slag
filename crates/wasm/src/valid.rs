@@ -16,7 +16,7 @@ use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
 use crate::types::{
     BlockType, CompositeType, FieldType, FuncType, GlobalType, HeapType, Limits, MemType, RefType,
-    StorageType, SubType, TableType, ValType,
+    StorageType, TableType, ValType,
 };
 
 /// A validation error. Messages mirror the spec's diagnostics where they are
@@ -83,24 +83,27 @@ pub fn validate(module: &Module) -> Result<(), Error> {
 
 fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
     // Resolve every referenced type index once so bodies can index freely.
+    // A type definition may only reference types of its own rec group or of
+    // earlier (already closed) groups, so the scope bound is the group end.
     let type_count = module.types.len();
     for (index, ty) in module.types.iter().enumerate() {
+        let group_end = module.rec_group_end(index as u32) as usize;
         if let Some(supertype) = ty.supertypes.first()
-            && *supertype as usize >= type_count
+            && (*supertype as usize >= type_count || *supertype as usize >= group_end)
         {
             return Err(Error::Invalid("unknown type"));
         }
         match &ty.composite {
             CompositeType::Func(func) => {
-                check_value_types(&func.params, type_count, index)?;
-                check_value_types(&func.results, type_count, index)?;
+                check_value_types(&func.params, group_end, index)?;
+                check_value_types(&func.results, group_end, index)?;
             }
             CompositeType::Struct(fields) => {
                 for field in fields {
-                    check_storage_type(&field.ty, type_count)?;
+                    check_storage_type(&field.ty, group_end)?;
                 }
             }
-            CompositeType::Array(field) => check_storage_type(&field.ty, type_count)?,
+            CompositeType::Array(field) => check_storage_type(&field.ty, group_end)?,
         }
     }
 
@@ -408,7 +411,7 @@ fn validate_elements(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> 
             // The segment's declared type must fit the target table's
             // element type.
             if !val_sub(
-                &module.types,
+                module,
                 ValType::Ref(table_ty.element),
                 ValType::Ref(element.ty),
             ) {
@@ -420,7 +423,7 @@ fn validate_elements(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> 
         }
         for item in &element.init {
             let item_type = const_expr_type(item, spaces, spaces.globals.len())?;
-            if !val_sub(&module.types, ValType::Ref(element.ty), item_type) {
+            if !val_sub(module, ValType::Ref(element.ty), item_type) {
                 return Err(Error::Invalid("type mismatch"));
             }
         }
@@ -480,7 +483,7 @@ fn validate_code(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> {
             check_value_types(std::slice::from_ref(ty), module.types.len(), 0)?;
             init.push(index < signature.params.len() || is_defaultable(*ty));
         }
-        let mut machine = Machine::new(&module.types);
+        let mut machine = Machine::new(module);
         machine.init = init;
         machine.push_frame(Ctrl::Func, vec![], signature.results.clone());
         machine.validate_body(&body.body, signature, &locals, spaces)?;
@@ -500,7 +503,7 @@ fn is_defaultable(ty: ValType) -> bool {
 /// hierarchy is a subtype of (`any` for the GC aggregate/i31 hierarchy,
 /// `func`/`extern`/`exn` for theirs). Casts may only target within the same
 /// hierarchy, so this is the operand bound for `ref.test`/`ref.cast`.
-fn top_heap(types: &[SubType], heap: &HeapType) -> HeapType {
+fn top_heap(module: &Module, heap: &HeapType) -> HeapType {
     match heap {
         HeapType::Func | HeapType::NoFunc => HeapType::Func,
         HeapType::Extern | HeapType::NoExtern => HeapType::Extern,
@@ -511,7 +514,7 @@ fn top_heap(types: &[SubType], heap: &HeapType) -> HeapType {
         | HeapType::Array
         | HeapType::I31
         | HeapType::None => HeapType::Any,
-        HeapType::Type(index) => match types.get(*index as usize) {
+        HeapType::Type(index) => match module.types.get(*index as usize) {
             Some(sub) => match &sub.composite {
                 CompositeType::Func(_) => HeapType::Func,
                 CompositeType::Struct(_) | CompositeType::Array(_) => HeapType::Any,
@@ -545,21 +548,23 @@ fn abs_sub(sub: &HeapType, sup: &HeapType) -> bool {
 /// Heap-type subsumption (spec 3.3.3): whether `sub <: sup` under the
 /// module's defined types (a concrete type is below its composite kind's
 /// abstract type and below any declared supertype).
-fn heap_sub(types: &[SubType], sub: &HeapType, sup: &HeapType) -> bool {
+fn heap_sub(module: &Module, sub: &HeapType, sup: &HeapType) -> bool {
     use HeapType::*;
     if sub == sup {
         return true;
     }
     match (sub, sup) {
         (Type(s), Type(t)) => {
+            // Equivalent types (isorecursive rec groups) are equal; otherwise
             // `sup` is an ancestor of `sub` through the declared supertype
-            // edges (index equality was handled above).
+            // edges (equivalence checked at every hop too).
             let mut current = *s;
-            for _ in 0..=types.len() {
-                if current == *t {
+            for _ in 0..=module.types.len() {
+                if module.type_indices_equivalent(current, *t) {
                     return true;
                 }
-                let Some(next) = types
+                let Some(next) = module
+                    .types
                     .get(current as usize)
                     .and_then(|st| st.supertypes.first())
                 else {
@@ -569,7 +574,7 @@ fn heap_sub(types: &[SubType], sub: &HeapType, sup: &HeapType) -> bool {
             }
             false
         }
-        (Type(s), abstract_sup) => match types.get(*s as usize) {
+        (Type(s), abstract_sup) => match module.types.get(*s as usize) {
             Option::Some(st) => {
                 let kind = match &st.composite {
                     CompositeType::Struct(_) => Struct,
@@ -584,11 +589,11 @@ fn heap_sub(types: &[SubType], sub: &HeapType, sup: &HeapType) -> bool {
         // `nofunc` under any defined function type, `none` under any defined
         // struct/array type (spec 3.3.3).
         (NoFunc, Type(index)) => matches!(
-            types.get(*index as usize).map(|sub| &sub.composite),
+            module.types.get(*index as usize).map(|sub| &sub.composite),
             Some(CompositeType::Func(_))
         ),
         (None, Type(index)) => matches!(
-            types.get(*index as usize).map(|sub| &sub.composite),
+            module.types.get(*index as usize).map(|sub| &sub.composite),
             Some(CompositeType::Struct(_) | CompositeType::Array(_))
         ),
         (abstract_sub, _) => abs_sub(abstract_sub, sup),
@@ -597,20 +602,20 @@ fn heap_sub(types: &[SubType], sub: &HeapType, sup: &HeapType) -> bool {
 
 /// Reference-type subsumption (spec 3.3.5): a value of `actual` type may be
 /// used where `expected` is required.
-fn ref_sub(types: &[SubType], expected: RefType, actual: RefType) -> bool {
+fn ref_sub(module: &Module, expected: RefType, actual: RefType) -> bool {
     if !expected.nullable && actual.nullable {
         return false;
     }
-    heap_sub(types, &actual.heap, &expected.heap)
+    heap_sub(module, &actual.heap, &expected.heap)
 }
 
 /// Value-type subsumption (spec 3.3.6).
-fn val_sub(types: &[SubType], expected: ValType, actual: ValType) -> bool {
+fn val_sub(module: &Module, expected: ValType, actual: ValType) -> bool {
     if expected == actual {
         return true;
     }
     match (expected, actual) {
-        (ValType::Ref(e), ValType::Ref(a)) => ref_sub(types, e, a),
+        (ValType::Ref(e), ValType::Ref(a)) => ref_sub(module, e, a),
         _ => false,
     }
 }
@@ -669,17 +674,17 @@ struct Machine<'a> {
     frames: Vec<Frame>,
     /// Which locals are currently known to be initialized.
     init: Vec<bool>,
-    /// The module's defined types, for reference subsumption.
-    types: &'a [SubType],
+    /// The module being validated, for reference subsumption.
+    module: &'a Module,
 }
 
 impl<'a> Machine<'a> {
-    fn new(types: &'a [SubType]) -> Self {
+    fn new(module: &'a Module) -> Self {
         Machine {
             vals: Vec::new(),
             frames: Vec::new(),
             init: Vec::new(),
-            types,
+            module,
         }
     }
 
@@ -749,7 +754,7 @@ impl<'a> Machine<'a> {
         match self.pop_val()? {
             StackTy::Bot => Ok(()),
             StackTy::Known(actual) => {
-                if val_sub(self.types, expected, actual) {
+                if val_sub(self.module, expected, actual) {
                     Ok(())
                 } else {
                     Err(Error::Invalid("type mismatch"))
@@ -793,7 +798,7 @@ impl<'a> Machine<'a> {
         match self.pop_val()? {
             StackTy::Bot => Ok(StackTy::Bot),
             StackTy::Known(actual) => {
-                if val_sub(self.types, expected, actual) {
+                if val_sub(self.module, expected, actual) {
                     Ok(StackTy::Known(actual))
                 } else {
                     Err(Error::Invalid("type mismatch"))
@@ -845,7 +850,7 @@ impl<'a> Machine<'a> {
             || payload
                 .iter()
                 .zip(&types)
-                .any(|(actual, expected)| !val_sub(self.types, *expected, *actual))
+                .any(|(actual, expected)| !val_sub(self.module, *expected, *actual))
         {
             return Err(Error::Invalid("type mismatch"));
         }
@@ -1277,7 +1282,7 @@ impl<'a> Machine<'a> {
                 let Some(element) = spaces.module.elements.get(*element_index as usize) else {
                     return Err(Error::Invalid("unknown elem segment"));
                 };
-                if !ref_sub(&spaces.module.types, table_ty.element, element.ty) {
+                if !ref_sub(spaces.module, table_ty.element, element.ty) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 // Operands (bottom to top): dst index, elem offset, length; the
@@ -1296,7 +1301,7 @@ impl<'a> Machine<'a> {
                 let src_table = table_at(spaces, *src as usize)?;
                 // Copied elements must fit the destination table: the source
                 // element type is a subtype of the destination's.
-                if !ref_sub(&spaces.module.types, dst_table.element, src_table.element) {
+                if !ref_sub(spaces.module, dst_table.element, src_table.element) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 let dst_addr = table_addr_type(spaces, *dst as usize)?;
@@ -1416,7 +1421,7 @@ impl<'a> Machine<'a> {
                     return Err(Error::Invalid("type mismatch"));
                 };
                 let elem_ty = element_type_at(spaces, *elem)?;
-                if !ref_sub(&spaces.module.types, array_ref, elem_ty) {
+                if !ref_sub(spaces.module, array_ref, elem_ty) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 self.pop_expected(ValType::I32)?;
@@ -1465,7 +1470,7 @@ impl<'a> Machine<'a> {
             Instr::ArrayCopy { dst, src } => {
                 let dst_field = array_field_mut(spaces.module, *dst)?;
                 let src_field = array_field(spaces.module, *src)?;
-                if !storage_compatible(&spaces.module.types, dst_field.ty, src_field.ty) {
+                if !storage_compatible(spaces.module, dst_field.ty, src_field.ty) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 self.pop_expected(ValType::I32)?;
@@ -1491,7 +1496,7 @@ impl<'a> Machine<'a> {
                     return Err(Error::Invalid("type mismatch"));
                 };
                 let elem_ty = element_type_at(spaces, *elem)?;
-                if !ref_sub(&spaces.module.types, array_ref, elem_ty) {
+                if !ref_sub(spaces.module, array_ref, elem_ty) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 self.pop_expected(ValType::I32)?;
@@ -1501,7 +1506,7 @@ impl<'a> Machine<'a> {
             }
             Instr::RefTest { nullable, heap } => {
                 let heap = heap_checked(*heap, spaces)?;
-                let top = top_heap(&spaces.module.types, &heap);
+                let top = top_heap(spaces.module, &heap);
                 self.pop_ref_under(ValType::Ref(RefType {
                     nullable: true,
                     heap: top,
@@ -1511,7 +1516,7 @@ impl<'a> Machine<'a> {
             }
             Instr::RefCast { nullable, heap } => {
                 let heap = heap_checked(*heap, spaces)?;
-                let top = top_heap(&spaces.module.types, &heap);
+                let top = top_heap(spaces.module, &heap);
                 self.pop_ref_under(ValType::Ref(RefType {
                     nullable: true,
                     heap: top,
@@ -1715,7 +1720,7 @@ impl<'a> Machine<'a> {
             return Err(Error::Invalid("type mismatch"));
         }
         for (declared, actual) in signature.results.iter().zip(&ty.results) {
-            if !val_sub(self.types, *declared, *actual) {
+            if !val_sub(self.module, *declared, *actual) {
                 return Err(Error::Invalid("type mismatch"));
             }
         }
@@ -1748,7 +1753,7 @@ impl<'a> Machine<'a> {
         match self.pop_val()? {
             StackTy::Bot => Ok(()),
             StackTy::Known(actual) if matches!(actual, ValType::Ref(_)) => {
-                if val_sub(self.types, expected, actual) {
+                if val_sub(self.module, expected, actual) {
                     Ok(())
                 } else {
                     Err(Error::Invalid("type mismatch"))
@@ -1769,14 +1774,14 @@ impl<'a> Machine<'a> {
         to: RefType,
         spaces: &Spaces<'_>,
     ) -> Result<(), Error> {
-        if !ref_sub(&spaces.module.types, from, to) {
+        if !ref_sub(spaces.module, from, to) {
             return Err(Error::Invalid("type mismatch"));
         }
         let types = self.label_types(label as usize)?;
         let Some((&last, prefix)) = types.split_last() else {
             return Err(Error::Invalid("type mismatch"));
         };
-        if !val_sub(self.types, last, ValType::Ref(to)) {
+        if !val_sub(self.module, last, ValType::Ref(to)) {
             return Err(Error::Invalid("type mismatch"));
         }
         self.pop_expected(ValType::Ref(from))?;
@@ -1796,7 +1801,7 @@ impl<'a> Machine<'a> {
         to: RefType,
         spaces: &Spaces<'_>,
     ) -> Result<(), Error> {
-        if !ref_sub(&spaces.module.types, from, to) {
+        if !ref_sub(spaces.module, from, to) {
             return Err(Error::Invalid("type mismatch"));
         }
         let remainder = type_difference(from, to);
@@ -1804,7 +1809,7 @@ impl<'a> Machine<'a> {
         let Some((&last, prefix)) = types.split_last() else {
             return Err(Error::Invalid("type mismatch"));
         };
-        if !val_sub(self.types, last, ValType::Ref(remainder)) {
+        if !val_sub(self.module, last, ValType::Ref(remainder)) {
             return Err(Error::Invalid("type mismatch"));
         }
         self.pop_expected(ValType::Ref(from))?;
@@ -1857,7 +1862,7 @@ fn array_field_mut(module: &Module, index: u32) -> Result<FieldType, Error> {
 }
 
 /// Whether a source array's storage type fits a destination's (array.copy).
-fn storage_compatible(types: &[SubType], dst: StorageType, src: StorageType) -> bool {
+fn storage_compatible(module: &Module, dst: StorageType, src: StorageType) -> bool {
     match (dst, src) {
         (StorageType::I8, StorageType::I8)
         | (StorageType::I16, StorageType::I16)
@@ -1866,7 +1871,7 @@ fn storage_compatible(types: &[SubType], dst: StorageType, src: StorageType) -> 
         | (StorageType::F32, StorageType::F32)
         | (StorageType::F64, StorageType::F64)
         | (StorageType::V128, StorageType::V128) => true,
-        (StorageType::Ref(dst_ref), StorageType::Ref(src_ref)) => ref_sub(types, dst_ref, src_ref),
+        (StorageType::Ref(dst_ref), StorageType::Ref(src_ref)) => ref_sub(module, dst_ref, src_ref),
         _ => false,
     }
 }
@@ -2016,7 +2021,7 @@ fn memory_access_ok(
 }
 
 fn table_is_func(module: &Module, table: &TableType) -> bool {
-    heap_sub(&module.types, &table.element.heap, &HeapType::Func)
+    heap_sub(module, &table.element.heap, &HeapType::Func)
 }
 
 /// The operand a `call_ref`/`return_call_ref` requires: a (nullable)
@@ -2190,7 +2195,7 @@ fn const_expr_type(expr: &[Instr], spaces: &Spaces<'_>, visible: usize) -> Resul
                 };
                 // Internalizing any aggregate (or null) value is fine; extern
                 // values are not `any` and cannot be externalized again.
-                if !heap_sub(&spaces.module.types, &entry.heap, &HeapType::Any) {
+                if !heap_sub(spaces.module, &entry.heap, &HeapType::Any) {
                     return Err(Error::Invalid("type mismatch"));
                 }
                 stack.push(ValType::Ref(RefType {
@@ -2201,7 +2206,7 @@ fn const_expr_type(expr: &[Instr], spaces: &Spaces<'_>, visible: usize) -> Resul
             Instr::StructNew(type_index) => {
                 let fields = struct_fields(spaces.module, *type_index)?;
                 for field in fields.iter().rev() {
-                    pop_const_sub(&spaces.module.types, &mut stack, field.ty.val())?;
+                    pop_const_sub(spaces.module, &mut stack, field.ty.val())?;
                 }
                 stack.push(ValType::Ref(RefType {
                     nullable: false,
@@ -2225,7 +2230,7 @@ fn const_expr_type(expr: &[Instr], spaces: &Spaces<'_>, visible: usize) -> Resul
                 if stack.pop() != Some(ValType::I32) {
                     return Err(Error::Invalid("type mismatch"));
                 }
-                pop_const_sub(&spaces.module.types, &mut stack, field.ty.val())?;
+                pop_const_sub(spaces.module, &mut stack, field.ty.val())?;
                 stack.push(ValType::Ref(RefType {
                     nullable: false,
                     heap: HeapType::Type(*type_index),
@@ -2247,7 +2252,7 @@ fn const_expr_type(expr: &[Instr], spaces: &Spaces<'_>, visible: usize) -> Resul
             Instr::ArrayNewFixed { ty, n } => {
                 let field = array_field(spaces.module, *ty)?;
                 for _ in 0..*n {
-                    pop_const_sub(&spaces.module.types, &mut stack, field.ty.val())?;
+                    pop_const_sub(spaces.module, &mut stack, field.ty.val())?;
                 }
                 stack.push(ValType::Ref(RefType {
                     nullable: false,
@@ -2265,12 +2270,12 @@ fn const_expr_type(expr: &[Instr], spaces: &Spaces<'_>, visible: usize) -> Resul
 
 /// Pop a constant-expression stack entry that must subsume `expected`.
 fn pop_const_sub(
-    types: &[SubType],
+    module: &Module,
     stack: &mut Vec<ValType>,
     expected: ValType,
 ) -> Result<(), Error> {
     let actual = stack.pop().ok_or(Error::Invalid("type mismatch"))?;
-    if val_sub(types, expected, actual) {
+    if val_sub(module, expected, actual) {
         Ok(())
     } else {
         Err(Error::Invalid("type mismatch"))
@@ -2284,7 +2289,7 @@ fn validate_const_expr(
     visible_globals: usize,
 ) -> Result<(), Error> {
     let actual = const_expr_type(expr, spaces, visible_globals)?;
-    if !val_sub(&spaces.module.types, expected, actual) {
+    if !val_sub(spaces.module, expected, actual) {
         return Err(Error::Invalid("type mismatch"));
     }
     Ok(())
@@ -2407,10 +2412,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(heap_sub(&module.types, &Type(1), &Struct));
-        assert!(heap_sub(&module.types, &Type(1), &Any));
-        assert!(heap_sub(&module.types, &Type(0), &Func));
-        assert!(!heap_sub(&module.types, &Type(1), &Func));
+        assert!(heap_sub(&module, &Type(1), &Struct));
+        assert!(heap_sub(&module, &Type(1), &Any));
+        assert!(heap_sub(&module, &Type(0), &Func));
+        assert!(!heap_sub(&module, &Type(1), &Func));
         // A declared supertype chain (type 3 sub 2 sub 0).
         let module = crate::Module {
             types: vec![
@@ -2435,12 +2440,12 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(heap_sub(&module.types, &Type(3), &Type(0)));
-        assert!(heap_sub(&module.types, &Type(3), &Type(2)));
-        assert!(!heap_sub(&module.types, &Type(2), &Type(3)));
+        assert!(heap_sub(&module, &Type(3), &Type(0)));
+        assert!(heap_sub(&module, &Type(3), &Type(2)));
+        assert!(!heap_sub(&module, &Type(2), &Type(3)));
         // Nullability: a nullable reference does not fit a non-null slot.
         assert!(ref_sub(
-            &module.types,
+            &module,
             RefType {
                 nullable: true,
                 heap: Func
@@ -2451,7 +2456,7 @@ mod tests {
             }
         ));
         assert!(!ref_sub(
-            &module.types,
+            &module,
             RefType {
                 nullable: false,
                 heap: Func

@@ -19,7 +19,7 @@ use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
 use crate::types::{
     BlockType, CompositeType, FieldType, FuncType, GlobalType, HeapType, Limits, MemType, RefType,
-    StorageType, SubType, TableType, ValType,
+    StorageType, TableType, ValType,
 };
 use crate::values::{ExternInner, FuncAddr, RefValue, Trap, Value, exec_num};
 
@@ -195,6 +195,10 @@ impl TableInst {
 #[derive(Debug)]
 pub struct TagInst {
     ty: FuncType,
+    /// The instance and module type index that declared the tag, when it came
+    /// from a module (used for cross-module import matching); `None` for
+    /// standalone JS-API tags.
+    owner: Option<(usize, u32)>,
 }
 
 /// A concrete exception: which tag was thrown plus the argument values.
@@ -361,7 +365,7 @@ impl Store {
     /// Register a standalone tag cell (a JS-API `WebAssembly.Tag`); returns
     /// its id. The payload shape is the tag's function type (parameters only).
     pub fn tag(&mut self, ty: FuncType) -> usize {
-        self.tags.push(TagInst { ty });
+        self.tags.push(TagInst { ty, owner: None });
         self.tags.len() - 1
     }
 
@@ -406,14 +410,12 @@ impl Store {
         for import in &module.imports {
             match &import.desc {
                 ImportDesc::Func(type_index) => {
-                    let expected = module
-                        .func_at_cloned(*type_index)
-                        .ok_or(InstantiateError::Unlinkable("unknown import"))?;
                     let value = resolve(&import.module, &import.name)
                         .ok_or(InstantiateError::Unlinkable("unknown import"))?;
                     match value {
                         ExternVal::HostFunc(id) => {
-                            if self.host_funcs[id].ty != expected {
+                            let target = FuncTarget::Host(id);
+                            if !self.func_type_matches(module, *type_index, target) {
                                 return Err(InstantiateError::Unlinkable(
                                     "incompatible import type",
                                 ));
@@ -426,7 +428,7 @@ impl Store {
                                 .get(instance)
                                 .and_then(|i| i.funcs.get(index))
                                 .ok_or(InstantiateError::Unlinkable("unknown import"))?;
-                            if self.target_type(target) != expected {
+                            if !self.func_type_matches(module, *type_index, target) {
                                 return Err(InstantiateError::Unlinkable(
                                     "incompatible import type",
                                 ));
@@ -527,8 +529,25 @@ impl Store {
                     match value {
                         ExternVal::Tag(cell) => {
                             // Tags match by payload shape: the imported type
-                            // must equal the tag's declared function type.
-                            if self.tags.get(cell).map(|t| t.ty.clone()) != Some(expected) {
+                            // must be equivalent to the tag's declared type
+                            // (cross-module rec-group aware when the tag was
+                            // declared by a module).
+                            let ok = match self.tags.get(cell).and_then(|t| t.owner) {
+                                Some((owner_instance, owner_type)) => {
+                                    self.instances.get(owner_instance).is_some_and(|owner| {
+                                        crate::module::type_indices_equivalent(
+                                            &module.types,
+                                            &module.rec_groups,
+                                            *type_index,
+                                            &owner.module.types,
+                                            &owner.module.rec_groups,
+                                            owner_type,
+                                        )
+                                    })
+                                }
+                                None => self.tags.get(cell).map(|t| t.ty.clone()) == Some(expected),
+                            };
+                            if !ok {
                                 return Err(InstantiateError::Unlinkable(
                                     "incompatible import type",
                                 ));
@@ -557,7 +576,10 @@ impl Store {
             let ty = module
                 .func_at_cloned(*type_index)
                 .ok_or(InstantiateError::Unlinkable("unknown tag type"))?;
-            self.tags.push(TagInst { ty });
+            self.tags.push(TagInst {
+                ty,
+                owner: Some((self_id, *type_index)),
+            });
             tags.push(self.tags.len() - 1);
         }
 
@@ -1040,20 +1062,34 @@ impl Store {
         engine.run()
     }
 
-    fn target_type(&self, target: FuncTarget) -> FuncType {
+    /// Whether a resolved function target satisfies a declared module type
+    /// index: an owned function's type must be rec-group equivalent across the
+    /// two module type spaces; a host function's signature must equal the
+    /// declared one (host signatures carry no module-defined types).
+    fn func_type_matches(&self, module: &Module, type_index: u32, target: FuncTarget) -> bool {
         match target {
-            FuncTarget::Host(id) => self.host_funcs[id].ty.clone(),
+            FuncTarget::Host(id) => {
+                let declared = module.func_at_cloned(type_index).unwrap_or(FuncType {
+                    params: Vec::new(),
+                    results: Vec::new(),
+                });
+                self.host_funcs[id].ty == declared
+            }
             FuncTarget::Owned { instance, defined } => {
-                let module = &self.instances[instance].module;
-                module
-                    .functions
-                    .get(defined)
-                    .and_then(|&ti| module.func_at(ti))
-                    .cloned()
-                    .unwrap_or(FuncType {
-                        params: Vec::new(),
-                        results: Vec::new(),
-                    })
+                let Some(owner) = self.instances.get(instance) else {
+                    return false;
+                };
+                let Some(&owner_type) = owner.module.functions.get(defined) else {
+                    return false;
+                };
+                crate::module::type_indices_equivalent(
+                    &module.types,
+                    &module.rec_groups,
+                    type_index,
+                    &owner.module.types,
+                    &owner.module.rec_groups,
+                    owner_type,
+                )
             }
         }
     }
@@ -2610,16 +2646,39 @@ impl<'a> Engine<'a> {
             .ok_or(ExecFail::Trap(Trap::UnknownFunction))?
             .composite
             .clone();
-        Ok(match heap {
+        let matches = match heap {
             HeapType::Type(target) => {
+                let owner_module = &self.store.instances[owner].module;
+                let frame_module = &self.store.instances[frame_instance].module;
                 if owner == frame_instance {
-                    let types = &self.store.instances[frame_instance].module.types;
-                    type_sub_canon(types, ty, target)
+                    owner_module.type_is_subtype(ty, target)
                 } else {
-                    // A concrete target in another module's type space cannot
-                    // be related to this object's type index. Fixtures never
-                    // cast aggregates across module type spaces.
-                    false
+                    // A cross-module cast: the object's concrete type must be
+                    // equivalent to the target, or reach it through the owner's
+                    // declared supertype chain (each edge compared by
+                    // equivalence against the frame module's target).
+                    let mut current = ty;
+                    loop {
+                        if crate::module::type_indices_equivalent(
+                            &frame_module.types,
+                            &frame_module.rec_groups,
+                            target,
+                            &owner_module.types,
+                            &owner_module.rec_groups,
+                            current,
+                        ) {
+                            break true;
+                        }
+                        let Some(parent) = owner_module
+                            .types
+                            .get(current as usize)
+                            .and_then(|sub| sub.supertypes.first())
+                            .copied()
+                        else {
+                            break false;
+                        };
+                        current = parent;
+                    }
                 }
             }
             abstract_target => {
@@ -2630,7 +2689,14 @@ impl<'a> Engine<'a> {
                 };
                 runtime_abs_matches(kind, abstract_target)
             }
-        })
+        };
+        Ok(matches)
+    }
+
+    /// Whether a resolved function target satisfies a declared module type
+    /// index of the top frame's module (see [`Store::func_type_matches`]).
+    fn func_type_matches(&self, module: &Module, type_index: u32, target: FuncTarget) -> bool {
+        self.store.func_type_matches(module, type_index, target)
     }
 
     /// The type index of a function reference's declared type, within the
@@ -3136,14 +3202,11 @@ impl<'a> Engine<'a> {
             return Err(ExecFail::Trap(Trap::UninitializedElement));
         };
         let target = self.resolve_target(address)?;
-        let expected = self
-            .store
-            .instances
-            .get(instance)
-            .and_then(|i| i.module.func_at(type_index as u32))
-            .cloned()
-            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-        if self.store.target_type(target) != expected {
+        if !self.func_type_matches(
+            &self.store.instances[instance].module,
+            type_index as u32,
+            target,
+        ) {
             return Err(ExecFail::Trap(Trap::IndirectCallTypeMismatch));
         }
         self.call_target(target)
@@ -3167,14 +3230,11 @@ impl<'a> Engine<'a> {
             return Err(ExecFail::Trap(Trap::UninitializedElement));
         };
         let target = self.resolve_target(address)?;
-        let expected = self
-            .store
-            .instances
-            .get(instance)
-            .and_then(|i| i.module.func_at(type_index as u32))
-            .cloned()
-            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-        if self.store.target_type(target) != expected {
+        if !self.func_type_matches(
+            &self.store.instances[instance].module,
+            type_index as u32,
+            target,
+        ) {
             return Err(ExecFail::Trap(Trap::IndirectCallTypeMismatch));
         }
         self.tail_target(target)
@@ -3188,14 +3248,11 @@ impl<'a> Engine<'a> {
             return Err(ExecFail::Trap(Trap::CallStackExhausted));
         }
         let target = self.resolve_target(address)?;
-        let expected = self
-            .store
-            .instances
-            .get(instance)
-            .and_then(|i| i.module.func_at(type_index as u32))
-            .cloned()
-            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-        if self.store.target_type(target) != expected {
+        if !self.func_type_matches(
+            &self.store.instances[instance].module,
+            type_index as u32,
+            target,
+        ) {
             return Err(ExecFail::Trap(Trap::IndirectCallTypeMismatch));
         }
         self.call_target(target)
@@ -3206,14 +3263,11 @@ impl<'a> Engine<'a> {
         let frame_index = self.frames.len() - 1;
         let instance = self.frames[frame_index].instance;
         let target = self.resolve_target(address)?;
-        let expected = self
-            .store
-            .instances
-            .get(instance)
-            .and_then(|i| i.module.func_at(type_index as u32))
-            .cloned()
-            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-        if self.store.target_type(target) != expected {
+        if !self.func_type_matches(
+            &self.store.instances[instance].module,
+            type_index as u32,
+            target,
+        ) {
             return Err(ExecFail::Trap(Trap::IndirectCallTypeMismatch));
         }
         self.tail_target(target)
@@ -4090,142 +4144,4 @@ fn runtime_abs_matches(sub: HeapType, sup: HeapType) -> bool {
         I31 | Struct | Array => sup == Eq || sup == Any,
         _ => false,
     }
-}
-
-/// Whether concrete type `start` is a subtype of `goal` in `types`: either
-/// the two are canonically (structurally) equal, or `start` follows a
-/// declared supertype edge to a type that is (spec 3.3: subsumption through
-/// declared subtypes, with type equality canonicalized).
-fn type_sub_canon(types: &[SubType], start: u32, goal: u32) -> bool {
-    if type_structural_eq(types, start, goal) {
-        return true;
-    }
-    let Some(sub) = types.get(start as usize) else {
-        return false;
-    };
-    sub.supertypes
-        .iter()
-        .any(|&parent| type_sub_canon(types, parent, goal))
-}
-
-/// Whether two type indices in one module are structurally (canonically)
-/// equal: same composite shape, same field mutability/storage, with nested
-/// type references compared recursively. Recursive type groups compare
-/// coinductively (a revisited pair is assumed equal), which is exact for the
-/// acyclic types the corpus exercises.
-fn type_structural_eq(types: &[SubType], a: u32, b: u32) -> bool {
-    fn recurse(types: &[SubType], a: u32, b: u32, seen: &mut Vec<(u32, u32)>) -> bool {
-        if a == b {
-            return true;
-        }
-        if seen
-            .iter()
-            .any(|&(x, y)| (x, y) == (a, b) || (x, y) == (b, a))
-        {
-            return true;
-        }
-        let (Some(sub_a), Some(sub_b)) = (types.get(a as usize), types.get(b as usize)) else {
-            return false;
-        };
-        if sub_a.is_final != sub_b.is_final
-            || sub_a.supertypes.len() != sub_b.supertypes.len()
-            || !sub_a
-                .supertypes
-                .iter()
-                .zip(&sub_b.supertypes)
-                .all(|(&x, &y)| recurse(types, x, y, seen))
-        {
-            return false;
-        }
-        seen.push((a, b));
-        let equal = composites_equal(types, &sub_a.composite, &sub_b.composite, seen);
-        seen.pop();
-        equal
-    }
-
-    fn composites_equal(
-        types: &[SubType],
-        a: &CompositeType,
-        b: &CompositeType,
-        seen: &mut Vec<(u32, u32)>,
-    ) -> bool {
-        match (a, b) {
-            (CompositeType::Func(fa), CompositeType::Func(fb)) => {
-                fa.params.len() == fb.params.len()
-                    && fa.results.len() == fb.results.len()
-                    && fa
-                        .params
-                        .iter()
-                        .zip(&fb.params)
-                        .all(|(x, y)| valtypes_equal(types, *x, *y, seen))
-                    && fa
-                        .results
-                        .iter()
-                        .zip(&fb.results)
-                        .all(|(x, y)| valtypes_equal(types, *x, *y, seen))
-            }
-            (CompositeType::Struct(fa), CompositeType::Struct(fb)) => {
-                fa.len() == fb.len()
-                    && fa
-                        .iter()
-                        .zip(fb)
-                        .all(|(x, y)| fields_equal(types, x, y, seen))
-            }
-            (CompositeType::Array(fa), CompositeType::Array(fb)) => {
-                fields_equal(types, fa, fb, seen)
-            }
-            _ => false,
-        }
-    }
-
-    fn fields_equal(
-        types: &[SubType],
-        a: &FieldType,
-        b: &FieldType,
-        seen: &mut Vec<(u32, u32)>,
-    ) -> bool {
-        a.mutable == b.mutable && storages_equal(types, a.ty, b.ty, seen)
-    }
-
-    fn storages_equal(
-        types: &[SubType],
-        a: StorageType,
-        b: StorageType,
-        seen: &mut Vec<(u32, u32)>,
-    ) -> bool {
-        match (a, b) {
-            (StorageType::Ref(ra), StorageType::Ref(rb)) => {
-                ra.nullable == rb.nullable && heaps_equal(types, ra.heap, rb.heap, seen)
-            }
-            _ => a == b,
-        }
-    }
-
-    fn valtypes_equal(
-        types: &[SubType],
-        a: ValType,
-        b: ValType,
-        seen: &mut Vec<(u32, u32)>,
-    ) -> bool {
-        match (a, b) {
-            (ValType::Ref(ra), ValType::Ref(rb)) => {
-                ra.nullable == rb.nullable && heaps_equal(types, ra.heap, rb.heap, seen)
-            }
-            _ => a == b,
-        }
-    }
-
-    fn heaps_equal(
-        types: &[SubType],
-        a: HeapType,
-        b: HeapType,
-        seen: &mut Vec<(u32, u32)>,
-    ) -> bool {
-        match (a, b) {
-            (HeapType::Type(x), HeapType::Type(y)) => recurse(types, x, y, seen),
-            _ => a == b,
-        }
-    }
-
-    recurse(types, a, b, &mut Vec::new())
 }

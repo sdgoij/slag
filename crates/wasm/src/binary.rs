@@ -193,7 +193,12 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
         SectionId::Type => {
             let count = read_u32(payload, &mut pos)?;
             for _ in 0..count {
+                let before = module.types.len();
                 decode_rectype(payload, &mut pos, &mut module.types)?;
+                let added = module.types.len() - before;
+                if added > 0 {
+                    module.rec_groups.push(added as u32);
+                }
             }
         }
         SectionId::Import => {
