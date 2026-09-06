@@ -2094,7 +2094,22 @@ impl JsObject {
         if !self.store_chain_clean_hit() && !self.store_chain_walk(index) {
             return Ok(None);
         }
-        slots.elements.borrow_mut().push(Some(value));
+        {
+            let mut elements = slots.elements.borrow_mut();
+            // The dense buffer can be shorter than `length` — a length grow
+            // past the buffer (`a.length = N` on a short array) leaves
+            // trailing holes — so the element lands at its real index
+            // (`length`), materializing the intervening holes, instead of a
+            // naive push that would store it at `elements.len()`. A huge gap
+            // spills (mirrors the hole-fill guard below).
+            if index as usize > elements.len() + DENSE_HOLE_SPILL_CAP {
+                return Ok(None);
+            }
+            if elements.len() < index as usize {
+                elements.resize(index as usize, None);
+            }
+            elements.push(Some(value));
+        }
         slots.length.set(length + 1.0);
         self.write_length_mirror(length + 1.0);
         self.bump_generation();
@@ -2111,6 +2126,55 @@ impl JsObject {
         {
             *slot = Value::Number(length);
         }
+    }
+
+    /// The current length of a dense Array as a `u64` — the cell, not a
+    /// property read. `None` when the object is not a dense Array (a spilled
+    /// Array or a non-Array reads its length through the generic property
+    /// machinery).
+    pub fn array_length_dense(&self) -> Option<u64> {
+        match &self.kind {
+            ObjectKind::Array(slots) if slots.dense.get() => Some(slots.length.get() as u64),
+            _ => None,
+        }
+    }
+
+    /// The dense `Array.prototype.pop` fast path: a dense Array whose last
+    /// slot holds an own data element pops by truncation — read the element,
+    /// truncate the buffer, and sync the length cell + mirror (the spec's
+    /// [[Delete]] + Set(length) collapse to one truncate for an own dense
+    /// element; an empty dense Array's Set(length, 0) is a no-op, so
+    /// `undefined` returns directly). Returns `Ok(None)` when the receiver
+    /// cannot be served densely — not a dense Array, or the last slot is a
+    /// hole, whose [[Get]] must consult the prototype chain — and the caller
+    /// runs the exact machinery. Never mutates on the `None` path.
+    pub fn array_pop_dense(&self) -> Result<Option<Value>, JsError> {
+        let ObjectKind::Array(slots) = &self.kind else {
+            return Ok(None);
+        };
+        if !slots.dense.get() {
+            return Ok(None);
+        }
+        let length = slots.length.get();
+        if length <= 0.0 {
+            return Ok(Some(Value::Undefined));
+        }
+        let index = (length - 1.0) as u64;
+        let value = {
+            let elements = slots.elements.borrow();
+            match elements.get(index as usize) {
+                Some(Some(value)) => Some(*value),
+                _ => None,
+            }
+        };
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        slots.elements.borrow_mut().truncate(index as usize);
+        slots.length.set(index as f64);
+        self.write_length_mirror(index as f64);
+        self.bump_generation();
+        Ok(Some(value))
     }
 
     /// Materialize the dense buffer into `properties` and drop dense mode:
@@ -5732,6 +5796,30 @@ mod tests {
         assert!(!array.set(&key("1"), Value::Number(9.0), false).unwrap());
         assert_eq!(array.get(&key("1")).unwrap(), Value::Number(1.0));
         assert!(!array.extensible.get());
+    }
+
+    #[test]
+    fn dense_append_after_length_growth_places_element_at_index() {
+        // `a.length = N` grows the length past the (short) dense buffer; the
+        // next append at index == length must store the element at its real
+        // index (materializing the intervening holes), not at the buffer's
+        // end.
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        assert!(
+            array
+                .set(&key("length"), Value::Number(10.0), false)
+                .unwrap()
+        );
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(10.0));
+        assert!(
+            array
+                .array_element_write(10, Value::Number(7.0))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(array.get(&key("10")).unwrap(), Value::Number(7.0));
+        assert_eq!(array.get(&key("5")).unwrap(), Value::Undefined);
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(11.0));
     }
 
     #[test]

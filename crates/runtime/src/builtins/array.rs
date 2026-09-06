@@ -1155,6 +1155,15 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
 fn pop(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
+    // Fast path: a dense Array whose last slot holds an own data element —
+    // pop is exactly a truncate there (see `array_pop_dense`). A hole at the
+    // end (whose [[Get]] must consult the prototype chain) or a non-dense
+    // receiver falls through to the exact machinery below.
+    if let Some(array) = object.as_object()
+        && let Some(value) = array.array_pop_dense()?
+    {
+        return Ok(value);
+    }
     let length = length_of_array_like(agent, &object)?;
     if length == 0 {
         set_property(&object, &JsString::from_utf8("length"), Value::Number(0.0))?;
@@ -1177,7 +1186,21 @@ fn pop(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsErro
 pub(crate) fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
     let object = crate::context::to_object(agent, this)?;
-    let mut length = length_of_array_like(agent, &object)?;
+    // A genuine dense Array's length cell is authoritative (dense keeps the
+    // length property mirrored), so read it directly instead of the generic
+    // LengthOfArrayLike [[Get]]. Each argument appends through
+    // `array_element_write` (which maintains the length + mirror), and when
+    // EVERY argument took that path the trailing full [[Set]] of `length`
+    // writes the value it already has — skip it. Any element that needed the
+    // generic [[Set]] (a non-Array receiver, a spill, a dirty chain, ...)
+    // keeps the final length set, byte-identical to before.
+    let dense_length = object
+        .as_object()
+        .and_then(|array| array.array_length_dense());
+    let mut length = match dense_length {
+        Some(length) => length,
+        None => length_of_array_like(agent, &object)?,
+    };
     // spec 23.1.3.22 step 5: len + argCount > 2^53-1 throws before any
     // write (throws-if-integer-limit-exceeded.js).
     if length.saturating_add(args.len() as u64) > 9007199254740991 {
@@ -1186,6 +1209,7 @@ pub(crate) fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
             "Array length exceeds 2^53-1".into(),
         ));
     }
+    let mut all_dense = dense_length.is_some();
     for item in args {
         // A plain Array's element write goes through the dense fast path
         // (chain-checked create, length bump included); anything else falls
@@ -1197,14 +1221,17 @@ pub(crate) fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
             length += 1;
             continue;
         }
+        all_dense = false;
         set_property(&object, &key(length), *item)?;
         length += 1;
     }
-    set_property(
-        &object,
-        &JsString::from_utf8("length"),
-        Value::Number(length as f64),
-    )?;
+    if !all_dense {
+        set_property(
+            &object,
+            &JsString::from_utf8("length"),
+            Value::Number(length as f64),
+        )?;
+    }
     Ok(Value::Number(length as f64))
 }
 
