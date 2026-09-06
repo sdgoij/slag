@@ -1397,3 +1397,44 @@ Remaining Cut 9 engine wave: a GC object runtime in the store
 (struct/array/i31 objects, extern wrappers), the executor for the
 `0xfb` instructions (incl. data/elem segment access and cast
 semantics), and the `gc/` file sweep — against `gc/` (17).
+
+### Quote-text converter + reserved-opcode decode (2026-09-06)
+
+The runner no longer marks every `assert_malformed`/`assert_invalid`
+`(module quote …)` fixture pending. `wasmtest` now:
+
+- parses each quote sidecar (`.wat`) with the `wast` crate and encodes
+  it to binary (`wat_text_to_binary`, trying a `(module …)` wrapper
+  first, then bare); for `assert_malformed` a text/encode parse failure
+  or a binary-level malformed decode is a pass, a decode that succeeds
+  is a fail; for `assert_invalid` a parse failure is a fail, an
+  invalid/valid verdict comes from the validator, and decode/validation
+  `Unsupported` stays pending.
+- `binary.rs` classifies the reserved single-byte opcode gaps as
+  malformed rather than unsupported, matching the pinned spec's
+  interpreter (`illegal opcode`): legacy EH `try`/`catch`/`rethrow`
+  (0x06/0x07/0x09), the 0x16-0x19, 0x1d-0x1e, 0x27, 0xc5-0xcf,
+  0xd7-0xfa control/numeric gaps, and 0xfe/0xff. This clears the last
+  baseline pendings (`binary.wast` elem/body reserved-opcode fixtures)
+  and the `exceptions/try_table.wast` legacy-`catch` fixtures (the
+  `wast` crate still parses the old standalone `catch`/`catch_all`
+  instruction forms, which encode to bytes the spec reserves).
+
+Measured (2026-09-06, in-process converter, single suite dirs):
+
+| Suite | pass / fail / pending / skip |
+|---|---|
+| baseline `core/*.wast` | 20,569 / 0 / 0 / 6 |
+| `exceptions/` | 95 / 0 / 0 / 1 |
+| `simd/` | 25,990 / 0 / 0 / 0 |
+| `relaxed-simd/` | 77 / 0 / 0 / 0 |
+| `multi-memory/` | 912 / 0 / 0 / 0 |
+| `memory64/` | 8,709 / 0 / 0 / 0 |
+| `gc/` | 654 / 0 / 0 / 1 |
+| `bulk-memory/` | 7,485 / 0 / 0 / 0 |
+
+Every suite that previously carried quote-text pendings (baseline 600,
+`simd` 511, `memory64` 59, `exceptions` 2, `gc` 1) now reports zero
+pendings. Remaining skips are documented Cut 9 converter exclusions
+(`type-rec`, `type-equivalence`, GC multi-supertype text the `wast`
+grammar rejects) and one `gc` fixture.

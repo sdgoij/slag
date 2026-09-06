@@ -29,6 +29,8 @@ use wasm::values::{ExternInner, FuncAddr};
 use wasm::{
     DecodeError, ExecFail, ExternVal, InstantiateError, Module, Store, Trap, decode, validate,
 };
+use wast::Wat;
+use wast::parser::{self, ParseBuffer};
 
 const USAGE: &str = "\
 wasmtest — WebAssembly conformance runner
@@ -451,7 +453,23 @@ fn run_json(json_path: &Path) -> Tally {
                         Err(DecodeError::Unsupported(reason)) => Outcome::Pending(reason),
                         Ok(_) => Outcome::Fail("expected malformed, module decoded".into()),
                     },
-                    ModuleSource::Text => Outcome::Pending("quote text module"),
+                    ModuleSource::Text => {
+                        let command = command.get("module").unwrap_or(command);
+                        match quote_command_bytes(command, dir) {
+                            Some(Err(_)) => Outcome::Pass,
+                            // A text-level defect (e.g. a second `start`) may
+                            // survive the `wast` parser and surface only as a
+                            // malformed binary once encoded.
+                            Some(Ok(bytes)) => match decode(&bytes) {
+                                Err(DecodeError::Malformed(_)) => Outcome::Pass,
+                                Err(DecodeError::Unsupported(reason)) => Outcome::Pending(reason),
+                                Ok(_) => {
+                                    Outcome::Fail("expected malformed, quote text parsed".into())
+                                }
+                            },
+                            None => Outcome::Pending("assert_malformed quote without a file"),
+                        }
+                    }
                     ModuleSource::Missing => {
                         Outcome::Pending("assert_malformed without a module file")
                     }
@@ -472,7 +490,30 @@ fn run_json(json_path: &Path) -> Tally {
                             Ok(_) => Outcome::Fail("expected invalid, module validated".into()),
                         },
                     },
-                    ModuleSource::Text => Outcome::Pending("quote text module"),
+                    ModuleSource::Text => {
+                        let command = command.get("module").unwrap_or(command);
+                        match quote_command_bytes(command, dir) {
+                            Some(Err(_)) => {
+                                Outcome::Fail("expected invalid, quote text is malformed".into())
+                            }
+                            Some(Ok(bytes)) => match decode(&bytes) {
+                                Err(DecodeError::Malformed(message)) => Outcome::Fail(format!(
+                                    "expected invalid, decoder says malformed: {message}"
+                                )),
+                                Err(DecodeError::Unsupported(reason)) => Outcome::Pending(reason),
+                                Ok(module) => match validate(&module) {
+                                    Err(ValidError::Invalid(_)) => Outcome::Pass,
+                                    Err(ValidError::Unsupported(reason)) => {
+                                        Outcome::Pending(reason)
+                                    }
+                                    Ok(_) => {
+                                        Outcome::Fail("expected invalid, module validated".into())
+                                    }
+                                },
+                            },
+                            None => Outcome::Pending("assert_invalid quote without a file"),
+                        }
+                    }
                     ModuleSource::Missing => {
                         Outcome::Pending("assert_invalid without a module file")
                     }
@@ -1290,6 +1331,33 @@ fn module_source(command: &Value, dir: &Path) -> ModuleSource {
         Some((_, bytes)) => ModuleSource::Binary(bytes),
         None => ModuleSource::Missing,
     }
+}
+
+/// Parse a quote-text module sidecar into binary: the quoted content may be a
+/// full `(module …)` or a bare field list, so try it wrapped when it does not
+/// parse standalone. An `Err` means the text is malformed.
+fn wat_text_to_binary(text: &str) -> Result<Vec<u8>, String> {
+    let candidates = [format!("(module\n{text}\n)"), text.to_string()];
+    for source in &candidates {
+        let Ok(buffer) = ParseBuffer::new(source) else {
+            continue;
+        };
+        let Ok(mut module) = parser::parse::<Wat>(&buffer) else {
+            continue;
+        };
+        return module.encode().map_err(|error| error.to_string());
+    }
+    // Neither form parsed: report the standalone parse error.
+    let buffer = ParseBuffer::new(text).map_err(|error| error.to_string())?;
+    parser::parse::<Wat>(&buffer).map_err(|error| error.to_string())?;
+    unreachable!()
+}
+
+/// A quote-text command's sidecar bytes as a parsed binary module.
+fn quote_command_bytes(command: &Value, dir: &Path) -> Option<Result<Vec<u8>, String>> {
+    let (_, bytes) = module_file(command, dir)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Some(wat_text_to_binary(&text))
 }
 
 /// Resolve a command's module reference (either a top-level `filename` or a

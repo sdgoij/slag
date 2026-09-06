@@ -1056,6 +1056,23 @@ fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Erro
         opcode @ 0x45..=0xc4 => numeric_op(opcode)
             .map(Instr::Num)
             .ok_or(Error::Malformed("illegal opcode")),
+        // Reserved gaps between the defined opcode blocks — incl. the legacy
+        // exception-handling `try`/`catch`/`rethrow` (0x06/0x07/0x09) and the
+        // 0xfe prefix, which the pinned spec's interpreter rejects as illegal
+        // — are malformed rather than an unimplemented feature.
+        0x06
+        | 0x07
+        | 0x09
+        | 0x16..=0x19
+        | 0x1d..=0x1e
+        | 0x27
+        | 0xc5..=0xcf
+        | 0xd7..=0xfa
+        | 0xfe
+        | 0xff => Err(Error::Malformed("illegal opcode")),
+        // Structural bytes (block/loop/if/else/end/try_table) never reach
+        // decode_instr — they are consumed by decode_expr — so this arm is
+        // unreachable from the corpus but keeps the match exhaustive.
         _ => Err(Error::Unsupported("instruction")),
     }
 }
