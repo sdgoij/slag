@@ -1675,3 +1675,21 @@ total
 with the feature, clippy clean in both configurations. Remaining Wave 1
 work: structured control flow (`block`/`loop`/`if`/`br*`), then floats
 with exact canonical-NaN semantics, before the corpus-wide gate.
+
+Structured control flow landed: the lowering driver is now a real
+stack-to-CFG translator. Blocks, loops, and if/else lower to sealed
+Cranelift blocks whose continuations carry the construct's (parameter-
+free, single-result) blocktype results as block parameters; loop headers
+are sealed at their `end` once every back-edge predecessor is declared
+(a predecessor may only target an unsealed block), so the variable
+machinery inserts the loop-carried phis. `br`/`br_if` target the
+continuation (block/if, carrying results) or the header (loop); dead
+regions after unconditional branches skip codegen while tracking
+structure depth, and continuations with live branch predecessors are
+filled on close. Locals/operand stacks stay SSA-correct across joins via
+block params. Equivalence tests now cover blocks with values, `br_if`
+exits, if/else results, a back-edge loop, a loop that falls out of its
+`end`, and a nested if/else-in-loop (Collatz) — 16 compile tests, 52
+total with the feature, clippy clean in both configurations. Not yet
+lowered: `br_table`, parameterized/multi-value block types, and floats
+(next, with exact canonical-quiet-NaN semantics).

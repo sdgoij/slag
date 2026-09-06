@@ -28,7 +28,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlagsData, Signature, Type, UserFuncName,
+    AbiParam, Block, BlockArg, Function, InstBuilder, MemFlagsData, Signature, Type, UserFuncName,
     Value as ClifValue, types,
 };
 use cranelift_codegen::isa::{CallConv, TargetIsa};
@@ -39,7 +39,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crate::exec::ExecFail;
 use crate::instr::{Instr, NumOp};
 use crate::module::{FuncBody, Module};
-use crate::types::{FuncType, ValType};
+use crate::types::{BlockType, FuncType, ValType};
 use crate::values::{Trap, Value};
 
 /// Trap code returned by a compiled entry; 0 means success.
@@ -206,6 +206,17 @@ fn clif_type(ty: ValType) -> Option<Type> {
     }
 }
 
+/// The result types of a supported block type. Only the parameter-free
+/// forms lower today (empty or a single integer result); multi-value and
+/// parameterized blocks keep the function on the interpreter.
+fn block_results(bt: &BlockType) -> Option<Vec<ValType>> {
+    match bt {
+        BlockType::Empty => Some(Vec::new()),
+        BlockType::Val(ty) if clif_type(*ty).is_some() => Some(vec![*ty]),
+        _ => None,
+    }
+}
+
 /// Whether `func_type` + `body` are inside the current lowering subset.
 fn lowerable(func_type: &FuncType, body: &FuncBody) -> bool {
     if func_type.params.iter().any(|t| clif_type(*t).is_none())
@@ -227,6 +238,8 @@ fn lowerable(func_type: &FuncType, body: &FuncBody) -> bool {
         | Instr::SelectTyped(_)
         | Instr::Return => true,
         Instr::Num(op) => supported_num(*op),
+        Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_results(bt).is_some(),
+        Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) => true,
         _ => false,
     })
 }
@@ -307,6 +320,40 @@ enum ShiftKind {
     RotateRight,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtlKind {
+    Block,
+    Loop,
+    If,
+}
+
+/// One open structured construct (`block`/`loop`/`if`) during lowering.
+///
+/// Supported block types carry no parameters and at most one result, so a
+/// construct never consumes the operand stack on entry: `height` is the
+/// stack depth the construct's results (if any) sit on top of. `br` to a
+/// block/if label jumps to `after` carrying the results; `br` to a loop
+/// label jumps back to its (sealed) `header` carrying nothing.
+struct CtlFrame {
+    kind: CtlKind,
+    /// Loop header (the `br` target for a loop label); sealed on entry so
+    /// body back-edges are legal.
+    header: Option<Block>,
+    /// The continuation after the construct; receives the results.
+    after: Block,
+    /// The false-condition branch of an `if`.
+    else_block: Option<Block>,
+    height: usize,
+    results: usize,
+    /// Lowering is currently inside the `else` branch of an `if`.
+    in_else: bool,
+    /// Whether an `else` marker was seen.
+    has_else: bool,
+    /// Whether any branch already targets `after` (so closing a dead body
+    /// must still fill the continuation).
+    after_used: bool,
+}
+
 /// A lowering context: locals, the operand stack, and the entry pointers.
 struct Lowerer<'a> {
     builder: FunctionBuilder<'a>,
@@ -315,6 +362,12 @@ struct Lowerer<'a> {
     stack: Vec<ClifValue>,
     out_ptr: ClifValue,
     results: Vec<ValType>,
+    controls: Vec<CtlFrame>,
+    /// The current path ended in an unconditional jump/trap/return.
+    dead: bool,
+    /// Structured markers opened since the path went dead (their `end`s must
+    /// be skipped without touching the real frame stack).
+    dead_depth: usize,
 }
 
 impl<'a> Lowerer<'a> {
@@ -559,6 +612,405 @@ impl<'a> Lowerer<'a> {
         self.trap_if(is_zero, TRAP_INT_DIVIDE_BY_ZERO);
         Ok(self.builder.ins().urem(a, b))
     }
+
+    /// The top `r` operand-stack values as branch arguments (empty when `r`
+    /// is 0).
+    fn label_args(&self, r: usize) -> Vec<BlockArg> {
+        self.stack[self.stack.len() - r..]
+            .iter()
+            .map(|value| (*value).into())
+            .collect()
+    }
+
+    /// Seal and switch into an `after` continuation, restoring the operand
+    /// stack to `height` plus the continuation's parameters. Every jump into
+    /// `after` must already have been emitted.
+    fn resume_after(&mut self, after: Block, height: usize) {
+        let params = self.builder.block_params(after).to_vec();
+        self.stack.truncate(height);
+        self.stack.extend(params);
+        self.builder.seal_block(after);
+        self.builder.switch_to_block(after);
+        self.dead = false;
+    }
+
+    fn open_block(&mut self, results: Vec<ValType>) {
+        let after = self.builder.create_block();
+        for ty in &results {
+            self.builder
+                .append_block_param(after, clif_type(*ty).expect("int block result"));
+        }
+        self.controls.push(CtlFrame {
+            kind: CtlKind::Block,
+            header: None,
+            after,
+            else_block: None,
+            height: self.stack.len(),
+            results: results.len(),
+            in_else: false,
+            has_else: false,
+            after_used: false,
+        });
+    }
+
+    fn open_loop(&mut self, results: Vec<ValType>) {
+        let header = self.builder.create_block();
+        let after = self.builder.create_block();
+        for ty in &results {
+            self.builder
+                .append_block_param(after, clif_type(*ty).expect("int block result"));
+        }
+        self.builder.ins().jump(header, &[]);
+        self.builder.switch_to_block(header);
+        // The header is NOT sealed here: every back-edge (`br` to this loop
+        // label) is a new predecessor, which may only target an unsealed
+        // block. The header is sealed when the loop's `end` closes it, once
+        // all of its predecessors are declared.
+        self.controls.push(CtlFrame {
+            kind: CtlKind::Loop,
+            header: Some(header),
+            after,
+            else_block: None,
+            height: self.stack.len(),
+            results: results.len(),
+            in_else: false,
+            has_else: false,
+            after_used: false,
+        });
+    }
+
+    fn open_if(&mut self, results: Vec<ValType>) -> Result<(), String> {
+        let condition = self.pop().ok_or("operand stack underflow")?;
+        let height = self.stack.len();
+        let then_block = self.builder.create_block();
+        let else_block = self.builder.create_block();
+        let after = self.builder.create_block();
+        for ty in &results {
+            self.builder
+                .append_block_param(after, clif_type(*ty).expect("int block result"));
+        }
+        let zero = self.iconst(types::I32, 0);
+        let flag = self.builder.ins().icmp(IntCC::NotEqual, condition, zero);
+        self.builder
+            .ins()
+            .brif(flag, then_block, &[], else_block, &[]);
+        self.builder.switch_to_block(then_block);
+        self.builder.seal_block(then_block);
+        self.controls.push(CtlFrame {
+            kind: CtlKind::If,
+            header: None,
+            after,
+            else_block: Some(else_block),
+            height,
+            results: results.len(),
+            in_else: false,
+            has_else: false,
+            after_used: false,
+        });
+        Ok(())
+    }
+
+    /// `else` marker: close the live then-branch and enter the else branch
+    /// (the false-condition path always reaches it).
+    fn open_else(&mut self) -> Result<(), String> {
+        let idx = self
+            .controls
+            .len()
+            .checked_sub(1)
+            .ok_or("else without an open if")?;
+        if self.controls[idx].kind != CtlKind::If || self.controls[idx].in_else {
+            return Err("misplaced else".to_string());
+        }
+        if !self.dead {
+            let (height, r, after) = {
+                let f = &self.controls[idx];
+                (f.height, f.results, f.after)
+            };
+            let payload = self.label_args(r);
+            self.controls[idx].after_used = true;
+            self.builder.ins().jump(after, &payload);
+            self.stack.truncate(height);
+        }
+        let (height, else_block) = {
+            let f = &self.controls[idx];
+            (f.height, f.else_block.expect("if else block"))
+        };
+        self.controls[idx].in_else = true;
+        self.controls[idx].has_else = true;
+        self.stack.truncate(height);
+        self.builder.seal_block(else_block);
+        self.builder.switch_to_block(else_block);
+        self.dead = false;
+        Ok(())
+    }
+
+    /// `end` marker closing the innermost construct.
+    fn close_construct(&mut self) -> Result<(), String> {
+        let idx = self
+            .controls
+            .len()
+            .checked_sub(1)
+            .ok_or("end without an open construct")?;
+        let kind = self.controls[idx].kind;
+        let live = !self.dead;
+        match kind {
+            CtlKind::Loop => {
+                let (height, after, r, header) = {
+                    let f = &self.controls[idx];
+                    (f.height, f.after, f.results, f.header)
+                };
+                if live {
+                    let payload = self.label_args(r);
+                    self.controls[idx].after_used = true;
+                    self.builder.ins().jump(after, &payload);
+                }
+                // All predecessors of the header (the entry edge and every
+                // back-edge from the body) are now declared: seal it so the
+                // variable machinery can insert the loop-carried phis.
+                if let Some(header) = header {
+                    self.builder.seal_block(header);
+                }
+                self.controls.pop();
+                if live {
+                    self.resume_after(after, height);
+                } else {
+                    self.dead = true;
+                }
+            }
+            CtlKind::Block => {
+                let (height, after, r) = {
+                    let f = &self.controls[idx];
+                    (f.height, f.after, f.results)
+                };
+                if live {
+                    let payload = self.label_args(r);
+                    self.controls[idx].after_used = true;
+                    self.builder.ins().jump(after, &payload);
+                }
+                let used = self.controls[idx].after_used;
+                self.controls.pop();
+                if live || used {
+                    self.resume_after(after, height);
+                } else {
+                    self.dead = true;
+                }
+            }
+            CtlKind::If => {
+                let in_else = self.controls[idx].in_else;
+                let (height, after, r) = {
+                    let f = &self.controls[idx];
+                    (f.height, f.after, f.results)
+                };
+                if !in_else {
+                    // No else: close the then-branch, then the empty else
+                    // (the false path) jumps straight to the continuation.
+                    if live {
+                        let payload = self.label_args(r);
+                        self.controls[idx].after_used = true;
+                        self.builder.ins().jump(after, &payload);
+                    }
+                    let else_block = self.controls[idx].else_block.expect("if else block");
+                    self.controls.pop();
+                    self.stack.truncate(height);
+                    self.builder.seal_block(else_block);
+                    self.builder.switch_to_block(else_block);
+                    self.builder.ins().jump(after, &[]);
+                    self.resume_after(after, height);
+                } else {
+                    if live {
+                        let payload = self.label_args(r);
+                        self.controls[idx].after_used = true;
+                        self.builder.ins().jump(after, &payload);
+                    }
+                    let used = self.controls[idx].after_used;
+                    self.controls.pop();
+                    if live || used {
+                        self.resume_after(after, height);
+                    } else {
+                        self.dead = true;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `br`: an unconditional jump to a label, carrying the label's payload
+    /// (the target block's results; nothing for a loop).
+    fn do_br(&mut self, depth: u32) -> Result<(), String> {
+        let idx = self
+            .controls
+            .len()
+            .checked_sub(1 + depth as usize)
+            .ok_or("branch past the control stack")?;
+        let (kind, header, after, r) = {
+            let f = &self.controls[idx];
+            (
+                f.kind,
+                f.header,
+                f.after,
+                if f.kind == CtlKind::Loop {
+                    0
+                } else {
+                    f.results
+                },
+            )
+        };
+        let payload = self.label_args(r);
+        let target = match kind {
+            CtlKind::Loop => header.ok_or("loop without a header")?,
+            _ => {
+                self.controls[idx].after_used = true;
+                after
+            }
+        };
+        self.builder.ins().jump(target, &payload);
+        self.dead = true;
+        Ok(())
+    }
+
+    /// `br_if`: a conditional jump that leaves the payload on the stack for
+    /// the fall-through path.
+    fn do_br_if(&mut self, depth: u32) -> Result<(), String> {
+        let condition = self.pop().ok_or("operand stack underflow")?;
+        let zero = self.iconst(types::I32, 0);
+        let flag = self.builder.ins().icmp(IntCC::NotEqual, condition, zero);
+        let idx = self
+            .controls
+            .len()
+            .checked_sub(1 + depth as usize)
+            .ok_or("branch past the control stack")?;
+        let (kind, header, after, r) = {
+            let f = &self.controls[idx];
+            (
+                f.kind,
+                f.header,
+                f.after,
+                if f.kind == CtlKind::Loop {
+                    0
+                } else {
+                    f.results
+                },
+            )
+        };
+        let payload = self.label_args(r);
+        let cont = self.builder.create_block();
+        match kind {
+            CtlKind::Loop => {
+                let header = header.ok_or("loop without a header")?;
+                self.builder.ins().brif(flag, header, &[], cont, &[]);
+            }
+            _ => {
+                self.controls[idx].after_used = true;
+                self.builder.ins().brif(flag, after, &payload, cont, &[]);
+            }
+        }
+        self.builder.switch_to_block(cont);
+        Ok(())
+    }
+
+    /// Lower one instruction. Dead paths skip code but still track the
+    /// structured markers so `end`s reach the right frames.
+    fn instruction(&mut self, instr: &Instr) -> Result<(), String> {
+        if self.dead {
+            match instr {
+                Instr::Block(_) | Instr::Loop(_) | Instr::If(_) => self.dead_depth += 1,
+                Instr::Else => {
+                    if self.dead_depth == 0 {
+                        self.open_else()?;
+                    }
+                }
+                Instr::End => {
+                    if self.dead_depth > 0 {
+                        self.dead_depth -= 1;
+                    } else {
+                        self.close_construct()?;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        match instr {
+            Instr::Nop => {}
+            Instr::I32Const(value) => {
+                let v = self.iconst(types::I32, i64::from(*value));
+                self.stack.push(v);
+            }
+            Instr::I64Const(value) => {
+                let v = self.iconst(types::I64, *value);
+                self.stack.push(v);
+            }
+            Instr::LocalGet(index) => {
+                let variable = self.variables[*index as usize];
+                let value = self.builder.use_var(variable);
+                self.stack.push(value);
+            }
+            Instr::LocalSet(index) => {
+                let value = self.pop().ok_or("operand stack underflow")?;
+                let variable = self.variables[*index as usize];
+                self.builder.def_var(variable, value);
+            }
+            Instr::LocalTee(index) => {
+                let value = self.pop().ok_or("operand stack underflow")?;
+                let variable = self.variables[*index as usize];
+                self.builder.def_var(variable, value);
+                self.stack.push(value);
+            }
+            Instr::Drop => {
+                self.pop().ok_or("operand stack underflow")?;
+            }
+            Instr::Select | Instr::SelectTyped(_) => {
+                let condition = self.pop().ok_or("operand stack underflow")?;
+                let b = self.pop().ok_or("operand stack underflow")?;
+                let a = self.pop().ok_or("operand stack underflow")?;
+                let zero = self.iconst(types::I32, 0);
+                let flag = self.builder.ins().icmp(IntCC::NotEqual, condition, zero);
+                let value = self.builder.ins().select(flag, a, b);
+                self.stack.push(value);
+            }
+            Instr::Num(op) => self.lower_num(*op)?,
+            Instr::Block(bt) => {
+                let results = block_results(bt).ok_or("unsupported block type")?;
+                self.open_block(results);
+            }
+            Instr::Loop(bt) => {
+                let results = block_results(bt).ok_or("unsupported block type")?;
+                self.open_loop(results);
+            }
+            Instr::If(bt) => {
+                let results = block_results(bt).ok_or("unsupported block type")?;
+                self.open_if(results)?;
+            }
+            Instr::Else => self.open_else()?,
+            Instr::End => self.close_construct()?,
+            Instr::Br(depth) => self.do_br(*depth)?,
+            Instr::BrIf(depth) => self.do_br_if(*depth)?,
+            Instr::Return => {
+                self.emit_return()?;
+                self.dead = true;
+            }
+            Instr::Unreachable => {
+                self.emit_trap(TRAP_UNREACHABLE);
+                self.dead = true;
+            }
+            _ => return Err("unsupported instruction reached the lowerer".to_string()),
+        }
+        Ok(())
+    }
+
+    fn lower_body(&mut self, body: &FuncBody) -> Result<(), String> {
+        for instr in &body.body {
+            self.instruction(instr)?;
+        }
+        if !self.controls.is_empty() {
+            return Err("unclosed control frame at the end of a body".to_string());
+        }
+        if !self.dead {
+            self.emit_return()?;
+        }
+        Ok(())
+    }
 }
 
 /// Lower `body` into `func`. Entry params: `(args, nargs, out, nout)`, all
@@ -610,65 +1062,11 @@ fn lower(
         stack: Vec::new(),
         out_ptr,
         results: func_type.results.clone(),
+        controls: Vec::new(),
+        dead: false,
+        dead_depth: 0,
     };
-    let mut dead = false;
-    for instr in &body.body {
-        if dead {
-            continue;
-        }
-        match instr {
-            Instr::Nop => {}
-            Instr::I32Const(value) => {
-                let v = lowerer.iconst(types::I32, i64::from(*value));
-                lowerer.stack.push(v);
-            }
-            Instr::I64Const(value) => {
-                let v = lowerer.iconst(types::I64, *value);
-                lowerer.stack.push(v);
-            }
-            Instr::LocalGet(index) => {
-                let variable = lowerer.variables[*index as usize];
-                let value = lowerer.builder.use_var(variable);
-                lowerer.stack.push(value);
-            }
-            Instr::LocalSet(index) => {
-                let value = lowerer.pop().ok_or("operand stack underflow")?;
-                let variable = lowerer.variables[*index as usize];
-                lowerer.builder.def_var(variable, value);
-            }
-            Instr::LocalTee(index) => {
-                let value = lowerer.pop().ok_or("operand stack underflow")?;
-                let variable = lowerer.variables[*index as usize];
-                lowerer.builder.def_var(variable, value);
-                lowerer.stack.push(value);
-            }
-            Instr::Drop => {
-                lowerer.pop().ok_or("operand stack underflow")?;
-            }
-            Instr::Select | Instr::SelectTyped(_) => {
-                let condition = lowerer.pop().ok_or("operand stack underflow")?;
-                let b = lowerer.pop().ok_or("operand stack underflow")?;
-                let a = lowerer.pop().ok_or("operand stack underflow")?;
-                let zero = lowerer.iconst(types::I32, 0);
-                let flag = lowerer.builder.ins().icmp(IntCC::NotEqual, condition, zero);
-                let value = lowerer.builder.ins().select(flag, a, b);
-                lowerer.stack.push(value);
-            }
-            Instr::Num(op) => lowerer.lower_num(*op)?,
-            Instr::Return => {
-                lowerer.emit_return()?;
-                dead = true;
-            }
-            Instr::Unreachable => {
-                lowerer.emit_trap(TRAP_UNREACHABLE);
-                dead = true;
-            }
-            _ => return Err("unsupported instruction reached the lowerer".to_string()),
-        }
-    }
-    if !dead {
-        lowerer.emit_return()?;
-    }
+    lowerer.lower_body(body)?;
     lowerer.builder.seal_all_blocks();
     lowerer.builder.finalize(isa.frontend_config());
     Ok(())
@@ -708,7 +1106,7 @@ mod tests {
     use super::*;
     use crate::exec::Store;
     use crate::module::{FuncBody, Module};
-    use crate::types::SubType;
+    use crate::types::{BlockType, SubType};
 
     fn int_module(body: Vec<Instr>, params: Vec<ValType>, results: Vec<ValType>) -> Module {
         Module {
@@ -1054,6 +1452,249 @@ mod tests {
             vec![Value::I32(-1), Value::I32(2), Value::I32(-3)],
             vec![Value::I32(i32::MAX), Value::I32(2), Value::I32(1)],
             vec![Value::I32(0), Value::I32(9), Value::I32(-5)],
+        ];
+        assert_equiv(&module, 0, &cases);
+    }
+
+    fn module_with(
+        body: Vec<Instr>,
+        params: Vec<ValType>,
+        locals: Vec<ValType>,
+        results: Vec<ValType>,
+    ) -> Module {
+        Module {
+            types: vec![SubType::func(params.clone(), results.clone())],
+            functions: vec![0],
+            bodies: vec![FuncBody { locals, body }],
+            ..Module::default()
+        }
+    }
+
+    #[test]
+    fn block_with_a_value_matches_the_interpreter() {
+        // (block (result i32) (i32.const 40) (i32.const 2) i32.add)
+        let module = module_with(
+            vec![
+                Instr::Block(BlockType::Val(ValType::I32)),
+                Instr::I32Const(40),
+                Instr::I32Const(2),
+                Instr::Num(NumOp::I32Add),
+                Instr::End,
+            ],
+            vec![],
+            vec![],
+            vec![ValType::I32],
+        );
+        assert_equiv(&module, 0, &[vec![]]);
+    }
+
+    #[test]
+    fn br_if_exits_a_block_with_its_result() {
+        // block (result i32) { i32.const 1; local.get 0; br_if 0;
+        //                        i32.const 41; i32.add }
+        // cond != 0 -> 1 (the payload); cond == 0 -> 1 + 41.
+        let module = module_with(
+            vec![
+                Instr::Block(BlockType::Val(ValType::I32)),
+                Instr::I32Const(1),
+                Instr::LocalGet(0),
+                Instr::BrIf(0),
+                Instr::I32Const(41),
+                Instr::Num(NumOp::I32Add),
+                Instr::End,
+            ],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+        );
+        let cases = [
+            vec![Value::I32(0)],
+            vec![Value::I32(1)],
+            vec![Value::I32(-3)],
+        ];
+        assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn if_else_value_matches_the_interpreter() {
+        // if (result i32) { 7 } else { 9 } -- cond on the stack.
+        let module = module_with(
+            vec![
+                Instr::LocalGet(0),
+                Instr::If(BlockType::Val(ValType::I32)),
+                Instr::I32Const(7),
+                Instr::Else,
+                Instr::I32Const(9),
+                Instr::End,
+            ],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+        );
+        let cases = [
+            vec![Value::I32(1)],
+            vec![Value::I32(0)],
+            vec![Value::I32(-1)],
+            vec![Value::I32(12345)],
+        ];
+        assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn loop_with_a_back_edge_matches_the_interpreter() {
+        // sum_{i<n} i via an outer empty block + br_if exit + br 0 loop:
+        //   (func (param $n i32) (result i32) (local $acc i32) (local $i i32)
+        //     block
+        //       loop
+        //         local.get $i local.get $n i32.ge_s br_if 1
+        //         local.get $acc local.get $i i32.add local.set $acc
+        //         local.get $i i32.const 1 i32.add local.set $i
+        //         br 0
+        //       end
+        //     end
+        //     local.get $acc)
+        let module = module_with(
+            vec![
+                Instr::Block(BlockType::Empty),
+                Instr::Loop(BlockType::Empty),
+                // exit when i >= n
+                Instr::LocalGet(2),
+                Instr::LocalGet(0),
+                Instr::Num(NumOp::I32GeS),
+                Instr::BrIf(1),
+                // acc += i
+                Instr::LocalGet(1),
+                Instr::LocalGet(2),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalSet(1),
+                // i += 1
+                Instr::LocalGet(2),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalSet(2),
+                Instr::Br(0),
+                Instr::End,
+                Instr::End,
+                Instr::LocalGet(1),
+            ],
+            vec![ValType::I32],
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        );
+        let cases = [
+            vec![Value::I32(0)],
+            vec![Value::I32(1)],
+            vec![Value::I32(2)],
+            vec![Value::I32(5)],
+            vec![Value::I32(10)],
+            vec![Value::I32(64)],
+            vec![Value::I32(-4)],
+        ];
+        assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn loop_that_falls_out_matches_the_interpreter() {
+        // Same sum, but the loop body ends with `br_if 0` (continue while
+        // i < n) and falls out of the `end` when the increment makes i >= n:
+        //   loop
+        //     local.get $acc local.get $i i32.add local.set $acc
+        //     local.get $i i32.const 1 i32.add local.set $i
+        //     local.get $i local.get $n i32.lt_s br_if 0
+        //   end
+        let module = module_with(
+            vec![
+                Instr::Loop(BlockType::Empty),
+                Instr::LocalGet(1),
+                Instr::LocalGet(2),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalSet(1),
+                Instr::LocalGet(2),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalSet(2),
+                Instr::LocalGet(2),
+                Instr::LocalGet(0),
+                Instr::Num(NumOp::I32LtS),
+                Instr::BrIf(0),
+                Instr::End,
+                Instr::LocalGet(1),
+            ],
+            vec![ValType::I32],
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        );
+        let cases = [
+            vec![Value::I32(0)],
+            vec![Value::I32(1)],
+            vec![Value::I32(3)],
+            vec![Value::I32(10)],
+            vec![Value::I32(100)],
+            vec![Value::I32(1000)],
+        ];
+        assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn nested_if_in_a_loop_matches_the_interpreter() {
+        // Collatz-style iteration inside a loop with an if/else that updates
+        // a local and a br_if exit:
+        //   (func (param $n i32) (result i32)
+        //     local.set 2 (t = n)
+        //     block
+        //       loop
+        //         local.get 2 i32.const 1 i32.le_s br_if 1   ;; exit when t <= 1
+        //         local.get 2 i32.const 2 i32.rem_s          ;; t % 2
+        //         if (result i32)                            ;; 1 -> odd
+        //           local.get 2 i32.const 3 i32.mul i32.const 1 i32.add
+        //         else
+        //           local.get 2 i32.const 2 i32.div_s
+        //         end
+        //         local.set 2
+        //         br 0
+        //       end
+        //     end
+        //     local.get 2)
+        let module = module_with(
+            vec![
+                Instr::LocalGet(0),
+                Instr::LocalSet(1),
+                Instr::Block(BlockType::Empty),
+                Instr::Loop(BlockType::Empty),
+                Instr::LocalGet(1),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32LeS),
+                Instr::BrIf(1),
+                Instr::LocalGet(1),
+                Instr::I32Const(2),
+                Instr::Num(NumOp::I32RemS),
+                Instr::If(BlockType::Val(ValType::I32)),
+                Instr::LocalGet(1),
+                Instr::I32Const(3),
+                Instr::Num(NumOp::I32Mul),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Add),
+                Instr::Else,
+                Instr::LocalGet(1),
+                Instr::I32Const(2),
+                Instr::Num(NumOp::I32DivS),
+                Instr::End,
+                Instr::LocalSet(1),
+                Instr::Br(0),
+                Instr::End,
+                Instr::End,
+                Instr::LocalGet(1),
+            ],
+            vec![ValType::I32],
+            vec![ValType::I32],
+            vec![ValType::I32],
+        );
+        let cases = [
+            vec![Value::I32(1)],
+            vec![Value::I32(2)],
+            vec![Value::I32(3)],
+            vec![Value::I32(6)],
+            vec![Value::I32(27)],
         ];
         assert_equiv(&module, 0, &cases);
     }
