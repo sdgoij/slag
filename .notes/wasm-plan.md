@@ -660,6 +660,25 @@ intrinsic identity like every other agent-dependent builtin.
   (shared-memory detach), and `table/get-set` (raw JS closures in funcref
   tables need typed `WebAssembly.Function`). Runtime suite: 726 tests
   pass.
+- Wave 5 slice 13 (landed): the last two in-scope gaps plus the sweep
+  taxonomy. `WebAssembly.JSTag` (JS-API 4.13): a Tag-shaped object whose
+  externref-payload cell materializes on first use; an arbitrary JS value
+  thrown by an imported function is now wrapped in the JS tag (so a wasm
+  `try_table` catch for it — or `catch_all` — intercepts the value, whose
+  externref payload reaches wasm), and a JS-tag exception that escapes —
+  whether wasm-originated (a `throw` of the tag) or a rethrow of an
+  injected one — surfaces as the original JS value, never a
+  `WebAssembly.Exception`. Constructing an exception with the JSTag stays
+  a TypeError, and the Tag constructor accepts an `externref` parameter.
+  `exception/jsTag.tentative.any.js` is green (3/3). `table/get-set`
+  (41/41): a funcref `Table.prototype.set` distinguishes an omitted value
+  (clears to null) from an explicit `undefined` (TypeError, since it is
+  neither callable nor null). `memory/grow.any.js` (18/19 — its one
+  failing test is the shared-memory grow-detach rule) joins
+  `wasm-exclusions.txt` as a not-planned proposal, like `js-string`/`gc`.
+  Corpus: the sweep is fully green — 44 fixture-files pass / 0 fail, 982
+  tests pass / 0 fail (the excluded proposals and `limits.any.js` run on
+  demand). Runtime suite: 728 tests pass.
 
 ## 6. Verification workflow
 

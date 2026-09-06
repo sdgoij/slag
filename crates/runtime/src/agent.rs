@@ -788,6 +788,11 @@ pub struct Agent {
     /// surfaced through a constructor, an import, or several exports keeps
     /// object identity (Cut 10 wave 4).
     pub wasm_tag_objects: std::collections::HashMap<usize, Value>,
+    /// The engine tag cell behind `WebAssembly.JSTag` (the tag arbitrary JS
+    /// exception values enter wasm with), once materialized: JS throws wrap
+    /// in it, a wasm `catch` for it intercepts them, and an escape unwraps
+    /// the payload back to the JS value (Cut 10 wave 4).
+    pub wasm_js_tag_cell: Option<usize>,
     /// The payload of `WebAssembly.Exception` objects, keyed by object id:
     /// the exception's tag cell and its arguments as engine values (Cut 10
     /// wave 4).
@@ -1087,6 +1092,7 @@ impl Agent {
             wasm_host_seq: 0,
             wasm_tags: std::collections::HashMap::new(),
             wasm_tag_objects: std::collections::HashMap::new(),
+            wasm_js_tag_cell: None,
             wasm_exceptions: std::collections::HashMap::new(),
             wasm_js_exceptions: std::collections::HashMap::new(),
             wasm_extern_values: std::collections::HashMap::new(),

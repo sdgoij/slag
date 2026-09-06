@@ -373,6 +373,20 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         define_data(&namespace, name, ctor, true, false, true)?;
     }
 
+    // WebAssembly.JSTag (JS-API 4.13): a Tag-shaped object whose engine cell
+    // is allocated lazily on first use (install has no agent/store). It is the
+    // tag arbitrary JS exception values are thrown with when they cross into
+    // wasm, so a wasm `catch` for it intercepts a thrown JS value.
+    let jstag_proto = realm
+        .intrinsics
+        .get("%WebAssembly.Tag.prototype%")
+        .and_then(|value| as_object(&value))
+        .expect("WebAssembly.Tag just installed");
+    let jstag = JsObject::ordinary_object_create(Some(jstag_proto));
+    let jstag_value = Value::Object(jstag);
+    realm.intrinsics.define("%WebAssembly.JSTag%", jstag_value);
+    define_data(&namespace, "JSTag", jstag_value, false, false, true)?;
+
     // Namespace operations.
     define_method(&namespace, realm, "validate", "%WebAssembly.validate%", 1)?;
     define_method(&namespace, realm, "compile", "%WebAssembly.compile%", 1)?;
@@ -1474,6 +1488,61 @@ fn tag_cell_of(agent: &Agent, value: &Value) -> Result<usize, JsError> {
     agent.wasm_tags.get(&object.id()).copied().ok_or_else(error)
 }
 
+/// The `WebAssembly.JSTag` object installed by [`install`].
+fn js_tag_object(agent: &Agent) -> Result<Value, JsError> {
+    agent
+        .current_realm()?
+        .intrinsics
+        .get("%WebAssembly.JSTag%")
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%WebAssembly.JSTag% missing".into()))
+}
+
+/// Whether `value` is the `WebAssembly.JSTag` object (object identity).
+fn is_js_tag(agent: &Agent, value: &Value) -> bool {
+    let Ok(tag) = js_tag_object(agent) else {
+        return false;
+    };
+    let ValueKind::Object(object) = value.kind() else {
+        return false;
+    };
+    matches!(tag.kind(), ValueKind::Object(tag) if tag.id() == object.id())
+}
+
+/// The `WebAssembly.JSTag` engine cell, materialized on first use: allocate
+/// the standalone externref-payload tag cell and register `WebAssembly.JSTag`
+/// as its wrapper so tag imports and `is`/`getArg` resolve it, and so an
+/// escaping JS-tag exception is recognized (run_failure unwraps it).
+fn js_tag_cell(agent: &mut Agent) -> Result<usize, JsError> {
+    if let Some(cell) = agent.wasm_js_tag_cell {
+        return Ok(cell);
+    }
+    let tag_value = js_tag_object(agent)?;
+    let cell = agent.wasm_store.borrow_mut().tag(wasm::types::FuncType {
+        params: vec![ValType::Ref(wasm::types::RefType::EXTERN)],
+        results: Vec::new(),
+    });
+    let ValueKind::Object(object) = tag_value.kind() else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "%WebAssembly.JSTag% is not an object".into(),
+        ));
+    };
+    agent.wasm_tags.insert(object.id(), cell);
+    agent.wasm_tag_objects.insert(cell, tag_value);
+    agent.wasm_js_tag_cell = Some(cell);
+    Ok(cell)
+}
+
+/// A tag candidate → its engine cell, materializing `WebAssembly.JSTag`
+/// when it is the candidate (a plain [`tag_cell_of`] would reject it before
+/// its first use has allocated the cell).
+fn resolve_tag_cell(agent: &mut Agent, value: &Value) -> Result<usize, JsError> {
+    if is_js_tag(agent, value) {
+        return js_tag_cell(agent);
+    }
+    tag_cell_of(agent, value)
+}
+
 /// One memoized `WebAssembly.Tag` wrapper per engine tag cell: a tag surfaced
 /// through the constructor, an import, or exports keeps object identity.
 fn tag_wrapper_memo(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
@@ -1488,14 +1557,16 @@ fn tag_wrapper_memo(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
     Ok(value)
 }
 
-/// One `WebAssembly.Tag` parameter value type (the numeric types; references/
-/// v128 are not exception payloads yet).
+/// One `WebAssembly.Tag` parameter value type (the numeric types plus
+/// `externref`, whose payload is a JS value; the other references/v128 are
+/// not exception payloads yet).
 fn tag_parameter_type(text: &str) -> Result<ValType, JsError> {
     Ok(match text {
         "i32" => ValType::I32,
         "i64" => ValType::I64,
         "f32" => ValType::F32,
         "f64" => ValType::F64,
+        "externref" => ValType::Ref(wasm::types::RefType::EXTERN),
         other => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1597,6 +1668,15 @@ fn exception_construct(
     new_target: &Value,
 ) -> Result<Value, JsError> {
     let tag_value = args.first().cloned().unwrap_or(Value::Undefined);
+    // A WebAssembly.Exception cannot be constructed with the JSTag: it is the
+    // tag the engine throws JS exception values with, never one JS builds
+    // (JS-API 4.9.1 throws a TypeError before the payload is touched).
+    if is_js_tag(agent, &tag_value) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "WebAssembly.Exception cannot be constructed with the JSTag".into(),
+        ));
+    }
     let cell = tag_cell_of(agent, &tag_value)?;
     let params = agent
         .wasm_store
@@ -1637,10 +1717,10 @@ fn exception_construct(
 /// `Exception.prototype.is(tag)` (JS-API spec 4.9.2): whether `tag` is a
 /// `WebAssembly.Tag` matching this exception's tag. A non-Tag argument
 /// (including a missing one) is a TypeError, per the spec's type checks.
-fn exception_is(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn exception_is(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let exception = exception_of(agent, this)?;
     let candidate = args.first().cloned().unwrap_or(Value::Undefined);
-    let cell = tag_cell_of(agent, &candidate)?;
+    let cell = resolve_tag_cell(agent, &candidate)?;
     Ok(Value::Boolean(cell == exception))
 }
 
@@ -1649,7 +1729,7 @@ fn exception_is(agent: &Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 fn exception_get_arg(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let exception_cell = exception_of(agent, this)?;
     let tag_value = args.first().cloned().unwrap_or(Value::Undefined);
-    let tag_cell = tag_cell_of(agent, &tag_value)?;
+    let tag_cell = resolve_tag_cell(agent, &tag_value)?;
     if tag_cell != exception_cell {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -2323,17 +2403,33 @@ fn table_set_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
         &args.first().cloned().unwrap_or(Value::Undefined),
         "table index",
     )?;
-    let value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let element = agent
         .wasm_store
         .borrow()
         .table_type(cell)
         .map(|ty| ty.element)
         .unwrap_or(wasm::types::RefType::FUNC);
+    // The value is optional: an omitted argument defaults per element type
+    // (funcref -> the null reference, externref -> undefined as a value). An
+    // explicitly-`undefined` funcref value is a TypeError (it is neither a
+    // function nor null), while externref accepts any JS value.
+    let supplied = args.get(1).copied();
     let reference = if element == wasm::types::RefType::EXTERN {
-        to_externref(agent, value)
+        to_externref(agent, supplied.unwrap_or(Value::Undefined))
     } else {
-        js_to_funcref(agent, &value)?
+        match supplied {
+            None => RefValue::Null,
+            Some(value) if matches!(value.kind(), ValueKind::Null) => RefValue::Null,
+            Some(value) if matches!(value.kind(), ValueKind::Undefined) => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "table elements must be null or an exported wasm function; raw JS closures \
+                     in funcref tables need typed WebAssembly.Function wrappers (Cut 10 wave 3b)"
+                        .into(),
+                ));
+            }
+            Some(value) => js_to_funcref(agent, &value)?,
+        }
     };
     let mut store = agent.wasm_store.borrow_mut();
     let slot = store
@@ -2777,7 +2873,7 @@ fn build_imports(
                     }
                 }
             }
-            wasm::module::ImportDesc::Tag(_) => match tag_cell_of(agent, &name_value) {
+            wasm::module::ImportDesc::Tag(_) => match resolve_tag_cell(agent, &name_value) {
                 Ok(cell) => wasm::ExternVal::Tag(cell),
                 Err(_) => {
                     return Err(link_failure(
@@ -2876,9 +2972,11 @@ fn wasm_result(agent: &Agent, value: WasmValue) -> Result<Value, JsError> {
 /// agent's engine store, refresh the buffers, and convert the results back.
 /// Turn an engine run failure into a JS exception: wasm traps surface as
 /// `WebAssembly.RuntimeError`; a tagged wasm exception reifies as a
-/// `WebAssembly.Exception` (its tag needs no JS wrapper); an engine exception
-/// that re-entered wasm from a JS throw rethrows the original JS value;
-/// unsupported features stay TypeErrors.
+/// `WebAssembly.Exception` (its tag needs no JS wrapper), except a
+/// wasm-originated JS-tag throw, which escapes as the JS value in its
+/// externref payload; an engine exception that re-entered wasm from a JS
+/// throw rethrows the original JS value; unsupported features stay
+/// TypeErrors.
 fn run_failure(agent: &mut Agent, fail: wasm::ExecFail) -> Result<JsError, JsError> {
     let message = format!("{fail:?}");
     let runtime_error = |agent: &mut Agent, reason: &str| {
@@ -2905,6 +3003,20 @@ fn run_failure(agent: &mut Agent, fail: wasm::ExecFail) -> Result<JsError, JsErr
                 return Ok(JsError::new(ErrorKind::TypeError, message)
                     .with_value(runtime_error(agent, "wasm threw an unknown exception")?));
             };
+            // A wasm-originated JS-tag throw (a JS value the module received
+            // as an externref and threw with the JS tag) escapes as that JS
+            // value, not as a WebAssembly.Exception (JS-API 4.13).
+            if agent.wasm_js_tag_cell == Some(cell) {
+                let args = args.unwrap_or_default();
+                if let Some(WasmValue::Ref(reference)) = args.first() {
+                    return Ok(
+                        JsError::new(ErrorKind::TypeError, "wasm threw a JS value".into())
+                            .with_value(externref_to_js(agent, *reference)?),
+                    );
+                }
+                return Ok(JsError::new(ErrorKind::TypeError, message)
+                    .with_value(runtime_error(agent, "invalid JS-tag payload")?));
+            }
             // Any tagged wasm exception reifies as a `WebAssembly.Exception`
             // (JS-API): JS needs no `WebAssembly.Tag` wrapper for the tag — an
             // internal tag that was neither imported nor exported is simply
@@ -2989,30 +3101,44 @@ fn invoke_export(
                         };
                     }
                     Err(error) => {
-                        // A JS exception thrown by the imported function. If
-                        // it is a `WebAssembly.Exception`, deliver it as an
-                        // in-flight wasm exception so a matching `try_table`
-                        // can catch it (when wasm does not catch it, the
-                        // escaping engine exception rethrows the original JS
-                        // value with identity preserved). Any other JS value
-                        // abandons the run and propagates unchanged.
-                        let injected = match error.value {
+                        // A JS exception thrown by the imported function. A
+                        // `WebAssembly.Exception` is delivered as an in-flight
+                        // wasm exception tagged by its own tag; any other JS
+                        // value is wrapped in the JS tag (`WebAssembly.JSTag`)
+                        // so a matching `try_table` catch — or a `catch_all` —
+                        // can intercept it. When wasm does not catch an
+                        // injected exception, the escaping engine exception
+                        // rethrows the original JS value with identity
+                        // preserved. An error with no thrown JS value
+                        // (machine-level, not user) abandons the run and
+                        // propagates unchanged.
+                        match error.value {
                             Some(value) => match value.kind() {
-                                ValueKind::Object(object) => agent
-                                    .wasm_exceptions
-                                    .get(&object.id())
-                                    .map(|(cell, args)| (value, *cell, args.clone())),
-                                _ => None,
+                                ValueKind::Object(object)
+                                    if agent.wasm_exceptions.contains_key(&object.id()) =>
+                                {
+                                    let (cell, args) = agent
+                                        .wasm_exceptions
+                                        .get(&object.id())
+                                        .map(|(cell, args)| (*cell, args.clone()))
+                                        .expect("just checked");
+                                    let mut store = agent.wasm_store.borrow_mut();
+                                    let exn = store.new_exception(cell, args);
+                                    agent.wasm_js_exceptions.insert(exn, value);
+                                    progress = store.resume_exception(exn);
+                                }
+                                _ => {
+                                    // Wrap the arbitrary JS value in the JS
+                                    // tag as an externref payload.
+                                    let cell = js_tag_cell(agent)?;
+                                    let payload = to_externref(agent, value);
+                                    let args = vec![WasmValue::Ref(payload)];
+                                    let mut store = agent.wasm_store.borrow_mut();
+                                    let exn = store.new_exception(cell, args);
+                                    agent.wasm_js_exceptions.insert(exn, value);
+                                    progress = store.resume_exception(exn);
+                                }
                             },
-                            None => None,
-                        };
-                        match injected {
-                            Some((original, cell, args)) => {
-                                let mut store = agent.wasm_store.borrow_mut();
-                                let exn = store.new_exception(cell, args);
-                                agent.wasm_js_exceptions.insert(exn, original);
-                                progress = store.resume_exception(exn);
-                            }
                             None => {
                                 let mut store = agent.wasm_store.borrow_mut();
                                 store.abandon();
@@ -4186,5 +4312,94 @@ mod tests {
                 ),
             );
         }
+    }
+
+    #[test]
+    fn js_tag_roundtrips_js_values_through_wasm() {
+        let mut context = Context::new().unwrap();
+        // The JSTag is not a constructible exception tag.
+        eval_true(
+            &mut context,
+            concat!(
+                "(function(){ try { new WebAssembly.Exception(WebAssembly.JSTag, [{}]); return false; }",
+                " catch (e) { return e instanceof TypeError; } })()"
+            ),
+        );
+        // A wasm `throw` of the JSTag with a JS value escapes as that value.
+        let thrower = wat_module_bytes(concat!(
+            "(module",
+            "  (import \"js\" \"JSTag\" (tag $jst (param externref)))",
+            "  (func (export \"throw_js\") (param externref)",
+            "    local.get 0",
+            "    throw $jst))"
+        ));
+        eval_true(
+            &mut context,
+            &format!(
+                concat!(
+                    "(function(){{ const obj = {{}};",
+                    " const i = new WebAssembly.Instance(new Uint8Array({thrower}), {{ js: {{ JSTag: WebAssembly.JSTag }} }});",
+                    " try {{ i.exports.throw_js(obj); return false; }} catch (e) {{ return e === obj; }} }})()"
+                ),
+                thrower = thrower,
+            ),
+        );
+        // A JS closure throwing an arbitrary value is catchable by a wasm
+        // try_table `catch` for the JSTag, which receives the value as its
+        // externref payload.
+        let catcher = wat_module_bytes(concat!(
+            "(module",
+            "  (import \"js\" \"JSTag\" (tag $jst (param externref)))",
+            "  (import \"js\" \"throw_ref\" (func $throw_ref (param externref) (result externref)))",
+            "  (func (export \"catch_js_value\") (param externref) (result externref)",
+            "    (block $h (result externref)",
+            "      (try_table (result externref) (catch $jst $h)",
+            "        (local.get 0)",
+            "        (call $throw_ref)",
+            "        (unreachable)))))"
+        ));
+        eval_true(
+            &mut context,
+            &format!(
+                concat!(
+                    "(function(){{ const obj = {{}};",
+                    " const i = new WebAssembly.Instance(new Uint8Array({catcher}),",
+                    "   {{ js: {{ JSTag: WebAssembly.JSTag, throw_ref: (x) => {{ throw x; }} }} }});",
+                    " if (i.exports.catch_js_value(obj) !== obj) return false;",
+                    " const wasmTag = new WebAssembly.Tag({{ parameters: ['externref'] }});",
+                    " const exn = new WebAssembly.Exception(wasmTag, [obj]);",
+                    " try {{ i.exports.catch_js_value(exn); return false; }}",
+                    " catch (e) {{ return e === exn; }} }})()"
+                ),
+                catcher = catcher,
+            ),
+        );
+    }
+
+    #[test]
+    fn funcref_table_set_clears_to_null_and_reaccepts() {
+        let mut context = Context::new().unwrap();
+        // The fixture's anyfunc-table set round-trip: constructing a table
+        // with an exported wasm function as the fill, clearing a slot with an
+        // omitted value (undefined -> null), and setting the function back
+        // all keep the function's wrapper identity through `get`.
+        let module = wat_module_bytes(concat!("(module", "  (func (export \"fn\"))", ")"));
+        eval_true(
+            &mut context,
+            &format!(
+                concat!(
+                    "(function(){{ const fn = new WebAssembly.Instance(new Uint8Array({module})).exports.fn;",
+                    " const t = new WebAssembly.Table({{ element: 'anyfunc', initial: 1 }}, fn);",
+                    " if (t.get(0) !== fn) return false;",
+                    " t.set(0);",
+                    " if (t.get(0) !== null) return false;",
+                    " try {{ t.set(0, undefined); return false; }} catch (e) {{ if (!(e instanceof TypeError)) return false; }}",
+                    " t.set(0, fn);",
+                    " if (t.get(0) !== fn) return false;",
+                    " try {{ t.set(0, {{}}); return false; }} catch (e) {{ return e instanceof TypeError; }} }})()"
+                ),
+                module = module,
+            ),
+        );
     }
 }
