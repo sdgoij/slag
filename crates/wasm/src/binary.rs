@@ -162,6 +162,21 @@ pub fn decode(bytes: &[u8]) -> Result<Module, Error> {
         decode_section(id, payload, &mut module)?;
         cursor = end;
     }
+    // Cross-section structural rules (spec 5.5): a function section without a
+    // matching code section, and a data count that disagrees with the data
+    // section's actual segment count, are malformed.
+    if module.functions.len() != module.bodies.len() {
+        return Err(Error::Malformed(
+            "function and code section have inconsistent lengths",
+        ));
+    }
+    if let Some(declared) = module.data_count
+        && declared as usize != module.data.len()
+    {
+        return Err(Error::Malformed(
+            "data count and data section have inconsistent lengths",
+        ));
+    }
     Ok(module)
 }
 
@@ -289,7 +304,19 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
                 if end > payload.len() {
                     return Err(Error::Malformed("unexpected end of section or function"));
                 }
-                module.bodies.push(decode_body(&payload[start..end])?);
+                let body = decode_body(&payload[start..end])?;
+                // `memory.init`/`data.drop` are only encodable when the module
+                // carries a data count section (spec 5.4.5): without one the
+                // body is malformed, whatever validation would later say.
+                if module.data_count.is_none()
+                    && body
+                        .body
+                        .iter()
+                        .any(|instr| matches!(instr, Instr::MemoryInit { .. } | Instr::DataDrop(_)))
+                {
+                    return Err(Error::Malformed("data count section required"));
+                }
+                module.bodies.push(body);
                 pos = end;
             }
         }
@@ -299,6 +326,13 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
                 module.data.push(decode_data(payload, &mut pos)?);
             }
         }
+    }
+    // A section payload must be consumed exactly: a count that leaves trailing
+    // bytes (more items than declared) or stops short is malformed, not a
+    // partially-read module (custom sections are the exception — their data is
+    // read to the payload end by construction).
+    if id != SectionId::Custom && pos != payload.len() {
+        return Err(Error::Malformed("section size mismatch"));
     }
     Ok(())
 }
@@ -1468,6 +1502,11 @@ fn read_s64(bytes: &[u8], pos: &mut usize) -> Result<i64, Error> {
         value |= i64::from(byte & 0x7f) << shift;
         shift += 7;
         if byte & 0x80 == 0 {
+            // The 10th byte of a u64 LEB carries only bit 63, so its unused
+            // bits must be pure sign extension: 0x00 or 0x7f and nothing else.
+            if index + 1 == 10 && byte != 0x00 && byte != 0x7f {
+                return Err(Error::Malformed("integer too large"));
+            }
             if shift < 64 && byte & 0x40 != 0 {
                 value |= -1i64 << shift;
             }
@@ -1714,7 +1753,7 @@ mod tests {
 
     #[test]
     fn type_section_decodes_sub_final_and_rec_groups() {
-        use crate::types::{CompositeType};
+        use crate::types::CompositeType;
         // (type $a (func)) then (type $b (sub final $a (func))):
         // the second subtype is `0x4f` + supertype list `[0]` + a func type.
         let mut w = Writer::header();
@@ -2051,5 +2090,67 @@ mod tests {
         assert_eq!(module.exports[0].name, "run");
         assert_eq!(module.data[0].bytes, b"hi");
         assert_eq!(module.bodies.len(), 1);
+    }
+
+    /// A header + type/function/code skeleton whose single function body is
+    /// `body` (locals group count 0 prepended, the terminating `end` included
+    /// in `body`).
+    fn module_with_body(body: &[u8]) -> Vec<u8> {
+        let mut w = Writer::header();
+        w.section(1, &[0x01, 0x60, 0x00, 0x00]); // (type (func))
+        w.section(3, &[0x01, 0x00]); // one function, type 0
+        let mut code = Vec::new();
+        count(1, &mut code);
+        let mut bytes = vec![0x00]; // no local groups
+        bytes.extend_from_slice(body);
+        count(bytes.len() as u32, &mut code);
+        code.extend_from_slice(&bytes);
+        w.section(10, &code);
+        w.into_module()
+    }
+
+    #[test]
+    fn decoder_enforces_section_and_leb_strictness() {
+        // A section payload that outlives its declared item count (the
+        // spec's "section size mismatch" family).
+        let mut w = Writer::header();
+        w.section(1, &[0x01, 0x60, 0x00, 0x00, 0x60, 0x00, 0x00]);
+        assert_eq!(
+            decode(&w.into_module()).unwrap_err(),
+            Error::Malformed("section size mismatch")
+        );
+
+        // A function section with no matching code section.
+        let mut w = Writer::header();
+        w.section(1, &[0x01, 0x60, 0x00, 0x00]);
+        w.section(3, &[0x01, 0x00]);
+        assert_eq!(
+            decode(&w.into_module()).unwrap_err(),
+            Error::Malformed("function and code section have inconsistent lengths")
+        );
+
+        // A non-zero data count without a data section.
+        let mut w = Writer::header();
+        w.section(12, &[0x01]);
+        assert_eq!(
+            decode(&w.into_module()).unwrap_err(),
+            Error::Malformed("data count and data section have inconsistent lengths")
+        );
+
+        // memory.init without a data count section.
+        let module = module_with_body(&[0xfc, 0x08, 0x00, 0x00, 0x0b]);
+        assert_eq!(
+            decode(&module).unwrap_err(),
+            Error::Malformed("data count section required")
+        );
+
+        // A 10-byte i64 LEB whose final byte is not pure sign extension.
+        let module = module_with_body(&[
+            0x42, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7e, 0x0b,
+        ]);
+        assert_eq!(
+            decode(&module).unwrap_err(),
+            Error::Malformed("integer too large")
+        );
     }
 }

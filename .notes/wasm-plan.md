@@ -760,6 +760,19 @@ intrinsic identity like every other agent-dependent builtin.
 
 ## 9. Status
 
+**2026-09-06 — baseline decoder-strictness gaps closed.** The last 18 red
+assertions in the top-level `core/` corpus were `assert_malformed` cases the
+decoder accepted (`crates/wasm/src/binary.rs`): section payloads that
+outlive their declared item count (the `binary.wast` "section size
+mismatch" family), a function section with no matching code section, data
+count / data section mismatches (incl. `custom.wast`), `memory.init` /
+`data.drop` bodies without a data count section, and the 10-byte `i64` LEB
+canonicality rule (`binary-leb128.wast`). The decoder now rejects all of
+them; the baseline run is **19 969 pass / 0 fail** (was 19 951 / 18) with no
+regressions across `exceptions`/`simd`/`multi-memory`/`memory64`/`gc`/
+`bulk-memory`. The remaining baseline pendings (600) are `quote text`
+converter limitations; `relaxed-simd/` is the only untouched proposal dir.
+
 **2026-09-05 — Cut 4 + import follow-up landed, and Cut 5's reference/table
 runtime is in** (tables, reference values, `call_indirect`, `call_ref`, bulk
 memory). `imports.wast`/`start`/`exports`/`memory_grow` and now
