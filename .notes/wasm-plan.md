@@ -771,7 +771,14 @@ canonicality rule (`binary-leb128.wast`). The decoder now rejects all of
 them; the baseline run is **19 969 pass / 0 fail** (was 19 951 / 18) with no
 regressions across `exceptions`/`simd`/`multi-memory`/`memory64`/`gc`/
 `bulk-memory`. The remaining baseline pendings (600) are `quote text`
-converter limitations; `relaxed-simd/` is the only untouched proposal dir.
+converter limitations.
+
+**2026-09-06 — relaxed-SIMD wave lands.** The `relaxed-simd/` corpus (7
+files) went from all-pending to **77 pass / 0 fail / 0 pending**: the
+relaxed `0xfd` ops (0x100-0x113) decode/validate/execute with one
+deterministic legal interpretation each (`simd::exec_relaxed`), and the
+runner accepts the `(either …)` result sets. `simd/` stays 25 479 / 0
+and the baseline stays 19 969 / 0.
 
 **2026-09-05 — Cut 4 + import follow-up landed, and Cut 5's reference/table
 runtime is in** (tables, reference values, `call_indirect`, `call_ref`, bulk
@@ -1163,12 +1170,26 @@ Traps fixed this wave:
   splats, 4 for `load32_zero`, 8 for the widen/`I64Splat`/`I64Zero`
   forms.
 
+### Cut 7c — relaxed SIMD wave (2026-09-06)
+
+The `relaxed-simd/` corpus (7 files) is green: **77 pass, 0 fail, 0
+pending**. The relaxed `0xfd` subopcodes (0x100-0x113) decode (added to
+`simd::sig` as unary/binary/ternary for typing), validate by category, and
+execute with one deterministic legal interpretation each (documented in
+`simd::exec_relaxed`): swizzle and q15mulr reuse the MVP kernels,
+relaxed trunc aliases the saturating forms, relaxed min/max use the spec
+min/max semantics, laneselect is bitselect, madd/nmadd use two-rounding
+multiply-then-add, and the dot products multiply signed i8 lanes (i16
+saturating / i32 wrapping accumulate). The runner now accepts the
+`assert_return` `(either …)` result sets these fixtures use. No
+regressions: `simd/` 25 479 pass / 0 fail, the baseline stays 19 969 / 0,
+runtime 729.
+
 Still failing (pre-existing, out of Cut 7 scope): the three
 GC-`rec`-bag modules — `type-canon` (2), `exceptions/tag` (3), and one
 module in `bulk-memory/table_init` (1) — decode the `rec`/subtype
 type-section encoding (0x4e/0x50) that the GC binary format (Cut 9)
 introduces; today the decoder reports those as malformed functypes.
-`relaxed-simd/` is untouched.
 
 ### Cut 8 — memory64, multi-memory, and table64 (2026-09-05)
 

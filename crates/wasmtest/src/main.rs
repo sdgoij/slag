@@ -952,6 +952,13 @@ fn gc_expected_matches(expected: &str, reference: RefValue) -> bool {
 /// Whether an actual result value satisfies an expected entry (which may be
 /// a NaN pattern).
 fn matches_expected(expected: &serde_json::Value, actual: WasmValue, module: usize) -> bool {
+    // A relaxed-SIMD `assert_return` may accept any of several results
+    // (`either`), encoded as a list of alternatives under the `either` key.
+    if let Some(alternatives) = expected.get("either").and_then(Value::as_array) {
+        return alternatives
+            .iter()
+            .any(|alternative| matches_expected(alternative, actual, module));
+    }
     let ty = expected.get("type").and_then(Value::as_str);
     let Some(ty) = ty else {
         return false;

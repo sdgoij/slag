@@ -185,8 +185,117 @@ pub fn sig(sub: u16) -> Option<VecSig> {
         0xe4..=0xeb | 0xf0..=0xf7 => VecSig::Binop,
         // Float/int conversions (trunc_sat, convert).
         0xf8..=0xff => VecSig::Unop,
+        // ---- relaxed SIMD (Cut 7 wave 3) ----
+        // i8x16.relaxed_swizzle, relaxed min/max, q15mulr, dot: binary.
+        0x100 | 0x10d..=0x112 => VecSig::Binop,
+        // relaxed trunc conversions: unary.
+        0x101..=0x104 => VecSig::Unop,
+        // relaxed madd/nmadd, laneselect, dot-with-accumulator: ternary.
+        0x105..=0x10c | 0x113 => VecSig::Ternop,
         _ => return None,
     })
+}
+
+/// The relaxed-SIMD subopcode range (spec: the `0xfd` prefix codes 0x100+).
+/// The semantics are deliberately nondeterministic across engines; Slag picks
+/// one deterministic behavior per op whose results the conformance fixtures'
+/// `(either ...)` sets accept.
+pub fn is_relaxed(sub: u16) -> bool {
+    (0x100..=0x113).contains(&sub)
+}
+
+/// How many v128 operands a relaxed op takes (1 = trunc conversions, 2 =
+/// swizzle/min-max/q15mulr/dot, 3 = madd/nmadd/laneselect/dot-add).
+pub fn relaxed_arity(sub: u16) -> u8 {
+    match sub {
+        0x101..=0x104 => 1,
+        0x100 | 0x10d..=0x112 => 2,
+        _ => 3,
+    }
+}
+
+/// Execute a relaxed SIMD op with a deterministic choice from its allowed
+/// results: swizzle and q15mulr reuse the MVP kernels, trunc/min/max alias
+/// the saturating/spec-min forms, laneselect is bitselect, madd/nmadd use
+/// two-rounding multiply-then-add, and the dot products multiply signed
+/// i8 lanes (accumulating to i16 with saturation / wrapping i32).
+pub fn exec_relaxed(sub: u16, a: u128, b: Option<u128>, c: Option<u128>) -> Option<u128> {
+    match sub {
+        0x100 => exec_binop(0x0e, a, b?),
+        0x101 => exec_conversion(0xf8, a),
+        0x102 => exec_conversion(0xf9, a),
+        0x103 => exec_conversion(0xfc, a),
+        0x104 => exec_conversion(0xfd, a),
+        0x105..=0x108 => {
+            let size = if matches!(sub, 0x105 | 0x106) {
+                4usize
+            } else {
+                8
+            };
+            let nmadd = matches!(sub, 0x106 | 0x108);
+            let b = b?;
+            let c = c?;
+            let mut out = 0u128;
+            for i in 0..(16 / size) {
+                let lane = |v: u128| -> (u64, f64) {
+                    if size == 4 {
+                        let bits = lane_bits(v, i, size) as u32;
+                        (u64::from(bits), f64::from(f32::from_bits(bits)))
+                    } else {
+                        let bits = lane_bits(v, i, size);
+                        (bits, f64::from_bits(bits))
+                    }
+                };
+                let (_, x) = lane(a);
+                let (_, y) = lane(b);
+                let (_, z) = lane(c);
+                let product = x * y;
+                let result = if nmadd { z - product } else { product + z };
+                let bits = if size == 4 {
+                    u64::from((result as f32).to_bits())
+                } else {
+                    result.to_bits()
+                };
+                out = set_lane(out, i, size, bits);
+            }
+            Some(out)
+        }
+        0x109..=0x10c => Some(exec_bitselect(a, b?, c?)),
+        0x10d => fp_arith_binop(0xe8, a, b?), // f32x4.min semantics
+        0x10e => fp_arith_binop(0xe9, a, b?), // f32x4.max semantics
+        0x10f => fp_arith_binop(0xf4, a, b?), // f64x2.min semantics
+        0x110 => fp_arith_binop(0xf5, a, b?), // f64x2.max semantics
+        0x111 => exec_binop(0x82, a, b?),     // q15mulr_sat_s semantics
+        0x112 => {
+            // i16x8 dot of signed i8 lanes: pairwise products, saturated to i16.
+            let b = b?;
+            let mut out = 0u128;
+            for i in 0..8 {
+                let x0 = lane_signed(a, 2 * i, 1) * lane_signed(b, 2 * i, 1);
+                let x1 = lane_signed(a, 2 * i + 1, 1) * lane_signed(b, 2 * i + 1, 1);
+                let r = narrow_clamp(x0 + x1, true, 2);
+                out = set_lane(out, i, 2, r as u64);
+            }
+            Some(out)
+        }
+        0x113 => {
+            // i32x4 dot of signed i8 lanes plus the accumulator lane.
+            let b = b?;
+            let c = c?;
+            let mut out = 0u128;
+            for i in 0..4 {
+                let mut sum: i64 = 0;
+                for k in 0..4 {
+                    let index = 4 * i + k;
+                    sum += lane_signed(a, index, 1) * lane_signed(b, index, 1);
+                }
+                sum += lane_signed(c, i, 4);
+                out = set_lane(out, i, 4, sum as u32 as u64);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 /// The lane kind of an extract/replace immediate's opcode.
@@ -1074,5 +1183,75 @@ fn exec_conversion(sub: u16, v: u128) -> Option<u128> {
             Some(out)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A v128 whose lanes are the raw `bytes` (i8 lanes).
+    fn bytes8(bytes: &[u8]) -> u128 {
+        let mut out = 0u128;
+        for (i, byte) in bytes.iter().enumerate() {
+            out = set_lane(out, i, 1, u64::from(*byte));
+        }
+        out
+    }
+
+    /// A v128 whose lanes are the given i16 values.
+    fn bytes16(values: &[i16]) -> u128 {
+        let mut out = 0u128;
+        for (i, value) in values.iter().enumerate() {
+            out = set_lane(out, i, 2, *value as u16 as u64);
+        }
+        out
+    }
+
+    #[test]
+    fn relaxed_kernels_are_deterministic_and_in_spec_set() {
+        // relaxed_swizzle with all out-of-range indices -> all-zero lanes.
+        let table = bytes8(&(0..16).collect::<Vec<u8>>());
+        let indices = bytes8(&(16..32).collect::<Vec<u8>>());
+        assert_eq!(exec_relaxed(0x100, table, Some(indices), None), Some(0));
+
+        // relaxed_laneselect is bitselect.
+        let a = bytes8(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let b = bytes8(&[
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        ]);
+        let mask = bytes8(&[0xff, 0, 0xf0, 0x0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            exec_relaxed(0x109, a, Some(b), Some(mask)),
+            Some(exec_bitselect(a, b, mask))
+        );
+
+        // q15mulr overflow lane saturates to 32767 (one of the allowed pair).
+        let min = bytes16(&[-32768, 0, 0, 0, 0, 0, 0, 0]);
+        let out = exec_relaxed(0x111, min, Some(min), None).unwrap();
+        assert_eq!(lane_signed(out, 0, 2), 32767);
+
+        // dot of signed i8 lanes: (-128 * -127) * 2 = 32512 (allowed value).
+        let a = bytes8(&[0x80, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let b = bytes8(&[0x81, 0x81, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let out = exec_relaxed(0x112, a, Some(b), None).unwrap();
+        assert_eq!(lane_signed(out, 0, 2), 32512);
+
+        // Determinism: the madd/trunc choices are pure functions of their
+        // inputs (the conformance `_cmp` helpers rely on this).
+        let x = bytes8(&(0..16).collect::<Vec<u8>>());
+        assert_eq!(
+            exec_relaxed(0x100, table, Some(indices), None),
+            exec_relaxed(0x100, table, Some(indices), None)
+        );
+        assert_eq!(
+            exec_relaxed(0x102, x, None, None),
+            exec_relaxed(0x102, x, None, None)
+        );
+        let c = bytes8(&[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(
+            exec_relaxed(0x113, a, Some(b), Some(c)),
+            exec_relaxed(0x113, a, Some(b), Some(c))
+        );
     }
 }

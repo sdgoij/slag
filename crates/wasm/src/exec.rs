@@ -2892,6 +2892,19 @@ impl<'a> Engine<'a> {
     fn simd_exec(&mut self, sub: u16, lane: Option<u8>) -> Result<Ctl, ExecFail> {
         use crate::simd::VecSig;
         let unsupported = || ExecFail::Unsupported("simd opcode");
+        // Relaxed SIMD ops take a fixed operand count and one deterministic
+        // behavior each (the spec allows a set of results per op); dispatch
+        // them before the category match so the ternary forms do not fall
+        // into the bitselect-only `Ternop` arm.
+        if crate::simd::is_relaxed(sub) {
+            let arity = crate::simd::relaxed_arity(sub);
+            let c = (arity == 3).then(|| self.pop_v128()).transpose()?;
+            let b = (arity >= 2).then(|| self.pop_v128()).transpose()?;
+            let a = self.pop_v128()?;
+            let out = crate::simd::exec_relaxed(sub, a, b, c).ok_or_else(unsupported)?;
+            self.stack.push(Value::V128(out));
+            return Ok(Ctl::Next);
+        }
         match crate::simd::sig(sub) {
             Some(VecSig::Not) => {
                 let v = self.pop_v128()?;
