@@ -357,6 +357,18 @@ fn meta_scripts(source: &str, file_dir: &Path, root: &Path) -> Vec<PathBuf> {
     scripts
 }
 
+/// Fixture-source patches for defects in the pinned spec snapshot (the
+/// submodule is read-only). Each entry prepends helper text to the fixture
+/// whose file name matches, restoring what the fixture's own `META: script=`
+/// list assumes. `grow-memory64.any.js` uses `nulls(n)` but only loads
+/// `assertions.js` + the builder; the helper lives in `grow.any.js`, and the
+/// commit that split the memory64 file (`2929f4497`, "Split memory64 JS API
+/// tests into separate files") never moved it.
+const FIXTURE_PATCHES: &[(&str, &str)] = &[(
+    "grow-memory64.any.js",
+    "function nulls(n) { return Array(n).fill(null); }\n",
+)];
+
 /// Run one fixture on a dedicated thread with the engine's deep-recursion
 /// stack budget. The debug interpreter grows ~160 KB of native stack per JS
 /// call level (see the `run_deep` helper in `crates/runtime/src/eval.rs`), so
@@ -367,8 +379,18 @@ fn meta_scripts(source: &str, file_dir: &Path, root: &Path) -> Vec<PathBuf> {
 /// `join()`. A fixture that still exhausts the budget panics on its own
 /// thread and surfaces as an `Err` for that file instead of aborting the run.
 fn run_fixture(path: &Path, root: &Path) -> Result<FixtureReport, String> {
-    let source =
+    let original =
         fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let source = FIXTURE_PATCHES
+        .iter()
+        .find(|(name, _)| *name == file_name)
+        .map(|(_, patch)| format!("{patch}{original}"))
+        .unwrap_or(original);
     let file = path.to_path_buf();
     let file_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let root = root.to_path_buf();

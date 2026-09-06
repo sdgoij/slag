@@ -2678,13 +2678,6 @@ fn build_imports(
                         let expected = module.func_at_cloned(*type_index).ok_or_else(|| {
                             JsError::new(ErrorKind::TypeError, "unknown function type".into())
                         })?;
-                        if expected.results.len() > 1 {
-                            return Err(link_failure(
-                                agent,
-                                "multi-value function imports are not supported yet (Cut 10 \
-                                 wave 3b)",
-                            )?);
-                        }
                         let token = agent.wasm_host_seq;
                         agent.wasm_host_seq += 1;
                         agent
@@ -2831,6 +2824,35 @@ fn wasm_arg(agent: &mut Agent, param: &ValType, value: &Value) -> Result<WasmVal
     })
 }
 
+/// An imported JS function's return value → the wasm results of its declared
+/// function type (JS-API 4.9.5): zero results ignore the value; a single
+/// result converts it directly; multiple results iterate the value —
+/// GetIterator then whole-sequence IteratorStep, converting each element by
+/// the result types in order once iteration completes.
+fn js_function_results(
+    agent: &mut Agent,
+    fty: &wasm::types::FuncType,
+    value: &Value,
+) -> Result<Vec<WasmValue>, JsError> {
+    if fty.results.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let [single] = fty.results.as_slice() {
+        return Ok(vec![wasm_arg(agent, single, value)?]);
+    }
+    let iterator = crate::expr::get_iterator(agent, value)?;
+    let mut collected = Vec::new();
+    while let Some(element) = crate::expr::iterator_step(agent, &iterator)? {
+        collected.push(element);
+    }
+    let mut results = Vec::with_capacity(fty.results.len());
+    for (index, result) in fty.results.iter().enumerate() {
+        let element = collected.get(index).copied().unwrap_or(Value::Undefined);
+        results.push(wasm_arg(agent, result, &element)?);
+    }
+    Ok(results)
+}
+
 /// One wasm result value → JS (i64 becomes a BigInt; the numeric types are
 /// numbers; externref becomes the JS value it holds).
 fn wasm_result(agent: &Agent, value: WasmValue) -> Result<Value, JsError> {
@@ -2960,10 +2982,7 @@ fn invoke_export(
                 memory_buffers_to_store(agent)?;
                 match reply {
                     Ok((value, fty)) => {
-                        let mut wasm_results = Vec::new();
-                        if let Some(result_type) = fty.results.first() {
-                            wasm_results.push(wasm_arg(agent, result_type, &value)?);
-                        }
+                        let wasm_results = js_function_results(agent, &fty, &value)?;
                         progress = {
                             let mut store = agent.wasm_store.borrow_mut();
                             store.resume(Ok(wasm_results))
@@ -3009,10 +3028,16 @@ fn invoke_export(
     match results.as_slice() {
         [] => Ok(Value::Undefined),
         [single] => wasm_result(agent, *single),
-        _ => Err(JsError::new(
-            ErrorKind::TypeError,
-            "multi-value wasm results are not supported yet (Cut 10 wave 3b)".into(),
-        )),
+        // A multi-value export returns a fresh Array of the converted
+        // results in order (JS-API: only a function's `WebAssembly.Function`
+        // wrapper reports the multi-result type; direct calls get an array).
+        many => {
+            let values = many
+                .iter()
+                .map(|value| wasm_result(agent, *value))
+                .collect::<Result<Vec<_>, _>>()?;
+            array_from_values(agent, &values)
+        }
     }
 }
 
@@ -3775,6 +3800,62 @@ mod tests {
     }
 
     // ---- wave 4 slice 1: promise-returning compile/instantiate ----
+
+    #[test]
+    fn multi_value_results_cross_the_js_boundary() {
+        let mut context = Context::new().unwrap();
+        // An export with two results returns a fresh Array from JS.
+        let swap = wat_module_bytes(concat!(
+            "(module",
+            "  (func (export \"swap\") (param f64 i32) (result i32 f64)",
+            "    local.get 1",
+            "    local.get 0",
+            "    return))"
+        ));
+        eval_true(
+            &mut context,
+            &format!(
+                concat!(
+                    "(function(){{ const i = new WebAssembly.Instance(new Uint8Array({swap}));",
+                    " const swapped = i.exports.swap(4.2, 7);",
+                    " return Array.isArray(swapped)",
+                    "   && Object.getPrototypeOf(swapped) === Array.prototype",
+                    "   && swapped.length === 2 && swapped[0] === 7 && swapped[1] === 4.2; }})()"
+                ),
+                swap = swap,
+            ),
+        );
+        // An imported JS function with two results is iterated (GetIterator +
+        // IteratorStep) and its elements converted by the result types.
+        let callfn = wat_module_bytes(concat!(
+            "(module",
+            "  (type $t (func (param f64 i32) (result i32 f64)))",
+            "  (import \"js\" \"fn\" (func $fn (type $t)))",
+            "  (func (export \"run\") (result i32)",
+            "    f64.const 4.2",
+            "    i32.const 7",
+            "    call $fn",
+            "    drop",
+            "    return))"
+        ));
+        eval_true(
+            &mut context,
+            &format!(
+                concat!(
+                    "(function(){{ const seen = [];",
+                    " const fn = () => ({{ get [Symbol.iterator]() {{ seen.push('iter'); return function() {{ let n = 0;",
+                    "   const values = [2, 7.3];",
+                    "   return {{ next: () => {{ seen.push('next'); const done = n >= values.length;",
+                    "     const value = done ? undefined : values[n++];",
+                    "     return {{ done, value: {{ valueOf: () => value }} }}; }} }}; }}; }} }});",
+                    " const i = new WebAssembly.Instance(new Uint8Array({callfn}), {{ js: {{ fn }} }});",
+                    " const out = i.exports.run();",
+                    " return out === 2 && seen.join(',') === 'iter,next,next,next'; }})()"
+                ),
+                callfn = callfn,
+            ),
+        );
+    }
 
     #[test]
     fn compile_and_instantiate_return_promises() {

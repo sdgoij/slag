@@ -641,6 +641,25 @@ intrinsic identity like every other agent-dependent builtin.
   same JS objects the importer passed in. `instance/constructor-caching`
   is green (1/1). Corpus: 994 tests pass / 96 fail (was 990/100), 40
   fixture-files green of 53. Runtime suite: 725 tests pass.
+- Wave 5 slice 12 (landed): multi-value across the JS boundary, plus a
+  harness fixture patch and out-of-scope exclusions. A wasm export with
+  several results now returns a fresh Array of the converted results (in
+  order) instead of erroring, and an imported JS function whose declared
+  type has several results runs the return value through GetIterator /
+  whole-sequence IteratorStep and converts each element by the result
+  types once iteration completes (the `constructor/multi-value.any.js`
+  observer ordering holds exactly). `constructor/multi-value.any.js` is
+  green (3/3). The jsapi runner gained a fixture-source patch table for
+  defects in the pinned spec snapshot (`grow-memory64.any.js` uses
+  `nulls(n)` but the commit that split it — `2929f4497` — never moved the
+  helper out of `grow.any.js`); that file is green (6/6). The `js-string`
+  and `gc` JS-API suites are now listed in `wasm-exclusions.txt` as out
+  of scope (no later cut owns them). Corpus: 997 tests pass / 4 fail (was
+  994/96), 42 fixture-files green with the 3 remaining files being
+  `exception/jsTag` (needs `WebAssembly.JSTag`), `memory/grow`
+  (shared-memory detach), and `table/get-set` (raw JS closures in funcref
+  tables need typed `WebAssembly.Function`). Runtime suite: 726 tests
+  pass.
 
 ## 6. Verification workflow
 

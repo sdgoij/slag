@@ -28,3 +28,14 @@ waspec/test/core/gc/type-subtyping.wast :: multi-supertype fixtures the `wast` g
 # million-element modules, which takes minutes or more in the debug engine
 # (which enforces no embedder limits); it is run on demand, not in a sweep.
 waspec/test/js-api/limits.any.js :: embedder-limit conformance builds 1M-element modules (WPT timeout=long); run on demand
+
+# The JS-string and GC proposals are outside the supported JS-API corpus (see
+# the wave 5 slices in .notes/wasm-plan.md): no later cut owns them.
+waspec/test/js-api/js-string/basic.any.js :: JSString proposal (out of scope)
+waspec/test/js-api/js-string/constants.any.js :: JSString proposal (out of scope)
+waspec/test/js-api/js-string/imports.any.js :: JSString proposal (out of scope)
+waspec/test/js-api/js-string/polyfill.js :: JSString proposal (out of scope)
+waspec/test/js-api/gc/casts.tentative.any.js :: GC proposal (out of scope)
+waspec/test/js-api/gc/default-value.tentative.any.js :: GC proposal (out of scope)
+waspec/test/js-api/gc/exported-object.tentative.any.js :: GC proposal (out of scope)
+waspec/test/js-api/gc/i31.tentative.any.js :: GC proposal (out of scope)
