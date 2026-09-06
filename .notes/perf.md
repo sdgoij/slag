@@ -5408,6 +5408,43 @@ the slice/concat/join native handlers are still ~5-9µs per call on tiny
 dense arrays — they build their results through their own machinery and
 are the next dense-array slice.
 
+### Dense `Array.prototype.slice`: whole-dense ranges copy by index (measured + landed 2026-09-06)
+
+The element-creation landing above left slice/concat/join handlers at
+~5-9µs per call on tiny dense arrays. Probe decomposition of slice:
+~4.5µs FIXED per call (species create — the constructor chain read, the
+@@species getter, and a full [[Construct]] — plus the length [[Set]] and
+dispatch) and ~740ns per ELEMENT (generic per-index HasProperty + Get
+through `index.to_string()` + string-key machinery): a 300-element slice
+ran 224µs/call jitless vs node-jl 74ns.
+
+Landing: `JsObject::dense_element(index)` (a dense element read that
+returns `None` for a hole) and a slice fast path gated on the source
+being a dense Array AND the whole copied range being dense-present (no
+holes): for such a range each index's HasProperty is trivially true and
+Get reads the OWN element, so the prototype chain is never consulted — a
+chain that shadows a hole (e.g. a property set on %Array.prototype%,
+which the S15.4.4.10_A4_T1 fixture does) cannot change the result.
+Holes, non-dense results, and exotic receivers keep the exact
+per-element HasProperty/Get path; the dense path also skips the result's
+trailing [[Set]] of length (already `count` from the species create).
+
+Results: a 300-element `slice(0)` 6712 -> ~278ms jitless / ~275ms jit
+for 30k calls (~24x; per-element ~740ns -> ~30ns, the residual fixed cost
+is the species create); 3-element 145 -> ~88ms. `arrays/slice_concat`
+corpus row ~226 -> ~204ms jl; no regressions. An 18-case
+node-differential battery (ranges, negatives, holes preserved incl.
+deleted elements, subclass species, custom species, array-like and
+string receivers, shallow copies, frozen sources, large copies) is
+byte-identical to node in jit, jitless, and `--gc-stress`. Gates: clippy
+clean; workspace tests green; test262 sweeps at baseline — language
+23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang (the sweep caught the first dense draft's hole-shadowing
+soundness hole on the S15.4.4.10 fixture; the whole-range-dense gate
+fixed it). Follow-ups (measured, not done): the ~2.5-4µs fixed species
+create cost (a stock-%Array%-species verdict, the for-of-verdict
+pattern) and the concat/join handlers' same per-element + species shape.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

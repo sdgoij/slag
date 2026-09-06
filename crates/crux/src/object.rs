@@ -2181,6 +2181,17 @@ impl JsObject {
         }
     }
 
+    /// The dense element at `index`, when `self` is a dense Array whose
+    /// materialized buffer holds it (`None` for a hole or a non-dense
+    /// receiver — callers gate on [`JsObject::array_length_dense`] first).
+    pub fn dense_element(&self, index: u64) -> Option<Value> {
+        let ObjectKind::Array(slots) = &self.kind else {
+            return None;
+        };
+        let elements = slots.elements.borrow();
+        elements.get(index as usize).copied().flatten()
+    }
+
     /// The dense `Array.prototype.pop` fast path: a dense Array whose last
     /// slot holds an own data element pops by truncation — read the element,
     /// truncate the buffer, and sync the length cell + mirror (the spec's

@@ -1423,19 +1423,48 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     let count = final_index.saturating_sub(k);
     let array = array_species_create(agent, &object, count as f64)?;
     let mut n = 0u64;
-    while k < final_index {
-        if has_property(&object, &key(k))? {
-            let value = get(agent, &object, &key(k))?;
-            array.create_data_property_or_throw(&key(n), value)?;
+    // Dense fast path: when the source is a dense Array and the WHOLE
+    // copied range is dense-present (no holes), each index's HasProperty is
+    // trivially true and Get reads the own element — the prototype chain is
+    // never consulted, so a chain that shadows a hole (e.g. a property on
+    // %Array.prototype%) cannot change the result. Holes (or a non-dense
+    // result) keep the exact per-element HasProperty/Get path. The result's
+    // length is already `count` from the species create, so its trailing
+    // [[Set]] is skipped on the dense path.
+    let dense = match object.kind() {
+        ValueKind::Object(src) => {
+            src.array_length_dense().is_some()
+                && array.array_length_dense().is_some()
+                && (k..final_index).all(|i| src.dense_element(i).is_some())
         }
-        k += 1;
-        n += 1;
+        _ => false,
+    };
+    if dense {
+        let ValueKind::Object(src) = object.kind() else {
+            unreachable!("dense gate matched an object")
+        };
+        while k < final_index {
+            // The range was verified dense-present: every element exists.
+            let value = src.dense_element(k).expect("range verified dense");
+            array.create_data_property_index(n, value)?;
+            k += 1;
+            n += 1;
+        }
+    } else {
+        while k < final_index {
+            if has_property(&object, &key(k))? {
+                let value = get(agent, &object, &key(k))?;
+                array.create_data_property_or_throw(&key(n), value)?;
+            }
+            k += 1;
+            n += 1;
+        }
+        array.set(
+            &JsString::from_utf8("length"),
+            Value::Number(n as f64),
+            true,
+        )?;
     }
-    array.set(
-        &JsString::from_utf8("length"),
-        Value::Number(n as f64),
-        true,
-    )?;
     Ok(Value::Object(array))
 }
 
