@@ -5360,6 +5360,54 @@ node in jit, jitless, and `--gc-stress`. Gates: clippy clean; workspace
 tests green; test262 sweeps at baseline — language 23721/3 skip, built-
 ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
 
+### Dense-array element creation: literals, from-values, and spread define by index (measured + landed 2026-09-06)
+
+Probe: an EMPTY `[]` literal cost ~1.1µs per creation (vs ~70ns for `{}`)
+and `[i, i+1, i+2]` ~1.65µs. Crux-level decomposition of the fresh-array
+path: `array_create` itself is only ~237ns (ordinary object ~105ns); the
+rest is the literal's per-element work — every element ran a full
+CreateDataProperty through `index.to_string()` + intern + a
+`PropertyDescriptor` + kind dispatch (~180-530ns each), and `ArrayEnd`
+ran a full `[[Set]]` of `length` (~960ns even when the dense length
+already equaled the element count).
+
+Landing: `JsObject::create_data_property_index(index, value)` — an
+index-native CreateDataProperty whose dense-array case goes through a
+shared `dense_index_define` (extracted from `array_define_own_property`'s
+canonical-w/e/c branch, so the two cannot drift) and whose fallback is
+the exact string-key define. The VM's `ArrayElement`/`ArraySpread` steps
+(the literal's own array is the fresh dense Array `ArrayBegin` created,
+unreachable before the literal completes) and `array_from_values` call it;
+`ArrayEnd` skips the length `[[Set]]` when the dense length already
+reached the element count (no trailing holes — assigning the own length
+its current value is unobservable). The change is spread across the
+dispatch match plus the JIT mirrors (the four-file helper mirror):
+`array_begin` still calls `array_create`, but the compiled
+`array_element`/`array_spread`/`array_end` helpers use the same dense
+define + redundant-length-skip. Also: `%Array.prototype%` now resolves
+through a cached intrinsic accessor (`Intrinsics::array_prototype`, like
+`object_prototype`) instead of `Intrinsics::get`'s per-call `JsString`
+alloc + hash, and `JsObject::array_create` initializes in place
+(`new_in_place`) instead of building the ~200-byte `JsObject` on the
+stack and memcpy'ing it.
+
+Isolated A/B (200k literals, interleaved parent/new): `[]` 221.5 ->
+53.6ms jitless / 168.6 -> 49.6ms jit; `[i, i+1, i+2]` 330.1 -> 71.6 /
+273.4 -> 63.6 (~4.1-4.6x), and jit now matches jitless (the compiled
+array path had been slower than the interpreter's). Corpus:
+`builtins/object_keys` ~271 -> ~169ms jit / ~270 -> ~163ms jl (keys/
+values/entries build arrays through the same creation), everything else
+within cross-run noise. A 20-case node-differential literal battery
+(holes, trailing holes/commas, spread incl. holes and custom iterators,
+nested literals, prototype index setters not consulted, growth past the
+literal, loop literals) is byte-identical to node in jit, jitless, and
+`--gc-stress`. Gates: clippy clean; workspace tests green; test262
+sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086, zero fail/crash/hang. Follow-up (measured, not done):
+the slice/concat/join native handlers are still ~5-9µs per call on tiny
+dense arrays — they build their results through their own machinery and
+are the next dense-array slice.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

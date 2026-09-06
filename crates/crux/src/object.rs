@@ -1217,24 +1217,66 @@ impl JsObject {
             length: Cell::new(length),
             dense: Cell::new(true),
         });
-        let array = Handle::new(Self {
-            id: next_object_id(),
-            kind: ObjectKind::Array(slots),
-            array_dense: Cell::new(Some(slots)),
-            typed_array: Cell::new(None),
-            prototype: Cell::new(prototype),
-            map: Cell::new(Some(canonical_empty_map(prototype))),
-            in_fields: [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
-            extensible: Cell::new(true),
-            immutable_prototype: Cell::new(false),
-            generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
-            properties: RefCell::new(SmallProps::new()),
-            property_index: RefCell::new(None),
-            private_elements: RefCell::new(Vec::new()),
-            self_handle: Cell::new(None),
-            function_self: Cell::new(None),
-            boxed: Cell::new(None),
+        // In-place init: `Handle::new(Self { .. })` would build the whole
+        // JsObject on the stack and memcpy it into the arena slot (~80ns per
+        // allocation on the hot creation paths — the `new_in_place` lesson);
+        // array literals and `new Array` create arrays constantly. The map
+        // (which can allocate) is resolved before the heap borrow.
+        let map = canonical_empty_map(prototype);
+        let array = Handle::new_in_place(|this: *mut Self| {
+            // SAFETY: `new_in_place` hands back the fresh slot; this closure
+            // writes every field before returning. The `slots` handle was
+            // allocated before the heap borrow (`new_in_place`'s init must
+            // not allocate through the heap).
+            unsafe {
+                std::ptr::write(std::ptr::addr_of_mut!((*this).id), next_object_id());
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).kind),
+                    ObjectKind::Array(slots),
+                );
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).array_dense),
+                    Cell::new(Some(slots)),
+                );
+                std::ptr::write(std::ptr::addr_of_mut!((*this).typed_array), Cell::new(None));
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).prototype),
+                    Cell::new(prototype),
+                );
+                std::ptr::write(std::ptr::addr_of_mut!((*this).map), Cell::new(Some(map)));
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).in_fields),
+                    [const { Cell::new(Value::uninitialized()) }; INLINE_FIELDS],
+                );
+                std::ptr::write(std::ptr::addr_of_mut!((*this).extensible), Cell::new(true));
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).immutable_prototype),
+                    Cell::new(false),
+                );
+                std::ptr::write(std::ptr::addr_of_mut!((*this).generation), Cell::new(0));
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).store_chain_clean),
+                    Cell::new(None),
+                );
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).properties),
+                    RefCell::new(SmallProps::new()),
+                );
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).property_index),
+                    RefCell::new(None),
+                );
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).private_elements),
+                    RefCell::new(Vec::new()),
+                );
+                std::ptr::write(std::ptr::addr_of_mut!((*this).self_handle), Cell::new(None));
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).function_self),
+                    Cell::new(None),
+                );
+                std::ptr::write(std::ptr::addr_of_mut!((*this).boxed), Cell::new(None));
+            }
         });
         Self::link_self_handle(&array);
         // The dense `length` mirror: `properties[0]` holds the canonical
@@ -2938,6 +2980,23 @@ impl JsObject {
         Ok(())
     }
 
+    /// CreateDataProperty (spec 7.3.4) on the array-index `index` — the
+    /// element shape of array literals, from-list arrays, spread, and the
+    /// array builtins' result arrays. A dense array stores directly through
+    /// [`dense_index_define`]; anything else falls back to the exact
+    /// string-key define. Index-native callers (the VM's `ArrayElement`/
+    /// `ArraySpread` steps, `array_from_values`) pay the string key +
+    /// descriptor + dispatch round trip once per call instead of per element.
+    pub fn create_data_property_index(&self, index: u64, value: Value) -> Result<bool, JsError> {
+        if index <= 0xFFFF_FFFE
+            && let Some(result) = dense_index_define(self, index, value)
+        {
+            return Ok(result);
+        }
+        let key = PropertyKey::String(crate::string::index_atom(index));
+        self.create_data_property_key(&key, value)
+    }
+
     /// The write-side chain-cache generation (Cut 22): bumped by any
     /// own-property or prototype change, so a cached "the chain holds no
     /// accessor/non-writable for this key" verdict can be re-validated
@@ -3701,6 +3760,42 @@ fn receiver_define_property(
     }
 }
 
+/// The shared dense index store: store `value` at `index` on a dense array
+/// (an append, an in-place update, or a grow). `Some(true)` stored,
+/// `Some(false)` rejected (a grow beyond `length` on a non-extensible
+/// array), `None` not applicable (not dense, or the hole span is huge —
+/// spill and run the generic path).
+fn dense_index_define(array: &JsObject, index: u64, value: Value) -> Option<bool> {
+    let ObjectKind::Array(slots) = &array.kind else {
+        return None;
+    };
+    if !slots.dense.get() {
+        return None;
+    }
+    let length = slots.length.get();
+    if (index as f64) >= length && !array.extensible.get() {
+        return Some(false);
+    }
+    // A huge hole span (e.g. `a[2^31] = v`) must not materialize billions
+    // of slots: spill, and the generic index define grows the length
+    // through the properties path.
+    let elements_len = slots.elements.borrow().len();
+    if index as usize > elements_len + DENSE_HOLE_SPILL_CAP {
+        return None;
+    }
+    let mut elements = slots.elements.borrow_mut();
+    if elements.len() <= index as usize {
+        elements.resize(index as usize + 1, None);
+    }
+    elements[index as usize] = Some(value);
+    if (index as f64) >= length {
+        slots.length.set(index as f64 + 1.0);
+        array.write_length_mirror(index as f64 + 1.0);
+    }
+    array.bump_generation();
+    Some(true)
+}
+
 /// ArrayDefineOwnProperty (spec 10.4.2.1): `length` goes through
 /// ArraySetLength; array-index definitions keep `length` one past the index.
 fn array_define_own_property(
@@ -3728,26 +3823,11 @@ fn array_define_own_property(
         && !desc.is_accessor_descriptor()
         && let Some(value) = desc.value
     {
-        let length = slots.length.get();
-        if (index as f64) >= length && !array.extensible.get() {
-            return Ok(false);
-        }
-        // A huge hole span (e.g. `a[2^31] = v`) must not materialize
-        // billions of slots: spill, and the generic index define below
-        // grows the length through the properties path.
-        let elements_len = slots.elements.borrow().len();
-        if index as usize <= elements_len + DENSE_HOLE_SPILL_CAP {
-            let mut elements = slots.elements.borrow_mut();
-            if elements.len() <= index as usize {
-                elements.resize(index as usize + 1, None);
-            }
-            elements[index as usize] = Some(value);
-            if (index as f64) >= length {
-                slots.length.set(index as f64 + 1.0);
-                array.write_length_mirror(index as f64 + 1.0);
-            }
-            array.bump_generation();
-            return Ok(true);
+        // The shared dense store: `None` (a huge hole span) spills and runs
+        // the generic index define below, which then sees the materialized
+        // elements.
+        if let Some(result) = dense_index_define(array, index, value) {
+            return Ok(result);
         }
     }
     if let ObjectKind::Array(slots) = &array.kind

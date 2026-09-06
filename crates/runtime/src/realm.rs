@@ -60,6 +60,11 @@ pub struct Intrinsics {
     /// literals (`ObjectBegin`) and constructor `this` fallbacks read it per
     /// object creation.
     object_prototype: RefCell<Option<Value>>,
+    /// The realm's %Array.prototype% handle, cached after the first
+    /// resolution like `object_prototype`: every array creation
+    /// (`array_create` — array literals, `new Array`, the array builtins)
+    /// reads it, and `Intrinsics::get` allocates a JsString per call.
+    array_prototype: RefCell<Option<Value>>,
     /// Cut 66: the function-creation prototype intrinsics (%Function.prototype%
     /// and the generator/async variants), resolved once per realm like
     /// `object_prototype` — `set_function_prototype`/`make_constructor` read
@@ -128,6 +133,7 @@ impl Trace for Intrinsics {
         // aborts the sweep instead of panicking.
         self.entries.trace(visit);
         self.object_prototype.trace(visit);
+        self.array_prototype.trace(visit);
         match self.function_prototypes.try_borrow() {
             Ok(guard) => {
                 for slot in guard.iter() {
@@ -166,6 +172,17 @@ impl Intrinsics {
         }
         let value = self.get("%Object.prototype%")?;
         *self.object_prototype.borrow_mut() = Some(value);
+        Some(value)
+    }
+
+    /// The realm's %Array.prototype% value, cached after the first
+    /// resolution (see the struct field).
+    pub fn array_prototype(&self) -> Option<Value> {
+        if let Some(value) = self.array_prototype.borrow().as_ref() {
+            return Some(*value);
+        }
+        let value = self.get("%Array.prototype%")?;
+        *self.array_prototype.borrow_mut() = Some(value);
         Some(value)
     }
 

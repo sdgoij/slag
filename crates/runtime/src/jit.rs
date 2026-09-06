@@ -2557,7 +2557,15 @@ extern "C" fn array_element(ctx: *mut c_void, array: u64, value: u64) -> u64 {
             );
         }
     };
-    if let Err(error) = crate::ir::array_set(&array, &index.to_string(), value) {
+    // The literal's own array is the fresh dense Array `array_begin`
+    // created, so the index-native CreateDataProperty stores directly.
+    let result = match array.kind() {
+        ValueKind::Object(obj) => obj
+            .create_data_property_index(index as u64, value)
+            .map(|_| ()),
+        _ => crate::ir::array_set(&array, &index.to_string(), value),
+    };
+    if let Err(error) = result {
         return slow_error(ctx, error);
     }
     *vm.array_index_stack.last_mut().expect("an array is open") = index + 1;
@@ -2588,7 +2596,13 @@ extern "C" fn array_spread(ctx: *mut c_void, array: u64, iterable: u64) -> u64 {
     };
     let mut index = start;
     for value in values {
-        if let Err(error) = crate::ir::array_set(&array, &index.to_string(), value) {
+        let result = match array.kind() {
+            ValueKind::Object(obj) => obj
+                .create_data_property_index(index as u64, value)
+                .map(|_| ()),
+            _ => crate::ir::array_set(&array, &index.to_string(), value),
+        };
+        if let Err(error) = result {
             return slow_error(ctx, error);
         }
         index += 1;
@@ -2631,14 +2645,25 @@ extern "C" fn array_end(ctx: *mut c_void, array: u64) -> u64 {
             JsError::new(ErrorKind::TypeError, "not an object".into()),
         );
     };
-    match obj.set(
-        &crux::JsString::from_utf8("length"),
-        Value::Number(length as f64),
-        true,
-    ) {
-        Ok(_) => array.bits(),
-        Err(error) => slow_error(ctx, error),
+    // A dense literal whose element defines already reached the element
+    // count (no trailing holes) needs no [[Set]] of length — assigning the
+    // own length its current value is unobservable, and the full
+    // ArraySetLength path costs ~1us per literal.
+    let needs_set = match obj.array_length_dense() {
+        Some(current) => current as usize != length,
+        None => true,
+    };
+    if needs_set {
+        match obj.set(
+            &crux::JsString::from_utf8("length"),
+            Value::Number(length as f64),
+            true,
+        ) {
+            Ok(_) => {}
+            Err(error) => return slow_error(ctx, error),
+        }
     }
+    array.bits()
 }
 
 // ----- Cut 53: object literals -----

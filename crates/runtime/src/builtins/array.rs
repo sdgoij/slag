@@ -141,7 +141,7 @@ pub fn array_create(agent: &Agent, length: f64) -> Result<Handle<JsObject>, JsEr
     let proto = agent
         .current_realm()?
         .intrinsics
-        .get(ARRAY_PROTO)
+        .array_prototype()
         .and_then(|value| as_object(&value));
     JsObject::array_create(proto, length)
 }
@@ -156,7 +156,7 @@ pub fn array_from_values(agent: &Agent, values: &[Value]) -> Result<Value, JsErr
     let _stress = crate::ir::StressSuppress::new();
     let array = array_create(agent, values.len() as f64)?;
     for (index, value) in values.iter().enumerate() {
-        array.create_data_property(&key(index as u64), *value)?;
+        array.create_data_property_index(index as u64, *value)?;
     }
     Ok(Value::Object(array))
 }

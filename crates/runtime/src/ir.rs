@@ -6575,7 +6575,17 @@ impl Vm {
                     let value = self.pop();
                     let array = self.pop();
                     let index = *self.array_index()?;
-                    array_set(&array, &index.to_string(), value)?;
+                    // The literal's own array is the fresh dense Array
+                    // `ArrayBegin` created (unreachable before it completes),
+                    // so the index-native CreateDataProperty stores directly
+                    // — no per-element string key + descriptor + dispatch
+                    // round trip.
+                    match array.kind() {
+                        ValueKind::Object(obj) => {
+                            obj.create_data_property_index(index as u64, value)?;
+                        }
+                        _ => array_set(&array, &index.to_string(), value)?,
+                    }
                     *self.array_index()? = index + 1;
                     self.stack.push(array);
                 }
@@ -6585,7 +6595,12 @@ impl Vm {
                     let iterator = get_iterator(agent, &iterable)?;
                     while let Some(value) = iterator_step(agent, &iterator)? {
                         let index = *self.array_index()?;
-                        array_set(&array, &index.to_string(), value)?;
+                        match array.kind() {
+                            ValueKind::Object(obj) => {
+                                obj.create_data_property_index(index as u64, value)?;
+                            }
+                            _ => array_set(&array, &index.to_string(), value)?,
+                        }
                         *self.array_index()? = index + 1;
                     }
                     self.stack.push(array);
@@ -6602,11 +6617,22 @@ impl Vm {
                     let ValueKind::Object(obj) = array.kind() else {
                         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
                     };
-                    obj.set(
-                        &JsString::from_utf8("length"),
-                        Value::Number(length as f64),
-                        true,
-                    )?;
+                    // A dense literal whose element defines already reached
+                    // the element count (no trailing holes) needs no [[Set]]
+                    // of length — assigning the own length its current value
+                    // is unobservable, and the full ArraySetLength path costs
+                    // ~1us per literal.
+                    let needs_set = match obj.array_length_dense() {
+                        Some(current) => current as usize != length,
+                        None => true,
+                    };
+                    if needs_set {
+                        obj.set(
+                            &JsString::from_utf8("length"),
+                            Value::Number(length as f64),
+                            true,
+                        )?;
+                    }
                     self.stack.push(array);
                 }
                 Step::ObjectBegin => {
