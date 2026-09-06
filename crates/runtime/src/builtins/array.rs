@@ -561,6 +561,10 @@ fn concat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let mut n = 0u64;
     let mut elements = vec![object];
     elements.extend_from_slice(args);
+    // Tracks whether every spread/append defined densely into the result: a
+    // fully-dense concat leaves the result length == n, so the trailing
+    // [[Set]] is skipped.
+    let mut dense_copy = true;
     for element in elements {
         if is_concat_spreadable(agent, &element)? {
             let length = length_of_array_like(agent, &element)?;
@@ -570,10 +574,37 @@ fn concat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
                     "Array length overflow".into(),
                 ));
             }
-            for k in 0..length {
-                if has_property(&element, &key(k))? {
-                    let value = get(agent, &element, &key(k))?;
-                    array.create_data_property_or_throw(&key(n + k), value)?;
+            // Dense fast path (mirrors slice): a spreadable element that is
+            // a dense Array whose whole [0, length) range is dense-present
+            // (no holes, so no prototype-chain HasProperty consultation can
+            // matter) copies by index into the dense result. Holes or
+            // non-dense receivers keep the exact per-element path.
+            let element_obj = match element.kind() {
+                ValueKind::Object(obj)
+                    if obj.array_length_dense() == Some(length)
+                        && array.array_length_dense().is_some()
+                        && (0..length).all(|i| obj.dense_element(i).is_some()) =>
+                {
+                    Some(obj)
+                }
+                _ => None,
+            };
+            match element_obj {
+                Some(obj) => {
+                    for k in 0..length {
+                        // The range was verified dense-present.
+                        let value = obj.dense_element(k).expect("range verified dense");
+                        array.create_data_property_index(n + k, value)?;
+                    }
+                }
+                None => {
+                    dense_copy = false;
+                    for k in 0..length {
+                        if has_property(&element, &key(k))? {
+                            let value = get(agent, &element, &key(k))?;
+                            array.create_data_property_or_throw(&key(n + k), value)?;
+                        }
+                    }
                 }
             }
             n += length;
@@ -588,11 +619,14 @@ fn concat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             n += 1;
         }
     }
-    array.set(
-        &JsString::from_utf8("length"),
-        Value::Number(n as f64),
-        true,
-    )?;
+    // A fully-dense concat's defines already grew the result length to n.
+    if !dense_copy || array.array_length_dense().is_none() {
+        array.set(
+            &JsString::from_utf8("length"),
+            Value::Number(n as f64),
+            true,
+        )?;
+    }
     Ok(Value::Object(array))
 }
 

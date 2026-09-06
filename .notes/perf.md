@@ -5445,6 +5445,42 @@ fixed it). Follow-ups (measured, not done): the ~2.5-4µs fixed species
 create cost (a stock-%Array%-species verdict, the for-of-verdict
 pattern) and the concat/join handlers' same per-element + species shape.
 
+### Dense `Array.prototype.concat`: fully-dense spreads copy by index (measured + landed 2026-09-06)
+
+The slice landing's measured follow-up. concat's per-arg shape: species
+create, then per spreadable arg a @@isConcatSpreadable chain read +
+LengthOfArrayLike + per-element generic HasProperty/Get + string-key
+defines. Probe (30k calls): `a.concat(b)` on two 3-element dense arrays
+~8.7µs/call jitless, `a.concat()` ~5.8µs (species + the receiver's own
+copy + length set), ~1µs per extra element.
+
+Landing: extend the slice dense gate to concat — a spreadable arg that is
+a dense Array whose whole `[0, length)` range is dense-present (no holes,
+so no prototype-chain HasProperty consultation can matter) copies by
+index (`dense_element` + `create_data_property_index`) into the dense
+result; holes/non-dense/exotic args keep the exact per-element path. The
+`@@isConcatSpreadable` read and LengthOfArrayLike stay exact per arg. A
+fully-dense concat's sequential defines already grew the result length to
+`n`, so the trailing [[Set]] is skipped (when any arg took the generic
+path or the result is not dense it still runs).
+
+Results (30k calls, jitless): `a.concat(b)` 261 -> ~141ms (~1.85x),
+`a.concat()` 175 -> ~114ms, `a.concat(9)` 214 -> ~104ms; per-element
+drops ~1µs -> dense (~30ns), residual fixed cost is the species create +
+per-arg @@isConcatSpreadable/LengthOfArrayLike reads + dispatch. A
+15-case node-differential battery (nested/sparse/array-like/non-array
+args, @@isConcatSpreadable true/false incl. on the prototype, holes and
+deleted elements preserved, subclass species, large multi-arg) is
+byte-identical to node in jit, jitless, and `--gc-stress`. Gates: clippy
+clean; workspace tests green; test262 sweeps at baseline — language
+23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang. Note: the built-ins `copyWithin/coerced-values-*-detached`
+typed-array fixtures take ~12.5s each in isolation (at the 15s boundary)
+and flip to load-classified `hang`s under sustained batch load across
+runs — pre-existing, unrelated to these array changes; they pass
+individually and clean runs record 0 hang. Follow-up: the shared ~3-4µs
+species create (slice/concat/map/filter) is now the dominant residual.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
