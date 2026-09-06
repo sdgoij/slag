@@ -1781,3 +1781,30 @@ bitwise float files: 30 suites, 0 diverged). Compiled coverage is the
 Wave 1 leaf subset, so most corpus bodies still run interpreted on both
 sides; later waves (memory, calls, …) widen what the gate actually
 exercises.
+
+Wave 2's first slice landed: numeric loads/stores and `memory.size`
+over a module's single 32-bit memory (index 0). The compiled-entry ABI
+grew a memory data pointer + byte length pair (`fn(args, nargs, mem,
+mem_len, out, nout) -> i32`), fetched per call from the instance's
+memory cell — no store access from generated code, and safe because the
+leaf subset never grows memory mid-call (growth stays interpreted).
+`mem_ea` bounds-checks `addr + offset + width` against the length and
+traps (`TRAP_MEMORY_OOB` → `OutOfBoundsMemoryAccess`) inline, then
+loads/stores little-endian at the effective address: every numeric
+width with sign/zero extension (`i32.load8_s/u` … `i64.load32_s/u`,
+byte/half stores), float loads/stores as raw bits, and `memory.size` as
+pages. Functions touching other memory indices, memory64, or growth
+still fall back to the interpreter. The equivalence harness caught a
+real bug immediately: `mem_ea` returned `base + addr` and dropped the
+static offset, so offset loads read the wrong bytes — the corpus
+divergence (`address.wast`) localized it to the missing offset, and the
+unit test now uses offset-vs-offset-0 cross-checks that cannot hide a
+dropped offset. Unit coverage sweeps every store/load width over the
+edge value sets, OOB traps, non-zero offsets (both directions), float
+bit round-trips, and `memory.size`. `wasmtest equiv` is green over the
+memory suites (`address`, `align`, `endianness`, `float_memory`, `left-
+to-right`, `load`, `memory`, `memory_redundancy`, `memory_size`,
+`memory_trap`, `store`: 11 suites, 0 diverged). 25 compile tests, 61
+total with the feature, clippy clean in both configurations. Wave 2
+remaining: `memory.grow`, memory64/multi-memory, globals, and the
+table/`call_indirect` family.

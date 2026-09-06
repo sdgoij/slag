@@ -1073,7 +1073,17 @@ impl Store {
                 .get(defined)
                 .and_then(|entry| entry.as_ref())
         {
-            let results = crate::compile::run_compiled(func, &signature, args)?;
+            // The module's single memory (index 0), as a raw pointer/len the
+            // compiled body can bounds-check against. Nothing reallocates it
+            // during the leaf call (growth is not in the compiled subset).
+            let mem = match self.instances[instance].memories.first().copied() {
+                Some(cell) => match self.memories.get(cell) {
+                    Some(memory) => (memory.bytes.as_ptr(), memory.bytes.len() as u64),
+                    None => (std::ptr::null(), 0),
+                },
+                None => (std::ptr::null(), 0),
+            };
+            let results = crate::compile::run_compiled(func, &signature, mem, args)?;
             return Ok(RunProgress::Finished(results));
         }
         let mut locals = args.to_vec();

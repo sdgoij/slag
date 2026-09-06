@@ -20,16 +20,21 @@
 //!   `br_table`) with numeric block types of any parameter/result count
 //!   (parameters enter the body as its initial operand stack and ride a
 //!   loop's header as block parameters; a parameterized `if` needs an
-//!   explicit else branch).
-//! - memory, globals, tables, calls, refs, SIMD, and GC are not lowered yet.
+//!   explicit else branch);
+//! - numeric loads/stores and `memory.size` over a module's single 32-bit
+//!   memory (index 0), bounds-checked inline against a per-call memory
+//!   pointer/length passed in the entry ABI. Memory growth, memory64,
+//!   multi-memory, globals, tables, calls, refs, SIMD, and GC are not
+//!   lowered yet.
 //!
 //! ABI: a compiled entry is
-//! `unsafe extern "C" fn(args: *const u64, nargs: u64, out: *mut u64,
-//! nout: u64) -> i32`. Arguments and results travel as 64-bit bit patterns
-//! (a `i32` uses the low 32 bits), so the Rust trampoline and the Cranelift
-//! signature can never disagree about float argument classification. The
-//! returned `i32` is a trap code (0 = ok); results are written only when the
-//! function completes normally, so a trap never produces partial results.
+//! `unsafe extern "C" fn(args, nargs, mem, mem_len, out, nout) -> i32`.
+//! Arguments, the module memory's data pointer/byte length, and results
+//! travel as 64-bit values (an `i32` uses the low 32 bits), so the Rust
+//! trampoline and the Cranelift signature can never disagree about float
+//! argument classification. The returned `i32` is a trap code (0 = ok);
+//! results are written only when the function completes normally, so a trap
+//! never produces partial results.
 
 use std::sync::{Arc, OnceLock};
 
@@ -46,7 +51,7 @@ use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use crate::exec::ExecFail;
-use crate::instr::{Instr, NumOp};
+use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
 use crate::module::{FuncBody, Module};
 use crate::types::{BlockType, FuncType, ValType};
 use crate::values::{QNAN32, QNAN64, Trap, Value};
@@ -56,6 +61,7 @@ pub const TRAP_NONE: i32 = 0;
 pub const TRAP_UNREACHABLE: i32 = 1;
 pub const TRAP_INT_DIVIDE_BY_ZERO: i32 = 2;
 pub const TRAP_INT_OVERFLOW: i32 = 3;
+pub const TRAP_MEMORY_OOB: i32 = 4;
 
 /// Map a compiled trap code back to the interpreter's [`Trap`].
 pub fn trap_of(code: i32) -> Trap {
@@ -63,13 +69,25 @@ pub fn trap_of(code: i32) -> Trap {
         TRAP_UNREACHABLE => Trap::Unreachable,
         TRAP_INT_DIVIDE_BY_ZERO => Trap::IntegerDivideByZero,
         TRAP_INT_OVERFLOW => Trap::IntegerOverflow,
+        TRAP_MEMORY_OOB => Trap::OutOfBoundsMemoryAccess,
         _ => Trap::Unreachable,
     }
 }
 
 /// The native entry point produced by the compiler.
-pub type CompiledEntry =
-    unsafe extern "C" fn(args: *const u64, nargs: u64, out: *mut u64, nout: u64) -> i32;
+///
+/// `(args, nargs, mem, mem_len, out, nout)`: the module's single memory's
+/// data pointer and byte length (0/0 when the module has none), so compiled
+/// loads/stores can bounds-check and access memory without touching the
+/// store. Returns the trap code (0 = ok).
+pub type CompiledEntry = unsafe extern "C" fn(
+    args: *const u64,
+    nargs: u64,
+    mem: *const u8,
+    mem_len: u64,
+    out: *mut u64,
+    nout: u64,
+) -> i32;
 
 /// One compiled function body: the entry plus the executable-code
 /// allocation that must outlive every call into it.
@@ -81,14 +99,17 @@ pub struct CompiledFunc {
 impl CompiledFunc {
     /// Invoke the compiled body with `args` (bit patterns) and return the
     /// results (bit patterns) plus the trap code.
-    pub fn call(&self, args: &[u64], out: &mut [u64]) -> i32 {
+    pub fn call(&self, args: &[u64], mem: (*const u8, u64), out: &mut [u64]) -> i32 {
         // SAFETY: `entry` is a plain function pointer into `_code`, which
         // this struct keeps alive and executable for its whole lifetime; the
-        // caller passes buffers of the declared lengths.
+        // caller passes buffers of the declared lengths and a memory pointer
+        // that stays valid for the (leaf) call.
         unsafe {
             (self.entry)(
                 args.as_ptr(),
                 args.len() as u64,
+                mem.0,
+                mem.1,
                 out.as_mut_ptr(),
                 out.len() as u64,
             )
@@ -101,6 +122,7 @@ impl CompiledFunc {
 pub fn run_compiled(
     func: &CompiledFunc,
     ty: &FuncType,
+    mem: (*const u8, u64),
     args: &[Value],
 ) -> Result<Vec<Value>, ExecFail> {
     if args.len() != ty.params.len() {
@@ -118,7 +140,7 @@ pub fn run_compiled(
         input.push(bits);
     }
     let mut output = vec![0u64; ty.results.len()];
-    let code = func.call(&input, &mut output);
+    let code = func.call(&input, mem, &mut output);
     if code != TRAP_NONE {
         return Err(ExecFail::Trap(trap_of(code)));
     }
@@ -211,11 +233,13 @@ fn platform_call_conv(isa: &dyn TargetIsa) -> CallConv {
     }
 }
 
-/// `fn(args: *const u64, nargs: u64, out: *mut u64, nout: u64) -> i32`
+/// `fn(args, nargs, mem, mem_len, out, nout) -> i32` (trap code).
 fn entry_signature(conv: CallConv) -> Signature {
     let mut sig = Signature::new(conv);
     sig.params.push(AbiParam::new(types::I64)); // args pointer
     sig.params.push(AbiParam::new(types::I64)); // nargs
+    sig.params.push(AbiParam::new(types::I64)); // memory data pointer
+    sig.params.push(AbiParam::new(types::I64)); // memory byte length
     sig.params.push(AbiParam::new(types::I64)); // out pointer
     sig.params.push(AbiParam::new(types::I64)); // nout
     sig.returns.push(AbiParam::new(types::I32)); // trap code
@@ -256,6 +280,37 @@ fn block_sig(module: &Module, bt: &BlockType) -> Option<(Vec<ValType>, Vec<ValTy
     }
 }
 
+/// Whether a function body may use the module's single 32-bit memory: every
+/// memory instruction must target memory index 0, and that memory must not
+/// be memory64 (multi-memory, memory64, and growth keep the interpreter).
+fn mem0_supported(module: &Module) -> bool {
+    matches!(module.memories.first(), Some(mem) if !mem.memory64)
+}
+
+/// The byte width a load reads (little-endian, from the effective address).
+fn load_width(op: LoadOp) -> u64 {
+    use LoadOp::*;
+    match op {
+        I32 | F32 => 4,
+        I64 | F64 => 8,
+        I32Load8S | I32Load8U | I64Load8S | I64Load8U => 1,
+        I32Load16S | I32Load16U | I64Load16S | I64Load16U => 2,
+        I64Load32S | I64Load32U => 4,
+    }
+}
+
+/// The byte width a store writes (little-endian, from the effective address).
+fn store_width(op: StoreOp) -> u64 {
+    use StoreOp::*;
+    match op {
+        I32 | F32 => 4,
+        I64 | F64 => 8,
+        I32Store8 | I64Store8 => 1,
+        I32Store16 | I64Store16 => 2,
+        I64Store32 => 4,
+    }
+}
+
 /// Whether `module`'s `func_type` + `body` are inside the current lowering
 /// subset.
 fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
@@ -282,6 +337,10 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         Instr::Num(op) => supported_num(*op),
         Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_sig(module, bt).is_some(),
         Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) | Instr::BrTable { .. } => true,
+        Instr::Load { memory, .. } | Instr::Store { memory, .. } => {
+            mem0_supported(module) && *memory == 0
+        }
+        Instr::MemorySize(memory) => mem0_supported(module) && *memory == 0,
         _ => false,
     })
 }
@@ -525,6 +584,9 @@ struct Lowerer<'a> {
     /// `locals` and `stack` entry metadata mirror the interpreter's model.
     variables: Vec<Variable>,
     stack: Vec<ClifValue>,
+    /// The module memory's data pointer and byte length (entry params 2/3).
+    mem_ptr: ClifValue,
+    mem_len: ClifValue,
     out_ptr: ClifValue,
     results: Vec<ValType>,
     controls: Vec<CtlFrame>,
@@ -733,6 +795,158 @@ impl<'a> Lowerer<'a> {
             ShiftKind::RotateLeft => self.builder.ins().rotl(a, count),
             ShiftKind::RotateRight => self.builder.ins().rotr(a, count),
         })
+    }
+
+    /// The byte address of a memory access: unsigned-widen the i32 address,
+    /// add the static offset, then trap when `addr + offset + width` exceeds
+    /// the memory's length. Returns the base-plus-effective-address pointer.
+    fn mem_ea(&mut self, addr: ClifValue, offset: u64, width: u64) -> Result<ClifValue, String> {
+        let addr64 = self.builder.ins().uextend(types::I64, addr);
+        let ea = self.builder.ins().iadd_imm_s(addr64, offset as i64);
+        let end = self.builder.ins().iadd_imm_s(ea, width as i64);
+        let oob = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, end, self.mem_len);
+        self.trap_if(oob, TRAP_MEMORY_OOB);
+        Ok(self.builder.ins().iadd(self.mem_ptr, ea))
+    }
+
+    /// Lower a numeric load (little-endian) with its sign/zero extension.
+    fn do_load(&mut self, op: LoadOp, offset: u64) -> Result<(), String> {
+        use LoadOp::*;
+        let addr = self.pop().ok_or("operand stack underflow")?;
+        let address = self.mem_ea(addr, offset, load_width(op))?;
+        let flags = MemFlagsData::new();
+        let value = match op {
+            I32 => self
+                .builder
+                .ins()
+                .load(types::I32, flags, address, Offset32::new(0)),
+            I64 => self
+                .builder
+                .ins()
+                .load(types::I64, flags, address, Offset32::new(0)),
+            F32 => {
+                let bits = self
+                    .builder
+                    .ins()
+                    .load(types::I32, flags, address, Offset32::new(0));
+                self.builder.ins().bitcast(types::F32, flags, bits)
+            }
+            F64 => {
+                let bits = self
+                    .builder
+                    .ins()
+                    .load(types::I64, flags, address, Offset32::new(0));
+                self.builder.ins().bitcast(types::F64, flags, bits)
+            }
+            I32Load8S => {
+                let byte = self
+                    .builder
+                    .ins()
+                    .load(types::I8, flags, address, Offset32::new(0));
+                self.builder.ins().sextend(types::I32, byte)
+            }
+            I32Load8U => {
+                let byte = self
+                    .builder
+                    .ins()
+                    .load(types::I8, flags, address, Offset32::new(0));
+                self.builder.ins().uextend(types::I32, byte)
+            }
+            I64Load8S => {
+                let byte = self
+                    .builder
+                    .ins()
+                    .load(types::I8, flags, address, Offset32::new(0));
+                self.builder.ins().sextend(types::I64, byte)
+            }
+            I64Load8U => {
+                let byte = self
+                    .builder
+                    .ins()
+                    .load(types::I8, flags, address, Offset32::new(0));
+                self.builder.ins().uextend(types::I64, byte)
+            }
+            I32Load16S => {
+                let half = self
+                    .builder
+                    .ins()
+                    .load(types::I16, flags, address, Offset32::new(0));
+                self.builder.ins().sextend(types::I32, half)
+            }
+            I32Load16U => {
+                let half = self
+                    .builder
+                    .ins()
+                    .load(types::I16, flags, address, Offset32::new(0));
+                self.builder.ins().uextend(types::I32, half)
+            }
+            I64Load16S => {
+                let half = self
+                    .builder
+                    .ins()
+                    .load(types::I16, flags, address, Offset32::new(0));
+                self.builder.ins().sextend(types::I64, half)
+            }
+            I64Load16U => {
+                let half = self
+                    .builder
+                    .ins()
+                    .load(types::I16, flags, address, Offset32::new(0));
+                self.builder.ins().uextend(types::I64, half)
+            }
+            I64Load32S => {
+                let word = self
+                    .builder
+                    .ins()
+                    .load(types::I32, flags, address, Offset32::new(0));
+                self.builder.ins().sextend(types::I64, word)
+            }
+            I64Load32U => {
+                let word = self
+                    .builder
+                    .ins()
+                    .load(types::I32, flags, address, Offset32::new(0));
+                self.builder.ins().uextend(types::I64, word)
+            }
+        };
+        self.stack.push(value);
+        Ok(())
+    }
+
+    /// Lower a numeric store (little-endian), truncating to the store width.
+    fn do_store(&mut self, op: StoreOp, offset: u64) -> Result<(), String> {
+        use StoreOp::*;
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let addr = self.pop().ok_or("operand stack underflow")?;
+        let address = self.mem_ea(addr, offset, store_width(op))?;
+        let flags = MemFlagsData::new();
+        let stored = match op {
+            I32 => value,
+            I64 => value,
+            F32 => self.builder.ins().bitcast(types::I32, flags, value),
+            F64 => self.builder.ins().bitcast(types::I64, flags, value),
+            I32Store8 => self.builder.ins().ireduce(types::I8, value),
+            I32Store16 => self.builder.ins().ireduce(types::I16, value),
+            I64Store8 => self.builder.ins().ireduce(types::I8, value),
+            I64Store16 => self.builder.ins().ireduce(types::I16, value),
+            I64Store32 => self.builder.ins().ireduce(types::I32, value),
+        };
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), stored, address, Offset32::new(0));
+        Ok(())
+    }
+
+    /// `memory.size`: current size in pages as an i32 (32-bit memory).
+    fn do_memory_size(&mut self) -> Result<(), String> {
+        let sixteen = self.iconst(types::I64, 16);
+        let pages = self.builder.ins().ushr(self.mem_len, sixteen);
+        let pages32 = self.builder.ins().ireduce(types::I32, pages);
+        self.stack.push(pages32);
+        Ok(())
     }
 
     /// A float constant from its IEEE bits.
@@ -1318,6 +1532,28 @@ impl<'a> Lowerer<'a> {
                 self.stack.push(value);
             }
             Instr::Num(op) => self.lower_num(*op)?,
+            Instr::Load {
+                memory, op, offset, ..
+            } => {
+                if *memory != 0 {
+                    return Err("unsupported memory index".to_string());
+                }
+                self.do_load(*op, *offset)?;
+            }
+            Instr::Store {
+                memory, op, offset, ..
+            } => {
+                if *memory != 0 {
+                    return Err("unsupported memory index".to_string());
+                }
+                self.do_store(*op, *offset)?;
+            }
+            Instr::MemorySize(memory) => {
+                if *memory != 0 {
+                    return Err("unsupported memory index".to_string());
+                }
+                self.do_memory_size()?;
+            }
             Instr::Block(bt) => {
                 let (params, results) =
                     block_sig(self.module, bt).ok_or("unsupported block type")?;
@@ -1380,7 +1616,7 @@ fn lower(
     builder.append_block_params_for_function_params(entry_block);
     builder.switch_to_block(entry_block);
     let params = builder.block_params(entry_block).to_vec();
-    let (args_ptr, out_ptr) = (params[0], params[2]);
+    let (args_ptr, mem_ptr, mem_len, out_ptr) = (params[0], params[2], params[3], params[4]);
 
     // Locals: params come from the args buffer; declared locals default 0.
     let mut value_types: Vec<ValType> = func_type.params.clone();
@@ -1424,6 +1660,8 @@ fn lower(
         module,
         variables,
         stack: Vec::new(),
+        mem_ptr,
+        mem_len,
         out_ptr,
         results: func_type.results.clone(),
         controls: Vec::new(),
@@ -1469,8 +1707,9 @@ impl ExecutableCode {
 mod tests {
     use super::*;
     use crate::exec::Store;
+    use crate::instr::StoreOp;
     use crate::module::{FuncBody, Module};
-    use crate::types::{BlockType, SubType};
+    use crate::types::{BlockType, Limits, MemType, SubType};
 
     fn int_module(body: Vec<Instr>, params: Vec<ValType>, results: Vec<ValType>) -> Module {
         Module {
@@ -2192,6 +2431,27 @@ mod tests {
         }
     }
 
+    /// A single-function module with one 1-page 32-bit memory (index 0).
+    fn mem_module(body: Vec<Instr>, params: Vec<ValType>, results: Vec<ValType>) -> Module {
+        Module {
+            types: vec![SubType::func(params.clone(), results.clone())],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body,
+            }],
+            memories: vec![MemType {
+                limits: Limits {
+                    min: 1,
+                    max: None,
+                    shared: false,
+                },
+                memory64: false,
+            }],
+            ..Module::default()
+        }
+    }
+
     #[test]
     fn block_with_a_value_matches_the_interpreter() {
         // (block (result i32) (i32.const 40) (i32.const 2) i32.add)
@@ -2694,5 +2954,265 @@ mod tests {
             &i32_to_i32,
         );
         assert_equiv(&loop_carry, 0, &[vec![]]);
+    }
+
+    #[test]
+    fn memory_ops_match_the_interpreter() {
+        use crate::instr::LoadOp::*;
+        // i32.store then i32.load at the same address (in-bounds and OOB).
+        let store_load = mem_module(
+            vec![
+                Instr::LocalGet(0),
+                Instr::LocalGet(1),
+                Instr::Store {
+                    memory: 0,
+                    op: StoreOp::I32,
+                    align: 2,
+                    offset: 0,
+                },
+                Instr::LocalGet(0),
+                Instr::Load {
+                    memory: 0,
+                    op: I32,
+                    align: 2,
+                    offset: 0,
+                },
+            ],
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        );
+        let store_load_cases = [
+            (0i32, 42i32),
+            (100, -7),
+            (65528, i32::MAX),
+            (4, i32::MIN),
+            // OOB stores/loads trap identically on both paths.
+            (65533, 1),
+            (0x4000_0000, 5),
+        ]
+        .into_iter()
+        .map(|(addr, value)| vec![Value::I32(addr), Value::I32(value)])
+        .collect::<Vec<_>>();
+        assert_equiv(&store_load, 0, &store_load_cases);
+
+        // Byte/half stores with sign- and zero-extending loads.
+        for (store_op, load_op, values) in [
+            (
+                StoreOp::I32Store8,
+                I32Load8S,
+                vec![-1i32, 0, 1, 0x7f, 0x80, 0xff, -0x1234],
+            ),
+            (
+                StoreOp::I32Store8,
+                I32Load8U,
+                vec![-1i32, 0, 1, 0x7f, 0x80, 0xff, 255],
+            ),
+            (
+                StoreOp::I32Store16,
+                I32Load16S,
+                vec![-1i32, 0, 1, 0x7fff, 0x8000, 0xffff, -0x1234],
+            ),
+            (
+                StoreOp::I32Store16,
+                I32Load16U,
+                vec![-1i32, 0, 1, 0x7fff, 0x8000, 0xffff, 0x12345],
+            ),
+        ] {
+            let module = mem_module(
+                vec![
+                    Instr::I32Const(0),
+                    Instr::LocalGet(0),
+                    Instr::Store {
+                        memory: 0,
+                        op: store_op,
+                        align: 0,
+                        offset: 0,
+                    },
+                    Instr::I32Const(0),
+                    Instr::Load {
+                        memory: 0,
+                        op: load_op,
+                        align: 0,
+                        offset: 0,
+                    },
+                ],
+                vec![ValType::I32],
+                vec![ValType::I32],
+            );
+            let cases = values
+                .into_iter()
+                .map(|value| vec![Value::I32(value)])
+                .collect::<Vec<_>>();
+            assert_equiv(&module, 0, &cases);
+        }
+
+        // 64-bit stores with sign/zero-extending loads.
+        for (store_op, load_op, values) in [
+            (
+                StoreOp::I64,
+                I64,
+                vec![0i64, 1, -1, 0x0123_4567_89ab_cdef, i64::MAX, i64::MIN],
+            ),
+            (StoreOp::I64Store8, I64Load8U, vec![-1i64, 0, 255, 0x1ff]),
+            (
+                StoreOp::I64Store16,
+                I64Load16U,
+                vec![-1i64, 0, 0xffff, 0x1_ffff],
+            ),
+            (
+                StoreOp::I64Store32,
+                I64Load32S,
+                vec![-1i64, 0, 0x7fff_ffff, 0x8000_0000, 0x1_0000_0000],
+            ),
+        ] {
+            let module = mem_module(
+                vec![
+                    Instr::I32Const(0),
+                    Instr::LocalGet(0),
+                    Instr::Store {
+                        memory: 0,
+                        op: store_op,
+                        align: 0,
+                        offset: 0,
+                    },
+                    Instr::I32Const(0),
+                    Instr::Load {
+                        memory: 0,
+                        op: load_op,
+                        align: 0,
+                        offset: 0,
+                    },
+                ],
+                vec![ValType::I64],
+                vec![ValType::I64],
+            );
+            let cases = values
+                .into_iter()
+                .map(|value| vec![Value::I64(value)])
+                .collect::<Vec<_>>();
+            assert_equiv(&module, 0, &cases);
+        }
+
+        // Float stores/loads round-trip the raw bit patterns.
+        let f32_module = mem_module(
+            vec![
+                Instr::I32Const(8),
+                Instr::LocalGet(0),
+                Instr::Store {
+                    memory: 0,
+                    op: StoreOp::F32,
+                    align: 2,
+                    offset: 0,
+                },
+                Instr::I32Const(8),
+                Instr::Load {
+                    memory: 0,
+                    op: F32,
+                    align: 2,
+                    offset: 0,
+                },
+            ],
+            vec![ValType::F32],
+            vec![ValType::F32],
+        );
+        assert_equiv(&f32_module, 0, &f32_unary());
+        let f64_module = mem_module(
+            vec![
+                Instr::I32Const(8),
+                Instr::LocalGet(0),
+                Instr::Store {
+                    memory: 0,
+                    op: StoreOp::F64,
+                    align: 3,
+                    offset: 0,
+                },
+                Instr::I32Const(8),
+                Instr::Load {
+                    memory: 0,
+                    op: F64,
+                    align: 3,
+                    offset: 0,
+                },
+            ],
+            vec![ValType::F64],
+            vec![ValType::F64],
+        );
+        assert_equiv(&f64_module, 0, &f64_unary());
+
+        // A store with a non-zero offset must land at address + offset, not
+        // address: store at (addr, offset 100), then load at addr + 100 with
+        // offset 0 — a store that dropped its offset would read 0 here.
+        let offset_store = mem_module(
+            vec![
+                Instr::LocalGet(0),
+                Instr::LocalGet(1),
+                Instr::Store {
+                    memory: 0,
+                    op: StoreOp::I32,
+                    align: 0,
+                    offset: 100,
+                },
+                Instr::LocalGet(0),
+                Instr::I32Const(100),
+                Instr::Num(NumOp::I32Add),
+                Instr::Load {
+                    memory: 0,
+                    op: I32,
+                    align: 2,
+                    offset: 0,
+                },
+            ],
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        );
+        let offset_cases = [
+            (0i32, 0x1111_2222i32),
+            (100, -1),
+            (2048, 7),
+            // OOB through the offseted effective address.
+            (0x10000, 3),
+        ]
+        .into_iter()
+        .map(|(addr, value)| vec![Value::I32(addr), Value::I32(value)])
+        .collect::<Vec<_>>();
+        assert_equiv(&offset_store, 0, &offset_cases);
+
+        // A load with a non-zero offset must read address + offset: two
+        // stores at offset 0 and offset 100, then the offset-100 load must
+        // see the second (and the offset-0 slot keeps the first).
+        let offset_load = mem_module(
+            vec![
+                Instr::I32Const(8),
+                Instr::I32Const(0x1111),
+                Instr::Store {
+                    memory: 0,
+                    op: StoreOp::I32,
+                    align: 0,
+                    offset: 0,
+                },
+                Instr::I32Const(8),
+                Instr::I32Const(0x2222),
+                Instr::Store {
+                    memory: 0,
+                    op: StoreOp::I32,
+                    align: 0,
+                    offset: 100,
+                },
+                Instr::I32Const(8),
+                Instr::Load {
+                    memory: 0,
+                    op: I32,
+                    align: 0,
+                    offset: 100,
+                },
+            ],
+            vec![],
+            vec![ValType::I32],
+        );
+        assert_equiv(&offset_load, 0, &[vec![]]);
+
+        // memory.size reports the 1-page memory on both paths.
+        let size_module = mem_module(vec![Instr::MemorySize(0)], vec![], vec![ValType::I32]);
+        assert_equiv(&size_module, 0, &[vec![]]);
     }
 }
