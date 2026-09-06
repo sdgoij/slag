@@ -7,12 +7,17 @@
 //!
 //! Supported subset (everything else bails to the interpreter, per
 //! function):
-//! - function signatures and locals over `i32`/`i64` only;
-//! - straight-line bodies: `const`, `local.get/set/tee`, `drop`, `select`,
-//!   integer `Num` ops (no floats, no conversions beyond `i64.wrap_i32`),
-//!   `nop`, `unreachable`, and `return`;
-//! - structured control flow (`block`/`loop`/`if`/`br*`), memory, globals,
-//!   tables, calls, refs, SIMD, and GC are not lowered yet.
+//! - function signatures and locals over `i32`/`i64`/`f32`/`f64`;
+//! - `const`, `local.get/set/tee`, `drop`, `select`, numeric `Num` ops
+//!   (integer arithmetic/comparisons, the float ops below, and
+//!   `i64.wrap_i32`), `nop`, `unreachable`, and `return`;
+//! - float arithmetic/rounding/sqrt/comparisons reproduce the
+//!   interpreter's canonical-quiet-NaN policy exactly (`abs`/`neg`/
+//!   `copysign` stay raw bit ops); `f32.min/max` and the
+//!   promote/demote conversions are deferred;
+//! - structured control flow (`block`/`loop`/`if`/`else`/`br`/`br_if`)
+//!   with empty or single-result block types (float or integer).
+//! - memory, globals, tables, calls, refs, SIMD, and GC are not lowered yet.
 //!
 //! ABI: a compiled entry is
 //! `unsafe extern "C" fn(args: *const u64, nargs: u64, out: *mut u64,
@@ -25,8 +30,8 @@
 use std::sync::Arc;
 
 use cranelift_codegen::Context;
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::immediates::Offset32;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::immediates::{Ieee32, Ieee64, Offset32};
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, Function, InstBuilder, MemFlagsData, Signature, Type, UserFuncName,
     Value as ClifValue, types,
@@ -40,7 +45,7 @@ use crate::exec::ExecFail;
 use crate::instr::{Instr, NumOp};
 use crate::module::{FuncBody, Module};
 use crate::types::{BlockType, FuncType, ValType};
-use crate::values::{Trap, Value};
+use crate::values::{QNAN32, QNAN64, Trap, Value};
 
 /// Trap code returned by a compiled entry; 0 means success.
 pub const TRAP_NONE: i32 = 0;
@@ -102,6 +107,8 @@ pub fn run_compiled(
         let bits = match (param, value) {
             (ValType::I32, Value::I32(bits)) => *bits as u32 as u64,
             (ValType::I64, Value::I64(bits)) => *bits as u64,
+            (ValType::F32, Value::F32(bits)) => u64::from(*bits),
+            (ValType::F64, Value::F64(bits)) => *bits,
             _ => return Err(ExecFail::Unsupported("compiled function argument type")),
         };
         input.push(bits);
@@ -116,6 +123,8 @@ pub fn run_compiled(
         let value = match result {
             ValType::I32 => Value::I32(bits as u32 as i32),
             ValType::I64 => Value::I64(bits as i64),
+            ValType::F32 => Value::F32(bits as u32),
+            ValType::F64 => Value::F64(bits),
             _ => return Err(ExecFail::Unsupported("compiled function result type")),
         };
         results.push(value);
@@ -202,6 +211,8 @@ fn clif_type(ty: ValType) -> Option<Type> {
     match ty {
         ValType::I32 => Some(types::I32),
         ValType::I64 => Some(types::I64),
+        ValType::F32 => Some(types::F32),
+        ValType::F64 => Some(types::F64),
         _ => None,
     }
 }
@@ -230,6 +241,8 @@ fn lowerable(func_type: &FuncType, body: &FuncBody) -> bool {
         | Instr::Unreachable
         | Instr::I32Const(_)
         | Instr::I64Const(_)
+        | Instr::F32Const(_)
+        | Instr::F64Const(_)
         | Instr::LocalGet(_)
         | Instr::LocalSet(_)
         | Instr::LocalTee(_)
@@ -307,6 +320,113 @@ fn supported_num(op: NumOp) -> bool {
             | I64GeU
             // Conversions.
             | I32WrapI64
+            // f32 arithmetic (the lowering canonicalizes NaN results;
+            // min/max and demote are deferred).
+            | F32Abs
+            | F32Neg
+            | F32Ceil
+            | F32Floor
+            | F32Trunc
+            | F32Nearest
+            | F32Sqrt
+            | F32Add
+            | F32Sub
+            | F32Mul
+            | F32Div
+            | F32Copysign
+            | F32Eq
+            | F32Ne
+            | F32Lt
+            | F32Gt
+            | F32Le
+            | F32Ge
+            | F32ConvertI32S
+            | F32ConvertI32U
+            | F32ConvertI64S
+            | F32ConvertI64U
+            // f64 arithmetic.
+            | F64Abs
+            | F64Neg
+            | F64Ceil
+            | F64Floor
+            | F64Trunc
+            | F64Nearest
+            | F64Sqrt
+            | F64Add
+            | F64Sub
+            | F64Mul
+            | F64Div
+            | F64Copysign
+            | F64Eq
+            | F64Ne
+            | F64Lt
+            | F64Gt
+            | F64Le
+            | F64Ge
+            | F64ConvertI32S
+            | F64ConvertI32U
+            | F64ConvertI64S
+            | F64ConvertI64U
+    )
+}
+
+/// Whether `op` is one of the lowered f32 ops (see `lower_float`).
+fn is_f32_op(op: NumOp) -> bool {
+    use NumOp::*;
+    matches!(
+        op,
+        F32Abs
+            | F32Neg
+            | F32Ceil
+            | F32Floor
+            | F32Trunc
+            | F32Nearest
+            | F32Sqrt
+            | F32Add
+            | F32Sub
+            | F32Mul
+            | F32Div
+            | F32Copysign
+            | F32Eq
+            | F32Ne
+            | F32Lt
+            | F32Gt
+            | F32Le
+            | F32Ge
+            | F32ConvertI32S
+            | F32ConvertI32U
+            | F32ConvertI64S
+            | F32ConvertI64U
+    )
+}
+
+/// Whether `op` is one of the lowered f64 ops (see `lower_float`).
+fn is_f64_op(op: NumOp) -> bool {
+    use NumOp::*;
+    matches!(
+        op,
+        F64Abs
+            | F64Neg
+            | F64Ceil
+            | F64Floor
+            | F64Trunc
+            | F64Nearest
+            | F64Sqrt
+            | F64Add
+            | F64Sub
+            | F64Mul
+            | F64Div
+            | F64Copysign
+            | F64Eq
+            | F64Ne
+            | F64Lt
+            | F64Gt
+            | F64Le
+            | F64Ge
+            | F64ConvertI32S
+            | F64ConvertI32U
+            | F64ConvertI64S
+            | F64ConvertI64U
     )
 }
 
@@ -404,6 +524,17 @@ impl<'a> Lowerer<'a> {
                 .iadd_imm_s(self.out_ptr, 8 * index as i64);
             let wide = match ty {
                 ValType::I32 => self.builder.ins().uextend(types::I64, *value),
+                ValType::F32 => {
+                    let bits = self
+                        .builder
+                        .ins()
+                        .bitcast(types::I32, MemFlagsData::new(), *value);
+                    self.builder.ins().uextend(types::I64, bits)
+                }
+                ValType::F64 => self
+                    .builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), *value),
                 _ => *value,
             };
             self.builder
@@ -423,6 +554,14 @@ impl<'a> Lowerer<'a> {
 
     fn lower_num(&mut self, op: NumOp) -> Result<(), String> {
         use NumOp::*;
+        // Float ops take their own path (they produce typed float values and
+        // canonicalize NaN results per the interpreter's policy).
+        if is_f32_op(op) {
+            return self.lower_float(op, types::F32);
+        }
+        if is_f64_op(op) {
+            return self.lower_float(op, types::F64);
+        }
         // Fetch operands: binary ops and comparisons pop two, unary pop one.
         let binary = matches!(
             op,
@@ -547,6 +686,107 @@ impl<'a> Lowerer<'a> {
             ShiftKind::RotateLeft => self.builder.ins().rotl(a, count),
             ShiftKind::RotateRight => self.builder.ins().rotr(a, count),
         })
+    }
+
+    /// A float constant from its IEEE bits.
+    fn fconst(&mut self, ty: Type, bits: u64) -> ClifValue {
+        match ty {
+            types::F32 => self.builder.ins().f32const(Ieee32::with_bits(bits as u32)),
+            types::F64 => self.builder.ins().f64const(Ieee64::with_bits(bits)),
+            _ => unreachable!("float constant of a non-float type"),
+        }
+    }
+
+    /// Canonicalize any NaN to the engine's quiet NaN (the interpreter's
+    /// `values.rs` policy: every arithmetic NaN result becomes QNAN32/64).
+    fn canon_float(&mut self, value: ClifValue, ty: Type) -> ClifValue {
+        let is_nan = self.builder.ins().fcmp(FloatCC::NotEqual, value, value);
+        let q = match ty {
+            types::F32 => self.fconst(types::F32, u64::from(QNAN32)),
+            _ => self.fconst(types::F64, QNAN64),
+        };
+        self.builder.ins().select(is_nan, q, value)
+    }
+
+    fn fcmp_result(&mut self, cc: FloatCC, a: ClifValue, b: ClifValue) -> ClifValue {
+        let flag = self.builder.ins().fcmp(cc, a, b);
+        let one = self.iconst(types::I32, 1);
+        let zero = self.iconst(types::I32, 0);
+        self.builder.ins().select(flag, one, zero)
+    }
+
+    /// Lower one of the f32/f64 ops (see `is_f32_op`/`is_f64_op`). NaN
+    /// arithmetic is canonicalized, abs/neg/copysign are raw bit ops, and
+    /// comparisons yield i32 — mirroring `values.rs` exactly.
+    fn lower_float(&mut self, op: NumOp, ty: Type) -> Result<(), String> {
+        use NumOp::*;
+        let binary = matches!(
+            op,
+            F32Add
+                | F64Add
+                | F32Sub
+                | F64Sub
+                | F32Mul
+                | F64Mul
+                | F32Div
+                | F64Div
+                | F32Copysign
+                | F64Copysign
+                | F32Eq
+                | F64Eq
+                | F32Ne
+                | F64Ne
+                | F32Lt
+                | F64Lt
+                | F32Gt
+                | F64Gt
+                | F32Le
+                | F64Le
+                | F32Ge
+                | F64Ge
+        );
+        let (a, b) = if binary {
+            let b = self.pop().ok_or("operand stack underflow")?;
+            let a = self.pop().ok_or("operand stack underflow")?;
+            (a, b)
+        } else {
+            let a = self.pop().ok_or("operand stack underflow")?;
+            (a, a)
+        };
+        let canon_raw = match op {
+            F32Add | F64Add => Some(self.builder.ins().fadd(a, b)),
+            F32Sub | F64Sub => Some(self.builder.ins().fsub(a, b)),
+            F32Mul | F64Mul => Some(self.builder.ins().fmul(a, b)),
+            F32Div | F64Div => Some(self.builder.ins().fdiv(a, b)),
+            F32Ceil | F64Ceil => Some(self.builder.ins().ceil(a)),
+            F32Floor | F64Floor => Some(self.builder.ins().floor(a)),
+            F32Trunc | F64Trunc => Some(self.builder.ins().trunc(a)),
+            F32Nearest | F64Nearest => Some(self.builder.ins().nearest(a)),
+            F32Sqrt | F64Sqrt => Some(self.builder.ins().sqrt(a)),
+            _ => None,
+        };
+        let result = if let Some(raw) = canon_raw {
+            self.canon_float(raw, ty)
+        } else {
+            match op {
+                F32Abs | F64Abs => self.builder.ins().fabs(a),
+                F32Neg | F64Neg => self.builder.ins().fneg(a),
+                F32Copysign | F64Copysign => self.builder.ins().fcopysign(a, b),
+                F32Eq | F64Eq => self.fcmp_result(FloatCC::Equal, a, b),
+                F32Ne | F64Ne => self.fcmp_result(FloatCC::NotEqual, a, b),
+                F32Lt | F64Lt => self.fcmp_result(FloatCC::LessThan, a, b),
+                F32Gt | F64Gt => self.fcmp_result(FloatCC::GreaterThan, a, b),
+                F32Le | F64Le => self.fcmp_result(FloatCC::LessThanOrEqual, a, b),
+                F32Ge | F64Ge => self.fcmp_result(FloatCC::GreaterThanOrEqual, a, b),
+                F32ConvertI32S | F64ConvertI32S => self.builder.ins().fcvt_from_sint(ty, a),
+                F32ConvertI32U | F64ConvertI32U => self.builder.ins().fcvt_from_uint(ty, a),
+                F32ConvertI64S | F64ConvertI64S => self.builder.ins().fcvt_from_sint(ty, a),
+                F32ConvertI64U | F64ConvertI64U => self.builder.ins().fcvt_from_uint(ty, a),
+                _ => return Err("unsupported float opcode".to_string()),
+            }
+        };
+        self.stack.push(result);
+        Ok(())
     }
 
     fn bin_bool(&mut self, cc: IntCC, a: ClifValue, b: ClifValue) -> ClifValue {
@@ -941,6 +1181,14 @@ impl<'a> Lowerer<'a> {
                 let v = self.iconst(types::I64, *value);
                 self.stack.push(v);
             }
+            Instr::F32Const(bits) => {
+                let v = self.fconst(types::F32, u64::from(*bits));
+                self.stack.push(v);
+            }
+            Instr::F64Const(bits) => {
+                let v = self.fconst(types::F64, *bits);
+                self.stack.push(v);
+            }
             Instr::LocalGet(index) => {
                 let variable = self.variables[*index as usize];
                 let value = self.builder.use_var(variable);
@@ -1036,7 +1284,8 @@ fn lower(
     for (index, ty) in value_types.iter().enumerate() {
         let variable = builder.declare_var(clif_type(*ty).expect("checked by lowerable"));
         let value = if index < func_type.params.len() {
-            // Load the i-th param (an I64 slot) and narrow i32 params.
+            // Load the i-th param (an I64 slot) and narrow/narrow-convert it
+            // to the parameter's value type.
             let address = builder.ins().iadd_imm_s(args_ptr, 8 * index as i64);
             let wide =
                 builder
@@ -1044,12 +1293,21 @@ fn lower(
                     .load(types::I64, MemFlagsData::new(), address, Offset32::new(0));
             match ty {
                 ValType::I32 => builder.ins().ireduce(types::I32, wide),
-                _ => wide,
+                ValType::I64 => wide,
+                ValType::F32 => {
+                    let bits = builder.ins().ireduce(types::I32, wide);
+                    builder.ins().bitcast(types::F32, MemFlagsData::new(), bits)
+                }
+                ValType::F64 => builder.ins().bitcast(types::F64, MemFlagsData::new(), wide),
+                _ => return Err("unsupported parameter type".to_string()),
             }
         } else {
             match ty {
                 ValType::I32 => builder.ins().iconst(types::I32, 0),
-                _ => builder.ins().iconst(types::I64, 0),
+                ValType::I64 => builder.ins().iconst(types::I64, 0),
+                ValType::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
+                ValType::F64 => builder.ins().f64const(Ieee64::with_bits(0)),
+                _ => return Err("unsupported local type".to_string()),
             }
         };
         builder.def_var(variable, value);
@@ -1141,6 +1399,14 @@ mod tests {
     /// interpreter forced) over every `cases` argument list and assert the
     /// outcomes agree exactly (values and trap kinds).
     fn assert_equiv(module: &Module, index: usize, cases: &[Vec<Value>]) {
+        // Gate the harness: `Engine::compile` falls back to the interpreter
+        // silently on any lowering error, so without this the comparison is
+        // vacuous (interpreter vs interpreter) for a body that did not
+        // compile.
+        assert!(
+            compile_module(module).iter().all(|entry| entry.is_some()),
+            "assert_equiv module did not compile; the comparison is vacuous"
+        );
         let mut compiled = Store::new();
         let compiled_instance = compiled
             .instantiate(module, &mut |_, _| None)
@@ -1196,6 +1462,91 @@ mod tests {
             }
         }
         cases
+    }
+
+    /// f32 bit patterns exercising the canonicalization policy: signed
+    /// zeros, subnormals, normals, infinities, and quiet/signaling NaNs of
+    /// both signs plus non-canonical payloads.
+    fn f32_bits() -> [u32; 20] {
+        [
+            0x0000_0000, // +0
+            0x8000_0000, // -0
+            0x0000_0001, // min subnormal
+            0x007f_ffff, // max subnormal
+            0x0080_0000, // min normal
+            0x3e00_0000, // 0.125
+            0x3f00_0000, // 0.5
+            0x3f80_0000, // 1.0
+            0x3f80_0001, // 1.0 + 1 ulp
+            0x4000_0000, // 2.0
+            0x4120_0000, // 10.0
+            0x7f7f_ffff, // max finite
+            0x7f80_0000, // +inf
+            0xff80_0000, // -inf
+            0x7fc0_0000, // +canonical quiet NaN
+            0xffc0_0000, // -canonical quiet NaN
+            0x7fa0_0000, // +signaling NaN
+            0xffa0_0000, // -signaling NaN
+            0x7fc1_2345, // +NaN payload
+            0xffc1_2345, // -NaN payload
+        ]
+    }
+
+    fn f64_bits() -> [u64; 18] {
+        [
+            0x0000_0000_0000_0000, // +0
+            0x8000_0000_0000_0000, // -0
+            0x0000_0000_0000_0001, // min subnormal
+            0x000f_ffff_ffff_ffff, // max subnormal
+            0x0010_0000_0000_0000, // min normal
+            0x3fe0_0000_0000_0000, // 0.5
+            0x3ff0_0000_0000_0000, // 1.0
+            0x3ff0_0000_0000_0001, // 1.0 + 1 ulp
+            0x4000_0000_0000_0000, // 2.0
+            0x4024_0000_0000_0000, // 10.0
+            0x7fef_ffff_ffff_ffff, // max finite
+            0x7ff0_0000_0000_0000, // +inf
+            0xfff0_0000_0000_0000, // -inf
+            0x7ff8_0000_0000_0000, // +canonical quiet NaN
+            0xfff8_0000_0000_0000, // -canonical quiet NaN
+            0x7ff4_0000_0000_0000, // +signaling NaN
+            0xfff4_0000_0000_0000, // -signaling NaN
+            0x7ff8_1234_5678_9abc, // +NaN payload
+        ]
+    }
+
+    fn f32_pairs() -> Vec<Vec<Value>> {
+        let mut cases = Vec::new();
+        for a in f32_bits() {
+            for b in f32_bits() {
+                cases.push(vec![Value::F32(a), Value::F32(b)]);
+            }
+        }
+        cases
+    }
+
+    fn f64_pairs() -> Vec<Vec<Value>> {
+        let mut cases = Vec::new();
+        for a in f64_bits() {
+            for b in f64_bits() {
+                cases.push(vec![Value::F64(a), Value::F64(b)]);
+            }
+        }
+        cases
+    }
+
+    fn f32_unary() -> Vec<Vec<Value>> {
+        f32_bits()
+            .into_iter()
+            .map(|a| vec![Value::F32(a)])
+            .collect()
+    }
+
+    fn f64_unary() -> Vec<Vec<Value>> {
+        f64_bits()
+            .into_iter()
+            .map(|a| vec![Value::F64(a)])
+            .collect()
     }
 
     #[test]
@@ -1368,8 +1719,17 @@ mod tests {
         let cases = i64_pairs();
         for op in [
             I64Add, I64Sub, I64Mul, I64DivS, I64DivU, I64RemS, I64RemU, I64And, I64Or, I64Xor,
-            I64Shl, I64ShrS, I64ShrU, I64Rotl, I64Rotr, I64Eq, I64Ne, I64LtS, I64LtU, I64GtS,
-            I64GtU, I64LeS, I64LeU, I64GeS, I64GeU,
+            I64Shl, I64ShrS, I64ShrU, I64Rotl, I64Rotr,
+        ] {
+            let module = int_module(
+                vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Num(op)],
+                vec![ValType::I64, ValType::I64],
+                vec![ValType::I64],
+            );
+            assert_equiv(&module, 0, &cases);
+        }
+        for op in [
+            I64Eq, I64Ne, I64LtS, I64LtU, I64GtS, I64GtU, I64LeS, I64LeU, I64GeS, I64GeU,
         ] {
             let module = int_module(
                 vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Num(op)],
@@ -1395,16 +1755,17 @@ mod tests {
             );
             assert_equiv(&module, 0, &values);
         }
-        // i64.popcnt and i64.eqz over the wide values.
+        // i64.popcnt and i64.eqz over the wide values (popcnt stays i64;
+        // eqz narrows to i32).
         let wide = i64_pairs()
             .into_iter()
             .map(|pair| vec![pair[0]])
             .collect::<Vec<_>>();
-        for op in [I64Popcnt, I64Eqz] {
+        for (op, result) in [(I64Popcnt, ValType::I64), (I64Eqz, ValType::I32)] {
             let module = int_module(
                 vec![Instr::LocalGet(0), Instr::Num(op)],
                 vec![ValType::I64],
-                vec![ValType::I32],
+                vec![result],
             );
             assert_equiv(&module, 0, &wide);
         }
@@ -1441,6 +1802,7 @@ mod tests {
                     Instr::LocalGet(3),
                     Instr::LocalGet(2),
                     Instr::LocalGet(0),
+                    Instr::I32Const(0),
                     Instr::Num(NumOp::I32GtS),
                     Instr::Select,
                 ],
@@ -1454,6 +1816,235 @@ mod tests {
             vec![Value::I32(0), Value::I32(9), Value::I32(-5)],
         ];
         assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn f32_binary_ops_match_the_interpreter() {
+        use NumOp::*;
+        let cases = f32_pairs();
+        for (op, result) in [
+            (F32Add, ValType::F32),
+            (F32Sub, ValType::F32),
+            (F32Mul, ValType::F32),
+            (F32Div, ValType::F32),
+            (F32Copysign, ValType::F32),
+            (F32Eq, ValType::I32),
+            (F32Ne, ValType::I32),
+            (F32Lt, ValType::I32),
+            (F32Gt, ValType::I32),
+            (F32Le, ValType::I32),
+            (F32Ge, ValType::I32),
+        ] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Num(op)],
+                vec![ValType::F32, ValType::F32],
+                vec![],
+                vec![result],
+            );
+            assert_equiv(&module, 0, &cases);
+        }
+    }
+
+    #[test]
+    fn f64_binary_ops_match_the_interpreter() {
+        use NumOp::*;
+        let cases = f64_pairs();
+        for (op, result) in [
+            (F64Add, ValType::F64),
+            (F64Sub, ValType::F64),
+            (F64Mul, ValType::F64),
+            (F64Div, ValType::F64),
+            (F64Copysign, ValType::F64),
+            (F64Eq, ValType::I32),
+            (F64Ne, ValType::I32),
+            (F64Lt, ValType::I32),
+            (F64Gt, ValType::I32),
+            (F64Le, ValType::I32),
+            (F64Ge, ValType::I32),
+        ] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Num(op)],
+                vec![ValType::F64, ValType::F64],
+                vec![],
+                vec![result],
+            );
+            assert_equiv(&module, 0, &cases);
+        }
+    }
+
+    #[test]
+    fn f32_unary_ops_match_the_interpreter() {
+        use NumOp::*;
+        let values = f32_unary();
+        for op in [
+            F32Abs, F32Neg, F32Ceil, F32Floor, F32Trunc, F32Nearest, F32Sqrt,
+        ] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::F32],
+                vec![],
+                vec![ValType::F32],
+            );
+            assert_equiv(&module, 0, &values);
+        }
+    }
+
+    #[test]
+    fn f64_unary_ops_match_the_interpreter() {
+        use NumOp::*;
+        let values = f64_unary();
+        for op in [
+            F64Abs, F64Neg, F64Ceil, F64Floor, F64Trunc, F64Nearest, F64Sqrt,
+        ] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::F64],
+                vec![],
+                vec![ValType::F64],
+            );
+            assert_equiv(&module, 0, &values);
+        }
+    }
+
+    #[test]
+    fn float_conversions_match_the_interpreter() {
+        use NumOp::*;
+        // Rounding-relevant integer inputs: values straddling the f32 and f64
+        // exactness boundaries (2^24 and 2^53), plus extremes.
+        let i32_cases: Vec<Vec<Value>> = [
+            0i32,
+            1,
+            -1,
+            0x00ff_ffff,  // 2^24 - 1 (exact in f32)
+            0x0100_0000,  // 2^24
+            0x0100_0001,  // 2^24 + 1 (rounds)
+            -0x0100_0001, // -(2^24 + 1)
+            123_456_789,
+            -123_456_789,
+            i32::MAX,
+            i32::MIN,
+        ]
+        .into_iter()
+        .map(|a| vec![Value::I32(a)])
+        .collect();
+        let i64_cases: Vec<Vec<Value>> = [
+            0i64,
+            1,
+            -1,
+            0x1f_ffff_ffff, // 2^37 - 1
+            0x20_0000_0000, // 2^37
+            0x20_0000_0001, // 2^37 + 1
+            (1 << 53) - 1,
+            1 << 53,
+            (1 << 53) + 1,
+            123_456_789_012_345,
+            -123_456_789_012_345,
+            i64::MAX,
+            i64::MIN,
+        ]
+        .into_iter()
+        .map(|a| vec![Value::I64(a)])
+        .collect();
+        for op in [F32ConvertI32S, F32ConvertI32U] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::I32],
+                vec![],
+                vec![ValType::F32],
+            );
+            assert_equiv(&module, 0, &i32_cases);
+        }
+        for op in [F32ConvertI64S, F32ConvertI64U] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::I64],
+                vec![],
+                vec![ValType::F32],
+            );
+            assert_equiv(&module, 0, &i64_cases);
+        }
+        for op in [F64ConvertI32S, F64ConvertI32U] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::I32],
+                vec![],
+                vec![ValType::F64],
+            );
+            assert_equiv(&module, 0, &i32_cases);
+        }
+        for op in [F64ConvertI64S, F64ConvertI64U] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::I64],
+                vec![],
+                vec![ValType::F64],
+            );
+            assert_equiv(&module, 0, &i64_cases);
+        }
+    }
+
+    #[test]
+    fn float_values_flow_through_control_structures() {
+        // block (result f64): an f64 result carried through the
+        // continuation's block params, then returned.
+        let block = module_with(
+            vec![
+                Instr::Block(BlockType::Val(ValType::F64)),
+                Instr::LocalGet(0),
+                Instr::F64Const(0x3ff8_0000_0000_0000), // 1.5
+                Instr::Num(NumOp::F64Add),
+                Instr::End,
+            ],
+            vec![ValType::F64],
+            vec![],
+            vec![ValType::F64],
+        );
+        assert_equiv(&block, 0, &f64_unary());
+
+        // if/else (result f32): cond ? x : -x.
+        let if_else = module_with(
+            vec![
+                Instr::LocalGet(1),
+                Instr::If(BlockType::Val(ValType::F32)),
+                Instr::LocalGet(0),
+                Instr::Else,
+                Instr::LocalGet(0),
+                Instr::Num(NumOp::F32Neg),
+                Instr::End,
+            ],
+            vec![ValType::F32, ValType::I32],
+            vec![],
+            vec![ValType::F32],
+        );
+        let mut cases = Vec::new();
+        for x in f32_bits() {
+            for cond in [Value::I32(0), Value::I32(1)] {
+                cases.push(vec![Value::F32(x), cond]);
+            }
+        }
+        assert_equiv(&if_else, 0, &cases);
+
+        // select over f32 operands (untyped `select` is valid for floats).
+        let select = module_with(
+            vec![
+                Instr::LocalGet(0),
+                Instr::LocalGet(1),
+                Instr::LocalGet(2),
+                Instr::Select,
+            ],
+            vec![ValType::F32, ValType::F32, ValType::I32],
+            vec![],
+            vec![ValType::F32],
+        );
+        let mut cases = Vec::new();
+        for a in f32_bits() {
+            for b in f32_bits() {
+                for cond in [Value::I32(0), Value::I32(1)] {
+                    cases.push(vec![Value::F32(a), Value::F32(b), cond]);
+                }
+            }
+        }
+        assert_equiv(&select, 0, &cases);
     }
 
     fn module_with(

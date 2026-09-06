@@ -1693,3 +1693,27 @@ exits, if/else results, a back-edge loop, a loop that falls out of its
 total with the feature, clippy clean in both configurations. Not yet
 lowered: `br_table`, parameterized/multi-value block types, and floats
 (next, with exact canonical-quiet-NaN semantics).
+
+Floats landed: `clif_type` now covers `f32`/`f64`, so float
+params/results/locals ride the same SSA value model (arguments still
+arrive as u64 slots — low 32 bits for f32, full 64 for f64 — bitcast to
+IEEE Cranelift values). `lower_float` handles the f32/f64 unops, binops,
+comparisons, and int→float conversions; arithmetic/rounding/sqrt results
+are NaN-canonicalized to the engine's QNAN32/QNAN64 (`fcmp != self`
+`select`s in the canonical constant), reproducing the interpreter's
+canonical-quiet-NaN policy bit-for-bit, while `abs`/`neg`/`copysign`
+stay raw bit ops (`fabs`/`fneg`/`fcopysign`) and conversions lower via
+`fcvt_from_sint`/`uint`. `f32.min/max` and promote/demote stay deferred.
+
+The equivalence harness is now honest: `assert_equiv` first asserts the
+module actually compiled (`Engine::compile` degrades to the interpreter
+silently on any lowering error), so a test can no longer compare the
+interpreter against itself. That gate exposed three previously vacuous
+modules — two declared `i64`-producing ops (arithmetic, `popcnt`) with
+an `i32` result type and one `select`/locals module whose stack
+underflowed — now corrected to valid wasm. New coverage sweeps f32/f64
+binary ops, comparisons, unary ops (incl. rounding/sqrt), and int→float
+conversions over signed-zero, subnormal, ∞, and quiet/signaling-NaN
+inputs, plus float values flowing through block and if/else results and
+untyped float `select`. 22 compile tests, 58 total with the feature,
+clippy clean in both configurations.
