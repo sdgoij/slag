@@ -163,6 +163,47 @@ impl Trace for ForOfFastVerdict {
     }
 }
 
+// Every live `Agent` on this thread that has run JavaScript, as
+// `(signifier, pointer)` pairs. The crux heap is thread-local and shared by
+// every agent on the thread, but a collection roots only the collecting
+// agent's own tables, so a nested or sibling agent's boxes — reachable only
+// through its Rust-heap tables, which the conservative stack scan cannot
+// see — would be swept. An agent is registered the first time it enters a
+// `with_agent` window and removed in `Drop`; an agent that moves between
+// runs re-registers its new address under the same signifier.
+thread_local! {
+    static LIVE_AGENTS: std::cell::RefCell<Vec<(u64, *const Agent)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The `with_agent` enter notifier (installed by [`crate::function::ensure_ecma_hook`]):
+/// register the agent as a GC root. Fires only on genuine window transitions.
+pub(crate) fn live_agent_entered(agent: *mut ()) {
+    let agent = agent as *const Agent;
+    // SAFETY: the notifier runs while `with_agent` has just recorded `agent`
+    // as current, so it is a live `Agent` for the whole window.
+    let signifier = unsafe { (*agent).signifier };
+    LIVE_AGENTS.with(|live| {
+        let mut live = live.borrow_mut();
+        // An agent that moved since its last run re-registers its new
+        // address; the stale entry (same signifier, old address) goes.
+        live.retain(|&(id, _)| id != signifier);
+        live.push((signifier, agent));
+    });
+}
+
+/// The registered live agents' pointers (see [`LIVE_AGENTS`]).
+fn live_agent_ptrs() -> Vec<*const Agent> {
+    LIVE_AGENTS.with(|live| live.borrow().iter().map(|&(_, ptr)| ptr).collect())
+}
+
+/// Unregister a dropped agent (by its unique, never-reused signifier).
+fn unregister_live_agent(signifier: u64) {
+    LIVE_AGENTS.with(|live| {
+        live.borrow_mut().retain(|&(id, _)| id != signifier);
+    });
+}
+
 pub struct Agent {
     pub execution_context_stack: Vec<ExecutionContext>,
     /// The IC caches shared by every Vm run in this agent (the global-var
@@ -736,6 +777,7 @@ impl Drop for Agent {
             // dropped, so this runs exactly once with a live pointer.
             unsafe { (hook.drop_cache)(hook.cache) };
         }
+        unregister_live_agent(self.signifier);
     }
 }
 
@@ -999,6 +1041,11 @@ impl Agent {
     /// InitializeHostDefinedRealm (spec 9.3.4) and push the bootstrap
     /// execution context.
     pub fn initialize_host_defined_realm(&mut self) -> Result<Handle<Realm>, JsError> {
+        // Register as a live GC root before the bootstrap allocates the realm
+        // boxes: an agent that holds a realm but has not yet entered a
+        // `with_agent` window (the embedding created it and will evaluate it
+        // later) would otherwise be invisible to a sibling's collection.
+        live_agent_entered(self as *mut Agent as *mut ());
         let realm = initialize_host_defined_realm(self)?;
         self.push_bootstrap_context(realm);
         Ok(realm)
@@ -1439,6 +1486,22 @@ impl Agent {
         if let Some(extra) = extra {
             roots.push(extra);
         }
+        // Every live agent on the thread is a precise root: the crux heap is
+        // shared, but each agent's state is reachable only from its own
+        // Rust-heap tables, so a nested or sibling agent's boxes would be
+        // swept otherwise. `self` is traced below.
+        let self_ptr = self as *const Agent;
+        let live = live_agent_ptrs();
+        for &agent in &live {
+            if agent == self_ptr {
+                continue;
+            }
+            // SAFETY: a registered agent is alive — registration is removed
+            // only in `Drop`, which cannot run during a collection on this
+            // thread.
+            let agent = unsafe { &*agent };
+            agent.trace_roots(&mut |any| roots.push(any));
+        }
         self.trace_roots(&mut |any| roots.push(any));
         // GC-3/GC-4: the compaction hook runs between the mark and the sweep
         // (the would-be-swept boxes are still allocated), dropping dead weak
@@ -1448,13 +1511,26 @@ impl Agent {
         // or FinalizationRegistry target alive (the sweep still uses the
         // conservative mark — the scan stays the safety net for Rust-held
         // handles).
-        let has_weak = self.has_weak_structures();
+        let has_weak = self.has_weak_structures()
+            || live.iter().any(|&agent| {
+                agent != self_ptr
+                    // SAFETY: as above.
+                    && unsafe { (&*agent).has_weak_structures() }
+            });
         // Cut 35 slice 31: the compaction hook (dead-set HashSet build +
         // weak-table walks) runs only when a weak structure actually exists
         // — the benchmark's collections have none, and the SipHash HashSet
         // of every dead address was measurable per collection.
         let compact: &mut crux::heap::CompactHook = if has_weak {
-            &mut |dead, retain| self.compact_weak_tables(dead, retain)
+            &mut |dead, retain| {
+                self.compact_weak_tables(dead, retain);
+                for &agent in &live {
+                    if agent != self_ptr {
+                        // SAFETY: as above.
+                        unsafe { (&*agent).compact_weak_tables(dead, retain) };
+                    }
+                }
+            }
         } else {
             &mut |_, _| {}
         };
@@ -1733,5 +1809,51 @@ mod tests {
         });
         agent.run_jobs().unwrap();
         assert_eq!(*order.borrow(), vec!["timed"]);
+    }
+
+    #[test]
+    fn sibling_agent_state_survives_other_agents_gc_stress() {
+        // Two agents share the thread-local crux heap, but a collection roots
+        // only the collecting agent's tables. Box `a` so the conservative
+        // stack scan cannot save its state from its inline fields, then run
+        // `b` under `--gc-stress` (a collection after every allocation):
+        // before the fix `a`'s world was swept out from under it (release AV;
+        // the debug arena masks it).
+        let mut a = Box::new(Agent::new());
+        a.initialize_host_defined_realm().unwrap();
+        a.run_script(
+            "globalThis.keep = function f(n) { return { tag: 'kept', nested: { v: n } }; }; globalThis.marker = 'alive';",
+        )
+        .unwrap();
+        let mut b = Agent::new();
+        b.initialize_host_defined_realm().unwrap();
+        b.set_gc_stress(true);
+        b.run_script(
+            "var acc = []; for (var i = 0; i < 4000; i++) { acc.push({ i: i }); } globalThis.acc = acc.length;",
+        )
+        .unwrap();
+        b.set_gc_stress(false);
+        let ok = a
+            .run_script("globalThis.marker === 'alive' && globalThis.keep(7).nested.v === 7")
+            .unwrap();
+        assert_eq!(ok.as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn realm_initialization_registers_the_agent_as_a_live_root() {
+        // Realm bootstrap happens outside any `with_agent` window, so the
+        // agent must be registered at initialization (not just at its first
+        // run) — otherwise a sibling's collection could sweep its realm.
+        let fresh = Agent::new();
+        let fresh_ptr = &fresh as *const Agent;
+        assert!(!live_agent_ptrs().contains(&fresh_ptr));
+        let ptr = {
+            let mut agent = Agent::new();
+            agent.initialize_host_defined_realm().unwrap();
+            let ptr = &agent as *const Agent;
+            assert!(live_agent_ptrs().contains(&ptr));
+            ptr
+        };
+        assert!(!live_agent_ptrs().contains(&ptr), "drop must unregister");
     }
 }

@@ -65,6 +65,16 @@ pub fn install_ecma_hook(hook: EcmaHook) {
     let _ = ECMA_HOOK.set(hook);
 }
 
+/// The runtime's live-agent notifier: called whenever [`with_agent`] makes an
+/// agent current that was not current before (a genuine window transition).
+/// The runtime registers the agent as a GC root; crux only relays the pointer.
+static AGENT_ENTER_HOOK: std::sync::OnceLock<fn(*mut ())> = std::sync::OnceLock::new();
+
+/// Install the live-agent notifier (the runtime calls this once at startup).
+pub fn install_agent_enter_hook(hook: fn(*mut ())) {
+    let _ = AGENT_ENTER_HOOK.set(hook);
+}
+
 /// Run `body` with `agent` recorded as the current agent. Crux code that
 /// invokes an ECMAScript function (proxy traps, object coercion) consults the
 /// recorded pointer inside this window; `agent` must stay alive for the whole
@@ -77,6 +87,9 @@ pub fn with_agent<T>(agent: *mut (), body: impl FnOnce() -> T) -> T {
         return body();
     }
     let previous = CURRENT_AGENT.with(|slot| slot.replace(agent));
+    if let Some(hook) = AGENT_ENTER_HOOK.get() {
+        hook(agent);
+    }
     let result = body();
     CURRENT_AGENT.with(|slot| slot.replace(previous));
     result

@@ -54,6 +54,10 @@ static INSTALL_ECMA_HOOK: std::sync::Once = std::sync::Once::new();
 pub fn ensure_ecma_hook() {
     INSTALL_ECMA_HOOK.call_once(|| {
         crux::function::install_ecma_hook(crux_ecma_executor);
+        // GC multi-agent: every agent that enters a `with_agent` window is a
+        // precise GC root while it lives (the heap is thread-local and
+        // shared, so a sibling agent's boxes would be swept otherwise).
+        crux::function::install_agent_enter_hook(crate::agent::live_agent_entered);
         // Proxy trap `argumentsList` arrays carry the current realm's
         // `%Array.prototype%` (CreateArrayFromList, spec 7.3.15).
         crux::proxy::install_array_from_list_hook(|agent, list| {
