@@ -3305,7 +3305,13 @@ extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
         // break completion — the loop is skipped, not an error. The
         // empty-key state makes ForInNext pop straight to the done label.
         let dummy = crux::object::JsObject::ordinary_object_create(None);
-        vm.for_in_stack.push((dummy, Vec::new(), 0));
+        vm.for_in_stack.push(crate::ir::ForInState {
+            base: dummy,
+            keys: Vec::new(),
+            index: 0,
+            base_generation: 0,
+            fast: false,
+        });
         return Value::Undefined.bits();
     }
     let obj = match crate::context::to_object(agent, &rhs) {
@@ -3325,25 +3331,49 @@ extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
         Ok(keys) => keys,
         Err(error) => return slow_error(ctx, error),
     };
-    vm.for_in_stack.push((obj, keys, 0));
+    let fast =
+        crate::ir::for_in_generation_tracked(&obj) && keys.iter().all(|(level, _)| *level == 0);
+    vm.for_in_stack.push(crate::ir::ForInState {
+        base: obj,
+        keys,
+        index: 0,
+        base_generation: obj.generation.get(),
+        fast,
+    });
     Value::Undefined.bits()
 }
 
 extern "C" fn for_in_next(ctx: *mut c_void, stack: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
-    let Some((obj, keys, index)) = vm.for_in_stack.last_mut() else {
+    let Some(state) = vm.for_in_stack.last_mut() else {
         return slow_error(
             ctx,
             JsError::new(ErrorKind::SyntaxError, "ForInNext without a for-in".into()),
         );
     };
-    while *index < keys.len() {
-        let (level, key) = keys[*index];
-        *index += 1;
+    if state.fast && state.base.generation.get() == state.base_generation {
+        // The base is an ordinary/array object and has not structurally
+        // changed since the keys were enumerated (any delete/define/attr flip
+        // bumps the generation), so every remaining level-0 key is still an
+        // own enumerable property — yield it without the per-key check.
+        if state.index < state.keys.len() {
+            let key = state.keys[state.index].1;
+            state.index += 1;
+            // SAFETY: the machine code passes its live working-stack
+            // pointer with room for one slot.
+            unsafe { *(stack as *mut u64) = key.bits() };
+            return 1;
+        }
+        vm.for_in_stack.pop();
+        return 0;
+    }
+    while state.index < state.keys.len() {
+        let (level, key) = state.keys[state.index];
+        state.index += 1;
         // A key deleted during enumeration is skipped (spec
         // EnumerateObjectProperties step 5.a.v).
-        match crate::eval::key_enumerable_at_level(obj, level, &key) {
+        match crate::eval::key_enumerable_at_level(&state.base, level, &key) {
             Ok(true) => {
                 // SAFETY: the machine code passes its live working-stack
                 // pointer with room for one slot.

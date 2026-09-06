@@ -1727,8 +1727,39 @@ pub enum CtlResult {
 }
 
 /// A for-in enumeration in progress: the base object, the
-/// (prototype-level, key) pairs, and the next index.
-pub(crate) type ForInState = (Handle<crux::object::JsObject>, Vec<(usize, Value)>, usize);
+/// (prototype-level, key) pairs, and the next index. When the base is an
+/// ordinary/array object and every collected key is an own (level-0) key,
+/// `fast` is set and `base_generation` snapshots the base's generation at
+/// the enumeration start: an unchanged generation (the Cut-22 contract bumps
+/// on every own-property or prototype change) means every level-0 key is
+/// still an own enumerable property, so the per-key deleted-during-
+/// enumeration check can be skipped. Any mutation drops back to the exact
+/// per-key check.
+#[derive(Debug)]
+pub struct ForInState {
+    pub(crate) base: Handle<crux::object::JsObject>,
+    pub(crate) keys: Vec<(usize, Value)>,
+    pub(crate) index: usize,
+    pub(crate) base_generation: u32,
+    pub(crate) fast: bool,
+}
+
+/// Whether a for-in base's own-property structure is tracked exactly by the
+/// generation counter (the Cut-22 bump-on-any-own-property-or-prototype-
+/// change contract): ordinary objects/arrays and the ordinary host variants.
+/// Exotic kinds whose [[GetOwnProperty]] is computed (proxies, typed arrays,
+/// arguments' parameter map, module namespaces) are excluded — their own-key
+/// state can change without a generation bump, so they keep the exact
+/// per-key deleted-during-enumeration check.
+pub(crate) fn for_in_generation_tracked(obj: &Handle<crux::object::JsObject>) -> bool {
+    matches!(
+        obj.kind,
+        crux::object::ObjectKind::Ordinary
+            | crux::object::ObjectKind::Array(_)
+            | crux::object::ObjectKind::External(_)
+            | crux::object::ObjectKind::IsHTMLDDA
+    )
+}
 
 /// Frame slots for small layouts live in a fixed inline array so a fast
 /// call allocates nothing (the bench's simple-param functions are ≤ 8
@@ -2695,9 +2726,9 @@ impl Trace for Vm {
         // The suspended-loop/iteration stacks hold live values and iterator
         // records across a suspension (a pooled Vm is reset before reuse, so
         // tracing an idle Vm's empty stacks is a no-op).
-        for (object, keys, _) in &self.for_in_stack {
-            object.trace(visit);
-            for (_, key) in keys {
+        for state in &self.for_in_stack {
+            state.base.trace(visit);
+            for (_, key) in &state.keys {
                 key.trace(visit);
             }
         }
@@ -7127,42 +7158,73 @@ impl Vm {
                         // fixtures). The empty-key state makes ForInNext pop
                         // straight to the done label.
                         let dummy = crux::object::JsObject::ordinary_object_create(None);
-                        self.for_in_stack.push((dummy, Vec::new(), 0));
+                        self.for_in_stack.push(ForInState {
+                            base: dummy,
+                            keys: Vec::new(),
+                            index: 0,
+                            base_generation: 0,
+                            fast: false,
+                        });
                     } else {
                         let obj = crate::context::to_object(agent, &rhs)?;
                         let obj = crate::context::as_object(&obj).ok_or_else(|| {
                             JsError::new(ErrorKind::TypeError, "for-in over a non-object".into())
                         })?;
                         let keys = crate::eval::for_in_key_levels(agent, &rhs)?;
-                        self.for_in_stack.push((obj, keys, 0));
+                        let fast = for_in_generation_tracked(&obj)
+                            && keys.iter().all(|(level, _)| *level == 0);
+                        self.for_in_stack.push(ForInState {
+                            base: obj,
+                            keys,
+                            index: 0,
+                            base_generation: obj.generation.get(),
+                            fast,
+                        });
                     }
                 }
                 Step::ForInNext { done, back } => {
-                    let Some((obj, keys, index)) = self.for_in_stack.last_mut() else {
+                    let Some(state) = self.for_in_stack.last_mut() else {
                         return Err(JsError::new(
                             ErrorKind::SyntaxError,
                             "ForInNext without a for-in".into(),
                         ));
                     };
-                    let mut pushed = false;
-                    while *index < keys.len() {
-                        let (level, key) = keys[*index];
-                        *index += 1;
-                        // A key deleted during enumeration is skipped (spec
-                        // EnumerateObjectProperties step 5.a.v).
-                        if crate::eval::key_enumerable_at_level(obj, level, &key)? {
+                    if state.fast && state.base.generation.get() == state.base_generation {
+                        // The base is an ordinary/array object and has not
+                        // structurally changed since the keys were enumerated
+                        // (any delete/define/attr flip bumps the generation), so
+                        // every remaining level-0 key is still an own enumerable
+                        // property — yield it without the per-key check.
+                        if state.index < state.keys.len() {
+                            let key = state.keys[state.index].1;
+                            state.index += 1;
                             self.stack.push(key);
-                            pushed = true;
-                            break;
+                            self.ip = *back;
+                        } else {
+                            self.for_in_stack.pop();
+                            self.ip = *done;
                         }
-                    }
-                    if pushed {
-                        // Cut 35 slice 18: continue at the do-while body
-                        // start (no back-jump per iteration).
-                        self.ip = *back;
                     } else {
-                        self.for_in_stack.pop();
-                        self.ip = *done;
+                        let mut pushed = false;
+                        while state.index < state.keys.len() {
+                            let (level, key) = state.keys[state.index];
+                            state.index += 1;
+                            // A key deleted during enumeration is skipped (spec
+                            // EnumerateObjectProperties step 5.a.v).
+                            if crate::eval::key_enumerable_at_level(&state.base, level, &key)? {
+                                self.stack.push(key);
+                                pushed = true;
+                                break;
+                            }
+                        }
+                        if pushed {
+                            // Cut 35 slice 18: continue at the do-while body
+                            // start (no back-jump per iteration).
+                            self.ip = *back;
+                        } else {
+                            self.for_in_stack.pop();
+                            self.ip = *done;
+                        }
                     }
                 }
                 Step::ForInBind { left } => {

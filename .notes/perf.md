@@ -5261,6 +5261,40 @@ Gates: clippy clean; workspace tests green (new crux test
 sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
 annexB 1086/1086, zero fail/crash/hang.
 
+### For-in per-key deletion checks skip on an unchanged base (measured + landed 2026-09-06)
+
+Probe of the corpus `control/for_in` row (~325ms both engines, 150k
+re-entries of `for (k in o) { s += o[k] }` over a stable 5-key object;
+node-jl 13.6ns/key-iter): isolated variants (for-in only vs same member
+reads via a manual key loop vs break-after-first) showed the row is ~90%
+ForInBegin — each re-entry eagerly re-enumerates the whole chain
+(own_property_keys + a per-key descriptor lookup + HashSet/Vec/key-box
+allocation; ~1.7µs per 5-key begin, ~1.0µs per 1-key begin) — with the
+per-iteration ForInNext deleted-key check costing only ~40ns/key. Landing:
+`ForInState` (now a struct) records the base's generation at enumeration
+start plus a `fast` flag (base is an ordinary/array/External/IsHTMLDDA
+object whose own-property structure the Cut-22 generation contract tracks
+exactly, and every collected key is level 0). On the fast path ForInNext
+yields each key directly while the base's generation is unchanged — any
+delete/define/attr flip bumps it and drops back to the exact per-key
+check, so the deleted-during-enumeration semantics are preserved by
+construction. Both engine copies (interpreter `Step::ForInNext`, JIT
+`for_in_next` helper) share the gate. `control/for_in` ~323 -> ~290ms jit /
+~325 -> ~305ms jl (~10%); the head-let amplified fixture ~1660 -> ~1590ms.
+A 16-case node-differential battery (deletes mid-loop incl. current/next/
+readd, proto and multi-level deletes, mid-loop adds and shadowing, array
+indices, proxy base, null-proto, attr flips, function objects, re-entry
+with mutation) is byte-identical to the parent. Gates: clippy clean;
+workspace tests green; test262 sweeps at baseline — language 23721/3
+skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
+The remaining ~90% of the row is the ForInBegin re-enumeration itself —
+the next slice is a per-object/generation-validated enumeration cache
+(mirrors the per-array for-of fast verdict). Note (pre-existing, not
+fixed): on `defineProperty` flipping a not-yet-visited key non-enumerable
+mid-loop, slag's per-key check skips it (a,c) while node yields it
+(a,b,c) — the check should skip only absent (deleted) keys, not
+attr-flipped ones; out of scope for this perf slice.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
