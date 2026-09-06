@@ -1737,3 +1737,26 @@ total with the feature, clippy clean in both configurations. Remaining
 Wave 1 gap: parameterized/multi-value block types (block parameters and
 several results), which need block-parameter plumbing on construct
 entry.
+
+Parameterized and multi-value block types landed, completing the Wave 1
+numeric/control leaf list. Block types now resolve through the module's
+type section (`block_sig`, so `BlockType::Type(i)` carries any numeric
+parameter/result list), and constructs model the wasm discipline
+exactly: a block type `[t1*] -> [t2*]` enters with `t1*` already on the
+operand stack — the label base (`height`) moves below them and the body
+starts from them; a `loop` jumps to a header whose block parameters ARE
+the first iteration's `t1*`, and `br` to its label carries `t1*` back
+(its label arity is the parameter count); block/if labels keep their
+result arity and jump to the continuation; an `if` saves its parameters
+so the else branch restarts from the same values (an `if` with
+parameters but no else stays interpreted). `br`/`br_if`/`br_table` share
+one `frame_target` label resolver, so `br_table` over parameterized
+loop labels and multi-value block results lowers too. Equivalence
+coverage adds a parameterized block (body adds 2 to its input), a
+multi-result `(i32 i32)` block, an `if` whose parameter feeds both
+branches, single- and two-parameter loops, and a loop whose `br_if`
+back-edge carries its parameter until the exit condition — all matched
+bit-for-bit against the interpreter. 24 compile tests, 60 total with
+the feature, clippy clean in both configurations. Wave 1's leaf list is
+done; the next step is the Wave 0 gate: the corpus-wide compile-forced
+equivalence harness in `wasmtest`.

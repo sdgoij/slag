@@ -17,8 +17,10 @@
 //!   `copysign` stay raw bit ops); `f32.min/max` and the
 //!   promote/demote conversions are deferred;
 //! - structured control flow (`block`/`loop`/`if`/`else`/`br`/`br_if`/
-//!   `br_table`) with empty or single-result block types (float or
-//!   integer).
+//!   `br_table`) with numeric block types of any parameter/result count
+//!   (parameters enter the body as its initial operand stack and ride a
+//!   loop's header as block parameters; a parameterized `if` needs an
+//!   explicit else branch).
 //! - memory, globals, tables, calls, refs, SIMD, and GC are not lowered yet.
 //!
 //! ABI: a compiled entry is
@@ -169,7 +171,7 @@ impl Engine {
         let body = module.bodies.get(defined)?;
         let type_index = *module.functions.get(defined)?;
         let func_type = module.func_at(type_index)?;
-        if !lowerable(func_type, body) {
+        if !lowerable(module, func_type, body) {
             return None;
         }
         let conv = platform_call_conv(&*self.isa);
@@ -178,7 +180,7 @@ impl Engine {
             entry_signature(conv),
         );
         let mut fctx = FunctionBuilderContext::new();
-        lower(body, func_type, &mut func, &mut fctx, &*self.isa).ok()?;
+        lower(module, body, func_type, &mut func, &mut fctx, &*self.isa).ok()?;
         let mut ctx = Context::for_function(func);
         let compiled = ctx.compile(&*self.isa, &mut ControlPlane::default()).ok()?;
         let code = ExecutableCode::new(compiled.code_buffer()).ok()?;
@@ -219,19 +221,33 @@ fn clif_type(ty: ValType) -> Option<Type> {
     }
 }
 
-/// The result types of a supported block type. Only the parameter-free
-/// forms lower today (empty or a single integer result); multi-value and
-/// parameterized blocks keep the function on the interpreter.
-fn block_results(bt: &BlockType) -> Option<Vec<ValType>> {
-    match bt {
-        BlockType::Empty => Some(Vec::new()),
-        BlockType::Val(ty) if clif_type(*ty).is_some() => Some(vec![*ty]),
-        _ => None,
+/// Resolve a block type to its parameter and result valtypes. `Type(i)`
+/// indexes the module's type section; only numeric (float/int) parameters
+/// and results lower today, so any other shape keeps the function on the
+/// interpreter.
+fn block_sig(module: &Module, bt: &BlockType) -> Option<(Vec<ValType>, Vec<ValType>)> {
+    let (params, results) = match bt {
+        BlockType::Empty => (Vec::new(), Vec::new()),
+        BlockType::Val(ty) => (Vec::new(), vec![*ty]),
+        BlockType::Type(index) => {
+            let ty = module.func_at(*index)?;
+            (ty.params.clone(), ty.results.clone())
+        }
+    };
+    if params
+        .iter()
+        .chain(results.iter())
+        .all(|t| clif_type(*t).is_some())
+    {
+        Some((params, results))
+    } else {
+        None
     }
 }
 
-/// Whether `func_type` + `body` are inside the current lowering subset.
-fn lowerable(func_type: &FuncType, body: &FuncBody) -> bool {
+/// Whether `module`'s `func_type` + `body` are inside the current lowering
+/// subset.
+fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
     if func_type.params.iter().any(|t| clif_type(*t).is_none())
         || func_type.results.iter().any(|t| clif_type(*t).is_none())
         || body.locals.iter().any(|t| clif_type(*t).is_none())
@@ -253,7 +269,7 @@ fn lowerable(func_type: &FuncType, body: &FuncBody) -> bool {
         | Instr::SelectTyped(_)
         | Instr::Return => true,
         Instr::Num(op) => supported_num(*op),
-        Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_results(bt).is_some(),
+        Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_sig(module, bt).is_some(),
         Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) | Instr::BrTable { .. } => true,
         _ => false,
     })
@@ -455,21 +471,31 @@ enum CtlKind {
 
 /// One open structured construct (`block`/`loop`/`if`) during lowering.
 ///
-/// Supported block types carry no parameters and at most one result, so a
-/// construct never consumes the operand stack on entry: `height` is the
-/// stack depth the construct's results (if any) sit on top of. `br` to a
-/// block/if label jumps to `after` carrying the results; `br` to a loop
-/// label jumps back to its (sealed) `header` carrying nothing.
+/// A block type `[t1*] -> [t2*]` enters with its `t1*` parameters on the
+/// operand stack: `height` is the depth of the stack below those parameters
+/// (the label base). A `br` to a block/if label jumps to `after` carrying
+/// the `t2*` results; a `br` to a loop label jumps back to its `header`
+/// carrying `t1*` (the next iteration's parameters).
 struct CtlFrame {
     kind: CtlKind,
-    /// Loop header (the `br` target for a loop label); sealed on entry so
-    /// body back-edges are legal.
+    /// Loop header (the `br` target for a loop label); unsealed until the
+    /// loop's `end`, so body back-edges stay legal.
     header: Option<Block>,
     /// The continuation after the construct; receives the results.
     after: Block,
     /// The false-condition branch of an `if`.
     else_block: Option<Block>,
+    /// Operand-stack depth of the label base (below the construct's
+    /// parameters, if any).
     height: usize,
+    /// The construct's parameter count (`br` to a loop label carries this
+    /// many values to the header).
+    nparams: usize,
+    /// The construct's parameter values, saved so an `if`'s else branch can
+    /// restart from them (empty otherwise).
+    params: Vec<ClifValue>,
+    /// The construct's result count (`br` to a block/if label carries this
+    /// many values to `after`).
     results: usize,
     /// Lowering is currently inside the `else` branch of an `if`.
     in_else: bool,
@@ -483,6 +509,8 @@ struct CtlFrame {
 /// A lowering context: locals, the operand stack, and the entry pointers.
 struct Lowerer<'a> {
     builder: FunctionBuilder<'a>,
+    /// The module (block types resolve through its type section).
+    module: &'a Module,
     /// `locals` and `stack` entry metadata mirror the interpreter's model.
     variables: Vec<Variable>,
     stack: Vec<ClifValue>,
@@ -882,18 +910,30 @@ impl<'a> Lowerer<'a> {
         self.dead = false;
     }
 
-    fn open_block(&mut self, results: Vec<ValType>) {
-        let after = self.builder.create_block();
-        for ty in &results {
+    /// Append `results` as block parameters of `block` (the continuation's
+    /// incoming values when a construct completes).
+    fn append_results(&mut self, block: Block, results: &[ValType]) {
+        for ty in results {
             self.builder
-                .append_block_param(after, clif_type(*ty).expect("int block result"));
+                .append_block_param(block, clif_type(*ty).expect("numeric block result"));
         }
+    }
+
+    fn open_block(&mut self, params: &[ValType], results: &[ValType]) {
+        // The parameters are already the top `params.len()` operand-stack
+        // values; they become the body's initial stack, so opening only moves
+        // the label base below them.
+        let height = self.stack.len() - params.len();
+        let after = self.builder.create_block();
+        self.append_results(after, results);
         self.controls.push(CtlFrame {
             kind: CtlKind::Block,
             header: None,
             after,
             else_block: None,
-            height: self.stack.len(),
+            height,
+            nparams: params.len(),
+            params: Vec::new(),
             results: results.len(),
             in_else: false,
             has_else: false,
@@ -901,15 +941,23 @@ impl<'a> Lowerer<'a> {
         });
     }
 
-    fn open_loop(&mut self, results: Vec<ValType>) {
+    fn open_loop(&mut self, params: &[ValType], results: &[ValType]) {
+        let height = self.stack.len() - params.len();
         let header = self.builder.create_block();
-        let after = self.builder.create_block();
-        for ty in &results {
+        for ty in params {
             self.builder
-                .append_block_param(after, clif_type(*ty).expect("int block result"));
+                .append_block_param(header, clif_type(*ty).expect("numeric block parameter"));
         }
-        self.builder.ins().jump(header, &[]);
+        let after = self.builder.create_block();
+        self.append_results(after, results);
+        // Enter the header with the initial parameters (they become the
+        // header's block parameters, i.e. the first iteration's values).
+        let payload = self.label_args(params.len());
+        self.builder.ins().jump(header, &payload);
         self.builder.switch_to_block(header);
+        let header_params = self.builder.block_params(header).to_vec();
+        self.stack.truncate(height);
+        self.stack.extend(header_params);
         // The header is NOT sealed here: every back-edge (`br` to this loop
         // label) is a new predecessor, which may only target an unsealed
         // block. The header is sealed when the loop's `end` closes it, once
@@ -919,7 +967,9 @@ impl<'a> Lowerer<'a> {
             header: Some(header),
             after,
             else_block: None,
-            height: self.stack.len(),
+            height,
+            nparams: params.len(),
+            params: Vec::new(),
             results: results.len(),
             in_else: false,
             has_else: false,
@@ -927,16 +977,16 @@ impl<'a> Lowerer<'a> {
         });
     }
 
-    fn open_if(&mut self, results: Vec<ValType>) -> Result<(), String> {
+    fn open_if(&mut self, params: &[ValType], results: &[ValType]) -> Result<(), String> {
         let condition = self.pop().ok_or("operand stack underflow")?;
-        let height = self.stack.len();
+        // The parameters sit below the popped condition; save them so the
+        // else branch can restart from the same values.
+        let saved = self.stack[self.stack.len() - params.len()..].to_vec();
+        let height = self.stack.len() - params.len();
         let then_block = self.builder.create_block();
         let else_block = self.builder.create_block();
         let after = self.builder.create_block();
-        for ty in &results {
-            self.builder
-                .append_block_param(after, clif_type(*ty).expect("int block result"));
-        }
+        self.append_results(after, results);
         let zero = self.iconst(types::I32, 0);
         let flag = self.builder.ins().icmp(IntCC::NotEqual, condition, zero);
         self.builder
@@ -950,6 +1000,8 @@ impl<'a> Lowerer<'a> {
             after,
             else_block: Some(else_block),
             height,
+            nparams: params.len(),
+            params: saved,
             results: results.len(),
             in_else: false,
             has_else: false,
@@ -979,13 +1031,18 @@ impl<'a> Lowerer<'a> {
             self.builder.ins().jump(after, &payload);
             self.stack.truncate(height);
         }
-        let (height, else_block) = {
+        let (height, else_block, params) = {
             let f = &self.controls[idx];
-            (f.height, f.else_block.expect("if else block"))
+            (
+                f.height,
+                f.else_block.expect("if else block"),
+                f.params.clone(),
+            )
         };
         self.controls[idx].in_else = true;
         self.controls[idx].has_else = true;
         self.stack.truncate(height);
+        self.stack.extend(params);
         self.builder.seal_block(else_block);
         self.builder.switch_to_block(else_block);
         self.dead = false;
@@ -1051,7 +1108,13 @@ impl<'a> Lowerer<'a> {
                 };
                 if !in_else {
                     // No else: close the then-branch, then the empty else
-                    // (the false path) jumps straight to the continuation.
+                    // (the false path) jumps straight to the continuation. An
+                    // `if` that carries parameters needs an explicit else to
+                    // consume them (the interpreter's skip would strand them
+                    // on the false path), so it stays interpreted.
+                    if self.controls[idx].nparams > 0 {
+                        return Err("an if with parameters needs an else branch".to_string());
+                    }
                     if live {
                         let payload = self.label_args(r);
                         self.controls[idx].after_used = true;
@@ -1083,35 +1146,32 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// The branch target and payload arity of the control frame at `idx`: a
+    /// loop label branches to its header carrying `nparams` values (the next
+    /// iteration's parameters); block/if labels branch to the continuation
+    /// carrying `results` values. Marks the continuation used for block/if.
+    fn frame_target(&mut self, idx: usize) -> (Block, usize) {
+        if self.controls[idx].kind == CtlKind::Loop {
+            (
+                self.controls[idx].header.expect("loop header"),
+                self.controls[idx].nparams,
+            )
+        } else {
+            self.controls[idx].after_used = true;
+            (self.controls[idx].after, self.controls[idx].results)
+        }
+    }
+
     /// `br`: an unconditional jump to a label, carrying the label's payload
-    /// (the target block's results; nothing for a loop).
+    /// (a loop's parameters; a block/if's results).
     fn do_br(&mut self, depth: u32) -> Result<(), String> {
         let idx = self
             .controls
             .len()
             .checked_sub(1 + depth as usize)
             .ok_or("branch past the control stack")?;
-        let (kind, header, after, r) = {
-            let f = &self.controls[idx];
-            (
-                f.kind,
-                f.header,
-                f.after,
-                if f.kind == CtlKind::Loop {
-                    0
-                } else {
-                    f.results
-                },
-            )
-        };
+        let (target, r) = self.frame_target(idx);
         let payload = self.label_args(r);
-        let target = match kind {
-            CtlKind::Loop => header.ok_or("loop without a header")?,
-            _ => {
-                self.controls[idx].after_used = true;
-                after
-            }
-        };
         self.builder.ins().jump(target, &payload);
         self.dead = true;
         Ok(())
@@ -1128,31 +1188,10 @@ impl<'a> Lowerer<'a> {
             .len()
             .checked_sub(1 + depth as usize)
             .ok_or("branch past the control stack")?;
-        let (kind, header, after, r) = {
-            let f = &self.controls[idx];
-            (
-                f.kind,
-                f.header,
-                f.after,
-                if f.kind == CtlKind::Loop {
-                    0
-                } else {
-                    f.results
-                },
-            )
-        };
+        let (target, r) = self.frame_target(idx);
         let payload = self.label_args(r);
         let cont = self.builder.create_block();
-        match kind {
-            CtlKind::Loop => {
-                let header = header.ok_or("loop without a header")?;
-                self.builder.ins().brif(flag, header, &[], cont, &[]);
-            }
-            _ => {
-                self.controls[idx].after_used = true;
-                self.builder.ins().brif(flag, after, &payload, cont, &[]);
-            }
-        }
+        self.builder.ins().brif(flag, target, &payload, cont, &[]);
         self.builder.switch_to_block(cont);
         Ok(())
     }
@@ -1164,9 +1203,9 @@ impl<'a> Lowerer<'a> {
     /// each target, ending in an unconditional jump to the default.
     fn do_br_table(&mut self, targets: &[u32], default: u32) -> Result<(), String> {
         let index = self.pop().ok_or("operand stack underflow")?;
-        // Resolve the targets (loop labels branch to the header with nothing;
-        // block/if labels branch to the continuation with its results) and
-        // check they all agree on the payload arity.
+        // Resolve the targets (loop labels branch to the header with their
+        // parameters; block/if labels branch to the continuation with their
+        // results) and check they all agree on the payload arity.
         let mut resolved: Vec<(Block, usize)> = Vec::with_capacity(targets.len() + 1);
         let mut arity: Option<usize> = None;
         for &depth in targets.iter().chain(std::iter::once(&default)) {
@@ -1175,20 +1214,7 @@ impl<'a> Lowerer<'a> {
                 .len()
                 .checked_sub(1 + depth as usize)
                 .ok_or("branch past the control stack")?;
-            let kind = self.controls[frame].kind;
-            let (block, a) = if kind == CtlKind::Loop {
-                (
-                    self.controls[frame].header.ok_or("loop without a header")?,
-                    0,
-                )
-            } else {
-                let (after, results) = {
-                    let f = &self.controls[frame];
-                    (f.after, f.results)
-                };
-                self.controls[frame].after_used = true;
-                (after, results)
-            };
+            let (block, a) = self.frame_target(frame);
             if let Some(common) = arity {
                 if common != a {
                     return Err("br_table labels have different arities".to_string());
@@ -1282,16 +1308,19 @@ impl<'a> Lowerer<'a> {
             }
             Instr::Num(op) => self.lower_num(*op)?,
             Instr::Block(bt) => {
-                let results = block_results(bt).ok_or("unsupported block type")?;
-                self.open_block(results);
+                let (params, results) =
+                    block_sig(self.module, bt).ok_or("unsupported block type")?;
+                self.open_block(&params, &results);
             }
             Instr::Loop(bt) => {
-                let results = block_results(bt).ok_or("unsupported block type")?;
-                self.open_loop(results);
+                let (params, results) =
+                    block_sig(self.module, bt).ok_or("unsupported block type")?;
+                self.open_loop(&params, &results);
             }
             Instr::If(bt) => {
-                let results = block_results(bt).ok_or("unsupported block type")?;
-                self.open_if(results)?;
+                let (params, results) =
+                    block_sig(self.module, bt).ok_or("unsupported block type")?;
+                self.open_if(&params, &results)?;
             }
             Instr::Else => self.open_else()?,
             Instr::End => self.close_construct()?,
@@ -1328,6 +1357,7 @@ impl<'a> Lowerer<'a> {
 /// Lower `body` into `func`. Entry params: `(args, nargs, out, nout)`, all
 /// pointers/counts as `I64`; returns the trap code `I32`.
 fn lower(
+    module: &Module,
     body: &FuncBody,
     func_type: &FuncType,
     func: &mut Function,
@@ -1380,6 +1410,7 @@ fn lower(
 
     let mut lowerer = Lowerer {
         builder,
+        module,
         variables,
         stack: Vec::new(),
         out_ptr,
@@ -2130,6 +2161,26 @@ mod tests {
         }
     }
 
+    /// `module_with` plus a second type-section entry (`type index 1`) so a
+    /// `BlockType::Type(1)` can carry a parameterized/multi-value signature.
+    fn module_with_type(
+        body: Vec<Instr>,
+        params: Vec<ValType>,
+        locals: Vec<ValType>,
+        results: Vec<ValType>,
+        block: &FuncType,
+    ) -> Module {
+        Module {
+            types: vec![
+                SubType::func(params.clone(), results.clone()),
+                SubType::func(block.params.clone(), block.results.clone()),
+            ],
+            functions: vec![0],
+            bodies: vec![FuncBody { locals, body }],
+            ..Module::default()
+        }
+    }
+
     #[test]
     fn block_with_a_value_matches_the_interpreter() {
         // (block (result i32) (i32.const 40) (i32.const 2) i32.add)
@@ -2494,5 +2545,143 @@ mod tests {
             .map(|n| vec![Value::I32(n)])
             .collect::<Vec<_>>();
         assert_equiv(&sum, 0, &n_cases);
+    }
+
+    #[test]
+    fn parameterized_and_multi_value_blocks_match_the_interpreter() {
+        let i32_to_i32 = FuncType {
+            params: vec![ValType::I32],
+            results: vec![ValType::I32],
+        };
+        let two_i32_to_i32 = FuncType {
+            params: vec![ValType::I32, ValType::I32],
+            results: vec![ValType::I32],
+        };
+        let empty_to_two_i32 = FuncType {
+            params: vec![],
+            results: vec![ValType::I32, ValType::I32],
+        };
+
+        // block (param i32) (result i32): the parameter is the block's
+        // operand-stack input; the body adds 2 to it.
+        let block_param = module_with_type(
+            vec![
+                Instr::LocalGet(0),
+                Instr::Block(BlockType::Type(1)),
+                Instr::I32Const(2),
+                Instr::Num(NumOp::I32Add),
+                Instr::End,
+            ],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+            &i32_to_i32,
+        );
+        let x_cases = [-5i32, -1, 0, 3, 100]
+            .into_iter()
+            .map(|x| vec![Value::I32(x)])
+            .collect::<Vec<_>>();
+        assert_equiv(&block_param, 0, &x_cases);
+
+        // block (result i32 i32): multi-value results flow through the
+        // continuation's block parameters.
+        let block_multi = module_with_type(
+            vec![
+                Instr::Block(BlockType::Type(1)),
+                Instr::I32Const(7),
+                Instr::I32Const(9),
+                Instr::End,
+            ],
+            vec![],
+            vec![],
+            vec![ValType::I32, ValType::I32],
+            &empty_to_two_i32,
+        );
+        assert_equiv(&block_multi, 0, &[vec![]]);
+
+        // if (param i32) (result i32) with an else: the parameter enters both
+        // branches (the else restarts from the same value).
+        let if_param = module_with_type(
+            vec![
+                Instr::LocalGet(0),
+                Instr::LocalGet(1),
+                Instr::If(BlockType::Type(1)),
+                Instr::I32Const(3),
+                Instr::Num(NumOp::I32Mul),
+                Instr::Else,
+                Instr::I32Const(10),
+                Instr::Num(NumOp::I32Add),
+                Instr::End,
+            ],
+            vec![ValType::I32, ValType::I32],
+            vec![],
+            vec![ValType::I32],
+            &i32_to_i32,
+        );
+        let cond_cases = [(1i32, 5i32), (0, 5), (1, -3), (0, -3), (0, 0), (1, 0)]
+            .into_iter()
+            .map(|(c, x)| vec![Value::I32(c), Value::I32(x)])
+            .collect::<Vec<_>>();
+        assert_equiv(&if_param, 0, &cond_cases);
+
+        // loop (param i32) (result i32), single pass: the body adds 2 to the
+        // parameter and falls out of the loop's end.
+        let loop_param = module_with_type(
+            vec![
+                Instr::I32Const(1),
+                Instr::Loop(BlockType::Type(1)),
+                Instr::I32Const(2),
+                Instr::Num(NumOp::I32Add),
+                Instr::End,
+            ],
+            vec![],
+            vec![],
+            vec![ValType::I32],
+            &i32_to_i32,
+        );
+        assert_equiv(&loop_param, 0, &[vec![]]);
+
+        // loop (param i32 i32) (result i32), single pass adding both params.
+        let loop_two_params = module_with_type(
+            vec![
+                Instr::I32Const(1),
+                Instr::I32Const(2),
+                Instr::Loop(BlockType::Type(1)),
+                Instr::Num(NumOp::I32Add),
+                Instr::End,
+            ],
+            vec![],
+            vec![],
+            vec![ValType::I32],
+            &two_i32_to_i32,
+        );
+        assert_equiv(&loop_two_params, 0, &[vec![]]);
+
+        // A loop whose br_if back-edge carries the loop parameter: count up by
+        // 4 from 1 while below 10, exiting with the value that reached 10.
+        //   i32.const 1
+        //   loop (param i32) (result i32)
+        //     i32.const 4 i32.add local.tee 0
+        //     local.get 0 i32.const 10 i32.lt_u br_if 0
+        //   end
+        let loop_carry = module_with_type(
+            vec![
+                Instr::I32Const(1),
+                Instr::Loop(BlockType::Type(1)),
+                Instr::I32Const(4),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalTee(0),
+                Instr::LocalGet(0),
+                Instr::I32Const(10),
+                Instr::Num(NumOp::I32LtU),
+                Instr::BrIf(0),
+                Instr::End,
+            ],
+            vec![],
+            vec![ValType::I32],
+            vec![ValType::I32],
+            &i32_to_i32,
+        );
+        assert_equiv(&loop_carry, 0, &[vec![]]);
     }
 }
