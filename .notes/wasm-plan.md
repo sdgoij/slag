@@ -1438,3 +1438,26 @@ Every suite that previously carried quote-text pendings (baseline 600,
 pendings. Remaining skips are documented Cut 9 converter exclusions
 (`type-rec`, `type-equivalence`, GC multi-supertype text the `wast`
 grammar rejects) and one `gc` fixture.
+
+### GC type-lattice bottoms + null `exnref` (2026-09-06)
+
+`ref_null.wast` is green and left the exclusions. Two engine gaps and
+one runner gap:
+
+- `valid.rs`: hierarchy bottoms now subsume every concrete type of
+  their hierarchy (`nofunc` under any defined function type, `none`
+  under any defined struct/array type, spec 3.3.3), and `none` is
+  below `i31` — it is the bottom of the whole aggregate hierarchy
+  (spec: "common subtype of all forms of aggregate types"). The unit
+  test that asserted `none` and `i31` are siblings was spec-wrong and
+  is corrected.
+- `wasmtest`: `matches_expected` treats an `exnref` expectation like
+  the other reference kinds (a null expectation matches a null
+  reference; `ref.null exn` returned as a result was previously
+  unmatched, falling through to the numeric-value path).
+
+Measured: baseline `core/*.wast` 20,603 / 0 / 0 / 5 skip
+(`ref_null.wast` now runs). The remaining core exclusions are the
+isorecursive rec-group canonicalization wave (`type-equivalence`,
+`type-rec`, `exceptions/tag`), the `wast`-grammar multi-supertype limit
+(`gc/type-subtyping`), and harness tooling (`annotations`/`instance`/`names`).

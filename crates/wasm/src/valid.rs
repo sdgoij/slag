@@ -533,8 +533,8 @@ fn abs_sub(sub: &HeapType, sup: &HeapType) -> bool {
         I31 => sup == &Eq || sup == &Any,
         Struct => sup == &Eq || sup == &Any,
         Array => sup == &Eq || sup == &Any,
-        // `none` is the common subtype of all aggregates.
-        None => matches!(sup, Any | Eq | Struct | Array),
+        // `none` is the common subtype of all aggregates (incl. `i31`).
+        None => matches!(sup, Any | Eq | I31 | Struct | Array),
         NoFunc => sup == &Func,
         NoExtern => sup == &Extern,
         NoExn => sup == &Exn,
@@ -580,6 +580,17 @@ fn heap_sub(types: &[SubType], sub: &HeapType, sup: &HeapType) -> bool {
             }
             Option::None => false,
         },
+        // A hierarchy bottom is below every concrete type of that hierarchy:
+        // `nofunc` under any defined function type, `none` under any defined
+        // struct/array type (spec 3.3.3).
+        (NoFunc, Type(index)) => matches!(
+            types.get(*index as usize).map(|sub| &sub.composite),
+            Some(CompositeType::Func(_))
+        ),
+        (None, Type(index)) => matches!(
+            types.get(*index as usize).map(|sub| &sub.composite),
+            Some(CompositeType::Struct(_) | CompositeType::Array(_))
+        ),
         (abstract_sub, _) => abs_sub(abstract_sub, sup),
     }
 }
@@ -2369,12 +2380,14 @@ mod tests {
     #[test]
     fn gc_heap_subtyping_hierarchy() {
         use HeapType::*;
-        // Abstract lattice: none/struct/array/i31 sit under eq under any;
-        // function and extern hierarchies are disjoint from the GC one.
+        // Abstract lattice: none is the bottom of the aggregate hierarchy
+        // (below i31/struct/array, under eq under any); function and extern
+        // hierarchies are disjoint from the GC one.
         assert!(abs_sub(&None, &Eq));
         assert!(abs_sub(&None, &Any));
         assert!(abs_sub(&None, &Struct));
-        assert!(!abs_sub(&None, &I31));
+        assert!(abs_sub(&None, &Array));
+        assert!(abs_sub(&None, &I31));
         assert!(abs_sub(&I31, &Eq));
         assert!(abs_sub(&Struct, &Any));
         assert!(abs_sub(&NoFunc, &Func));

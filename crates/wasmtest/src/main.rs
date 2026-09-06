@@ -986,6 +986,7 @@ fn gc_expected_matches(expected: &str, reference: RefValue) -> bool {
         "i31ref" => kind == "i31",
         // `none` is a bottom type: no non-null value is a `nullref`.
         "nullref" => false,
+        "exnref" => kind == "exn",
         _ => false,
     }
 }
@@ -1052,7 +1053,7 @@ fn matches_expected(expected: &serde_json::Value, actual: WasmValue, module: usi
     // value "0" means "some non-null reference of this kind" (like funcref).
     if matches!(
         ty,
-        "anyref" | "eqref" | "structref" | "arrayref" | "i31ref" | "nullref"
+        "anyref" | "eqref" | "structref" | "arrayref" | "i31ref" | "exnref" | "nullref"
     ) {
         let WasmValue::Ref(reference) = actual else {
             return false;
