@@ -23,8 +23,12 @@
 //!   explicit else branch);
 //! - numeric loads/stores and `memory.size` over a module's single 32-bit
 //!   memory (index 0), bounds-checked inline against a per-call memory
-//!   pointer/length passed in the entry ABI. Memory growth, memory64,
-//!   multi-memory, globals, tables, calls, refs, SIMD, and GC are not
+//!   pointer/length passed in the entry ABI;
+//! - `global.get`/`global.set` of numeric module-defined globals, through a
+//!   caller-owned buffer (one u64 slot per used global): the compiled body
+//!   reads and mutates slots in place, so its writes reach the store even
+//!   when it traps. Imported globals (whose cells can alias), memory growth,
+//!   memory64, multi-memory, tables, calls, refs, SIMD, and GC are not
 //!   lowered yet.
 //!
 //! ABI: a compiled entry is
@@ -52,7 +56,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use crate::exec::ExecFail;
 use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
-use crate::module::{FuncBody, Module};
+use crate::module::{FuncBody, ImportDesc, Module};
 use crate::types::{BlockType, FuncType, ValType};
 use crate::values::{QNAN32, QNAN64, Trap, Value};
 
@@ -76,15 +80,18 @@ pub fn trap_of(code: i32) -> Trap {
 
 /// The native entry point produced by the compiler.
 ///
-/// `(args, nargs, mem, mem_len, out, nout)`: the module's single memory's
-/// data pointer and byte length (0/0 when the module has none), so compiled
-/// loads/stores can bounds-check and access memory without touching the
-/// store. Returns the trap code (0 = ok).
+/// `(args, nargs, mem, mem_len, gvals, out, nout)`: `mem`/`mem_len` are the
+/// module's single memory's data pointer and byte length (0/0 when absent);
+/// `gvals` is a caller-owned buffer, one u64 slot per module global the body
+/// uses, holding the initial values on entry and the (possibly mutated)
+/// values on return — so `global.set` is visible to the store even when a
+/// later instruction traps. Returns the trap code (0 = ok).
 pub type CompiledEntry = unsafe extern "C" fn(
     args: *const u64,
     nargs: u64,
     mem: *const u8,
     mem_len: u64,
+    gvals: *mut u64,
     out: *mut u64,
     nout: u64,
 ) -> i32;
@@ -94,12 +101,27 @@ pub type CompiledEntry = unsafe extern "C" fn(
 pub struct CompiledFunc {
     _code: ExecutableCode,
     entry: CompiledEntry,
+    /// The module global indices (index space) the body reads or writes, in
+    /// the same order as their `gvals` buffer slots.
+    globals: Vec<u32>,
 }
 
 impl CompiledFunc {
+    /// The module global indices whose values ride the per-call `gvals`
+    /// buffer (slot order).
+    pub fn used_globals(&self) -> &[u32] {
+        &self.globals
+    }
+
     /// Invoke the compiled body with `args` (bit patterns) and return the
     /// results (bit patterns) plus the trap code.
-    pub fn call(&self, args: &[u64], mem: (*const u8, u64), out: &mut [u64]) -> i32 {
+    pub fn call(
+        &self,
+        args: &[u64],
+        mem: (*const u8, u64),
+        globals: &mut [u64],
+        out: &mut [u64],
+    ) -> i32 {
         // SAFETY: `entry` is a plain function pointer into `_code`, which
         // this struct keeps alive and executable for its whole lifetime; the
         // caller passes buffers of the declared lengths and a memory pointer
@@ -110,6 +132,7 @@ impl CompiledFunc {
                 args.len() as u64,
                 mem.0,
                 mem.1,
+                globals.as_mut_ptr(),
                 out.as_mut_ptr(),
                 out.len() as u64,
             )
@@ -123,6 +146,7 @@ pub fn run_compiled(
     func: &CompiledFunc,
     ty: &FuncType,
     mem: (*const u8, u64),
+    globals: &mut [u64],
     args: &[Value],
 ) -> Result<Vec<Value>, ExecFail> {
     if args.len() != ty.params.len() {
@@ -140,7 +164,7 @@ pub fn run_compiled(
         input.push(bits);
     }
     let mut output = vec![0u64; ty.results.len()];
-    let code = func.call(&input, mem, &mut output);
+    let code = func.call(&input, mem, globals, &mut output);
     if code != TRAP_NONE {
         return Err(ExecFail::Trap(trap_of(code)));
     }
@@ -213,7 +237,11 @@ impl Engine {
             entry_signature(conv),
         );
         let mut fctx = FunctionBuilderContext::new();
-        lower(module, body, func_type, &mut func, &mut fctx, &*self.isa).ok()?;
+        let globals = body_globals(body);
+        lower(
+            module, body, func_type, &globals, &mut func, &mut fctx, &*self.isa,
+        )
+        .ok()?;
         let mut ctx = Context::for_function(func);
         let compiled = ctx.compile(&*self.isa, &mut ControlPlane::default()).ok()?;
         let code = ExecutableCode::new(compiled.code_buffer()).ok()?;
@@ -221,7 +249,11 @@ impl Engine {
         // the cast; a data pointer to a function pointer is a plain integer
         // cast on every supported (64-bit) target.
         let entry: CompiledEntry = unsafe { std::mem::transmute(code.as_ptr()) };
-        Some(CompiledFunc { _code: code, entry })
+        Some(CompiledFunc {
+            _code: code,
+            entry,
+            globals,
+        })
     }
 }
 
@@ -233,13 +265,14 @@ fn platform_call_conv(isa: &dyn TargetIsa) -> CallConv {
     }
 }
 
-/// `fn(args, nargs, mem, mem_len, out, nout) -> i32` (trap code).
+/// `fn(args, nargs, mem, mem_len, gvals, out, nout) -> i32` (trap code).
 fn entry_signature(conv: CallConv) -> Signature {
     let mut sig = Signature::new(conv);
     sig.params.push(AbiParam::new(types::I64)); // args pointer
     sig.params.push(AbiParam::new(types::I64)); // nargs
     sig.params.push(AbiParam::new(types::I64)); // memory data pointer
     sig.params.push(AbiParam::new(types::I64)); // memory byte length
+    sig.params.push(AbiParam::new(types::I64)); // global-values buffer
     sig.params.push(AbiParam::new(types::I64)); // out pointer
     sig.params.push(AbiParam::new(types::I64)); // nout
     sig.returns.push(AbiParam::new(types::I32)); // trap code
@@ -285,6 +318,36 @@ fn block_sig(module: &Module, bt: &BlockType) -> Option<(Vec<ValType>, Vec<ValTy
 /// be memory64 (multi-memory, memory64, and growth keep the interpreter).
 fn mem0_supported(module: &Module) -> bool {
     matches!(module.memories.first(), Some(mem) if !mem.memory64)
+}
+
+/// A module global's declared `(ValType, mutable)`, resolving index-space
+/// indices past the imported globals (imported globals may alias a shared
+/// cell, so compiled bodies only touch module-defined ones).
+fn defined_global(module: &Module, index: u32) -> Option<(ValType, bool)> {
+    let imported = module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Global(_)))
+        .count() as u32;
+    let slot = index.checked_sub(imported)?;
+    let global = module.globals.get(slot as usize)?;
+    Some((global.ty.value, global.ty.mutable))
+}
+
+/// The module global indices (index space) a body reads or writes, sorted
+/// and deduplicated (the order the `gvals` buffer slots use).
+fn body_globals(body: &FuncBody) -> Vec<u32> {
+    let mut indices: Vec<u32> = body
+        .body
+        .iter()
+        .filter_map(|instr| match instr {
+            Instr::GlobalGet(index) | Instr::GlobalSet(index) => Some(*index),
+            _ => None,
+        })
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
 }
 
 /// The byte width a load reads (little-endian, from the effective address).
@@ -341,6 +404,13 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
             mem0_supported(module) && *memory == 0
         }
         Instr::MemorySize(memory) => mem0_supported(module) && *memory == 0,
+        Instr::GlobalGet(index) => {
+            matches!(defined_global(module, *index), Some((ty, _)) if clif_type(ty).is_some())
+        }
+        Instr::GlobalSet(index) => matches!(
+            defined_global(module, *index),
+            Some((ty, true)) if clif_type(ty).is_some()
+        ),
         _ => false,
     })
 }
@@ -587,6 +657,11 @@ struct Lowerer<'a> {
     /// The module memory's data pointer and byte length (entry params 2/3).
     mem_ptr: ClifValue,
     mem_len: ClifValue,
+    /// The per-call global-values buffer (entry param 4): one u64 slot per
+    /// used module global. `globals` maps a module global index to its slot
+    /// position and clif type.
+    globals_ptr: ClifValue,
+    globals: Vec<(u32, Type)>,
     out_ptr: ClifValue,
     results: Vec<ValType>,
     controls: Vec<CtlFrame>,
@@ -946,6 +1021,79 @@ impl<'a> Lowerer<'a> {
         let pages = self.builder.ins().ushr(self.mem_len, sixteen);
         let pages32 = self.builder.ins().ireduce(types::I32, pages);
         self.stack.push(pages32);
+        Ok(())
+    }
+
+    /// `global.get`: read the module global's `gvals` buffer slot, narrowed
+    /// from the u64 slot to the global's value type.
+    fn do_global_get(&mut self, index: u32) -> Result<(), String> {
+        let (slot, ty) = self
+            .globals
+            .iter()
+            .position(|(i, _)| *i == index)
+            .map(|position| (position, self.globals[position].1))
+            .ok_or("unmapped global in the lowering subset")?;
+        let address = self
+            .builder
+            .ins()
+            .iadd_imm_s(self.globals_ptr, 8 * slot as i64);
+        let wide =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), address, Offset32::new(0));
+        let value = match ty {
+            types::I32 => self.builder.ins().ireduce(types::I32, wide),
+            types::F32 => {
+                let bits = self.builder.ins().ireduce(types::I32, wide);
+                self.builder
+                    .ins()
+                    .bitcast(types::F32, MemFlagsData::new(), bits)
+            }
+            types::I64 => wide,
+            types::F64 => self
+                .builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), wide),
+            _ => return Err("non-numeric global reached the lowerer".to_string()),
+        };
+        self.stack.push(value);
+        Ok(())
+    }
+
+    /// `global.set`: widen the value to the u64 `gvals` buffer slot. The
+    /// write lands in caller-owned memory immediately, so it is visible to
+    /// the store even when a later instruction traps.
+    fn do_global_set(&mut self, index: u32) -> Result<(), String> {
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let (slot, ty) = self
+            .globals
+            .iter()
+            .position(|(i, _)| *i == index)
+            .map(|position| (position, self.globals[position].1))
+            .ok_or("unmapped global in the lowering subset")?;
+        let wide = match ty {
+            types::I32 => self.builder.ins().uextend(types::I64, value),
+            types::F32 => {
+                let bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I32, MemFlagsData::new(), value);
+                self.builder.ins().uextend(types::I64, bits)
+            }
+            types::I64 => value,
+            types::F64 => self
+                .builder
+                .ins()
+                .bitcast(types::I64, MemFlagsData::new(), value),
+            _ => return Err("non-numeric global reached the lowerer".to_string()),
+        };
+        let address = self
+            .builder
+            .ins()
+            .iadd_imm_s(self.globals_ptr, 8 * slot as i64);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), wide, address, Offset32::new(0));
         Ok(())
     }
 
@@ -1519,6 +1667,8 @@ impl<'a> Lowerer<'a> {
                 self.builder.def_var(variable, value);
                 self.stack.push(value);
             }
+            Instr::GlobalGet(index) => self.do_global_get(*index)?,
+            Instr::GlobalSet(index) => self.do_global_set(*index)?,
             Instr::Drop => {
                 self.pop().ok_or("operand stack underflow")?;
             }
@@ -1601,12 +1751,15 @@ impl<'a> Lowerer<'a> {
     }
 }
 
-/// Lower `body` into `func`. Entry params: `(args, nargs, out, nout)`, all
-/// pointers/counts as `I64`; returns the trap code `I32`.
+/// Lower `body` into `func`. Entry params: `(args, nargs, mem, mem_len,
+/// gvals, out, nout)`, all pointers/counts as `I64`; returns the trap code
+/// `I32`. `used_globals` lists the module globals the body touches (their
+/// initial values arrive and final values leave through the `gvals` buffer).
 fn lower(
     module: &Module,
     body: &FuncBody,
     func_type: &FuncType,
+    used_globals: &[u32],
     func: &mut Function,
     fctx: &mut FunctionBuilderContext,
     isa: &dyn TargetIsa,
@@ -1616,7 +1769,19 @@ fn lower(
     builder.append_block_params_for_function_params(entry_block);
     builder.switch_to_block(entry_block);
     let params = builder.block_params(entry_block).to_vec();
-    let (args_ptr, mem_ptr, mem_len, out_ptr) = (params[0], params[2], params[3], params[4]);
+    let (args_ptr, mem_ptr, mem_len, globals_ptr, out_ptr) =
+        (params[0], params[2], params[3], params[4], params[5]);
+    // Each used module global gets a `gvals` buffer slot (slot == position).
+    let globals = used_globals
+        .iter()
+        .map(|index| {
+            let (ty, _) = defined_global(module, *index).expect("global type checked by lowerable");
+            (
+                *index,
+                clif_type(ty).expect("numeric global checked by lowerable"),
+            )
+        })
+        .collect::<Vec<_>>();
 
     // Locals: params come from the args buffer; declared locals default 0.
     let mut value_types: Vec<ValType> = func_type.params.clone();
@@ -1662,6 +1827,8 @@ fn lower(
         stack: Vec::new(),
         mem_ptr,
         mem_len,
+        globals_ptr,
+        globals,
         out_ptr,
         results: func_type.results.clone(),
         controls: Vec::new(),
@@ -1708,8 +1875,8 @@ mod tests {
     use super::*;
     use crate::exec::Store;
     use crate::instr::StoreOp;
-    use crate::module::{FuncBody, Module};
-    use crate::types::{BlockType, Limits, MemType, SubType};
+    use crate::module::{FuncBody, Global, Module};
+    use crate::types::{BlockType, GlobalType, Limits, MemType, SubType};
 
     fn int_module(body: Vec<Instr>, params: Vec<ValType>, results: Vec<ValType>) -> Module {
         Module {
@@ -2450,6 +2617,68 @@ mod tests {
             }],
             ..Module::default()
         }
+    }
+
+    /// A single-function module with module-defined globals (`ty`, init expr).
+    fn global_module(
+        body: Vec<Instr>,
+        params: Vec<ValType>,
+        results: Vec<ValType>,
+        globals: Vec<(GlobalType, Vec<Instr>)>,
+    ) -> Module {
+        Module {
+            types: vec![SubType::func(params.clone(), results.clone())],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body,
+            }],
+            globals: globals
+                .into_iter()
+                .map(|(ty, init)| Global { ty, init })
+                .collect(),
+            ..Module::default()
+        }
+    }
+
+    fn i32_global(mutable: bool, init: i32) -> (GlobalType, Vec<Instr>) {
+        (
+            GlobalType {
+                value: ValType::I32,
+                mutable,
+            },
+            vec![Instr::I32Const(init)],
+        )
+    }
+
+    /// Run an ordered sequence of `(function index, args)` invocations through
+    /// both paths on fresh stores and require every outcome (values or trap)
+    /// to agree, returning the interpreter outcomes so tests can assert on
+    /// cross-call global state.
+    fn run_seq(
+        module: &Module,
+        sequence: &[(usize, Vec<Value>)],
+    ) -> Vec<Result<Vec<Value>, ExecFail>> {
+        let mut compiled = Store::new();
+        let compiled_instance = compiled
+            .instantiate(module, &mut |_, _| None)
+            .expect("module instantiates");
+        let mut interpreter = Store::new();
+        interpreter.set_compile(false);
+        let interpreter_instance = interpreter
+            .instantiate(module, &mut |_, _| None)
+            .expect("module instantiates");
+        let mut outcomes = Vec::new();
+        for (index, args) in sequence {
+            let via_compiled = compiled.invoke(compiled_instance, *index, args);
+            let via_interpreter = interpreter.invoke(interpreter_instance, *index, args);
+            assert!(
+                via_compiled == via_interpreter,
+                "paths diverge for seq {sequence:?}: compiled={via_compiled:?} interpreter={via_interpreter:?}"
+            );
+            outcomes.push(via_interpreter);
+        }
+        outcomes
     }
 
     #[test]
@@ -3214,5 +3443,124 @@ mod tests {
         // memory.size reports the 1-page memory on both paths.
         let size_module = mem_module(vec![Instr::MemorySize(0)], vec![], vec![ValType::I32]);
         assert_equiv(&size_module, 0, &[vec![]]);
+    }
+
+    #[test]
+    fn globals_match_the_interpreter() {
+        // An immutable global read.
+        let get_only = global_module(
+            vec![Instr::GlobalGet(0)],
+            vec![],
+            vec![ValType::I32],
+            vec![i32_global(false, 5)],
+        );
+        assert_equiv(&get_only, 0, &[vec![]]);
+
+        // Mutable i32/i64 set-then-get inside one call (read-your-write).
+        let i32_rw = global_module(
+            vec![Instr::LocalGet(0), Instr::GlobalSet(0), Instr::GlobalGet(0)],
+            vec![ValType::I32],
+            vec![ValType::I32],
+            vec![i32_global(true, 0)],
+        );
+        let i32_cases = [-5i32, 0, 3, i32::MAX, i32::MIN]
+            .into_iter()
+            .map(|v| vec![Value::I32(v)])
+            .collect::<Vec<_>>();
+        assert_equiv(&i32_rw, 0, &i32_cases);
+        let i64_rw = global_module(
+            vec![Instr::LocalGet(0), Instr::GlobalSet(0), Instr::GlobalGet(0)],
+            vec![ValType::I64],
+            vec![ValType::I64],
+            vec![(
+                GlobalType {
+                    value: ValType::I64,
+                    mutable: true,
+                },
+                vec![Instr::I64Const(0)],
+            )],
+        );
+        let i64_cases = [-1i64, 0, 1, (1 << 40), i64::MAX, i64::MIN]
+            .into_iter()
+            .map(|v| vec![Value::I64(v)])
+            .collect::<Vec<_>>();
+        assert_equiv(&i64_rw, 0, &i64_cases);
+
+        // Float globals round-trip their raw bits.
+        let f32_rw = global_module(
+            vec![Instr::LocalGet(0), Instr::GlobalSet(0), Instr::GlobalGet(0)],
+            vec![ValType::F32],
+            vec![ValType::F32],
+            vec![(
+                GlobalType {
+                    value: ValType::F32,
+                    mutable: true,
+                },
+                vec![Instr::F32Const(0)],
+            )],
+        );
+        assert_equiv(&f32_rw, 0, &f32_unary());
+        let f64_rw = global_module(
+            vec![Instr::LocalGet(0), Instr::GlobalSet(0), Instr::GlobalGet(0)],
+            vec![ValType::F64],
+            vec![ValType::F64],
+            vec![(
+                GlobalType {
+                    value: ValType::F64,
+                    mutable: true,
+                },
+                vec![Instr::F64Const(0)],
+            )],
+        );
+        assert_equiv(&f64_rw, 0, &f64_unary());
+
+        // A global write before a trap must persist (wasm traps do not roll
+        // back prior writes): the compiled body sets the global through its
+        // caller-owned buffer and only then hits `unreachable`, so the store
+        // must still see the write afterwards.
+        let setter_getter = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32], vec![]),
+                SubType::func(vec![], vec![ValType::I32]),
+            ],
+            functions: vec![0, 1],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::GlobalSet(0), Instr::Unreachable],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::GlobalGet(0)],
+                },
+            ],
+            globals: vec![Global {
+                ty: GlobalType {
+                    value: ValType::I32,
+                    mutable: true,
+                },
+                init: vec![Instr::I32Const(0)],
+            }],
+            ..Module::default()
+        };
+        let outcomes = run_seq(
+            &setter_getter,
+            &[
+                (0, vec![Value::I32(42)]),
+                (1, vec![]),
+                (0, vec![Value::I32(-3)]),
+                (1, vec![]),
+            ],
+        );
+        assert!(matches!(
+            outcomes[0],
+            Err(ExecFail::Trap(Trap::Unreachable))
+        ));
+        assert!(matches!(
+            outcomes[2],
+            Err(ExecFail::Trap(Trap::Unreachable))
+        ));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(42)]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(-3)]));
     }
 }

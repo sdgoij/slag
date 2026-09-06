@@ -1808,3 +1808,25 @@ to-right`, `load`, `memory`, `memory_redundancy`, `memory_size`,
 total with the feature, clippy clean in both configurations. Wave 2
 remaining: `memory.grow`, memory64/multi-memory, globals, and the
 table/`call_indirect` family.
+
+Globals landed next: `global.get`/`global.set` of numeric module-defined
+globals lower through a caller-owned `gvals` buffer (one u64 slot per
+used global, entry ABI param 4, slot order = sorted used indices). The
+compiled body loads and stores slots in place, so a write is visible to
+the store even when a later instruction traps (the caller copies the
+buffer back to the store's cells after the call, success or trap) —
+wasm traps do not roll back prior writes. Only module-defined globals
+compile: an imported global's cell can alias another import (the same
+provider global imported twice), which the buffer model cannot express;
+import-touching bodies stay interpreted. The `lowerable` gate requires
+numeric defined globals (`global.set` additionally mutable), the entry
+reads current cell bits into the buffer before the call and writes the
+buffer back after. Unit coverage: immutable reads, i32/i64/f32/f64
+set-then-get round trips, a set-before-`unreachable` function whose
+write must persist to a following getter (cross-call), all through both
+the per-call equivalence harness and a new ordered `run_seq` helper.
+`wasmtest equiv` stays green over `global.wast`, `imports.wast`, and the
+memory/numeric regressions. 26 compile tests, 62 total with the
+feature, clippy clean in both configurations. Wave 2 remaining:
+`memory.grow` (needs store-side realloc), memory64/multi-memory, and the
+table/`call_indirect` family.

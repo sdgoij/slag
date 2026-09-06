@@ -1067,12 +1067,22 @@ impl Store {
         // interpreter run that never suspends. `set_compile(false)` forces
         // the interpreter for equivalence testing.
         #[cfg(feature = "compile")]
-        if !self.compile_off
-            && let Some(func) = self.instances[instance]
+        let compiled = if self.compile_off {
+            None
+        } else {
+            self.instances[instance]
                 .compiled
                 .get(defined)
                 .and_then(|entry| entry.as_ref())
-        {
+                .map(|func| func as *const crate::compile::CompiledFunc)
+        };
+        #[cfg(feature = "compile")]
+        if let Some(func_ptr) = compiled {
+            // SAFETY: the instance (and its compiled entries) is stable for
+            // this whole method — nothing below pushes to `instances`. The
+            // reference is only used to reach the native entry and the
+            // function's global metadata while we mutate global/memory cells.
+            let func = unsafe { &*func_ptr };
             // The module's single memory (index 0), as a raw pointer/len the
             // compiled body can bounds-check against. Nothing reallocates it
             // during the leaf call (growth is not in the compiled subset).
@@ -1083,8 +1093,36 @@ impl Store {
                 },
                 None => (std::ptr::null(), 0),
             };
-            let results = crate::compile::run_compiled(func, &signature, mem, args)?;
-            return Ok(RunProgress::Finished(results));
+            // The used globals' current bits ride a caller-owned buffer: the
+            // compiled body reads and mutates slots in place, so its writes
+            // are visible to the store even when it traps.
+            let used = func.used_globals().to_vec();
+            let cells = used
+                .iter()
+                .map(|index| self.instances[instance].globals[*index as usize])
+                .collect::<Vec<_>>();
+            let mut globals: Vec<u64> = cells
+                .iter()
+                .map(|cell| match self.globals[*cell] {
+                    Value::I32(bits) => bits as u32 as u64,
+                    Value::I64(bits) => bits as u64,
+                    Value::F32(bits) => u64::from(bits),
+                    Value::F64(bits) => bits,
+                    _ => 0,
+                })
+                .collect();
+            let result = crate::compile::run_compiled(func, &signature, mem, &mut globals, args);
+            for (cell, bits) in cells.iter().zip(&globals) {
+                let value = match self.global_types[*cell].value {
+                    ValType::I32 => Value::I32(*bits as u32 as i32),
+                    ValType::I64 => Value::I64(*bits as i64),
+                    ValType::F32 => Value::F32(*bits as u32),
+                    ValType::F64 => Value::F64(*bits),
+                    _ => continue,
+                };
+                self.globals[*cell] = value;
+            }
+            return Ok(RunProgress::Finished(result?));
         }
         let mut locals = args.to_vec();
         for ty in &declared {
