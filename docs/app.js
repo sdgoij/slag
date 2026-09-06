@@ -253,6 +253,67 @@ console.log('named groups:', JSON.stringify(match.groups));
 console.log('unicode property:', /^\\p{Script=Greek}+$/u.test('αβγ'));
 console.log('backreference:', /^(ab)\\1$/.test('abab'));
 `,
+  wasm: `// WebAssembly inside Slag: the whole engine is compiled to WebAssembly, and
+// its wasm engine runs wasm modules from JS. Bench it against the JS
+// interpreter (same --jit-bench idea, wasm engine vs JS, one row each).
+
+const bytes = new Uint8Array([0,97,115,109,1,0,0,0,1,17,3,96,1,127,1,127,96,2,127,127,1,127,96,1,126,1,126,3,5,4,0,1,0,2,7,27,4,3,102,105,98,0,0,4,119,111,114,107,0,1,4,104,97,115,104,0,2,3,108,99,103,0,3,10,209,1,4,28,0,32,0,65,2,73,4,127,32,0,5,32,0,65,1,107,16,0,32,0,65,2,107,16,0,106,11,11,68,1,4,127,2,64,3,64,32,2,32,0,79,13,1,32,2,32,1,110,33,4,32,2,32,1,112,33,5,32,3,65,31,108,32,4,65,7,108,106,32,5,65,13,108,106,65,255,255,255,255,7,113,33,3,32,2,65,1,106,33,2,12,0,11,11,32,3,11,55,1,2,127,2,64,3,64,32,1,32,0,79,13,1,32,2,65,237,156,153,142,4,108,32,2,65,17,118,32,1,115,106,65,255,255,255,255,7,113,33,2,32,1,65,1,106,33,1,12,0,11,11,32,2,11,53,1,1,126,2,64,3,64,32,0,80,13,1,32,1,66,173,254,213,228,212,133,253,168,216,0,126,66,207,130,158,187,239,239,222,130,20,124,33,1,32,0,66,1,125,33,0,12,0,11,11,32,1,11]);
+const wasm = new WebAssembly.Instance(new WebAssembly.Module(bytes), {}).exports;
+
+function jsFib(n) { return n < 2 ? n : jsFib(n - 1) + jsFib(n - 2); }
+function jsWork(total, cols) {
+  let acc = 0;
+  for (let t = 0; t < total; t++) {
+    const i = (t / cols) | 0, j = t % cols;
+    acc = (acc * 31 + i * 7 + j * 13) & 0x7fffffff;
+  }
+  return acc;
+}
+function jsHash(iters) {
+  let acc = 0;
+  for (let t = 0; t < iters; t++) acc = (Math.imul(acc, 1103515245) + ((acc >> 17) ^ t)) & 0x7fffffff;
+  return acc;
+}
+function jsLcg(n) {
+  let x = 0n;
+  const a = 6364136223846793005n, c = 1442695040888963407n, mask = 0xffffffffffffffffn;
+  for (let i = 0n; i < n; i++) x = (x * a + c) & mask;
+  return x >= 0x8000000000000000n ? x - 0x10000000000000000n : x; // signed i64
+}
+
+const pad = (s, n) => String(s).padEnd(n);
+function time(reps, fn) {
+  const start = Date.now();
+  let r;
+  for (let i = 0; i < reps; i++) r = fn();
+  return [Date.now() - start, r];
+}
+function bench(name, j, w, reps) {
+  reps = reps === undefined ? 1 : reps;
+  const [jMs, jR] = time(reps, j);
+  const [wMs, wR] = time(reps, w);
+  const ok = wR === jR ? 'result-ok' : 'MISMATCH wasm=' + wR + ' js=' + jR;
+  console.log(pad(name, 26) + 'js ' + pad(jMs + 'ms', 8) + 'wasm ' + pad(wMs + 'ms', 9) + 'wasm/js ' + pad((wMs / jMs).toFixed(2), 7) + ok);
+}
+
+console.log('wasm vs js micro-benchmarks: JS interpreter (base) vs wasm engine,');
+console.log('both running inside Slag (which is itself compiled to wasm).');
+console.log('wasm/js ratio < 1 = wasm wins, > 1 = JS faster.');
+console.log(pad('workload', 26) + 'js       wasm      wasm/js  ');
+
+wasm.fib(12); jsFib(12); wasm.work(1000, 10); jsWork(1000, 10);
+wasm.hash(1000); jsHash(1000); wasm.lcg(1000n); jsLcg(1000n);
+
+const FIB_N = 25;
+const WORK_TOTAL = 500000, WORK_COLS = 1000;
+const HASH_N = 500000;
+const LCG_N = 700000n;
+bench('fib(' + FIB_N + ')', () => jsFib(FIB_N), () => wasm.fib(FIB_N));
+bench('work(' + WORK_TOTAL + ', ' + WORK_COLS + ')', () => jsWork(WORK_TOTAL, WORK_COLS), () => wasm.work(WORK_TOTAL, WORK_COLS));
+bench('hash(' + HASH_N + ')', () => jsHash(HASH_N), () => wasm.hash(HASH_N));
+bench('lcg(' + LCG_N + ')', () => jsLcg(LCG_N), () => wasm.lcg(LCG_N));
+'wasm vs js: 4 workloads done'
+`,
 };
 exampleEl.addEventListener('change', () => {
   const source = EXAMPLES[exampleEl.value];

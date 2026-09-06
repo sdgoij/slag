@@ -531,6 +531,7 @@
                 <option value="objects">objects & json</option>
                 <option value="async">async & timers</option>
                 <option value="regexp">regexp</option>
+                <option value="wasm">wasm vs js bench</option>
               </select>
               <select id="run-mode" class="mode-select" aria-label="Run mode" title="What Run does with the editor contents">
                 <option value="execute">Execute</option>
@@ -614,17 +615,27 @@ python -m http.server    # then open the served docs/index.html</code></pre>
       import { instantiate } from './slag.js';
 
       const bootLog = document.getElementById('out');
+      // Mirror engine console lines to the browser console (devtools).
+      // Sandbox lines are the user script's own output (level-faithful); the
+      // app engine's lines are the framework's logs, prefixed `[app]`.
+      const mirrorConsole = (level, text) => {
+        const method = { 0: 'log', 1: 'info', 2: 'warn', 3: 'error', 4: 'debug', 5: 'error' }[level] ?? 'log';
+        const line = level === 5 ? `[unhandled rejection] ${text}` : text;
+        const fn = console[method];
+        if (typeof fn === 'function') fn.call(console, line);
+        else console.log(line);
+      };
+      const appConsole = {
+        log: (text) => console.log('[app]', text),
+        info: (text) => console.info('[app]', text),
+        warn: (text) => console.warn('[app]', text),
+        error: (text) => console.error('[app]', text),
+        debug: (text) => console.debug('[app]', text),
+      };
       try {
         const response = await fetch('slag.wasm');
         if (!response.ok) throw new Error(`fetch slag.wasm: ${response.status}`);
         const bytes = await response.arrayBuffer();
-        const silent = {
-          log: () => {},
-          info: () => {},
-          warn: () => {},
-          error: () => {},
-          debug: () => {},
-        };
 
         // Requests from the app (in the UI engine) arrive through
         // __host.userRun/userReset and are queued here. Ops run on a
@@ -663,7 +674,9 @@ python -m http.server    # then open the served docs/index.html</code></pre>
               }
             } catch (error) {
               if (op.kind === 'run') {
-                deliverLine(7, 0, error && error.message ? error.message : String(error));
+                const message = error && error.message ? error.message : String(error);
+                deliverLine(7, 0, message);
+                console.error(message);
               } else {
                 bootLog.textContent = `sandbox reset failed: ${error.message}`;
               }
@@ -686,27 +699,26 @@ python -m http.server    # then open the served docs/index.html</code></pre>
         };
 
         ui = await instantiate(bytes, {
-          console: silent,
+          console: appConsole,
           userRun,
           userReset,
         });
         sandbox = await instantiate(bytes, {
           dom: false,
           console: {
-            log: () => {},
-            info: () => {},
-            warn: () => {},
-            error: () => {},
-            debug: () => {},
-            // Receive the level (0-4 console, 5 rejection) so the UI can
-            // render rejections distinctly from console.error.
-            __raw: (level, text) => deliverLine(level, 0, text),
+            // Every console.* line and unhandled rejection (level 5) lands
+            // here: render into the page pane and mirror to devtools.
+            __raw: (level, text) => {
+              deliverLine(level, 0, text);
+              mirrorConsole(level, text);
+            },
           },
         });
 
-        const app = await (await fetch('./app.js')).text();
+        const app = await (await fetch(`./app.js?v=${Date.now()}`)).text();
         ui.eval(app);
       } catch (error) {
+        console.error('Could not start the engine:', error);
         bootLog.textContent = `Could not start the engine:: ${error.message}`;
       }
     </script>
