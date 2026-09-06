@@ -1,20 +1,20 @@
-# wasmtest run exclusions — the written taxonomy for the wasm cuts.
+# wasmtest run exclusions — the written taxonomy for the wasm suite.
 #
-# A `.wast` listed here prints as `skip` when a suite is run, so a file the
-# engine cannot yet handle does not fail the CI gate. Each entry names the
-# file and why it is excluded; a file belongs here only while a later cut owns
-# its feature. The in-process converter (the `wast` crate) parses every entry;
-# the remaining reasons are engine-side or Cut 9 work.
+# A file listed here prints as `skip` when a suite is run. Every entry names
+# the file and why it is excluded. No engine-gap exclusions remain (the core
+# and JS-API corpora run green); what is left is harness tooling, proposals
+# outside the supported corpus, or a `wast`-grammar limit. The in-process
+# converter (the `wast` crate) parses every entry.
 
 # Harness tooling the engine has no counterpart for.
 waspec/test/core/annotations.wast :: annotation directives are harness tooling, not engine features
 waspec/test/core/instance.wast :: module-linking `(instance ...)` is outside the supported corpus
 waspec/test/core/names.wast :: export names use confusing-unicode strings the `wast` lexer rejects
 
-# The GC proposal corpus: one remaining file uses multi-supertype fixtures the
-# `wast` grammar (and the decoder's single-supertype model) rejects; the rest
-# of the directory runs green as of Cut 9 wave 3.
-waspec/test/core/gc/type-subtyping.wast :: multi-supertype fixtures the `wast` grammar rejects (Cut 9)
+# The GC proposal corpus runs green except one file whose multi-supertype
+# fixtures the `wast` grammar (and the engine's single-supertype type model)
+# rejects.
+waspec/test/core/gc/type-subtyping.wast :: multi-supertype fixtures the `wast` grammar rejects
 
 # JS-API fixtures (`wasmtest jsapi`). `limits.any.js` is the embedder-limit
 # conformance file (WPT marks it `timeout=long`): it builds and validates

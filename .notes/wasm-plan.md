@@ -695,6 +695,52 @@ intrinsic identity like every other agent-dependent builtin.
   set (`limits.any.js` stays excluded: embedder-limit conformance whose
   `maxMemories = 1` subtest conflicts with the landed multi-memory
   support). Runtime suite: 729 tests pass.
+- **Cut 10 exit — standalone WebAssembly smoke (landed 2026-09-06):** the
+  `wasm_smoke` example's default self-test compiles, instantiates, and
+  calls a wasm module from JS (`add(20, 22)` → 42) and reads a
+  `WebAssembly.Memory`/`Global`; `cargo run -p slag --example wasm_smoke`
+  asserts the output and exits non-zero on any mismatch. The browser demo
+  pages were intentionally left untouched — wasm correctness is gated by
+  the `wasmtest` CLI corpora, not by the dogfood UI.
+
+### Cut 11 — Compilation: wasm-to-native via Cranelift (planned, not started)
+
+Not a conformance cut: the interpreter is green against the full corpus and
+stays the correctness oracle. Cut 11 is a performance path — a wasm-to-
+native compiler over the existing Cranelift dependency, reusing the Slag
+JIT's `Step`-lowering lessons — that must not change observable behavior.
+
+Scope:
+- A compile stage after `validate` succeeds: lower each function body to a
+  Cranelift function whose ABI mirrors the interpreter's value model,
+  passing the store, instance, and memory/table cells by handle.
+- The call graph: direct wasm-to-wasm calls stay native; calls into
+  imported host/JS functions and host calls into compiled wasm cross the
+  same boundary the interpreter uses (the resumable `HostRequest`/
+  `RunProgress` split), so compiled frames must be unwound or recorded at
+  host-call boundaries.
+- Fallbacks: any body the compiler cannot lower keeps the interpreter's
+  `Step` loop, giving a per-function compiled/interpreted split with a
+  shared value protocol.
+- Stack: preserve the depth limit and `assert_exhaustion` behavior with a
+  Cranelift-native guard (the interpreter's `DEFAULT_DEPTH_LIMIT`
+  contract).
+
+Key decisions to ratify in review (mirroring the Slag JIT's conventions):
+- The helper ABI for memory/table access, host calls, GC allocation, and
+  traps, plus how `throw`/`try_table` exceptions lower (the interpreter's
+  in-flight `ExceptionInst` pool vs native unwind).
+- A compile threshold (the Slag JIT's `Cut 69` analogue): compile simple /
+  hot bodies only, dispatch everything else to the interpreter.
+- Whether GC `RefValue`s stay pool ids (objects are already store-pool ids,
+  so cross-compiled/interpreter references should need no new
+  representation).
+
+Verification: an equivalence harness runs the corpus's `action`/
+`assert_return` commands through both paths with compilation forced and
+compares outcomes bit-for-bit (results, trap kinds, NaN patterns,
+exceptions). Compiled-only runs must reproduce the Cut 10 totals
+(baseline core 20,662 / 0 / 0 and the feature dirs).
 
 ## 6. Verification workflow
 
@@ -702,20 +748,23 @@ intrinsic identity like every other agent-dependent builtin.
   edges, floats, traps) plus `cargo run -p wasmtest` over the cut's gate
   files; the runner reports pass/fail/hang per file like the test262 sweep.
 - Full-workspace gates after every cut: `cargo clippy -- -D warnings` and
-  the native/wasm builds of the embedding demo (the browser demo gets a
-  `WebAssembly` smoke once Cut 10 lands).
+  the native/wasm builds of the embedding demo. Wasm correctness is gated
+  by the `wasmtest` CLI corpora plus the standalone `wasm_smoke` example
+  (which asserts its output; it is not part of the browser demo).
+- Cut 11 has no new suite: its gate is the equivalence harness (see Cut
+  11), which must reproduce the interpreter's corpus totals when
+  compilation is forced.
 - A cut is only "done" when its suite reports **0 failures** and any
   deliberate exclusions have a written taxonomy entry (the test262
   convention), not silent skips.
 
 ## 7. Future work (post-baseline, deliberately out of the cuts above)
 
-- **Compilation**: a wasm-to-native pass (the obvious long-term path is
-  Cranelift, reusing the JIT dependency and its `Step`-lowering lessons);
-  until then the interpreter is the sole execution path.
-- **Threads/shared memory**: `shared` memories + `atomic.*` ops wired into
-  the existing workers/`Atomics` machinery once multi-agent memory is in
-  place.
+- **Compilation**: now Cut 11 above; until it lands the interpreter is the
+  sole execution path.
+- **Threads/shared memory**: `atomic.*` ops wired into the existing
+  workers/`Atomics` machinery once multi-agent memory is in place (shared
+  memories themselves already work — Cut 10).
 - **Web API** (`WebAssembly.instantiateStreaming`/fetch integration,
   `document/web-api`) — a host concern for the browser demo, not the core
   engine.
@@ -1494,3 +1543,28 @@ single remaining skip the `wast`-grammar multi-supertype file
 (`gc/type-subtyping`). Remaining core skips are harness tooling
 (`annotations`/`instance`/`names`) and that one converter limit. The
 JS-API corpus is unchanged at 1001 / 0.
+
+### Conformance baseline complete; Cut 11 defined (2026-09-06)
+
+The in-scope conformance surface is done: the core suite (baseline +
+all proposal dirs) and the JS-API corpus report zero failures and zero
+pendings, and no engine-gap exclusions remain — the exclusions file now
+holds only harness tooling, out-of-scope proposals, and the one
+`wast`-grammar limit. Housekeeping: the stale `exec.rs` module header
+(GC no longer unimplemented) and the `wasm-exclusions.txt` header were
+updated. Cut 11 (Compilation: wasm-to-native via Cranelift) was added to
+section 5 as a planned, not-started performance cut with an equivalence
+harness as its gate; the matching future-work bullet in section 7 was
+reworded.
+
+### Cut 10 exit: standalone WebAssembly smoke (2026-09-06)
+
+The final Cut 10 exit item landed as a standalone example, not in the
+browser demo. `wasm_smoke`'s default self-test compiles, instantiates,
+and calls a wasm module from JS (`add(20, 22)` → 42) and reads a
+`WebAssembly.Memory`/`Global`; `cargo run -p slag --example wasm_smoke`
+asserts the output and exits non-zero on any mismatch. The browser demo
+pages (`browser/demo.html`, `docs/index.html`) and `wasm_binding` were
+left untouched — wasm correctness is already verified by the `wasmtest`
+CLI corpora, and the dogfood UI is for the JS engine, not a wasm
+showcase.

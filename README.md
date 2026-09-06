@@ -17,8 +17,8 @@ areas (a fourth `intl402` area runs the ECMA-402 fixtures). That includes
 the **Intl** surface (ECMA-402 Cuts 1–8: NumberFormat, Locale,
 PluralRules, RelativeTimeFormat, ListFormat, DisplayNames, DateTimeFormat,
 Collator, Segmenter, DurationFormat), and **Temporal**. It ships a
-command-line runner/REPL, a small embedding API, and drop-in
-JavaScriptCore C-API bindings.
+command-line runner/REPL, a full WebAssembly engine and its JavaScript
+API, a small embedding API, and drop-in JavaScriptCore C-API bindings.
 
 ## Highlights
 
@@ -34,6 +34,13 @@ JavaScriptCore C-API bindings.
   Proxy/Reflect, TypedArrays, SharedArrayBuffer/Atomics with worker
   threads, full Intl (ECMA-402 Cuts 1–8), and Temporal (the intl402×
   Temporal integration, Cut 9, is in flight).
+- **Full WebAssembly runtime + JS API** — a from-scratch engine
+  (`crates/wasm`) plus the document/js-api surface, validated against the
+  pinned `waspec` corpus: **64,594 core checks / 0 fail** and **1,001
+  JS-API tests / 0 fail**. Covers GC (struct/array/i31, casts),
+  exceptions, SIMD + relaxed SIMD, memory64, multi-memory, and bulk
+  memory; every realm gets the `WebAssembly` global (V8/Node parity — no
+  bare-`.wasm`-file mode).
 - **Experimental Cranelift JIT** — compiled bodies run as native machine
   code via [Cranelift](https://cranelift.dev): inline number/string fast
   paths, direct-mapped global/member value cells, and register-resident
@@ -80,7 +87,10 @@ The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
 `--bench` (interpreter micro-benchmarks), and — when the JIT feature is
 compiled, the default — `--jitless` (disable the Cranelift JIT for the run;
 it is on by default) and `--jit-bench` (time JIT vs interpreter). `--help`
-lists the optional flags and the compiled features. `--jsx` parses
+lists the optional flags and the compiled features (the list always leads
+with `wasm` — the WebAssembly JS API is compiled in unconditionally).
+Scripts get the full `WebAssembly` global in every realm, matching
+V8/Node. `--jsx` parses
 the input with the opt-in JSX extension (`<element/>` syntax desugaring to
 `rlx.h(...)` calls). Building the
 CLI with the `raylib` feature exposes the `rl` host module to every
@@ -174,6 +184,62 @@ deadline; the long config (`--timeout 120 --recheck-timeout 120`)
 reclassifies them as passes. The full methodology and triage live in
 `.notes/conformance.md`.
 
+## WebAssembly
+
+Slag also ships a from-scratch WebAssembly engine and the full
+`WebAssembly` JavaScript API (document/js-api). The engine
+(`crates/wasm`) implements binary decoding, validation, and execution for
+the pinned WebAssembly spec corpus, covering the merged post-MVP
+proposals: typed references and tail calls, tables and bulk memory,
+exceptions (`throw`/`try_table`/`throw_ref`), SIMD and relaxed SIMD, GC
+(`struct`/`array`/`i31`, `ref.test`/`ref.cast` and subtyping), memory64,
+and multi-memory. The JS-API layer surfaces
+`WebAssembly.Module/Instance/Memory/Table/Global/Tag/Exception`, the error
+constructors, `compile`/`instantiate`/`validate`, `WebAssembly.JSTag`,
+BigInt/i64 across the JS boundary, and shared-memory grow semantics.
+`WebAssembly` is installed in every realm, so CLI/embed scripts use it
+exactly as they would under V8 or Node (there is deliberately no bare
+`.wasm`-file mode — Node and d8 do not have one either).
+
+Conformance is gated by the pinned `waspec` submodule (init it with `git
+submodule update --init` alongside `test262`): the core corpus — the
+baseline files plus each proposal directory — and the JS-API fixtures all
+report **0 failures and 0 pendings**:
+
+| Suite | Pass / fail |
+|---|---|
+| baseline `core/*.wast` | 20,662 / 0 |
+| `exceptions/` | 105 / 0 |
+| `simd/` | 25,990 / 0 |
+| `relaxed-simd/` | 77 / 0 |
+| `multi-memory/` | 912 / 0 |
+| `memory64/` | 8,709 / 0 |
+| `gc/` | 654 / 0 |
+| `bulk-memory/` | 7,485 / 0 |
+| **core total** | **64,594 / 0** |
+| JS-API (`js-api`) | 1,001 / 0 |
+
+The only non-runnable files are documented taxonomy entries, not silent
+skips: three harness-tooling files in the baseline (`annotations`,
+module-linking `instance`, and `names` — confusing-unicode export names),
+one `gc/type-subtyping.wast` whose multi-supertype text the `wast`
+grammar rejects, and the out-of-scope `gc`/`js-string` JS-API proposals
+(the embedder-limit `limits.any.js` runs on demand).
+
+Run the sweeps with the `wasmtest` runner. Duplicate `.wast` file names
+across directories share the runner's cache key, so each suite directory
+runs separately:
+
+```sh
+cargo run -p wasmtest -- run waspec/test/core/*.wast   # baseline (top-level files)
+cargo run -p wasmtest -- run waspec/test/core/simd      # ... and each proposal dir
+cargo run -p wasmtest -- run waspec/test/core/gc
+cargo run -p wasmtest -- jsapi waspec/test/js-api       # the JS-API fixtures
+```
+
+The implementation plan, cut history, and status live in
+`.notes/wasm-plan.md`.
+
 ## Repository layout
 
 | Crate | Responsibility |
@@ -185,6 +251,8 @@ reclassifies them as passes. The full methodology and triage live in
 | `parser` | Recursive-descent parser, cover grammar, early errors |
 | `regexp` | RegExp pattern parser + backtracking matcher |
 | `runtime` | Realms, environments, evaluation, modules, all built-ins (incl. Intl + Temporal), `Context` |
+| `wasm` | WebAssembly engine: decode, validation, and execution (GC, exceptions, SIMD + relaxed SIMD, memory64/multi-memory, bulk memory) |
+| `wasmtest` | The pinned `waspec` corpus + the wasm conformance runner (`run` for core, `jsapi` for the JS-API fixtures) |
 | `jit` | Experimental Cranelift JIT backend for the interpreter's certified `Step` bytecode (CLI feature `jit`, on by default) |
 | `ffi` | Shared C-ABI plumbing for the drop-in surfaces (handle tables, value/string marshaling) |
 | `jsc` | Drop-in JavaScriptCore C API (`JSContextRef` family) backed by Slag; not in the default build (`cargo build -p jsc`, or alongside the CLI with `cargo build -p cli --features jsc`) |
@@ -199,6 +267,7 @@ reclassifies them as passes. The full methodology and triage live in
 - `.notes/intl-plan.md` — the ECMA-402 (Intl) implementation plan and cut status
 - `.notes/jit-report.md` — the experimental Cranelift JIT: design, fast paths, hardening, validation, and remaining work
 - `.notes/memory-model.md` — ECMAScript ch. 28 shared-memory model
+- `.notes/wasm-plan.md` — the WebAssembly engine plan: cuts, decisions, conformance status
 - `.notes/perf.md` — performance milestones and deferred work
 
 ## License

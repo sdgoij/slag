@@ -163,11 +163,41 @@ pub extern "C" fn panic_len() -> usize {
 }
 
 fn main() {
-    // The native-host self-test exercises the same `evaluate` path.
-    let script = "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } \
-                  console.log('wasm smoke', fib(10)); fib(10)";
-    match evaluate(script) {
-        Ok(out) => println!("{out}"),
-        Err(error) => eprintln!("{error}"),
+    // The standalone WebAssembly smoke (Cut 10 exit): compile, instantiate,
+    // and call a wasm module from JS, plus Memory/Global access. It runs the
+    // same evaluate path a browser host drives, so `cargo run -p slag
+    // --example wasm_smoke` verifies the embed end to end on any host.
+    let script = "const bytes = new Uint8Array([\
+        0,97,115,109,1,0,0,0,\
+        1,7,1,96,2,127,127,1,127,\
+        3,2,1,0,\
+        7,7,1,3,97,100,100,0,0,\
+        10,9,1,7,0,32,0,32,1,106,11]);\
+        const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), {});\
+        const sum = instance.exports.add(20, 22);\
+        const memory = new WebAssembly.Memory({ initial: 1 });\
+        new Uint8Array(memory.buffer)[0] = 42;\
+        const global = new WebAssembly.Global({ value: 'i32', mutable: true }, 5);\
+        console.log('wasm add(20, 22) =', sum);\
+        console.log('memory[0] =', new Uint8Array(memory.buffer)[0]);\
+        console.log('global.value =', global.value);\
+        'wasm smoke ok'";
+    let output = match evaluate(script) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("wasm smoke: {error}");
+            std::process::exit(1);
+        }
+    };
+    println!("{output}");
+    let expected = [
+        "wasm add(20, 22) = 42",
+        "memory[0] = 42",
+        "global.value = 5",
+        "wasm smoke ok",
+    ];
+    if !expected.iter().all(|line| output.contains(line)) {
+        eprintln!("wasm smoke: output did not match the expected lines");
+        std::process::exit(1);
     }
 }

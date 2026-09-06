@@ -12,8 +12,8 @@
 //! bounded by a configured limit instead of the host stack. Numeric semantics
 //! live in [`crate::values`].
 //!
-//! Not executed yet ([`ExecFail::Unsupported`]): GC reference operations
-//! (Cut 9) and threads/shared memory.
+//! Not executed yet ([`ExecFail::Unsupported`]): threads and the atomic
+//! memory operations (a separate proposal outside the pinned corpus).
 
 use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};

@@ -189,28 +189,24 @@ fn report(error: impl std::fmt::Display) -> u8 {
     1
 }
 
-/// The cargo features this binary was compiled with, shown in `--help` so a
-/// user can see which optional surfaces are active. `cfg!` is a compile-time
-/// constant here, so the list reflects this build exactly.
+/// The surfaces this binary was compiled with, shown in `--help` so a user
+/// can see what is active. The WebAssembly JS API ships unconditionally (the
+/// runtime depends on `crates/wasm` and installs the global in every realm);
+/// the cargo-optional surfaces follow it. `cfg!` is a compile-time constant,
+/// so the list reflects this build exactly.
 fn compiled_features() -> String {
-    const NAMES: [&str; 4] = ["jit", "jsc", "raylib", "raygui"];
-    let active = [
-        cfg!(feature = "jit"),
-        cfg!(feature = "jsc"),
-        cfg!(feature = "raylib"),
-        cfg!(feature = "raygui"),
-    ];
-    let enabled: Vec<&str> = NAMES
-        .iter()
-        .zip(active)
-        .filter(|(_, on)| *on)
-        .map(|(name, _)| *name)
-        .collect();
-    if enabled.is_empty() {
-        "none".to_string()
-    } else {
-        enabled.join(", ")
+    let mut enabled = vec!["wasm"];
+    for (name, on) in [
+        ("jit", cfg!(feature = "jit")),
+        ("jsc", cfg!(feature = "jsc")),
+        ("raylib", cfg!(feature = "raylib")),
+        ("raygui", cfg!(feature = "raygui")),
+    ] {
+        if on {
+            enabled.push(name);
+        }
     }
+    enabled.join(", ")
 }
 
 /// Parse and evaluate a script file (spec 16.1: ParseScript +
