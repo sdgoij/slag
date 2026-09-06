@@ -9,14 +9,16 @@
 //! function):
 //! - function signatures and locals over `i32`/`i64`/`f32`/`f64`;
 //! - `const`, `local.get/set/tee`, `drop`, `select`, numeric `Num` ops
-//!   (integer arithmetic/comparisons, the float ops below, and
-//!   `i64.wrap_i32`), `nop`, `unreachable`, and `return`;
+//!   (integer arithmetic/comparisons/shifts, `clz`/`ctz`/`popcnt`, the
+//!   float ops below, and `i64.wrap_i32`), `nop`, `unreachable`, and
+//!   `return`;
 //! - float arithmetic/rounding/sqrt/comparisons reproduce the
 //!   interpreter's canonical-quiet-NaN policy exactly (`abs`/`neg`/
 //!   `copysign` stay raw bit ops); `f32.min/max` and the
 //!   promote/demote conversions are deferred;
-//! - structured control flow (`block`/`loop`/`if`/`else`/`br`/`br_if`)
-//!   with empty or single-result block types (float or integer).
+//! - structured control flow (`block`/`loop`/`if`/`else`/`br`/`br_if`/
+//!   `br_table`) with empty or single-result block types (float or
+//!   integer).
 //! - memory, globals, tables, calls, refs, SIMD, and GC are not lowered yet.
 //!
 //! ABI: a compiled entry is
@@ -252,7 +254,7 @@ fn lowerable(func_type: &FuncType, body: &FuncBody) -> bool {
         | Instr::Return => true,
         Instr::Num(op) => supported_num(*op),
         Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_results(bt).is_some(),
-        Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) => true,
+        Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) | Instr::BrTable { .. } => true,
         _ => false,
     })
 }
@@ -277,6 +279,8 @@ fn supported_num(op: NumOp) -> bool {
             | I32ShrU
             | I32Rotl
             | I32Rotr
+            | I32Clz
+            | I32Ctz
             | I32Popcnt
             // i64 arithmetic.
             | I64Add
@@ -294,6 +298,8 @@ fn supported_num(op: NumOp) -> bool {
             | I64ShrU
             | I64Rotl
             | I64Rotr
+            | I64Clz
+            | I64Ctz
             | I64Popcnt
             // Tests and comparisons.
             | I32Eqz
@@ -626,8 +632,8 @@ impl<'a> Lowerer<'a> {
         };
         let ty = match op {
             I32Add | I32Sub | I32Mul | I32DivS | I32DivU | I32RemS | I32RemU | I32And | I32Or
-            | I32Xor | I32Shl | I32ShrS | I32ShrU | I32Rotl | I32Rotr | I32Popcnt | I32Eqz
-            | I32WrapI64 => types::I32,
+            | I32Xor | I32Shl | I32ShrS | I32ShrU | I32Rotl | I32Rotr | I32Clz | I32Ctz
+            | I32Popcnt | I32Eqz | I32WrapI64 => types::I32,
             _ => types::I64,
         };
         let wide = ty == types::I64;
@@ -657,6 +663,8 @@ impl<'a> Lowerer<'a> {
             I32LeU | I64LeU => self.bin_bool(IntCC::UnsignedLessThanOrEqual, a, b),
             I32GeS | I64GeS => self.bin_bool(IntCC::SignedGreaterThanOrEqual, a, b),
             I32GeU | I64GeU => self.bin_bool(IntCC::UnsignedGreaterThanOrEqual, a, b),
+            I32Clz | I64Clz => self.builder.ins().clz(a),
+            I32Ctz | I64Ctz => self.builder.ins().ctz(a),
             I32Popcnt => self.builder.ins().popcnt(a),
             I64Popcnt => self.builder.ins().popcnt(a),
             I32Eqz | I64Eqz => self.un_bool(a, ty),
@@ -1149,6 +1157,61 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// `br_table`: pop an `i32` index, branch to `targets[index]` when it is
+    /// in range and to `default` otherwise (the interpreter's exact rule,
+    /// negative indices included). Every label shares one payload arity
+    /// (wasm validates this); a chain of `index == k` guards dispatches to
+    /// each target, ending in an unconditional jump to the default.
+    fn do_br_table(&mut self, targets: &[u32], default: u32) -> Result<(), String> {
+        let index = self.pop().ok_or("operand stack underflow")?;
+        // Resolve the targets (loop labels branch to the header with nothing;
+        // block/if labels branch to the continuation with its results) and
+        // check they all agree on the payload arity.
+        let mut resolved: Vec<(Block, usize)> = Vec::with_capacity(targets.len() + 1);
+        let mut arity: Option<usize> = None;
+        for &depth in targets.iter().chain(std::iter::once(&default)) {
+            let frame = self
+                .controls
+                .len()
+                .checked_sub(1 + depth as usize)
+                .ok_or("branch past the control stack")?;
+            let kind = self.controls[frame].kind;
+            let (block, a) = if kind == CtlKind::Loop {
+                (
+                    self.controls[frame].header.ok_or("loop without a header")?,
+                    0,
+                )
+            } else {
+                let (after, results) = {
+                    let f = &self.controls[frame];
+                    (f.after, f.results)
+                };
+                self.controls[frame].after_used = true;
+                (after, results)
+            };
+            if let Some(common) = arity {
+                if common != a {
+                    return Err("br_table labels have different arities".to_string());
+                }
+            } else {
+                arity = Some(a);
+            }
+            resolved.push((block, a));
+        }
+        let payload = self.label_args(arity.unwrap_or(0));
+        for (k, &(target, _)) in resolved[..targets.len()].iter().enumerate() {
+            let k_value = self.iconst(types::I32, k as i64);
+            let eq = self.builder.ins().icmp(IntCC::Equal, index, k_value);
+            let next = self.builder.create_block();
+            self.builder.ins().brif(eq, target, &payload, next, &[]);
+            self.builder.switch_to_block(next);
+        }
+        let (default_target, _) = resolved[targets.len()];
+        self.builder.ins().jump(default_target, &payload);
+        self.dead = true;
+        Ok(())
+    }
+
     /// Lower one instruction. Dead paths skip code but still track the
     /// structured markers so `end`s reach the right frames.
     fn instruction(&mut self, instr: &Instr) -> Result<(), String> {
@@ -1234,6 +1297,7 @@ impl<'a> Lowerer<'a> {
             Instr::End => self.close_construct()?,
             Instr::Br(depth) => self.do_br(*depth)?,
             Instr::BrIf(depth) => self.do_br_if(*depth)?,
+            Instr::BrTable { targets, default } => self.do_br_table(targets, *default)?,
             Instr::Return => {
                 self.emit_return()?;
                 self.dead = true;
@@ -1747,7 +1811,7 @@ mod tests {
             .into_iter()
             .map(|pair| vec![pair[0]])
             .collect::<Vec<_>>();
-        for op in [I32Popcnt, I32Eqz] {
+        for op in [I32Popcnt, I32Eqz, I32Clz, I32Ctz] {
             let module = int_module(
                 vec![Instr::LocalGet(0), Instr::Num(op)],
                 vec![ValType::I32],
@@ -1761,7 +1825,12 @@ mod tests {
             .into_iter()
             .map(|pair| vec![pair[0]])
             .collect::<Vec<_>>();
-        for (op, result) in [(I64Popcnt, ValType::I64), (I64Eqz, ValType::I32)] {
+        for (op, result) in [
+            (I64Popcnt, ValType::I64),
+            (I64Eqz, ValType::I32),
+            (I64Clz, ValType::I64),
+            (I64Ctz, ValType::I64),
+        ] {
             let module = int_module(
                 vec![Instr::LocalGet(0), Instr::Num(op)],
                 vec![ValType::I64],
@@ -2288,5 +2357,142 @@ mod tests {
             vec![Value::I32(27)],
         ];
         assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn br_table_matches_the_interpreter() {
+        // 1. Uniform arity-1 payload, every index branches to the same
+        // block: block (result i32) { const 1; br_table 0 0 0 <index> }.
+        let payload = module_with(
+            vec![
+                Instr::Block(BlockType::Val(ValType::I32)),
+                Instr::I32Const(1),
+                Instr::LocalGet(0),
+                Instr::BrTable {
+                    targets: vec![0, 0, 0],
+                    default: 0,
+                },
+                Instr::End,
+            ],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+        );
+        let index_cases = [-5i32, -1, 0, 1, 2, 3, 100]
+            .into_iter()
+            .map(|i| vec![Value::I32(i)])
+            .collect::<Vec<_>>();
+        assert_equiv(&payload, 0, &index_cases);
+
+        // 2. Dispatch over three nested value blocks: exiting the k-th block
+        // carries the payload into the code after it, so each index picks a
+        // different post-processing chain.
+        //   block $out (result i32)
+        //     block $a (result i32)
+        //       block $b (result i32)
+        //         i32.const 5 (payload)
+        //         br_table 0 1 2 2 (index)
+        //       end
+        //       i32.const 10 i32.add
+        //     end
+        //     i32.const 100 i32.add
+        //   end
+        let dispatch = module_with(
+            vec![
+                Instr::Block(BlockType::Val(ValType::I32)),
+                Instr::Block(BlockType::Val(ValType::I32)),
+                Instr::Block(BlockType::Val(ValType::I32)),
+                Instr::I32Const(5),
+                Instr::LocalGet(0),
+                Instr::BrTable {
+                    targets: vec![0, 1, 2],
+                    default: 2,
+                },
+                Instr::End,
+                Instr::I32Const(10),
+                Instr::Num(NumOp::I32Add),
+                Instr::End,
+                Instr::I32Const(100),
+                Instr::Num(NumOp::I32Add),
+                Instr::End,
+            ],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+        );
+        assert_equiv(&dispatch, 0, &index_cases);
+
+        // 3. Dispatch over empty blocks: each branch exits to a different
+        // continuation that returns its own constant.
+        //   block $out
+        //     block $b1
+        //       block $b0
+        //         br_table 0 1 2 2 (index)
+        //       end
+        //       i32.const 100 return
+        //     end
+        //     i32.const 200 return
+        //   end
+        //   i32.const 300
+        let empty = module_with(
+            vec![
+                Instr::Block(BlockType::Empty),
+                Instr::Block(BlockType::Empty),
+                Instr::Block(BlockType::Empty),
+                Instr::LocalGet(0),
+                Instr::BrTable {
+                    targets: vec![0, 1, 2],
+                    default: 2,
+                },
+                Instr::End,
+                Instr::I32Const(100),
+                Instr::Return,
+                Instr::End,
+                Instr::I32Const(200),
+                Instr::Return,
+                Instr::End,
+                Instr::I32Const(300),
+            ],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+        );
+        assert_equiv(&empty, 0, &index_cases);
+
+        // 4. A loop whose exit is a br_table (one case targets the unsealed
+        // loop header): sum_{i<n} i, exiting via index 0 when i >= n.
+        let sum = module_with(
+            vec![
+                Instr::Block(BlockType::Empty),
+                Instr::Loop(BlockType::Empty),
+                Instr::LocalGet(1),
+                Instr::LocalGet(2),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalSet(1),
+                Instr::LocalGet(2),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalSet(2),
+                // i < n ? continue the loop (index 1) : exit (index 0).
+                Instr::LocalGet(2),
+                Instr::LocalGet(0),
+                Instr::Num(NumOp::I32LtS),
+                Instr::BrTable {
+                    targets: vec![1, 0],
+                    default: 0,
+                },
+                Instr::End,
+                Instr::End,
+                Instr::LocalGet(1),
+            ],
+            vec![ValType::I32],
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        );
+        let n_cases = [0i32, 1, 2, 3, 10, 64]
+            .into_iter()
+            .map(|n| vec![Value::I32(n)])
+            .collect::<Vec<_>>();
+        assert_equiv(&sum, 0, &n_cases);
     }
 }

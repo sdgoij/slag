@@ -1717,3 +1717,23 @@ conversions over signed-zero, subnormal, ∞, and quiet/signaling-NaN
 inputs, plus float values flowing through block and if/else results and
 untyped float `select`. 22 compile tests, 58 total with the feature,
 clippy clean in both configurations.
+
+`br_table` and the remaining bit-counting ops landed, closing out the
+Wave 1 numeric/control list: `do_br_table` pops the `i32` index and
+emits a chain of `index == k` guards, each branching to its label's
+target with the shared payload — block/if labels jump to the
+continuation carrying the construct's result, loop labels jump to the
+(until-then-unsealed) header — ending in an unconditional jump to the
+default. The interpreter's negative-index rule (any index < 0 selects
+the default) falls out of the signed equality guards. `I32Clz`/`I32Ctz`
+and `I64Clz`/`I64Ctz` lower to Cranelift's `clz`/`ctz` (defined at
+zero, matching wasm). Equivalence coverage adds a same-target payload
+block, a dispatch across three nested value blocks (each exit carries
+the payload through a different post-processing chain), a dispatch
+across empty blocks returning per-case constants, a sum loop whose exit
+is a `br_table` case targeting the unsealed loop header, and `clz`/
+`ctz` over the edge integer sets (zero included). 23 compile tests, 59
+total with the feature, clippy clean in both configurations. Remaining
+Wave 1 gap: parameterized/multi-value block types (block parameters and
+several results), which need block-parameter plumbing on construct
+entry.
