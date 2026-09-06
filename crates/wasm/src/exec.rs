@@ -644,7 +644,13 @@ impl Store {
             data_segments: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
             #[cfg(feature = "compile")]
-            compiled: crate::compile::compile_module(module),
+            compiled: if self.compile_off {
+                // Interpreter-forced store: don't pay the compile cost at
+                // all (the equivalence harness runs whole corpora twice).
+                Vec::new()
+            } else {
+                crate::compile::compile_module(module)
+            },
         });
 
         // Instantiate element segments in order (all elements before data),

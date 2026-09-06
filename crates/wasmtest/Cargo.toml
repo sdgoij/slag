@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 serde_json = "1"
-wasm = { path = "../wasm" }
+wasm = { path = "../wasm", features = ["compile"] }
 wast = { version = "258.0.0", default-features = false, features = ["wasm-module"] }
 wat = { version = "1.258.0", default-features = false }
 runtime = { path = "../runtime" }

@@ -41,6 +41,9 @@ usage:
                                     converter (JSON + per-module .wasm/.wat)
   wasmtest run <wast|json|dir>...      convert (if needed) and run suites;
                                     exits nonzero when any suite reports a fail
+  wasmtest equiv <wast|json|dir>...   run each suite through the compiled and
+                                    interpreter paths and report the first
+                                    command whose outcomes diverge
   wasmtest jsapi <file.js|dir>...     run the WebAssembly JS-API fixtures
                                     (waspec/test/js-api) through the Slag
                                     embed; exits nonzero when any fixture
@@ -105,6 +108,14 @@ fn main() -> ExitCode {
             }
             run(&paths)
         }
+        "equiv" => {
+            let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
+            if paths.is_empty() {
+                eprintln!("wasmtest equiv: missing path\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            equiv(&paths)
+        }
         "jsapi" => {
             let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
             if paths.is_empty() {
@@ -158,7 +169,7 @@ fn check(path: &Path) -> ExitCode {
 
 // ---- run: convert (if needed) and execute a suite's commands ----
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Tally {
     pass: usize,
     fail: usize,
@@ -206,7 +217,7 @@ fn run(paths: &[PathBuf]) -> ExitCode {
     let mut totals = Tally::default();
     for (source, is_json) in items {
         if is_json {
-            let tally = run_json(&source);
+            let (tally, _) = run_json_mode(&source, false, true);
             println!(
                 "\n{}: {} pass, {} fail, {} pending",
                 source.display(),
@@ -232,7 +243,7 @@ fn run(paths: &[PathBuf]) -> ExitCode {
                 continue;
             }
         };
-        let tally = run_json(&json);
+        let (tally, _) = run_json_mode(&json, false, true);
         println!(
             "\n{}: {} pass, {} fail, {} pending",
             json.display(),
@@ -249,6 +260,81 @@ fn run(paths: &[PathBuf]) -> ExitCode {
         totals.pass, totals.fail, totals.pending, totals.skipped
     );
     if totals.fail == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Run each suite twice — compiled bodies and the interpreter forced — and
+/// fail on the first command whose outcome diverges between the paths. The
+/// interpreter run is the oracle: a compiled body must reproduce it exactly
+/// (Cut 11's equivalence gate).
+fn equiv(paths: &[PathBuf]) -> ExitCode {
+    let exclusions = load_exclusions();
+    let mut items: Vec<(PathBuf, bool)> = Vec::new();
+    for path in paths {
+        collect_run_items(path, &mut items);
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items.dedup_by(|a, b| a.0 == b.0);
+    if items.is_empty() {
+        eprintln!("wasmtest equiv: no suites found at {paths:?}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut diverged = 0usize;
+    let mut compared = 0usize;
+    for (source, is_json) in items {
+        if !is_json && let Some(reason) = excluded(&source, &exclusions) {
+            println!("skip  {}: {reason}", source.display());
+            continue;
+        }
+        let json = if is_json {
+            source
+        } else {
+            match convert_wast(&source) {
+                Ok(json) => json,
+                Err(message) => {
+                    println!("error {}: {message}", source.display());
+                    diverged += 1;
+                    continue;
+                }
+            }
+        };
+        let (compiled_tally, compiled_log) = run_json_mode(&json, true, false);
+        let (interpreter_tally, interpreter_log) = run_json_mode(&json, false, false);
+        compared += 1;
+        if compiled_log == interpreter_log {
+            println!(
+                "equiv  {}: {} commands agree ({:?})",
+                json.display(),
+                compiled_log.len(),
+                compiled_tally
+            );
+        } else {
+            diverged += 1;
+            println!(
+                "DIVERGE {}: compiled {:?} vs interpreter {:?}",
+                json.display(),
+                compiled_tally,
+                interpreter_tally
+            );
+            for (index, ((kind_c, outcome_c), (kind_i, outcome_i))) in
+                compiled_log.iter().zip(&interpreter_log).enumerate()
+            {
+                if kind_c != kind_i || outcome_c != outcome_i {
+                    println!(
+                        "  command {} ({}): compiled {outcome_c:?}, interpreter {outcome_i:?}",
+                        index + 1,
+                        kind_c
+                    );
+                }
+            }
+        }
+    }
+    println!("\nequiv: {compared} suites compared, {diverged} diverged");
+    if diverged == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -327,15 +413,25 @@ pub(crate) fn excluded(source: &Path, exclusions: &[(String, String)]) -> Option
     None
 }
 
-fn run_json(json_path: &Path) -> Tally {
+/// Run one converted suite's commands. `compiled` selects the execution path
+/// (compiled bodies when true, the interpreter forced when false); `verbose`
+/// prints per-command fail/pending lines. Returns the tally plus a
+/// per-command outcome log (command type + verdict) so two runs can be
+/// compared command-by-command.
+fn run_json_mode(
+    json_path: &Path,
+    compiled: bool,
+    verbose: bool,
+) -> (Tally, Vec<(String, Outcome)>) {
     let mut tally = Tally::default();
+    let mut log = Vec::new();
     let dir = json_path.parent().unwrap_or_else(|| Path::new("."));
     let text = match fs::read_to_string(json_path) {
         Ok(text) => text,
         Err(error) => {
             tally.fail += 1;
             println!("read {}: {error}", json_path.display());
-            return tally;
+            return (tally, log);
         }
     };
     let root: Value = match serde_json::from_str(&text) {
@@ -343,19 +439,20 @@ fn run_json(json_path: &Path) -> Tally {
         Err(error) => {
             tally.fail += 1;
             println!("parse {}: {error}", json_path.display());
-            return tally;
+            return (tally, log);
         }
     };
     let Some(commands) = root.get("commands").and_then(Value::as_array) else {
         tally.fail += 1;
         println!("parse {}: no commands array", json_path.display());
-        return tally;
+        return (tally, log);
     };
 
     // Instance state across a file's commands: the store of live instances,
     // an import registry (spectest plus every `register`-named module), the
     // most recent module id, and module ids given a name by `register`.
     let mut store = Store::new();
+    store.set_compile(compiled);
     let mut registry = spectest_exports(&mut store);
     let mut last: Option<usize> = None;
     let mut named: HashMap<String, usize> = HashMap::new();
@@ -705,21 +802,27 @@ fn run_json(json_path: &Path) -> Tally {
             }
             other => Outcome::Fail(format!("unknown command type {other:?}")),
         };
+        log.push((kind.to_string(), outcome.clone()));
         match outcome {
             Outcome::Pass => tally.pass += 1,
             Outcome::Pending(reason) => {
                 tally.pending += 1;
-                println!("pending {}:{} {kind}: {reason}", json_path.display(), line);
+                if verbose {
+                    println!("pending {}:{} {kind}: {reason}", json_path.display(), line);
+                }
             }
             Outcome::Fail(reason) => {
                 tally.fail += 1;
-                println!("FAIL   {}:{} {kind}: {reason}", json_path.display(), line);
+                if verbose {
+                    println!("FAIL   {}:{} {kind}: {reason}", json_path.display(), line);
+                }
             }
         }
     }
-    tally
+    (tally, log)
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Outcome {
     Pass,
     Pending(&'static str),

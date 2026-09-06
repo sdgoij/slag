@@ -31,7 +31,7 @@
 //! returned `i32` is a trap code (0 = ok); results are written only when the
 //! function completes normally, so a trap never produces partial results.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -147,13 +147,11 @@ pub fn compile_module(module: &Module) -> Vec<Option<CompiledFunc>> {
         .collect()
 }
 
-/// The native-code generation engine: a cached native `TargetIsa`.
-struct Engine {
-    isa: Arc<dyn TargetIsa>,
-}
-
-impl Engine {
-    fn new() -> Result<Self, String> {
+/// The process-wide native `TargetIsa`, built once (an ISA construction runs
+/// a host-CPU feature scan, far too expensive to repeat per module).
+fn native_isa() -> Result<Arc<dyn TargetIsa>, String> {
+    static ISA: OnceLock<Result<Arc<dyn TargetIsa>, String>> = OnceLock::new();
+    ISA.get_or_init(|| {
         let mut flag_builder = settings::builder();
         flag_builder
             .set("opt_level", "speed")
@@ -162,7 +160,20 @@ impl Engine {
         let isa = cranelift_native::builder()?
             .finish(flags)
             .map_err(|e| e.to_string())?;
-        Ok(Self { isa })
+        Ok(isa)
+    })
+    .clone()
+}
+
+/// The native-code generation engine over a process-wide cached `TargetIsa`
+/// (building one is expensive; corpus runs compile per module instantiation).
+struct Engine {
+    isa: Arc<dyn TargetIsa>,
+}
+
+impl Engine {
+    fn new() -> Result<Self, String> {
+        Ok(Self { isa: native_isa()? })
     }
 
     /// Compile `defined` of `module`, or `None` when the function is outside

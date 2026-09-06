@@ -1760,3 +1760,24 @@ bit-for-bit against the interpreter. 24 compile tests, 60 total with
 the feature, clippy clean in both configurations. Wave 1's leaf list is
 done; the next step is the Wave 0 gate: the corpus-wide compile-forced
 equivalence harness in `wasmtest`.
+
+Wave 0's equivalence gate landed in `wasmtest`: `wasmtest equiv
+<wast|json|dir>` runs each suite twice — once through compiled bodies,
+once with the interpreter forced (`Store::set_compile(false)`) — and
+fails on the first command whose verdict (or command type) diverges.
+`run_json` was parameterized into `run_json_mode(path, compiled,
+verbose)`, returning a per-command (command type, verdict) log for the
+comparison; `run` keeps its interpreter-forced behavior, so the totals
+are unchanged. The runner's `wasm` dependency enables the `compile`
+feature. Supporting changes in `crates/wasm`: the native `TargetIsa` is
+now built once per process (`OnceLock` in `native_isa`) instead of per
+module instantiation, and an interpreter-forced store skips the compile
+pass entirely (the harness instantiates whole corpora twice). The gate
+is green over the numeric/control core suites (`i32`/`i64`/`f32`/`f64`
+and bitwise/cmp, `const`, `block`, `loop`, `if`, `br*`, `select`,
+locals, `switch`, `return`, `nop`, `labels`, `stack`, `int_exprs`/
+literals, `float_exprs`/literals/misc, `conversions`, `fac`, and the
+bitwise float files: 30 suites, 0 diverged). Compiled coverage is the
+Wave 1 leaf subset, so most corpus bodies still run interpreted on both
+sides; later waves (memory, calls, …) widen what the gate actually
+exercises.
