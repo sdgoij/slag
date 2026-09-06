@@ -4,6 +4,496 @@ Current performance state of the slag runtime and the PLAN Phase 18
 performance milestones, each behind a benchmark gate rather than a
 correctness gate.
 
+This file is the single, self-contained performance record for the slag
+runtime (consolidated 2026-09-05 from the earlier plan, task-list, and
+scratch documents — everything those files said lives here now). Reading
+order: the failed-experiments register and the state/remaining sections
+below summarize the whole effort; the `## Benchmark gate` section is the
+dated journal of every landing and probe; the milestone sections near the
+end record the major rewrites (NaN-boxed values, shapes/IC, ropes, the
+bytecode VM, the GC); and the final section archives the two superseded
+planning documents verbatim for provenance.
+
+## Failed experiments
+
+Ideas that were designed, implemented, or probed and did not pay. Re-check
+a premise here before re-proposing it. Each entry gives the idea, the
+measurement that killed or bounded it, and its disposition.
+
+### Reverted code
+
+- **The dense-append length mirror is load-bearing** (2026-09-02, the M1
+  decomposition). No-op'ing the `ArraySlots` length mirror corrupted
+  `length` once a string property landed (probe `a[2] = 3` left `len 0`)
+  and collapsed the buildString-full row to 302µs with a false result-ok;
+  an `is_empty()` guard on the mirror measured as noise (181-183 vs
+  176-180ms — the shared borrow cost more than the skipped mut borrow).
+  Both reverted; the mirror stays.
+- **Cut 35 slice 24 — the result-store direct write** (2026-08-24). Wrote
+  the leaf call's result straight to the target slot (a `result_target` +
+  bool return, so the caller skipped its pop) instead of the `stack.push`
+  → handler pop → store. Measured a ~1.3ns/call REGRESSION on both call
+  rows (5M probe, consistent in both pair orders): the amortized Vec
+  push+pop cost less than the plumbing (the param, the bool, the store's
+  TDZ check in the inlined tail). Reverted before commit; the result
+  round trip is not a lever.
+- **Direct-operand local compounds as one fat op** (2026-09-04, the
+  `BinStoreReg` follow-up). Generalizing the store-step fuse to the
+  direct-RHS shapes (`s += 1`, `s += t`, and the captured/context forms)
+  collapsed the whole RMW into ONE fat op. Interleaved 3-round A/B vs the
+  `BinStoreReg` parent measured a consistent ~1ns/iter REGRESSION on
+  `arithmetic` and `bare loop` (11.46-11.61 → 12.27-14.06 and 10.34-10.80
+  → 10.83-11.94): the executor's per-op match dispatch (~1-2ns) plus the
+  small shared combine work beat a single fat arm, whose extra
+  discriminant branches and cold operand tail hurt the hot arm's layout.
+  Reverted; the direct-right shapes stay three ops, and the register-run
+  local-compound arc is closed by measurement (its row levers moved to the
+  property write end-state).
+- **`MEMBER_CELLS` 16 → 256** (2026-09-04, part of the read-thrash probe).
+  Did not move the cycling-object read rows and REGRESSED every warm row
+  ~25% — the larger inline tables bloated the Agent hot struct (the
+  documented inline-table-bloat trap). Not landed; read cells stay at 16.
+- **The JIT chain-probe inline** (2026-09-01). Inlining the chain-read
+  validation in machine code measured SLOWER than the helper call; the
+  chain read's cost is the fixed `member_chain_get` validation, and no
+  machine copy of it paid.
+
+### Premises falsified by probe (never paid)
+
+- **Per-site read ICs — interpreter** (2026-09-04). The premise "the read
+  residual is in-suite direct-mapped thrash" was measured with certified
+  register-run bodies: a warm member read is ~3.5ns/op, and reading 64
+  DISTINCT same-map objects in one body costs ~4.2ns/read — the map-cell
+  layer absorbs every value-cell miss at +0.7ns. Interpreter reads are
+  near their floor; per-site read feedback is not a lever.
+- **Per-site member-IC gate — JIT (Slice 4)** (2026-09-05). The compiled
+  own-read gate — a per-call-site, direct-mapped cell recording a site's
+  last own-data resolution (receiver map id + slot + name), validated
+  against the receiver's LIVE map id after a value-cell miss and before
+  the shared map-cell probe — measured FLAT: cycling same-shape reads
+  stayed ~19-23ns/op, identical to the map-cell table path it replaced.
+  Root cause: the cycling cost is dependent-load latency (map handle →
+  map id → slot, plus the value-cell probe), which Cranelift's scheduler
+  does not overlap, and the gate's own validation loads are a comparable
+  serial chain that adds its own latency. Prototype-chain reads are
+  latency-bound the same way, so the designed one-link chain variant was
+  dropped with the gate; the whole experiment was reverted to the Slice-3
+  state. Soundness side-finding kept on record: any per-site member IC
+  MUST validate the property NAME — site ids are per-compiled-body and
+  reset each compile, so a bare site index can collide onto another
+  property's slot.
+- **Warm chain reads are fixed-cost, not walk-cost** (2026-09-04). Clean
+  marginal rows with numeric prototype values (both engines): own-data
+  ~1-3ns interp / ~0.5ns jit, chain 1-link ~18/~17ns, chain 2-link
+  ~19/~17.5ns — FLAT in link depth, so `member_chain_get`'s validation
+  dominates, not the walk. The 2026-09-01 JIT inline-probe experiment
+  measured slower, and no shape-free slice clears it; the fix is the
+  shape-end-state read (a shape compare + slot serves the chain at
+  own-data cost).
+- **The L3 "compile the general path" (Sparkplug analog)** (2026-09-04).
+  The scope-gate probe falsified the premise: try/catch bodies certify
+  AND reach the JIT (a per-iteration `try { s += o.x } catch` loop runs
+  ~125ms interp / ~72ms jit for 1M, ratio 0.57 — compiled; a try AROUND
+  the whole loop equals the certified control ~17-19ms interp / ~3.7ms
+  jit). The residual uncertified hot shape — a method whose arrow
+  captures `this` (~40x, up to ~75x for per-call arrow creation) — was
+  fixed ~33x by certifying this-capturing arrows (row 2.3 below), a far
+  smaller change than general-path compilation. Do not start the
+  Sparkplug analog without a corpus probe showing an uncertified hot body
+  whose cost is dispatch (not the env path certification removes).
+- **M4 — statically-known leaf calls skip-the-gate** (2026-09-02). Died
+  by measurement: steady-state direct calls were already ~5-7ns/call at
+  the leaf-call protocol floor — the plan's row targets were
+  harness-inflated (the old single-timed-eval methodology re-created the
+  callee per eval, re-probing the per-site leaf cache, and ran the interp
+  column under warmup garbage). The real call-row residual was the
+  apply/call machinery (M10, which landed), so the level-1 skip-the-gate
+  was never built.
+- **M7's manual-unroll premise** (2026-09-03). Dropped before work: the
+  register-run and raw-f64-counter cuts put the loop counter in a machine
+  register across the back edge, so the remaining JIT row gaps are
+  codegen quality, not unrollable dispatch.
+- **M9's chain-invalidation premise** (2026-09-03, corrected the same
+  day). The fused compound store was assumed to need setter/chain
+  invalidation machinery (a setter added to a prototype does not bump the
+  receiver's generation). Spec 7.3.3 step 3 consults the chain only when
+  the OWN property is absent, so an own writable data property shadows the
+  entire chain and the store cell needs NO chain tracking. The corrected,
+  smaller design became L1a (landed); the fused store landed later
+  through the register-run member-compound fusions.
+- **The bump-arena build (L4/M8)** (2026-09-04 counting probe). The
+  premise "buildString/construct churn allocate a hot box per element"
+  measured false: construct churn = exactly 1 arena box per iteration
+  (the instance the program constructs — no arena can remove it) and
+  buildString full = ~390 boxes TOTAL across the whole row (~1.1M dense
+  element writes allocate zero). The proposed bump arena ALREADY exists
+  (bump + size-classed free-list; the free-list half measured net-neutral
+  and registration ~11ns/alloc). No arena work is indicated.
+
+### Measured-closed candidates (worth re-checking only on new evidence)
+
+- **The field-authoritative (Option 3) storage migration.** Rejected by
+  measurement twice: the 2026-09-03 attribution probe put the interpreter
+  lever at ~5ns of a ~63ns row (every structural consumer must become
+  field-aware, and attr drift — `defineProperty` leaving a mapped key
+  non-enumerable/non-writable while the map keeps describing it — needs a
+  fork-to-overflow or map-fork mechanism first); the 2026-09-05 Slice-3
+  scoping re-derived the JIT ceiling at ~4ns/op (a machine inline read of
+  a mirrored overflow box is indirection-bound: object → overflow handle
+  → box → values → element). Defer until a real slice needs addressable
+  storage past the inline fields.
+- **Apply/.call member-read inline (row 4.1)** (2026-09-04). Fresh A/B
+  decomposition: the ~40-44ns interp / ~20-37ns jit overhead over a
+  direct leaf call is allocation-free and spreads across the per-
+  iteration chain member read + intrinsic compare + CallApply dispatch —
+  no narrow `.apply`-only target (the read is shared with every `o.m()`;
+  a 2026-09-01 inline validation measured slower). Read side defers to
+  the shape end-state, dispatch side to the registered-call floor.
+- **M3 slice 2, M7 slice 2, M1-C-deep, M2's 65+ args** (closed 2026-09-03
+  in the first plan's disposition). Assessed not worth against the
+  measurements: a second register accumulator (~¼ of a ~4ns/iter register
+  body, at the cost of a new VM register with JIT liveness and GC rooting
+  across the back edge), the remaining member-read dispatch (single-digit
+  percent on one row), the machine-code RefCell/Vec dense-append inline
+  (UB-sensitive, for a row already at 42.9ms jit), and 65+-arg vector
+  calls (no bench row exercises them).
+
+## Where the work stands (2026-09-05)
+
+### The suite today
+
+`--jit-bench`, all rows result-ok (re-baselined 2026-09-04 at HEAD
+`7312c72`; only the Slice 1-3 compiled-read micro probes landed since,
+which touch no `--jit-bench` row):
+
+| row | interp (ms) | jit (ms) |
+|---|---|---|
+| arithmetic | 13.3 | 2.46 |
+| bare loop | 12.6 | 2.32 |
+| property read | 26.7 | 5.69 |
+| string concat | 3.96 | 1.96 |
+| function calls | 5.67 | 0.762 |
+| global read | 16.6 | 3.49 |
+| compound assign | 3.56 | 1.43 |
+| buildString shape | 92.9 | 33.4 |
+| buildString full | 74.2 | 24.4 |
+| typed-array write | 32.3 | 12.3 |
+| typed-array length | 11.9 | 1.86 |
+| wide leaf call | 18.7 | 1.71 |
+| apply leaf call | 19.2 | 7.09 |
+
+JIT ratios are 0.09-0.49 across rows (compiled bodies run 2-11x under
+the interpreter). Since the 2026-09-02 baseline the interpreter closed
+most of the row gaps the landings targeted: arithmetic 26.2 → 13.3,
+property read 54.5 → 26.7, string concat 10.6 → 3.96, compound assign
+19.7 → 3.56, typed-array write 75 → 32.3, buildString shape 180 → 92.9.
+The five original gate rows are 100-600x under the corrected
+pre-migration baselines (see the dated `Current status` record).
+
+### What the work has established
+
+- **Property stores** went from full `[[Set]]` re-derivation per write
+  (~140-180ns) to a layered fast path: the L1a warm-store cell, a separate
+  256→4096-entry write table, shape-keyed (map id, name) cells, a direct
+  own-data fallback for vector-only keys, and a compiled shape gate with a
+  narrow slot write — same-shape stores at any object count sit at the
+  ~44-67ns/store warm level in both engines; single-object rows unchanged.
+- **Property reads** are served by generation-validated value cells, a
+  shape layer, and compiled inline reads for map-pinned fields: interpreter
+  reads are at their floor (~3.5ns warm), and the compiled cycling-object
+  reads sit ~20-25ns/op (latency-bound — see Slice 4's flat result).
+- **Map/Set** went from O(n) scans and ~55-arm dispatch chains to a
+  hash-indexed entry store plus O(1) registered handlers (~38x on
+  delete+set churn; Map.get/Set.has rows to ~220-245ns/call).
+- **Agent-dependent builtins** (String/Number/Boolean/BigInt/Keyed/Object/
+  DataView) dispatch O(1) by function id instead of linear identity
+  chains (charCodeAt ~3.1x, Object.hasOwn ~8.6x, DataView reads ~2.2-2.5x).
+- **Primitive property/method reads** no longer box a wrapper per access
+  (strings ~23x on `.length`, Number methods ~8-13x).
+- **The interpreter** gained register-run bodies (fused loop heads,
+  counter-fed compounds, member/element fuses, do-while loops, elided
+  completion resets, hoisted typed-array length guards) — per-op floors of
+  ~4ns/iter on register loops and ~3.5ns warm reads.
+- **The JIT** gained inline typed-array stores/reads and length hoists,
+  the dense-append inline gate, compiled intrinsic apply/call, and
+  certified `this`-capturing arrows.
+
+The dated records for every landing and probe are the `###`-headed
+entries in the Benchmark gate journal below.
+
+### The plan's levers and their fates
+
+The mechanism plan organized the work into five levers; their status:
+
+- **L1 — property machinery (both engines).** L1a (warm-store fast path)
+  LANDED. L1b (fused compound store) was delivered through the
+  register-run member-compound fusions rather than as a standalone op.
+  L1c (shapes with inline offsets) is PARTIAL: the record discipline
+  (warm stores stop bumping the generation), the store-cell capacity and
+  shape-keyed cells, the map-describes-every-default-key slice, and the
+  compiled shape-compare reads/stores (Slices 1-3) all landed; the
+  read-end-state premise measured out on BOTH engines (interpreter
+  falsification 2026-09-04, JIT Slice 4 flat 2026-09-05); the Option-3
+  field-authoritative migration measured not-justified twice. See the L1c
+  decision section below for what that leaves.
+- **L2 — per-site feedback.** Read-side per-site ICs closed by probe on
+  both engines. The remaining per-site arguments (vector-only-key stores
+  past 4096 objects, chain reads at own-data cost, the JIT shape-compare
+  end-state) all sit behind the L1c shape/storage end-state.
+- **L3 — JIT coverage.** The compile-the-general-path premise was
+  falsified by the scope-gate probe; the two certification gaps it
+  exposed (nested non-arrow `this`/`arguments`, `this`-capturing arrows)
+  both landed. Remaining scope=None shapes are narrow (with/eval/async-
+  generator/super-constructors); a corpus probe gates any further work.
+- **L4 — allocation.** Closed by the counting probe (the arena already
+  exists; no second hot shape).
+- **L5 — call/construct breadth.** The O(1) handler-registration arc
+  closed (all modules whose methods a probe showed hot are registered);
+  the compiled intrinsic apply/call path landed; the apply/call member-
+  member-read residual is diffuse and defers to L2.
+
+## What is left to do (2026-09-05)
+
+### The merged task list (status of every tracked item)
+
+Row ids below are the stable ids the journal entries cite. Almost every
+row is landed or closed; the genuinely open items are 1.1/1.2 (the L1c
+shape end-state), 2.1 (gated on a corpus probe), and the probe-first
+interpreter rows (buildString/typed-array machinery).
+
+**P0 — Correctness (JIT)**
+
+| row | item | status |
+|---|---|---|
+| 0.1 | JIT Float16Array/typed-array miscompile: compiled `makeArrayLike`-style loops read all-`NaN` from some iteration onward then segfault (~200-fixture JIT-only cluster; `--jitless` clean; pre-existing; not GC) | **FIXED** by the Linux debug work (2026-09-05); unblocks the clean Linux JIT built-ins sweep and the `-p jit` release test binary |
+
+**P1 — Structural property machinery (L1c → L2)**
+
+| row | item | status |
+|---|---|---|
+| 1.1 | L1c read/write end-state on maps/shapes (hot member paths serve via shape-compare + inline-field access; exotic receivers/accessors/index keys fall back) | **PARTIAL**: record discipline (stones 1-3), the store-cell capacity slices, shape-keyed store cells, the direct own-data fallback, the map-describes-every-default-key slice, and the compiled Slices 1-3 all landed; the READ-end-state premise was probed and FALSIFIED on the interpreter (reads ~3.5-4.2ns across 64-object sets) and measured FLAT on the JIT (Slice 4). The remaining write end-state (true defines; JIT shape-compare) is behind the storage decision below |
+| 1.2 | L2 per-site feedback (per-call-site shape/offset ICs shared by both engines) | re-scoped/deferred by the probes: the interpreter read path does not need it; the write side beyond 4096 objects and the chain-read slice wait on the L1c shape representation; the JIT shape-compare end-state would use it |
+| 1.3 | L1a store cells on a separate, larger table | landed (2026-09-04): 64-distinct-object cycling stores ~10x |
+| 1.4 | Primitive-string property reads without boxing a wrapper | landed: ~23x on `.length`/unit rows, boxes 400k → 0 |
+| 1.5 | Primitive-string METHOD reads on `%String.prototype%` without boxing | landed: ~1.4-1.7x on charCodeAt/charAt/indexOf |
+| 1.6 | Non-string primitives (Number/Boolean/BigInt/Symbol) method reads without boxing | landed: ~8-13x on Number method rows |
+| 1.7 | Store-cell capacity 256 → 4096 (boxed, heap-direct) | landed: the >256-object store cliff removed through ~4k objects |
+| 1.8 | Shape-keyed store cells + the direct own-data fallback (the >4096-object cliff) | landed: 8192/16384-object rows to the warm level; vector-only keys served by the direct resolve-and-write fallback |
+
+**P2 — JIT coverage (L3)**
+
+| row | item | status |
+|---|---|---|
+| 2.1 | Compile the general path (Sparkplug analog) | open but gated: the scope-gate probe closed the premise for try/catch and this-arrows; do NOT start without a corpus probe showing an uncertified hot body whose cost is dispatch |
+| 2.2 | Certification over-rejection: nested non-arrow functions' own `this`/`arguments` | landed (~6x on the construct-wrapped shape) |
+| 2.3 | `this`-capturing arrows certify | landed (~33x on the callback-in-method shape) |
+
+**P3 — Allocation (L4 / M8 arena)**
+
+| row | item | status |
+|---|---|---|
+| 3.1 | Bump arena for the hot shapes | closed by the counting probe (2026-09-04): the arena already exists; construct = 1 box/iter and buildString full = ~390 boxes total — no second hot shape |
+
+**P4 — Call/apply residual (L5 / M10 slice 2)**
+
+| row | item | status |
+|---|---|---|
+| 4.1 | Inline the `.apply`/`.call` member read on the compiled intrinsic path | probe-closed (2026-09-04): the ~40-44ns interp / ~20-37ns jit residual is diffuse (chain read + intrinsic compare + CallApply dispatch); read side defers to the shape end-state |
+| 4.2 | O(1) per-function-id handlers for agent-dependent builtins | landed for String + Number/Boolean/BigInt (charCodeAt ~3.1x, toFixed ~1.7x, toString ~2-2.8x) |
+| 4.3 | Keyed module (Map/Set/WeakMap/WeakSet + iterator nexts) in the O(1) table | landed: Map.get ~7.8x, Set.has ~18x |
+| 4.4 | Object + DataView in the O(1) table (named-handler refactor first) | landed: Object.hasOwn ~8.6x, DataView reads ~2.2-2.5x; the registration arc is CLOSED |
+
+**P5 — Small interpreter micro-slices**
+
+| row | item | status |
+|---|---|---|
+| 5.1 | Drop the per-`if` completion reset in certified loops | landed (~5% on buildString shape) |
+| 5.2 | Closed-plan residuals (M7 slice 2, M1-C-deep, M2 65+ args, M3 slice 2, LICM of `o.a`/`g`) | closed as not-worth (see Failed experiments) |
+| 5.3 | `BinStoreReg` — statement-position local compound fuses bin+store | landed (arithmetic ~15%, compound assign ~12%) |
+| 5.4 | Direct-operand local compounds as one fat op | closed by measurement (REVERTED — a ~1ns/iter regression) |
+
+### The genuinely open items
+
+1. **The L1c shape/storage end-state (1.1/1.2)** — the only remaining
+   structural item, and everything below it hangs on the storage decision
+   (next section):
+   - **True defines** (a genuinely new key on a live object) still run the
+     full `[[Set]]` in both engines — no IC can make them faster without
+     the storage migration.
+   - **Vector-only keys on shared maps** (>4096-object store loops on a
+     5th+ field) still take the (id, name) table and cliff — the per-step
+     shape key needs the storage model.
+   - **Chain-member reads** (~17-18ns both engines, flat in depth) stay
+     ~7-18x own-data reads until a shape compare + slot serves them at
+     own-data cost.
+   - **The compiled read gap** (cycling same-shape ~20-25ns/op vs the
+     ~4ns single-object floor) is dependent-load latency (Slice 4
+     measured the per-site gate flat); only cutting probe depth — a
+     single validated map id serving slot arithmetic inline — reduces it.
+2. **The remaining large interpreted rows**, to be attacked probe-first
+   outside the property track: the dense-array/string machinery
+   (buildString shape ~93ms / full ~74ms) and the typed-array write path
+   (~32ms) — their residuals are per-op step dispatch and machinery
+   floors, not allocation (3.1) or the read/write cells.
+3. **WeakMap/WeakSet stay linear** (GC compaction renumbers slots, which
+   a position index must clear at every sweep) — a deliberate gap, not in
+   any measured row; a probe showing them hot would reopen it.
+
+### Recommended order
+
+Everything concrete is landed or closed by probe. The standing rules:
+no next slice without its probe, and the full gate before every landing.
+The next lever should come from a fresh `--jit-bench` row scan (the
+2026-09-04 re-baseline above is the reference), with the buildString and
+typed-array rows as the leading probe candidates. The property track's
+remaining work is the storage decision below — start it only behind a
+probe showing a >4-key compiled read/write row (or a chain-read row) is
+hot enough to justify the migration.
+
+## Working rules and measurement discipline
+
+- **Compliance is the constraint.** No perf landing proceeds without the
+  full gate: `cargo clippy --workspace --all-targets -- -D warnings`
+  clean; `cargo test --workspace` green (including the new regression and
+  edge e2e tests each landing adds); the three release sweeps at baseline
+  (language 23721/23724 with 3 skip, built-ins 23657/23812 with 155 skip,
+  annexB 1086/1086 — zero fail/crash/hang); and the targeted edge probes
+  passing under the JIT, `--jitless`, and `--gc-stress`. A perf change
+  that costs a fixture is reverted.
+- **A lever opens with its probe.** Quantify the mechanism being replaced
+  with a dated measurement before implementing; never commit expected
+  numbers on a milestone — record what the probe showed and what the
+  landing measured.
+- **One experiment at a time.** A landing names the next experiment.
+- **Both engines move together.** The interpreter and the JIT lower the
+  same `Step`/register-op streams and share the object machinery; state
+  and measure each mechanism on both (`--jit-bench` runs every row in
+  both modes).
+- **Measurement discipline.** The machine swings ±15%; judge only
+  multi-run interleaved A/B deltas (alternate base/new order, min-of-3+
+  runs), never single runs; prefer isolated 5M-iteration probes over the
+  full bench to amplify the signal above load noise; the A/B harness
+  measures steady state (the definition evacuated once, args bound once,
+  2-call warmup, min of 3 timed calls — no per-run recompile, no
+  warmup-garbage skew); a later measurement that contradicts an earlier
+  note deletes or updates the note.
+- **Sweep timeouts.** Never run a sweep with a per-fixture timeout above
+  15 seconds (`--timeout 15 --recheck-timeout 15`, or the default):
+  anything that cannot finish in 15s is too slow by definition, and a
+  hang under the deadline is a real result, not something to reclassify
+  with a longer timeout.
+
+## Reference model — why V8 is fast and what Slag mirrors
+
+The mechanism plan's design reference is the vendored V8 checkout: we
+borrow architecture, never code. The table maps each V8 mechanism to what
+it buys and to Slag's (current) analog:
+
+| V8 mechanism | What it buys | Slag's analog |
+|---|---|---|
+| Maps (shapes) with descriptor offsets + in-object fields (`map.h`) | property load/store = shape-identity check + direct field access; no name resolution per access | generation-validated value cells (reads) plus — originally full `[[Set]]` (writes); now shape-keyed store cells, the direct own-data fallback, and compiled shape gates with narrow slot read/write helpers for map-described keys |
+| Per-site inline caches / feedback vectors (`ic.cc`) | monomorphic fast path validated by one shape compare; exact fallback | global direct-mapped caches (thrash with many keys → separate/wider write tables); per-site read feedback measured NOT to pay on either engine — deferred behind the shape end-state |
+| Accumulator bytecode + specialized handlers (`bytecodes.h`) | low per-op interpreter cost | register runs (`RunRegBody`: one dispatch per straight-line segment, accumulator + dedicated f64 counter field) — already at/under V8-ignition on certified bodies |
+| Baseline compilation of ALL code (Sparkplug, `baseline/`) | every body runs compiled, then hot bodies tier up | certified-subset-only JIT; the general-path compile was probed and de-scoped (try/catch and this-arrows already certify) |
+| Nursery (bump) allocation | cheap per-object allocation | per-object arena-box allocation; the counting probe closed the dedicated-arena idea (the arena already exists) |
+
+The two engines as they stand: the interpreter is a `Step`-dispatch VM
+over compiled function IR; certified bodies (scope analysis) get frame
+slots and their loops lower to register runs; member reads are served by
+cells + the shape layer. The JIT (Cranelift) compiles the certified
+bodies reached by ordinary calls and shares the object machinery; both
+engines measured per-op floors of ~4ns/iter register loops, ~3.5ns warm
+member reads, and ~44-67ns warm same-shape stores at any object count.
+
+## The L1c property-shape end-state: the three storage options and the decision
+
+This is the fork the property-shape thread had to settle (analysis
+2026-09-05), about what "a mapped key with ordinal ≥ 4" (past the four
+inline fields) means for storage. The presize sub-question mostly
+dissolves once the options are clear, so it is folded in.
+
+**Option 1 — Vector-slot pinning.** Keep the existing insertion-ordered
+property vector as the only store. A map descriptor at ordinal `o ≥ 4`
+means "this key lives at vector position `o`," enforced by an
+append-alignment rule (transition a new key only when it lands at the
+descriptor boundary), with boilerplate presize capped at 4 (pre-described
+but unstored fields are only safe as in-fields holes below 4).
+
+- Pros: smallest change — no new per-object allocation, no new trace
+  edge, no double write; enumeration/delete/descriptor consumers keep
+  working off the vector untouched; the map-field extensions are small;
+  immediately makes the runtime read map cells and the shape write cells
+  exact for ordinals ≥ 4 (the map cell's slot becomes object-independent
+  for every default key).
+- Cons: the ordinal==slot coincidence is an invariant that must hold
+  forever (enforced at the three define sites; a missed gate silently
+  misaddresses); the ≥4 read is still a borrow into the property vector;
+  and — the big one — it is NOT machine-addressable: the vector can be
+  inline or heap and reallocs, so the JIT can never emit a stable
+  shape-compare + offset load for a >4 key. It pins the logical slot, not
+  an address.
+
+**Option 2 — Dedicated out-of-line value array (mirror).** The object
+adds a per-object heap value array indexed by map ordinal ≥ 4 (V8's
+property backing store); the inline fields + this array are the
+map-addressed value region. The vector stays authoritative for
+keys/attrs/enumeration; the array is a hole-capable mirror, so presize
+can describe >4 fields and skipped fields read absent.
+
+- Pros: ordinal addressing is independent of vector order (no alignment
+  gate, no scramble hazard); presize can grow past 4; a stable base
+  pointer + fixed stride gives a future JIT inline load a real target;
+  read/write paths stay uniform (the map field is always an array
+  access).
+- Cons: every mapped ≥4 value exists twice (vector + mirror) — a second
+  store per define and per warm write, a second trace path, and a
+  resize-on-transition path; doubles memory for exactly the properties
+  that are hottest at scale; and it is a MIDDLE state — if the end-state
+  is field-authoritative (Option 3), the mirror period is transitional
+  overhead, not a step you would keep.
+
+**Option 3 — Field-authoritative (the full V8 model).** Keys/attrs move
+entirely into the map's descriptors for map-described properties; the
+object holds only values (inline + an out-of-line array); the vector
+shrinks to overflow/dictionary/accessor/attr-drift cases. Enumeration,
+own-keys, getOwnPropertyDescriptor, delete, the lazy index — everything
+that reads the vector — becomes descriptor/field-aware.
+
+- Pros: the clean end-state — one value copy, true shape semantics,
+  natural JIT offsets, no mirror drift.
+- Cons: it is the whole migration, not a slice; it was MEASURED as an
+  interpreter lever (2026-09-03 attribution: ~5ns of a ~63ns row — "not
+  justified" — because every structural consumer must be reworked), and
+  attr drift is the killer: `defineProperty` can leave a mapped key
+  non-enumerable/non-writable while the map keeps describing it, which
+  field-authoritative storage cannot tolerate — that path needs a
+  fork-to-overflow or map-fork mechanism first.
+
+**What the evidence says.** No current `--jit-bench` row moves under any
+option (a cap probe showed the 5th+ field define costs the same as the
+1st-4th, and warm 5th-field stores already equal warm 2nd-field stores
+via the direct fallback), so the choice was 100% downstream-unblocking
+and risk was the dominant selection criterion. The presize sub-question
+dissolves: Options 1 and 2 both lose almost nothing by capping presize at
+4. Only Options 2/3 give the JIT an addressable offset for >4 keys;
+Option 1 cannot.
+
+**Decision: Option 1 now, Option 3 later — Option 2 skipped as a
+permanent state.** Option 1 is the smallest change that establishes
+"maps describe every default key with a real, shape-pinned offset," and
+its alignment invariant (mapped keys are exactly the vector prefix, in
+descriptor order) is precisely the ordering a later field-authoritative
+migration needs — it is not throwaway (Option 3 just splits that
+prefix's values out into an ordinal-indexed array and re-points
+enumeration at the descriptors). Option 1 LANDED as the
+map-describes-every-default-key slice (commit `2067ee1`, the immediate
+predecessor of the fix commit Slice 1 sits on): with every default key
+pinned at a map-described vector slot, the interpreter map cells and
+shape write cells served ordinals ≥ 4 — the substrate Slices 1-3 built
+on. A later Option 3 slice stays gated on its own probe (a compiled
+member-read/write row with >4-key shapes actually being hot) and on the
+attr-drift fork mechanism.
+
 ## Current architecture
 
 - **Value representation**: a NaN-boxed `u64` (PLAN Phase 18): a quiet-NaN
@@ -3573,7 +4063,7 @@ dominates, and the row levers move on to the L1c read/write end state.
 
 ### L1c record discipline — warm stores stop bumping the generation (measured 2026-09-04)
 
-The write-side half of the L1c program (tasklist 1.1, stones 1-3). The
+The write-side half of the L1c program (row 1.1, stones 1-3). The
 plan's M9 correction (spec 7.3.3 step 3 consults the chain only when the
 OWN property is absent) makes the interpreter's per-value-write generation
 bump unnecessary: an own writable data property shadows the whole chain,
@@ -3769,7 +4259,7 @@ path. The plan's motivating example does not hold in this engine.
   body reads it as a depth-0 context slot. Measured ceiling ~40x on the
   callback-in-method shape; both engines' arrow creation must mirror.
 
-### This-capturing arrows certify (tasklist 2.3, measured 2026-09-04)
+### This-capturing arrows certify (row 2.3, measured 2026-09-04)
 
 The probe above landed. An arrow created in a certified non-arrow body
 that references `this` no longer bails the body: the closure walker
@@ -3815,7 +4305,7 @@ fail/crash/hang.
 
 ### L4 counting probe: the two hot rows allocate 1 box/iter (construct) and ~390 boxes total (buildString full) (measured 2026-09-04)
 
-Tasklist 3.1's re-scope mandates counting arena boxes per iteration on the
+Row 3.1's re-scope mandates counting arena boxes per iteration on the
 `construct churn` and `buildString full` rows before any arena work. Probe
 method: a temporary cumulative counter + rounded-size histogram bumped by
 `Gc::new`/`Gc::new_in_place` (TLS writes), drained before and read after
@@ -3863,12 +4353,12 @@ constructing (an arena cannot remove that box), and `buildString full`
 allocates ~390 boxes across the whole row — an arena has nothing to save.
 The rows' residual interpreter cost is the certified-construct path and
 the branchy step dispatch (per the earlier 2026-09-04 probes), not
-allocation. Tasklist 3.1 closes with this record; no arena code lands.
+allocation. Row 3.1 closes with this record; no arena code lands.
 The allocation-adjacent lead this probe surfaced is the primitive-string
-property-read boxing above (probed and landed as tasklist 1.4, below), not
+property-read boxing above (probed and landed as row 1.4 below), not
 the arena.
 
-### Primitive-string member reads serve length/units without boxing (tasklist 1.4, measured + landed 2026-09-04)
+### Primitive-string member reads serve length/units without boxing (row 1.4, measured + landed 2026-09-04)
 
 The L4 probe's side finding, taken to its end: **reading a property off a
 primitive string boxed a fresh String-exotic wrapper on EVERY read path.**
@@ -3910,7 +4400,7 @@ clippy clean, `cargo test --workspace` green (4648/0), three release
 sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
 annexB 1086/1086, zero fail/crash/hang.
 
-### Primitive-string METHOD reads resolve on the prototype chain without boxing (tasklist 1.5, measured + landed 2026-09-04)
+### Primitive-string METHOD reads resolve on the prototype chain without boxing (row 1.5, measured + landed 2026-09-04)
 
 The 1.4 fix left the METHOD-read shape boxing: `s.charAt(0)` reads the
 `charAt` METHOD off the string, and that member read (a chain data
@@ -3951,7 +4441,7 @@ sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
 annexB 1086/1086, zero fail/crash/hang. Number/Boolean/Symbol primitives
 still box on method reads (n.toFixed etc.) — same pattern, unprobed.
 
-### Non-string primitives resolve method reads on their prototype chain without boxing (tasklist 1.6, measured + landed 2026-09-04)
+### Non-string primitives resolve method reads on their prototype chain without boxing (row 1.6, measured + landed 2026-09-04)
 
 The 1.5 fix was string-only; the generic `[[Get]]` still boxed a fresh
 wrapper per READ for the other primitives. Probe (200k, `Gc::new` TLS
@@ -4027,10 +4517,10 @@ Conclusion: 4.1's premise — a distinct `.apply`/`.call` member-read
 residual worth inlining — does not re-derive. The row's remaining cost is
 the general chain method read plus the intrinsic dispatch, so the read
 side defers to L2 (per-site shape/offset ICs once the L1c representation
-lands) and the dispatch side to L5. Tasklist 4.1 closes with this record;
+lands) and the dispatch side to L5. Row 4.1 closes with this record;
 no code lands. (No gates run — a probe-only turn; the tree is untouched.)
 
-### Agent-dependent builtin handlers register O(1) — String module (tasklist 4.2, measured + landed 2026-09-04)
+### Agent-dependent builtin handlers register O(1) — String module (row 4.2, measured + landed 2026-09-04)
 
 The L5 intrinsic-call dispatch floor, localized. Probe (200k calls,
 certified rows, both engines): `s.charCodeAt(i)` ~1.18µs/call interp
@@ -4084,7 +4574,7 @@ at baseline — language 23721/3 skip, built-ins 23657/155 skip, annexB
 modules (Object/Date/Keyed/...) stay on their chains pending a corpus
 probe.
 
-### The >256-object store ceiling and the write-cell capacity bump (tasklist 1.7, measured + landed 2026-09-04)
+### The >256-object store ceiling and the write-cell capacity bump (row 1.7, measured + landed 2026-09-04)
 
 The write-side >256 follow-on probe (recommended order (a)): cycling
 member stores over distinct-object working sets (1M stores, certified
@@ -4139,7 +4629,7 @@ not the chain walk. The 2026-09-01 JIT inline-probe experiment (the same
 validation inlined) measured slower, and no shape-free interpreter slice
 obviously clears it, so the fix is L2's per-site shape/offset IC (serve
 the read at own-data cost via a shape compare + slot) once the L1c shape
-representation lands. Tasklist candidate (a) closes with this record; no
+representation lands. Candidate (a) closes with this record; no
 code lands. (No gates run — probe-only; the tree is untouched.)
 
 ### The remaining-module registration probe: Map/Set are O(n)-scan bound, not chain-bound (measured 2026-09-04)
@@ -4407,7 +4897,7 @@ sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip,
 annexB 1086/1086, zero fail/crash/hang). Residual: vector-only keys on
 shared maps (a hot 5th+ field of a many-field shape) still take the
 (id, name) table and cliff beyond 4096 objects — that is the per-STEP
-store IC (tasklist 1.2), and the chain-member-read slice (a) stays
+store IC (row 1.2), and the chain-member-read slice (a) stays
 behind L1c's shape end-state.
 
 ### The vector-only store fallback: direct own-data writes past the map-pinned fields (measured 2026-09-04)
@@ -4934,3 +5424,1165 @@ compatibility. They are no-ops because the corresponding machinery (call-
 stack depth control, a heap to cap) does not exist yet. (`--print-bytecode`
 is live — it prints the compiled `Step` stream via
 `runtime::ir::debug_print_body`.)
+## Closed-plan archives (superseded text, retained verbatim)
+
+The two earlier planning documents are archived here so no measurement or
+disposition is lost. They are superseded by the summary sections at the top
+of this file (and the dated journal below); treat them as the original
+milestone write-ups and design notes for provenance. Content overlaps the
+journal; where the two disagree, the dated journal record wins.
+
+### Archive A - the first, row-based plan (closed 2026-09-03)
+
+## Plan: closing the Slag–Node gap
+
+> **Superseded (2026-09-03) by the mechanism-based plan (Archive B below).** This document
+> is kept as the closed historical record of the first (row-organized,
+> estimate-heavy) performance push; the current plan is mechanism-based
+> and covers both engines.
+
+> **Status: closed (2026-09-03).** The gap-close work stops here: the
+> remaining wide gaps need machinery beyond this engine's step-VM design
+> (callee inlining, a store-side hidden-class write path, a GC arena), at
+> costs out of proportion to the measured wins. The unlanded milestones
+> and their dispositions are listed in §5; there is no next experiment.
+
+### 0. Working rules (2026-09-03)
+
+- A milestone carries dated, measured facts only — no forward-looking
+  numbers. Early `Expected:` estimates contradicted by the outcomes are
+  deleted from the sections below, not annotated.
+- One next step at a time; a completed experiment names the next single
+  step in §5.
+- A later measurement that contradicts an earlier note deletes the note.
+
+### 1. Measured baseline (2026-09-02)
+
+The full `--jit-bench` suite (12 rows) re-measured against node v24.12.0,
+both JIT (default) and interpreter-only (`--jitless`, V8's Ignition), on
+the same machine and session. Slag columns are best-of-3 `--jit-bench`
+process runs; Node columns are the best (steady-state) round of
+`tools/jit_bench/node_bench.js`. All four modes agree on every row's
+completion value. Recorded in `.notes/perf.md` (measured 2026-09-02).
+
+| Benchmark | slag interp | slag jit | node jitless | node jit | interp gap | jit gap |
+|---|---|---|---|---|---|---|
+| arithmetic | 26.2 | 3.3 | 10.2 | 0.58 | 2.6x | 5.7x |
+| property read | 54.5 | 6.9 | 12.4 | 0.32 | 4.4x | 21.8x |
+| string concat | 10.6 | 2.7 | 1.5 | 0.53 | 7.1x | 5.0x |
+| function calls | 6.3 | 1.9 | 1.9 | 0.06 | 3.3x | 32x |
+| global read | 23.2 | 3.8 | 7.8 | 0.32 | 3.0x | 12.1x |
+| compound assign | 19.7 | 2.5 | 1.6 | 0.06 | 12.6x | 41.5x |
+| buildString shape | 180.1 | 54.2 | 53.1 | 8.2 | 3.4x | 6.6x |
+| buildString full | 86.9 | 32.3 | 26.2 | 10.2 | 3.3x | 3.2x |
+| typed-array write | 75.0 | 30.2 | 13.6 | 0.29 | 5.5x | 103x |
+| typed-array length | 59.3 | 11.4 | 16.9 | 0.47 | 3.5x | 24.3x |
+| vector leaf call | 45.0 | 29.7 | 9.5 | 0.12 | 4.8x | 258x |
+| apply leaf call | 20.4 | 18.3 | 6.1 | 2.16 | 3.4x | 8.5x |
+
+Gaps are slag ÷ node (ms). This table predates the `bench_once` steady-state
+harness fix and the M2/M6/M10 slices; the slag cells superseded by later
+dated measurements are corrected here (the milestone sections carry the
+full records):
+
+- `function calls` jit 1.9 → **0.71ms** (harness fix, 2026-09-02).
+- `vector leaf call` → renamed `wide leaf call`; jit 29.7 → **1.6ms**,
+  interp 45 → **21ms** (M2 fast-arg cap 32→64 gave jit 29.7→3.2ms; the
+  harness fix then 3.2→1.6ms, both 2026-09-02).
+- `apply leaf call` jit 18.3 → **7.0ms** (M10 slice 1, 2026-09-02; interp
+  unchanged ~20.8).
+- `arithmetic` jit 3.3 → **2.6ms** (harness fix, 2026-09-02).
+- `string concat` interp 10.6 → **3.6ms** (harness fix — the old number was
+  GC-polluted; the isolated steady probe confirms 4-5ms).
+- `compound assign` jit 2.5 → **1.47–1.49ms** (re-measured 2026-09-03).
+
+### 2. Goal
+
+Focus on the wide rows (compound assign, typed-array write, vector leaf
+call). "Closed" means the row's gap halves or better, measured per the
+A/B protocol in §6 — not a single run.
+
+### 3. The gap, decomposed
+
+The interpreter gaps are per-op machinery cost. The JIT gaps are three
+things V8 does that Slag's straight-line lowering does not — **callee
+inlining**, **loop-invariant code motion (LICM)**, and **bounds-check
+elision + register quality** — plus **FFI-helper calls per element** on
+the shapes the JIT lowers through the shared machinery.
+
+| row | interp bottleneck | jit bottleneck | lever |
+|---|---|---|---|
+| arithmetic | loop head | codegen quality | register quality (M7) |
+| property read | `member_cell_get` double probe | V8 hoists invariant `o.a`/`o.b` | single probe (M3); LICM (M6) |
+| string concat | rope node alloc + `Rc` bumps | concat helper round-trip | arena alloc (M8) |
+| function calls | — (fine) | at the leaf-call protocol floor | at the floor (M4 measured); apply/call is M10 |
+| global read | — (fine) | LICM hoists `g` | LICM (M6) |
+| compound assign | read-modify-write machinery | keep `o` in a register | fused cell op (M3/M9); register quality (M7) |
+| buildString shape | dense-append machinery (shared with JIT) | same shared machinery | dense elements (M1) |
+| buildString full | concat + array machinery | concat helper | M1/M8 |
+| typed-array write | per-write view checks | FFI helper per element + re-checked bounds | fused write (M3); inline store (M5) |
+| typed-array length | — (fine) | LICM hoists `ta.length` | LICM (M6) |
+| vector leaf call | fast-layout rebuild above the arg cap | same | fast-arg cap 32→64 (M2) |
+| apply leaf call | arg-list copy + member read | member read + leaf frame setup | compiled intrinsic apply/call (M10) |
+
+### 4. Milestones
+
+#### M0 — Profiling pass (before any slice)
+
+Wrap the hot helpers in counting/instrumented fns (the `leaf_call_probe`
+count precedent) and decompose each row's per-op cost: `member_cell_get`
+(map probe vs value-cell probe vs dispatch), `typed_array_element_set`,
+`do_call`'s rebuild, the leaf-call core, rope `concat`. Several slices
+have two candidate targets (e.g. M3's map probe vs value-cell probe) —
+measure before picking. Add a `bare loop` row to `--jit-bench` so the
+loop-head floor stays visible next to the machinery rows.
+
+**Status (2026-09-02):** the `bare loop` row landed (function-wrapped
+`--bench` shape; certifies, ratio 0.13): interp ~22.4ms, jit ~2.9ms.
+The M3 A/B below resolved the member-probe decomposition; the other
+rows' decompositions remain when their slices start.
+
+#### M1 — Dense array elements (both modes) — existing plan, highest absolute ROI
+
+`.notes/array-store-plan.md` Item 2 (`ArraySlots`: keyless
+`Vec<Option<Value>>` + `Cell<f64>` length, spill-on-miss). The
+`buildString shape` row is the suite's biggest absolute time (interp
+180ms); the append path (`array_element_write`: key + clone +
+`SmallProps::push` + index-map insert + length write + generation bump +
+RefCell borrows) is ~60ns/iter, and the JIT store helper calls the same
+shared machinery — why the JIT row cannot go below it today. Phase A
+(representation + the three hot paths: write/get/length) and Phase B
+(exotic ops over the buffer) are the bulk; Phase C (buffer-direct ICs +
+`offset_of!` inline store) is where the JIT row moves.
+
+- **Risk:** Phase B (Array exotic semantics) — the plan's "spill on any
+  shape the buffer cannot represent exactly" keeps it a fast path, not a
+  second implementation. `IntegerIndexed` is the blueprint.
+- **Validation:** the plan's per-phase gate (workspace tests + clippy +
+  JIT/jitless sweep at zero regressions); track the buildString rows.
+
+**Status (2026-09-02): dense elements are LANDED — the plan doc's baseline
+predates the current tree.** `ArraySlots` (`elements`/`length`/`dense`),
+the dense write/get/length paths, the exotic ops (own-keys, get-own-
+property, delete, define, set-length), the spill fallback, the Slice 1b
+chain-clean verdict, the runtime IC fronts (`array_element_value_cells`/
+`array_length_cells`), and the JIT `fast_array_element_write` helper are
+all in: buildString shape measures 176–180ms interp / 51–54ms jit (vs
+the plan's ~740ms baseline). Remaining per-op decomposition (A/B'd,
+2026-09-02):
+
+- **The length mirror is load-bearing — cannot drop it.** A no-op'd
+  `write_length_mirror` corrupts `length` once a string prop lands
+  (probe: `a[2]=3 len=0`) and collapses `buildString full` to 302µs with
+  a false result-ok. Reverted.
+- **An `is_empty()` guard on the mirror is noise** (181–183ms vs
+  176–180ms — the shared borrow costs the skipped mut borrow). Reverted.
+- The append path is a broad sum of small costs (elements borrow+push,
+  mirror borrow, generation bump, chain-clean hit, the caller's
+  nullish/kind/key checks, the register store's discarded result push,
+  the PostInc `update_value`) — no single 5ns+ hog remains on the interp
+  side. The remaining interp gap to node jitless (3.4x) is this per-op
+  floor.
+- **The JIT row's remaining lever is the Phase C inline store** —
+  `fast_array_element_write` is still an FFI call per element. Inlining
+  the dense append in machine code (offset_of! into `ArraySlots` +
+  RefCell + Vec-push discipline, call_slow on the rare path) is the next
+  M1 slice; the RefCell/Vec/realloc surface makes it a UB-sensitive
+  slice worth its own session.
+
+**Status update (2026-09-02): M1 C slice 1 landed — the inline dense-
+append gate.** A new pub `JsObject::array_dense` cell (the ArraySlots box
+base, set at `array_create`, cleared on spill — the JIT reads it via
+`offset_of!`, sidestepping the `ObjectKind` enum-layout problem) gates a
+compiled computed-store fast path shared by the step `AssignMemberComputed`
+and the register `StoreMemberComputed` emissions: the machine code checks
+the object tag, `array_dense`, the canonical-index key (a separate
+is-double gate block — `fcvt_to_uint` on a NaN-boxed heap key's bits traps
+in the lowering; found by the string-key crash bisect), and `index ==
+slots.length`, then runs the stateful append (extensibility, chain-clean,
+push, length + mirror, generation) through a new narrow `dense_array_append`
+helper (the four-file mirror). Typed arrays / updates / hole-fills /
+spills / non-canonical keys fall through to the existing
+`fast_array_element_write` / `assign_member_computed`. Measured:
+**buildString shape jit 52.9 → 42.9ms (~19%, 3-run stable)** — the
+register-path store previously went straight to `call_slow(SetMemberComputed)`;
+no other row moved. Validation: the `installed_jit_dense_array_element_write_fast_path`
+e2e now counts `dense_array_append` (was `fast_array_element_write`), a new
+`installed_jit_register_store_member_computed_takes_the_inline_append` e2e
+covers the register gate, clippy clean, workspace tests green (incl. the
+fallback-in-a-compiled-loop crash regression), and the new paths are clean
+under `--gc-stress` (the `array_dense` handle needs no trace — it is always
+reachable via `kind`). The remaining M1 C work is the deeper inline
+(RefCell/Vec push in machine code + the chain-clean/mirror inline, the
+`Option<Value>` 16-byte stride, and the free NaN tag for a hole sentinel).
+
+#### M2 — Vector-form calls without the rebuild (both modes)
+
+`Step::Call`'s handler does `args.split_off(base)` (a `Vec` alloc) and
+rebuilds the `[this, callee, args]` fast layout per call; the JIT's
+`call_vector` mirrors it. The compiler knows the arg count at compile
+time — emit the vector form's args **directly in fast layout** for plain
+(non-spread) vector calls, so `do_call`/`call_vector` read them in place.
+The `vector leaf call` row is the 33-arg case (the fast cap is 32, so it
+always takes this path).
+
+**Status (2026-09-02): the fast-argument cap was raised 32 → 64 (the
+8→16→32 pattern), delivering the measured win.** Isolated A/B (200K
+calls, same loop shape): the 32-arg fast form runs ~29x faster than the
+33-arg vector form in the JIT (1ms vs 29ms) and ~1.9x interpreted (22ms
+vs 42ms) — the vector form's `ArgsBase`/`ArgsPush` per-arg protocol
+(~35 FFI calls per call in the JIT) and the `split_off` rebuild were the
+cost. With the cap at 64, the 33-arg row takes the one-step fast form:
+**`vector leaf call` (renamed `wide leaf call`) interp 42→21ms (2.1x),
+jit 29→3.2ms (9x)**, no other row moved. The two `[Value;
+FAST_CALL_MAX_ARGS]` buffers (`do_call_apply`, `run_inline_leaf`) grow to
+512B each. Tests updated: `wide_fast_form_calls_stay_spec_exact` gained
+33-arg (fast) and 65-arg (vector) cases, and the two vector e2e tests
+(self tail call, tail-call chain) moved to 65 args so they still exercise
+the vector machinery above the cap. Clippy clean, workspace tests green.
+The remaining slow shape is a 65+-arg plain call (still the vector
+form) — the in-stack-vector follow-up if it matters.
+
+#### M3 — Single fused member-read probe (interp)
+
+`member_cell_get` probes the map fast path (`member_cell_get_map`), then
+`value_cell` — so a warm loop's read is a map read + in-fields access + a
+per-read value-cell write. Fold them into one check (or reorder per M0's
+fold them into one check (or reorder per M0's
+measurement) and shave the per-read dispatch
+on the register path (`GetMemberNameLocal`). Feeds property read,
+compound assign, and every member-heavy loop.
+
+**Status (2026-09-02): slice 1 landed — the value cell is probed first.**
+The warm read path is now a pure (id, name, generation) compare (no map
+read, no in-fields access, no per-read write); the map probe runs only
+on a value-cell miss and still warms the cell. A/B (alternating
+builds): `property read` interp 54.3→50.8ms median (~6.5%, non-
+overlapping across 6 runs each) and the 5M-iteration probe 271→252ms
+(~7%); JIT row unchanged; global read and compound assign unchanged.
+Behavior-preserving (both caches serve the same own-data property, both
+revalidated); clippy clean, workspace tests green. The remaining
+`GetMemberNameLocal` dispatch cost and compound-assign write side are
+the next slices.
+
+#### M4 — JIT: statically-known leaf calls (premise superseded — the harness fix landed)
+
+The single biggest JIT lever. Every call site runs the leaf-call
+protocol per iteration (probe → frame → completion round-trip) even when
+the callee is a stable frame-slot/global certified leaf —
+`jit-report.md` §7 item 4 flags "skipping the probe for the
+statically-known case" as future work. Level 1 (no body copying): the
+machine code re-validates the cached callee's identity against the
+slot/global cell (a `Value` bits compare, the `TailCallSelfCheck`
+pattern), then runs the leaf's compiled body on the same Vm, skipping
+the probe + fresh-frame + completion. The register-leaf `CallerSlots`
+alias (Cut 35 slice 23) is the frame-discipline blueprint.
+
+- **Risk:** medium — the leaf-eligibility gate (re-validation must mirror
+  `can_inline_leaf`) and the frame discipline. Body inlining with
+  dead-arg elimination (the last factor to node's 0.12ms) is the
+  explicitly long-term follow-up.
+
+**Status (2026-09-02): the premise is superseded by measurement — the
+direct-call path is already near its protocol floor, and the plan's
+row targets were based on harness-inflated numbers.** 1M-iteration
+steady-state A/B (the exact `function calls` row shape measured 7ns/call,
+not the harness's 19ns — the `--jit-bench` single-timed-eval methodology
+re-creates the callee function per eval, re-probing the per-site leaf
+cache): member-callee 7ns/call, direct global 6ns, slot/param 5ns. The
+Cut 39/68 per-site leaf-cache gate already skips the probe on warm
+repeat visits; what remains per call is the gate itself (~6 loads + 5
+compares) + the in-frame leaf run — a ~1-2ns ceiling for Level 1's
+"skip the gate for constant callees" on shapes that are already fast.
+The real remaining call-row cost is the **apply/call machinery**: the
+`apply leaf call` row decomposes to ~90ns/call (vs 10ns for a direct
+9-arg call) — the `.apply`/`.call` member read (the prototype chain) +
+the builtin round-trip + `create_list_from_array_like`'s per-call copy
+(the plan's M10 lever, not M4). Re-scope M4 to the apply/call machinery
+or defer to body inlining (the long-term item).
+
+**Harness fix (2026-09-02): `bench_once` now measures steady state.** The
+old single-timed-eval methodology re-parsed the snippet per eval, so the
+timed window included a fresh ~1ms Cranelift compile of the re-created
+bodies (and the interp column's timed eval ran under the GC pressure of
+the warmup eval's garbage on allocation-heavy rows). The harness now
+evacuates the definition once, binds `bench` + the ARGS to globals once
+(function-literal arguments stay the SAME object across calls), warms
+with 2 calls, and reports the min of 3 timed calls. The compile
+inflation and the GC skew are gone: `function calls` jit 1.9→0.71ms
+(the measured ~7ns/call steady), `wide leaf call` 3.2→1.6ms, arithmetic
+3.3→2.6ms, and `string concat` interp 10.6→3.6ms (the old number was
+GC-polluted — the isolated steady probe confirms 4-5ms). The 2026-09-02
+table's small-row JIT gaps were therefore 15-30% pessimistic and the
+call rows ~2.7x so.
+
+#### M5 — JIT: inline typed-array store + bounds elision
+
+The `typed-array write` row (103x) is the canonical
+`for (k = 0; k < ta.length; k++) ta[k] = k & 255` shape: the loop guard
+**is** the bounds check, yet every store calls the
+`fast_array_element_write` → `typed_array_element_set` FFI helper which
+re-checks the view + bounds + encodes. Three steps: (a) recognize the
+guard-shaped store (store index == loop counter, guard on the same
+length, call-free body so the view cannot detach/mutate mid-loop); (b)
+elide the per-store re-check; (c) inline the store as machine code
+(`offset_of!` into `TypedArraySlots` — the dense-elements Phase C
+pattern; the encode is already allocation-free).
+
+- **Risk:** medium — the soundness argument is guard-identity + call-free
+  body; the `encode_element_into` primitive-only gate already exists.
+
+**Decomposition (2026-09-02, 800K stores, the row's own shape):** the
+row is `bench(new Uint8Array(800000))` with `ta.length` re-read per
+iteration. Three temporary `--jit-bench` rows isolated the per-iteration
+costs (jit, min-of-3):
+
+| probe | jit | per-iter |
+|---|---|---|
+| `ta[k] = k & 255` reading `ta.length` in the test (the row) | ~30ms | 37.5ns |
+| same with the length hoisted (`var n = ta.length`) | ~26ms | 32.8ns |
+| hoisted length, no store (`s += k`) | ~2.0ms | 2.5ns |
+
+So: the certified counter loop + `k & 255` + `s += k` floor is ~2.5ns/iter;
+per-iteration `ta.length` (the compiled `typed_array_length` probe — an
+FFI per iteration, M6 LICM territory) is ~5ns/iter; and the STORE is
+~30ns/iter — the machine dense-append gate (fails fast for a typed
+array) + the `fast_array_element_write` FFI round trip + inside
+`typed_array_element_set`: the immutable-buffer check, the
+`encode_element_into` element-type dispatch + Number→bytes conversion,
+`typed_array_valid_index`, and the `SharedBuffer` write. The row is
+~99x vs node's 0.29ms, and closing it needs a real machine-code inline
+(M5c), not a cheaper helper restructure (the FFI + checks floor is
+~20ns/iter). M5c is the
+UB-sensitive inline the M1 C note warned about (reading the
+`TypedArraySlots`/`SharedBuffer` internals — resizable buffers realloc
+their storage, so the data pointer must be re-validated against the live
+buffer per store) and is its own session.
+
+**M5c status (2026-09-02):** the machine-code inline landed
+(`emit_typed_array_store_inline`, shared by the step `AssignMemberComputed`
+and the register `StoreMemberComputed` emissions): gate the receiver to a
+fixed-length `Uint8Array` over a live, writable, non-resizable buffer (the
+`JsObject.typed_array` mirror → `TypedArraySlots`, the shared per-buffer
+`BlockState` box for the byte base + the detached/immutable/resizable
+flags), the key to a canonical in-range index, the value to an integral
+[0, 255] Number; then write the byte straight into the block. Any gate
+failure falls back to the existing helper (nothing observable ran — the
+write is a pure byte store and the accepted value is a Number). The gate
+re-reads the live geometry per store (a helper that detaches/freezes/
+resizes between stores is picked up); the data base is mirrored in
+`BlockState` (`SharedBuffer::state` — an offset-visible raw box address,
+since the `Rc`/`Arc` box layout is not `offset_of!`-expressible across
+crates) and updated on resize; the whole probe is cfg-collapsed to the
+legacy jump under the `workers` feature (`crux::typed_array::WORKERS` —
+the plain machine write would need atomics there). Measured (jit,
+min-of-3, 800K stores): the row 26.0→**16.8ms** (~57x vs node, ratio
+0.37→0.23); the hoisted-length variant 13.3→**12.4ms**. The per-store
+probe is ~13ns/iter — the remaining cost is the per-store re-derivation
+of the slots/buffer geometry + the per-iteration `ta.length` probe, both
+loop-invariant work for M6 (LICM), not the FFI/encode/checks the inline
+replaced (the fallback still measures ~21.5ns/iter for the same shape).
+Validation: clippy clean, `cargo test --workspace` green, JIT language
+(23721/0/0/0) + JIT built-ins (23657/0/0/0) + jitless built-ins
+(23657/0/0/0) sweeps match baseline.
+
+#### M6 — JIT: loop-invariant code motion
+
+The mechanism behind three wide rows (property read 21.8x, global read
+12.1x, typed-array length 24.3x): V8 hoists `o.a`/`g`/`ta.length` out of
+the loop because the body never writes them. Start with the safe subset:
+hoist a `GetMemberName*`/`LoadGlobal`/`typed_array_length` read to a
+pre-head temp when its operands are loop-invariant, the receiver is
+never written in the loop, and the body contains no calls (no
+alias/escape). Compose with the register-op machinery (a hoisted temp is
+a frame-slot or machine-local).
+
+**M6 slice 1 status (2026-09-02):** the machine typed-array length read
+landed (`emit_typed_array_length_inline`, in `emit_member_cell_read` —
+every compiled `GetMemberName` whose name is `length` now probes the
+receiver's `typed_array` mirror + fixed-view state first and serves
+`slots.array_length` straight from the box, ~2ns, instead of the ~5ns
+FFI `typed_array_length` round trip; the FFI probe still covers the
+auto/detached/resizable/own-length-shadow misses). Two real bugs were
+found and fixed along the way: (1) the FFI probe ignored an own
+`length` data property shadowing the %TypedArray%.prototype accessor —
+a JIT-compiled `ta.length` read on a defineProperty'd typed array
+returned the slots length (e.g. 8) where the interpreter returned the
+own value (3); the probe now gates on `has_own_property_atom` like the
+interpreter's shortcut, and defining an own `length` clears the
+`typed_array` mirror (`typed_array_define_own_property`) so the machine
+read/store gates miss to the exact helpers thereafter. (2) both the M5c
+store gate and the new read gate AND-ed the block flags together
+(`(detached & immutable & resizable) == 0` — only missed when ALL were
+set), so detached/auto/immutable views slipped through to the machine
+paths; both gates now miss when ANY flag is set. Measured (jit, min-of-3,
+800K): typed-array length 10.2→**6.6ms** (ratio 0.18→0.12); typed-array
+write 16.8→**15.5ms** (its per-iteration guard read is the same probe).
+The residual ~8ns/iter (two ~2ns reads + the general-loop test/dispatch
+overhead) is the actual hoisting work — the reads are loop-invariant and
+still re-execute per iteration; that needs the pre-head temp + certified-
+loop rewrite (the "high effort" slice above), not more read-side
+cheapening. Validation: clippy clean (incl. the workers cfg), `cargo test
+--workspace` green, JIT built-ins (23657/0/0/0) + jitless built-ins
+(23657/0/0/0) sweeps match baseline; differential scripts (shadowed/
+detached/auto/resizable/byte-offset/subarray/SAB length reads and the
+store edge cases) agree between JIT and the interpreter.
+
+**M6 slice 2 design + decomposition (2026-09-02, measured ceilings):**
+the remaining ~8ns/iter is the two loop-invariant `ta.length` reads
+still re-executing per iteration. The full hoist's prize, measured by
+source-hoisting the length into a var (which turns the general loop
+into the fused canonical loop with a `RelLimit::Slot` limit):
+
+| probe (jit, min-of-3) | row | per-iter |
+|---|---|---|
+| `for k < ta.length: s += ta.length` (the row) | 6.6ms | 8.2ns |
+| guard hoisted (`n = ta.length`), body reads `n` | 2.0ms | 2.5ns |
+| guard hoisted, body reads `ta.length` | 3.2ms | 4.0ns |
+| write row (guard only; body = `ta[k] = k & 255`) | 15.5ms | — |
+| write row, guard hoisted | 12.4ms | — |
+
+So the ceiling: length row 6.6→2.0ms (full hoist) or →3.2ms (guard
+only); write row 15.5→12.4ms (guard only — its body has no length
+reads). Design for the slice: a runtime-guarded once-per-loop hoist of
+the loop TEST only (guard-only; body reads stay per-iteration — exact),
+for certified `for (var K = INIT; K <op> RECV.length; K++)` loops where
+RECV is a frame-slot binding never assigned in the loop and the
+body/update are "length-pure" (no explicit calls — nothing can detach/
+resize/define-`length` — and no member access except `RECV.length`
+reads and `RECV[expr] = v` element stores, which cannot change the
+accessor-served length; other receivers could alias RECV through a
+global, so they are excluded).
+
+Emission shape (per hoisted loop): a guard evaluates `RECV.length` ONCE
+via the probe semantics (IntegerIndexed + no own `length` — the exact
+fixed FFI probe / slice-1 machine gate) into a NEW lazily-allocated
+hidden frame slot (`Compiler.scope` is OWNED — `frame_size`/`tdz_store`
+can grow mid-compile before any call runs, so no pre-scan is needed; a
+synthetic `\0`-prefixed AtomId maps to the slot so the fast loop's
+synthetic `K <op> HIDDEN` test resolves `RelLimit::Slot` and takes the
+existing fused canonical loop). On a probe MISS (any other receiver,
+an own-`length` shadow, auto/detached views) the loop re-runs as the
+general per-iteration loop (unchanged semantics). The fast + general
+loops are separate emissions (their bottoms differ); bodies compile
+identically in both (body member reads re-resolve exactly). A new
+label-fixup step (`TypedArrayLengthHoist { target }`, the
+`JumpIfRelLimit` pattern: Step variant + Fixup + interpreter arm +
+JIT emit arm via the existing `TypedArrayLength` FFI + sentinel) pops
+the receiver and pushes the length on a probe hit.
+
+**M6 slice 2 status (2026-09-02):** the guard-only hoist landed for
+certified `for (var K = INIT; K <op> RECV.length; K++)` loops (the
+emission shape above: `Step::TypedArrayLengthHoist` guard + hidden
+hoist slot via `alloc_hoist_slot`, the synthetic `\0hoist<N>` binding
+resolving `RelLimit::Slot`, and two `compile_for` copies; the step's
+interpreter arm mirrors the FFI probe, its JIT arm lowers through the
+`TypedArrayLength` FFI + sentinel). One soundness bug was found and
+fixed during differential testing: the fast copy probes RECV BEFORE
+the head init runs, so a head initializer that plainly assigns RECV
+(`for (var k = (ta = other, 0); k < ta.length; …)` with ta/other
+frame-slot bindings) left the guard's hoisted length stale — the
+general loop's first test reads the post-init length, the hoisted copy
+never re-reads it; `hoistable_length_loop` now scans the head
+declarator initializers with `collect_assigned_expr` alongside the
+body and update. Measured (jit, min-of-3, 800K): typed-array length
+6.6→**3.19ms** (interp 56.3→25.3 — the step-level transform is
+shared) and typed-array write 15.6→**12.47ms** (interp 74.1→42.6) —
+both rows at the guard-only ceilings in the table above. Validation:
+clippy clean, `cargo test --workspace` green, JIT + jitless language
+(23721/0/0/0) and built-ins (23657/0/0/0) sweeps match baseline; the
+16-case differential (canonical length/write rows, own-`length`
+shadow, impure head init, head/update RECV reassigns, break/continue
+bodies, member-left/`<=`/`>=` forms, alias reads, nested loops,
+Float64, zero-length) agrees between JIT and the interpreter with
+hand-traced results.
+
+Both follow-up bugs were investigated and FIXED (2026-09-02): (1) the
+JIT leaf-inlined run of a certified body whose fast/general loop
+contains a `break`/`continue` out of the loop corrupted the CALLER (the
+call after the leaf returned blank output / hit wrong functions — the
+machine-state symptom the slice's body purity had avoided, reached by
+the plain fused loop) — `steps_are_leaf` now excludes `Break`/
+`Continue`, so such bodies run the general path with their own
+frame/buffer, which is exact; (2) the acc path syncs its counter to the
+binding with a single `FastLoopStore` at the loop's END step, and a
+labeled `break`/`continue` to a label OUTSIDE the body jumps past that
+step — the binding then keeps its pre-loop value, observable after the
+transfer (`outer: for (var k = 0; k < n; k++) { ... break outer; }`
+leaves k = 0) — the acc decision now rejects bodies whose labeled
+transfers leave the loop (`acc_body_label_transfers_inside`), falling
+back to the slot path, whose head writes the binding every iteration.
+The doc's original "Bug 2" — element-read counter loops with a
+non-canonical test shape (`k >= 0`, `ta.length > k`) returning 0 in
+both modes — was a differential ARTIFACT, not a defect: those
+differential cases summed a ZERO-FILLED `new Uint8Array(1000)`, so 0
+was correct; with a filled array both shapes compute correctly in JIT
+and jitless.
+
+Body-read hoisting (length row 3.2→2.0ms, the last 1.2ms) is M6 slice
+3: compile member reads of `RECV.length` in the fast body as
+`LoadLocal(HIDDEN)` — a compile-time hook in the member path gated on
+the loop's guard having passed. Validation for each slice: clippy +
+workspace tests + JIT/jitless built-ins sweeps + differential scripts.
+
+**M6 slice 3 status (2026-09-02):** body-read hoisting landed. While
+compiling a hoisted loop's FAST copy (the guard-probe-hit path), a
+member read of the guard-probed receiver's `length` lowers to a plain
+`LoadLocal` of the hidden hoist slot: a new `Compiler` field
+(`hoisted_length: Option<(recv_slot, hoist_slot)>`, set around the fast
+copy's `compile_for`, save/restored so a nested hoist re-establishes
+its own redirect) and a `compile_member` hook
+(`try_hoisted_length_read`) that matches the receiver by RESOLVED slot
+— a shadowing declaration of the name (a block `let`/`var` rebinding)
+resolves to a different slot and keeps the member path, and the
+guard-miss fallback copy compiles with the field `None` (its hidden
+slot is never initialized, so its reads re-run the member machinery).
+The redirect is exact: the probe verified the IntegerIndexed /
+no-own-`length` receiver and the slice-2 body purity (no calls, no RECV
+writes) makes the length loop-invariant, so the per-iteration member
+read and the slot agree. Measured (`--jit-bench`, min-of-3, 800K):
+typed-array length 3.19→**2.02ms** jit (the plan's 2.0ms full-hoist
+ceiling — the last 1.2ms) and 25.3→**16.4ms** interp (the step-level
+transform is shared); the typed-array write row is unchanged (12.4ms —
+its body has no length reads). Validation: clippy clean,
+`cargo test --workspace` green, JIT + jitless language (23721/0/0/0)
+and built-ins (23657/0/0/0) sweeps match baseline (one language-jitless
+batch flake — a computed-property-name fixture with no loop that cannot
+reach the hoist path — passed standalone and did not reproduce on
+re-run); a 10-case differential (row/init reads, own-`length` shadow
+fallback, nested conditionals, Float64, zero-length, alias receiver,
+break body, update reads, element reads) agrees between JIT and the
+interpreter.
+
+#### M7 — Register quality (the acc-path register runs)
+
+M7's original premise — manual loop unrolling to close `compound assign`'s
+jit gap — was dropped: the register-run and raw-f64-counter work (Cut 35)
+made the remaining jit rows codegen-quality issues, and the acc-path loop
+counter already lives in a machine register across the back edge.
+
+**Discovery (2026-09-03):** a braced loop body (`{ n += 1; }`) compiles to
+`[ListBegin, body-steps, ListEnd]` inside the loop, so the block's
+`ListEnd` follows the body's last statement. `lower_leaf_ops_segmented`
+committed a run only at a `SetCompletion` or the slice end, so the body's
+steps never closed a run — the whole braced body dispatched per step while
+the unbraced equivalent ran as one `RunRegBody`. (The member-store shape
+`a[l++] = i` did lower: its statement ends in a `SetCompletion` the run
+absorbs, popping the assigned value the register form consumes.)
+
+**M7 slice 1a LANDED (2026-09-03):** the commit rule also closes a run at a
+self-balancing fused statement-terminal store (`FusedStoreLocal`/
+`StoreLocal`/`InitLocal` — their step-path form pops their own value and
+leaves nothing for a later step to pop), so a braced body whose last
+statement is such a store closes a run before the `ListEnd`. A MEMBER store
+is deliberately NOT such a boundary: its trailing `SetCompletion` pops the
+assigned value and must stay absorbed with the run — ending a run at the
+member store was the buildString corruption a first version of this rule
+hit. The `SetCompletion`-absorbing and list-wrapper boundaries are
+unchanged. Measured (interpreter, isolated 5M-iteration probe, both
+orderings): braced `{ n += 1; }` 96→72ms and braced `{ n += i * 2; }`
+110→78ms (~25-29%). JIT rows unchanged.
+
+**M7 slice 1b LANDED (2026-09-03): the all-register block's list wrappers
+are absorbed.** A run bracketed directly by a `ListBegin`/`ListEnd` pair —
+a block whose EVERY statement lowered into the run — absorbs the pair into
+its span (nested all-register blocks absorb outward). Over an all-register
+block the wrappers are a completion no-op on the step path (`ListBegin`
+saves, `ListEnd` restores only an untouched completion, and the register
+ops never write it), and the run contains no abrupt control that could
+skip the pop (breaks/jumps never lower), so dropping the pair — and its
+per-iteration list push/pop — is unobservable. Braced bodies now compile
+to the SAME single `RunRegBody` as the unbraced form. Measured
+(interpreter, same probe): braced `{ n += 1; }` 72→**56.7ms** and braced
+`{ n += i * 2; }` 78→**61ms** — equal to the unbraced rows (56/60ms);
+JIT rows unchanged. Validation (both slices): clippy clean, workspace
+tests green, all three sweeps at baseline, plus the bytecode-level
+regression tests (the braced body lowers to one run with no list steps
+left; the member-store body keeps its `SetCompletion` absorbed).
+
+#### M8 — Arena allocation (interp)
+
+`.notes/gc-plan.md`'s remaining lever: `Gc::new` heavier than `Rc::new`;
+recovers the string-concat/construct-churn regressions. The rope
+append allocates a box per append (100K for the string-concat row); a
+bump arena + the small-string path (Cut 67) cuts the alloc + `Rc` bump.
+
+#### Longer tail
+
+- **M9 — fused compound member op** (`o.x += 1` as one register op:
+  generation-validated cell read + add + store back).
+- **M10 — apply arg-list copy**: `create_list_from_array_like`'s dense
+  path still copies; inline the known `.apply` into a vector call (the
+  M4 + M2 combination).
+
+**M9 decomposition (2026-09-03, interp, the row's own shape):** the
+`compound assign` row (`{ o.x += 1; s += o.x; }`, o/n locals, 100K iters)
+is ~186ns/iter, of which ~146ns is the MEMBER WRITE. Isolated shapes:
+slot-only control ~20ns/iter; two member reads (value-cell hits) add
+~4ns each; `o.x = i` (plain warm own-property write) ~166ns/iter. The
+write path (`assign_member` → `member_reference` + `put_value`) has no
+single dumb bottleneck — `find_ecma_accessor` already short-circuits on
+the own data property (one `get_own_property_key`, no chain walk), so
+the cost is the broad sum of put_value's re-derivation (namespace
+checks, receiver boxing) plus TWO property-vector lookups and the
+`set_with_receiver_key` write. M9 therefore needs a STORE-side fast
+path (an own-writable-data write validated like the read cells), whose
+design must handle chain invalidation across objects (a setter added to
+Object.prototype does not bump the receiver's generation) — not a
+cheaper helper. Row gap vs node jitless stays ~12x until then.
+
+**M10 decomposition (2026-09-02, 200K jit):** direct leaf call 5ns/call;
+recognized `.call` (fixed args) 70ns; recognized `.apply` with a dense
+9-element array 85ns (the element handling adds only ~1.7ns/element via
+the dense fast path); an UNRECOGNIZED apply shape (`g = f.apply` hoisted,
+then `g.call(f, null, arr)`) 840ns — so the compiled `CallApply`
+recognition already buys ~10x, and the residual ~70-80ns is the FIXED
+machinery: the member read of `.apply`/`.call` (a Function.prototype
+chain read), the `call_slow(CallApply)` round trip, the argument-region
+copy + `[thisArg, f, rest...]` layout rebuild, and `do_call_fast`. The
+interp apply steady-state (the harness-fix numbers) is ~102ns/call vs
+the direct ~50ns.
+
+**Next-slice design (the JIT inlines the recognized shape):** for a
+compiled `CallApply` whose member read resolved the realm's intrinsic
+(compare `resolved` against the intrinsic's cached identity — the
+compiler already knows the pattern; the fallback is the current slow
+path), rebuild the fast layout in machine code (drop the resolved
+`apply`/`call`, move `thisArg` before `f`) and route into the
+`emit_call` leaf-inline machinery — skipping the `call_slow` round trip
+and the helper's re-checks. The dense-`arr` apply then extends the
+leaf-inline probe to read the array's buffer directly.
+
+**Status (2026-09-02): slice 1 LANDED — the compiled intrinsic fast
+path.** The `Step::CallApply` arm now compares the member-read result
+against the realm's intrinsic bits (`JitCallContext` snapshots
+`apply_builtin`/`call_builtin` per run, gated on a new
+`CompiledBody::has_call_apply` flag — leaf/resume ctxs included, since a
+leaf body can contain the step) plus a Function-tag receiver gate, then
+rebuilds the direct-call layout in machine code: `.call` (fixed args) is
+a pure region shift, `.apply` routes a nullish argArray to a zero-arg
+call and copies a dense Array's elements to the buffer top via a new
+`apply_args_fill` helper (the one heap read the machine code cannot do;
+rejects — nothing written — on non-dense/too-long/no-room shapes), and
+both route into `emit_call` (which now takes a runtime `argc` value).
+The fallback (shadowed `apply`/`call`, non-Function receiver, non-dense
+argArray) is the unchanged `call_apply` slow path — `do_call_apply`'s
+exact TypeError for a non-callable receiver is preserved by the
+Function gate. Measured: **apply leaf call jit 16.5 → ~7.0ms** (4 runs;
+interp unchanged ~20.8). Validation: 5 new e2e tests (counting wrappers
+prove the dense fill runs per iteration with zero `call_apply` calls,
+`.call` needs no helpers at all, a shadowed `apply` runs the slow path
+per iteration, the non-Function receiver keeps `do_call_apply`'s
+message, and the nullish/empty/array-like shapes stay correct), clippy
+clean, workspace tests green. The residual ~35ns/call on the row is the
+member read of `.apply` (a separate step) plus the per-iteration fill
+copy — the next slice is inlining the member read / skipping the fill on
+a generation-validated repeat.
+
+**Known pre-existing JIT bug (reproduced at HEAD, FIXED 2026-09-02):**
+a compiled body that throws a call error (a non-function callee, or a
+callee body that throws) into its OWN catch inside a loop, many
+iterations (≈200+), panicked "a pending JIT error is present" — the
+covered-error dispatch lost the ctx error. Root cause: a helper error
+inside a try leaves the erroring step's operands on the working stack
+(the interpreter's covered error keeps them on its growing Vec — an
+invisible leak, confirmed by instrumentation); the JIT's FIXED buffer
+mirrored the leak, so the machine sp drifted +operands per iteration
+until the writes overran the buffer and corrupted the ctx (measured: sp
++16 bytes per iteration; the ctx sat ~1880 bytes above buf_end, hit
+after ~125 iterations). Fix (Cut 70, JIT): the compiled `EnterTry` saves
+the working-sp per handler, and each catch/finally entry step resets the
+sp to it — the catch/finally regions never read try-body values, so
+resuming at the try-entry depth is unobservable and bounds the buffer.
+Gated off suspension bodies (a resume restores the working region into a
+fresh buffer, so a pre-suspension sp is stale — the async-rejection e2e
+caught that). Validation: 100K-iteration catch/finally loops pass (two
+new e2e tests), the 201-fixture language/statements+expressions try
+cluster passes, and the full language (23721/0/0/0) and built-ins
+(23657 pass / 0 fail / 0 crash / 0 hang) sweeps are at their baselines.
+The interpreter's equivalent Vec-growth leak is documented but
+unchanged (bounded per call; a hot catch loop grows the stack until the
+call returns).
+
+### 5. Disposition (closed 2026-09-03)
+
+The section-4 order was the original week plan; the work is executed one
+single experiment at a time in measurement-dictated order. Landed as of
+2026-09-03: M1 (dense elements + the inline append gate), M2 (fast-arg
+cap), M3 slice 1 (value-cell-first probe), M5c (typed-array store
+inline), M6 slices 1-3 (typed-array length read/host/body-read hoist),
+M10 slice 1 (compiled intrinsic apply/call), M7 slices 1a-1b (braced
+fused-store register runs + all-register list-wrapper absorption — the
+braced and unbraced loop-body forms now compile identically).
+
+**The plan is closed — no next experiment.** The remaining items were
+assessed against the measurements and are not pursued:
+
+- **M7 slice 2** (a loop-local accumulator carried across the back edge
+  in a second register): a new VM register with JIT liveness and GC
+  rooting across the back edge, to save the ~quarter of the ~4ns/iter
+  register body that the accumulator's slot round trip still costs.
+- **M1 C deep** (the machine-code RefCell/Vec dense-append inline): a
+  UB-sensitive JIT slice for a row already at 42.9ms jit.
+- **M2 residual** (65+ arg vector-form plain calls): no bench row
+  exercises it.
+- **M3 slice 2** (the remaining member-read dispatch): single-digit
+  percent on one row.
+- **M8** (the GC arena): a cross-cutting collector change for interp
+  rows (string concat ~2.4x vs node jitless after the harness fix)
+  already close to their floor.
+- **M9** (the fused compound member op / store-side write path): the
+  decomposition measured the warm member write at ~146ns/iter of the
+  compound row's ~186; a store fast path must handle chain invalidation
+  across objects (a setter added to a prototype does not bump the
+  receiver's generation) — hidden-class-scale machinery.
+- **M10 slice 2** (inlining the `.apply` member read): a JIT micro-slice
+  for the residual ~35ns/call.
+
+### 6. Tracking & methodology
+
+- **Gate:** the §1 table in `.notes/perf.md` (measured 2026-09-02). After
+  each milestone, re-run `--jit-bench` and `tools/jit_bench/node_bench.js`
+  in both modes and append a dated row.
+- **A/B protocol (the machine swings ±15%; judge only multi-run
+  deltas):** alternate base/new order per pair, min-of-3+ runs, prefer
+  the isolated 5M-iteration probe over the full bench to amplify the
+  signal above load noise (the slice-19 order-bias lesson).
+- **Validation per milestone:** `cargo clippy --workspace --all-targets --
+  -D warnings` clean, `cargo test --workspace` green, then the JIT and
+  `--jitless` sweeps at zero regressions; new e2e/unit tests for the
+  soundness edges (spill triggers, guard identity, LICM write/alias
+  rules, leaf eligibility).
+
+### Archive B - the mechanism-based plan (2026-09-03)
+
+## Performance plan: interpreter + JIT (2026-09-03)
+
+> Supersedes the first, row-based plan (Archive A below, closed 2026-09-03). That plan was
+> organized around benchmark rows and committed expected numbers before
+> measuring them; this one is organized around the mechanisms that cost
+> time, treats the two engines (interpreter, JIT) as one shared-machinery
+> system, and uses the vendored V8 checkout (`v8/`, $V8 below) as the
+> design reference — we borrow architecture, never code.
+
+### 0. What the previous analysis got wrong
+
+- **It decomposed rows, not mechanisms.** `compound assign`, `property
+  read`, and `buildString` all trace to the same machinery (property
+  access and allocation) but were planned as separate milestones with
+  separate (mostly wrong) estimates. Row gaps are symptoms; the plan
+  should target the shared cause.
+- **It committed expected numbers before measuring.** Several
+  `Expected:` values were contradicted by the outcomes and had to be
+  deleted (M4's call-row targets were based on a harness artifact; M5's
+  ~8ms target landed at 16.8; M6's ~1ms property-read target never
+  existed). A forward plan must open every item with its probe and never
+  state a target it has not measured toward.
+- **It ignored the reference implementation.** V8's speed on the exact
+  rows we studied comes from a small set of architectural mechanisms
+  (shapes + inline-property offsets, per-site feedback, full-code
+  baseline compilation, nursery allocation). The old plan never mapped
+  its machinery against them.
+- **The harness itself was broken for part of the record.** `bench_once`
+  re-compiled per timed eval and ran the interp column under warmup
+  garbage, inflating the JIT gaps 15-30% and the call rows ~2.7x. The
+  corrected numbers moved the goalposts mid-plan.
+- **One disposition in the closed plan is itself wrong** — the M9 note
+  claims a warm-store fast path "must handle chain invalidation across
+  objects." Spec `OrdinarySetWithOwnDescriptor` (7.3.3) consults the
+  chain only when the OWN property is absent: an own writable data
+  property shadows every chain accessor. A generation-validated store
+  cell therefore never needs chain tracking. That correction is the seed
+  of L1 below.
+
+### 1. Ground rules
+
+1. **Compliance is the constraint.** The engine passes ~99% of the
+   runnable test262 corpus (language 23721/23724, built-ins 23657/23812
+   incl. 155 skips, annexB 1086/1086). No performance landing proceeds
+   without the three release sweeps at baseline, clippy clean, and the
+   workspace tests green. A perf change that costs a fixture is reverted.
+2. **A lever opens with its probe.** Before implementation, quantify the
+   current cost of the mechanism being replaced with a dated measurement
+   (recorded in `.notes/perf.md`). No expected numbers on a milestone; a
+   milestone records what its probe showed and what its landing measured.
+3. **One experiment at a time.** A landing names the next experiment.
+4. **Both engines move together.** The interpreter and the JIT lower the
+   same `Step`/register-op streams and share the object machinery; a
+   mechanism change must state its effect on each and be measured on
+   both (`--jit-bench` runs each row in both modes).
+5. **$V8 is the reference.** Each lever cites the V8 mechanism it
+   mirrors and why that mechanism is fast.
+
+### 2. The two engines as they stand (measured 2026-09-02/03)
+
+- **Interpreter**: a step-dispatch VM over compiled `Step` streams.
+  Certified bodies (scope analysis) get frame slots; straight-line
+  loop/leaf bodies lower to register runs (`RunRegBody`, one dispatch,
+  accumulator + dedicated f64 counter field). Member reads are served by
+  generation-validated direct-mapped cells; arrays by dense `ArraySlots`
+  mirrors. Measured per-operation floors: register-run loop body
+  ~4ns/iter after the M7 slices; warm member read ~4-12ns; warm member
+  write ~146ns (compound-assign decomposition, 2026-09-03). Step fusion
+  beyond the register runs measured ~0 (slices 19-20) — dispatch count
+  is not the remaining lever.
+- **JIT**: Cranelift compiles only CERTIFIED bodies reached by ordinary
+  calls (`scope` = Some). Bodies on the general path — anything with env
+  machinery (try/catch, `with`, `eval`, closures that capture with
+  `this`, uncertified writes) — never reach `run_compiled_body` and run
+  interpreted forever. Within the certified subset the JIT is strong
+  (fast loops, leaf-inline, caller-slot args, machine typed-array
+  stores).
+
+The wide remaining gaps, after the harness corrections and M7, are the
+rows whose cost is property-write machinery (`compound assign` interp
+~12x vs node jitless, of which ~146ns/iter of ~186 is the write), JIT
+coverage (bodies that never JIT), and allocation churn.
+
+### 3. Why V8 is fast — the mechanisms, mapped to this engine
+
+| V8 mechanism | $V8 source | What it buys | Slag's current analog |
+|---|---|---|---|
+| Maps (shapes) with descriptor offsets + in-object fields | `src/objects/map.h` | property load/store = shape identity check + direct field access; no name resolution per access | generation-validated cells (reads) + full `[[Set]]` re-resolution (writes) |
+| Per-site inline caches / feedback vectors | `src/ic/ic.cc`, `src/objects/feedback-vector.h` | monomorphic fast path validated by one shape compare; exact fallback | global direct-mapped caches (thrash with many keys, Cut 35 slice 5) |
+| Accumulator bytecode + specialized handlers | `src/interpreter/bytecodes.h` | low per-op interpreter cost | register runs (already match/beat this on certified straight-line bodies) |
+| Baseline compilation of ALL code (Sparkplug) | `src/baseline/baseline-compiler.cc` | every body runs compiled, then hot bodies tier up | certified-subset-only JIT; the general path never compiles |
+| Nursery (bump) allocation | `src/heap` | cheap per-object allocation | per-object `Gc::new`/Rc boxes on the hot paths |
+
+### 4. Levers
+
+#### L1 — Property machinery (the dominant lever; both engines)
+
+Property access is where JS programs spend their time and where the
+remaining measured gaps concentrate (reads ~4-12ns vs V8's ~1-2; writes
+~146ns vs V8's few). Three phases, each independently valuable:
+
+**L1a — Warm-store fast path (next experiment).** A store-side cell
+mirroring the read cells: keyed by (object id, name, generation), it
+records "own writable data property." On a hit the write skips
+`put_value`'s re-derivation (namespace checks, receiver boxing,
+`find_ecma_accessor`'s own-property lookup) and the second
+property-vector lookup inside `set_with_receiver_key`, storing directly
+(with the generation bump). Sound because an own writable data property
+shadows the entire chain (7.3.3 step 3), so no setter tracking is
+needed; the existing slice-11 discipline (every own-property mutation
+bumps, including in-place `set_key`) invalidates on redefinition/delete/
+accessor-conversion. Applies only when receiver == base on an
+Object/Function. **Probe first**: prototype the cell, measure the
+`compound assign` row against the 146ns decomposition; gate on the row
+moving with the sweeps at baseline. Interp impact direct; JIT impact via
+its `call_slow` fallbacks (the compiled fast paths are separate).
+**L1b — Fused compound store** (`o.x += v` as one register op, riding on
+L1a's cell + the read cell): merges the read-modify-write under one
+validation. Interp and register-op paths.
+**L1c — Shapes/maps with inline-property offsets (structural, long
+pole).** Give ordinary objects a stable shape with offset-addressed
+properties so hot reads AND writes are a shape compare + field access in
+both engines, replacing the generation/id/name probes, killing the
+direct-mapped thrash, and making the JIT emit the same check inline.
+Shape transitions on structural change; exotic receivers/accessors/index
+keys fall back to the existing exact machinery. This is the V8
+`map.h`/descriptor model, phased: read path first (interp shared helper,
+then JIT inline), then the write path, then transitions. The compliance
+gate is the sweeps plus targeted differential probes (shadowing,
+accessor conversion, prototype mutation, delete/redefine during loops).
+
+Timing note: this decision gets CHEAPER the earlier it is made. The
+generation-validated cell model is the accretion point — every new
+property path written on top of it (L1a's store cell, the register and
+JIT member ops) either becomes a legacy layer to carry or must later be
+re-expressed on shapes. The engine is three weeks old; building the
+read/write/JIT paths on the final representation once beats retrofitting
+them after more machinery depends on the cells. V8's ~18 years set the
+ceiling, not the schedule — the cost of adopting shapes only grows as
+the property machinery grows, so L1c should follow L1a/L1b promptly
+rather than drift.
+
+#### L2 — Per-site feedback (after L1)
+
+Per-call-site IC entries (shape/offset pairs on the L1c model) shared by
+the interpreter (validate + direct access) and the JIT (monomorphic fast
+path with exact slow path), replacing the global direct-mapped tables
+that thrash at scale. V8's `ic.cc`/feedback-vector model. Defer until L1
+establishes the shape representation; a per-site cache on the current
+hash-based cells buys little.
+
+#### L3 — JIT coverage: compile the general path
+
+Today the JIT only compiles certified bodies. Every uncertified hot body
+(try/catch, `with`, captured closures, most methods on complex objects)
+runs the interpreter forever. Mirror Sparkplug (`baseline/`): compile
+ANY body by emitting each step's work in machine code, calling into the
+shared general machinery for the env/handler steps instead of
+dispatching them — the dispatch disappears, the semantics stay exact
+(the handler table, covered-error paths, and suspension state are
+already the interpreter's; the compiled code must reuse them, not
+reimplement). **Probe first**: measure (a) what fraction of a realistic
+hot corpus never reaches the JIT today (the scope gate), and (b) the
+dispatch share of a general-path hot loop (e.g. a try/catch loop, a
+`with`-free but uncertified closure) by comparing interp time against a
+hand-compiled-equivalent. Gate the first slice on the narrowest
+uncertified shape (env reads/writes only, no try) with the sweeps at
+baseline; widen only per measured gain.
+
+#### L4 — Allocation (bump arena)
+
+The `buildString`/construct-churn rows allocate a box per element/object
+(the rope append and per-object `Gc::new`). V8's nursery is a bump
+allocator with a copying collector; Slag's per-object allocation is the
+measured interp floor on those rows. A bump arena for the hot shapes
+(ropes, fresh ordinary objects) with the existing collector sweeping the
+arena is the M8 idea, resized to measured need: probe the allocation
+share of the construct/buildString rows first (count boxes per
+iteration), then build the smallest arena that covers them.
+
+#### L5 — Call/construct breadth
+
+The leaf-inline + certified-call machinery is strong within the
+certified subset. After L1-L3 land, revisit the remaining call rows with
+measurement: method-call inline paths (`o.m()` where `m` is a stable
+slot/global), and the residual apply/call member-read cost. No design
+work until L3 changes what is even reachable by the JIT.
+
+### 5. Sequencing
+
+The single next experiment is **L1a (the warm-store fast path)**: it
+targets the largest measured per-operation cost in the engine (~146ns of
+the compound row's ~186ns/iter), is tractable on the current object
+model, and its probe is one small cell plus a row re-measure. Landing
+order after that follows what L1a/L3's probes show, with one standing
+instruction: L1c is the primary architectural investment and is not to
+drift — per its timing note it only gets more expensive as the property
+machinery accretes on the cell model, so it should start as soon as
+L1a/L1b land, ahead of L2 unless the probes change the calculus.
+
+Landing gates (every item): clippy clean, `cargo test --workspace`
+green, language + built-ins + annexB release sweeps at baseline, the row
+A/B in both modes recorded in `.notes/perf.md`, and the measurement the
+item's probe promised.
+
+### 6. Measurement discipline
+
+- Rows live in `.notes/perf.md` with their dates and harness; the machine
+  swings ±15%, so deltas are judged on multi-run interleaved A/Bs, never
+  single runs.
+- The A/B harness (`bench_once`) measures steady state: definition
+  evacuated once, args bound once, warmup before timing — no per-run
+  recompile, no warmup-garbage skew.
+- Mechanism probes (per-op costs) use isolated loops shaped like the
+  real row, alternated in order; a probe that changes the goalposts is
+  recorded as such, not silently re-baselined.
+
+### Archive C - the merged task list (2026-09-04; superseded by the front-matter tables)
+
+## Merged task list (the status view as of 2026-09-04)
+
+> Merged, prioritized view of the remaining work in the active plan
+> (mechanism-based, supersedes) and the closed historical plan (both
+> archived above). Status reflects everything
+> landed through `0d70d3e` (the L1c record-discipline landing), the
+> write-cell capacity slice (1.3), and the certification-coverage slice
+> (2.2): the gap-close milestones M1-M7/M10, the L1a/L1c register-path
+> work, the typed-array no-alloc reads, the `UpdateReg`/`JumpIfEqImm`/
+> `BinStoreReg` slices, and the GC fixes. Only remaining work is listed.
+> One experiment at a time; a lever opens with its probe; every landing
+> gates on clippy clean, workspace tests green, and the three release
+> sweeps.
+
+### P0 — Correctness (JIT)
+
+| # | Item | Status | Evidence / first action |
+|---|---|---|---|
+| 0.1 | JIT `Float16Array`/typed-array miscompile: compiled `makeArrayLike`-style loops read all-`NaN` from some iteration onward, then segfault (~200-fixture crash cluster, JIT-only, `--jitless` clean) | open; Linux-only; being debugged | Pre-existing at `d58caea`; not GC (reproduces with collections disabled). Lives in `crates/jit` lowering. Unblocks clean Linux JIT built-ins and the `-p jit` release test binary. |
+
+### P1 — Structural property machinery (L1c → L2)
+
+| # | Item | Status | Evidence / first action |
+|---|---|---|---|
+| 1.1 | L1c read/write end-state on maps/shapes: hot member paths serve via shape-compare + inline-field access instead of the generation/id/name value-cell probes; exotic receivers/accessors/index keys fall back to the exact machinery | partial; stones 1-3 (record discipline) and 1.3 (write-cell capacity) LANDED; the READ-end-state premise was probed and FALSIFIED on the interpreter (perf.md, 2026-09-04) | **Stones 1-3 (LANDED, 2026-09-04)**: the warm member write stopped bumping the generation (`write_data_property_slot`) after converting the three generation-stamped VALUE caches to the L1c oracle pattern (`construct_this_object` reads `prototype` via the shared member value cell; `member_chain_cells` cache the resolution and re-read live; the for-of verdict oracles AIP's `next`). **1.3 (LANDED, this tree)**: the L1a store cells moved to a SEPARATE 256-entry table (`MEMBER_WRITE_CELLS`) — see the 1.3 row. **Read probe (FALSIFIED the per-site read premise)**: warm register member reads are ~3.5ns and read 64 distinct same-map objects at ~4.2ns (+0.7ns — the map-cell layer absorbs value-cell misses at near-warm cost); a 16->256 `MEMBER_CELLS` experiment did NOT speed the cycling-object rows and bloated the Agent's inline tables ~25% slower on every warm row. So the interpreter read path is near its floor; per-site read ICs are NOT the next slice. **Next**: the write end-state — see 1.3's follow-on (per-site store cells only if >256-object working sets show up in a probe). |
+| 1.2 | L2 per-site feedback: per-call-site IC entries (shape/offset) shared by the interpreter and the JIT, replacing the global direct-mapped tables | re-scoped by the 2026-09-04 probes | The interpreter read path does not need per-site ICs (1.1's probe: reads ~3.5-4.2ns across 64-object working sets). The remaining per-site argument is the WRITE side beyond the 256-entry capacity (1.3) and the JIT's compiled shape-compare end-state. Defer full L2 until a >256-object store-loop probe shows the capacity ceiling, or the JIT work needs the shape/offset representation. |
+| 1.3 | L1a store cells on a separate, larger table (`MEMBER_WRITE_CELLS`) | **landed 2026-09-04** (this tree) | The 16-entry write cells alias across any >16-object store loop; a store-cell miss falls back to the full [[Set]] (~140ns). Interleaved A/B (parent `0d70d3e` + probe rows vs this tree): a 64-distinct-object cycling-store row (32M stores) drops ~4.4-4.5s -> ~0.42s (~10x, ~140ns -> ~13ns/store); the warm rows moved within the cross-build layout band (`arithmetic` — no property cells — moved ~±25%, recorded as noise). Read cells stay at 16 (1.1's probe); the store probe/record now index by `MEMBER_WRITE_CELLS` while the value-cell front keeps the read table's mask. Gates: clippy, workspace tests (new `warm_stores_across_many_distinct_objects_keep_separate_cells`), three sweeps at baseline. Follow-on: per-site store ICs if a probe finds >256-object hot store loops (the JIT's compiled stores are separate). |
+| 1.4 | Primitive-string property reads box a String-exotic wrapper per access | **landed 2026-09-04** | Certified-body probe (200k `s.length` reads, `Gc::new` TLS counters): top-level eval, certified interp, AND the JIT all boxed 448B wrapper + 64B [[StringData]] per read. Fix in the shared `Vm::get_member_name`/`get_member_computed` helpers (mirroring the typed-array `length`/element shortcuts, so the step path, register ops, and JIT ABI all inherit): string-`.length` returns the code-unit count; in-range canonical numeric index returns the single code unit (StringGetOwnProperty — own, shadows the chain); OOB/non-index falls through (patched `%String.prototype%` numeric keys still found). Counts 400k -> 0; clean A/B on the 200k row: interp ~106-119ms -> ~4.2-4.8ms (~23x), jit ~108-308ms -> ~2.4-2.8ms (~40x). Gates: clippy, workspace tests (new `string_primitive_member_reads_serve_length_and_units_without_boxing`), three sweeps at baseline (perf.md record). |
+| 1.5 | Primitive-string METHOD reads (chain data/accessor/symbol keys) resolve on `%String.prototype%` without boxing | **landed 2026-09-04** | Probe: `s.charAt`/`charCodeAt`/`indexOf` each boxed 448B wrapper + 64B [[StringData]] per CALL on top-level eval, certified interp, AND the JIT (200k calls = 400k boxes; the compiled call path has no primitive-receiver member fast path). Fix: `Vm::get_string_primitive` — after the 1.4 length/index shortcuts, a string-primitive fallback resolves the key against the realm's cached `%String.prototype%` with the PRIMITIVE as the [[Get]] receiver (exact: the wrapper's own props are only length/index, and the engine threads Receiver=primitive through OrdinaryGet — data props, accessors (strict getters see the primitive; sloppy this-coercion boxes), proxy links, symbol keys all match). Boxes 400k -> 0 (charAt retains its inherent result-string box). Clean A/B on 200k rows: charCodeAt interp ~413-430 -> ~246-250ms (~1.7x), charAt ~348-371 -> ~207-216 (~1.7x), indexOf ~550-578 -> ~394-409 (~1.4x); jit similar; the residual per-call cost is the intrinsic CALL dispatch (4.1/L5), not the read. Semantic battery byte-identical vs the boxed path (sloppy/strict getters, patched methods, proxy-in-chain receiver, numeric OOB). Gates: clippy, workspace tests (new `string_primitive_method_reads_resolve_on_the_prototype_chain`), three sweeps at baseline (perf.md record). |
+| 1.6 | Non-string primitives (Number/Boolean/BigInt/Symbol) METHOD reads resolve on their %X.prototype% without boxing | **landed 2026-09-04** | The 1.4/1.5 helper was string-only; probe (200k, `Gc::new` TLS counters) showed Number/Boolean/Symbol/BigInt method reads/calls boxed a 448B wrapper PER READ on both engines (number/boolean wrapper creation also inserts an agent boxed-value-table entry): `n.toFixed`/`toString` reads 200k x 448B, call rows + the inherent result-string boxes, `sym.description` + result, bigint call + 48B box. Fix: generalized `Vm::get_string_primitive` -> `Vm::get_primitive_member` and routed every primitive (not just String) through it in `get_member_name`/`get_member_computed`; new `Intrinsics::primitive_prototypes` cache (Number/Boolean/BigInt/Symbol, array indexed like `function_prototypes`). Exactness is the same argument as 1.5 (these wrappers are ordinary objects with NO own properties — the direct chain read with the primitive receiver reproduces every read; the `description` accessor and proxy links see the primitive receiver). Boxes 200k -> 0 on reads. Clean A/B on Number method-read rows (200k): interp ~106-119ms -> ~13.3-14.1ms (~8.4x), jit ~97-104ms -> ~7.9-9.7ms (~11-13x); the residual ~67ns/call interp is the %Number.prototype% own-scan chain read (the 4.1 probe's chain-read primitive — L2). 18-line semantic battery byte-identical (methods, patches, strict/sloppy getters, proxy receiver, `Symbol().description`, boxed `new Number(5)` reads). Gates: clippy, workspace tests (new `non_string_primitive_method_reads_resolve_on_the_prototype_chain`), three sweeps at baseline (perf.md record). |
+| 1.7 | Store-cell capacity: `MEMBER_WRITE_CELLS` 256 -> 4096 (boxed table, heap-direct init) | **landed 2026-09-04** | The (a) probe: a >256-distinct-object cycling store loop hits a real cliff — 1M stores across 1024 objects ~180ns/store interp (~165 jit) vs ~55ns/~40ns for 1-256-object sets, because the 256-entry direct-mapped write cells thrash and every store falls to the full [[Set]]; READ rows do NOT cliff (59-61ns at both 64 and 1024 — the read map/proto-cell layer absorbs). Such loops are realistic (per-frame entity/record updates over thousands of objects). Fix: grow the boxed `MEMBER_WRITE_CELLS` 256 -> 4096 and make `Agent::new` build it heap-direct (the `from_fn` array temporary sat on the stack — ~128KB at 4096 — and overflowed the 1MB-stack embed doctest). 1024-object stores drop ~180 -> ~55ns interp (~165 -> ~40 jit); warm rows and the suite move within the cross-build layout band; the charCodeAt control flat. Working sets >4096 still cliff (that residual is the L2 shape-keyed store slice, 1.8). Gates: clippy, workspace tests (4652/0 incl. the embed doctest), three sweeps at baseline (perf.md record). |
+| 1.8 | Shape-keyed store cells + the direct own-data fallback (L2 slices b/c): remove the >4096-object store cliff for same-shape and vector-only hot stores | **landed 2026-09-04** (this tree) | The (id, name) `MEMBER_WRITE_CELLS` table thrashes once a store loop's object working set exceeds 4096, even when every object shares one shape — measured cliff (200k-call rows, fresh release build of `ebe30cc`): 8192-object inline-field stores ~181ns/store interp (~162 jit) and 16384 ~182ns vs ~56ns/~40ns at 64-1024 objects. Two mechanisms. (1) **Shape-keyed cells**: a second direct-mapped table `member_write_map_cells` keyed by (map id, name) — a map id pins the descriptor layout for every instance of the shape, so a hit needs no per-object identity or generation. Probed as the fallback when the (id, name) cell misses; recorded ONLY for map-described inline keys (a vector-only property's slot is per-object — two objects can share a live map yet hold different vectors after it), so the pinned inline mirror is always real. (2) **Direct own-data fallback**: the residual probe showed the same cliff for a key the map does NOT pin (a 5th+ field of a many-field shape is vector-only — 8192 ~214ns, 16384 ~223ns interp) and that no per-step IC can serve it (nothing shape-pins a vector-only slot). Instead the miss chain now resolves the object's OWN vector slot (`property_slot`) and writes in place when the property is already an own writable data property — exact (an own writable data property shadows the chain, spec 7.3.3; accessor/non-writable/absent fall to the full [[Set]]) — turning every warm in-place store into an O(1) resolve+write regardless of object count. A hit on either fallback re-keys the (id, name) cell so the same instance's next store keeps the cheaper primary probe, and fronts the read-side value cell under the L1c no-bump discipline. Inline rows: 8192/16384 ~181-182ns -> ~58-67ns/interp (~162 -> ~44 jit), now AT the 64/1024 warm level; vector-only rows ~214-223ns -> ~68ns (jit ~184-196 -> ~54ns); single-object rows unchanged (no warm regression). Gates: clippy, workspace tests (new `stores_over_many_same_shape_objects_stay_exact` + `stores_over_many_vector_field_objects_stay_exact` — 9000 same-shape / six-field instances with distinct values, interleaved map transitions, non-transitioning defineProperty, and deletes to dictionary mode, all read back), three sweeps at baseline (perf.md record). The remaining full-[[Set]] stores are true defines (a genuinely new key), which no IC can make faster without the L1c storage migration; the chain-member-read slice (a) still waits on L1c's shape end-state. |
+
+### P2 — JIT coverage (L3)
+
+| # | Item | Status | Evidence / first action |
+|---|---|---|---|
+| 2.1 | Compile the general path (Sparkplug analog): emit every step in machine code for bodies the scope gate excludes, routing env/handler steps through the shared machinery | re-scoped by the 2026-09-04 probes | The scope-gate probe falsified the plan's premise for try/catch (those certify AND reach the JIT — per-iter try interp ~125ms / jit ~72ms) and 2.3 (this-capturing arrows) landed the dominant residual scope=None shape (~33x). The remaining scope=None hot shapes are narrow (with/eval/async-generator/super-constructors); their dispatch cost is not measured as a lever. Do NOT start the Sparkplug analog without a corpus probe showing uncertified hot bodies whose cost is dispatch (not the env path the certification fixes remove). |
+| 2.2 | Certification over-rejection: nested NON-ARROW functions' own `this`/`arguments` bailed the enclosing body's scope certification | **landed 2026-09-04** | The closure walker (`closure_*_allows`) now threads an `own` flag: entering a nested non-arrow function sets it (its `this`/`arguments` are its OWN, bound at its own call); arrows propagate the caller's flag (an arrow in the analyzed body still observes its lexical `this` and bails). `super`/`class`/private/tagged/import stays rejected under `own`. Probe (perf.md, 2026-09-04): the construct-churn loop function-wrapped with a nested `function C(x){ this.x = x; }` ran ~117-129ms vs ~19-21ms with C a global; after the fix the nested form matches the control (~6x), because the body re-certifies and its `var`s leave the env path. Gates: clippy, workspace tests (new `nested_function_own_this_and_arguments_keep_the_body_certified`), three sweeps at baseline. |
+| 2.3 | Certify `this`-capturing arrows: an arrow created in a certified non-arrow body that references `this` captures the body's this value (a synthetic context entry sourced from the this slot at creation); the arrow body reads it as a depth-0 context slot | **landed 2026-09-04** | The closure walker records a reserved marker (\u{1}captured-this) when an arrow references `this`; a NON-ARROW body allocates a marker context slot + forced this slot and `compile_body` emits an entry store copying this into it; an ARROW body certifies only when its outer chain carries the marker (its direct `this` compiles to a `LoadContextSlot` resolved through the chain; deeper this-arrows flow the same way). Env-path arrows (rest params etc.) inside a capturing body resolve lexical this through the capture context (`DeclarativeEnv::has_captured_this`/`captured_this_value` make the marker env a this-environment — the Object/keys/proxy-keys regression fix). Measurement (perf.md, 2026-09-04): the callback-in-method probe dropped ~1.4s -> ~42ms (~33x). Gates: clippy, workspace tests (new `this_capturing_arrows_certify`), three sweeps at baseline. |
+
+### P3 — Allocation (L4 / M8 arena)
+
+| # | Item | Status | Evidence / first action |
+|---|---|---|---|
+| 3.1 | Bump arena for the hot shapes (ropes, fresh ordinary objects), swept by the existing collector | **closed by probe 2026-09-04 — no arena work indicated** | Counting probe (perf.md, 2026-09-04): `construct churn` = exactly 1 x 448B arena box per iteration (the `new C(i)` instance itself; no context/env/key extras); `buildString full` = 390 boxes TOTAL for the whole row (the ~1.1M dense element writes allocate zero). The bump arena the plan proposed ALREADY exists (A5.1: bump + size-classed free-list; GC-5 measured the free-list half net-neutral and registration ~11ns/alloc). No second hot shape to give a dedicated arena; the rows' residual cost is the certified-construct path and branchy step dispatch. The probe's side finding (primitive-string property reads boxing a wrapper per access) is tracked as 1.4. |
+
+### P4 — Call/apply residual (L5 / M10 slice 2)
+
+| # | Item | Status | Evidence / first action |
+|---|---|---|---|
+| 4.1 | Inline the `.apply`/`.call` member read on the compiled intrinsic path | probe done 2026-09-04 — target re-derived as diffuse; deferred to the L2 per-site IC and the L5 call-dispatch levers | Fresh A/B decomposition on the `apply leaf call` shape (200k, per call): apply-9 interp ~98-105ns / jit ~36-44ns; .call-9 interp ~100-107 / jit ~26-32; same-leaf direct 9-arg call interp ~58-62 / jit ~6.2 (the floor). Overhead vs the direct call: interp ~40-44ns, jit ~20-37ns — allocation-free (boxes 0) and the arg-array fill is NOT the term (interp .call ≈ .apply; jit apply-9 ≈ apply-1). The residual is spread across the per-iteration chain member read of the method, the intrinsic identity compare, and the CallApply dispatch; prototype-chain member reads cost ~4x own-data reads interp and ~10x jit (55 vs 16ns interp; ~28 vs ~2.8ns jit) across function/object/array receivers — the read IS a real primitive, but a narrow `.apply`-only inline has no clean target (the read is shared with every `o.m()`; an inline validation was measured slower in 2026-09-01). Defer the read-side fix to L2 (per-site shape/offset ICs) and the dispatch-side residual to L5. |
+| 4.2 | Register agent-dependent builtin handlers in the O(1) per-function-id table so warm calls skip the module dispatch chains (the L5 intrinsic-call dispatch floor) | **landed 2026-09-04 — String + Number + Boolean + BigInt**; Object/Date/Keyed/etc. chains share the pattern | Probe (200k calls, certified rows, both engines): `s.charCodeAt` ~1.18µs/call interp and `a.push` ~1.7µs vs `Math.abs` ~150ns (a plain native closure, no agent chain) and a same-work JS leaf ~90ns. Mechanism: agent-dependent methods (ToString/@@-delegation need the agent, so they are placeholder-closure builtins dispatched by intrinsic identity) run the module's LINEAR `dispatch_call` chain on every warm call — each `intrinsics.get` arm allocates a JsString + hash-lookup, and only `array::handler_for`/`regexp::handler_for` register O(1) per-id handlers today. Fix: per-module `handler_for` maps (String ~39 non-HTML arms, Number 7, Boolean 3, BigInt 6 — each arm's `(agent, this, args)` handler, constructor arms via adapter closures) consulted by `Intrinsics::define`, registering each method by function id at install. charCodeAt interp ~1.18µs -> ~380ns (~3.1x); clean A/B per call on the primitive rows: `n.toFixed(1)` interp ~1170 -> ~680ns (~1.7x), `b.toString()` ~615-653 -> ~300-307 (~2.0-2.3x), `123n.toString()` ~926-963 -> ~346-361 (~2.6-2.8x); jit proportional. Residual is the primitive chain READ (~250ns) + native call (the L2 read lever). Gates: clippy, workspace tests (new `string_agent_builtins_dispatch_identically_via_registered_handlers` + `number_boolean_bigint_builtins_dispatch_via_registered_handlers`), three sweeps at baseline (perf.md record). Next: the same `handler_for` maps for the other agent-dependent modules if a corpus probe shows their methods hot. |
+| 4.3 | Register the KEYED module (Map/Set/WeakMap/WeakSet + iterator nexts + statics/size/species) in the O(1) handler table — the (d)-landing follow-on (c) | **landed 2026-09-04** (this tree) | After the hash-index landing (d) the keyed rows' residual was the module's ~55-intrinsic `dispatch_call` chain (Set.has's arm ~40 `intrinsics.get` calls in — ~5µs/call; Map.get ~1.9µs at arm ~10). `keyed::handler_for` maps every `Intrinsics::define`'d keyed function (methods, groupBy, size/species getters, both iterator `next`s) to the named `(agent, this, args)` handler the chain already calls; the four constructors register their call-without-new TypeError (their `new` path keeps `dispatch_construct`). A/B vs parent `3cd5c9b` (the index landing, 200k-call rows): Map.get ~356 -> ~45.6ms (~7.8x, ~228ns/call), Map.set ~513 -> ~44.3ms (~11.6x), Set.has ~891 -> ~48.9ms (~18x — its late arm collapses to Map.get's cost), delete+set churn ~770 -> ~94ms (~8x); the JIT column matches. Gates: clippy, workspace tests (new `keyed_builtins_dispatch_via_registered_handlers`), three sweeps at baseline (perf.md record). Next: the (c)-probe's remaining chain-bound modules are Object (arms are INLINE closures — a named-handler refactor first) and DataView (~660ns) — extend per a corpus probe showing their methods hot. |
+| 4.4 | Register the OBJECT and DataView modules in the O(1) handler table (candidate (c) completion) | **landed 2026-09-04** (this tree) | Object's `dispatch_call` arms were INLINE closures (the (c)-probe's reason registration was deferred): each closure is now extracted into a named `(agent, this, args)` handler (`prototype_has_own_property`, `object_create`, `object_define_property`, `object_entries`/`values`/`keys`, `object_get_own_property_descriptor(s)`, `object_has_own`, the integrity-level statics, ...), so the chain and the new `object::handler_for` share one implementation; DataView's get/set codecs register per element type and the buffer accessors directly. A/B vs the 4.3 parent (200k-call rows): Object.hasOwn ~1085 -> ~126ms (~8.6x, ~632ns/call), hasOwnProperty ~283 -> ~150ms (~1.9x — an early arm, work-bound), DataView.getUint8 ~630-720ns/call (the (c) probe) -> ~291ns (~2.2-2.5x); Object.keys' row is allocation-bound (64 fresh key strings per call), unchanged. Gates: clippy, workspace tests (new `object_and_dataview_builtins_dispatch_via_registered_handlers`), three sweeps at baseline (perf.md record). Candidate (c) is now CLOSED: every agent-dependent module whose methods a probe showed hot (String/Number/Boolean/BigInt/Keyed/Object/DataView) is registered. |
+
+### P5 — Small interpreter micro-slices (probe first)
+
+| # | Item | Status | Evidence / first action |
+|---|---|---|---|
+| 5.1 | Drop the per-`if` `ResetCompletion` in certified loop bodies (one fewer dispatch/iteration on branchy bodies) | **landed 2026-09-04** | `buildString shape` ~99-104 -> ~94-97ms interp (~5%); completion battery + three sweeps at baseline (perf.md record). |
+| 5.2 | Closed-plan residuals (assessed not-worth in gap-close §5, listed for completeness): M7 slice 2 (second register accumulator), M1-C-deep (machine dense append), M2 65+ args, M3 slice 2, general LICM of `o.a`/`g` reads | closed | No bench row exercises most; revisit only if a probe shows otherwise. |
+| 5.3 | Fuse the statement-position local compound into one op when its RHS is in the accumulator (`BinStoreReg` — the `n += i*2`/`s += o.x` tails) | **landed 2026-09-04** (`83b7bea`) | arithmetic interp ~13.2-13.5 -> ~11.3-11.5ms (~15%), compound assign ~12%; JIT flat; three sweeps at baseline (perf.md record). |
+| 5.4 | Direct-operand local compounds (`n += 1`, `s += t`) fused into one fat op | **closed by measurement 2026-09-04 (REVERTED)** | Interleaved A/B vs `83b7bea`: arithmetic +~1.2ms, bare loop +~0.4ms regression — the per-op match dispatch is cheaper than a fat arm with operand branches + a cold tail. The direct-right shapes stay three ops (perf.md record). |
+
+### Recommended order
+
+1. 0.1 in parallel (the Linux debug agent owns it) — a correctness blocker.
+2. 5.1-5.4 are LANDED/CLOSED (2026-09-04): the register-run local-compound
+   arc ended at the `BinStoreReg` fuse (5.3); the direct-right fat-op
+   generalization measured as a regression (5.4) and the branchy micro-arc
+   is at its 4-dispatch floor. 1.3 (write-cell capacity) is LANDED on this
+   tree.
+3. The read-end-state premise (per-site member reads) was probed and
+   FALSIFIED (1.1): interpreter member reads are ~3.5-4.2ns across
+   64-object working sets — the map-cell layer already absorbs the
+   value-cell misses. 2.2 (certification over-rejection) and 2.3
+   (this-capturing arrows, ~33x) are LANDED, and the scope-gate probe
+   (2.1) closed the Sparkplug-analog premise for try/catch.
+4. 3.1 (L4 arena) is CLOSED by its counting probe (2026-09-04): the arena
+   already exists and both target rows measured 1 box/iter (construct) and
+   ~390 boxes total (buildString full) — no arena to build. 1.4 (string
+   `.length`/unit reads boxing a wrapper per access), 1.5 (string METHOD
+   reads), and 1.6 (Number/Boolean/BigInt/Symbol METHOD reads) are LANDED
+   on this tree (~23x/.length; ~8-13x on Number method-read rows; boxes
+   200-600k -> 0 on every read). 4.1's fresh A/B is DONE (2026-09-04): the
+   apply/.call residual (~40-44ns interp / ~20-37ns jit over a direct leaf
+   call) is allocation-free, the fill is interp-free, and the cost spreads
+   across the per-iteration chain method read + intrinsic compare +
+   CallApply dispatch — no narrow .apply-only slice; the read side defers
+   to L2 (per-site ICs), the dispatch side to L5. 4.2 (the intrinsic-CALL
+   dispatch floor: warm agent-dependent builtin calls paid the module's
+   linear identity chain) is LANDED for String + Number/Boolean/BigInt
+   (charCodeAt ~3.1x, toFixed ~1.7x, bool/bigint toString ~2-2.8x; see the
+   4.2 row). 1.7 (the write-side >256 capacity probe) is LANDED: the
+   cliff was real (~3.3x at >256 objects) and the boxed `MEMBER_WRITE_CELLS`
+   bump to 4096 removes it through ~4k-object sets at no measured warm-row
+   cost. 1.8 (the >4096-object store ceiling) is LANDED (2026-09-04, this
+   tree): a (map id, name)-keyed write table serves every instance of a
+   shape at the map-pinned slot after the identity table thrashes, and a
+   direct own-data resolve-and-write fallback serves vector-only (5th+)
+   fields the map does not pin — the 8192/16384-object store rows drop
+   ~181-223ns -> ~58-69ns/store interp (~162-196 -> ~44-54ns jit) and sit
+   at the 64/1024 warm level, with the single-object rows unchanged. The
+   remaining full-[[Set]] stores are true defines (a genuinely new key),
+   which no IC can make faster without the L1c storage migration.
+   Remaining candidates, in
+   order: (a) the chain-member-read cost itself — probe DONE 2026-09-04:
+   clean marginal warm chain reads (numeric values, bare-row-subtracted,
+   both engines) are interp ~18ns / jit ~17ns vs own-data ~1-3ns, FLAT in
+   link depth (1 vs 2 links identical) — the fixed member_chain_get
+   validation dominates, not the walk; the JIT inline-probe experiment
+   measured slower, and there is no shape-free slice, so the fix is L2's
+   per-site shape/offset IC once the L1c representation lands; (b) the
+   >4096-object store ceiling via L2 per-site store ICs once the shape
+   representation exists; (c) extending 4.2's O(1) handler registration to
+   the remaining agent-dependent modules — probe DONE 2026-09-04: the
+   chain-bound residue is Object's (~40-arm chain: hasOwnProperty ~950ns,
+   Object.hasOwn ~5µs — late arms pay ~35 `intrinsics.get`/call) and
+   DataView's (~660ns) methods, but Object's dispatch arms are INLINE
+   CLOSURES (registering them means refactoring to named fns — defer to L2
+   or a dedicated mechanical pass); Map/Set/WeakMap are NOT chain-bound —
+   they are O(n) per op (find_index/find_set_index linear-scans the
+   entries Vec; Map.get ~2.9µs, Map.set ~3.7µs, Set.has ~5.5µs on a
+   1024-entry map vs Math.abs ~155ns), a structural lever that registration
+   cannot touch. So candidate (c) is superseded by (d): hash-index
+   `map_data`/`set_data` (the entries Vec + a key index) — likely the
+   largest remaining lever for Map/Set-heavy code, and O(n) is why no
+   bench row exposes it. (d) is LANDED (2026-09-04, this tree): each
+   Map/Set now carries a SameValue-consistent key-word index over its live
+   entries (a `MapCollection`/`SetCollection` bundling the tombstoned
+   entries List with the index), so get/has/set/delete probe O(1); a
+   delete drops its row in O(1) and a word-absent probe is an
+   authoritative miss (the exact scan runs only under a genuine 64-bit
+   word collision, `collided`). A/B vs parent (fresh release builds,
+   200k-call rows): the churn row (delete+set over a 1024-entry map, which
+   tombstones and re-appends) drops ~34.5s -> ~0.9s (~38x); Map.get misses
+   ~908 -> ~386ms; Map.get hits ~606 -> ~388ms and Set.has ~1245 -> ~1033ms
+   with the row cost now FLAT in size (1024-entry == 16-entry rows), so
+   the scans are gone. The per-call residual (~1.9µs Map.get / ~3-5µs
+   Set.has) is the module's dispatch-chain arm, NOT a scan — so candidate
+   (c) for the keyed module is the next slice: its dispatch arms are the
+   named `(agent, this, args)` handlers 4.2's `handler_for` pattern wants
+   (unlike Object's inline closures), and registration should collapse the
+   Map.get/Set.has row floors toward the registered charCodeAt ~350ns
+   floor. (c) is LANDED for the keyed module (4.3, 2026-09-04, this
+   tree): Map.get/Map.set/Set.has rows drop to ~220-245ns/call
+   (~7.8-18x vs the index-only rows), Set.has's late chain arm now equals
+   Map.get, and the keyed row floor is the registered-call floor.
+   WeakMap/WeakSet stay linear (their GC compaction renumbers
+   slots, which a position index must clear at every sweep) — not in the
+   measured rows. Remaining chain-bound modules from the (c) probe:
+   Object (~40-arm; its `dispatch_call` arms are INLINE CLOSURES, so
+   registration needs a named-handler refactor) and DataView (~660ns) —
+   extend 4.2 only behind a corpus probe showing their methods hot; and
+   the L2 per-site IC slices (a)/(b) stay behind the L1c shape
+   representation. 4.4 (Object + DataView registration) is LANDED
+   (2026-09-04, this tree): candidate (c) is CLOSED — every module whose
+   methods a probe showed hot is now registered (String/Number/Boolean/
+   BigInt/Keyed/Object/DataView); Object.hasOwn ~8.6x and DataView reads
+   ~2.2-2.5x, and the only remaining linear chains are modules whose
+   methods no probe has shown hot. The open structural items: the L2
+   per-STEP store IC (for vector-only keys on shared maps and the JIT's
+   shape-compare end-state) and the chain-member-read slice (a) both stay
+   behind L1c's shape end-state; the JIT Float16Array/typed-array
+   miscompile (0.1) is FIXED by the Linux work.
+
+### Archive D - the L1c storage-options analysis (2026-09-05; superseded by the L1c decision section above)
+
+Good question — this is the fork the thread had to settle, so let me lay out the actual trade space I found while reading the code, with names so we can talk precisely. The presize sub-question mostly dissolves once the storage options are clear, so I folded it in.
+
+### The three storage shapes for "a mapped key with ordinal ≥ 4"
+
+**Option 1 — Vector-slot pinning.** Keep the existing `SmallProps` insertion-ordered `(key, Property)` vector as the only store. A map descriptor at ordinal `o ≥ 4` means "this key lives at vector position `o`." Enforced by an append-alignment rule (transition a new key only when it lands at the descriptor boundary), with boilerplate presize capped at 4 (pre-described-but-unstored fields are only safe as in_fields holes below 4).
+
+| | |
+|---|---|
+| **Pros** | Smallest change: no new per-object allocation, no new trace edge, no double write. Enumeration/delete/descriptor consumers keep working off the vector untouched. `map_field`/`map_set` extensions are ~30 lines. Matches the recorded B1 intent in `engine-redesign.md` ("`in_fields[offset]` **or the overflow store**"). Immediately makes the runtime read map cells (`MemberMapCell`) and shape write cells serve ordinals ≥ 4 — the map cell's `slot` becomes object-independent for every default key, so >4096-object 5th-field loops stop needing per-object slot resolution. |
+| **Cons** | The ordinal==slot coincidence is an invariant that must hold forever — enforced at the three define sites, and fragile if a future path appends out of order (a missed gate silently misaddresses). The ≥4 read is still a `RefCell` borrow into `SmallProps` (not lock-free like `in_fields`), and — the big one — **it is not machine-addressable**: `SmallProps` can be inline or heap and the `Vec` reallocs, so the JIT can never emit a stable shape-compare + offset load for a >4 key from this. It pins the *logical* slot, not an address. |
+
+**Option 2 — Dedicated out-of-line value array (mirror).** The object gains a per-object heap value array indexed by map ordinal ≥ 4 (V8's property backing store); `in_fields` + this array are the map-addressed value region. The vector stays authoritative for keys/attrs/enumeration; the array is a mirror, hole-capable (`Option<Value>` per slot), so boilerplate presize can pre-describe >4 fields and skipped fields read absent.
+
+| | |
+|---|---|
+| **Pros** | Ordinal addressing is independent of vector order — **no alignment gate**, no scramble hazard. Presize can grow past 4 (a >4-field constructor starts on its full shape). Stable base pointer + fixed stride, so a future JIT inline load for >4 keys has a real target (this is the storage the "shape-compare + offset, JIT can emit inline" end-state actually wants). Read/write paths stay uniform (`map_field` is always an array access, lock-free). |
+| **Cons** | Every mapped ≥4 value exists twice (vector + mirror): a second store per define and per warm write, a second trace path, and a new resize-on-transition path (the array must grow when an object's map transitions). Doubles memory for exactly the properties that are hottest at scale. Bigger diff than Option 1. It is a **middle state**: if the eventual end-state is field-authoritative (Option 3), this array later becomes the source of truth and the vector copy for mapped keys dies — so the mirror period is transitional overhead, not a step you'd keep. |
+
+**Option 3 — Field-authoritative (the full V8 model).** Keys/attrs move entirely into the map's descriptors for map-described properties; the object holds only values (in_fields + an out-of-line array); the vector shrinks to overflow/dictionary/accessor/attr-drift cases. Enumeration, `own_property_keys`, `getOwnPropertyDescriptor`, `delete`, `property_slot`, the lazy index — everything currently reading the vector — becomes descriptor/field-aware.
+
+| | |
+|---|---|
+| **Pros** | The clean end-state: one value copy, true shape semantics, natural JIT offsets, no mirror drift. |
+| **Cons** | This is not a slice — it's the whole migration. `perf.md` L2846 (2026-09-03) *measured* the field-authoritative rewrite and rejected it as an interpreter lever (~5ns of a ~63ns row, "not justified") purely because every structural consumer must be reworked. Attr drift is the killer here: today `defineProperty` can make a mapped key non-enumerable/non-writable while the map keeps describing it (`sync_map_after_define` leaves it mapped); field-authoritative storage can't tolerate descriptor attrs that lie, so that path needs a fork-to-overflow or map-fork mechanism first. |
+
+### What the evidence says
+
+- **No current row moves under any option** — my probe (`scratch/l1c_cap_probe.js`) shows the 5th+ field define is ~same cost as the 1st-4th (~118ns/field construct churn), and warm 5th-field stores already equal warm 2nd-field stores (55ns interp) via the 1.8 direct fallback. So this slice is 100% downstream-unblocking, which makes **risk** the dominant selection criterion.
+- **The presize sub-question dissolves**: even Option 2's full presize only removes a per-construct transition (a cached HashMap hit) — Options 1 and 2 both lose almost nothing by capping presize at 4. Don't let that drive the choice.
+- **The end-state summary you attached says the point is "reads/writes via shape-compare + offset … which the JIT can emit inline."** Only Options 2/3 give the JIT an addressable offset for >4 keys. Option 1 cannot — its ordinals are logical slots into a movable, RefCell'd, sometimes-inline store.
+
+### My recommendation
+
+**Option 1 now, Option 3 later — skip Option 2 as a permanent state.**
+
+Option 1 is the correct *first slice*: it is the smallest change that establishes "maps describe every default key with a real, shape-pinned offset," it immediately makes the interpreter's map cells exact for >4 keys (the only thing with any near-term effect), and — importantly — its alignment invariant (mapped keys are exactly the vector prefix, in descriptor order) is precisely the ordering a later field-authoritative migration needs, so it is not throwaway: Option 3 just splits that prefix's *values* out of the vector into an ordinal-indexed array and re-points enumeration at the descriptors. The recorded L2846 probe already told us Option 3's consumer rework isn't worth doing until a JIT/chain slice actually needs the addressable storage — and when that slice arrives, it should be gated on its own probe (a compiled member-read row with >4-key shapes), per the repo's one-lever-at-a-time discipline.
+
+If you'd rather land the storage the JIT end-state needs *now* and eat the double-write/trace/memory cost in the interim, Option 2 is defensible — but I'd want a probe showing the >4-key JIT read row is actually hot before paying that.
+
+Want me to proceed with Option 1 (alignment gate + presize-at-4 + `map_set`/`map_field`/`map_store_field` ≥4 + updated crux tests, gated on clippy/workspace tests), or did the thread specify something closer to Option 2?
+
+_Resolution: Option 1 proceeded and landed as the map-describes-every-default-key slice; see the L1c decision section at the top of this file for the outcome and the remaining Option-3 gate._
