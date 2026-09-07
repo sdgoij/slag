@@ -1849,3 +1849,36 @@ memory64 bodies stay interpreted). 27 compile tests, 63 total with the
 feature, clippy clean in both configurations. Wave 2 remaining:
 `memory.grow` (needs a store-side realloc helper + descriptor
 refresh), memory64 addressing, and the table/`call_indirect` family.
+
+`memory.grow` landed, the last 32-bit memory gap before the 64-bit and
+table work. The entry ABI grew to `(args, nargs, mems, ncount, gvals,
+out, nout, store, instance, grow)`: params 7-9 carry the owning store
+pointer, the invoked instance index, and the code address of a Rust grow
+helper (`exec::memory_grow_helper`, an `extern "C"` fn reached from
+generated code through a helper-signature `call_indirect` whose params
+are all u64 slots, so no float classification can disagree).
+`do_memory_grow` widens the popped i32 delta, computes the memory's
+descriptor-slot address (`mems + 16*memory`), and calls the helper with
+store/instance/memory-index/delta/desc-slot; the helper resolves the
+module memory index to the instance's store cell, grows the backing
+`Vec` through `Store::grow_memory` (enforcing the cell's declared max
+and the memory32 2^16 cap), and on success rewrites the descriptor
+entry's data pointer + byte length in place — a `Vec` data pointer is
+unstable across a resize, and every later `mem_ea`/`memory.size` reloads
+the descriptor, so the growth is visible to subsequent compiled
+accesses. The helper returns the old page count or all-ones (-1); the
+generated code narrows it to i32, reproducing wasm's "old pages or -1"
+exactly (32-bit growth caps far below 2^32). `lowerable` now admits
+`memory.grow` on any 32-bit memory index (multi-memory growth compiles
+too); memory64 stays interpreter-side. Unit coverage grows both an
+unbounded memory (pre-grow store, grow to 2 pages, stores on the new
+page and its last aligned slot, cross-call reads back all three values
+via `run_seq` — a stale descriptor after the `Vec` realloc would write
+through freed memory) and a `(1 2)`-bounded memory (grow-to-max returns
+old pages × new size, the next grow fails with -1, and a page-boundary
+store/load after the successful grow lands). `wasmtest equiv` is green
+over `memory_grow.wast` (106 commands agree) and the memory +
+`multi-memory` regression sweep (41 suites), 0 diverged. 29 compile
+tests, 65 total with the feature, clippy clean in both configurations.
+Wave 2 remaining: memory64 addressing and the table/`call_indirect`
+family.

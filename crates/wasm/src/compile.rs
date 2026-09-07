@@ -21,24 +21,26 @@
 //!   (parameters enter the body as its initial operand stack and ride a
 //!   loop's header as block parameters; a parameterized `if` needs an
 //!   explicit else branch);
-//! - numeric loads/stores and `memory.size` over any 32-bit memory, each
-//!   access bounds-checking against a per-call descriptor array (one
-//!   (data pointer, byte length) pair per module memory index, entry ABI
-//!   params 2/3);
+//! - numeric loads/stores, `memory.size`, and `memory.grow` over any 32-bit
+//!   memory, each access bounds-checking against a per-call descriptor array
+//!   (one (data pointer, byte length) pair per module memory index, entry
+//!   ABI params 2/3). `memory.grow` calls a runtime helper (entry params
+//!   7-9) that reallocates the store cell's backing `Vec` and rewrites the
+//!   descriptor entry, so later accesses see the grown buffer;
 //! - `global.get`/`global.set` of numeric module-defined globals, through a
 //!   caller-owned buffer (one u64 slot per used global): the compiled body
 //!   reads and mutates slots in place, so its writes reach the store even
-//!   when it traps. Imported globals (whose cells can alias), memory growth,
-//!   memory64, multi-memory, tables, calls, refs, SIMD, and GC are not
-//!   lowered yet.
+//!   when it traps. Imported globals (whose cells can alias), memory64,
+//!   tables, calls, refs, SIMD, and GC are not lowered yet.
 //!
 //! ABI: a compiled entry is
-//! `unsafe extern "C" fn(args, nargs, mem, mem_len, out, nout) -> i32`.
-//! Arguments, the module memory's data pointer/byte length, and results
-//! travel as 64-bit values (an `i32` uses the low 32 bits), so the Rust
-//! trampoline and the Cranelift signature can never disagree about float
-//! argument classification. The returned `i32` is a trap code (0 = ok);
-//! results are written only when the function completes normally, so a trap
+//! `unsafe extern "C" fn(args, nargs, mems, ncount, gvals, out, nout,
+//! store, instance, grow) -> i32`. Arguments, the descriptor array
+//! pointer/count, the global-values and result buffers, and results travel
+//! as 64-bit values (an `i32` uses the low 32 bits), so the Rust trampoline
+//! and the Cranelift signature can never disagree about float argument
+//! classification. The returned `i32` is a trap code (0 = ok); the result
+//! buffer is written only when the function completes normally, so a trap
 //! never produces partial results.
 
 use std::sync::{Arc, OnceLock};
@@ -79,15 +81,30 @@ pub fn trap_of(code: i32) -> Trap {
     }
 }
 
+/// Runtime pointers/helper addresses a compiled body may call back into,
+/// passed as entry params 7-9 (`store`, `instance`, `grow`).
+#[derive(Clone, Copy)]
+pub struct CompiledRuntime {
+    /// Raw `*mut Store` address.
+    pub store: u64,
+    /// The invoked instance's index.
+    pub instance: u64,
+    /// The `memory.grow` helper's address (0 when unused is fine; bodies that
+    /// grow load it from this param).
+    pub grow: u64,
+}
+
 /// The native entry point produced by the compiler.
 ///
-/// `(args, nargs, mems, ncount, gvals, out, nout)`: `mems` points at a
-/// caller-owned descriptor array holding, per module memory index, its data
-/// pointer then byte length (each `u64`); `ncount` is the descriptor count.
-/// `gvals` is a caller-owned buffer, one u64 slot per module global the body
-/// uses, holding the initial values on entry and the (possibly mutated)
-/// values on return — so `global.set` is visible to the store even when a
-/// later instruction traps. Returns the trap code (0 = ok).
+/// `(args, nargs, mems, ncount, gvals, out, nout, store, instance, grow)`:
+/// `mems` points at a caller-owned descriptor array holding, per module
+/// memory index, its data pointer then byte length (each `u64`); `ncount`
+/// is the descriptor count. `gvals` is a caller-owned buffer, one u64 slot
+/// per module global the body uses, holding the initial values on entry and
+/// the (possibly mutated) values on return — so `global.set` is visible to
+/// the store even when a later instruction traps. `store`/`instance`/
+/// `grow` let a body call the `memory.grow` helper. Returns the trap code
+/// (0 = ok).
 pub type CompiledEntry = unsafe extern "C" fn(
     args: *const u64,
     nargs: u64,
@@ -96,6 +113,9 @@ pub type CompiledEntry = unsafe extern "C" fn(
     gvals: *mut u64,
     out: *mut u64,
     nout: u64,
+    store: u64,
+    instance: u64,
+    grow: u64,
 ) -> i32;
 
 /// One compiled function body: the entry plus the executable-code
@@ -116,18 +136,23 @@ impl CompiledFunc {
     }
 
     /// Invoke the compiled body with `args` (bit patterns) and return the
-    /// results (bit patterns) plus the trap code.
+    /// results (bit patterns) plus the trap code. `runtime` carries the
+    /// store/instance pointers and the `memory.grow` helper address the body
+    /// may call back into (entry params 7-9).
     pub fn call(
         &self,
         args: &[u64],
         mems: (*const u64, u64),
         globals: &mut [u64],
         out: &mut [u64],
+        runtime: CompiledRuntime,
     ) -> i32 {
         // SAFETY: `entry` is a plain function pointer into `_code`, which
         // this struct keeps alive and executable for its whole lifetime; the
         // caller passes buffers of the declared lengths and a descriptor
-        // array that stays valid for the (leaf) call.
+        // array that stays valid for the (leaf) call. `runtime` addresses
+        // the owning store/instance, which the caller keeps alive for the
+        // call.
         unsafe {
             (self.entry)(
                 args.as_ptr(),
@@ -137,6 +162,9 @@ impl CompiledFunc {
                 globals.as_mut_ptr(),
                 out.as_mut_ptr(),
                 out.len() as u64,
+                runtime.store,
+                runtime.instance,
+                runtime.grow,
             )
         }
     }
@@ -150,6 +178,7 @@ pub fn run_compiled(
     mems: (*const u64, u64),
     globals: &mut [u64],
     args: &[Value],
+    runtime: CompiledRuntime,
 ) -> Result<Vec<Value>, ExecFail> {
     if args.len() != ty.params.len() {
         return Err(ExecFail::Unsupported("compiled function arity"));
@@ -166,7 +195,7 @@ pub fn run_compiled(
         input.push(bits);
     }
     let mut output = vec![0u64; ty.results.len()];
-    let code = func.call(&input, mems, globals, &mut output);
+    let code = func.call(&input, mems, globals, &mut output, runtime);
     if code != TRAP_NONE {
         return Err(ExecFail::Trap(trap_of(code)));
     }
@@ -267,16 +296,20 @@ fn platform_call_conv(isa: &dyn TargetIsa) -> CallConv {
     }
 }
 
-/// `fn(args, nargs, mem, mem_len, gvals, out, nout) -> i32` (trap code).
+/// `fn(args, nargs, mems, ncount, gvals, out, nout, store, instance,
+/// grow) -> i32` (trap code).
 fn entry_signature(conv: CallConv) -> Signature {
     let mut sig = Signature::new(conv);
     sig.params.push(AbiParam::new(types::I64)); // args pointer
     sig.params.push(AbiParam::new(types::I64)); // nargs
-    sig.params.push(AbiParam::new(types::I64)); // memory data pointer
-    sig.params.push(AbiParam::new(types::I64)); // memory byte length
+    sig.params.push(AbiParam::new(types::I64)); // memory descriptor array
+    sig.params.push(AbiParam::new(types::I64)); // descriptor count
     sig.params.push(AbiParam::new(types::I64)); // global-values buffer
     sig.params.push(AbiParam::new(types::I64)); // out pointer
     sig.params.push(AbiParam::new(types::I64)); // nout
+    sig.params.push(AbiParam::new(types::I64)); // store pointer
+    sig.params.push(AbiParam::new(types::I64)); // instance index
+    sig.params.push(AbiParam::new(types::I64)); // memory.grow helper address
     sig.returns.push(AbiParam::new(types::I32)); // trap code
     sig
 }
@@ -427,6 +460,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
             memory_is64(module, *memory) == Some(false)
         }
         Instr::MemorySize(memory) => memory_is64(module, *memory) == Some(false),
+        Instr::MemoryGrow(memory) => memory_is64(module, *memory) == Some(false),
         Instr::GlobalGet(index) => {
             matches!(defined_global(module, *index), Some((ty, _)) if clif_type(ty).is_some())
         }
@@ -674,11 +708,16 @@ struct Lowerer<'a> {
     builder: FunctionBuilder<'a>,
     /// The module (block types resolve through its type section).
     module: &'a Module,
+    /// The ABI call convention (the internal helper `call_indirect` sig must
+    /// match the platform C ABI the helper was compiled with).
+    conv: CallConv,
     /// `locals` and `stack` entry metadata mirror the interpreter's model.
     variables: Vec<Variable>,
     stack: Vec<ClifValue>,
     /// The per-call memory descriptor array (entry param 2): per module
     /// memory index, its data pointer then byte length (each a `u64`).
+    /// `memory.grow` refreshes the entry in place, so `mem_ea`/`memory.size`
+    /// must reload it on every use (they do).
     mems: ClifValue,
     /// The per-call global-values buffer (entry param 4): one u64 slot per
     /// used module global. `globals` maps a module global index to its slot
@@ -686,6 +725,12 @@ struct Lowerer<'a> {
     globals_ptr: ClifValue,
     globals: Vec<(u32, Type)>,
     out_ptr: ClifValue,
+    /// Entry params 7-9: the owning store pointer, the invoked instance
+    /// index, and the `memory.grow` helper address (entry param 9; bodies
+    /// that grow call it through a helper-signature `call_indirect`).
+    store: ClifValue,
+    instance: ClifValue,
+    grow: ClifValue,
     results: Vec<ValType>,
     controls: Vec<CtlFrame>,
     /// The current path ended in an unconditional jump/trap/return.
@@ -1072,6 +1117,43 @@ impl<'a> Lowerer<'a> {
         let pages = self.builder.ins().ushr(mem_len, sixteen);
         let pages32 = self.builder.ins().ireduce(types::I32, pages);
         self.stack.push(pages32);
+        Ok(())
+    }
+
+    /// `memory.grow`: pop the i32 delta and call the runtime grow helper
+    /// (entry params 7-9) with the store/instance pointers, this memory's
+    /// module index, the widened delta, and this memory's descriptor-slot
+    /// address in the caller-owned array. The helper grows the store cell's
+    /// backing `Vec` (enforcing the declared maximum and the memory32 2^16
+    /// cap) and, on success, rewrites the descriptor entry in place — its
+    /// data pointer is unstable across a resize, and every later access
+    /// reloads the descriptor. The helper returns the old page count or
+    /// `u64::MAX` (-1) on failure; narrowing to i32 reproduces wasm's
+    /// "old pages or -1" result exactly (growth caps far below 2^32).
+    fn do_memory_grow(&mut self, memory: u32) -> Result<(), String> {
+        let delta = self.pop().ok_or("operand stack underflow")?;
+        let delta64 = self.builder.ins().uextend(types::I64, delta);
+        let desc = self.builder.ins().iadd_imm_s(self.mems, 16 * memory as i64);
+        let memory_index = self.iconst(types::I64, i64::from(memory));
+        // The helper's ABI: (store, instance, memory index, delta, desc
+        // slot) -> old pages / -1, all u64 slots so no float classification
+        // can disagree with the Rust trampoline.
+        let mut sig = Signature::new(self.conv);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let sig = self.builder.import_signature(sig);
+        let call = self.builder.ins().call_indirect(
+            sig,
+            self.grow,
+            &[self.store, self.instance, memory_index, delta64, desc],
+        );
+        let old = self.builder.inst_results(call)[0];
+        let old32 = self.builder.ins().ireduce(types::I32, old);
+        self.stack.push(old32);
         Ok(())
     }
 
@@ -1740,6 +1822,7 @@ impl<'a> Lowerer<'a> {
                 memory, op, offset, ..
             } => self.do_store(*memory, *op, *offset)?,
             Instr::MemorySize(memory) => self.do_memory_size(*memory)?,
+            Instr::MemoryGrow(memory) => self.do_memory_grow(*memory)?,
             Instr::Block(bt) => {
                 let (params, results) =
                     block_sig(self.module, bt).ok_or("unsupported block type")?;
@@ -1788,10 +1871,11 @@ impl<'a> Lowerer<'a> {
 }
 
 /// Lower `body` into `func`. Entry params: `(args, nargs, mems, ncount,
-/// gvals, out, nout)`, all pointers/counts as `I64`; returns the trap code
-/// `I32`. `mems` is the per-memory descriptor array; `used_globals` lists the
-/// module globals the body touches (their initial values arrive and final
-/// values leave through the `gvals` buffer).
+/// gvals, out, nout, store, instance, grow)`, all pointers/counts as `I64`;
+/// returns the trap code `I32`. `mems` is the per-memory descriptor array;
+/// `used_globals` lists the module globals the body touches (their initial
+/// values arrive and final values leave through the `gvals` buffer);
+/// `store`/`instance`/`grow` let the body call the `memory.grow` helper.
 fn lower(
     module: &Module,
     body: &FuncBody,
@@ -1801,12 +1885,15 @@ fn lower(
     fctx: &mut FunctionBuilderContext,
     isa: &dyn TargetIsa,
 ) -> Result<(), String> {
+    let conv = platform_call_conv(isa);
     let mut builder = FunctionBuilder::new(func, fctx);
     let entry_block = builder.create_block();
     builder.append_block_params_for_function_params(entry_block);
     builder.switch_to_block(entry_block);
     let params = builder.block_params(entry_block).to_vec();
-    let (args_ptr, mems, globals_ptr, out_ptr) = (params[0], params[2], params[4], params[5]);
+    let (args_ptr, mems, globals_ptr, out_ptr, store, instance, grow) = (
+        params[0], params[2], params[4], params[5], params[7], params[8], params[9],
+    );
     // Each used module global gets a `gvals` buffer slot (slot == position).
     let globals = used_globals
         .iter()
@@ -1859,12 +1946,16 @@ fn lower(
     let mut lowerer = Lowerer {
         builder,
         module,
+        conv,
         variables,
         stack: Vec::new(),
         mems,
         globals_ptr,
         globals,
         out_ptr,
+        store,
+        instance,
+        grow,
         results: func_type.results.clone(),
         controls: Vec::new(),
         dead: false,
@@ -3597,6 +3688,165 @@ mod tests {
         ));
         assert_eq!(outcomes[1], Ok(vec![Value::I32(42)]));
         assert_eq!(outcomes[3], Ok(vec![Value::I32(-3)]));
+    }
+
+    #[test]
+    fn memory_grow_matches_the_interpreter() {
+        use crate::instr::LoadOp::*;
+        // Unbounded 1-page memory. func 0 stores pre-growth data, grows to 2
+        // pages, stores on the freshly grown second page and at its last
+        // aligned slot (a stale descriptor would write through a freed
+        // buffer after the `Vec` realloc), then returns `memory.size`. func 1
+        // reads every slot back — cross-call, so the growth must have
+        // reached the store.
+        let module = Module {
+            types: vec![SubType::func(vec![], vec![ValType::I32])],
+            functions: vec![0, 0],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(4),
+                        Instr::I32Const(0x1111_1111),
+                        Instr::Store {
+                            memory: 0,
+                            op: StoreOp::I32,
+                            align: 2,
+                            offset: 0,
+                        },
+                        Instr::I32Const(1),
+                        Instr::MemoryGrow(0),
+                        Instr::Drop,
+                        Instr::I32Const(0x1_0004),
+                        Instr::I32Const(0x2222_2222),
+                        Instr::Store {
+                            memory: 0,
+                            op: StoreOp::I32,
+                            align: 2,
+                            offset: 0,
+                        },
+                        Instr::I32Const(0x1_fffc),
+                        Instr::I32Const(0x3333_3333),
+                        Instr::Store {
+                            memory: 0,
+                            op: StoreOp::I32,
+                            align: 2,
+                            offset: 0,
+                        },
+                        Instr::MemorySize(0),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(4),
+                        Instr::Load {
+                            memory: 0,
+                            op: I32,
+                            align: 2,
+                            offset: 0,
+                        },
+                        Instr::I32Const(0x1_0004),
+                        Instr::Load {
+                            memory: 0,
+                            op: I32,
+                            align: 2,
+                            offset: 0,
+                        },
+                        Instr::I32Const(0x1_fffc),
+                        Instr::Load {
+                            memory: 0,
+                            op: I32,
+                            align: 2,
+                            offset: 0,
+                        },
+                        Instr::Num(NumOp::I32Add),
+                        Instr::Num(NumOp::I32Add),
+                    ],
+                },
+            ],
+            memories: vec![MemType {
+                limits: Limits {
+                    min: 1,
+                    max: None,
+                    shared: false,
+                },
+                memory64: false,
+            }],
+            ..Module::default()
+        };
+        let outcomes = run_seq(&module, &[(0, vec![]), (1, vec![])]);
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(2)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(0x6666_6666)]));
+    }
+
+    #[test]
+    fn memory_grow_respects_the_declared_maximum() {
+        use crate::instr::LoadOp::*;
+        // Memory (1 2): starts 1 page, declared max 2. func 0 grows to the
+        // max and returns old-pages × new size (1 × 2). func 1 then tries
+        // another grow (must fail with -1) and reports the size (still 2),
+        // so the success/failure results and the refreshed length are all
+        // pinned. func 2 stores at the newly grown page boundary and reads
+        // it back — a stale descriptor after the successful grow would write
+        // out of bounds.
+        let module = Module {
+            types: vec![SubType::func(vec![], vec![ValType::I32])],
+            functions: vec![0, 0, 0],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(1),
+                        Instr::MemoryGrow(0),
+                        Instr::MemorySize(0),
+                        Instr::Num(NumOp::I32Mul),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(1),
+                        Instr::MemoryGrow(0),
+                        Instr::MemorySize(0),
+                        Instr::Num(NumOp::I32Mul),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(0x1_0000),
+                        Instr::I32Const(7),
+                        Instr::Store {
+                            memory: 0,
+                            op: StoreOp::I32,
+                            align: 2,
+                            offset: 0,
+                        },
+                        Instr::I32Const(0x1_0000),
+                        Instr::Load {
+                            memory: 0,
+                            op: I32,
+                            align: 2,
+                            offset: 0,
+                        },
+                    ],
+                },
+            ],
+            memories: vec![MemType {
+                limits: Limits {
+                    min: 1,
+                    max: Some(2),
+                    shared: false,
+                },
+                memory64: false,
+            }],
+            ..Module::default()
+        };
+        let outcomes = run_seq(&module, &[(0, vec![]), (1, vec![]), (2, vec![])]);
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(2)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(-2)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::I32(7)]));
     }
 
     #[test]

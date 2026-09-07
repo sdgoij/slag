@@ -333,6 +333,59 @@ impl Default for Store {
     }
 }
 
+/// Cut 11: the `memory.grow` runtime helper called from compiled bodies
+/// through a helper-signature `call_indirect` (its address rides the entry
+/// ABI as param 9). `memory` is a module memory index (imports first); the
+/// helper resolves it to the instance's store cell, grows the backing `Vec`
+/// through the store (enforcing the cell's declared maximum and the memory32
+/// 2^16-page cap), then rewrites the caller-owned descriptor entry at `desc`
+/// — data pointer, then byte length — so later compiled accesses see the
+/// reallocated buffer (a `Vec` data pointer is unstable across a resize).
+/// Returns the old page count, or `u64::MAX` (-1) when the growth would
+/// exceed the limits (the descriptor is then untouched).
+///
+/// # Safety
+///
+/// The caller (a compiled body running under [`Store::start_owned`]) holds
+/// `&mut self` for the whole call, so `store` stays valid and uniquely
+/// borrowed; `desc` points into the caller-owned descriptor array, which
+/// stays alive for the call. The instance/memory indices come from a
+/// validated module, so the store-cell lookups always resolve.
+#[cfg(feature = "compile")]
+pub unsafe extern "C" fn memory_grow_helper(
+    store: *mut Store,
+    instance: u64,
+    memory: u64,
+    delta: u64,
+    desc: *mut u64,
+) -> u64 {
+    // SAFETY: the caller (a compiled body running under `Store::start_owned`)
+    // holds `&mut self` for the whole call, so the raw store pointer stays
+    // valid and uniquely borrowed; `desc` points into the caller-owned
+    // descriptor array, which stays alive for the call. The instance/memory
+    // indices come from a validated module, so the lookups always resolve.
+    let store = unsafe { &mut *store };
+    let cell = store
+        .instances
+        .get(instance as usize)
+        .and_then(|inst| inst.memories.get(memory as usize))
+        .copied();
+    let Some(cell) = cell else {
+        return u64::MAX;
+    };
+    match store.grow_memory(cell, delta) {
+        Some(old) => {
+            let grown = &store.memories[cell];
+            unsafe {
+                *desc = grown.bytes.as_ptr() as u64;
+                *desc.add(1) = grown.bytes.len() as u64;
+            }
+            old
+        }
+        None => u64::MAX,
+    }
+}
+
 impl Store {
     pub fn new() -> Self {
         Store {
@@ -1085,8 +1138,10 @@ impl Store {
             let func = unsafe { &*func_ptr };
             // Per-memory descriptors (data pointer, byte length) for the
             // module's whole memory index space, caller-owned for the leaf
-            // call (nothing reallocates a memory mid-call — growth is not in
-            // the compiled subset).
+            // call. A compiled `memory.grow` reallocates a cell's backing
+            // `Vec` through the runtime helper, which refreshes the
+            // descriptor entry in place; `desc` pointers stay valid because
+            // this array is never resized mid-call.
             let memory_cells = self.instances[instance].memories.clone();
             let mut descriptors: Vec<u64> = Vec::with_capacity(2 * memory_cells.len());
             for cell in memory_cells {
@@ -1120,7 +1175,16 @@ impl Store {
                     _ => 0,
                 })
                 .collect();
-            let result = crate::compile::run_compiled(func, &signature, mems, &mut globals, args);
+            // Runtime pointers the compiled body can call back into: the
+            // store address and instance index for the `memory.grow` helper,
+            // plus the helper's own code address (entry params 7-9).
+            let runtime = crate::compile::CompiledRuntime {
+                store: self as *mut Store as u64,
+                instance: instance as u64,
+                grow: memory_grow_helper as *const () as usize as u64,
+            };
+            let result =
+                crate::compile::run_compiled(func, &signature, mems, &mut globals, args, runtime);
             for (cell, bits) in cells.iter().zip(&globals) {
                 let value = match self.global_types[*cell].value {
                     ValType::I32 => Value::I32(*bits as u32 as i32),
