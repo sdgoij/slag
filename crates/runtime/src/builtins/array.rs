@@ -279,6 +279,106 @@ fn get_prototype_from_constructor(
     }
 }
 
+/// The interned "constructor" atom (the species probe's key).
+fn species_ctor_atom() -> crux::AtomId {
+    use std::sync::OnceLock;
+    static ATOM: OnceLock<crux::AtomId> = OnceLock::new();
+    *ATOM.get_or_init(|| crux::string::intern_utf8("constructor"))
+}
+
+/// The Array-species fast-verdict probe: the cached "this %Array.prototype%
+/// still resolves species to its %Array%" verdict holds while the shared
+/// objects' generations match and the (%Array.prototype%, "constructor")
+/// member value cell still holds the %Array% value — the oracle catches a
+/// VALUE write to %Array.prototype%.constructor that the compiled store path
+/// makes without a generation bump (the probe mirrors the for-of verdict's
+/// oracle, expr.rs).
+fn array_species_fast_probe(agent: &mut Agent, array_proto: &crux::object::JsObject) -> bool {
+    let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+    let Some(verdict) = agent.species_fast_cells[index].as_ref() else {
+        return false;
+    };
+    if verdict.array_proto.0 != array_proto.id()
+        || verdict.array_proto.1 != array_proto.generation()
+    {
+        return false;
+    }
+    // %Array%'s own @@species is the stock accessor while its object part's
+    // generation is unchanged: only a structural redefinition can change an
+    // accessor's getter, and every such change bumps.
+    let ValueKind::Function(array_ctor) = verdict.array_ctor_value.kind() else {
+        return false;
+    };
+    if verdict.array_ctor_object.1 != array_ctor.object.generation() {
+        return false;
+    }
+    let vcell = &agent.member_value_cells[verdict.ctor_vindex];
+    vcell.id == array_proto.id()
+        && vcell.name == species_ctor_atom()
+        && vcell.generation == array_proto.generation()
+        && vcell.value == verdict.array_ctor_value
+}
+
+/// Resolve and cache the Array-species fast verdict: `%Array.prototype%`'s
+/// own data `constructor` is this realm's %Array%, and %Array%'s own @@species
+/// is the stock accessor (getter = the SPECIES intrinsic, which returns
+/// `this`, so the species resolution is always the receiver %Array%).
+/// `Some(())` = stock (now cached); `None` = not (the caller falls to the
+/// exact species machinery below).
+fn array_species_fast_resolve(
+    agent: &mut Agent,
+    array_proto: &crux::object::JsObject,
+) -> Result<Option<()>, JsError> {
+    let Some(realm) = agent.current_realm().ok() else {
+        return Ok(None);
+    };
+    let Some(array_ctor_value) = realm.intrinsics.get(ARRAY) else {
+        return Ok(None);
+    };
+    let ValueKind::Function(array_ctor) = array_ctor_value.kind() else {
+        return Ok(None);
+    };
+    let ctor_atom = species_ctor_atom();
+    let Some(constructor_prop) =
+        array_proto.get_own_property_key(&PropertyKey::String(ctor_atom))?
+    else {
+        return Ok(None);
+    };
+    let Some(constructor_value) = constructor_prop.value() else {
+        return Ok(None);
+    };
+    if constructor_value != array_ctor_value {
+        return Ok(None);
+    }
+    let species_key = PropertyKey::Symbol(crux::symbol::well_known("species"));
+    let Some(species_prop) = array_ctor.object.get_own_property_key(&species_key)? else {
+        return Ok(None);
+    };
+    if species_prop.getter() != realm.intrinsics.get(SPECIES) {
+        return Ok(None);
+    }
+    let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+    // Warm the (%Array.prototype%, "constructor") member value cell with the
+    // stock value and record its slot in the verdict: the probe re-reads the
+    // constructor through that oracle, so a warm no-bump VALUE write to it
+    // (compiled member store) is caught by the probe's value compare.
+    let ctor_vindex =
+        (array_proto.id() as usize ^ ctor_atom as usize) & (crate::ir::MEMBER_CELLS - 1);
+    agent.member_value_cells[ctor_vindex] = crate::ir::MemberValueCell {
+        id: array_proto.id(),
+        name: ctor_atom,
+        generation: array_proto.generation(),
+        value: constructor_value,
+    };
+    agent.species_fast_cells[index] = Some(crate::agent::ArraySpeciesVerdict {
+        array_proto: (array_proto.id(), array_proto.generation()),
+        array_ctor_object: (array_ctor.object.id(), array_ctor.object.generation()),
+        array_ctor_value: constructor_value,
+        ctor_vindex,
+    });
+    Ok(Some(()))
+}
+
 /// ArraySpeciesCreate (spec 9.4.2.3): the species constructor of
 /// `original_array`, or a plain `%Array.prototype%`-linked ArrayCreate.
 /// A null or primitive `constructor` throws; an object's `@@species` of
@@ -291,6 +391,52 @@ fn array_species_create(
 ) -> Result<Handle<JsObject>, JsError> {
     if !is_array(original_array) {
         return array_create(agent, length);
+    }
+    // Species fast verdict (this landing): a plain Array whose own proto is
+    // the CURRENT realm's %Array.prototype% (so the chain `constructor`
+    // resolves to this realm's %Array%, never a foreign-array collapse) and
+    // which has no own `constructor` resolves species to that %Array% and
+    // constructs it — exactly an ArrayCreate with that %Array.prototype%.
+    // The per-array cell (id, generation, realm prototype id) makes the hot
+    // result-building loop skip the own-property scan; the shared stock
+    // verdict's re-probe plus the realm-proto compare are the per-call cost
+    // after the first. The realm gate is exact because the species collapse
+    // (spec 9.4.2.3 steps 4-6) and the construct are realm-sensitive: a
+    // foreign realm's slice called on this array would create with THIS
+    // realm's prototype, so the fast tier only ever runs when the array's
+    // proto IS the current realm's %Array.prototype%.
+    if let ValueKind::Object(object) = original_array.kind()
+        && matches!(object.kind, ObjectKind::Array(_))
+        && let Some(realm_array_proto) = agent
+            .current_realm()
+            .ok()
+            .and_then(|realm| realm.intrinsics.array_prototype())
+            .and_then(|value| as_object(&value))
+    {
+        let index = object.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+        let realm_proto_id = realm_array_proto.id();
+        if let Some((cached_array, cached_generation, cached_proto)) =
+            agent.species_array_cells[index]
+            && cached_array == object.id()
+            && cached_generation == object.generation()
+            && cached_proto == realm_proto_id
+            && array_species_fast_probe(agent, &realm_array_proto)
+        {
+            return JsObject::array_create(Some(realm_array_proto), length);
+        }
+        let ctor_key = PropertyKey::String(species_ctor_atom());
+        if object.get_own_property_key(&ctor_key)?.is_none()
+            && object
+                .get_prototype_of()?
+                .as_ref()
+                .is_some_and(|proto| proto.id() == realm_proto_id)
+            && (array_species_fast_probe(agent, &realm_array_proto)
+                || array_species_fast_resolve(agent, &realm_array_proto)?.is_some())
+        {
+            agent.species_array_cells[index] =
+                Some((object.id(), object.generation(), realm_proto_id));
+            return JsObject::array_create(Some(realm_array_proto), length);
+        }
     }
     let mut c = get(agent, original_array, &JsString::from_utf8("constructor"))?;
     // spec 9.4.2.3 steps 6-7: a constructor from another realm that *is*

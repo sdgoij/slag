@@ -5522,6 +5522,58 @@ green; test262 sweeps at baseline — language 23721/3 skip, built-ins
 23657/155 skip, annexB 1086/1086, zero fail/crash/hang. All 13
 `--jit-bench` rows result-ok.
 
+### The Array-species fast verdict: stock species creates skip resolution + construct (measured + landed 2026-09-07)
+
+After the dense slice/concat landings, `array_species_create` was the
+shared dominant fixed cost on slice/concat/map/filter/splice/flat/flatMap
+(~2.5-4µs/call): every result-building call paid IsArray, the chain
+`constructor` read, the GetFunctionRealm / same-realm check, the @@species
+getter invocation, an IsConstructor gate, and a full [[Construct]] of the
+resolved constructor. For the common case — a plain Array whose chain
+resolves to its realm's %Array% under the stock @@species accessor — that
+resolution is exactly an ArrayCreate with the array's own prototype.
+
+Landing: a two-tier verdict mirroring the for-of verdicts (Cut 24/27). The
+shared tier (keyed on the %Array.prototype% id) resolves once that the
+proto's own data `constructor` is this realm's %Array% AND %Array%'s own
+@@species is still the SPECIES-intrinsic accessor (its getter returns
+`this`, so the resolution is always the receiver %Array%); it re-validates
+by generation (a structural mutation of either shared object bumps) plus a
+value oracle — the (%Array.prototype%, "constructor") member value cell,
+warmed at resolve and refreshed by every warm store, catches the compiled
+member-store VALUE write to %Array.prototype%.constructor that does not
+bump (the JIT no-bump path). The per-array tier (id, generation, realm
+prototype id) covers a plain Array (real Array kind, never a proxy) with no
+own `constructor` whose prototype IS the current realm's %Array.prototype%
+— the realm gate is exact because the foreign-constructor collapse (spec
+9.4.2.3 steps 4-6) and the construct are realm-sensitive (a foreign realm's
+slice applied to this array must create with THIS realm's prototype):
+those creates become `JsObject::array_create` with the realm's prototype.
+The soundness case is exactly the compiled no-bump write — a
+probe cycles a JIT-compiled writer between two subclasses and %Array% and
+confirms every following slice observes the live constructor value.
+
+Results (isolated corpus probes, 200k slices per bench call, min of 3
+runs, both modes): the fixed-source empty `slice(0)` stock baseline
+~497ms (recorded 2026-09-06 handoff) -> ~163-169ms jitless / ~151-160ms
+jit (~3x; ~810ns/call). The in-build control — a source with own
+`constructor = Array`, identical species result but the verdict defeated —
+measures ~410-419ms jitless / ~405ms jit, so the verdict is ~2.5x over the
+equivalent exact species machinery on the same binary; subclass sources
+~575-583ms. The full `arrays/slice_concat` corpus row moved ~204ms (the
+concat landing's record) -> ~113ms jitless on a single run. Correctness: a 28-case functional battery (stock
+slice/map/concat/splice/flat/flatMap, subclass species, own-constructor,
+custom @@species value, reassigned %Array.prototype%.constructor, species
+null, stock-shaped custom species getter, proxy receiver, holes/sparse) is
+clean in jit, jitless, and `--gc-stress`; plus the compiled-store
+soundness battery. Gates: clippy clean; workspace tests green; test262
+sweeps at baseline — language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086, zero fail/crash/hang. All 13 `--jit-bench` rows
+result-ok. Follow-up: map/filter/concat inherit the win only at their
+species-create share — their per-element native-handler dispatch and the
+@@isConcatSpreadable/LengthOfArrayLike reads are the next dense-array
+residuals.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -163,6 +163,40 @@ impl Trace for ForOfFastVerdict {
     }
 }
 
+/// The cached "the Array species machinery is stock" verdict: this realm's
+/// %Array.prototype% has an own data `constructor` equal to this realm's
+/// %Array%, and %Array% carries the stock @@species accessor (whose getter is
+/// the SPECIES intrinsic, returning `this`). A stock-Array species create
+/// therefore resolves `constructor` -> %Array% and @@species -> %Array%, i.e.
+/// exactly an ArrayCreate with that %Array.prototype%. Re-validated by
+/// generation: a structural mutation of either shared object (constructor
+/// redefined/deleted/replaced, @@species redefined, %Array% re-frozen) bumps
+/// one and re-resolves. A VALUE write to %Array.prototype%.constructor that
+/// does not bump (the compiled member-store path) is caught by the value
+/// oracle: `ctor_vindex` is the (%Array.prototype% id, "constructor") member
+/// value cell slot, warmed at resolve with the %Array% value and refreshed by
+/// every warm store, so a probe compares the live cell value to the recorded
+/// %Array% value.
+pub(crate) struct ArraySpeciesVerdict {
+    pub array_proto: (u64, u32),
+    /// The %Array% function's own data: (object-part id, generation). A
+    /// structural change to %Array%'s @@species property bumps the object
+    /// part's generation; an in-place VALUE write cannot touch an accessor.
+    pub array_ctor_object: (u64, u32),
+    /// The %Array% function value the oracle cell must still hold (also what
+    /// the species resolution constructs).
+    pub array_ctor_value: Value,
+    /// The member-value-cell slot the probe re-reads
+    /// (%Array.prototype%, "constructor") through.
+    pub ctor_vindex: usize,
+}
+
+impl Trace for ArraySpeciesVerdict {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.array_ctor_value.trace(visit);
+    }
+}
+
 // Every live `Agent` on this thread that has run JavaScript, as
 // `(signifier, pointer)` pairs. The crux heap is thread-local and shared by
 // every agent on the thread, but a collection roots only the collecting
@@ -314,6 +348,20 @@ pub struct Agent {
     /// does not bloat the Agent struct's hot-field cache footprint (an
     /// inline copy regressed the leaf-call path by ~10ns/call).
     pub(crate) for_of_array_cells: Box<[Option<(u64, u32, u64)>; crate::ir::MEMBER_CELLS]>,
+    /// The Array-species fast verdict (this landing): "the species machinery
+    /// of this %Array.prototype% is stock" — see [`ArraySpeciesVerdict`].
+    /// Direct-mapped on the %Array.prototype% id (different realms' protos
+    /// collide on an index only under the id check).
+    pub(crate) species_fast_cells: [Option<ArraySpeciesVerdict>; crate::ir::MEMBER_CELLS],
+    /// The per-array species fast verdict: (array id, array generation,
+    /// prototype id) — "this array is a plain stock Array whose chain
+    /// `constructor` resolves to its realm's %Array%". The array generation
+    /// catches an own `constructor` addition and proto changes (Cut 22's
+    /// mechanism bumps it); the shared verdict is re-validated per access
+    /// through the species probe. A hit skips the own-property scan and the
+    /// proto walk on every result-building call. Boxed so the 16-entry table
+    /// does not bloat the Agent struct's hot-field cache footprint.
+    pub(crate) species_array_cells: Box<[Option<(u64, u32, u64)>; crate::ir::MEMBER_CELLS]>,
     /// The for-in enumeration cache (this landing): base id -> the
     /// enumerated (level, key) list + the full chain snapshot for a base
     /// whose whole prototype chain is generation-tracked (see
@@ -841,6 +889,8 @@ impl Agent {
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
             for_of_fast_cells: std::array::from_fn(|_| None),
             for_of_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
+            species_fast_cells: std::array::from_fn(|_| None),
+            species_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
             for_in_cells: Box::new(std::array::from_fn(|_| None)),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
@@ -1255,6 +1305,9 @@ impl Agent {
             cell.trace(visit);
         }
         for cell in self.for_of_fast_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.species_fast_cells.iter() {
             cell.trace(visit);
         }
         for cell in self.for_in_cells.iter() {
