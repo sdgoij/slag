@@ -508,6 +508,39 @@ fn num_type(ty: ValType) -> Option<Type> {
     }
 }
 
+/// Whether a heap type denotes a function reference under `module`'s type
+/// space: the abstract `func` heap, or a type index that resolves to a
+/// function type (`(ref $t)` where `$t` is a func type). The `nofunc` bottom
+/// (only ever null) stays interpreted.
+fn heap_is_func(module: &Module, heap: &HeapType) -> bool {
+    match heap {
+        HeapType::Func => true,
+        HeapType::Type(index) => module.func_at(*index).is_some(),
+        _ => false,
+    }
+}
+
+/// Whether a value type is a function reference under `module`'s type space
+/// (abstract `funcref` or a typed `(ref $t)`/`(ref null $t)` over a func
+/// type).
+fn val_is_func_ref(module: &Module, ty: ValType) -> bool {
+    match ty {
+        ValType::Ref(reference) => heap_is_func(module, &reference.heap),
+        _ => false,
+    }
+}
+
+/// The compiled carrier type of a value the lowering actually carries — a
+/// numeric scalar, or a function-reference token (`I64`) — or `None` when the
+/// type stays interpreted.
+fn carrier_type(module: &Module, ty: ValType) -> Option<Type> {
+    match num_type(ty) {
+        Some(t) => Some(t),
+        None if val_is_func_ref(module, ty) => Some(types::I64),
+        None => None,
+    }
+}
+
 /// Resolve a block type to its parameter and result valtypes. `Type(i)`
 /// indexes the module's type section; only numeric (float/int) parameters
 /// and results lower today, so any other shape keeps the function on the
@@ -524,7 +557,7 @@ fn block_sig(module: &Module, bt: &BlockType) -> Option<(Vec<ValType>, Vec<ValTy
     if params
         .iter()
         .chain(results.iter())
-        .all(|t| clif_type(*t).is_some())
+        .all(|t| carrier_type(module, *t).is_some())
     {
         Some((params, results))
     } else {
@@ -651,18 +684,13 @@ fn table_is_funcref(module: &Module, index: u32) -> bool {
             .get((index - imported) as usize)
             .map(|table| table.ty.element)
     };
-    matches!(
-        element,
-        Some(RefType {
-            heap: HeapType::Func,
-            ..
-        })
-    )
+    matches!(element, Some(RefType { heap, .. }) if heap_is_func(module, &heap))
 }
 
-/// Whether a callee type fits the compiled-call subset: numeric parameters
-/// and results, each few enough to ride the caller-owned scratch buffer.
-fn callable_type(ty: Option<FuncType>) -> bool {
+/// Whether a callee type fits the compiled-call subset: numeric or
+/// function-reference parameters and results, each few enough to ride the
+/// caller-owned scratch buffer.
+fn callable_type(module: &Module, ty: Option<FuncType>) -> bool {
     let Some(ty) = ty else { return false };
     ty.params.len() <= SCRATCH_SLOTS
         && ty.results.len() <= SCRATCH_SLOTS
@@ -670,7 +698,7 @@ fn callable_type(ty: Option<FuncType>) -> bool {
             .params
             .iter()
             .chain(ty.results.iter())
-            .all(|t| clif_type(*t).is_some())
+            .all(|t| carrier_type(module, *t).is_some())
 }
 
 /// The module global indices (index space) a body reads or writes, sorted
@@ -716,9 +744,18 @@ fn store_width(op: StoreOp) -> u64 {
 /// Whether `module`'s `func_type` + `body` are inside the current lowering
 /// subset.
 fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
-    if func_type.params.iter().any(|t| clif_type(*t).is_none())
-        || func_type.results.iter().any(|t| clif_type(*t).is_none())
-        || body.locals.iter().any(|t| clif_type(*t).is_none())
+    if func_type
+        .params
+        .iter()
+        .any(|t| carrier_type(module, *t).is_none())
+        || func_type
+            .results
+            .iter()
+            .any(|t| carrier_type(module, *t).is_none())
+        || body
+            .locals
+            .iter()
+            .any(|t| carrier_type(module, *t).is_none())
     {
         return false;
     }
@@ -772,7 +809,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
             Some((ty, true)) if num_type(ty).is_some()
         ),
         Instr::Call(index) | Instr::ReturnCall(index) => {
-            callable_type(func_type_of(module, *index))
+            callable_type(module, func_type_of(module, *index))
         }
         Instr::CallIndirect {
             type_index,
@@ -783,16 +820,17 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
             table_index,
         } => {
             table_is64(module, *table_index) == Some(false)
-                && callable_type(module.func_at_cloned(*type_index))
+                && callable_type(module, module.func_at_cloned(*type_index))
         }
         Instr::CallRef(type_index) | Instr::ReturnCallRef(type_index) => {
-            callable_type(module.func_at_cloned(*type_index))
+            callable_type(module, module.func_at_cloned(*type_index))
         }
         Instr::TableGet(table) | Instr::TableSet(table) => {
             table_is64(module, *table) == Some(false) && table_is_funcref(module, *table)
         }
-        Instr::RefNull(heap) => *heap == HeapType::Func,
-        Instr::RefFunc(_) | Instr::RefIsNull => true,
+        Instr::RefNull(heap) => heap_is_func(module, heap),
+        Instr::RefFunc(_) | Instr::RefIsNull | Instr::RefAsNonNull => true,
+        Instr::BrOnNull(_) | Instr::BrOnNonNull(_) => true,
         _ => false,
     })
 }
@@ -1792,8 +1830,10 @@ impl<'a> Lowerer<'a> {
     /// incoming values when a construct completes).
     fn append_results(&mut self, block: Block, results: &[ValType]) {
         for ty in results {
-            self.builder
-                .append_block_param(block, clif_type(*ty).expect("numeric block result"));
+            self.builder.append_block_param(
+                block,
+                carrier_type(self.module, *ty).expect("carried block result"),
+            );
         }
     }
 
@@ -1823,8 +1863,10 @@ impl<'a> Lowerer<'a> {
         let height = self.stack.len() - params.len();
         let header = self.builder.create_block();
         for ty in params {
-            self.builder
-                .append_block_param(header, clif_type(*ty).expect("numeric block parameter"));
+            self.builder.append_block_param(
+                header,
+                carrier_type(self.module, *ty).expect("carried block parameter"),
+            );
         }
         let after = self.builder.create_block();
         self.append_results(after, results);
@@ -2134,7 +2176,7 @@ impl<'a> Lowerer<'a> {
                 .builder
                 .ins()
                 .bitcast(types::I64, MemFlagsData::new(), value)),
-            ValType::Ref(reference) if reference.heap == HeapType::Func => Ok(value),
+            ValType::Ref(reference) if heap_is_func(self.module, &reference.heap) => Ok(value),
             _ => Err("unsupported value reached the call lowering".to_string()),
         }
     }
@@ -2156,7 +2198,7 @@ impl<'a> Lowerer<'a> {
                 .builder
                 .ins()
                 .bitcast(types::F64, MemFlagsData::new(), wide)),
-            ValType::Ref(reference) if reference.heap == HeapType::Func => Ok(wide),
+            ValType::Ref(reference) if heap_is_func(self.module, &reference.heap) => Ok(wide),
             _ => Err("unsupported value reached the call lowering".to_string()),
         }
     }
@@ -2360,6 +2402,63 @@ impl<'a> Lowerer<'a> {
         self.runtime_call(&args)
     }
 
+    /// A `ref.as_non_null`: trap on the null token (0), else keep it.
+    fn do_ref_as_non_null(&mut self) -> Result<(), String> {
+        let reference = self.pop().ok_or("operand stack underflow")?;
+        let zero = self.iconst(types::I64, 0);
+        let is_null = self.builder.ins().icmp(IntCC::Equal, reference, zero);
+        self.trap_if(is_null, TRAP_NULL_REFERENCE);
+        self.stack.push(reference);
+        Ok(())
+    }
+
+    /// A `br_on_null`: pop a (nullable) reference; branch to the label when
+    /// it is null (the payload below it), otherwise push it back and continue.
+    fn do_br_on_null(&mut self, depth: u32) -> Result<(), String> {
+        let reference = self.pop().ok_or("operand stack underflow")?;
+        let idx = self
+            .controls
+            .len()
+            .checked_sub(1 + depth as usize)
+            .ok_or("branch past the control stack")?;
+        let (target, arity) = self.frame_target(idx);
+        let payload = self.label_args(arity);
+        let zero = self.iconst(types::I64, 0);
+        let is_null = self.builder.ins().icmp(IntCC::Equal, reference, zero);
+        let cont = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_null, target, &payload, cont, &[]);
+        self.builder.switch_to_block(cont);
+        self.stack.push(reference);
+        Ok(())
+    }
+
+    /// A `br_on_non_null`: pop a (nullable) reference; when it is non-null,
+    /// branch to the label carrying it (on top of the payload); when null it
+    /// is consumed and the fall-through continues without it.
+    fn do_br_on_non_null(&mut self, depth: u32) -> Result<(), String> {
+        let reference = self.pop().ok_or("operand stack underflow")?;
+        let idx = self
+            .controls
+            .len()
+            .checked_sub(1 + depth as usize)
+            .ok_or("branch past the control stack")?;
+        let (target, arity) = self.frame_target(idx);
+        let zero = self.iconst(types::I64, 0);
+        let non_null = self.builder.ins().icmp(IntCC::NotEqual, reference, zero);
+        // The label's payload includes the reference on top.
+        self.stack.push(reference);
+        let payload = self.label_args(arity);
+        self.stack.pop();
+        let cont = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(non_null, target, &payload, cont, &[]);
+        self.builder.switch_to_block(cont);
+        Ok(())
+    }
+
     /// Lower one instruction. Dead paths skip code but still track the
     /// structured markers so `end`s reach the right frames.
     fn instruction(&mut self, instr: &Instr) -> Result<(), String> {
@@ -2419,7 +2518,7 @@ impl<'a> Lowerer<'a> {
             Instr::GlobalGet(index) => self.do_global_get(*index)?,
             Instr::GlobalSet(index) => self.do_global_set(*index)?,
             Instr::RefNull(heap) => {
-                if *heap != HeapType::Func {
+                if !heap_is_func(self.module, heap) {
                     return Err("unsupported ref.null heap type".to_string());
                 }
                 let null = self.iconst(types::I64, 0);
@@ -2434,6 +2533,9 @@ impl<'a> Lowerer<'a> {
                 let token = self.do_ref_func(*index);
                 self.stack.push(token);
             }
+            Instr::RefAsNonNull => self.do_ref_as_non_null()?,
+            Instr::BrOnNull(label) => self.do_br_on_null(*label)?,
+            Instr::BrOnNonNull(label) => self.do_br_on_non_null(*label)?,
             Instr::TableGet(table) => self.do_table_get(*table)?,
             Instr::TableSet(table) => self.do_table_set(*table)?,
             Instr::CallRef(type_index) => self.do_call_ref(*type_index, false)?,
@@ -2558,7 +2660,8 @@ fn lower(
     value_types.extend(body.locals.iter().copied());
     let mut variables = Vec::with_capacity(value_types.len());
     for (index, ty) in value_types.iter().enumerate() {
-        let variable = builder.declare_var(clif_type(*ty).expect("checked by lowerable"));
+        let variable =
+            builder.declare_var(carrier_type(module, *ty).expect("checked by lowerable"));
         let value = if index < func_type.params.len() {
             // Load the i-th param (an I64 slot) and narrow/narrow-convert it
             // to the parameter's value type.
@@ -2576,7 +2679,7 @@ fn lower(
                 }
                 ValType::F64 => builder.ins().bitcast(types::F64, MemFlagsData::new(), wide),
                 // A function-reference parameter arrives as its u64 token.
-                ValType::Ref(reference) if reference.heap == HeapType::Func => wide,
+                ValType::Ref(reference) if heap_is_func(module, &reference.heap) => wide,
                 _ => return Err("unsupported parameter type".to_string()),
             }
         } else {
@@ -2586,7 +2689,7 @@ fn lower(
                 ValType::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
                 ValType::F64 => builder.ins().f64const(Ieee64::with_bits(0)),
                 // A function-reference local defaults to the null token.
-                ValType::Ref(reference) if reference.heap == HeapType::Func => {
+                ValType::Ref(reference) if heap_is_func(module, &reference.heap) => {
                     builder.ins().iconst(types::I64, 0)
                 }
                 _ => return Err("unsupported local type".to_string()),
@@ -2657,7 +2760,9 @@ mod tests {
     use crate::exec::Store;
     use crate::instr::StoreOp;
     use crate::module::{FuncBody, Global, Module, Table};
-    use crate::types::{BlockType, GlobalType, Limits, MemType, RefType, SubType, TableType};
+    use crate::types::{
+        BlockType, GlobalType, HeapType, Limits, MemType, RefType, SubType, TableType,
+    };
     use crate::values::{FuncAddr, RefValue};
 
     fn int_module(body: Vec<Instr>, params: Vec<ValType>, results: Vec<ValType>) -> Module {
@@ -5065,6 +5170,119 @@ mod tests {
             .into_iter()
             .map(|n| vec![Value::I32(n)])
             .collect::<Vec<_>>();
+        assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn typed_function_ref_param_matches_the_interpreter() {
+        // `apply(f, x)` where `f` is a *typed* `(ref null $t)` parameter
+        // (`$t` = type 0, the i32 -> i32 function type), dispatched with
+        // call_ref — a type-indexed function ref must ride the compiled
+        // stack as a token like an abstract funcref.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                SubType::func(
+                    vec![
+                        ValType::Ref(RefType {
+                            nullable: true,
+                            heap: HeapType::Type(0),
+                        }),
+                        ValType::I32,
+                    ],
+                    vec![ValType::I32],
+                ),
+            ],
+            functions: vec![0, 1],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::Num(NumOp::I32Add),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(1), Instr::LocalGet(0), Instr::CallRef(0)],
+                },
+            ],
+            ..Module::default()
+        };
+        let function = Value::Ref(RefValue::Func(FuncAddr {
+            instance: 0,
+            index: 0,
+        }));
+        let cases = [
+            vec![function, Value::I32(41)],
+            vec![Value::Ref(RefValue::Null), Value::I32(1)],
+        ];
+        assert_equiv(&module, 1, &cases);
+    }
+
+    #[test]
+    fn br_on_null_loop_matches_the_interpreter() {
+        // If `$r` is null, exit immediately (return 0); otherwise increment a
+        // counter to 10. Exercises `br_on_null` to the outer block label.
+        let module = module_with(
+            vec![
+                Instr::Block(BlockType::Empty),
+                Instr::Loop(BlockType::Empty),
+                Instr::LocalGet(0),
+                Instr::BrOnNull(1),
+                Instr::LocalGet(1),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalSet(1),
+                Instr::LocalGet(1),
+                Instr::I32Const(10),
+                Instr::Num(NumOp::I32LtS),
+                Instr::BrIf(0),
+                Instr::End,
+                Instr::End,
+                Instr::LocalGet(1),
+            ],
+            vec![ValType::Ref(RefType::FUNC)],
+            vec![ValType::I32],
+            vec![ValType::I32],
+        );
+        let non_null = vec![Value::Ref(RefValue::Func(FuncAddr {
+            instance: 0,
+            index: 0,
+        }))];
+        let cases = vec![non_null, vec![Value::Ref(RefValue::Null)]];
+        assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn ref_as_non_null_matches_the_interpreter() {
+        // `ref.as_non_null` keeps a non-null reference and traps on null.
+        let non_null_type = |nullable| {
+            ValType::Ref(RefType {
+                nullable,
+                heap: HeapType::Func,
+            })
+        };
+        let module = Module {
+            types: vec![SubType::func(
+                vec![non_null_type(true)],
+                vec![non_null_type(false)],
+            )],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body: vec![Instr::LocalGet(0), Instr::RefAsNonNull],
+            }],
+            ..Module::default()
+        };
+        let cases = vec![
+            vec![Value::Ref(RefValue::Func(FuncAddr {
+                instance: 0,
+                index: 0,
+            }))],
+            vec![Value::Ref(RefValue::Null)],
+        ];
         assert_equiv(&module, 0, &cases);
     }
 }

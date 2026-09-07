@@ -2017,3 +2017,22 @@ proves every lowered instruction reproduces the interpreter exactly
 across the entire corpus at once — no residual divergence in any
 combination of the numeric/control/memory/global/call/ref subset the
 waves have enabled.
+
+Typed function references and the null-branch ops landed (Wave 4's
+reference-types slice). The value model's function-reference check is
+now module-aware: a `(ref $t)`/`(ref null $t)` whose type index resolves
+to a function type rides the compiled stack as the same u64 token as an
+abstract funcref (`heap_is_func`/`val_is_func_ref`/`carrier_type`), so
+type-indexed refs work in params, locals, block types, `ref.func`,
+`call_ref`, and tables whose element type is a typed function ref.
+`ref.as_non_null` (trap `NullReference` on the null token), `br_on_null`
+(conditional branch carrying the payload below the popped reference, or
+pushing it back), and `br_on_non_null` (branch carrying the reference on
+top of the payload when non-null; the null is consumed) all lower over
+the funcref token model. Unit coverage adds a typed-`(ref null $t)`
+`apply` through `call_ref`, a `br_on_null` loop exiting on a null
+parameter, and a `ref.as_non_null` keep/trap pair. `wasmtest equiv` is
+green over `call_ref`, `return_call_ref`, `ref_func`, `br_on_null`,
+`br_on_non_null`, `ref_as_non_null` (0 diverged) and the whole core
+corpus stays at 254 suites / 0 diverged. 40 compile tests, 76 total with
+the feature, clippy clean in both configurations.
