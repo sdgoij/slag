@@ -2036,3 +2036,25 @@ green over `call_ref`, `return_call_ref`, `ref_func`, `br_on_null`,
 `br_on_non_null`, `ref_as_non_null` (0 diverged) and the whole core
 corpus stays at 254 suites / 0 diverged. 40 compile tests, 76 total with
 the feature, clippy clean in both configurations.
+
+Externrefs ride the compiled token model (the extern/GC half of Wave
+4's reference types). The token space gains an extern region — bit 62
+marks an external reference, bits 60-61 select its payload kind
+(host/i31/struct/array), and 60 bits carry the payload — so `RefValue::
+Extern` encodes into the same zero-allocation u64 token as function
+references (no store-side registry needed: tokens encode the value
+directly, so compiled externrefs never allocate). The value model's
+carrier check (`heap_is_carried`) now admits the abstract `extern` heap
+alongside function refs, unlocking externref params/locals/results,
+`ref.null extern`, and `table.get`/`table.set` over externref tables
+(the table element gate became `table_carried_ref`). Boundary
+marshaling is generic already (any ref param/result round-trips
+through `ref_to_token`/`token_to_ref`), and the call helper's slot
+decoder accepts extern params too. Unit coverage stores an externref
+parameter (crossing the boundary as a packed extern token) into an
+externref table, reads it back, and null-tests it. `wasmtest equiv` is
+green over `table_get`, `table_set`, `table`, `ref_func`, and `call_ref`
+(0 diverged) and the whole core corpus stays at 254 suites / 0 diverged.
+41 compile tests, 77 total with the feature, clippy clean in both
+configurations. GC heap types (i31/struct/array/exn and their tables)
+and the GC object instructions remain interpreted.

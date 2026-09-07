@@ -520,24 +520,23 @@ fn heap_is_func(module: &Module, heap: &HeapType) -> bool {
     }
 }
 
-/// Whether a value type is a function reference under `module`'s type space
-/// (abstract `funcref` or a typed `(ref $t)`/`(ref null $t)` over a func
-/// type).
-fn val_is_func_ref(module: &Module, ty: ValType) -> bool {
-    match ty {
-        ValType::Ref(reference) => heap_is_func(module, &reference.heap),
-        _ => false,
-    }
+/// Whether a heap type is one the compiled value model can carry as a token:
+/// a function reference, or the abstract `extern` heap (an externref — its
+/// payload packs into the token). Exn/GC-heap references stay interpreted.
+fn heap_is_carried(module: &Module, heap: &HeapType) -> bool {
+    heap_is_func(module, heap) || matches!(heap, HeapType::Extern)
 }
 
 /// The compiled carrier type of a value the lowering actually carries — a
-/// numeric scalar, or a function-reference token (`I64`) — or `None` when the
-/// type stays interpreted.
+/// numeric scalar, or a function-/extern-reference token (`I64`) — or `None`
+/// when the type stays interpreted.
 fn carrier_type(module: &Module, ty: ValType) -> Option<Type> {
     match num_type(ty) {
         Some(t) => Some(t),
-        None if val_is_func_ref(module, ty) => Some(types::I64),
-        None => None,
+        None => match ty {
+            ValType::Ref(reference) if heap_is_carried(module, &reference.heap) => Some(types::I64),
+            _ => None,
+        },
     }
 }
 
@@ -661,9 +660,10 @@ fn table_is64(module: &Module, index: u32) -> Option<bool> {
     }
 }
 
-/// Whether a table index's element type is a (nullable or not) function
-/// reference — the only reference kind the compiled value model carries.
-fn table_is_funcref(module: &Module, index: u32) -> bool {
+/// Whether a table index's element type is a reference kind the compiled
+/// value model carries (a function or extern reference) — the only tables the
+/// lowering touches.
+fn table_carried_ref(module: &Module, index: u32) -> bool {
     let imported = module
         .imports
         .iter()
@@ -684,7 +684,7 @@ fn table_is_funcref(module: &Module, index: u32) -> bool {
             .get((index - imported) as usize)
             .map(|table| table.ty.element)
     };
-    matches!(element, Some(RefType { heap, .. }) if heap_is_func(module, &heap))
+    matches!(element, Some(RefType { heap, .. }) if heap_is_carried(module, &heap))
 }
 
 /// Whether a callee type fits the compiled-call subset: numeric or
@@ -826,9 +826,9 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
             callable_type(module, module.func_at_cloned(*type_index))
         }
         Instr::TableGet(table) | Instr::TableSet(table) => {
-            table_is64(module, *table) == Some(false) && table_is_funcref(module, *table)
+            table_is64(module, *table) == Some(false) && table_carried_ref(module, *table)
         }
-        Instr::RefNull(heap) => heap_is_func(module, heap),
+        Instr::RefNull(heap) => heap_is_carried(module, heap),
         Instr::RefFunc(_) | Instr::RefIsNull | Instr::RefAsNonNull => true,
         Instr::BrOnNull(_) | Instr::BrOnNonNull(_) => true,
         _ => false,
@@ -2176,7 +2176,7 @@ impl<'a> Lowerer<'a> {
                 .builder
                 .ins()
                 .bitcast(types::I64, MemFlagsData::new(), value)),
-            ValType::Ref(reference) if heap_is_func(self.module, &reference.heap) => Ok(value),
+            ValType::Ref(reference) if heap_is_carried(self.module, &reference.heap) => Ok(value),
             _ => Err("unsupported value reached the call lowering".to_string()),
         }
     }
@@ -2198,7 +2198,7 @@ impl<'a> Lowerer<'a> {
                 .builder
                 .ins()
                 .bitcast(types::F64, MemFlagsData::new(), wide)),
-            ValType::Ref(reference) if heap_is_func(self.module, &reference.heap) => Ok(wide),
+            ValType::Ref(reference) if heap_is_carried(self.module, &reference.heap) => Ok(wide),
             _ => Err("unsupported value reached the call lowering".to_string()),
         }
     }
@@ -2518,7 +2518,7 @@ impl<'a> Lowerer<'a> {
             Instr::GlobalGet(index) => self.do_global_get(*index)?,
             Instr::GlobalSet(index) => self.do_global_set(*index)?,
             Instr::RefNull(heap) => {
-                if !heap_is_func(self.module, heap) {
+                if !heap_is_carried(self.module, heap) {
                     return Err("unsupported ref.null heap type".to_string());
                 }
                 let null = self.iconst(types::I64, 0);
@@ -2678,8 +2678,8 @@ fn lower(
                     builder.ins().bitcast(types::F32, MemFlagsData::new(), bits)
                 }
                 ValType::F64 => builder.ins().bitcast(types::F64, MemFlagsData::new(), wide),
-                // A function-reference parameter arrives as its u64 token.
-                ValType::Ref(reference) if heap_is_func(module, &reference.heap) => wide,
+                // A reference parameter arrives as its u64 token.
+                ValType::Ref(reference) if heap_is_carried(module, &reference.heap) => wide,
                 _ => return Err("unsupported parameter type".to_string()),
             }
         } else {
@@ -2688,8 +2688,8 @@ fn lower(
                 ValType::I64 => builder.ins().iconst(types::I64, 0),
                 ValType::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
                 ValType::F64 => builder.ins().f64const(Ieee64::with_bits(0)),
-                // A function-reference local defaults to the null token.
-                ValType::Ref(reference) if heap_is_func(module, &reference.heap) => {
+                // A reference local defaults to the null token.
+                ValType::Ref(reference) if heap_is_carried(module, &reference.heap) => {
                     builder.ins().iconst(types::I64, 0)
                 }
                 _ => return Err("unsupported local type".to_string()),
@@ -5281,6 +5281,51 @@ mod tests {
                 instance: 0,
                 index: 0,
             }))],
+            vec![Value::Ref(RefValue::Null)],
+        ];
+        assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn externref_table_ops_match_the_interpreter() {
+        // An externref table: store the externref parameter (which crossed the
+        // compiled boundary as a packed extern token) into slot 0, read it
+        // back, and test nullness.
+        let module = Module {
+            types: vec![SubType::func(
+                vec![ValType::Ref(RefType::EXTERN)],
+                vec![ValType::I32],
+            )],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body: vec![
+                    Instr::I32Const(0),
+                    Instr::LocalGet(0),
+                    Instr::TableSet(0),
+                    Instr::I32Const(0),
+                    Instr::TableGet(0),
+                    Instr::RefIsNull,
+                ],
+            }],
+            tables: vec![Table {
+                ty: TableType {
+                    element: RefType::EXTERN,
+                    limits: Limits {
+                        min: 1,
+                        max: None,
+                        shared: false,
+                    },
+                    table64: false,
+                },
+                init: None,
+            }],
+            ..Module::default()
+        };
+        let cases = vec![
+            vec![Value::Ref(RefValue::Extern(
+                crate::values::ExternInner::Host(7),
+            ))],
             vec![Value::Ref(RefValue::Null)],
         ];
         assert_equiv(&module, 0, &cases);

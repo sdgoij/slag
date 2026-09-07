@@ -11,9 +11,19 @@ use crate::instr::NumOp;
 /// as opaque u64 tokens carried in `I64` Cranelift values. Token 0 is the
 /// null reference; a function reference is tagged with bit 63 and packs its
 /// address's instance (bits 32-62, up to 2^31) and full function-index-space
-/// index (bits 0-31) — an address that does not fit stays interpreted.
+/// index (bits 0-31); an external reference is tagged with bit 62 and packs
+/// its payload kind (bits 60-61) and 60-bit payload. An address/payload that
+/// does not fit stays interpreted.
 pub const REF_NULL_TOKEN: u64 = 0;
 pub const REF_FUNC_TAG: u64 = 1 << 63;
+pub const REF_EXTERN_TAG: u64 = 1 << 62;
+const REF_EXTERN_KIND_SHIFT: u64 = 60;
+const REF_EXTERN_PAYLOAD_MASK: u64 = (1 << 60) - 1;
+const REF_EXTERN_KIND_MASK: u64 = 0b11 << REF_EXTERN_KIND_SHIFT;
+const KIND_HOST: u64 = 0;
+const KIND_I31: u64 = 1;
+const KIND_STRUCT: u64 = 2;
+const KIND_ARRAY: u64 = 3;
 
 /// The compiled token for a function address, when both parts fit.
 pub fn func_ref_token(instance: usize, index: usize) -> Option<u64> {
@@ -23,12 +33,28 @@ pub fn func_ref_token(instance: usize, index: usize) -> Option<u64> {
     Some(REF_FUNC_TAG | ((instance as u64) << 32) | index as u64)
 }
 
-/// Encode an interpreter value as its compiled token. Only the null and
-/// function references the compiled subset carries are encodable.
+/// The compiled token for an external reference, when its payload fits.
+pub fn extern_ref_token(inner: ExternInner) -> Option<u64> {
+    let (kind, payload) = match inner {
+        ExternInner::Host(host) => (KIND_HOST, u64::from(host)),
+        ExternInner::I31(value) => (KIND_I31, value as u32 as u64),
+        ExternInner::Struct(id) => (KIND_STRUCT, id as u64),
+        ExternInner::Array(id) => (KIND_ARRAY, id as u64),
+    };
+    if payload & !REF_EXTERN_PAYLOAD_MASK != 0 {
+        return None;
+    }
+    Some(REF_EXTERN_TAG | kind << REF_EXTERN_KIND_SHIFT | payload)
+}
+
+/// Encode an interpreter value as its compiled token. Only the references the
+/// compiled subset carries are encodable: null, function references, and
+/// external references.
 pub fn ref_to_token(value: Value) -> Option<u64> {
     match value {
         Value::Ref(RefValue::Null) => Some(REF_NULL_TOKEN),
         Value::Ref(RefValue::Func(addr)) => func_ref_token(addr.instance, addr.index),
+        Value::Ref(RefValue::Extern(inner)) => extern_ref_token(inner),
         _ => None,
     }
 }
@@ -38,12 +64,22 @@ pub fn token_to_ref(token: u64) -> Option<Value> {
     if token == REF_NULL_TOKEN {
         return Some(Value::Ref(RefValue::Null));
     }
-    if token & REF_FUNC_TAG == 0 {
-        return None;
+    if token & REF_FUNC_TAG != 0 {
+        let instance = ((token >> 32) & 0x7fff_ffff) as usize;
+        let index = (token & u64::from(u32::MAX)) as usize;
+        return Some(Value::Ref(RefValue::Func(FuncAddr { instance, index })));
     }
-    let instance = ((token >> 32) & 0x7fff_ffff) as usize;
-    let index = (token & u64::from(u32::MAX)) as usize;
-    Some(Value::Ref(RefValue::Func(FuncAddr { instance, index })))
+    if token & REF_EXTERN_TAG != 0 {
+        let inner = match (token & REF_EXTERN_KIND_MASK) >> REF_EXTERN_KIND_SHIFT {
+            KIND_HOST => ExternInner::Host(token as u32),
+            KIND_I31 => ExternInner::I31(token as u32 as i32),
+            KIND_STRUCT => ExternInner::Struct((token & REF_EXTERN_PAYLOAD_MASK) as usize),
+            KIND_ARRAY => ExternInner::Array((token & REF_EXTERN_PAYLOAD_MASK) as usize),
+            _ => return None,
+        };
+        return Some(Value::Ref(RefValue::Extern(inner)));
+    }
+    None
 }
 
 /// Where a function reference points: the full function index space of a
