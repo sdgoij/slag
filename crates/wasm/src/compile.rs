@@ -263,6 +263,50 @@ impl CompiledFunc {
             )
         }
     }
+
+    /// Invoke the compiled body with raw pointers/counts (the native
+    /// re-entry path from [`Store`]'s call helper): `args` and `out` may point
+    /// anywhere the caller keeps alive, including the same caller-owned
+    /// scratch (arguments are read before results are written). Returns the
+    /// entry's trap code.
+    ///
+    /// # Safety
+    ///
+    /// `entry` is a plain function pointer into `_code`, kept alive and
+    /// executable by this struct; `args`/`mems`/`gvals`/`out` are caller-
+    /// owned buffers of the declared lengths that stay valid for the call
+    /// (the callee may refresh/replace `mems` entries but never the array
+    /// itself); `runtime` addresses the owning store/instance.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn call_raw(
+        &self,
+        args: *const u64,
+        nargs: u64,
+        mems: *const u64,
+        ncount: u64,
+        gvals: *mut u64,
+        out: *mut u64,
+        nout: u64,
+        runtime: CompiledRuntime,
+    ) -> i32 {
+        // SAFETY: enforced by `call_raw`'s own `# Safety` contract.
+        unsafe {
+            (self.entry)(
+                args,
+                nargs,
+                mems,
+                ncount,
+                gvals,
+                out,
+                nout,
+                runtime.store,
+                runtime.instance,
+                runtime.grow,
+                runtime.call,
+                runtime.scratch,
+            )
+        }
+    }
 }
 
 /// Run a compiled entry with the interpreter's [`Value`] argument model,
@@ -4990,5 +5034,37 @@ mod tests {
         assert_eq!(outcomes[2], Ok(vec![Value::I32(0)]));
         assert_eq!(outcomes[3], Ok(vec![Value::I32(42)]));
         assert_eq!(outcomes[4], Ok(vec![Value::I32(0)]));
+    }
+
+    #[test]
+    fn recursion_past_the_native_budget_matches_the_interpreter() {
+        // countdown(n) = n == 0 ? 0 : countdown(n - 1) + 1, so a depth-1500
+        // recursion is correct. Depth 1500 crosses `NATIVE_CALL_DEPTH`, so
+        // the compiled run mixes native re-entry frames with an interpreted
+        // fallback subtree and must still agree with the pure interpreter.
+        let module = module_with(
+            vec![
+                Instr::LocalGet(0),
+                Instr::Num(NumOp::I32Eqz),
+                Instr::If(BlockType::Val(ValType::I32)),
+                Instr::I32Const(0),
+                Instr::Else,
+                Instr::LocalGet(0),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Sub),
+                Instr::Call(0),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Add),
+                Instr::End,
+            ],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+        );
+        let cases = [0, 1, 2, 64, 1500]
+            .into_iter()
+            .map(|n| vec![Value::I32(n)])
+            .collect::<Vec<_>>();
+        assert_equiv(&module, 0, &cases);
     }
 }

@@ -109,6 +109,15 @@ pub enum RunProgress {
 /// bounded stack).
 pub const DEFAULT_DEPTH_LIMIT: usize = 4096;
 
+/// Cut 11: compiled-to-compiled native re-entry depth budget. Each native
+/// level costs a Cranelift frame plus Rust helper/trampoline frames; past
+/// this the call helper runs callees through the interpreter (whose own frame
+/// budget then applies), so runaway recursion traps like an interpreted run
+/// instead of overflowing the native stack. Kept small enough that even the
+/// debug build (and a 1 MB host main-thread stack) survives the worst corpus
+/// recursion.
+pub const NATIVE_CALL_DEPTH: usize = 64;
+
 /// The page size of linear memory, in bytes.
 pub const PAGE_SIZE: u64 = 65536;
 
@@ -331,6 +340,12 @@ pub struct Store {
     /// the interpreter would have produced.
     #[cfg(feature = "compile")]
     pending_error: Option<ExecFail>,
+    /// Cut 11: current compiled-to-compiled native call depth. Above
+    /// [`NATIVE_CALL_DEPTH`] the call helper routes callees through the
+    /// interpreter instead, bounding the native stack so the interpreter's
+    /// exhaustion semantics still hold for runaway recursion.
+    #[cfg(feature = "compile")]
+    native_depth: usize,
 }
 
 impl Default for Store {
@@ -546,6 +561,47 @@ pub unsafe extern "C" fn wasm_call_helper(
         store.set_pending_error(ExecFail::Unsupported("compiled call arity"));
         return crate::compile::TRAP_PENDING_ERROR;
     }
+    // Native compiled-to-compiled re-entry: when the callee is itself a
+    // compiled module-defined function and we are inside the native depth
+    // budget, run it natively — each native level carries its own
+    // descriptor/global/scratch buffers. Deeper chains (or interpreted or
+    // host callees) fall through to the interpreter path below, which
+    // preserves the interpreter's exhaustion semantics and bounds the native
+    // stack.
+    let native = match declared.1 {
+        FuncTarget::Owned {
+            instance: own,
+            defined,
+        } if !store.compile_off && store.native_depth < NATIVE_CALL_DEPTH => store
+            .instances
+            .get(own)
+            .and_then(|inst| inst.compiled.get(defined))
+            .and_then(|entry| entry.as_ref())
+            .map(|func| (own, func as *const crate::compile::CompiledFunc)),
+        _ => None,
+    };
+    if let Some((own, native_ptr)) = native {
+        store.native_depth += 1;
+        // SAFETY: the native entry and its buffers are handled inside
+        // `run_native_callee` (callee-owned buffers stay alive for the call;
+        // `store` stays uniquely borrowed by this whole helper invocation).
+        let code = unsafe {
+            run_native_callee(
+                store as *mut Store,
+                native_ptr,
+                own,
+                NativeCall {
+                    argc: ty.params.len(),
+                    nout: ty.results.len(),
+                    args_out: scratch,
+                    caller_instance: instance as usize,
+                    caller_mems: mems,
+                },
+            )
+        };
+        store.native_depth -= 1;
+        return code;
+    }
     // Decode the argument slots (numeric values, or function tokens for
     // function-reference parameters).
     let mut args = Vec::with_capacity(ty.params.len());
@@ -591,6 +647,115 @@ pub unsafe extern "C" fn wasm_call_helper(
             crate::compile::TRAP_PENDING_ERROR
         }
     }
+}
+
+/// The caller-side buffers a native compiled re-entry (Wave 3) hands to the
+/// callee: the argument slots the caller already spilled (also where results
+/// land), plus the caller's instance index and descriptor pointer so the
+/// callee's memory growth can be refreshed back after the call.
+#[cfg(feature = "compile")]
+struct NativeCall {
+    argc: usize,
+    nout: usize,
+    args_out: *mut u64,
+    caller_instance: usize,
+    caller_mems: *mut u64,
+}
+
+/// Run a compiled callee natively from the call helper (Wave 3 direct
+/// compiled-to-compiled re-entry). The callee's arguments already sit in the
+/// caller's scratch at `call.args_out`; the callee writes its results back
+/// there and gets fresh caller-owned buffers for its own memories
+/// (descriptors), used globals, and internal-call scratch. Its global
+/// mutations are flushed back to the store's cells on return (writes persist
+/// across traps), and the caller's memory descriptors are refreshed in case
+/// the callee grew a memory. Returns the callee entry's trap code.
+///
+/// # Safety
+///
+/// `store` stays valid and uniquely borrowed for the whole call;
+/// `native_ptr` points at a compiled entry kept alive by its instance;
+/// `call.args_out`/`call.caller_mems` are the caller's buffers, alive for the
+/// call; the buffers allocated here stay alive until the native call returns.
+#[cfg(feature = "compile")]
+unsafe fn run_native_callee(
+    store: *mut Store,
+    native_ptr: *const crate::compile::CompiledFunc,
+    own: usize,
+    call: NativeCall,
+) -> i32 {
+    let func = unsafe { &*native_ptr };
+    let store_ref = unsafe { &mut *store };
+    // The callee's memory descriptors, from its own instance's cells.
+    let memories = store_ref.instances[own].memories.clone();
+    let mut descriptors = Vec::with_capacity(2 * memories.len());
+    for cell in &memories {
+        match store_ref.memories.get(*cell) {
+            Some(memory) => {
+                descriptors.push(memory.bytes.as_ptr() as u64);
+                descriptors.push(memory.bytes.len() as u64);
+            }
+            None => {
+                descriptors.push(0);
+                descriptors.push(0);
+            }
+        }
+    }
+    // The callee's used globals ride a caller-owned buffer seeded from its
+    // cells (slot order = `used_globals()`), flushed back after the call.
+    let used = func.used_globals().to_vec();
+    let cells: Vec<usize> = used
+        .iter()
+        .map(|index| store_ref.instances[own].globals[*index as usize])
+        .collect();
+    let mut gvals: Vec<u64> = cells
+        .iter()
+        .map(|cell| match store_ref.globals[*cell] {
+            Value::I32(bits) => bits as u32 as u64,
+            Value::I64(bits) => bits as u64,
+            Value::F32(bits) => u64::from(bits),
+            Value::F64(bits) => bits,
+            _ => 0,
+        })
+        .collect();
+    let callee_scratch = vec![0u64; crate::compile::SCRATCH_SLOTS];
+    let runtime = crate::compile::CompiledRuntime {
+        store: store as u64,
+        instance: own as u64,
+        grow: memory_grow_helper as *const () as usize as u64,
+        call: wasm_call_helper as *const () as usize as u64,
+        scratch: callee_scratch.as_ptr() as u64,
+    };
+    // SAFETY: enforced by `CompiledFunc::call_raw`'s contract (the buffers
+    // above stay alive for the call).
+    let code = unsafe {
+        func.call_raw(
+            call.args_out,
+            call.argc as u64,
+            descriptors.as_ptr(),
+            descriptors.len() as u64,
+            gvals.as_mut_ptr(),
+            call.args_out,
+            call.nout as u64,
+            runtime,
+        )
+    };
+    // Flush the callee's global writes back to its cells (survive traps) and
+    // refresh the caller's descriptors (the callee may have grown a memory
+    // shared with the caller, or any memory the caller later touches).
+    let store_ref = unsafe { &mut *store };
+    for (cell, bits) in cells.iter().zip(&gvals) {
+        let value = match store_ref.global_types[*cell].value {
+            ValType::I32 => Value::I32(*bits as u32 as i32),
+            ValType::I64 => Value::I64(*bits as i64),
+            ValType::F32 => Value::F32(*bits as u32),
+            ValType::F64 => Value::F64(*bits),
+            _ => continue,
+        };
+        store_ref.globals[*cell] = value;
+    }
+    refresh_descriptors(store_ref, call.caller_instance as u64, call.caller_mems);
+    code
 }
 
 /// A compiled `table.get` (mode 3) or `table.set` (mode 4): resolve the
@@ -695,6 +860,8 @@ impl Store {
             compile_off: false,
             #[cfg(feature = "compile")]
             pending_error: None,
+            #[cfg(feature = "compile")]
+            native_depth: 0,
         }
     }
 

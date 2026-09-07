@@ -1977,3 +1977,43 @@ exnref/GC heap refs, ref-typed globals, and `br_on_null`/`br_on_non_null`
 lowering stay interpreted (bodies bail cleanly), so those suites remain
 interpreter-on-both-sides. 36 compile tests, 72 total with the feature,
 clippy clean in both configurations. Wave 2 is complete.
+
+Wave 3's first slice landed: direct compiled-to-compiled re-entry. The
+call helper now dispatches a resolved callee that is itself a compiled
+module-defined function **natively** (`run_native_callee`), instead of
+running every callee through an interpreter subtree. Each native level
+allocates fresh caller-owned buffers for the callee's own memories
+(descriptors from its instance's cells), its used globals (a `gvals`
+buffer seeded from — and flushed back to — its cells, surviving traps),
+and its internal-call scratch; arguments already spilled in the caller's
+scratch double as the result buffer (`CompiledFunc::call_raw` invokes the
+entry with raw pointers). After the callee returns, its global writes are
+flushed to the store and the caller's memory descriptors are refreshed in
+case a shared memory grew. A `native_depth` budget (`NATIVE_CALL_DEPTH`,
+64 — sized for a 1 MB host main-thread stack even in debug builds)
+bounds the native frames: past it the callee runs through the
+interpreter, whose own frame budget then applies, so runaway recursion
+still ends in a clean `CallStackExhausted` instead of a native stack
+overflow. `return_call*` tails still route through the interpreter (its
+frame-replacing tail call keeps those bounded). Unit coverage adds a
+1500-deep countdown recursion that crosses the native budget, mixing
+native frames with an interpreted fallback subtree. `wasmtest equiv`
+stays green over `call`, `call_indirect`, `fac`, `switch`, `return_call*`,
+`linking` (cross-instance native calls), `imports`, `global`, `memory`,
+`memory_grow`, and the ref/table suites (0 diverged). 37 compile tests,
+73 total with the feature, clippy clean in both configurations. Wave 3
+remaining: compiled bodies whose callee graph can reach a resumable
+external host import stay interpreted (the plan's one-host-call-mechanism
+rule), so the host-boundary arm is already satisfied by exclusion; a
+future perf wave can tune `NATIVE_CALL_DEPTH` (or make it release-only).
+
+Whole-corpus equivalence gate: `wasmtest equiv waspec/test/core` now
+compares **254 suites — the full core corpus (top level plus
+`bulk-memory`, `exceptions`, `gc`, `memory64`, `multi-memory`,
+`relaxed-simd`, and `simd`)** — through the compiled path against the
+interpreter-forced oracle with **0 diverged**. Bodies the compiler cannot
+lower yet run interpreted on both sides and cannot diverge, so this
+proves every lowered instruction reproduces the interpreter exactly
+across the entire corpus at once — no residual divergence in any
+combination of the numeric/control/memory/global/call/ref subset the
+waves have enabled.
