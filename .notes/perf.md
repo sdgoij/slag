@@ -5620,7 +5620,40 @@ fail/crash/hang. All 13 `--jit-bench` rows result-ok; 37-workload corpus
 result-identical jit vs jitless. Follow-ups: the same dense visit for the
 some/every/find family and `Array.from`'s per-item reads, plus the ~60ns
 callback call itself (the compiled/leaf path from a native loop) once the
-reads are at the floor.
+the reads are at the floor.
+
+### Dense result defines and element reads in split/join (measured + landed 2026-09-07)
+
+`strings/split_join.js` (60k round trips of `"a,b,...,h".split(",")` +
+`parts.join(",")`) sat at ~407ms jitless / ~364ms jit. Decomposition
+(isolated probes): split costs a ~1µs fixed plus ~270ms per token, join
+~2.7µs for 8 elements — node-jitless is ~43ns/split and ~118ns/join. The
+per-token/per-element cost was the same pattern the HOF landing removed:
+`array_from_list` (split's result builder, and the empty-separator split
+branch) defined each element via `create_data_property` with a fresh
+`index.to_string()` key, and `join` read each element through `key(k)` +
+the general [[Get]].
+
+Landing: `array_from_list` (and split's per-code-unit branch) defines
+elements with `create_data_property_index` (the dense w/e/c element
+define on the pre-sized result, string-key fallback kept); `join` reads
+each element through `dense_own_element` (a present dense own element IS
+the [[Get]] result — holes/spilled/exotic receivers fall back to the
+exact `get`). Results (isolated 60k-call probes, min of 3): 8-token split
+~2.8µs -> ~1.4µs, join ~2.7µs -> ~1.1µs; `split_join.js` ~407 -> ~215ms
+jitless / ~364 -> ~202ms jit (~1.9x). Correctness: a 40-case
+node-differential battery (limits, empty/undefined/null separators,
+code-unit empty-separator splits incl. astral pairs, trailing/double
+separators, multichar separators, holes/sparse/deleted joins, chain
+shadowing of holes, separator coercion order, array-like and string
+receivers, index getters) is byte-identical to node in jit, jitless, and
+`--gc-stress`. Gates: clippy clean; workspace tests green; test262 sweeps
+at baseline — language 23721/3 skip, built-ins 23657/155 skip, annexB
+1086/1086, zero fail/crash/hang. All 13 `--jit-bench` rows result-ok;
+37-workload corpus result-identical jit vs jitless. Follow-up: split's
+remaining ~0.8µs fixed cost is the primitive-string method dispatch +
+per-token string boxing floor (substring copies), not the result
+defines.
 
 ## Deferred milestones
 

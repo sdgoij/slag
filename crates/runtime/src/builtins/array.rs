@@ -1277,7 +1277,10 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         if k > 0 {
             result.push_str(&separator);
         }
-        let element = get(agent, &object, &key(k))?;
+        let element = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => get(agent, &object, &key(k))?,
+        };
         if matches!(element.kind(), ValueKind::Undefined | ValueKind::Null) {
             continue;
         }

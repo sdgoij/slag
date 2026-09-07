@@ -893,10 +893,13 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         // boxings; see `array_from_list`).
         let array = crate::builtins::array::array_create(agent, head.len() as f64)?;
         for (index, &unit) in head.as_slice().iter().enumerate() {
-            array.create_data_property(
-                &crux::string::JsString::from_utf8(&index.to_string()),
-                Value::String(Handle::new(JsString::from_utf16(&[unit]))),
-            )?;
+            let value = Value::String(Handle::new(JsString::from_utf16(&[unit])));
+            if !array.create_data_property_index(index as u64, value)? {
+                array.create_data_property(
+                    &crux::string::JsString::from_utf8(&index.to_string()),
+                    value,
+                )?;
+            }
         }
         return Ok(Value::Object(array));
     }
@@ -1447,10 +1450,17 @@ fn array_from_list(agent: &mut Agent, items: &[JsString]) -> Result<Value, JsErr
     // vector keeps the defined elements.
     let array = crate::builtins::array::array_create(agent, items.len() as f64)?;
     for (index, item) in items.iter().enumerate() {
-        array.create_data_property(
-            &crux::string::JsString::from_utf8(&index.to_string()),
-            Value::String(Handle::new(item.clone())),
-        )?;
+        // The dense index define (a fresh w/e/c element on the pre-sized
+        // dense result) skips the per-element string-key allocation; a
+        // receiver the dense path cannot serve falls back to the exact
+        // string-key CreateDataProperty.
+        let value = Value::String(Handle::new(item.clone()));
+        if !array.create_data_property_index(index as u64, value)? {
+            array.create_data_property(
+                &crux::string::JsString::from_utf8(&index.to_string()),
+                value,
+            )?;
+        }
     }
     Ok(Value::Object(array))
 }
