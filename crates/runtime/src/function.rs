@@ -1594,6 +1594,7 @@ fn builtin_dispatch_at(
         38 => crate::module::dispatch_deferred_module_wait(agent, callee, args),
         39 => crate::builtins::temporal::dispatch_call(agent, callee, this, args),
         40 => crate::builtins::intl::dispatch_call(agent, callee, this, args),
+        #[cfg(feature = "wasm")]
         41 => crate::builtins::wasm::dispatch_call(agent, callee, this, args),
         _ => None,
     }
@@ -1811,6 +1812,7 @@ fn construct_inner(
                 {
                     return result;
                 }
+                #[cfg(feature = "wasm")]
                 if let Some(result) =
                     crate::builtins::wasm::dispatch_construct(agent, callee, args, new_target)
                 {

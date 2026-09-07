@@ -11,7 +11,7 @@ crate-type = ["lib", "staticlib", "cdylib"]
 [dependencies]
 crux = { path = "../crux" }
 ffi = { path = "../ffi" }
-runtime = { path = "../runtime" }
+runtime = { path = "../runtime", default-features = false }
 
 [build-dependencies]
 cc = "1"

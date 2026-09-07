@@ -399,6 +399,9 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     crate::builtins::date::install(realm)?;
     crate::builtins::symbol::install(realm)?;
     crate::builtins::error::install(realm)?;
+    // The WebAssembly JS-API namespace ships with the default-on `wasm`
+    // feature; without it the global simply is not installed.
+    #[cfg(feature = "wasm")]
     crate::builtins::wasm::install(realm)?;
     crate::builtins::global::install(realm)?;
     crate::builtins::math::install(realm)?;

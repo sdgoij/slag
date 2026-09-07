@@ -39,8 +39,9 @@ API, a small embedding API, and drop-in JavaScriptCore C-API bindings.
   pinned `waspec` corpus: **64,594 core checks / 0 fail** and **1,001
   JS-API tests / 0 fail**. Covers GC (struct/array/i31, casts),
   exceptions, SIMD + relaxed SIMD, memory64, multi-memory, and bulk
-  memory; every realm gets the `WebAssembly` global (V8/Node parity — no
-  bare-`.wasm`-file mode).
+  memory; every realm gets the `WebAssembly` global by default — a
+  default-on cargo feature (V8/Node parity — no bare-`.wasm`-file
+  mode).
 - **Experimental Cranelift JIT** — compiled bodies run as native machine
   code via [Cranelift](https://cranelift.dev): inline number/string fast
   paths, direct-mapped global/member value cells, and register-resident
@@ -86,11 +87,12 @@ The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
 `--dump-tokens`, `--print-bytecode` (dump the compiled `Step` stream),
 `--bench` (interpreter micro-benchmarks), and — when the JIT feature is
 compiled, the default — `--jitless` (disable the Cranelift JIT for the run;
-it is on by default) and `--jit-bench` (time JIT vs interpreter). `--help`
-lists the optional flags and the compiled features (the list always leads
-with `wasm` — the WebAssembly JS API is compiled in unconditionally).
-Scripts get the full `WebAssembly` global in every realm, matching
-V8/Node. `--jsx` parses
+it is on by default) and `--jit-bench` (time JIT vs interpreter). Scripts
+get the full `WebAssembly` global in every realm, matching V8/Node; the
+JS API is a default-on cargo feature (drop it with
+`cargo build -p cli --no-default-features --features jit`). `--help`
+lists the optional flags and the compiled features (`wasm`, `jit`, ...).
+`--jsx` parses
 the input with the opt-in JSX extension (`<element/>` syntax desugaring to
 `rlx.h(...)` calls). Building the
 CLI with the `raylib` feature exposes the `rl` host module to every
@@ -197,9 +199,12 @@ and multi-memory. The JS-API layer surfaces
 `WebAssembly.Module/Instance/Memory/Table/Global/Tag/Exception`, the error
 constructors, `compile`/`instantiate`/`validate`, `WebAssembly.JSTag`,
 BigInt/i64 across the JS boundary, and shared-memory grow semantics.
-`WebAssembly` is installed in every realm, so CLI/embed scripts use it
-exactly as they would under V8 or Node (there is deliberately no bare
-`.wasm`-file mode — Node and d8 do not have one either).
+`WebAssembly` is installed in every realm by default, so CLI/embed
+scripts use it exactly as they would under V8 or Node (there is
+deliberately no bare `.wasm`-file mode — Node and d8 do not have one
+either). The JS API is a default-on cargo feature of `runtime` (the CLI
+mirrors it): `cargo build -p cli --no-default-features --features jit`
+produces a wasm-free binary.
 
 Conformance is gated by the pinned `waspec` submodule (init it with `git
 submodule update --init` alongside `test262`): the core corpus — the

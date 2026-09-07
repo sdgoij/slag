@@ -735,78 +735,99 @@ pub struct Agent {
     pub error_stack: std::collections::HashMap<u64, crux::string::JsString>,
     /// The compiled module of `WebAssembly.Module` instances, keyed by object
     /// identity (JS-API spec: the [[Module]] internal slot; Wave 2 of Cut 10).
+    #[cfg(feature = "wasm")]
     pub wasm_modules: std::collections::HashMap<u64, wasm::Module>,
     /// The shared wasm engine store every `WebAssembly.Instance` in this
     /// agent instantiates into (so imports alias cells across instances).
+    #[cfg(feature = "wasm")]
     pub wasm_store: std::cell::RefCell<wasm::Store>,
     /// Exported-function wrappers: function id -> engine (instance, index).
+    #[cfg(feature = "wasm")]
     pub wasm_exports: std::collections::HashMap<u64, (usize, usize)>,
     /// The prebuilt `exports` object of each Instance, keyed by instance
     /// object identity (read by the `exports` accessor).
+    #[cfg(feature = "wasm")]
     pub wasm_instance_exports: std::collections::HashMap<u64, Value>,
     /// One JS wrapper per engine function, keyed by the function's canonical
     /// engine identity ([`wasm::FuncKey`]), so a function surfaced through
     /// several exports, table slots, or import/re-export chains keeps object
     /// identity (JS-API [[FuncObj]] memoization; Cut 10 wave 3b).
+    #[cfg(feature = "wasm")]
     pub wasm_func_objects: std::collections::HashMap<wasm::FuncKey, Value>,
     /// The memory-cell registry of `WebAssembly.Memory` wrapper objects:
     /// wrapper object id -> engine store cell (Cut 10 wave 3b).
+    #[cfg(feature = "wasm")]
     pub wasm_memories: std::collections::HashMap<u64, usize>,
     /// One `WebAssembly.Memory` wrapper per engine memory cell, memoized so a
     /// memory surfaced through a constructor, an import, or several exports
     /// keeps object identity (JS-API [[Memory]] memoization).
+    #[cfg(feature = "wasm")]
     pub wasm_memory_objects: std::collections::HashMap<usize, Value>,
     /// The live ArrayBuffer of each engine memory cell that has materialized
     /// one: cell -> buffer. `Memory.prototype.buffer` returns the same object
     /// until a grow detaches it, and the cell's bytes are bridged into it at
     /// every JS<->wasm call boundary.
+    #[cfg(feature = "wasm")]
     pub wasm_memory_buffers: std::collections::HashMap<usize, Value>,
     /// The table-cell registry of `WebAssembly.Table` wrapper objects: wrapper
     /// object id -> engine store cell (Cut 10 wave 3b).
+    #[cfg(feature = "wasm")]
     pub wasm_tables: std::collections::HashMap<u64, usize>,
     /// One `WebAssembly.Table` wrapper per engine table cell, memoized so a
     /// table surfaced through a constructor, an import, or several exports
     /// keeps object identity (JS-API [[Table]] memoization).
+    #[cfg(feature = "wasm")]
     pub wasm_table_objects: std::collections::HashMap<usize, Value>,
     /// The global-cell registry of `WebAssembly.Global` wrapper objects:
     /// wrapper object id -> engine store cell (Cut 10 wave 3b).
+    #[cfg(feature = "wasm")]
     pub wasm_globals: std::collections::HashMap<u64, usize>,
     /// One `WebAssembly.Global` wrapper per engine global cell, memoized so a
     /// global surfaced through a constructor, an import, or several exports
     /// keeps object identity (JS-API [[Global]] memoization).
+    #[cfg(feature = "wasm")]
     pub wasm_global_objects: std::collections::HashMap<usize, Value>,
     /// The JS functions backing the agent's *external* engine host functions
     /// (raw JS closures imported into a module), keyed by the token handed to
     /// `Store::external_host`, with the function type the engine matched.
+    #[cfg(feature = "wasm")]
     pub wasm_host_functions: std::collections::HashMap<u64, (Value, wasm::types::FuncType)>,
     /// The next external-host token (monotonic within the agent).
+    #[cfg(feature = "wasm")]
     pub wasm_host_seq: u64,
     /// The tag-cell registry of `WebAssembly.Tag` wrapper objects: wrapper
     /// object id -> engine store cell (Cut 10 wave 4).
+    #[cfg(feature = "wasm")]
     pub wasm_tags: std::collections::HashMap<u64, usize>,
     /// One `WebAssembly.Tag` wrapper per engine tag cell, memoized so a tag
     /// surfaced through a constructor, an import, or several exports keeps
     /// object identity (Cut 10 wave 4).
+    #[cfg(feature = "wasm")]
     pub wasm_tag_objects: std::collections::HashMap<usize, Value>,
     /// The engine tag cell behind `WebAssembly.JSTag` (the tag arbitrary JS
     /// exception values enter wasm with), once materialized: JS throws wrap
     /// in it, a wasm `catch` for it intercepts them, and an escape unwraps
     /// the payload back to the JS value (Cut 10 wave 4).
+    #[cfg(feature = "wasm")]
     pub wasm_js_tag_cell: Option<usize>,
     /// The payload of `WebAssembly.Exception` objects, keyed by object id:
     /// the exception's tag cell and its arguments as engine values (Cut 10
     /// wave 4).
+    #[cfg(feature = "wasm")]
     pub wasm_exceptions: std::collections::HashMap<u64, (usize, Vec<wasm::Value>)>,
     /// JS exception values that entered wasm through an imported function and
     /// escaped uncaught: engine exception id -> the original JS value, so the
     /// boundary rethrows it with identity preserved (Cut 10 wave 4).
+    #[cfg(feature = "wasm")]
     pub wasm_js_exceptions: std::collections::HashMap<usize, Value>,
     /// The JS value behind each wasm *externref* host payload (the JS-API
     /// represents an externref as an arbitrary JS value — including null and
     /// undefined, which round-trip distinctly): host token -> the JS value.
     /// The token is an opaque `ExternInner::Host` payload to the engine.
+    #[cfg(feature = "wasm")]
     pub wasm_extern_values: std::collections::HashMap<u32, Value>,
     /// The next externref host token (monotonic within the agent).
+    #[cfg(feature = "wasm")]
     pub wasm_extern_seq: u32,
     /// [[WeakRefTarget]] of WeakRef instances, keyed by object identity
     /// (spec 26.1.1: the target is held weakly — `deref` returns it while it
@@ -1076,26 +1097,47 @@ impl Agent {
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
             error_stack: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_modules: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_store: std::cell::RefCell::new(wasm::Store::new()),
+            #[cfg(feature = "wasm")]
             wasm_exports: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_instance_exports: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_func_objects: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_memories: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_memory_objects: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_memory_buffers: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_tables: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_table_objects: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_globals: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_global_objects: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_host_functions: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_host_seq: 0,
+            #[cfg(feature = "wasm")]
             wasm_tags: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_tag_objects: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_js_tag_cell: None,
+            #[cfg(feature = "wasm")]
             wasm_exceptions: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_js_exceptions: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_extern_values: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
             wasm_extern_seq: 0,
             weak_ref_targets: std::cell::RefCell::new(std::collections::HashMap::new()),
             kept_during_job: std::cell::RefCell::new(Vec::new()),
@@ -1493,39 +1535,42 @@ impl Agent {
         self.disposable_async_drivers.trace(visit);
         self.disposable_async_caps.trace(visit);
         self.async_body_disposal.trace(visit);
-        // The wasm JS-API wrapper tables (Cut 10): their values are heap
-        // edges and must survive a collection (an untraced `Value` here is
-        // freed and its object id reused, so a later lookup returns the wrong
-        // object — e.g. `Instance.exports` yielding a Promise).
-        for value in self.wasm_instance_exports.values() {
-            value.trace(visit);
-        }
-        for value in self.wasm_func_objects.values() {
-            value.trace(visit);
-        }
-        for value in self.wasm_memory_objects.values() {
-            value.trace(visit);
-        }
-        for value in self.wasm_memory_buffers.values() {
-            value.trace(visit);
-        }
-        for value in self.wasm_table_objects.values() {
-            value.trace(visit);
-        }
-        for value in self.wasm_global_objects.values() {
-            value.trace(visit);
-        }
-        for (_, (value, _)) in self.wasm_host_functions.iter() {
-            value.trace(visit);
-        }
-        for value in self.wasm_tag_objects.values() {
-            value.trace(visit);
-        }
-        for value in self.wasm_js_exceptions.values() {
-            value.trace(visit);
-        }
-        for value in self.wasm_extern_values.values() {
-            value.trace(visit);
+        #[cfg(feature = "wasm")]
+        {
+            // The wasm JS-API wrapper tables (Cut 10): their values are heap
+            // edges and must survive a collection (an untraced `Value` here is
+            // freed and its object id reused, so a later lookup returns the wrong
+            // object — e.g. `Instance.exports` yielding a Promise).
+            for value in self.wasm_instance_exports.values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_func_objects.values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_memory_objects.values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_memory_buffers.values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_table_objects.values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_global_objects.values() {
+                value.trace(visit);
+            }
+            for (_, (value, _)) in self.wasm_host_functions.iter() {
+                value.trace(visit);
+            }
+            for value in self.wasm_tag_objects.values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_js_exceptions.values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_extern_values.values() {
+                value.trace(visit);
+            }
         }
         // `host_modules` is keyed by JsString: keys are heap edges too, so
         // trace the whole cell manually (the generic HashMap trace visits

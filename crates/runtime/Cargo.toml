@@ -8,7 +8,7 @@ license.workspace = true
 crux = { path = "../crux" }
 lexer = { path = "../lexer" }
 parser = { path = "../parser" }
-wasm = { path = "../wasm" }
+wasm = { path = "../wasm", optional = true }
 # Trimmed raylib build. Keep `SUPPORT_WINMM_HIGHRES_TIMER`: without it,
 # raylib's Windows frame limiter uses the ~15.6ms Sleep granularity and
 # `SetTargetFPS(60)` paces at ~30ms/frame instead of 16.6.
@@ -33,6 +33,11 @@ libc = "0.2"
 raylib-sys = { version = "6.0.0", default-features = false, features = ["GLFW_BUILD_WAYLAND"], optional = true }
 
 [features]
+# The WebAssembly JS API (`WebAssembly` global): on by default. The engine
+# is a full dependency and per-realm install, so a build that does not want
+# it drops the feature (and the `wasm` crate) with `--no-default-features`.
+default = ["wasm"]
+wasm = ["dep:wasm"]
 # Experimental multi-agent mode (PLAN Phase 17): workers run as OS threads
 # with their own realms and job queues, sharing SharedArrayBuffer blocks
 # with the main agent; Atomics.wait blocks and notify wakes via a global

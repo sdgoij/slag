@@ -13,5 +13,9 @@ region = "4"
 target-lexicon = "0.13"
 
 crux = { path = "../crux" }
-runtime = { path = "../runtime" }
+# No default features: the compiler backend only needs the core engine's ir
+# and jit hooks, and keeping runtime defaults off lets a host build drop the
+# WebAssembly JS API (the default-on `runtime/wasm`) without this crate
+# silently re-enabling it through feature unification.
+runtime = { path = "../runtime", default-features = false }
 syntax = { path = "../syntax" }

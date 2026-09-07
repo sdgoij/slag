@@ -16,15 +16,21 @@ jit = { path = "../jit", optional = true }
 jsc = { path = "../jsc", optional = true }
 lexer = { path = "../lexer" }
 parser = { path = "../parser" }
-runtime = { path = "../runtime", features = ["fs"] }
+# Defaults off so the `wasm` feature below is the single source of truth for
+# the WebAssembly JS API (runtime defaults would otherwise force it back on);
+# the CLI always wants `fs`.
+runtime = { path = "../runtime", default-features = false, features = ["fs"] }
 syntax = { path = "../syntax" }
 
 [features]
 # The Cranelift JIT: compiled by default (`--jitless` at runtime turns it off
 # for a run; without this feature the flag does not exist). Build with
 # `--no-default-features` for an interpreter-only binary.
-default = ["jit"]
+default = ["jit", "wasm"]
 jit = ["dep:jit"]
+# The WebAssembly JS API (`WebAssembly` global): on by default; drop it with
+# `--no-default-features` (keep the JIT with `--features jit`).
+wasm = ["runtime/wasm"]
 # The drop-in JavaScriptCore C API (`crates/jsc`): not part of the default
 # workspace build; this feature builds it alongside the CLI so a release can
 # ship `slag` plus the JSC-compatible library.

@@ -190,13 +190,15 @@ fn report(error: impl std::fmt::Display) -> u8 {
 }
 
 /// The surfaces this binary was compiled with, shown in `--help` so a user
-/// can see what is active. The WebAssembly JS API ships unconditionally (the
-/// runtime depends on `crates/wasm` and installs the global in every realm);
-/// the cargo-optional surfaces follow it. `cfg!` is a compile-time constant,
-/// so the list reflects this build exactly.
+/// can see what is active. The WebAssembly JS API ships behind the default-on
+/// `wasm` cargo feature (the runtime gates the whole engine behind the same
+/// feature), so a `--no-default-features` build drops it here instead of at
+/// runtime. `cfg!` is a compile-time constant, so the list reflects this
+/// build exactly.
 fn compiled_features() -> String {
-    let mut enabled = vec!["wasm"];
+    let mut enabled = Vec::new();
     for (name, on) in [
+        ("wasm", cfg!(feature = "wasm")),
         ("jit", cfg!(feature = "jit")),
         ("jsc", cfg!(feature = "jsc")),
         ("raylib", cfg!(feature = "raylib")),
@@ -205,6 +207,9 @@ fn compiled_features() -> String {
         if on {
             enabled.push(name);
         }
+    }
+    if enabled.is_empty() {
+        enabled.push("(none)");
     }
     enabled.join(", ")
 }

@@ -33,5 +33,6 @@ pub mod string;
 pub mod symbol;
 pub mod temporal;
 pub mod typed_array;
+#[cfg(feature = "wasm")]
 pub mod wasm;
 pub mod weakref;

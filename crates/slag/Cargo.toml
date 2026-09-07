@@ -6,11 +6,17 @@ license.workspace = true
 
 [dependencies]
 crux = { path = "../crux" }
-runtime = { path = "../runtime" }
+# Defaults off so the `wasm` feature below is the single source of truth for
+# the WebAssembly JS API; the runtime's other optional surfaces come through
+# the pass-through features.
+runtime = { path = "../runtime", default-features = false }
 jit = { path = "../jit", optional = true }
 
 [features]
-default = []
+# The WebAssembly JS API: on by default (drop it with `--no-default-features`
+# for a minimal embed build).
+default = ["wasm"]
+wasm = ["runtime/wasm"]
 # The Cranelift JIT hook (`install_jit`); off by default so embedders who do
 # not need it avoid the Cranelift dependency tree.
 jit = ["dep:jit"]
