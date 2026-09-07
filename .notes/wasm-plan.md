@@ -2327,6 +2327,27 @@ and interleaves two vectors with a shuffle — each asserted bit-for-bit
 against the interpreter over shared memory. `wasmtest equiv` is green
 over the whole core corpus: 254 suites, 0 diverged. 58 compile tests,
 94 total with the feature, clippy clean in both configurations.
-Remaining Cut 11 gaps are by design: v128-typed *call* arguments,
-v128 globals/table elements/GC storage, and the resumable-host-call
-boundary keep those bodies interpreted.
+Remaining Cut 11 gaps are by design: v128 globals/table elements/GC
+storage and the resumable-host-call boundary keep those bodies
+interpreted.
+
+v128-typed calls landed, removing the last SIMD coverage gap: a
+compiled body can now call functions whose signatures carry v128. The
+call scratch is word-indexed everywhere a signature is involved —
+`lower_call` spills each param at its cumulative word offset (a v128
+occupies two u64 words, so numeric params after one shift accordingly)
+and reads results back at their word offsets (an `I128` load for a
+v128 result); the call helper's interpreted-callee path decodes v128
+arguments from two words and encodes v128 results back the same way;
+and the compiled-callee native re-entry needs no change (the callee's
+entry already loads/stores params/results at the shared signature's
+word offsets, and `call.args_out` is the caller's scratch on both
+sides). `callable_type` now sizes its scratch guard in words, so a
+v128-heavy signature cannot silently overflow the buffer. Unit coverage
+calls a numeric identity leaf, an `i32x4.neg` leaf, a neg leaf from a
+compiled caller, an add leaf with a const argument, and a negate-then-
+extract chain — the caller/callee pairs exercise the native re-entry
+path in the compiled store and the interpreted path in the oracle
+store, agreeing bit-for-bit. `wasmtest equiv` is green over the whole
+core corpus: 254 suites, 0 diverged. 59 compile tests, 95 total with
+the feature, clippy clean in both configurations.

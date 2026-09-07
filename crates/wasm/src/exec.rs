@@ -660,18 +660,31 @@ pub unsafe extern "C" fn wasm_call_helper(
         store.native_depth -= 1;
         return code;
     }
-    // Decode the argument slots (numeric values, or function tokens for
-    // function-reference parameters).
+    // Decode the argument slots (numeric values, function tokens for
+    // function-reference parameters, or a v128 as two words) in parameter
+    // order.
     let mut args = Vec::with_capacity(ty.params.len());
-    for (i, param) in ty.params.iter().enumerate() {
-        let slot = unsafe { *scratch.add(i) };
-        match value_from_call_slot(*param, slot) {
-            Some(value) => args.push(value),
-            None => {
-                store.set_pending_error(ExecFail::Unsupported(
-                    "unsupported value across a compiled call",
-                ));
-                return crate::compile::TRAP_PENDING_ERROR;
+    let mut word = 0usize;
+    for param in &ty.params {
+        match param {
+            ValType::V128 => {
+                let lo = unsafe { *scratch.add(word) };
+                let hi = unsafe { *scratch.add(word + 1) };
+                args.push(Value::V128(u128::from(lo) | (u128::from(hi) << 64)));
+                word += 2;
+            }
+            _ => {
+                let slot = unsafe { *scratch.add(word) };
+                word += 1;
+                match value_from_call_slot(*param, slot) {
+                    Some(value) => args.push(value),
+                    None => {
+                        store.set_pending_error(ExecFail::Unsupported(
+                            "unsupported value across a compiled call",
+                        ));
+                        return crate::compile::TRAP_PENDING_ERROR;
+                    }
+                }
             }
         }
     }
@@ -688,14 +701,27 @@ pub unsafe extern "C" fn wasm_call_helper(
     refresh_descriptors(store, instance, mems);
     match outcome {
         Ok(results) => {
-            for (i, result) in results.iter().enumerate() {
-                let Some(slot) = value_to_call_slot(*result) else {
-                    store.set_pending_error(ExecFail::Unsupported(
-                        "unsupported result across a compiled call",
-                    ));
-                    return crate::compile::TRAP_PENDING_ERROR;
-                };
-                unsafe { *scratch.add(i) = slot };
+            let mut word = 0usize;
+            for result in results.iter() {
+                match result {
+                    Value::V128(bits) => {
+                        unsafe {
+                            *scratch.add(word) = *bits as u64;
+                            *scratch.add(word + 1) = (*bits >> 64) as u64;
+                        }
+                        word += 2;
+                    }
+                    _ => {
+                        let Some(slot) = value_to_call_slot(*result) else {
+                            store.set_pending_error(ExecFail::Unsupported(
+                                "unsupported result across a compiled call",
+                            ));
+                            return crate::compile::TRAP_PENDING_ERROR;
+                        };
+                        unsafe { *scratch.add(word) = slot };
+                        word += 1;
+                    }
+                }
             }
             crate::compile::TRAP_NONE
         }

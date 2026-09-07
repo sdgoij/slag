@@ -44,7 +44,8 @@
 //!   `ref.func`/`ref.null func`/`ref.is_null`, `table.get`/`table.set` over
 //!   32-bit funcref tables, and `call_ref`/`return_call_ref` lower too;
 //! - direct `call`/`return_call` and `call_indirect`/`return_call_indirect`
-//!   (32-bit-addressed tables) over numeric or function-reference signatures:
+//!   (32-bit-addressed tables) over carried signatures (numeric, function-
+//!   reference, or v128 — a v128 rides two u64 words at its slot offset):
 //!   the call site spills its params into a caller-owned scratch region and
 //!   calls a store-side helper (entry params 10-11) that runs the callee
 //!   through the interpreter, so a compiled body can call anything —
@@ -873,13 +874,13 @@ fn table_carried_ref(module: &Module, index: u32) -> bool {
     matches!(element, Some(RefType { heap, .. }) if heap_is_carried(module, &heap))
 }
 
-/// Whether a callee type fits the compiled-call subset: numeric or
-/// function-reference parameters and results, each few enough to ride the
-/// caller-owned scratch buffer.
+/// Whether a callee type fits the compiled-call subset: carried parameters
+/// and results (numeric, function-reference, or v128 — a v128 rides two u64
+/// words), each few enough to ride the caller-owned scratch buffer.
 fn callable_type(module: &Module, ty: Option<FuncType>) -> bool {
     let Some(ty) = ty else { return false };
-    ty.params.len() <= SCRATCH_SLOTS
-        && ty.results.len() <= SCRATCH_SLOTS
+    ty.params.iter().map(|t| slot_words(*t)).sum::<usize>() <= SCRATCH_SLOTS
+        && ty.results.iter().map(|t| slot_words(*t)).sum::<usize>() <= SCRATCH_SLOTS
         && ty
             .params
             .iter()
@@ -2490,15 +2491,29 @@ impl<'a> Lowerer<'a> {
         ty: &FuncType,
         tail: bool,
     ) -> Result<(), String> {
+        // The scratch layout is word-indexed: a v128 param/result occupies two
+        // u64 words at its slot offset (the helper, the native callee, and
+        // `value_from_slot`/`slot_from` all agree on these offsets).
+        let mut param_word = Vec::with_capacity(ty.params.len());
+        {
+            let mut words = 0usize;
+            for param in &ty.params {
+                param_word.push(words);
+                words += slot_words(*param);
+            }
+        }
         // Spill the params (last on the operand stack) into scratch slots in
         // parameter order.
         for i in (0..ty.params.len()).rev() {
             let value = self.pop().ok_or("operand stack underflow")?;
-            let wide = self.slot_from(ty.params[i], value)?;
-            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+            let word = param_word[i];
+            match ty.params[i] {
+                ValType::V128 => self.spill_v128(word, value),
+                _ => {
+                    let wide = self.slot_from(ty.params[i], value)?;
+                    self.spill_u64(word, wide);
+                }
+            }
         }
         let mode_v = self.iconst(types::I64, mode);
         let z_v = self.iconst(types::I64, z);
@@ -2515,14 +2530,27 @@ impl<'a> Lowerer<'a> {
             self.mems,
         ];
         self.runtime_call(&args)?;
-        for (i, ty) in ty.results.iter().enumerate() {
-            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
-            let wide =
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), address, Offset32::new(0));
-            let value = self.value_from_slot(*ty, wide)?;
-            self.stack.push(value);
+        let mut result_word = 0usize;
+        for ty in ty.results.iter() {
+            let word = result_word;
+            result_word += slot_words(*ty);
+            match ty {
+                ValType::V128 => {
+                    let value = self.load_v128(word);
+                    self.stack.push(value);
+                }
+                _ => {
+                    let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * word as i64);
+                    let wide = self.builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        address,
+                        Offset32::new(0),
+                    );
+                    let value = self.value_from_slot(*ty, wide)?;
+                    self.stack.push(value);
+                }
+            }
         }
         if tail {
             self.emit_return()?;
@@ -9056,5 +9084,86 @@ mod tests {
             shuffled |= u128::from(byte(source, i as usize)) << (8 * k);
         }
         assert_eq!(outcomes[9], Ok(vec![Value::V128(shuffled)]));
+    }
+
+    #[test]
+    fn v128_calls_match_the_interpreter() {
+        // A compiled body can now call v128-typed functions: args/results
+        // cross the call scratch as word-indexed slots (two words per v128),
+        // through the helper's interpreted-callee path and the compiled
+        // callee's native re-entry alike.
+        let v128 = ValType::V128;
+        let module = Module {
+            types: vec![
+                // 0: (i32) -> i32.
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                // 1: (v128) -> v128.
+                SubType::func(vec![v128], vec![v128]),
+                // 2: (v128) -> i32.
+                SubType::func(vec![v128], vec![ValType::I32]),
+                // 3: (v128, v128) -> v128.
+                SubType::func(vec![v128, v128], vec![v128]),
+            ],
+            functions: vec![0, 1, 1, 3, 1, 2, 0],
+            bodies: vec![
+                // 0: i32 identity leaf.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0)],
+                },
+                // 1: i32x4.neg (0xa1) leaf.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Vec(0xa1)],
+                },
+                // 2: call the neg leaf (v128 -> v128).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Call(1)],
+                },
+                // 3: i32x4.add (0xae) leaf.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0xae)],
+                },
+                // 4: add a const to the param via the add leaf.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::V128Const(0x0001_0002_0003_0004_0005_0006_0007_0008),
+                        Instr::Call(3),
+                    ],
+                },
+                // 5: negate the param, then extract lane 0.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::Call(1),
+                        Instr::VecLane { op: 0x1b, lane: 0 },
+                    ],
+                },
+                // 6: call the i32 identity leaf.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Call(0)],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "v128 call module did not compile"
+        );
+        let a = 0x0001_0002_0003_0004_0005_0006_0007_0008u128;
+        let b = 0x0100_0200_0300_0400_0500_0600_0700_0800u128;
+        assert_equiv(&module, 0, &[vec![Value::I32(7)]]);
+        assert_equiv(&module, 1, &[vec![Value::V128(a)]]);
+        assert_equiv(&module, 2, &[vec![Value::V128(a)]]);
+        assert_equiv(&module, 3, &[vec![Value::V128(a), Value::V128(b)]]);
+        assert_equiv(&module, 4, &[vec![Value::V128(b)]]);
+        assert_equiv(&module, 5, &[vec![Value::V128(a)]]);
+        assert_equiv(&module, 6, &[vec![Value::I32(-5)]]);
     }
 }
