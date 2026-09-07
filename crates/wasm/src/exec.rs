@@ -462,7 +462,8 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// table `x` slot `y`; `5`-`8` = the bulk-memory ops (see [`bulk_op`]);
 /// `9`-`14` = the table bulk ops (see [`table_bulk_op`]); `15` = a `throw`
 /// of tag index-space entry `x` whose payload rides `scratch[0..nargs)`,
-/// parked as an in-flight exception (see [`throw_op`]).
+/// parked as an in-flight exception (see [`throw_op`]); `16` = a `throw_ref`
+/// re-raising the exception whose pool id is `x` (see [`rethrow_op`]).
 ///
 /// # Safety
 ///
@@ -485,11 +486,15 @@ pub unsafe extern "C" fn wasm_call_helper(
 ) -> i32 {
     let code_of = crate::compile::code_of_trap;
     let store = unsafe { &mut *store };
-    // A compiled `throw` (mode 15) parks an in-flight exception as a pending
-    // error for the entry to drain (no compiled body can contain a `try_table`
-    // catch, so the exception always escapes the native path).
-    if mode == 15 {
-        return throw_op(store, instance, x, nargs, scratch);
+    // A compiled `throw` (mode 15) or `throw_ref` (mode 16) parks an
+    // in-flight exception as a pending error for the entry to drain (no
+    // compiled body can contain a `try_table` catch, so the exception always
+    // escapes the native path).
+    if mode == 15 || mode == 16 {
+        if mode == 15 {
+            return throw_op(store, instance, x, nargs, scratch);
+        }
+        return rethrow_op(store, x);
     }
     // Table reads/writes (modes 3/4), the bulk-memory ops (modes 5-8), and
     // the table bulk ops (modes 9-14) resolve cells/segments directly.
@@ -1172,6 +1177,16 @@ fn throw_op(store: &mut Store, instance: u64, x: u64, nargs: u64, scratch: *mut 
     }
     let exn = store.new_exception(cell, args);
     store.set_pending_error(ExecFail::Exception(exn));
+    crate::compile::TRAP_PENDING_ERROR
+}
+
+/// A compiled `throw_ref` (runtime helper mode 16): re-raise the exception
+/// whose store-pool id is `x`, exactly like the interpreter's `throw_ref` on a
+/// non-null `exnref` — the exception is already in the pool, so this only
+/// parks it as a pending error for the entry to drain.
+#[cfg(feature = "compile")]
+fn rethrow_op(store: &mut Store, x: u64) -> i32 {
+    store.set_pending_error(ExecFail::Exception(x as usize));
     crate::compile::TRAP_PENDING_ERROR
 }
 

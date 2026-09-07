@@ -2140,3 +2140,20 @@ boundary and back, and an i31ref table through init/grow/get/overlapping
 copy reading stored values back. `wasmtest equiv` is green over the
 whole core corpus: 254 suites, 0 diverged. 48 compile tests, 84 total
 with the feature, clippy clean in both configurations.
+
+Exception references complete the carried token model: `exnref` (bit 61
+with bits 60/62/63 clear) packs the exception's store-pool id, so
+`ref.null exn`/`ref.is_null` work over the token, an `exnref` parameter
+crosses the compiled boundary and back, and a compiled `throw_ref`
+(mode 16) re-raises a non-null token's exception — the id is masked out
+of the token and passed to a helper that parks `ExecFail::Exception`
+exactly like a fresh `throw`, while a null token traps
+`NullExceptionReference` inline. This is the last reference kind the
+interpreter's exnref values need to ride compiled code (and the
+prerequisite for delivering `catch_ref` payloads once `try_table`
+bodies compile). Unit coverage seeds real exception cells through a
+compiled `throw` on both stores, then rethrows one (pool id verbatim)
+and traps on a null, plus a `ref.null exn`/`ref.is_null` round-trip.
+`wasmtest equiv` is green over the whole core corpus: 254 suites, 0
+diverged. 49 compile tests, 85 total with the feature, clippy clean in
+both configurations.

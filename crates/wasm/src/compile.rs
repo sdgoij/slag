@@ -490,7 +490,7 @@ fn clif_type(ty: ValType) -> Option<Type> {
         ValType::Ref(reference)
             if matches!(
                 reference.heap,
-                HeapType::Func | HeapType::Extern | HeapType::I31
+                HeapType::Func | HeapType::Extern | HeapType::I31 | HeapType::Exn
             ) =>
         {
             Some(types::I64)
@@ -528,7 +528,7 @@ fn heap_is_func(module: &Module, heap: &HeapType) -> bool {
 /// a function reference, or the abstract `extern` heap (an externref — its
 /// payload packs into the token). Exn/GC-heap references stay interpreted.
 fn heap_is_carried(module: &Module, heap: &HeapType) -> bool {
-    heap_is_func(module, heap) || matches!(heap, HeapType::Extern | HeapType::I31)
+    heap_is_func(module, heap) || matches!(heap, HeapType::Extern | HeapType::I31 | HeapType::Exn)
 }
 
 /// The compiled carrier type of a value the lowering actually carries — a
@@ -898,7 +898,8 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         | Instr::RefEq
         | Instr::RefI31
         | Instr::I31GetS
-        | Instr::I31GetU => true,
+        | Instr::I31GetU
+        | Instr::ThrowRef => true,
         Instr::BrOnNull(_) | Instr::BrOnNonNull(_) => true,
         _ => false,
     })
@@ -2867,6 +2868,40 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// A `throw_ref`: pop an `exnref` token and re-raise its exception. A null
+    /// token traps `NullExceptionReference`; otherwise the exception's
+    /// store-pool id is passed to the throw helper (mode 16), which parks the
+    /// in-flight exception exactly like a fresh `throw`. The body is dead
+    /// afterwards.
+    fn do_throw_ref(&mut self) -> Result<(), String> {
+        let token = self.pop().ok_or("operand stack underflow")?;
+        let zero = self.iconst(types::I64, 0);
+        let is_null = self.builder.ins().icmp(IntCC::Equal, token, zero);
+        self.trap_if(is_null, TRAP_NULL_EXCEPTION_REFERENCE);
+        let id = self
+            .builder
+            .ins()
+            .band_imm_u(token, crate::values::REF_EXN_PAYLOAD_MASK as i64);
+        let mode = self.iconst(types::I64, 16);
+        let zero64 = self.iconst(types::I64, 0);
+        let nargs = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            id,
+            zero64,
+            zero64,
+            nargs,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.emit_trap(TRAP_UNREACHABLE);
+        self.dead = true;
+        Ok(())
+    }
+
     /// Pop a table instruction's address operand (i32 for a 32-bit table,
     /// zero-extended; i64 for a table64) as a u64 slot.
     fn pop_table_addr(&mut self, table: u32) -> Result<ClifValue, String> {
@@ -3028,6 +3063,7 @@ impl<'a> Lowerer<'a> {
             Instr::TableGet(table) => self.do_table_get(*table)?,
             Instr::TableSet(table) => self.do_table_set(*table)?,
             Instr::Throw(index) => self.do_throw(*index)?,
+            Instr::ThrowRef => self.do_throw_ref()?,
             Instr::TableSize(table) => self.do_table_size(*table)?,
             Instr::TableGrow(table) => self.do_table_grow(*table)?,
             Instr::TableFill(table) => self.do_table_fill(*table)?,
@@ -6693,5 +6729,90 @@ mod tests {
         assert_eq!(outcomes[7], Ok(vec![]));
         assert_eq!(outcomes[8], Ok(vec![Value::I32(10)]));
         assert_eq!(outcomes[9], Ok(vec![Value::I32(12)]));
+    }
+
+    #[test]
+    fn exnrefs_and_throw_ref_match_the_interpreter() {
+        use crate::types::RefType;
+        // Exception references complete the carried token model: ref.null
+        // exn/ref.is_null work over the token, and throw_ref re-raises an
+        // existing exception (pool id passed through verbatim; a null traps
+        // NullExceptionReference). The exceptions are seeded by the compiled
+        // `throw` on both stores so the re-raised pool id is real.
+        let exn_ref = ValType::Ref(RefType {
+            nullable: true,
+            heap: HeapType::Exn,
+        });
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![]),
+                SubType::func(vec![exn_ref], vec![]),
+                SubType::func(vec![], vec![ValType::I32]),
+            ],
+            tags: vec![0],
+            functions: vec![0, 1, 2],
+            bodies: vec![
+                // 0: throw tag 0 (seeds a real exception cell).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::Throw(0)],
+                },
+                // 1: throw_ref of an exnref parameter.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::ThrowRef],
+                },
+                // 2: ref.null exn then ref.is_null.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::RefNull(HeapType::Exn), Instr::RefIsNull],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "exnref module did not compile"
+        );
+        let mut compiled = Store::new();
+        let compiled_instance = compiled
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        let mut interpreter = Store::new();
+        interpreter.set_compile(false);
+        let interpreter_instance = interpreter
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        let agree = |a: &Result<Vec<Value>, ExecFail>, b: &Result<Vec<Value>, ExecFail>| {
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "paths diverged on an exception outcome"
+            );
+        };
+        let rethrow = |store: &mut Store, instance: usize, id: usize| {
+            store.invoke(instance, 1, &[Value::Ref(RefValue::Exn(id))])
+        };
+        // Seed exception cell 0 on both stores, then rethrow it.
+        let seed_compiled = compiled.invoke(compiled_instance, 0, &[]);
+        let seed_interpreter = interpreter.invoke(interpreter_instance, 0, &[]);
+        agree(&seed_compiled, &seed_interpreter);
+        agree(
+            &rethrow(&mut compiled, compiled_instance, 0),
+            &rethrow(&mut interpreter, interpreter_instance, 0),
+        );
+        // A null exnref traps on both paths.
+        let null_case = |store: &mut Store, instance: usize| {
+            store.invoke(instance, 1, &[Value::Ref(RefValue::Null)])
+        };
+        agree(
+            &null_case(&mut compiled, compiled_instance),
+            &null_case(&mut interpreter, interpreter_instance),
+        );
+        // ref.null exn + ref.is_null over a fresh store is 1 on both paths.
+        agree(
+            &compiled.invoke(compiled_instance, 2, &[]),
+            &interpreter.invoke(interpreter_instance, 2, &[]),
+        );
     }
 }
