@@ -1002,6 +1002,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         }
         Instr::ArraySet(ty) => array_value_lowerable(module, *ty),
         Instr::ArrayLen => true,
+        Instr::AnyConvertExtern | Instr::ExternConvertAny => true,
         _ => false,
     })
 }
@@ -3298,6 +3299,51 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// An `extern.convert_any`: re-tag an internal `any` token as its `extern`
+    /// box (mode 40; a null stays null).
+    fn do_extern_convert_any(&mut self) -> Result<(), String> {
+        let token = self.pop().ok_or("operand stack underflow")?;
+        let mode = self.iconst(types::I64, 40);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            token,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(ValType::Ref(RefType::EXTERN))
+    }
+
+    /// An `any.convert_extern`: unwrap an `extern` token back to its internal
+    /// `any` value (mode 41; a null stays null).
+    fn do_any_convert_extern(&mut self) -> Result<(), String> {
+        let token = self.pop().ok_or("operand stack underflow")?;
+        let mode = self.iconst(types::I64, 41);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            token,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(ValType::Ref(RefType {
+            nullable: true,
+            heap: HeapType::Any,
+        }))
+    }
+
     /// Pop a table instruction's address operand (i32 for a 32-bit table,
     /// zero-extended; i64 for a table64) as a u64 slot.
     fn pop_table_addr(&mut self, table: u32) -> Result<ClifValue, String> {
@@ -3467,6 +3513,8 @@ impl<'a> Lowerer<'a> {
             Instr::ArrayGetU(ty) => self.do_array_get(*ty, 2)?,
             Instr::ArraySet(ty) => self.do_array_set(*ty)?,
             Instr::ArrayLen => self.do_array_len()?,
+            Instr::ExternConvertAny => self.do_extern_convert_any()?,
+            Instr::AnyConvertExtern => self.do_any_convert_extern()?,
             Instr::BrOnNull(label) => self.do_br_on_null(*label)?,
             Instr::BrOnNonNull(label) => self.do_br_on_non_null(*label)?,
             Instr::TableGet(table) => self.do_table_get(*table)?,
@@ -7445,5 +7493,169 @@ mod tests {
             outcomes[3],
             Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess))
         ));
+    }
+
+    #[test]
+    fn extern_any_conversions_match_the_interpreter() {
+        use crate::types::{CompositeType, FieldType, StorageType};
+        use crate::values::ExternInner;
+        // extern.convert_any / any.convert_extern re-tag carried tokens (i31,
+        // struct objects, null, and host values) between their internal `any`
+        // form and their `extern` box.
+        let struct_type = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Struct(vec![FieldType {
+                ty: StorageType::I32,
+                mutable: false,
+            }]),
+        };
+        let any_ref = ValType::Ref(RefType {
+            nullable: true,
+            heap: HeapType::Any,
+        });
+        let module = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                struct_type,
+                SubType::func(vec![], vec![ValType::I32]),
+                SubType::func(vec![any_ref], vec![ValType::Ref(RefType::EXTERN)]),
+                SubType::func(vec![ValType::Ref(RefType::EXTERN)], vec![ValType::I32]),
+            ],
+            functions: vec![0, 2, 2, 3, 4],
+            bodies: vec![
+                // 0: box and unbox an i31, then read it back.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::RefI31,
+                        Instr::ExternConvertAny,
+                        Instr::AnyConvertExtern,
+                        Instr::I31GetU,
+                    ],
+                },
+                // 1: box and unbox a struct, then read its default field.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::StructNewDefault(1),
+                        Instr::ExternConvertAny,
+                        Instr::AnyConvertExtern,
+                        Instr::StructGet { ty: 1, field: 0 },
+                    ],
+                },
+                // 2: a null any boxes to a null extern; ref.is_null sees it.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::RefNull(HeapType::Any),
+                        Instr::ExternConvertAny,
+                        Instr::RefIsNull,
+                    ],
+                },
+                // 3: box an any parameter (including a host value).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::ExternConvertAny],
+                },
+                // 4: unbox an extern parameter and test it for null.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::AnyConvertExtern,
+                        Instr::RefIsNull,
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "extern/any conversion module did not compile"
+        );
+        let values = [0i32, 1, -1, 0x7fff_ffff, 0xaaaa_aaaa_u32 as i32];
+        let cases: Vec<Vec<Value>> = values.iter().map(|v| vec![Value::I32(*v)]).collect();
+        let mut store = Store::new();
+        let instance = store.instantiate(&module, &mut |_, _| None).unwrap();
+        let mut interpreter = Store::new();
+        interpreter.set_compile(false);
+        let interpreter_instance = interpreter.instantiate(&module, &mut |_, _| None).unwrap();
+        let agree = |store: &mut Store,
+                     instance: usize,
+                     interpreter: &mut Store,
+                     interpreter_instance: usize,
+                     index: usize,
+                     args: &[Value]| {
+            assert_eq!(
+                format!("{:?}", store.invoke(instance, index, args)),
+                format!(
+                    "{:?}",
+                    interpreter.invoke(interpreter_instance, index, args)
+                ),
+                "paths diverged for func {index} {args:?}"
+            );
+        };
+        for args in &cases {
+            agree(
+                &mut store,
+                instance,
+                &mut interpreter,
+                interpreter_instance,
+                0,
+                args,
+            );
+        }
+        agree(
+            &mut store,
+            instance,
+            &mut interpreter,
+            interpreter_instance,
+            1,
+            &[],
+        );
+        agree(
+            &mut store,
+            instance,
+            &mut interpreter,
+            interpreter_instance,
+            2,
+            &[],
+        );
+        // Host values round-trip through the box/unbox (an any host boxes to
+        // an extern-host; unwrapping a host external returns a non-null any).
+        agree(
+            &mut store,
+            instance,
+            &mut interpreter,
+            interpreter_instance,
+            3,
+            &[Value::Ref(RefValue::Host(7))],
+        );
+        agree(
+            &mut store,
+            instance,
+            &mut interpreter,
+            interpreter_instance,
+            3,
+            &[Value::Ref(RefValue::Null)],
+        );
+        agree(
+            &mut store,
+            instance,
+            &mut interpreter,
+            interpreter_instance,
+            4,
+            &[Value::Ref(RefValue::Extern(ExternInner::Host(7)))],
+        );
+        agree(
+            &mut store,
+            instance,
+            &mut interpreter,
+            interpreter_instance,
+            4,
+            &[Value::Ref(RefValue::Null)],
+        );
     }
 }

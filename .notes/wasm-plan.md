@@ -2182,3 +2182,18 @@ new/default/len/set/get with an out-of-bounds get trap, through both
 paths. `wasmtest equiv` is green over the whole core corpus: 254
 suites, 0 diverged. 51 compile tests, 87 total with the feature,
 clippy clean in both configurations.
+
+Internal host values ride the GC token region (a third kind under bit
+59, payload = the u32 host id, mirroring the extern `KIND_HOST`), which
+lets `extern.convert_any`/`any.convert_extern` lower for every carried
+`any` value: the conversion helpers (modes 40-41) box an internal
+i31/struct/array/host (or a null) into its `extern` token and unbox an
+`extern` back to the internal token, exactly like the interpreter's
+`wrap`/`unwrap_extern`. This closes the last gap the reference model
+had for `any`-typed values crossing compiled code — a host external
+unwraps to a host `any` that can be boxed again, be compared, or ride a
+param/local/result. Unit coverage drives i31 and struct box/unbox
+round-trips, a null box, and host-value box/unbox through both paths.
+`wasmtest equiv` is green over the whole core corpus: 254 suites, 0
+diverged. 52 compile tests, 88 total with the feature, clippy clean in
+both configurations.

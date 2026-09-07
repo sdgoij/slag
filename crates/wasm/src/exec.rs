@@ -463,7 +463,9 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// `9`-`14` = the table bulk ops (see [`table_bulk_op`]); `15` = a `throw`
 /// of tag index-space entry `x` whose payload rides `scratch[0..nargs)`,
 /// parked as an in-flight exception (see [`throw_op`]); `16` = a `throw_ref`
-/// re-raising the exception whose pool id is `x` (see [`rethrow_op`]).
+/// re-raising the exception whose pool id is `x` (see [`rethrow_op`]);
+/// `40`/`41` = `extern.convert_any`/`any.convert_extern` re-tagging the
+/// token `x` (see [`gc_convert_op`]).
 ///
 /// # Safety
 ///
@@ -500,6 +502,10 @@ pub unsafe extern "C" fn wasm_call_helper(
     // struct/array semantics against the store's object pool.
     if (30..=38).contains(&mode) {
         return gc_op(store, instance, mode, x, y, z, nargs, scratch);
+    }
+    // Compiled extern/any conversion (modes 40-41) re-tag a reference token.
+    if mode == 40 || mode == 41 {
+        return gc_convert_op(store, mode, x, scratch);
     }
     // Table reads/writes (modes 3/4), the bulk-memory ops (modes 5-8), and
     // the table bulk ops (modes 9-14) resolve cells/segments directly.
@@ -1519,6 +1525,55 @@ fn gc_object_error(
         Some(Value::Ref(RefValue::Null)) => code_of(null_trap),
         _ => gc_unsupported(store, "non-object GC operand"),
     }
+}
+
+/// A compiled `extern.convert_any` (mode 40) / `any.convert_extern` (mode
+/// 41): convert between an internal `any` value and its `extern` box by
+/// re-tagging the token, exactly like the interpreter's `wrap`/`unwrap_extern`
+/// (a null passes through unchanged; host values ride the `any` token region,
+/// so unboxing a host external works too). The result token lands in
+/// `scratch[0]`.
+#[cfg(feature = "compile")]
+fn gc_convert_op(store: &mut Store, mode: u64, x: u64, scratch: *mut u64) -> i32 {
+    let Some(value) = crate::values::token_to_ref(x) else {
+        return gc_unsupported(store, "unencodable convert operand");
+    };
+    let token = match (mode, value) {
+        (40, Value::Ref(reference)) => {
+            if reference == RefValue::Null {
+                Some(crate::values::REF_NULL_TOKEN)
+            } else {
+                match ExternInner::wrap(reference) {
+                    Some(inner) => crate::values::ref_to_token(Value::Ref(RefValue::Extern(inner))),
+                    None => {
+                        return gc_unsupported(store, "extern.convert_any of unboxable reference");
+                    }
+                }
+            }
+        }
+        (41, Value::Ref(reference)) => {
+            if reference == RefValue::Null {
+                Some(crate::values::REF_NULL_TOKEN)
+            } else {
+                let RefValue::Extern(inner) = reference else {
+                    return gc_unsupported(store, "any.convert_extern of non-extern");
+                };
+                let internal = inner.into_ref();
+                if matches!(internal, RefValue::Func(_) | RefValue::Exn(_)) {
+                    return gc_unsupported(store, "any.convert_extern of an unboxable external");
+                }
+                crate::values::ref_to_token(Value::Ref(internal))
+            }
+        }
+        _ => return gc_unsupported(store, "bad convert mode"),
+    };
+    match token {
+        Some(token) => unsafe {
+            *scratch = token;
+        },
+        None => return gc_unsupported(store, "unencodable convert result"),
+    }
+    crate::compile::TRAP_NONE
 }
 
 /// Park a non-trap error for the compiled entry to drain and return the

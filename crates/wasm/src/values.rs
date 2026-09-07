@@ -40,12 +40,15 @@ pub const REF_EXN_TAG: u64 = 1 << 61;
 pub const REF_EXN_PAYLOAD_MASK: u64 = (1 << 60) - 1;
 /// An internal struct/array object: bit 59 with the struct/array kind in bits
 /// 57-58 and the object's store-pool id in the low 57 bits (bits 60-63
-/// clear, so it cannot collide with the func/extern/i31/exn regions).
+/// clear, so it cannot collide with the func/extern/i31/exn regions). Host
+/// `any` values ride the same region under a third kind (payload = the u32
+/// host id).
 pub const REF_GC_TAG: u64 = 1 << 59;
 pub const REF_GC_KIND_SHIFT: u64 = 57;
 pub const REF_GC_PAYLOAD_MASK: u64 = (1 << 57) - 1;
 const GC_STRUCT: u64 = 0;
 const GC_ARRAY: u64 = 1;
+const GC_HOST: u64 = 2;
 
 /// The compiled token for an internal struct object's pool id.
 pub fn struct_ref_token(id: usize) -> Option<u64> {
@@ -102,6 +105,9 @@ pub fn ref_to_token(value: Value) -> Option<u64> {
         }
         Value::Ref(RefValue::Struct(id)) => struct_ref_token(id),
         Value::Ref(RefValue::Array(id)) => array_ref_token(id),
+        Value::Ref(RefValue::Host(id)) => {
+            Some(REF_GC_TAG | GC_HOST << REF_GC_KIND_SHIFT | u64::from(id))
+        }
         _ => None,
     }
 }
@@ -138,9 +144,10 @@ pub fn token_to_ref(token: u64) -> Option<Value> {
     }
     if token & REF_GC_TAG != 0 {
         let id = (token & REF_GC_PAYLOAD_MASK) as usize;
-        return Some(match (token >> REF_GC_KIND_SHIFT) & 1 {
+        return Some(match (token >> REF_GC_KIND_SHIFT) & 0b11 {
             GC_STRUCT => Value::Ref(RefValue::Struct(id)),
-            _ => Value::Ref(RefValue::Array(id)),
+            GC_ARRAY => Value::Ref(RefValue::Array(id)),
+            _ => Value::Ref(RefValue::Host(id as u32)),
         });
     }
     None
