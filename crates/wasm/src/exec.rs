@@ -393,8 +393,9 @@ pub unsafe extern "C" fn memory_grow_helper(
 }
 
 /// Decode one u64 call slot into an interpreter value of `ty` (the compiled
-/// entry ABI's argument marshaling, inverted). Returns `None` for a
-/// non-numeric type — the compiled-call subset is numeric only.
+/// entry ABI's argument marshaling, inverted). Numeric types decode directly;
+/// a function-reference type decodes its token. Returns `None` for an
+/// unsupported type or an unencodable token.
 #[cfg(feature = "compile")]
 fn value_from_call_slot(ty: ValType, slot: u64) -> Option<Value> {
     match ty {
@@ -402,12 +403,15 @@ fn value_from_call_slot(ty: ValType, slot: u64) -> Option<Value> {
         ValType::I64 => Some(Value::I64(slot as i64)),
         ValType::F32 => Some(Value::F32(slot as u32)),
         ValType::F64 => Some(Value::F64(slot)),
+        ValType::Ref(reference) if reference.heap == HeapType::Func => {
+            crate::values::token_to_ref(slot)
+        }
         _ => None,
     }
 }
 
-/// Encode an interpreter value into its u64 call slot (numeric types only;
-/// the compiled-call subset never passes references through the boundary).
+/// Encode an interpreter value into its u64 call slot (numeric types, plus
+/// null/function references as their tokens).
 #[cfg(feature = "compile")]
 fn value_to_call_slot(value: Value) -> Option<u64> {
     match value {
@@ -415,6 +419,7 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
         Value::I64(bits) => Some(bits as u64),
         Value::F32(bits) => Some(u64::from(bits)),
         Value::F64(bits) => Some(bits),
+        Value::Ref(_) => crate::values::ref_to_token(value),
         _ => None,
     }
 }
@@ -432,9 +437,12 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// code (0 = ok); a non-trap error is parked on the store and the
 /// [`crate::compile::TRAP_PENDING_ERROR`] sentinel returned.
 ///
-/// `mode` selects the target: `0` = direct call to function index-space
+/// `mode` selects the operation: `0` = direct call to function index-space
 /// entry `x` (`y`/`z` unused); `1` = `call_indirect` through table `x` at
-/// element `y`, type-checked against `z`.
+/// element `y`, type-checked against `z`; `2` = `call_ref` on the function
+/// token `x`, type-checked against `z`; `3` = `table.get` at table `x` slot
+/// `y`, token written to `scratch[0]`; `4` = `table.set` of token `z` at
+/// table `x` slot `y`.
 ///
 /// # Safety
 ///
@@ -457,6 +465,10 @@ pub unsafe extern "C" fn wasm_call_helper(
 ) -> i32 {
     let code_of = crate::compile::code_of_trap;
     let store = unsafe { &mut *store };
+    // Table reads/writes (modes 3/4) resolve the cell and element directly.
+    if mode == 3 || mode == 4 {
+        return table_op(store, instance, mode, x, y, z, scratch);
+    }
     // Resolve the target and the declared type with immutable reads only,
     // dropping every borrow before the store is mutated below.
     let caller = match store.instances.get(instance as usize) {
@@ -471,9 +483,9 @@ pub unsafe extern "C" fn wasm_call_helper(
             let Some(target) = caller.funcs.get(x as usize).copied() else {
                 return code_of(Trap::UnknownFunction);
             };
-            (ty, Some(target))
+            (ty, target)
         }
-        _ => {
+        1 => {
             let Some(ty) = caller.module.func_at_cloned(z as u32) else {
                 return code_of(Trap::UnknownFunction);
             };
@@ -500,19 +512,42 @@ pub unsafe extern "C" fn wasm_call_helper(
             if !store.func_type_matches(&caller.module, z as u32, target) {
                 return code_of(Trap::IndirectCallTypeMismatch);
             }
-            (ty, Some(target))
+            (ty, target)
         }
-    };
-    let Some(target) = declared.1 else {
-        return crate::compile::TRAP_PENDING_ERROR;
+        _ => {
+            // `call_ref`: `x` is a function token (mode 2; anything else is
+            // an internal error, not a wasm trap). A null reference is the
+            // null-function-reference trap.
+            let Some(value) = crate::values::token_to_ref(x) else {
+                return crate::compile::TRAP_PENDING_ERROR;
+            };
+            let Value::Ref(RefValue::Func(address)) = value else {
+                return code_of(Trap::NullFunctionReference);
+            };
+            let Some(ty) = caller.module.func_at_cloned(z as u32) else {
+                return code_of(Trap::UnknownFunction);
+            };
+            let Some(target) = store
+                .instances
+                .get(address.instance)
+                .and_then(|i| i.funcs.get(address.index))
+                .copied()
+            else {
+                return code_of(Trap::UnknownFunction);
+            };
+            if !store.func_type_matches(&caller.module, z as u32, target) {
+                return code_of(Trap::IndirectCallTypeMismatch);
+            }
+            (ty, target)
+        }
     };
     let ty = declared.0;
     if ty.params.len() as u64 != nargs {
         store.set_pending_error(ExecFail::Unsupported("compiled call arity"));
         return crate::compile::TRAP_PENDING_ERROR;
     }
-    // Decode the argument slots (the compiled subset is numeric-only, so a
-    // reference parameter here is an internal error, not a wasm trap).
+    // Decode the argument slots (numeric values, or function tokens for
+    // function-reference parameters).
     let mut args = Vec::with_capacity(ty.params.len());
     for (i, param) in ty.params.iter().enumerate() {
         let slot = unsafe { *scratch.add(i) };
@@ -520,7 +555,7 @@ pub unsafe extern "C" fn wasm_call_helper(
             Some(value) => args.push(value),
             None => {
                 store.set_pending_error(ExecFail::Unsupported(
-                    "non-numeric value across a compiled call",
+                    "unsupported value across a compiled call",
                 ));
                 return crate::compile::TRAP_PENDING_ERROR;
             }
@@ -530,7 +565,7 @@ pub unsafe extern "C" fn wasm_call_helper(
     // subtree): identical semantics, bounded native stack.
     let previous = store.compile_off;
     store.compile_off = true;
-    let outcome = store.run_target(target, &args);
+    let outcome = store.run_target(declared.1, &args);
     store.compile_off = previous;
     // The callee may have grown a memory (its `Vec` reallocated): refresh
     // the caller-owned descriptors so later compiled accesses see the new
@@ -542,7 +577,7 @@ pub unsafe extern "C" fn wasm_call_helper(
             for (i, result) in results.iter().enumerate() {
                 let Some(slot) = value_to_call_slot(*result) else {
                     store.set_pending_error(ExecFail::Unsupported(
-                        "non-numeric result across a compiled call",
+                        "unsupported result across a compiled call",
                     ));
                     return crate::compile::TRAP_PENDING_ERROR;
                 };
@@ -555,6 +590,61 @@ pub unsafe extern "C" fn wasm_call_helper(
             store.set_pending_error(error);
             crate::compile::TRAP_PENDING_ERROR
         }
+    }
+}
+
+/// A compiled `table.get` (mode 3) or `table.set` (mode 4): resolve the
+/// instance's table `x`, bounds-check slot `y`, and read/write the element.
+/// A `table.get` writes the element's token to `scratch[0]`.
+#[cfg(feature = "compile")]
+fn table_op(
+    store: &mut Store,
+    instance: u64,
+    mode: u64,
+    x: u64,
+    y: u64,
+    z: u64,
+    scratch: *mut u64,
+) -> i32 {
+    let code_of = crate::compile::code_of_trap;
+    let Some(cell) = store
+        .instances
+        .get(instance as usize)
+        .and_then(|inst| inst.tables.get(x as usize))
+        .copied()
+    else {
+        return code_of(Trap::OutOfBoundsTableAccess);
+    };
+    let Some(len) = store.tables.get(cell).map(|table| table.elements.len()) else {
+        return code_of(Trap::OutOfBoundsTableAccess);
+    };
+    if y as usize >= len {
+        return code_of(Trap::OutOfBoundsTableAccess);
+    }
+    if mode == 3 {
+        let entry = store.tables[cell].elements[y as usize];
+        let Some(token) = crate::values::ref_to_token(Value::Ref(entry)) else {
+            store.set_pending_error(ExecFail::Unsupported(
+                "unsupported table element across a compiled table.get",
+            ));
+            return crate::compile::TRAP_PENDING_ERROR;
+        };
+        unsafe {
+            *scratch = token;
+        }
+        crate::compile::TRAP_NONE
+    } else {
+        let Some(value) = crate::values::token_to_ref(z) else {
+            store.set_pending_error(ExecFail::Unsupported(
+                "unsupported table element across a compiled table.set",
+            ));
+            return crate::compile::TRAP_PENDING_ERROR;
+        };
+        let Value::Ref(reference) = value else {
+            return crate::compile::TRAP_PENDING_ERROR;
+        };
+        store.tables[cell].elements[y as usize] = reference;
+        crate::compile::TRAP_NONE
     }
 }
 

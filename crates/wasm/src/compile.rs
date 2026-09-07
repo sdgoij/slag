@@ -31,16 +31,20 @@
 //! - `global.get`/`global.set` of numeric module-defined globals, through a
 //!   caller-owned buffer (one u64 slot per used global): the compiled body
 //!   reads and mutates slots in place, so its writes reach the store even
-//!   when it traps. Imported globals (whose cells can alias), tables, refs,
-//!   SIMD, and GC are not lowered yet;
+//!   when it traps. Imported globals (whose cells can alias), extern/GC
+//!   references, SIMD, and GC objects are not lowered yet;
+//! - (nullable or not) function references ride the compiled stack as opaque
+//!   u64 tokens (0 = null; a function reference packs its address), so
+//!   `ref.func`/`ref.null func`/`ref.is_null`, `table.get`/`table.set` over
+//!   32-bit funcref tables, and `call_ref`/`return_call_ref` lower too;
 //! - direct `call`/`return_call` and `call_indirect`/`return_call_indirect`
-//!   (32-bit-addressed tables) over numeric signatures: the call site spills
-//!   its params into a caller-owned scratch region and calls a store-side
-//!   helper (entry params 10-11) that runs the callee through the
-//!   interpreter, so a compiled body can call anything — interpreted or
-//!   compiled, owned or host — without unbounded native recursion. A
-//!   call-bearing body that also uses globals stays interpreted (the `gvals`
-//!   snapshot would go stale across the callee).
+//!   (32-bit-addressed tables) over numeric or function-reference signatures:
+//!   the call site spills its params into a caller-owned scratch region and
+//!   calls a store-side helper (entry params 10-11) that runs the callee
+//!   through the interpreter, so a compiled body can call anything —
+//!   interpreted or compiled, owned or host — without unbounded native
+//!   recursion. A call-bearing body that also uses globals stays interpreted
+//!   (the `gvals` snapshot would go stale across the callee).
 //!
 //! ABI: a compiled entry is
 //! `unsafe extern "C" fn(args, nargs, mems, ncount, gvals, out, nout,
@@ -69,8 +73,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crate::exec::ExecFail;
 use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
 use crate::module::{FuncBody, ImportDesc, Module};
-use crate::types::{BlockType, FuncType, ValType};
-use crate::values::{QNAN32, QNAN64, Trap, Value};
+use crate::types::{BlockType, FuncType, HeapType, RefType, ValType};
+use crate::values::{QNAN32, QNAN64, Trap, Value, ref_to_token, token_to_ref};
 
 /// Trap code returned by a compiled entry; 0 means success.
 pub const TRAP_NONE: i32 = 0;
@@ -281,6 +285,14 @@ pub fn run_compiled(
             (ValType::I64, Value::I64(bits)) => *bits as u64,
             (ValType::F32, Value::F32(bits)) => u64::from(*bits),
             (ValType::F64, Value::F64(bits)) => *bits,
+            (ValType::Ref(_), Value::Ref(_)) => {
+                let Some(token) = ref_to_token(*value) else {
+                    return Err(ExecFail::Unsupported(
+                        "function-reference argument across the compiled boundary",
+                    ));
+                };
+                token
+            }
             _ => return Err(ExecFail::Unsupported("compiled function argument type")),
         };
         input.push(bits);
@@ -307,6 +319,14 @@ pub fn run_compiled(
             ValType::I64 => Value::I64(bits as i64),
             ValType::F32 => Value::F32(bits as u32),
             ValType::F64 => Value::F64(bits),
+            ValType::Ref(_) => {
+                let Some(value) = token_to_ref(bits) else {
+                    return Err(ExecFail::Unsupported(
+                        "function-reference result across the compiled boundary",
+                    ));
+                };
+                value
+            }
             _ => return Err(ExecFail::Unsupported("compiled function result type")),
         };
         results.push(value);
@@ -418,6 +438,23 @@ fn entry_signature(conv: CallConv) -> Signature {
 }
 
 fn clif_type(ty: ValType) -> Option<Type> {
+    match ty {
+        ValType::I32 => Some(types::I32),
+        ValType::I64 => Some(types::I64),
+        ValType::F32 => Some(types::F32),
+        ValType::F64 => Some(types::F64),
+        // A (nullable or not) function reference rides the compiled stack as
+        // an opaque u64 token (see `values`); a null is token 0. Refs over
+        // other heap types (extern/exn/GC) stay interpreted.
+        ValType::Ref(reference) if reference.heap == HeapType::Func => Some(types::I64),
+        _ => None,
+    }
+}
+
+/// The numeric subset of [`clif_type`]: only the four scalar value types
+/// (used wherever the lowering actually computes on the value — globals, the
+/// call scratch — rather than just carrying it).
+fn num_type(ty: ValType) -> Option<Type> {
     match ty {
         ValType::I32 => Some(types::I32),
         ValType::I64 => Some(types::I64),
@@ -547,6 +584,38 @@ fn table_is64(module: &Module, index: u32) -> Option<bool> {
     }
 }
 
+/// Whether a table index's element type is a (nullable or not) function
+/// reference — the only reference kind the compiled value model carries.
+fn table_is_funcref(module: &Module, index: u32) -> bool {
+    let imported = module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Table(_)))
+        .count() as u32;
+    let element = if index < imported {
+        module
+            .imports
+            .iter()
+            .filter_map(|import| match &import.desc {
+                ImportDesc::Table(table) => Some(table.element),
+                _ => None,
+            })
+            .nth(index as usize)
+    } else {
+        module
+            .tables
+            .get((index - imported) as usize)
+            .map(|table| table.ty.element)
+    };
+    matches!(
+        element,
+        Some(RefType {
+            heap: HeapType::Func,
+            ..
+        })
+    )
+}
+
 /// Whether a callee type fits the compiled-call subset: numeric parameters
 /// and results, each few enough to ride the caller-owned scratch buffer.
 fn callable_type(ty: Option<FuncType>) -> bool {
@@ -652,11 +721,11 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
             memory_is64(module, *memory).is_some()
         }
         Instr::GlobalGet(index) => {
-            matches!(defined_global(module, *index), Some((ty, _)) if clif_type(ty).is_some())
+            matches!(defined_global(module, *index), Some((ty, _)) if num_type(ty).is_some())
         }
         Instr::GlobalSet(index) => matches!(
             defined_global(module, *index),
-            Some((ty, true)) if clif_type(ty).is_some()
+            Some((ty, true)) if num_type(ty).is_some()
         ),
         Instr::Call(index) | Instr::ReturnCall(index) => {
             callable_type(func_type_of(module, *index))
@@ -672,6 +741,14 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
             table_is64(module, *table_index) == Some(false)
                 && callable_type(module.func_at_cloned(*type_index))
         }
+        Instr::CallRef(type_index) | Instr::ReturnCallRef(type_index) => {
+            callable_type(module.func_at_cloned(*type_index))
+        }
+        Instr::TableGet(table) | Instr::TableSet(table) => {
+            table_is64(module, *table) == Some(false) && table_is_funcref(module, *table)
+        }
+        Instr::RefNull(heap) => *heap == HeapType::Func,
+        Instr::RefFunc(_) | Instr::RefIsNull => true,
         _ => false,
     })
 }
@@ -1995,9 +2072,9 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    /// Widen a numeric SSA value to its u64 call-slot form (mirrors the
-    /// entry ABI's argument marshaling: an `i32` uses the low 32 bits, an
-    /// `f32` its raw bits).
+    /// Widen a value to its u64 call-slot form (mirrors the entry ABI's
+    /// argument marshaling: an `i32` uses the low 32 bits, an `f32` its raw
+    /// bits; a function-reference token is already a u64 slot).
     fn slot_from(&mut self, ty: ValType, value: ClifValue) -> Result<ClifValue, String> {
         match ty {
             ValType::I32 => Ok(self.builder.ins().uextend(types::I64, value)),
@@ -2013,11 +2090,13 @@ impl<'a> Lowerer<'a> {
                 .builder
                 .ins()
                 .bitcast(types::I64, MemFlagsData::new(), value)),
-            _ => Err("non-numeric value reached the call lowering".to_string()),
+            ValType::Ref(reference) if reference.heap == HeapType::Func => Ok(value),
+            _ => Err("unsupported value reached the call lowering".to_string()),
         }
     }
 
-    /// Narrow a u64 call-slot back to a numeric SSA value of `ty`.
+    /// Narrow a u64 call-slot back to an SSA value of `ty` (a
+    /// function-reference token stays a u64 slot).
     fn value_from_slot(&mut self, ty: ValType, wide: ClifValue) -> Result<ClifValue, String> {
         match ty {
             ValType::I32 => Ok(self.builder.ins().ireduce(types::I32, wide)),
@@ -2033,7 +2112,8 @@ impl<'a> Lowerer<'a> {
                 .builder
                 .ins()
                 .bitcast(types::F64, MemFlagsData::new(), wide)),
-            _ => Err("non-numeric value reached the call lowering".to_string()),
+            ValType::Ref(reference) if reference.heap == HeapType::Func => Ok(wide),
+            _ => Err("unsupported value reached the call lowering".to_string()),
         }
     }
 
@@ -2064,46 +2144,21 @@ impl<'a> Lowerer<'a> {
                 .ins()
                 .store(MemFlagsData::new(), wide, address, Offset32::new(0));
         }
-        // The helper's ABI: (store, instance, mode, x, y, z, nargs, scratch,
-        // mems) -> i32 trap code, all u64 slots so no float classification
-        // can disagree with the Rust trampoline. `mems` lets the helper
-        // refresh this body's memory descriptors after the callee ran (an
-        // interpreted callee can grow a memory, reallocating its `Vec`).
-        let mut sig = Signature::new(self.conv);
-        for _ in 0..9 {
-            sig.params.push(AbiParam::new(types::I64));
-        }
-        sig.returns.push(AbiParam::new(types::I32));
-        let sig = self.builder.import_signature(sig);
         let mode_v = self.iconst(types::I64, mode);
         let z_v = self.iconst(types::I64, z);
         let nargs = self.iconst(types::I64, ty.params.len() as i64);
-        let call = self.builder.ins().call_indirect(
-            sig,
-            self.call,
-            &[
-                self.store,
-                self.instance,
-                mode_v,
-                x,
-                y,
-                z_v,
-                nargs,
-                self.scratch,
-                self.mems,
-            ],
-        );
-        let code = self.builder.inst_results(call)[0];
-        // A nonzero code means the callee trapped (or a pending error):
-        // return it from the entry verbatim, then continue on success.
-        let zero = self.iconst(types::I32, 0);
-        let failed = self.builder.ins().icmp(IntCC::NotEqual, code, zero);
-        let trap_block = self.builder.create_block();
-        let cont = self.builder.create_block();
-        self.builder.ins().brif(failed, trap_block, &[], cont, &[]);
-        self.builder.switch_to_block(trap_block);
-        self.builder.ins().return_(&[code]);
-        self.builder.switch_to_block(cont);
+        let args = [
+            self.store,
+            self.instance,
+            mode_v,
+            x,
+            y,
+            z_v,
+            nargs,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
         for (i, ty) in ty.results.iter().enumerate() {
             let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
             let wide =
@@ -2117,6 +2172,34 @@ impl<'a> Lowerer<'a> {
             self.emit_return()?;
             self.dead = true;
         }
+        Ok(())
+    }
+
+    /// Emit a call to the runtime helper (address entry param 10) and branch
+    /// to a trap-code return when it reports failure. The helper's ABI:
+    /// `(store, instance, mode, x, y, z, nargs, scratch, mems)` -> i32 trap
+    /// code, all u64 slots so no float classification can disagree with the
+    /// Rust trampoline; `mems` lets it refresh this body's memory descriptors
+    /// after an interpreted callee grows a memory.
+    fn runtime_call(&mut self, args: &[ClifValue]) -> Result<(), String> {
+        let mut sig = Signature::new(self.conv);
+        for _ in 0..9 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let sig = self.builder.import_signature(sig);
+        let call = self.builder.ins().call_indirect(sig, self.call, args);
+        let code = self.builder.inst_results(call)[0];
+        // A nonzero code means the callee trapped (or a pending error):
+        // return it from the entry verbatim, then continue on success.
+        let zero = self.iconst(types::I32, 0);
+        let failed = self.builder.ins().icmp(IntCC::NotEqual, code, zero);
+        let trap_block = self.builder.create_block();
+        let cont = self.builder.create_block();
+        self.builder.ins().brif(failed, trap_block, &[], cont, &[]);
+        self.builder.switch_to_block(trap_block);
+        self.builder.ins().return_(&[code]);
+        self.builder.switch_to_block(cont);
         Ok(())
     }
 
@@ -2145,6 +2228,92 @@ impl<'a> Lowerer<'a> {
         let element64 = self.builder.ins().uextend(types::I64, element);
         let table = self.iconst(types::I64, i64::from(table_index));
         self.lower_call(1, table, element64, i64::from(type_index), &ty, tail)
+    }
+
+    /// A `call_ref`/`return_call_ref`: the function reference is the top
+    /// operand, above the arguments; the helper resolves and type-checks it
+    /// against `type_index` (runtime helper mode 2).
+    fn do_call_ref(&mut self, type_index: u32, tail: bool) -> Result<(), String> {
+        let ty = self
+            .module
+            .func_at_cloned(type_index)
+            .ok_or("unresolved call_ref type")?;
+        let reference = self.pop().ok_or("operand stack underflow")?;
+        let zero = self.iconst(types::I64, 0);
+        self.lower_call(2, reference, zero, i64::from(type_index), &ty, tail)
+    }
+
+    /// A `ref.func`: push the function's token (`tag | instance << 32 | f`).
+    fn do_ref_func(&mut self, index: u32) -> ClifValue {
+        let amount = self.iconst(types::I64, 32);
+        let tag_and_index = self.iconst(
+            types::I64,
+            (crate::values::REF_FUNC_TAG | u64::from(index)) as i64,
+        );
+        let shifted = self.builder.ins().ishl(self.instance, amount);
+        self.builder.ins().bor(shifted, tag_and_index)
+    }
+
+    /// A `ref.is_null`: 1 when the token is the null token (0), else 0.
+    fn do_ref_is_null(&mut self, reference: ClifValue) -> ClifValue {
+        let zero = self.iconst(types::I64, 0);
+        let is_null = self.builder.ins().icmp(IntCC::Equal, reference, zero);
+        let one = self.iconst(types::I32, 1);
+        let zero32 = self.iconst(types::I32, 0);
+        self.builder.ins().select(is_null, one, zero32)
+    }
+
+    /// A `table.get` over a 32-bit funcref table: pop the i32 index, read the
+    /// element through the runtime helper (mode 3), and push its token.
+    fn do_table_get(&mut self, table: u32) -> Result<(), String> {
+        let index = self.pop().ok_or("operand stack underflow")?;
+        let index64 = self.builder.ins().uextend(types::I64, index);
+        let table_v = self.iconst(types::I64, i64::from(table));
+        let mode = self.iconst(types::I64, 3);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            table_v,
+            index64,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 0);
+        let token =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), address, Offset32::new(0));
+        self.stack.push(token);
+        Ok(())
+    }
+
+    /// A `table.set` over a 32-bit funcref table: pop the reference token and
+    /// the i32 index (reference on top), write through the runtime helper
+    /// (mode 4).
+    fn do_table_set(&mut self, table: u32) -> Result<(), String> {
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let index = self.pop().ok_or("operand stack underflow")?;
+        let index64 = self.builder.ins().uextend(types::I64, index);
+        let table_v = self.iconst(types::I64, i64::from(table));
+        let mode = self.iconst(types::I64, 4);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            table_v,
+            index64,
+            value,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
     }
 
     /// Lower one instruction. Dead paths skip code but still track the
@@ -2205,6 +2374,26 @@ impl<'a> Lowerer<'a> {
             }
             Instr::GlobalGet(index) => self.do_global_get(*index)?,
             Instr::GlobalSet(index) => self.do_global_set(*index)?,
+            Instr::RefNull(heap) => {
+                if *heap != HeapType::Func {
+                    return Err("unsupported ref.null heap type".to_string());
+                }
+                let null = self.iconst(types::I64, 0);
+                self.stack.push(null);
+            }
+            Instr::RefIsNull => {
+                let reference = self.pop().ok_or("operand stack underflow")?;
+                let is_null = self.do_ref_is_null(reference);
+                self.stack.push(is_null);
+            }
+            Instr::RefFunc(index) => {
+                let token = self.do_ref_func(*index);
+                self.stack.push(token);
+            }
+            Instr::TableGet(table) => self.do_table_get(*table)?,
+            Instr::TableSet(table) => self.do_table_set(*table)?,
+            Instr::CallRef(type_index) => self.do_call_ref(*type_index, false)?,
+            Instr::ReturnCallRef(type_index) => self.do_call_ref(*type_index, true)?,
             Instr::Drop => {
                 self.pop().ok_or("operand stack underflow")?;
             }
@@ -2342,6 +2531,8 @@ fn lower(
                     builder.ins().bitcast(types::F32, MemFlagsData::new(), bits)
                 }
                 ValType::F64 => builder.ins().bitcast(types::F64, MemFlagsData::new(), wide),
+                // A function-reference parameter arrives as its u64 token.
+                ValType::Ref(reference) if reference.heap == HeapType::Func => wide,
                 _ => return Err("unsupported parameter type".to_string()),
             }
         } else {
@@ -2350,6 +2541,10 @@ fn lower(
                 ValType::I64 => builder.ins().iconst(types::I64, 0),
                 ValType::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
                 ValType::F64 => builder.ins().f64const(Ieee64::with_bits(0)),
+                // A function-reference local defaults to the null token.
+                ValType::Ref(reference) if reference.heap == HeapType::Func => {
+                    builder.ins().iconst(types::I64, 0)
+                }
                 _ => return Err("unsupported local type".to_string()),
             }
         };
@@ -2419,6 +2614,7 @@ mod tests {
     use crate::instr::StoreOp;
     use crate::module::{FuncBody, Global, Module, Table};
     use crate::types::{BlockType, GlobalType, Limits, MemType, RefType, SubType, TableType};
+    use crate::values::{FuncAddr, RefValue};
 
     fn int_module(body: Vec<Instr>, params: Vec<ValType>, results: Vec<ValType>) -> Module {
         Module {
@@ -4679,5 +4875,120 @@ mod tests {
             vec![Value::I32(2), Value::I32(3), Value::I32(100)],
         ];
         assert_equiv(&module, 1, &cases);
+    }
+
+    #[test]
+    fn function_references_match_the_interpreter() {
+        // add(x) = x + 1, and an `apply(f, x)` that dispatches through
+        // `call_ref` on a funcref parameter. Passing the actual function
+        // reference crosses the compiled boundary as a token; a null
+        // reference traps with a null-function reference.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                SubType::func(
+                    vec![ValType::Ref(RefType::FUNC), ValType::I32],
+                    vec![ValType::I32],
+                ),
+            ],
+            functions: vec![0, 1],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::Num(NumOp::I32Add),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(1), Instr::LocalGet(0), Instr::CallRef(0)],
+                },
+            ],
+            ..Module::default()
+        };
+        let function = Value::Ref(RefValue::Func(FuncAddr {
+            instance: 0,
+            index: 0,
+        }));
+        let cases = [
+            vec![function, Value::I32(4)],
+            vec![Value::Ref(RefValue::Null), Value::I32(1)],
+        ];
+        assert_equiv(&module, 1, &cases);
+    }
+
+    #[test]
+    fn table_get_set_and_call_ref_match_the_interpreter() {
+        // A funcref table (initially null) over which a compiled body stores
+        // `ref.func $add`, reads it back with `table.get`, and dispatches
+        // through `call_ref`. A later `ref.is_null` of the slot sees the
+        // stored function (cross-call, so the write reached the store).
+        let module = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32, ValType::I32], vec![ValType::I32]),
+                SubType::func(vec![], vec![ValType::I32]),
+            ],
+            functions: vec![0, 0, 1],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::Num(NumOp::I32Add),
+                    ],
+                },
+                // Set slot 0 to `ref.func 0`, then call it via call_ref on a
+                // table.get of that slot: add(a, b).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(0),
+                        Instr::RefFunc(0),
+                        Instr::TableSet(0),
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::I32Const(0),
+                        Instr::TableGet(0),
+                        Instr::CallRef(0),
+                    ],
+                },
+                // ref.is_null of slot 0 (null before any store).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::I32Const(0), Instr::TableGet(0), Instr::RefIsNull],
+                },
+            ],
+            tables: vec![Table {
+                ty: TableType {
+                    element: RefType::FUNC,
+                    limits: Limits {
+                        min: 1,
+                        max: None,
+                        shared: false,
+                    },
+                    table64: false,
+                },
+                init: None,
+            }],
+            ..Module::default()
+        };
+        let outcomes = run_seq(
+            &module,
+            &[
+                (2, vec![]),
+                (1, vec![Value::I32(2), Value::I32(3)]),
+                (2, vec![]),
+                (1, vec![Value::I32(10), Value::I32(32)]),
+                (2, vec![]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(1)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(5)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::I32(0)]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(42)]));
+        assert_eq!(outcomes[4], Ok(vec![Value::I32(0)]));
     }
 }

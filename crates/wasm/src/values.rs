@@ -7,6 +7,45 @@
 
 use crate::instr::NumOp;
 
+/// Cut 11 compiled-ref token encoding: references cross the compiled boundary
+/// as opaque u64 tokens carried in `I64` Cranelift values. Token 0 is the
+/// null reference; a function reference is tagged with bit 63 and packs its
+/// address's instance (bits 32-62, up to 2^31) and full function-index-space
+/// index (bits 0-31) — an address that does not fit stays interpreted.
+pub const REF_NULL_TOKEN: u64 = 0;
+pub const REF_FUNC_TAG: u64 = 1 << 63;
+
+/// The compiled token for a function address, when both parts fit.
+pub fn func_ref_token(instance: usize, index: usize) -> Option<u64> {
+    if instance > 0x7fff_ffff || index > u32::MAX as usize {
+        return None;
+    }
+    Some(REF_FUNC_TAG | ((instance as u64) << 32) | index as u64)
+}
+
+/// Encode an interpreter value as its compiled token. Only the null and
+/// function references the compiled subset carries are encodable.
+pub fn ref_to_token(value: Value) -> Option<u64> {
+    match value {
+        Value::Ref(RefValue::Null) => Some(REF_NULL_TOKEN),
+        Value::Ref(RefValue::Func(addr)) => func_ref_token(addr.instance, addr.index),
+        _ => None,
+    }
+}
+
+/// Decode a compiled token back to an interpreter reference value.
+pub fn token_to_ref(token: u64) -> Option<Value> {
+    if token == REF_NULL_TOKEN {
+        return Some(Value::Ref(RefValue::Null));
+    }
+    if token & REF_FUNC_TAG == 0 {
+        return None;
+    }
+    let instance = ((token >> 32) & 0x7fff_ffff) as usize;
+    let index = (token & u64::from(u32::MAX)) as usize;
+    Some(Value::Ref(RefValue::Func(FuncAddr { instance, index })))
+}
+
 /// Where a function reference points: the full function index space of a
 /// store instance. The instance stays alive for the life of the store, so
 /// references imported by later modules remain valid.

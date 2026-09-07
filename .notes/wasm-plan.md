@@ -1948,3 +1948,32 @@ the feature, clippy clean in both configurations. Wave 2 remaining: the
 table/`ref.func` value family whose refs must flow *through* compiled
 code (`table.get/set`, `call_ref`, `ref.func` results) — that needs an
 opaque ref representation on the compiled operand stack.
+
+Function references flow through compiled code — the last Wave 2 piece.
+The compiled value model now carries a (nullable or not) function
+reference as an opaque u64 token (`values`: 0 is the null reference; a
+function reference is tagged at bit 63 and packs its address's instance
+and full function-index-space index), so `ref.func`, `ref.null func`,
+`ref.is_null`, `table.get`/`table.set` over 32-bit funcref tables, and
+`call_ref`/`return_call_ref` all lower. `clif_type` maps a funcref to
+`I64` (a new `num_type` keeps the genuinely numeric gates — globals, the
+call scratch — from accidentally accepting refs), params/locals/blocks
+carry the tokens, and the store boundary marshals them (`run_compiled`
+and the call helper encode/decode tokens; a ref param/result crosses to
+an interpreted callee or back as its token). The runtime call helper
+gained three modes: `call_ref` on a function token (null →
+`NullFunctionReference`), and `table.get`/`table.set` with bounds
+checking (the element is read/written as its token). The token model
+needs no store-side registry — tokens encode the address directly, so a
+compiled loop calling `ref.func` never allocates. Unit coverage drives a
+funcref-parameter `apply` through `call_ref` (including a null
+reference trap) and a module that `table.set`s `ref.func $add`, reads it
+back with `table.get`, dispatches via `call_ref`, and observes the store
+cross-call with `ref.is_null`. `wasmtest equiv` is green over `ref_func`,
+`ref_is_null`, `call_ref`, `return_call_ref`, `table`, `table_get`,
+`table_set`, `br_on_null`, `br_on_non_null` (0 diverged) plus the
+call/call_indirect, numeric/control, and memory regressions. Externref/
+exnref/GC heap refs, ref-typed globals, and `br_on_null`/`br_on_non_null`
+lowering stay interpreted (bodies bail cleanly), so those suites remain
+interpreter-on-both-sides. 36 compile tests, 72 total with the feature,
+clippy clean in both configurations. Wave 2 is complete.
