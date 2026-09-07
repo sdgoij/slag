@@ -1010,6 +1010,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         | Instr::I31GetU
         | Instr::ThrowRef => true,
         Instr::BrOnNull(_) | Instr::BrOnNonNull(_) => true,
+        Instr::BrOnCast { .. } | Instr::BrOnCastFail { .. } => true,
         Instr::StructNew(ty) => struct_values_lowerable(module, *ty),
         Instr::StructNewDefault(ty) => struct_fields_of(module, *ty).is_some(),
         Instr::StructGet { ty, field }
@@ -2569,10 +2570,14 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    /// Run the runtime type-match check (helper mode 60) for the popped token
-    /// against `nullable`/`heap`, returning whether it matched (as an i32).
-    fn cast_matches(&mut self, nullable: bool, heap: &HeapType) -> Result<ClifValue, String> {
-        let token = self.pop().ok_or("operand stack underflow")?;
+    /// Run the runtime type-match check (helper mode 60) for `token` against
+    /// `nullable`/`heap`, returning whether it matched (as an i32).
+    fn emit_cast_check(
+        &mut self,
+        token: ClifValue,
+        nullable: bool,
+        heap: &HeapType,
+    ) -> Result<ClifValue, String> {
         let mode = self.iconst(types::I64, 60);
         let null_v = self.iconst(types::I64, i64::from(nullable));
         let heap_v = self.iconst(types::I64, heap_code(heap));
@@ -2598,7 +2603,8 @@ impl<'a> Lowerer<'a> {
 
     /// A `ref.test`: push whether the popped reference matches the target.
     fn do_ref_test(&mut self, nullable: bool, heap: &HeapType) -> Result<(), String> {
-        let matches = self.cast_matches(nullable, heap)?;
+        let token = self.pop().ok_or("operand stack underflow")?;
+        let matches = self.emit_cast_check(token, nullable, heap)?;
         self.stack.push(matches);
         Ok(())
     }
@@ -2607,27 +2613,7 @@ impl<'a> Lowerer<'a> {
     /// match the target, else push it back (its token is unchanged).
     fn do_ref_cast(&mut self, nullable: bool, heap: &HeapType) -> Result<(), String> {
         let reference = self.pop().ok_or("operand stack underflow")?;
-        let mode = self.iconst(types::I64, 60);
-        let null_v = self.iconst(types::I64, i64::from(nullable));
-        let heap_v = self.iconst(types::I64, heap_code(heap));
-        let zero = self.iconst(types::I64, 0);
-        let args = [
-            self.store,
-            self.instance,
-            mode,
-            reference,
-            null_v,
-            heap_v,
-            zero,
-            self.scratch,
-            self.mems,
-        ];
-        self.runtime_call(&args)?;
-        let address = self.builder.ins().iadd_imm_s(self.scratch, 0);
-        let matches =
-            self.builder
-                .ins()
-                .load(types::I32, MemFlagsData::new(), address, Offset32::new(0));
+        let matches = self.emit_cast_check(reference, nullable, heap)?;
         let zero32 = self.iconst(types::I32, 0);
         let failed = self.builder.ins().icmp(IntCC::Equal, matches, zero32);
         self.trap_if(failed, TRAP_CAST_FAILURE);
@@ -3745,6 +3731,42 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// A `br_on_cast`/`br_on_cast_fail`: pop the reference, run the runtime
+    /// type-match check against the target reftype (`nullable`/`heap`), and
+    /// push it back. `branch_when_matches` selects the branch: `br_on_cast`
+    /// branches on a match, `br_on_cast_fail` on a miss — in both cases the
+    /// reference rides the label payload on top (its token is unchanged), and
+    /// the fall-through continues with it still on the stack, exactly like the
+    /// interpreter.
+    fn do_br_on_cast(
+        &mut self,
+        depth: u32,
+        nullable: bool,
+        heap: &HeapType,
+        branch_when_matches: bool,
+    ) -> Result<(), String> {
+        let reference = self.pop().ok_or("operand stack underflow")?;
+        let idx = self
+            .controls
+            .len()
+            .checked_sub(1 + depth as usize)
+            .ok_or("branch past the control stack")?;
+        let (target, arity) = self.frame_target(idx);
+        let matches = self.emit_cast_check(reference, nullable, heap)?;
+        self.stack.push(reference);
+        let payload = self.label_args(arity);
+        let zero = self.iconst(types::I32, 0);
+        let flag = if branch_when_matches {
+            self.builder.ins().icmp(IntCC::NotEqual, matches, zero)
+        } else {
+            self.builder.ins().icmp(IntCC::Equal, matches, zero)
+        };
+        let cont = self.builder.create_block();
+        self.builder.ins().brif(flag, target, &payload, cont, &[]);
+        self.builder.switch_to_block(cont);
+        Ok(())
+    }
+
     /// Lower one instruction. Dead paths skip code but still track the
     /// structured markers so `end`s reach the right frames.
     fn instruction(&mut self, instr: &Instr) -> Result<(), String> {
@@ -3850,6 +3872,12 @@ impl<'a> Lowerer<'a> {
             Instr::AnyConvertExtern => self.do_any_convert_extern()?,
             Instr::BrOnNull(label) => self.do_br_on_null(*label)?,
             Instr::BrOnNonNull(label) => self.do_br_on_non_null(*label)?,
+            Instr::BrOnCast { label, to, .. } => {
+                self.do_br_on_cast(*label, to.nullable, &to.heap, true)?
+            }
+            Instr::BrOnCastFail { label, to, .. } => {
+                self.do_br_on_cast(*label, to.nullable, &to.heap, false)?
+            }
             Instr::TableGet(table) => self.do_table_get(*table)?,
             Instr::TableSet(table) => self.do_table_set(*table)?,
             Instr::Throw(index) => self.do_throw(*index)?,
@@ -8270,6 +8298,125 @@ mod tests {
             outcomes[2],
             Err(ExecFail::Trap(Trap::CastFailure))
         ));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(0)]));
+    }
+
+    #[test]
+    fn br_on_cast_ops_match_the_interpreter() {
+        use crate::types::{CompositeType, FieldType, StorageType};
+        // br_on_cast / br_on_cast_fail run the mode-60 match check and branch
+        // to the label when the reference does (or does not) cast to the
+        // target type, carrying the reference on the label payload; the
+        // fall-through keeps it on the stack. Function 0 exits a block by
+        // br_on_cast of a matching struct; function 1 exits it by
+        // br_on_cast_fail of a null (which misses the non-null target);
+        // function 2 falls through br_on_cast for a null and an i31 argument.
+        let struct_type = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Struct(vec![FieldType {
+                ty: StorageType::I32,
+                mutable: false,
+            }]),
+        };
+        let any_null = ValType::Ref(RefType {
+            nullable: true,
+            heap: HeapType::Any,
+        });
+        let ref1 = ValType::Ref(RefType {
+            nullable: true,
+            heap: HeapType::Type(1),
+        });
+        let from_any = RefType {
+            nullable: true,
+            heap: HeapType::Any,
+        };
+        let to_1 = RefType {
+            nullable: false,
+            heap: HeapType::Type(1),
+        };
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![ValType::I32]),
+                struct_type,
+                SubType::func(vec![], vec![ref1]),
+                SubType::func(vec![any_null], vec![ValType::I32]),
+            ],
+            functions: vec![0, 0, 3],
+            bodies: vec![
+                // 0: a struct matches the non-null struct target, so the
+                // br_on_cast exits the block with the struct (non-null).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::Block(BlockType::Type(2)),
+                        Instr::StructNewDefault(1),
+                        Instr::BrOnCast {
+                            label: 0,
+                            from: from_any,
+                            to: to_1,
+                        },
+                        // The unmatched fall-through would leave a null block
+                        // result; the struct always matches, so this never runs.
+                        Instr::RefNull(HeapType::Type(1)),
+                        Instr::End,
+                        Instr::RefIsNull,
+                    ],
+                },
+                // 1: a null misses the non-null target, so the
+                // br_on_cast_fail exits the block carrying the null.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::Block(BlockType::Type(2)),
+                        Instr::RefNull(HeapType::Type(1)),
+                        Instr::BrOnCastFail {
+                            label: 0,
+                            from: from_any,
+                            to: to_1,
+                        },
+                        // The matched fall-through would leave a struct block
+                        // result; the null never matches, so this never runs.
+                        Instr::StructNewDefault(1),
+                        Instr::End,
+                        Instr::RefIsNull,
+                    ],
+                },
+                // 2: a null (or i31) misses the non-null struct target and
+                // falls through br_on_cast into the block result.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::Block(BlockType::Type(2)),
+                        Instr::LocalGet(0),
+                        Instr::BrOnCast {
+                            label: 0,
+                            from: from_any,
+                            to: to_1,
+                        },
+                        Instr::End,
+                        Instr::RefIsNull,
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "br_on_cast module did not compile"
+        );
+        let outcomes = run_seq(
+            &module,
+            &[
+                (0, vec![]),
+                (1, vec![]),
+                (2, vec![Value::Ref(RefValue::Null)]),
+                (2, vec![Value::Ref(RefValue::i31(5))]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(0)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(1)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::I32(1)]));
         assert_eq!(outcomes[3], Ok(vec![Value::I32(0)]));
     }
 }

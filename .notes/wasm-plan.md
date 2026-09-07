@@ -2242,3 +2242,26 @@ diverged. 55 compile tests, 91 total with the feature, clippy clean in
 both configurations. Remaining Cut 11 surface: `br_on_cast`/
 `br_on_cast_fail` (they branch to a label carrying the reference
 token, like `br_on_null`) and the v128 SIMD/relaxed-SIMD wave.
+
+`br_on_cast`/`br_on_cast_fail` landed, closing out the typed-branch GC
+surface. Each pops the reference, runs the same mode-60 match check
+against the target reftype, and pushes it back; then it branches to the
+label when the check selects that path — `br_on_cast` on a match,
+`br_on_cast_fail` on a miss — carrying the label payload with the
+(unchanged) reference token on top, exactly like the interpreter (the
+branch carries the value the label's top type accepts; the fall-through
+continues with the reference still on the stack). The match-check
+helper is shared with `ref.test`/`ref.cast` (the pop was refactored out
+of `emit_cast_check`), and the lowering admits both instructions
+unconditionally — a body whose `br_on_cast*` targets the function label
+(no control frame exists for it in the lowering) fails to lower and
+stays interpreted. Unit coverage drives a `br_on_cast` exiting a block
+with a matching struct, a `br_on_cast_fail` exiting with a null (which
+misses the non-null target), and a nullable-param function falling
+through `br_on_cast` for null and i31 arguments — the fall-through
+regions add a conflicting block result so an inverted branch condition
+would diverge. `wasmtest equiv` is green over the whole core corpus:
+254 suites, 0 diverged. 56 compile tests, 92 total with the feature,
+clippy clean in both configurations. Remaining Cut 11 surface: the
+v128 SIMD/relaxed-SIMD wave (the interpreter's `simd`/`relaxed-simd`
+corpus suites are still interpreter-on-both-sides).
