@@ -2369,3 +2369,21 @@ bit-for-bit with the interpreter over the shared store. `wasmtest
 equiv` is green over the whole core corpus: 254 suites, 0 diverged. 60
 compile tests, 96 total with the feature, clippy clean in both
 configurations.
+
+The deferred scalar float ops landed, completing the numeric lowering
+surface: `f32`/`f64` `.min`/`.max` lower natively with the wasm
+signed-zero and NaN rules (`lower_fminmax`: canonical quiet NaN when
+either operand is NaN, else the ordered pick, with `min(-0,+0) = -0`
+and `max(-0,-0) = -0` decided from the operands' sign bits), and the
+promote/demote conversions use Cranelift's `fpromote`/`fdemote`
+— `f32.demote_f64` canonicalizes a NaN result to `QNAN32` while
+`f64.promote_f32` preserves the promoted bits, exactly like the
+interpreter's `values.rs` (promote/demote run on the same host
+instruction as the Rust `as` cast, so the raw NaN bits agree).
+`is_f32_op`/`is_f64_op`/`supported_num` admit the six new opcodes, so
+corpus bodies using `.min`/`.max` or the demote/promote conversions
+compile. Unit coverage drives f32/f64 min/max over the signed-zero and
+NaN edge pairs and demote/promote over NaN, signed zero, and
+infinity, agreeing bit-for-bit with the interpreter. `wasmtest equiv`
+is green over the whole core corpus: 254 suites, 0 diverged. 61 compile
+tests, 97 total with the feature, clippy clean in both configurations.

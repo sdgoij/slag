@@ -17,8 +17,9 @@
 //!   `return`;
 //! - float arithmetic/rounding/sqrt/comparisons reproduce the
 //!   interpreter's canonical-quiet-NaN policy exactly (`abs`/`neg`/
-//!   `copysign` stay raw bit ops); `f32.min/max` and the
-//!   promote/demote conversions are deferred;
+//!   `copysign` stay raw bit ops), `fmin`/`fmax` implement the signed-zero
+//!   and NaN rules, `f32.demote_f64` canonicalizes (and `f64.promote_f32`
+//!   preserves) NaN results, and int/float conversions lower natively;
 //! - structured control flow (`block`/`loop`/`if`/`else`/`br`/`br_if`/
 //!   `br_table`) with carried block types of any parameter/result count
 //!   (parameters enter the body as its initial operand stack and ride a
@@ -1155,8 +1156,7 @@ fn supported_num(op: NumOp) -> bool {
             | I64GeU
             // Conversions.
             | I32WrapI64
-            // f32 arithmetic (the lowering canonicalizes NaN results;
-            // min/max and demote are deferred).
+            // f32 arithmetic (the lowering canonicalizes NaN results).
             | F32Abs
             | F32Neg
             | F32Ceil
@@ -1175,6 +1175,9 @@ fn supported_num(op: NumOp) -> bool {
             | F32Gt
             | F32Le
             | F32Ge
+            | F32Min
+            | F32Max
+            | F32DemoteF64
             | F32ConvertI32S
             | F32ConvertI32U
             | F32ConvertI64S
@@ -1198,6 +1201,9 @@ fn supported_num(op: NumOp) -> bool {
             | F64Gt
             | F64Le
             | F64Ge
+            | F64Min
+            | F64Max
+            | F64PromoteF32
             | F64ConvertI32S
             | F64ConvertI32U
             | F64ConvertI64S
@@ -1232,6 +1238,9 @@ fn is_f32_op(op: NumOp) -> bool {
             | F32ConvertI32U
             | F32ConvertI64S
             | F32ConvertI64U
+            | F32Min
+            | F32Max
+            | F32DemoteF64
     )
 }
 
@@ -1262,6 +1271,9 @@ fn is_f64_op(op: NumOp) -> bool {
             | F64ConvertI32U
             | F64ConvertI64S
             | F64ConvertI64U
+            | F64Min
+            | F64Max
+            | F64PromoteF32
     )
 }
 
@@ -1991,6 +2003,10 @@ impl<'a> Lowerer<'a> {
                 | F64Le
                 | F32Ge
                 | F64Ge
+                | F32Min
+                | F64Min
+                | F32Max
+                | F64Max
         );
         let (a, b) = if binary {
             let b = self.pop().ok_or("operand stack underflow")?;
@@ -2029,11 +2045,71 @@ impl<'a> Lowerer<'a> {
                 F32ConvertI32U | F64ConvertI32U => self.builder.ins().fcvt_from_uint(ty, a),
                 F32ConvertI64S | F64ConvertI64S => self.builder.ins().fcvt_from_sint(ty, a),
                 F32ConvertI64U | F64ConvertI64U => self.builder.ins().fcvt_from_uint(ty, a),
+                F32Min | F64Min => self.lower_fminmax(a, b, ty, false),
+                F32Max | F64Max => self.lower_fminmax(a, b, ty, true),
+                F32DemoteF64 => {
+                    let demoted = self.builder.ins().fdemote(types::F32, a);
+                    self.canon_float(demoted, types::F32)
+                }
+                F64PromoteF32 => self.builder.ins().fpromote(types::F64, a),
                 _ => return Err("unsupported float opcode".to_string()),
             }
         };
         self.stack.push(result);
         Ok(())
+    }
+
+    /// `fmin`/`fmax`: canonical quiet NaN when either operand is NaN, else the
+    /// ordered pick, with the signed-zero rule for equal zeros — mirroring the
+    /// interpreter's `fmin32`/`fmax32` (and 64-bit forms) exactly.
+    fn lower_fminmax(&mut self, a: ClifValue, b: ClifValue, ty: Type, is_max: bool) -> ClifValue {
+        let nan = self.builder.ins().fcmp(FloatCC::Unordered, a, b);
+        let q = match ty {
+            types::F32 => self.fconst(types::F32, u64::from(QNAN32)),
+            _ => self.fconst(types::F64, QNAN64),
+        };
+        let cc = if is_max {
+            FloatCC::GreaterThan
+        } else {
+            FloatCC::LessThan
+        };
+        let flag = self.builder.ins().fcmp(cc, a, b);
+        let ordered = self.builder.ins().select(flag, a, b);
+        let zero = self.fconst(ty, 0);
+        let neg_zero_bits = if ty == types::F32 {
+            u64::from(0x8000_0000u32)
+        } else {
+            0x8000_0000_0000_0000
+        };
+        let neg_zero = self.fconst(ty, neg_zero_bits);
+        let (int_ty, zero_int) = if ty == types::F32 {
+            (types::I32, self.iconst(types::I32, 0))
+        } else {
+            (types::I64, self.iconst(types::I64, 0))
+        };
+        let a_zero = self.builder.ins().fcmp(FloatCC::Equal, a, zero);
+        let b_zero = self.builder.ins().fcmp(FloatCC::Equal, b, zero);
+        let both_zero = self.builder.ins().band(a_zero, b_zero);
+        let a_bits = self.builder.ins().bitcast(int_ty, MemFlagsData::new(), a);
+        let b_bits = self.builder.ins().bitcast(int_ty, MemFlagsData::new(), b);
+        let a_neg = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, a_bits, zero_int);
+        let b_neg = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, b_bits, zero_int);
+        // `min(-0, +0)` is -0 (either may be negative); `max` is -0 only when
+        // both are.
+        let neg_flag = if is_max {
+            self.builder.ins().band(a_neg, b_neg)
+        } else {
+            self.builder.ins().bor(a_neg, b_neg)
+        };
+        let zero_case = self.builder.ins().select(neg_flag, neg_zero, zero);
+        let chosen = self.builder.ins().select(both_zero, zero_case, ordered);
+        self.builder.ins().select(nan, q, chosen)
     }
 
     fn bin_bool(&mut self, cc: IntCC, a: ClifValue, b: ClifValue) -> ClifValue {
@@ -9263,5 +9339,126 @@ mod tests {
         assert_eq!(outcomes[3], Ok(vec![Value::I32(0x0007_0008)]));
         assert_eq!(outcomes[4], Ok(vec![]));
         assert_eq!(outcomes[5], Ok(vec![Value::V128(y)]));
+    }
+
+    #[test]
+    fn float_minmax_and_promote_demote_match_the_interpreter() {
+        use NumOp::*;
+        // fmin/fmax implement the wasm signed-zero and NaN rules, and the
+        // demote/promote conversions canonicalize (demote) or preserve
+        // (promote) their NaN results, exactly like `values.rs`.
+        let f32 = ValType::F32;
+        let f64 = ValType::F64;
+        let min32 = module_with(
+            vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Num(F32Min)],
+            vec![f32, f32],
+            vec![],
+            vec![f32],
+        );
+        let max32 = module_with(
+            vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Num(F32Max)],
+            vec![f32, f32],
+            vec![],
+            vec![f32],
+        );
+        let min64 = module_with(
+            vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Num(F64Min)],
+            vec![f64, f64],
+            vec![],
+            vec![f64],
+        );
+        let max64 = module_with(
+            vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Num(F64Max)],
+            vec![f64, f64],
+            vec![],
+            vec![f64],
+        );
+        let demote = module_with(
+            vec![Instr::LocalGet(0), Instr::Num(F32DemoteF64)],
+            vec![f64],
+            vec![],
+            vec![f32],
+        );
+        let promote = module_with(
+            vec![Instr::LocalGet(0), Instr::Num(F64PromoteF32)],
+            vec![f32],
+            vec![],
+            vec![f64],
+        );
+        let neg_zero32 = 0x8000_0000u32;
+        let one32 = 1.0f32.to_bits();
+        let two32 = 2.0f32.to_bits();
+        let nan32 = 0x7fc0_1234u32; // quiet NaN, non-canonical payload.
+        assert_equiv(
+            &min32,
+            0,
+            &[
+                vec![Value::F32(neg_zero32), Value::F32(0)],
+                vec![Value::F32(0), Value::F32(neg_zero32)],
+                vec![Value::F32(0), Value::F32(0)],
+                vec![Value::F32(nan32), Value::F32(one32)],
+                vec![Value::F32(one32), Value::F32(nan32)],
+                vec![Value::F32(two32), Value::F32(one32)],
+            ],
+        );
+        assert_equiv(
+            &max32,
+            0,
+            &[
+                vec![Value::F32(neg_zero32), Value::F32(0)],
+                vec![Value::F32(0), Value::F32(neg_zero32)],
+                vec![Value::F32(neg_zero32), Value::F32(neg_zero32)],
+                vec![Value::F32(nan32), Value::F32(one32)],
+                vec![Value::F32(one32), Value::F32(nan32)],
+                vec![Value::F32(two32), Value::F32(one32)],
+            ],
+        );
+        let neg_zero64 = 0x8000_0000_0000_0000u64;
+        let one64 = 1.0f64.to_bits();
+        let two64 = 2.0f64.to_bits();
+        let nan64 = 0x7ff8_1234_5678_9abcu64;
+        assert_equiv(
+            &min64,
+            0,
+            &[
+                vec![Value::F64(neg_zero64), Value::F64(0)],
+                vec![Value::F64(0), Value::F64(neg_zero64)],
+                vec![Value::F64(nan64), Value::F64(one64)],
+                vec![Value::F64(one64), Value::F64(nan64)],
+                vec![Value::F64(two64), Value::F64(one64)],
+            ],
+        );
+        assert_equiv(
+            &max64,
+            0,
+            &[
+                vec![Value::F64(neg_zero64), Value::F64(0)],
+                vec![Value::F64(0), Value::F64(neg_zero64)],
+                vec![Value::F64(neg_zero64), Value::F64(neg_zero64)],
+                vec![Value::F64(nan64), Value::F64(one64)],
+                vec![Value::F64(one64), Value::F64(nan64)],
+                vec![Value::F64(two64), Value::F64(one64)],
+            ],
+        );
+        // Demote canonicalizes NaNs to QNAN32; promote preserves the bits.
+        assert_equiv(
+            &demote,
+            0,
+            &[
+                vec![Value::F64(one64)],
+                vec![Value::F64(nan64)],
+                vec![Value::F64(neg_zero64)],
+                vec![Value::F64(f64::INFINITY.to_bits())],
+            ],
+        );
+        assert_equiv(
+            &promote,
+            0,
+            &[
+                vec![Value::F32(one32)],
+                vec![Value::F32(nan32)],
+                vec![Value::F32(neg_zero32)],
+            ],
+        );
     }
 }
