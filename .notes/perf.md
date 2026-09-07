@@ -5691,6 +5691,40 @@ All 13 `--jit-bench` rows result-ok; 37-workload corpus result-identical
 jit vs jitless. Follow-up: the row's residual ~190ms is the remaining
 concat + string-alloc machinery and the number+string+number chain shape.
 
+### The concat-spread verdict: stock arrays spread without the symbol read (measured + landed 2026-09-07)
+
+Decomposing `arrays/slice_concat.js` showed Array.prototype.concat carries a
+~2.2us FIXED per-call cost on `a.concat(b)` of two 1-element arrays (30+30
+only adds ~19ns/element): per spreadable element `is_concat_spreadable` ran
+a full @@isConcatSpreadable symbol chain-read (~0.75us/element pair with
+the general length [[Get]]) even though a plain Array's chain never
+carries the symbol. Landing: a shared verdict (mirroring the species/for-of
+pattern) records that a %Array.prototype% -> %Object.prototype% chain
+(whose own prototype is null) has no own @@isConcatSpreadable,
+re-validated by the two shared objects' generations (an absent own property
+can only appear by a define, which bumps; symbol-keyed stores never take
+the compiled no-bump member-store path). A concat element that is a real
+dense Array on a certified chain with no own @@isConcatSpreadable spreads
+with its dense length cell — skipping the symbol read and the length
+[[Get]]; any other element (array-like spreadables, exotic/own/prototype
+@@isConcatSpreadable, subclass chains, holes, proxies) keeps the exact
+per-element machinery. Results (isolated 30k-call probes, min of 2):
+`a.concat(b)` 66 -> ~28ms jitless (per call ~2.2us -> ~0.95us);
+`a.concat()` (3-element receiver) ~42 -> ~22ms; 30+30 ~100 -> ~58ms;
+`arrays/slice_concat.js` ~91 -> ~76ms. Correctness: a 26-case
+node-differential battery (dense/multi-arg/holes/deleted/sparse, own and
+instance/prototype/Object.prototype @@isConcatSpreadable true/false
+including getter observation and delete-mid, subclass species sources and
+results, array-like spreadables with holes, string/arguments receivers) is
+byte-identical to node in jit, jitless, and `--gc-stress`. Gates: clippy
+clean; workspace tests green; test262 sweeps at baseline — language
+23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang. All 13 `--jit-bench` rows result-ok; corpus
+result-identical jit vs jitless. Follow-up: the concat residual ~0.95us
+per call is the method dispatch + species create + result-array dense
+copies; `slice_concat.js`'s literal+slice+join portions are container
+creation / join machinery.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

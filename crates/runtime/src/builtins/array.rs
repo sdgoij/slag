@@ -719,6 +719,80 @@ fn is_concat_spreadable(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
     is_array_or_throw(value)
 }
 
+/// The concat-spread fast-verdict probe: the cached "this %Array.prototype%'s
+/// chain to %Object.prototype% (which is null-prototyped) carries no own
+/// @@isConcatSpreadable" verdict holds while the two shared objects'
+/// generations match — an absent own property can only appear by a define
+/// (bump), and symbol-keyed stores never take the compiled no-bump path.
+fn concat_spread_probe(agent: &mut Agent, array_proto: &crux::object::JsObject) -> bool {
+    let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+    let Some(verdict) = agent.spread_cells[index].as_ref() else {
+        return false;
+    };
+    verdict.array_proto.0 == array_proto.id()
+        && verdict.array_proto.1 == array_proto.generation()
+        && verdict.object_proto.1 == verdict.object_proto_handle.generation()
+}
+
+/// Resolve and cache the concat-spread verdict: `%Array.prototype%` and its
+/// %Object.prototype% (whose own prototype is null) both lack an own
+/// @@isConcatSpreadable, so a plain Array on that chain spreads in `concat`
+/// without consulting the symbol. `Some(())` = cached; `None` = not (the
+/// caller keeps the exact per-element spreadable read).
+fn concat_spread_resolve(
+    agent: &mut Agent,
+    array_proto: &crux::object::JsObject,
+) -> Result<Option<()>, JsError> {
+    let key = PropertyKey::Symbol(crux::symbol::well_known("isConcatSpreadable"));
+    if array_proto.get_own_property_key(&key)?.is_some() {
+        return Ok(None);
+    }
+    let Some(object_proto) = array_proto.get_prototype_of()? else {
+        return Ok(None);
+    };
+    if object_proto.get_own_property_key(&key)?.is_some() {
+        return Ok(None);
+    }
+    if object_proto.get_prototype_of()?.is_some() {
+        return Ok(None);
+    }
+    let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
+    agent.spread_cells[index] = Some(crate::agent::ConcatSpreadVerdict {
+        array_proto: (array_proto.id(), array_proto.generation()),
+        object_proto: (object_proto.id(), object_proto.generation()),
+        object_proto_handle: object_proto,
+    });
+    Ok(Some(()))
+}
+
+/// The concat element fast verdict: when `element` is a real dense Array on a
+/// certified clean @@isConcatSpreadable chain with no own @@isConcatSpreadable,
+/// its spread is trivially true and its length is the dense cell — skipping the
+/// per-element symbol chain read and the general length [[Get]]. `None` keeps
+/// the exact machinery.
+fn concat_fast_length(agent: &mut Agent, element: &Value) -> Result<Option<u64>, JsError> {
+    let ValueKind::Object(object) = element.kind() else {
+        return Ok(None);
+    };
+    if !matches!(object.kind, ObjectKind::Array(_)) {
+        return Ok(None);
+    }
+    let Some(proto) = object.get_prototype_of()? else {
+        return Ok(None);
+    };
+    if !concat_spread_probe(agent, &proto) && concat_spread_resolve(agent, &proto)?.is_none() {
+        return Ok(None);
+    }
+    let spreadable_key = PropertyKey::Symbol(crux::symbol::well_known("isConcatSpreadable"));
+    if object.get_own_property_key(&spreadable_key)?.is_some() {
+        return Ok(None);
+    }
+    match object.array_length_dense() {
+        Some(length) => Ok(Some(length)),
+        None => Ok(None),
+    }
+}
+
 /// spec 23.1.3.2 Array.prototype.concat.
 fn concat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
@@ -732,8 +806,12 @@ fn concat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     // [[Set]] is skipped.
     let mut dense_copy = true;
     for element in elements {
-        if is_concat_spreadable(agent, &element)? {
-            let length = length_of_array_like(agent, &element)?;
+        let fast_length = concat_fast_length(agent, &element)?;
+        if fast_length.is_some() || is_concat_spreadable(agent, &element)? {
+            let length = match fast_length {
+                Some(length) => length,
+                None => length_of_array_like(agent, &element)?,
+            };
             if n + length > 9007199254740991.0 as u64 {
                 return Err(JsError::new(
                     ErrorKind::TypeError,

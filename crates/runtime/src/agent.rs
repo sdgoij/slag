@@ -197,6 +197,24 @@ impl Trace for ArraySpeciesVerdict {
     }
 }
 
+/// The cached "the %Array.prototype% -> %Object.prototype% chain carries no
+/// own @@isConcatSpreadable" verdict: a plain Array on that chain spreads in
+/// `concat` without the per-element @@isConcatSpreadable symbol read. The two
+/// shared objects' generations gate later defines/deletes (an absent own
+/// property can only appear by a define, which bumps; symbol-keyed stores
+/// never take the compiled no-bump member-store path, which is name-keyed).
+pub(crate) struct ConcatSpreadVerdict {
+    pub array_proto: (u64, u32),
+    pub object_proto: (u64, u32),
+    pub object_proto_handle: Handle<crux::object::JsObject>,
+}
+
+impl Trace for ConcatSpreadVerdict {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.object_proto_handle.trace(visit);
+    }
+}
+
 // Every live `Agent` on this thread that has run JavaScript, as
 // `(signifier, pointer)` pairs. The crux heap is thread-local and shared by
 // every agent on the thread, but a collection roots only the collecting
@@ -362,6 +380,11 @@ pub struct Agent {
     /// proto walk on every result-building call. Boxed so the 16-entry table
     /// does not bloat the Agent struct's hot-field cache footprint.
     pub(crate) species_array_cells: Box<[Option<(u64, u32, u64)>; crate::ir::MEMBER_CELLS]>,
+    /// The concat-spread verdict (this landing): "the %Array.prototype% ->
+    /// %Object.prototype% chain of this %Array.prototype% carries no own
+    /// @@isConcatSpreadable" — see [`ConcatSpreadVerdict`]. Direct-mapped on
+    /// the %Array.prototype% id.
+    pub(crate) spread_cells: [Option<ConcatSpreadVerdict>; crate::ir::MEMBER_CELLS],
     /// The for-in enumeration cache (this landing): base id -> the
     /// enumerated (level, key) list + the full chain snapshot for a base
     /// whose whole prototype chain is generation-tracked (see
@@ -891,6 +914,7 @@ impl Agent {
             for_of_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
             species_fast_cells: std::array::from_fn(|_| None),
             species_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
+            spread_cells: std::array::from_fn(|_| None),
             for_in_cells: Box::new(std::array::from_fn(|_| None)),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
@@ -1308,6 +1332,9 @@ impl Agent {
             cell.trace(visit);
         }
         for cell in self.species_fast_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.spread_cells.iter() {
             cell.trace(visit);
         }
         for cell in self.for_in_cells.iter() {
