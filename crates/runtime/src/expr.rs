@@ -1246,6 +1246,48 @@ fn to_numeric_operand(agent: &mut Agent, value: &Value) -> Result<Value, JsError
 
 /// ApplyStringOrNumericBinaryOperator (spec 13.15.4) for the arithmetic,
 /// shift, and bitwise operators.
+/// Whether a Number/Boolean/Null/Undefined needs no ToPrimitive/ToString
+/// dispatch for the string-`Add` fusion below.
+fn plain_stringable(kind: &ValueKind) -> bool {
+    matches!(
+        kind,
+        &ValueKind::Number(_) | &ValueKind::Boolean(_) | &ValueKind::Null | &ValueKind::Undefined
+    )
+}
+
+/// The string+plain-primitive `Add` fusion: `ToPrimitive` of a
+/// Number/Boolean/Null/Undefined is itself and its ToString is the fixed
+/// constant or the fast small-integer decimal (`crux::number::to_string`), so
+/// the abstract add collapses to a two-string concat without the general
+/// ToPrimitive/ToString agent round-trips. `None` for any other shape
+/// (objects, symbols, BigInt, both non-string) falls to the exact machinery.
+pub(crate) fn concat_primitive(left: &Value, right: &Value) -> Option<Value> {
+    let (a, b) = match (left.kind(), right.kind()) {
+        (ValueKind::String(_), r) if plain_stringable(&r) => {
+            (left.as_string()?, primitive_to_string(right)?.as_string()?)
+        }
+        (l, ValueKind::String(_)) if plain_stringable(&l) => {
+            (primitive_to_string(left)?.as_string()?, right.as_string()?)
+        }
+        _ => return None,
+    };
+    Some(Value::String(JsString::concat(&a, &b)))
+}
+
+/// The ToString of a plain stringable primitive (see [`plain_stringable`]).
+fn primitive_to_string(value: &Value) -> Option<Value> {
+    match value.kind() {
+        ValueKind::Number(number) => {
+            Some(Value::String(Handle::new(crux::number::to_string(number))))
+        }
+        ValueKind::Boolean(true) => Some(Value::String(Handle::new(JsString::from_utf8("true")))),
+        ValueKind::Boolean(false) => Some(Value::String(Handle::new(JsString::from_utf8("false")))),
+        ValueKind::Null => Some(Value::String(Handle::new(JsString::from_utf8("null")))),
+        ValueKind::Undefined => Some(Value::String(Handle::new(JsString::from_utf8("undefined")))),
+        _ => None,
+    }
+}
+
 pub(crate) fn apply_binary(
     agent: &mut Agent,
     op: BinaryOp,
@@ -1265,6 +1307,12 @@ pub(crate) fn apply_binary(
             // concat appends without copying once the string is large.
             if let (Some(left_text), Some(right_text)) = (left.as_string(), right.as_string()) {
                 return Ok(Value::String(JsString::concat(&left_text, &right_text)));
+            }
+            // Fast path: a string plus a plain primitive (Number/Boolean/
+            // Null/Undefined) is the same two-string concat without the
+            // general ToPrimitive/ToString agent round-trips below.
+            if let Some(value) = concat_primitive(left, right) {
+                return Ok(value);
             }
             let left_prim = crate::context::to_primitive(agent, left, ToPrimitiveHint::Default)?;
             let right_prim = crate::context::to_primitive(agent, right, ToPrimitiveHint::Default)?;

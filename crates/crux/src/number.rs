@@ -45,6 +45,15 @@ pub fn to_string(x: f64) -> JsString {
     if x.is_infinite() {
         return JsString::from_utf8(if x < 0.0 { "-Infinity" } else { "Infinity" });
     }
+    // Fast path: an exactly-representable integer (|x| <= 2^53) has an exact
+    // <=16-digit decimal that prints without the exponential form (its digit
+    // count never reaches the n > 21 case) and is its own shortest
+    // round-trip representation, so write it directly instead of running
+    // ryu + the digit-vector/String rebuild — loop counters and indices
+    // dominate number -> string.
+    if x.fract() == 0.0 && x.abs() <= 9007199254740992.0 {
+        return small_integer_string(x);
+    }
     let mut out = String::new();
     if x < 0.0 {
         out.push('-');
@@ -82,6 +91,31 @@ pub fn to_string(x: f64) -> JsString {
         out.push_str(&exponent.abs().to_string());
     }
     JsString::from_utf8(&out)
+}
+
+/// The decimal string of an exactly-representable small integer (`|x|` an
+/// integer `<= 2^53`, never zero — `to_string` handles zero first).
+fn small_integer_string(x: f64) -> JsString {
+    let negative = x < 0.0;
+    let mut digits = x.abs() as u64;
+    // Sign + 20 digits + NUL margin; 2^53 has 16 digits.
+    let mut buf = [0u8; 22];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (digits % 10) as u8;
+        digits /= 10;
+        if digits == 0 {
+            break;
+        }
+    }
+    if negative {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    // SAFETY: buf[i..] holds only '-' (optional) followed by ASCII digits.
+    let text = unsafe { std::str::from_utf8_unchecked(&buf[i..]) };
+    JsString::from_utf8(text)
 }
 
 /// spec 6.1.6.1.1 Number::add.
@@ -904,6 +938,36 @@ mod tests {
         assert_eq!(s(9007199254740992.0), "9007199254740992");
         assert_eq!(s(9007199254740994.0), "9007199254740994");
         assert_eq!(s(-0.00000123), "-0.00000123");
+    }
+
+    #[test]
+    fn to_string_small_integer_fast_path() {
+        // The |x| <= 2^53 integer path writes the exact decimal directly.
+        assert_eq!(s(-9007199254740992.0), "-9007199254740992");
+        assert_eq!(s(9007199254740992.0), "9007199254740992");
+        assert_eq!(s(-7.0), "-7");
+        assert_eq!(s(123456789.0), "123456789");
+        assert_eq!(s(1000000000000000.0), "1000000000000000");
+        assert_eq!(s(65535.0), "65535");
+        // Parity with the exact decimal across the exact-integer range.
+        let mut n = -100000i64;
+        while n <= 100000 {
+            let x = n as f64;
+            if x as i64 == n {
+                assert_eq!(s(x), n.to_string());
+            }
+            n += 17;
+        }
+        for &n in &[
+            1i64,
+            -1,
+            999999999,
+            -999999999,
+            4503599627370496,
+            -4503599627370496,
+        ] {
+            assert_eq!(s(n as f64), n.to_string());
+        }
     }
 
     #[test]

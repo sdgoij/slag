@@ -9999,10 +9999,13 @@ impl Vm {
                 _ => {}
             }
         }
-        if op == BinaryOp::Add
-            && let Some(value) = Self::concat_strings(left, right)
-        {
-            return Ok(value);
+        if op == BinaryOp::Add {
+            if let Some(value) = Self::concat_strings(left, right) {
+                return Ok(value);
+            }
+            if let Some(value) = crate::expr::concat_primitive(left, right) {
+                return Ok(value);
+            }
         }
         crate::expr::apply_binary(agent, op, left, right)
     }

@@ -5655,6 +5655,42 @@ remaining ~0.8µs fixed cost is the primitive-string method dispatch +
 per-token string boxing floor (substring copies), not the result
 defines.
 
+### Small-integer number-to-string and the fused string+primitive add (measured + landed 2026-09-07)
+
+`strings/coercion_concat.js` (`"value=" + i + ":" + (i * 2)` per iteration)
+sat at ~395ms jitless / ~332ms jit (node-jitless ~15.5ms) — a ~25x gap
+with the JIT column flat. Decomposition (isolated probes): a string+string
+concat is ~80-97ns/iter, but `"value=" + 100` (a CONSTANT number) was
+~452ns and `"" + i` ~443ns — number->string via `crux::number::to_string`
+ran ryu + a digit-vector/String rebuild on EVERY call (~350ns), and the
+string+number `+` then fell into the general `apply_binary` tail
+(ToPrimitive + agent ToString round-trips per operand).
+
+Landing: (1) `crux::number::to_string` writes the exact decimal directly
+for an exactly-representable integer (|x| <= 2^53, <= 16 digits, always
+plain decimal — its own shortest round-trip, never the exponential form)
+instead of the ryu path; (2) `Add` with one string operand and a
+Number/Boolean/Null/Undefined on the other (whose ToString is the fixed
+constant or the fast integer path) fuses to a two-string concat, in
+`expr::apply_binary` AND the register executor's `binary_inline` (shared
+`expr::concat_primitive`). Objects/symbols/BigInt/both-non-string shapes
+keep the exact ToPrimitive machinery. Results (isolated, min of 2):
+`"value=" + i` ~149 -> ~76ms jitless, `"" + i` ~133 -> ~55ms, full
+fixture ~337 -> ~185-192ms jitless / ~320 -> ~160ms jit (~1.9x);
+`coercion_concat.js` ~395 -> ~213ms; `json_roundtrip.js` ~220 -> ~188ms
+(the stringify number path benefits). Correctness: a 45-case
+node-differential battery (both operand orders, -0/NaN/Infinity,
+fractions, 2^53 and 2^53+2 and 2^60 boundaries, sub-1e-6 and >=1e21
+exponential thresholds, booleans/null/undefined, mixed chains,
+template substitutions, toString/Number() parity, object/symbol/BigInt
+fallbacks) is byte-identical to node in jit, jitless, and `--gc-stress`;
+plus a small-integer parity unit test in crux. Gates: clippy clean;
+workspace tests green; test262 sweeps at baseline — language 23721/3
+skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang.
+All 13 `--jit-bench` rows result-ok; 37-workload corpus result-identical
+jit vs jitless. Follow-up: the row's residual ~190ms is the remaining
+concat + string-alloc machinery and the number+string+number chain shape.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
