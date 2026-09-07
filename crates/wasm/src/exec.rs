@@ -466,7 +466,8 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// re-raising the exception whose pool id is `x` (see [`rethrow_op`]);
 /// `40`/`41` = `extern.convert_any`/`any.convert_extern` re-tagging the
 /// token `x` (see [`gc_convert_op`]); `50`-`56` = the array bulk ops (see
-/// [`array_bulk_op`]).
+/// [`array_bulk_op`]); `60` = the `ref.test`/`ref.cast` type match check
+/// (see [`ref_cast_op`]).
 ///
 /// # Safety
 ///
@@ -512,6 +513,11 @@ pub unsafe extern "C" fn wasm_call_helper(
     // segment/fill/copy semantics against the store's object pool.
     if (50..=56).contains(&mode) {
         return array_bulk_op(store, instance, mode, x, y, z, nargs, scratch);
+    }
+    // A compiled ref.test/ref.cast match check (mode 60) runs the runtime
+    // type-lattice test against the store.
+    if mode == 60 {
+        return ref_cast_op(store, instance, x, y, z, scratch);
     }
     // Table reads/writes (modes 3/4), the bulk-memory ops (modes 5-8), and
     // the table bulk ops (modes 9-14) resolve cells/segments directly.
@@ -1849,6 +1855,143 @@ fn gc_convert_op(store: &mut Store, mode: u64, x: u64, scratch: *mut u64) -> i32
 fn gc_unsupported(store: &mut Store, what: &'static str) -> i32 {
     store.set_pending_error(ExecFail::Unsupported(what));
     crate::compile::TRAP_PENDING_ERROR
+}
+
+/// The declared type index of a function reference within its owner module,
+/// when it resolves to one (host functions from outside a module's type space
+/// are treated as abstract `func`, exactly like the interpreter).
+#[cfg(feature = "compile")]
+fn gc_func_type_index(store: &Store, addr: FuncAddr) -> Option<u32> {
+    let instance = store.instances.get(addr.instance)?;
+    let func_imports = instance
+        .module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Func(_)))
+        .count();
+    if addr.index < func_imports {
+        instance
+            .module
+            .imports
+            .iter()
+            .filter_map(|import| match import.desc {
+                ImportDesc::Func(ty) => Some(ty),
+                _ => None,
+            })
+            .nth(addr.index)
+    } else {
+        instance
+            .module
+            .functions
+            .get(addr.index - func_imports)
+            .copied()
+    }
+}
+
+/// Whether a runtime reference matches a target reftype (`nullable`, `heap`)
+/// whose type indices live in `frame`'s module, mirroring the interpreter's
+/// `Engine::ref_matches`: null matches only a nullable target; i31/host/
+/// extern/exn and unresolved funcs match by their abstract heap; struct/array
+/// objects and resolved funcs match by subtype (same-module) or by walking
+/// the owner's supertype chain against the frame module's target type
+/// (cross-module equivalence).
+#[cfg(feature = "compile")]
+fn ref_matches_target(
+    store: &Store,
+    frame: usize,
+    reference: RefValue,
+    nullable: bool,
+    heap: HeapType,
+) -> Option<bool> {
+    if reference == RefValue::Null {
+        return Some(nullable);
+    }
+    let concrete = match reference {
+        RefValue::Func(addr) => match gc_func_type_index(store, addr) {
+            Some(ty) => Some((addr.instance, ty)),
+            None => return Some(runtime_abs_matches(HeapType::Func, heap)),
+        },
+        RefValue::Struct(id) => Some((store.objects.get(id)?.owner, store.objects.get(id)?.ty)),
+        RefValue::Array(id) => Some((store.objects.get(id)?.owner, store.objects.get(id)?.ty)),
+        RefValue::Host(_) => return Some(runtime_abs_matches(HeapType::Any, heap)),
+        RefValue::I31(_) => return Some(runtime_abs_matches(HeapType::I31, heap)),
+        RefValue::Extern(_) => return Some(runtime_abs_matches(HeapType::Extern, heap)),
+        RefValue::Exn(_) => return Some(runtime_abs_matches(HeapType::Exn, heap)),
+        RefValue::Null => return Some(nullable),
+    };
+    let (owner, ty) = concrete?;
+    let module = &store.instances.get(owner)?.module;
+    let composite = module.types.get(ty as usize)?.composite.clone();
+    Some(match heap {
+        HeapType::Type(target) => {
+            let owner_module = &store.instances.get(owner)?.module;
+            if owner == frame {
+                owner_module.type_is_subtype(ty, target)
+            } else {
+                let frame_module = &store.instances.get(frame)?.module;
+                let mut current = ty;
+                loop {
+                    if crate::module::type_indices_equivalent(
+                        &frame_module.types,
+                        &frame_module.rec_groups,
+                        target,
+                        &owner_module.types,
+                        &owner_module.rec_groups,
+                        current,
+                    ) {
+                        break true;
+                    }
+                    let Some(parent) = owner_module
+                        .types
+                        .get(current as usize)
+                        .and_then(|sub| sub.supertypes.first())
+                        .copied()
+                    else {
+                        break false;
+                    };
+                    current = parent;
+                }
+            }
+        }
+        abstract_target => {
+            let kind = match &composite {
+                CompositeType::Func(_) => HeapType::Func,
+                CompositeType::Struct(_) => HeapType::Struct,
+                CompositeType::Array(_) => HeapType::Array,
+            };
+            runtime_abs_matches(kind, abstract_target)
+        }
+    })
+}
+
+/// A compiled `ref.test`/`ref.cast` match check (runtime helper mode 60):
+/// whether the reference token `x` matches the target reftype (`y` nullable,
+/// `z` the target heap code — a type index or an abstract heap's negative
+/// code). The 0/1 result lands in `scratch[0]`; a reference the token model
+/// cannot decode parks an error.
+#[cfg(feature = "compile")]
+fn ref_cast_op(store: &mut Store, frame: u64, x: u64, y: u64, z: u64, scratch: *mut u64) -> i32 {
+    let Some(value) = crate::values::token_to_ref(x) else {
+        return gc_unsupported(store, "unencodable cast operand");
+    };
+    let Value::Ref(reference) = value else {
+        return gc_unsupported(store, "non-reference cast operand");
+    };
+    let heap = if z as i64 >= 0 {
+        HeapType::Type(z as u32)
+    } else {
+        match HeapType::from_s33(z as i64) {
+            Some(heap) => heap,
+            None => return gc_unsupported(store, "unknown cast target heap"),
+        }
+    };
+    match ref_matches_target(store, frame as usize, reference, y != 0, heap) {
+        Some(matches) => unsafe {
+            *scratch = u64::from(matches);
+        },
+        None => return gc_unsupported(store, "cast target resolution"),
+    }
+    crate::compile::TRAP_NONE
 }
 
 /// Decode a value of `storage` from its u64 scratch slot (a reference decodes

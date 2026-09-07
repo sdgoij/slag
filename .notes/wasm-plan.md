@@ -2213,3 +2213,32 @@ segment, a `new_elem` funcref array's length, and an `init_elem` write
 read back through `array.get`/`ref.is_null`. `wasmtest equiv` is green
 over the whole core corpus: 254 suites, 0 diverged. 54 compile tests,
 90 total with the feature, clippy clean in both configurations.
+
+### Cut 11 Wave 4: `ref.test`/`ref.cast` slice landed (2026-09-07)
+
+`ref.test` and `ref.cast` run the runtime type-lattice check against the
+store through a new helper (mode 60), the last carried-reference check
+before the `br_on_cast*` labels: the reference token, a nullable flag,
+and the target heap (a positive type index or an abstract heap's
+negative code) produce whether the value matches, landing a 0/1 in the
+caller-owned scratch. The helper mirrors the interpreter's
+`Engine::ref_matches` exactly — a null matches only a nullable target;
+i31/host/extern/exn values and function references that do not resolve
+to an owner-module type index match by their abstract heap; struct/
+array objects and resolved function references match by subtype
+(same-module `type_is_subtype`) or, cross-module, by walking the
+owner's supertype chain against the frame module's target type under
+isorecursive type equivalence. `ref.test` pushes the 0/1 result;
+`ref.cast` traps `CastFailure` when the value does not match and
+therefore keeps the unchanged reference token otherwise. `heap_code`
+inverts the interpreter's `HeapType::from_s33` so target heaps cross
+the helper ABI losslessly, and `ref_cast_op` parks an error when a
+token cannot decode (bodies that could produce one stay interpreted via
+the lowering gates). Unit coverage drives a struct matching its own
+type, an i31 matching the i31 heap, a failing i31-to-struct cast
+(`CastFailure`), and a struct-to-`any` widening through both paths.
+`wasmtest equiv` is green over the whole core corpus: 254 suites, 0
+diverged. 55 compile tests, 91 total with the feature, clippy clean in
+both configurations. Remaining Cut 11 surface: `br_on_cast`/
+`br_on_cast_fail` (they branch to a label carrying the reference
+token, like `br_on_null`) and the v128 SIMD/relaxed-SIMD wave.

@@ -730,6 +730,27 @@ fn storage_val_type(storage: StorageType) -> Option<ValType> {
     }
 }
 
+/// The compiled token for a `ref.test`/`ref.cast` target heap: a positive
+/// type index, or an abstract heap's negative spec code (`HeapType::from_s33`
+/// inverts this).
+fn heap_code(heap: &HeapType) -> i64 {
+    match heap {
+        HeapType::Type(index) => i64::from(*index),
+        HeapType::Func => -0x10,
+        HeapType::Extern => -0x11,
+        HeapType::Any => -0x12,
+        HeapType::Eq => -0x13,
+        HeapType::I31 => -0x14,
+        HeapType::Struct => -0x15,
+        HeapType::Array => -0x16,
+        HeapType::Exn => -0x17,
+        HeapType::None => -0x0f,
+        HeapType::NoExtern => -0x0e,
+        HeapType::NoFunc => -0x0d,
+        HeapType::NoExn => -0x0c,
+    }
+}
+
 /// Whether a struct type index's field values can all ride the compiled value
 /// model and fit the scratch, and whether a single field's value can.
 fn struct_values_lowerable(module: &Module, ty: u32) -> bool {
@@ -1015,6 +1036,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         }
         Instr::ArrayCopy { .. } => true,
         Instr::AnyConvertExtern | Instr::ExternConvertAny => true,
+        Instr::RefTest { .. } | Instr::RefCast { .. } => true,
         _ => false,
     })
 }
@@ -2547,6 +2569,72 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Run the runtime type-match check (helper mode 60) for the popped token
+    /// against `nullable`/`heap`, returning whether it matched (as an i32).
+    fn cast_matches(&mut self, nullable: bool, heap: &HeapType) -> Result<ClifValue, String> {
+        let token = self.pop().ok_or("operand stack underflow")?;
+        let mode = self.iconst(types::I64, 60);
+        let null_v = self.iconst(types::I64, i64::from(nullable));
+        let heap_v = self.iconst(types::I64, heap_code(heap));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            token,
+            null_v,
+            heap_v,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 0);
+        Ok(self
+            .builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), address, Offset32::new(0)))
+    }
+
+    /// A `ref.test`: push whether the popped reference matches the target.
+    fn do_ref_test(&mut self, nullable: bool, heap: &HeapType) -> Result<(), String> {
+        let matches = self.cast_matches(nullable, heap)?;
+        self.stack.push(matches);
+        Ok(())
+    }
+
+    /// A `ref.cast`: trap `CastFailure` when the popped reference does not
+    /// match the target, else push it back (its token is unchanged).
+    fn do_ref_cast(&mut self, nullable: bool, heap: &HeapType) -> Result<(), String> {
+        let reference = self.pop().ok_or("operand stack underflow")?;
+        let mode = self.iconst(types::I64, 60);
+        let null_v = self.iconst(types::I64, i64::from(nullable));
+        let heap_v = self.iconst(types::I64, heap_code(heap));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            reference,
+            null_v,
+            heap_v,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 0);
+        let matches =
+            self.builder
+                .ins()
+                .load(types::I32, MemFlagsData::new(), address, Offset32::new(0));
+        let zero32 = self.iconst(types::I32, 0);
+        let failed = self.builder.ins().icmp(IntCC::Equal, matches, zero32);
+        self.trap_if(failed, TRAP_CAST_FAILURE);
+        self.stack.push(reference);
+        Ok(())
+    }
+
     /// A `ref.i31`: box the i32 as an internal i31 token, canonicalizing to
     /// its low 31 bits like the interpreter (`ref.i31` takes the value modulo
     /// 2^31).
@@ -3733,6 +3821,8 @@ impl<'a> Lowerer<'a> {
             }
             Instr::RefAsNonNull => self.do_ref_as_non_null()?,
             Instr::RefEq => self.do_ref_eq()?,
+            Instr::RefTest { nullable, heap } => self.do_ref_test(*nullable, heap)?,
+            Instr::RefCast { nullable, heap } => self.do_ref_cast(*nullable, heap)?,
             Instr::RefI31 => self.do_ref_i31()?,
             Instr::I31GetS => self.do_i31_get(true)?,
             Instr::I31GetU => self.do_i31_get(false)?,
@@ -8093,5 +8183,93 @@ mod tests {
         let outcomes = run_seq(&module, &[(1, vec![]), (2, vec![])]);
         assert_eq!(outcomes[0], Ok(vec![Value::I32(2)]));
         assert_eq!(outcomes[1], Ok(vec![Value::I32(0)]));
+    }
+
+    #[test]
+    fn ref_cast_ops_match_the_interpreter() {
+        use crate::types::{CompositeType, FieldType, StorageType};
+        // ref.test / ref.cast run the runtime type-lattice check against the
+        // store: a struct matches its own (and `any`) type, an i31 matches
+        // the i31 heap, and a failed cast to an unrelated struct type traps
+        // CastFailure.
+        let struct_type = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Struct(vec![FieldType {
+                ty: StorageType::I32,
+                mutable: false,
+            }]),
+        };
+        let module = Module {
+            types: vec![SubType::func(vec![], vec![ValType::I32]), struct_type],
+            functions: vec![0, 0, 0, 0],
+            bodies: vec![
+                // 0: a struct matches its own (non-null) type.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::StructNewDefault(1),
+                        Instr::RefTest {
+                            nullable: false,
+                            heap: HeapType::Type(1),
+                        },
+                    ],
+                },
+                // 1: an i31 matches the i31 heap.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(7),
+                        Instr::RefI31,
+                        Instr::RefTest {
+                            nullable: false,
+                            heap: HeapType::I31,
+                        },
+                    ],
+                },
+                // 2: casting an i31 to a struct type fails with CastFailure
+                // (the never-success path after it is unreachable).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(7),
+                        Instr::RefI31,
+                        Instr::RefCast {
+                            nullable: false,
+                            heap: HeapType::Type(1),
+                        },
+                        Instr::Unreachable,
+                    ],
+                },
+                // 3: casting a struct to `any` succeeds (result is non-null).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::StructNewDefault(1),
+                        Instr::RefCast {
+                            nullable: true,
+                            heap: HeapType::Any,
+                        },
+                        Instr::RefIsNull,
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "ref.cast module did not compile"
+        );
+        let outcomes = run_seq(
+            &module,
+            &[(0, vec![]), (1, vec![]), (2, vec![]), (3, vec![])],
+        );
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(1)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(1)]));
+        assert!(matches!(
+            outcomes[2],
+            Err(ExecFail::Trap(Trap::CastFailure))
+        ));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(0)]));
     }
 }
