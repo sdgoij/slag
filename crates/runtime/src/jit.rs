@@ -648,6 +648,11 @@ pub struct JitSlowPaths {
     /// return its result.
     pub call_vector:
         extern "C" fn(ctx: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64,
+    /// `Step::Construct` (the vector form): the callee on the JIT buffer,
+    /// the arguments in the Vm's vector — run the construct machinery (the
+    /// construct-inline leaf fast path or the general path) and return the
+    /// constructed value.
+    pub construct: extern "C" fn(ctx: *mut c_void, callee: u64) -> u64,
     /// `Step::TailCall` (the vector form): like `tail_call`, reading the
     /// arguments from the Vm's vector instead of the JIT buffer.
     pub tail_call_vector:
@@ -977,6 +982,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     args_push,
     args_spread,
     call_vector,
+    construct,
     tail_call_vector,
     tail_call_self_vector,
     array_begin,
@@ -2393,6 +2399,20 @@ extern "C" fn call_vector(ctx: *mut c_void, this: u64, callee: u64, direct_eval:
             vm.stack.truncate(entry_len);
             slow_error(ctx, error)
         }
+    }
+}
+
+extern "C" fn construct(ctx: *mut c_void, callee: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    // Mirror the interpreter's `Step::Construct`: pop the argument
+    // boundary and run the construct-inline leaf fast path or the general
+    // construct machinery, returning the constructed value (the machine
+    // code pushes it onto the work stack).
+    match vm.step_construct(agent, Value::from_bits(callee)) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
     }
 }
 
@@ -5083,6 +5103,7 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.args_push as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.args_spread as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.call_vector as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.construct as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.tail_call_vector as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.tail_call_self_vector as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.array_begin as usize, 0);

@@ -77,6 +77,10 @@ pub enum Helper {
     ArgsPush,
     ArgsSpread,
     CallVector,
+    /// The compiled `Step::Construct`: pops the argument boundary and runs
+    /// the interpreter's construct machinery (the construct-inline leaf fast
+    /// path or the general path), returning the constructed value.
+    Construct,
     /// The compiled `Step::CallApply` (a member call whose property name is
     /// `apply`/`call`): runs the interpreter's `do_call_apply` — the
     /// intrinsic check and, on a match, the direct call of the receiver with
@@ -212,6 +216,7 @@ impl Helper {
             Helper::ArgsPush => "args_push",
             Helper::ArgsSpread => "args_spread",
             Helper::CallVector => "call_vector",
+            Helper::Construct => "construct",
             Helper::CallApply => "call_apply",
             Helper::ApplyArgsFill => "apply_args_fill",
             Helper::TailCallVector => "tail_call_vector",
@@ -361,7 +366,8 @@ pub struct JitHelpers {
     /// above `INLINE_FIELDS` (Slice 3): the machine validated the shape, so
     /// read the map-described vector slot live; a hole or a divergent shape
     /// falls back to the full `Get`. `slot` is the recorded vector slot.
-    pub get_member_map_slot: Option<extern "C" fn(vm: *mut c_void, object: u64, name: u64, slot: u64) -> u64>,
+    pub get_member_map_slot:
+        Option<extern "C" fn(vm: *mut c_void, object: u64, name: u64, slot: u64) -> u64>,
     /// `Get(o, key)` with a computed key value.
     pub get_member_computed: Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64) -> u64>,
     /// `Set(o, name, v)` (plain assignment); returns the stored value.
@@ -540,6 +546,11 @@ pub struct JitHelpers {
     pub args_spread: Option<extern "C" fn(vm: *mut c_void, iterable: u64) -> u64>,
     pub call_vector:
         Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
+    /// The compiled `Step::Construct`: the callee on the JIT buffer, the
+    /// arguments in the Vm's vector. Runs the interpreter's construct
+    /// machinery (the construct-inline leaf fast path or the general path)
+    /// and returns the constructed value.
+    pub construct: Option<extern "C" fn(vm: *mut c_void, callee: u64) -> u64>,
     /// The compiled `Step::CallApply` (.notes/perf.md "remaining apply floor"):
     /// `args` points at the JIT buffer's argument region (`argc` slots, the
     /// `thisArg` first); `kind` is 0 for `apply`, 1 for `call`. Runs the
@@ -775,6 +786,7 @@ impl JitHelpers {
             args_push: None,
             args_spread: None,
             call_vector: None,
+            construct: None,
             call_apply: None,
             apply_args_fill: None,
             tail_call_vector: None,
@@ -906,6 +918,7 @@ impl JitHelpers {
             Helper::ArgsPush => self.args_push.map(|f| f as usize as u64),
             Helper::ArgsSpread => self.args_spread.map(|f| f as usize as u64),
             Helper::CallVector => self.call_vector.map(|f| f as usize as u64),
+            Helper::Construct => self.construct.map(|f| f as usize as u64),
             Helper::CallApply => self.call_apply.map(|f| f as usize as u64),
             Helper::ApplyArgsFill => self.apply_args_fill.map(|f| f as usize as u64),
             Helper::TailCallVector => self.tail_call_vector.map(|f| f as usize as u64),
@@ -1344,6 +1357,10 @@ pub extern "C" fn test_call_vector(
     _direct_eval: u64,
 ) -> u64 {
     Value::Number(53.0).bits()
+}
+
+pub extern "C" fn test_construct(_vm: *mut c_void, _callee: u64) -> u64 {
+    Value::Number(53.5).bits()
 }
 
 pub extern "C" fn test_tail_call_vector(
@@ -1846,6 +1863,7 @@ mod tests {
         assert_eq!(Helper::TdzError.name(), "tdz_error");
         assert_eq!(Helper::CallSlow.name(), "call_slow");
         assert_eq!(Helper::CallApply.name(), "call_apply");
+        assert_eq!(Helper::Construct.name(), "construct");
         assert_eq!(Helper::GetGlobal.name(), "get_global");
         assert_eq!(Helper::SetGlobal.name(), "set_global");
         assert_eq!(Helper::LoadIdent.name(), "load_ident");

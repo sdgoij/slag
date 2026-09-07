@@ -374,6 +374,7 @@ fn runtime_helpers() -> JitHelpers {
         args_push: Some(rt.args_push),
         args_spread: Some(rt.args_spread),
         call_vector: Some(rt.call_vector),
+        construct: Some(rt.construct),
         call_apply: Some(rt.call_apply),
         apply_args_fill: Some(rt.apply_args_fill),
         tail_call_vector: Some(rt.tail_call_vector),
@@ -583,6 +584,7 @@ mod tests {
             args_push: Some(helpers::test_args_push),
             args_spread: Some(helpers::test_args_spread),
             call_vector: Some(helpers::test_call_vector),
+            construct: Some(helpers::test_construct),
             call_apply: Some(helpers::test_call_apply),
             apply_args_fill: Some(helpers::test_apply_args_fill),
             tail_call_vector: Some(helpers::test_tail_call_vector),
@@ -1997,6 +1999,58 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(5050.0));
         assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_construct_in_a_loop_compiles_and_runs() {
+        // `Step::Construct` in a certified loop body: `new Point(i)` per
+        // iteration (the vector-form construct — ArgsBase/ArgsPush build the
+        // Vm argument vector, the helper runs the construct machinery).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function Point(x) { this.x = x; }\n\
+                     function bench(n) { var s = 0; for (var i = 0; i < n; i++) { var p = new Point(i); s += p.x; } return s; }\n\
+                     bench(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(4950.0));
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_constructing_a_builtin_in_a_loop_compiles_and_runs() {
+        // A builtin constructor (`new Uint8Array`) in a compiled loop: the
+        // construct helper's general path (no EcmaScript leaf) plus the
+        // typed-array element store/read on the fresh view each iteration.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function bench(n) { var s = 0; for (var i = 0; i < n; i++) { var a = new Uint8Array(4); a[0] = i & 255; s += a[0] + a.length; } return s; } bench(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(5350.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_construct_error_in_a_compiled_loop_is_caught() {
+        // A throwing construct inside a compiled body's own try: the helper
+        // sets the pending byte and the machine code dispatches to the catch
+        // without drifting the working stack.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function Boom() { throw new Error('boom'); }\n\
+                     function bench(n) { var s = 0; for (var i = 0; i < n; i++) { try { new Boom(); } catch (e) { s++; } } return s; }\n\
+                     bench(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(100.0));
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]

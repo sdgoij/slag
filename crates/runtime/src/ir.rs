@@ -6453,59 +6453,7 @@ impl Vm {
                 }
                 Step::Construct => {
                     let callee = self.pop();
-                    let base = self.args_base_stack.pop().ok_or_else(|| {
-                        JsError::new(
-                            ErrorKind::SyntaxError,
-                            "Construct without an argument boundary".into(),
-                        )
-                    })?;
-                    // GC-2: the general construct path copies its arguments
-                    // into a local Vec (the leaf path's frame copies them
-                    // before any collection, so it can split freely); the
-                    // copy is unrooted while the construct machinery (env
-                    // records, the capture context, a rest binding's
-                    // `array_from_values`) allocates, so `--gc-stress` is
-                    // suppressed for the window.
-                    let result = if self.can_inline_leaf()
-                        && let ValueKind::Function(function) = callee.kind()
-                        && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
-                        && agent.realm_count.get() == 1
-                        && let Some(entry) = agent.leaf_lookup(function.id())
-                        // Cut 33: the certified base-constructor leaf verdict
-                        // (leaf body, base kind, no fields/private methods) is
-                        // cached at ir-compile time.
-                        && entry.construct_inline
-                    {
-                        // The argument slice is read in place from `self.args`
-                        // into a small stack buffer (≤3 args, the common
-                        // shape) instead of `split_off`'s per-construct Vec
-                        // allocation; a longer argument list keeps the Vec
-                        // path. The buffer is a local like the Vec was, so
-                        // the rooting story is unchanged.
-                        let argc = self.args.len() - base;
-                        let mut args_buf = [Value::Undefined; 3];
-                        let args: std::borrow::Cow<'_, [Value]> = if argc <= args_buf.len() {
-                            args_buf[..argc].copy_from_slice(&self.args[base..]);
-                            std::borrow::Cow::Borrowed(&args_buf[..argc])
-                        } else {
-                            std::borrow::Cow::Owned(self.args.split_off(base))
-                        };
-                        self.args.truncate(base);
-                        let ir = entry.ir.clone();
-                        let strict = entry.strict;
-                        // Cut 30: clone the callee's env only for a leaf
-                        // that reads one (see `do_call_fast`).
-                        let environment = if ir.leaf_uses_env {
-                            entry.environment
-                        } else {
-                            None
-                        };
-                        self.run_leaf_construct(agent, &ir, environment, strict, &callee, &args)?
-                    } else {
-                        let _stress = StressSuppress::new();
-                        let args = self.args.split_off(base);
-                        crate::function::construct(agent, &callee, &args, &callee)?
-                    };
+                    let result = self.step_construct(agent, callee)?;
                     self.stack.push(result);
                 }
                 Step::TaggedTemplate(template) => {
@@ -10214,6 +10162,72 @@ impl Vm {
                 ErrorKind::SyntaxError,
                 "Illegal break/continue statement".into(),
             )),
+        }
+    }
+
+    /// The shared `Step::Construct` core (the interpreter handler and the
+    /// JIT's `construct` helper): pop the argument boundary, then run the
+    /// certified base-constructor LEAF inline when the callee qualifies
+    /// (mirroring `do_call_fast`'s leaf cache read) or the general
+    /// construct machinery otherwise. The callee was popped by the caller;
+    /// the args sit in `self.args` above the boundary.
+    pub(crate) fn step_construct(
+        &mut self,
+        agent: &mut Agent,
+        callee: Value,
+    ) -> Result<Value, JsError> {
+        let base = self.args_base_stack.pop().ok_or_else(|| {
+            JsError::new(
+                ErrorKind::SyntaxError,
+                "Construct without an argument boundary".into(),
+            )
+        })?;
+        // GC-2: the general construct path copies its arguments
+        // into a local Vec (the leaf path's frame copies them
+        // before any collection, so it can split freely); the
+        // copy is unrooted while the construct machinery (env
+        // records, the capture context, a rest binding's
+        // `array_from_values`) allocates, so `--gc-stress` is
+        // suppressed for the window.
+        if self.can_inline_leaf()
+            && let ValueKind::Function(function) = callee.kind()
+            && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+            && agent.realm_count.get() == 1
+            && let Some(entry) = agent.leaf_lookup(function.id())
+            // Cut 33: the certified base-constructor leaf verdict
+            // (leaf body, base kind, no fields/private methods) is
+            // cached at ir-compile time.
+            && entry.construct_inline
+        {
+            // The argument slice is read in place from `self.args`
+            // into a small stack buffer (≤3 args, the common
+            // shape) instead of `split_off`'s per-construct Vec
+            // allocation; a longer argument list keeps the Vec
+            // path. The buffer is a local like the Vec was, so
+            // the rooting story is unchanged.
+            let argc = self.args.len() - base;
+            let mut args_buf = [Value::Undefined; 3];
+            let args: std::borrow::Cow<'_, [Value]> = if argc <= args_buf.len() {
+                args_buf[..argc].copy_from_slice(&self.args[base..]);
+                std::borrow::Cow::Borrowed(&args_buf[..argc])
+            } else {
+                std::borrow::Cow::Owned(self.args.split_off(base))
+            };
+            self.args.truncate(base);
+            let ir = entry.ir.clone();
+            let strict = entry.strict;
+            // Cut 30: clone the callee's env only for a leaf
+            // that reads one (see `do_call_fast`).
+            let environment = if ir.leaf_uses_env {
+                entry.environment
+            } else {
+                None
+            };
+            self.run_leaf_construct(agent, &ir, environment, strict, &callee, &args)
+        } else {
+            let _stress = StressSuppress::new();
+            let args = self.args.split_off(base);
+            crate::function::construct(agent, &callee, &args, &callee)
         }
     }
 

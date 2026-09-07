@@ -5856,6 +5856,48 @@ row stays interpreter-bound in the jit column. Supporting `Step::Construct`
 param-array analog measured 2.2x (232→106ms). That is an L3-coverage
 slice, separate from this element-path landing.
 
+### JIT: `Step::Construct` lowers as a vector-form construct helper (measured + landed 2026-09-07)
+
+The 2026-09-07 typed-array landing's closing note is now closed: a
+certified body containing `new` reached the JIT and bailed whole-body at
+the emit-step gate (`Construct` had no arm, so the corpus `typed_array.js`
+row — whose `var ta = new Uint8Array(...)` sits inside `bench` — ran
+interpreted in BOTH columns at ~jl speed). The construct CALL is lowered
+as a vector-form helper mirroring `Step::Call`: the callee rides the work
+stack, the arguments are built in `Vm::args` by the existing
+`ArgsBase`/`ArgsPush`/`ArgsSpread` helpers, and a new `construct` helper
+pops the argument boundary and runs the interpreter's shared
+`step_construct` core (extracted from the `Step::Construct` handler) —
+the certified base-constructor LEAF inline fast path (`run_leaf_construct`,
+when `can_inline_leaf` and the leaf cache's `construct_inline` verdict
+qualify) or the general `crate::function::construct` machinery. The new
+arm is net-0 in `max_stack_usage` (pop callee, push result), is named in
+`step_name`, and the helper runs the four-file mirror (`JitSlowPaths`
+field/static/extern in runtime jit.rs, the `Helper` variant/name/field/
+none/get/test double in jit helpers.rs, the `runtime_helpers()`/
+`helpers_all()` copies in jit lib.rs, and the compiler `emit_step` arm).
+
+A/B on the corpus rows whose bodies construct LOCALLY (previously never
+compiled, jit == jl): `arrays/typed_array.js` jit ~197 → ~106ms (~1.9x),
+`arrays/index_loop.js` jit ~139 → ~70ms (~2x, its `new Array(200000)`
+blocked the whole body's compile). The interpreter columns are unchanged
+and non-constructing rows move only with machine drift. `--jit-bench`
+rows stay result-ok and unchanged. New `installed_jit_*` e2e tests drive
+constructs through real compiled bodies: a base `function` constructor
+in a loop, a builtin (`new Uint8Array`) in a loop, and a throwing
+construct (`new Boom` whose body throws) caught by the compiled body's
+own try. A construct differential battery (base fn, class + fields +
+derived + `super` + `#priv` getter, `new.target`, Uint16Array/Date/
+RegExp/Map/Array builtins, spread args, a param-throwing constructor
+caught per iteration, a computed/conditional callee, inner constructs,
+object-literal mixes) is byte-identical to Node under jit, jitless, and
+`--gc-stress`.
+
+Gates: clippy clean, workspace tests green (177 jit incl. the 3 new), and
+the three release sweeps at baseline (language 23721/3 skip, built-ins
+23657/155 skip, annexB 1086/1086, zero fail/crash/hang); 37-workload
+corpus parity across all four modes.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

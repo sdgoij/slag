@@ -216,6 +216,10 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::ArgsPush | Step::ArgsSpread => depth = depth.saturating_sub(1),
             Step::Call { .. } => depth = depth.saturating_sub(1),
             Step::TailCall { .. } => depth = depth.saturating_sub(2),
+            // The vector-form construct: `[callee]` on the work stack (the
+            // arguments are in the Vm's vector), popped and replaced by the
+            // result — net 0.
+            Step::Construct => {}
             // Array literals (Cut 52): `ArrayBegin` pushes the array;
             // `ArrayElement`/`ArraySpread` pop the element(s) + the array and
             // push the array back; `ArrayHole`/`ArrayEnd` keep the array on
@@ -458,6 +462,7 @@ fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Call { .. } | Step::CallFast { .. } => "Call",
         Step::CallApply { .. } => "CallApply",
+        Step::Construct => "Construct",
         Step::CallFastGlobal { .. }
         | Step::CallFastSlot { .. }
         | Step::CallFastGlobalStore { .. }
@@ -4266,6 +4271,18 @@ impl<'a> Lowerer<'a> {
                     Helper::CallVector,
                     &[this, callee, direct_eval_imm],
                 )?;
+                self.push(result);
+                self.fall_through(index);
+            }
+            Step::Construct => {
+                // The vector-form construct: `[callee]` on the work stack,
+                // the arguments in `Vm::args` (built by `ArgsBase`/
+                // `ArgsPush`/`ArgsSpread` through the helpers). The helper
+                // pops the argument boundary and runs the interpreter's
+                // construct machinery (the construct-inline leaf fast path
+                // or the general path), returning the constructed value.
+                let callee = self.pop();
+                let result = self.call_slow(self.sig_bool, Helper::Construct, &[callee])?;
                 self.push(result);
                 self.fall_through(index);
             }
