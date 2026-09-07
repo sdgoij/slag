@@ -409,8 +409,9 @@ pub unsafe extern "C" fn memory_grow_helper(
 
 /// Decode one u64 call slot into an interpreter value of `ty` (the compiled
 /// entry ABI's argument marshaling, inverted). Numeric types decode directly;
-/// a function- or extern-reference type decodes its token. Returns `None` for
-/// an unsupported type or an unencodable token.
+/// a reference type decodes its token (the lowerable subset only carries
+/// null/function/external/i31 references). Returns `None` for an unsupported
+/// type or an unencodable token.
 #[cfg(feature = "compile")]
 fn value_from_call_slot(ty: ValType, slot: u64) -> Option<Value> {
     match ty {
@@ -418,11 +419,10 @@ fn value_from_call_slot(ty: ValType, slot: u64) -> Option<Value> {
         ValType::I64 => Some(Value::I64(slot as i64)),
         ValType::F32 => Some(Value::F32(slot as u32)),
         ValType::F64 => Some(Value::F64(slot)),
-        ValType::Ref(reference)
-            if reference.heap == HeapType::Func || reference.heap == HeapType::Extern =>
-        {
-            crate::values::token_to_ref(slot)
-        }
+        // Any reference parameter decodes by token: the lowerable subset only
+        // ever carries null/function/external/i31 references across a
+        // boundary, and the token carries its own kind.
+        ValType::Ref(_) => crate::values::token_to_ref(slot),
         _ => None,
     }
 }

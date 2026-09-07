@@ -2120,3 +2120,23 @@ match bit-for-bit (parameter order and types), plus a throw inside an
 if-then-only body with a dead then-branch. `wasmtest equiv` is green
 over the whole core corpus: 254 suites, 0 diverged. 46 compile tests, 82
 total with the feature, clippy clean in both configurations.
+
+Internal `i31` references ride the compiled token model (the first
+`any`-hierarchy heap the compiler carries, following the func/extern
+regions): token bit 60 (bits 61-63 clear) packs a canonicalized 31-bit
+value, so `ref.i31` (i32 modulo 2^31), `i31.get_u` (zero-extend), and
+`i31.get_s` (sign-extend bit 30, computed as `(v << 1) >> 1` exactly
+like the interpreter) lower to inline Cranelift shifts/masks over the
+token, a null token traps `NullI31Reference`, and `ref.eq` compares
+tokens (identical to `RefValue` equality for the carried subset). The
+carrier gate now admits the `I31` heap, which unlocks `(ref null i31)`
+params/locals/results/blocks across the compiled boundary and i31
+`table.get/set/grow/fill/init/copy` element tokens through the existing
+table helpers; the call-slot decoder decodes any carried-ref token
+(rather than only the concrete func/extern heaps). Unit coverage drives
+wrap/unwrap round-trips over edge bit patterns, both null traps,
+`ref.eq` over canonicalized pairs, an i31 parameter crossing the
+boundary and back, and an i31ref table through init/grow/get/overlapping
+copy reading stored values back. `wasmtest equiv` is green over the
+whole core corpus: 254 suites, 0 diverged. 48 compile tests, 84 total
+with the feature, clippy clean in both configurations.

@@ -487,10 +487,14 @@ fn clif_type(ty: ValType) -> Option<Type> {
         ValType::I64 => Some(types::I64),
         ValType::F32 => Some(types::F32),
         ValType::F64 => Some(types::F64),
-        // A (nullable or not) function reference rides the compiled stack as
-        // an opaque u64 token (see `values`); a null is token 0. Refs over
-        // other heap types (extern/exn/GC) stay interpreted.
-        ValType::Ref(reference) if reference.heap == HeapType::Func => Some(types::I64),
+        ValType::Ref(reference)
+            if matches!(
+                reference.heap,
+                HeapType::Func | HeapType::Extern | HeapType::I31
+            ) =>
+        {
+            Some(types::I64)
+        }
         _ => None,
     }
 }
@@ -524,7 +528,7 @@ fn heap_is_func(module: &Module, heap: &HeapType) -> bool {
 /// a function reference, or the abstract `extern` heap (an externref — its
 /// payload packs into the token). Exn/GC-heap references stay interpreted.
 fn heap_is_carried(module: &Module, heap: &HeapType) -> bool {
-    heap_is_func(module, heap) || matches!(heap, HeapType::Extern)
+    heap_is_func(module, heap) || matches!(heap, HeapType::Extern | HeapType::I31)
 }
 
 /// The compiled carrier type of a value the lowering actually carries — a
@@ -888,7 +892,13 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         Instr::ElemDrop(_) => true,
         Instr::Throw(index) => throwable_tag(module, *index),
         Instr::RefNull(heap) => heap_is_carried(module, heap),
-        Instr::RefFunc(_) | Instr::RefIsNull | Instr::RefAsNonNull => true,
+        Instr::RefFunc(_)
+        | Instr::RefIsNull
+        | Instr::RefAsNonNull
+        | Instr::RefEq
+        | Instr::RefI31
+        | Instr::I31GetS
+        | Instr::I31GetU => true,
         Instr::BrOnNull(_) | Instr::BrOnNonNull(_) => true,
         _ => false,
     })
@@ -2408,6 +2418,53 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().select(is_null, one, zero32)
     }
 
+    /// A `ref.eq`: 1 when the two (carried) reference tokens are identical,
+    /// which for the compiled subset (null, i31, func, extern) is exactly
+    /// interpreter `RefValue` equality.
+    fn do_ref_eq(&mut self) -> Result<(), String> {
+        let b = self.pop().ok_or("operand stack underflow")?;
+        let a = self.pop().ok_or("operand stack underflow")?;
+        let equal = self.builder.ins().icmp(IntCC::Equal, a, b);
+        let one = self.iconst(types::I32, 1);
+        let zero = self.iconst(types::I32, 0);
+        let result = self.builder.ins().select(equal, one, zero);
+        self.stack.push(result);
+        Ok(())
+    }
+
+    /// A `ref.i31`: box the i32 as an internal i31 token, canonicalizing to
+    /// its low 31 bits like the interpreter (`ref.i31` takes the value modulo
+    /// 2^31).
+    fn do_ref_i31(&mut self) -> Result<(), String> {
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let wide = self.builder.ins().uextend(types::I64, value);
+        let masked = self.builder.ins().band_imm_u(wide, 0x7fff_ffff);
+        let tag = self.iconst(types::I64, crate::values::REF_I31_TAG as i64);
+        let token = self.builder.ins().bor(masked, tag);
+        self.stack.push(token);
+        Ok(())
+    }
+
+    /// An `i31.get_s`/`i31.get_u`: trap on the null token (0), else unpack the
+    /// canonical 31-bit value — zero-extended for `get_u`, sign-extended from
+    /// bit 30 for `get_s` exactly like the interpreter (`(value << 1) >> 1`).
+    fn do_i31_get(&mut self, signed: bool) -> Result<(), String> {
+        let token = self.pop().ok_or("operand stack underflow")?;
+        let zero = self.iconst(types::I64, 0);
+        let is_null = self.builder.ins().icmp(IntCC::Equal, token, zero);
+        self.trap_if(is_null, TRAP_NULL_I31_REFERENCE);
+        let masked = self.builder.ins().band_imm_u(token, 0x7fff_ffff);
+        let value32 = self.builder.ins().ireduce(types::I32, masked);
+        let out = if signed {
+            let shifted = self.builder.ins().ishl_imm_u(value32, 1);
+            self.builder.ins().sshr_imm_u(shifted, 1)
+        } else {
+            value32
+        };
+        self.stack.push(out);
+        Ok(())
+    }
+
     /// A `table.get` over a 32-bit funcref table: pop the i32 index, read the
     /// element through the runtime helper (mode 3), and push its token.
     fn do_table_get(&mut self, table: u32) -> Result<(), String> {
@@ -2962,6 +3019,10 @@ impl<'a> Lowerer<'a> {
                 self.stack.push(token);
             }
             Instr::RefAsNonNull => self.do_ref_as_non_null()?,
+            Instr::RefEq => self.do_ref_eq()?,
+            Instr::RefI31 => self.do_ref_i31()?,
+            Instr::I31GetS => self.do_i31_get(true)?,
+            Instr::I31GetU => self.do_i31_get(false)?,
             Instr::BrOnNull(label) => self.do_br_on_null(*label)?,
             Instr::BrOnNonNull(label) => self.do_br_on_non_null(*label)?,
             Instr::TableGet(table) => self.do_table_get(*table)?,
@@ -6389,5 +6450,248 @@ mod tests {
         check(&module, 2, &[vec![Value::F32(5.0f32.to_bits())]]);
         check(&module, 3, &[vec![Value::I64(5)]]);
         check(&module, 4, &[vec![Value::F64(5.0f64.to_bits())]]);
+    }
+
+    #[test]
+    fn i31_ops_match_the_interpreter() {
+        use crate::types::RefType;
+        // Internal i31 references ride the compiled token model: ref.i31
+        // canonicalizes an i32 to its low 31 bits, i31.get_s/u unpack it (a
+        // null operand traps NullI31Reference), ref.eq compares tokens, and
+        // an i31 parameter crosses the compiled boundary and back.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                SubType::func(vec![], vec![ValType::I32]),
+                SubType::func(vec![ValType::I32, ValType::I32], vec![ValType::I32]),
+                SubType::func(
+                    vec![ValType::Ref(RefType {
+                        nullable: false,
+                        heap: HeapType::I31,
+                    })],
+                    vec![ValType::I32],
+                ),
+            ],
+            functions: vec![0, 0, 1, 1, 2, 3],
+            bodies: vec![
+                // 0: i31.get_u (ref.i31 (local.get 0)).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::RefI31, Instr::I31GetU],
+                },
+                // 1: i31.get_s of the same.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::RefI31, Instr::I31GetS],
+                },
+                // 2: i31.get_u of a null i31 -> NullI31Reference.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::RefNull(HeapType::I31), Instr::I31GetU],
+                },
+                // 3: i31.get_s of a null i31 -> NullI31Reference.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::RefNull(HeapType::I31), Instr::I31GetS],
+                },
+                // 4: ref.eq of two ref.i31'd i32s (canonicalized).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::RefI31,
+                        Instr::LocalGet(1),
+                        Instr::RefI31,
+                        Instr::RefEq,
+                    ],
+                },
+                // 5: an i31 parameter crossing the compiled boundary, read
+                // back with i31.get_u.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::I31GetU],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "i31 module did not compile"
+        );
+        let values = [
+            0i32,
+            1,
+            -1,
+            0x3fff_ffff,
+            0x4000_0000,
+            0x7fff_ffff,
+            0xaaaa_aaaa_u32 as i32,
+        ];
+        let wrap = |v: i32| vec![Value::I32(v)];
+        let cases: Vec<Vec<Value>> = values.iter().map(|&v| wrap(v)).collect();
+        assert_equiv(&module, 0, &cases);
+        assert_equiv(&module, 1, &cases);
+        assert_equiv(&module, 2, &[vec![]]);
+        assert_equiv(&module, 3, &[vec![]]);
+        let eq_cases: Vec<Vec<Value>> = [
+            (0, 0),
+            (5, 5),
+            (5, 6),
+            (-1, -1),
+            (-1, 0x7fff_ffff),
+            (0x7fff_ffff, -1),
+            (12345, 12345),
+        ]
+        .into_iter()
+        .map(|(a, b)| vec![Value::I32(a), Value::I32(b)])
+        .collect();
+        assert_equiv(&module, 4, &eq_cases);
+        let boundary_cases: Vec<Vec<Value>> = [0, 1, -1, 0x7fff_ffff]
+            .into_iter()
+            .map(|v| vec![Value::Ref(RefValue::I31(v & 0x7fff_ffff))])
+            .collect();
+        assert_equiv(&module, 5, &boundary_cases);
+    }
+
+    #[test]
+    fn i31_tables_match_the_interpreter() {
+        use crate::module::{ElementMode, ElementSegment};
+        use crate::types::RefType;
+        // A (ref null i31) table: table.get/grow/fill/copy/init all lower over
+        // i31 element tokens, and reading a slot back with i31.get_u observes
+        // the stored value.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![]),
+                SubType::func(vec![], vec![ValType::I32]),
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                SubType::func(vec![ValType::I32, ValType::I32], vec![ValType::I32]),
+                SubType::func(vec![ValType::I32, ValType::I32, ValType::I32], vec![]),
+            ],
+            functions: vec![0, 1, 2, 3, 4, 4, 4],
+            bodies: vec![
+                // 0: the no-op referenced by the element segment.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![],
+                },
+                // 1: table.size.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::TableSize(0)],
+                },
+                // 2: i31.get_u of table.get slot local 0.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::TableGet(0), Instr::I31GetU],
+                },
+                // 3: grow table 0 by local 1 slots filled with ref.i31(local
+                // 0) -> old size or -1.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::RefI31,
+                        Instr::LocalGet(1),
+                        Instr::TableGrow(0),
+                    ],
+                },
+                // 4: fill table 0 with ref.i31(local 1) over [local 0, +local
+                // 2).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::RefI31,
+                        Instr::LocalGet(2),
+                        Instr::TableFill(0),
+                    ],
+                },
+                // 5: table.init from element segment 0 (three ref.i31 items)
+                // at (dst, src, len).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::TableInit {
+                            element_index: 0,
+                            table: 0,
+                        },
+                    ],
+                },
+                // 6: table.copy over table 0 at (dst, src, len).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::TableCopy { dst: 0, src: 0 },
+                    ],
+                },
+            ],
+            tables: vec![Table {
+                ty: TableType {
+                    element: RefType {
+                        nullable: true,
+                        heap: HeapType::I31,
+                    },
+                    limits: Limits {
+                        min: 4,
+                        max: None,
+                        shared: false,
+                    },
+                    table64: false,
+                },
+                init: None,
+            }],
+            elements: vec![ElementSegment {
+                ty: RefType {
+                    nullable: true,
+                    heap: HeapType::I31,
+                },
+                mode: ElementMode::Passive,
+                init: (0..3)
+                    .map(|i| vec![Instr::I32Const(i + 10), Instr::RefI31])
+                    .collect(),
+            }],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "i31 table module did not compile"
+        );
+        let outcomes = run_seq(
+            &module,
+            &[
+                // 5: init items 10, 11, 12 at slots 0..3.
+                (5, vec![Value::I32(0), Value::I32(0), Value::I32(3)]),
+                (2, vec![Value::I32(0)]),
+                (2, vec![Value::I32(2)]),
+                (1, vec![]),
+                // 3: grow 2 slots filled with 7 -> old 4.
+                (3, vec![Value::I32(7), Value::I32(2)]),
+                (1, vec![]),
+                // 2: read slot 4 (the grown fill).
+                (2, vec![Value::I32(4)]),
+                // 6: overlapping copy of [0, 3) onto [1, 4).
+                (6, vec![Value::I32(1), Value::I32(0), Value::I32(3)]),
+                (2, vec![Value::I32(1)]),
+                (2, vec![Value::I32(3)]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(10)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::I32(12)]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(4)]));
+        assert_eq!(outcomes[4], Ok(vec![Value::I32(4)]));
+        assert_eq!(outcomes[5], Ok(vec![Value::I32(6)]));
+        assert_eq!(outcomes[6], Ok(vec![Value::I32(7)]));
+        assert_eq!(outcomes[7], Ok(vec![]));
+        assert_eq!(outcomes[8], Ok(vec![Value::I32(10)]));
+        assert_eq!(outcomes[9], Ok(vec![Value::I32(12)]));
     }
 }

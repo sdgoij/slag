@@ -12,8 +12,10 @@ use crate::instr::NumOp;
 /// null reference; a function reference is tagged with bit 63 and packs its
 /// address's instance (bits 32-62, up to 2^31) and full function-index-space
 /// index (bits 0-31); an external reference is tagged with bit 62 and packs
-/// its payload kind (bits 60-61) and 60-bit payload. An address/payload that
-/// does not fit stays interpreted.
+/// its payload kind (bits 60-61) and 60-bit payload; an internal `i31` (the
+/// `any`-hierarchy reference the compiled subset carries) is tagged with bit
+/// 60 (bits 61-63 clear) and packs its canonicalized 31-bit value. An
+/// address/payload that does not fit stays interpreted.
 pub const REF_NULL_TOKEN: u64 = 0;
 pub const REF_FUNC_TAG: u64 = 1 << 63;
 pub const REF_EXTERN_TAG: u64 = 1 << 62;
@@ -24,6 +26,9 @@ const KIND_HOST: u64 = 0;
 const KIND_I31: u64 = 1;
 const KIND_STRUCT: u64 = 2;
 const KIND_ARRAY: u64 = 3;
+/// An internal (non-extern) `i31` reference: bit 60 with bits 61-63 clear.
+pub const REF_I31_TAG: u64 = 1 << 60;
+const REF_I31_VALUE_MASK: u64 = 0x7fff_ffff;
 
 /// The compiled token for a function address, when both parts fit.
 pub fn func_ref_token(instance: usize, index: usize) -> Option<u64> {
@@ -48,13 +53,14 @@ pub fn extern_ref_token(inner: ExternInner) -> Option<u64> {
 }
 
 /// Encode an interpreter value as its compiled token. Only the references the
-/// compiled subset carries are encodable: null, function references, and
-/// external references.
+/// compiled subset carries are encodable: null, function references, external
+/// references, and internal `i31` references.
 pub fn ref_to_token(value: Value) -> Option<u64> {
     match value {
         Value::Ref(RefValue::Null) => Some(REF_NULL_TOKEN),
         Value::Ref(RefValue::Func(addr)) => func_ref_token(addr.instance, addr.index),
         Value::Ref(RefValue::Extern(inner)) => extern_ref_token(inner),
+        Value::Ref(RefValue::I31(value)) => Some(REF_I31_TAG | value as u32 as u64),
         _ => None,
     }
 }
@@ -78,6 +84,11 @@ pub fn token_to_ref(token: u64) -> Option<Value> {
             _ => return None,
         };
         return Some(Value::Ref(RefValue::Extern(inner)));
+    }
+    if token & REF_I31_TAG != 0 {
+        return Some(Value::Ref(RefValue::I31(
+            (token & REF_I31_VALUE_MASK) as i32,
+        )));
     }
     None
 }
