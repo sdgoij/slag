@@ -459,7 +459,8 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// element `y`, type-checked against `z`; `2` = `call_ref` on the function
 /// token `x`, type-checked against `z`; `3` = `table.get` at table `x` slot
 /// `y`, token written to `scratch[0]`; `4` = `table.set` of token `z` at
-/// table `x` slot `y`.
+/// table `x` slot `y`; `5`-`8` = the bulk-memory ops (see [`bulk_op`]);
+/// `9`-`14` = the table bulk ops (see [`table_bulk_op`]).
 ///
 /// # Safety
 ///
@@ -482,13 +483,16 @@ pub unsafe extern "C" fn wasm_call_helper(
 ) -> i32 {
     let code_of = crate::compile::code_of_trap;
     let store = unsafe { &mut *store };
-    // Table reads/writes (modes 3/4) and the bulk-memory ops (modes 5-8)
-    // resolve cells/segments directly.
-    if (3..=8).contains(&mode) {
+    // Table reads/writes (modes 3/4), the bulk-memory ops (modes 5-8), and
+    // the table bulk ops (modes 9-14) resolve cells/segments directly.
+    if (3..=14).contains(&mode) {
         if mode == 3 || mode == 4 {
             return table_op(store, instance, mode, x, y, z, scratch);
         }
-        return bulk_op(store, instance, mode, x, y, scratch);
+        if mode <= 8 {
+            return bulk_op(store, instance, mode, x, y, scratch);
+        }
+        return table_bulk_op(store, instance, mode, x, y, scratch);
     }
     // Resolve the target and the declared type with immutable reads only,
     // dropping every borrow before the store is mutated below.
@@ -921,6 +925,206 @@ fn bulk_op(store: &mut Store, instance: u64, mode: u64, x: u64, y: u64, scratch:
             crate::compile::TRAP_NONE
         }
     }
+}
+
+/// A compiled table bulk op (runtime helper modes 9-14). The operand slots
+/// (table addresses, lengths, and the reference token where one exists, each
+/// a u64) ride `scratch[0..3]`: `table.size` (9, `x`=table, size written to
+/// `scratch[0]`), `table.grow` (10, `x`=table, delta at slot 0 and the init
+/// token at slot 1, old length or all-ones written to slot 0), `table.fill`
+/// (11, `x`=table, dst/value/len at slots 0-2), `table.init` (12, `x`=elem
+/// index, `y`=table, dst/src/len at slots 0-2), `table.copy` (13, `x`=dst
+/// table, `y`=src table, dst/src/len at slots 0-2), and `elem.drop` (14,
+/// `x`=elem index). Bounds failures are `OutOfBoundsTableAccess`, mirroring
+/// the interpreter exactly (a dropped element segment is empty, overlapping
+/// same-table copies move through a temporary, and growth caps follow the
+/// table's address type). The `size`/`grow` result is the full u64 scalar
+/// (an all-ones failure), and the compiled body loads it at its own width.
+#[cfg(feature = "compile")]
+fn table_bulk_op(
+    store: &mut Store,
+    instance: u64,
+    mode: u64,
+    x: u64,
+    y: u64,
+    scratch: *mut u64,
+) -> i32 {
+    let code_of = crate::compile::code_of_trap;
+    match mode {
+        9 => {
+            // table.size: the current length as the table's address width.
+            let Some(cell) = table_cell_of(store, instance, x) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let Some(size) = table_cell_len(store, cell) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            unsafe {
+                *scratch = size;
+            }
+            crate::compile::TRAP_NONE
+        }
+        10 => {
+            // table.grow: grow by `slot(0)` slots filled with the reference
+            // decoded from `slot(1)`; the old length, or all-ones (an i32/i64
+            // -1 at the table's width) when the growth would exceed the
+            // limits.
+            let Some(cell) = table_cell_of(store, instance, x) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let delta = unsafe { *scratch };
+            let token = unsafe { *scratch.add(1) };
+            let Some(value) = crate::values::token_to_ref(token) else {
+                store.set_pending_error(ExecFail::Unsupported(
+                    "unsupported table element across a compiled table.grow",
+                ));
+                return crate::compile::TRAP_PENDING_ERROR;
+            };
+            let Value::Ref(init) = value else {
+                return crate::compile::TRAP_PENDING_ERROR;
+            };
+            let table64 = table_cell_is64(store, cell);
+            let old = store.tables[cell].grow(delta, init, table64);
+            unsafe {
+                *scratch = old.unwrap_or(u64::MAX);
+            }
+            crate::compile::TRAP_NONE
+        }
+        11 => {
+            // table.fill: fill `[dst, dst+len)` with the reference token.
+            let Some(cell) = table_cell_of(store, instance, x) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let Some(size) = table_cell_len(store, cell) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let dst = unsafe { *scratch };
+            let len = unsafe { *scratch.add(2) };
+            if dst.checked_add(len).is_none_or(|end| end > size) {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            }
+            let Some(value) = crate::values::token_to_ref(unsafe { *scratch.add(1) }) else {
+                store.set_pending_error(ExecFail::Unsupported(
+                    "unsupported table element across a compiled table.fill",
+                ));
+                return crate::compile::TRAP_PENDING_ERROR;
+            };
+            let Value::Ref(fill) = value else {
+                return crate::compile::TRAP_PENDING_ERROR;
+            };
+            let (dst, len) = (dst as usize, len as usize);
+            store.tables[cell].elements[dst..dst + len].fill(fill);
+            crate::compile::TRAP_NONE
+        }
+        12 => {
+            // table.init: copy `[src, src+len)` of element segment `x` into
+            // table `y` at `[dst, dst+len)`; a dropped segment is empty.
+            let Some(cell) = table_cell_of(store, instance, y) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let Some(size) = table_cell_len(store, cell) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let (dst, src, len) = (unsafe { *scratch }, unsafe { *scratch.add(1) }, unsafe {
+                *scratch.add(2)
+            });
+            let Some(segment) = store.instances[instance as usize]
+                .element_segments
+                .get(x as usize)
+            else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let source = segment.as_deref().unwrap_or(&[]);
+            if dst.checked_add(len).is_none_or(|end| end > size)
+                || src
+                    .checked_add(len)
+                    .is_none_or(|end| end > source.len() as u64)
+            {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            }
+            let (dst, src, len) = (dst as usize, src as usize, len as usize);
+            let elements = &mut store.tables[cell].elements;
+            elements[dst..dst + len].copy_from_slice(&source[src..src + len]);
+            crate::compile::TRAP_NONE
+        }
+        13 => {
+            // table.copy: `[src, src+len)` of the `y` table into `[dst,
+            // dst+len)` of the `x` table; same-cell copies behave like a
+            // memmove, different cells snapshot the source first.
+            let Some(dst_cell) = table_cell_of(store, instance, x) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let Some(src_cell) = table_cell_of(store, instance, y) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let (dst_size, src_size) = match (
+                table_cell_len(store, dst_cell),
+                table_cell_len(store, src_cell),
+            ) {
+                (Some(dst), Some(src)) => (dst, src),
+                _ => return code_of(Trap::OutOfBoundsTableAccess),
+            };
+            let (dst, src, len) = (unsafe { *scratch }, unsafe { *scratch.add(1) }, unsafe {
+                *scratch.add(2)
+            });
+            if dst.checked_add(len).is_none_or(|end| end > dst_size)
+                || src.checked_add(len).is_none_or(|end| end > src_size)
+            {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            }
+            let (dst, src, len) = (dst as usize, src as usize, len as usize);
+            if dst_cell == src_cell {
+                let elements = &mut store.tables[dst_cell].elements;
+                elements.copy_within(src..src + len, dst);
+            } else {
+                let source = store.tables[src_cell].elements[src..src + len].to_vec();
+                store.tables[dst_cell].elements[dst..dst + len].copy_from_slice(&source);
+            }
+            crate::compile::TRAP_NONE
+        }
+        _ => {
+            // elem.drop: the segment becomes empty (a later init reads none).
+            let Some(segment) = store.instances[instance as usize]
+                .element_segments
+                .get_mut(x as usize)
+            else {
+                return code_of(Trap::UnknownFunction);
+            };
+            *segment = None;
+            crate::compile::TRAP_NONE
+        }
+    }
+}
+
+/// The store cell of `instance`'s table index-space entry `table`.
+#[cfg(feature = "compile")]
+fn table_cell_of(store: &Store, instance: u64, table: u64) -> Option<usize> {
+    store
+        .instances
+        .get(instance as usize)
+        .and_then(|inst| inst.tables.get(table as usize))
+        .copied()
+}
+
+/// A table cell's current length, or `None` when the cell is gone.
+#[cfg(feature = "compile")]
+fn table_cell_len(store: &Store, cell: usize) -> Option<u64> {
+    store
+        .tables
+        .get(cell)
+        .map(|table| table.elements.len() as u64)
+}
+
+/// A table cell's `table64` flag (its address operands and `table.size`/
+/// `table.grow` values are i64), used to cap growth exactly like the
+/// interpreter's cell-level `grow`.
+#[cfg(feature = "compile")]
+fn table_cell_is64(store: &Store, cell: usize) -> bool {
+    store
+        .table_types
+        .get(cell)
+        .map(|table_type| table_type.table64)
+        .unwrap_or(false)
 }
 
 /// Rewrite the caller-owned memory descriptors at `mems` (one data-pointer +

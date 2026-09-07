@@ -835,6 +835,19 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         Instr::TableGet(table) | Instr::TableSet(table) => {
             table_is64(module, *table) == Some(false) && table_carried_ref(module, *table)
         }
+        Instr::TableSize(table) | Instr::TableGrow(table) | Instr::TableFill(table) => {
+            table_is64(module, *table).is_some() && table_carried_ref(module, *table)
+        }
+        Instr::TableInit { table, .. } => {
+            table_is64(module, *table).is_some() && table_carried_ref(module, *table)
+        }
+        Instr::TableCopy { dst, src } => {
+            table_is64(module, *dst).is_some()
+                && table_carried_ref(module, *dst)
+                && table_is64(module, *src).is_some()
+                && table_carried_ref(module, *src)
+        }
+        Instr::ElemDrop(_) => true,
         Instr::RefNull(heap) => heap_is_carried(module, heap),
         Instr::RefFunc(_) | Instr::RefIsNull | Instr::RefAsNonNull => true,
         Instr::BrOnNull(_) | Instr::BrOnNonNull(_) => true,
@@ -2545,6 +2558,198 @@ impl<'a> Lowerer<'a> {
         self.runtime_call(&args)
     }
 
+    /// A `table.size`: run the runtime table helper (mode 9) and push the
+    /// current length at the table's address width.
+    fn do_table_size(&mut self, table: u32) -> Result<(), String> {
+        let table64 = table_is64(self.module, table).ok_or("unresolved table index")?;
+        let mode = self.iconst(types::I64, 9);
+        let table_v = self.iconst(types::I64, i64::from(table));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            table_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        let size = self.read_scratch(if table64 { types::I64 } else { types::I32 });
+        self.stack.push(size);
+        Ok(())
+    }
+
+    /// A `table.grow`: pop the init reference and the delta (both on the
+    /// operand stack as value-then-delta), spill them, and run the runtime
+    /// table helper (mode 10); the old length (or -1) comes back at the
+    /// table's address width.
+    fn do_table_grow(&mut self, table: u32) -> Result<(), String> {
+        let table64 = table_is64(self.module, table).ok_or("unresolved table index")?;
+        let delta = self.pop().ok_or("operand stack underflow")?;
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let delta64 = if table64 {
+            delta
+        } else {
+            self.builder.ins().uextend(types::I64, delta)
+        };
+        self.spill_u64(0, delta64);
+        self.spill_u64(1, value);
+        let mode = self.iconst(types::I64, 10);
+        let table_v = self.iconst(types::I64, i64::from(table));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            table_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        let old = self.read_scratch(if table64 { types::I64 } else { types::I32 });
+        self.stack.push(old);
+        Ok(())
+    }
+
+    /// A `table.fill`: pop (dst, reference, len), spill them to scratch, and
+    /// run the runtime table helper (mode 11). The reference token rides slot
+    /// 1; the address operands follow the table's address type.
+    fn do_table_fill(&mut self, table: u32) -> Result<(), String> {
+        let len = self.pop_table_addr(table)?;
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let dst = self.pop_table_addr(table)?;
+        self.spill_u64(0, dst);
+        self.spill_u64(1, value);
+        self.spill_u64(2, len);
+        let mode = self.iconst(types::I64, 11);
+        let table_v = self.iconst(types::I64, i64::from(table));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            table_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// A `table.init`: pop (dst, element offset, length), spill them to
+    /// scratch, and run the runtime table helper (mode 12). The dst follows
+    /// the table's address type; the element offset and length are i32 in
+    /// both table address models, exactly like the interpreter.
+    fn do_table_init(&mut self, element_index: u32, table: u32) -> Result<(), String> {
+        let len_value = self.pop().ok_or("operand stack underflow")?;
+        let len = self.builder.ins().uextend(types::I64, len_value);
+        let src_value = self.pop().ok_or("operand stack underflow")?;
+        let src = self.builder.ins().uextend(types::I64, src_value);
+        let dst = self.pop_table_addr(table)?;
+        self.spill_u64(0, dst);
+        self.spill_u64(1, src);
+        self.spill_u64(2, len);
+        let mode = self.iconst(types::I64, 12);
+        let elem_v = self.iconst(types::I64, i64::from(element_index));
+        let table_v = self.iconst(types::I64, i64::from(table));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            elem_v,
+            table_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// A `table.copy`: pop (dst, src, len), spill them to scratch, and run
+    /// the runtime table helper (mode 13). The dst and src addresses follow
+    /// their own tables; the length is i64 only when both are table64, per
+    /// the interpreter.
+    fn do_table_copy(&mut self, dst: u32, src: u32) -> Result<(), String> {
+        let dst64 = table_is64(self.module, dst).ok_or("unresolved table index")?;
+        let src64 = table_is64(self.module, src).ok_or("unresolved table index")?;
+        let len = if dst64 && src64 {
+            self.pop().ok_or("operand stack underflow")?
+        } else {
+            let value = self.pop().ok_or("operand stack underflow")?;
+            self.builder.ins().uextend(types::I64, value)
+        };
+        let src_a = self.pop_table_addr(src)?;
+        let dst_a = self.pop_table_addr(dst)?;
+        self.spill_u64(0, dst_a);
+        self.spill_u64(1, src_a);
+        self.spill_u64(2, len);
+        let mode = self.iconst(types::I64, 13);
+        let dst_v = self.iconst(types::I64, i64::from(dst));
+        let src_v = self.iconst(types::I64, i64::from(src));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            dst_v,
+            src_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// An `elem.drop`: run the runtime table helper (mode 14).
+    fn do_elem_drop(&mut self, element_index: u32) -> Result<(), String> {
+        let mode = self.iconst(types::I64, 14);
+        let elem_v = self.iconst(types::I64, i64::from(element_index));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            elem_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// Pop a table instruction's address operand (i32 for a 32-bit table,
+    /// zero-extended; i64 for a table64) as a u64 slot.
+    fn pop_table_addr(&mut self, table: u32) -> Result<ClifValue, String> {
+        let value = self.pop().ok_or("operand stack underflow")?;
+        if table_is64(self.module, table).ok_or("unresolved table index")? {
+            Ok(value)
+        } else {
+            Ok(self.builder.ins().uextend(types::I64, value))
+        }
+    }
+
+    /// Load the u64 at `scratch[0]` as `ty` (the low 32 bits when `ty` is an
+    /// i32), where a table helper wrote a result scalar.
+    fn read_scratch(&mut self, ty: Type) -> ClifValue {
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 0);
+        self.builder
+            .ins()
+            .load(ty, MemFlagsData::new(), address, Offset32::new(0))
+    }
+
     /// A `ref.as_non_null`: trap on the null token (0), else keep it.
     fn do_ref_as_non_null(&mut self) -> Result<(), String> {
         let reference = self.pop().ok_or("operand stack underflow")?;
@@ -2681,6 +2886,15 @@ impl<'a> Lowerer<'a> {
             Instr::BrOnNonNull(label) => self.do_br_on_non_null(*label)?,
             Instr::TableGet(table) => self.do_table_get(*table)?,
             Instr::TableSet(table) => self.do_table_set(*table)?,
+            Instr::TableSize(table) => self.do_table_size(*table)?,
+            Instr::TableGrow(table) => self.do_table_grow(*table)?,
+            Instr::TableFill(table) => self.do_table_fill(*table)?,
+            Instr::TableInit {
+                element_index,
+                table,
+            } => self.do_table_init(*element_index, *table)?,
+            Instr::TableCopy { dst, src } => self.do_table_copy(*dst, *src)?,
+            Instr::ElemDrop(element_index) => self.do_elem_drop(*element_index)?,
             Instr::CallRef(type_index) => self.do_call_ref(*type_index, false)?,
             Instr::ReturnCallRef(type_index) => self.do_call_ref(*type_index, true)?,
             Instr::Drop => {
@@ -5584,6 +5798,407 @@ mod tests {
         assert!(matches!(
             outcomes[8],
             Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))
+        ));
+    }
+
+    #[test]
+    fn table_bulk_ops_match_the_interpreter() {
+        use crate::module::{ElementMode, ElementSegment};
+        // Two funcref tables drive the table bulk ops: table 0 starts 16
+        // slots, table 1 starts 4. A passive element segment of `ref.func 0`
+        // (six items) drives table.init; then same-table table.copy (an
+        // overlapping move), a fill, a cross-table copy, table.grow/size, and
+        // an out-of-bounds fill/init pair.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![]),
+                SubType::func(vec![], vec![ValType::I32]),
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                SubType::func(vec![ValType::I32, ValType::I32], vec![]),
+                SubType::func(vec![ValType::I32, ValType::I32, ValType::I32], vec![]),
+            ],
+            functions: vec![0, 1, 2, 3, 4, 4, 4, 1, 2],
+            bodies: vec![
+                // 0: the referenced no-op function.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![],
+                },
+                // 1: table.size of table 0.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::TableSize(0)],
+                },
+                // 2: grow table 0 by local 0 (a null fill) -> old size or -1.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::RefNull(HeapType::Func),
+                        Instr::LocalGet(0),
+                        Instr::TableGrow(0),
+                    ],
+                },
+                // 3: table.fill table 0 with a null over [local 0, +local 1).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::RefNull(HeapType::Func),
+                        Instr::LocalGet(1),
+                        Instr::TableFill(0),
+                    ],
+                },
+                // 4: table.init from element segment 0 into table 0 at
+                // (dst, src, len).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::TableInit {
+                            element_index: 0,
+                            table: 0,
+                        },
+                    ],
+                },
+                // 5: same-table table.copy over table 0 at (dst, src, len).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::TableCopy { dst: 0, src: 0 },
+                    ],
+                },
+                // 6: cross-table table.copy from table 1 into table 0.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::TableCopy { dst: 0, src: 1 },
+                    ],
+                },
+                // 7: set table 1 slot 0 to `ref.func 0`, then ref.is_null of
+                // a table.get of it (cross-call visible).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(0),
+                        Instr::RefFunc(0),
+                        Instr::TableSet(1),
+                        Instr::I32Const(0),
+                        Instr::TableGet(1),
+                        Instr::RefIsNull,
+                    ],
+                },
+                // 8: ref.is_null of a table.get of table 0 at local 0.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::TableGet(0), Instr::RefIsNull],
+                },
+            ],
+            tables: vec![
+                Table {
+                    ty: TableType {
+                        element: RefType::FUNC,
+                        limits: Limits {
+                            min: 16,
+                            max: None,
+                            shared: false,
+                        },
+                        table64: false,
+                    },
+                    init: None,
+                },
+                Table {
+                    ty: TableType {
+                        element: RefType::FUNC,
+                        limits: Limits {
+                            min: 4,
+                            max: None,
+                            shared: false,
+                        },
+                        table64: false,
+                    },
+                    init: None,
+                },
+            ],
+            elements: vec![ElementSegment {
+                ty: RefType::FUNC,
+                mode: ElementMode::Passive,
+                init: (0..6).map(|_| vec![Instr::RefFunc(0)]).collect(),
+            }],
+            ..Module::default()
+        };
+        let outcomes = run_seq(
+            &module,
+            &[
+                // 1: initial size.
+                (1, vec![]),
+                // 2: grow 4 -> old 16; size then 20.
+                (2, vec![Value::I32(4)]),
+                (1, vec![]),
+                // 2: grow -1 (delta 2^32-1) exceeds the 32-bit cap -> -1.
+                (2, vec![Value::I32(-1)]),
+                (1, vec![]),
+                // 4: init six ref.func items at slots 2..8.
+                (4, vec![Value::I32(2), Value::I32(0), Value::I32(6)]),
+                // 7: table 1 slot 0 is non-null after the set.
+                (7, vec![]),
+                // 3: null-fill slots 2..4.
+                (3, vec![Value::I32(2), Value::I32(2)]),
+                // 8: slot 2 is now null; slot 4 still holds a function.
+                (8, vec![Value::I32(2)]),
+                (8, vec![Value::I32(4)]),
+                // 5: overlapping same-table copy of [1, 7) onto [0, 6): slot
+                // 3 sees the function that slid in, slot 0 stays null.
+                (5, vec![Value::I32(0), Value::I32(1), Value::I32(6)]),
+                (8, vec![Value::I32(3)]),
+                (8, vec![Value::I32(0)]),
+                // 6: cross-table copy of table 1's [0, 2) onto table 0 [8,
+                // 10) (slot 0 carries the function set above).
+                (6, vec![Value::I32(8), Value::I32(0), Value::I32(2)]),
+                (8, vec![Value::I32(8)]),
+                (8, vec![Value::I32(9)]),
+                // OOB fill over the end traps.
+                (3, vec![Value::I32(15), Value::I32(6)]),
+                // OOB init over the end traps.
+                (4, vec![Value::I32(100), Value::I32(0), Value::I32(1)]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(16)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(16)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::I32(20)]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(-1)]));
+        assert_eq!(outcomes[4], Ok(vec![Value::I32(20)]));
+        assert_eq!(outcomes[5], Ok(vec![]));
+        assert_eq!(outcomes[6], Ok(vec![Value::I32(0)]));
+        assert_eq!(outcomes[7], Ok(vec![]));
+        assert_eq!(outcomes[8], Ok(vec![Value::I32(1)]));
+        assert_eq!(outcomes[9], Ok(vec![Value::I32(0)]));
+        assert_eq!(outcomes[10], Ok(vec![]));
+        assert_eq!(outcomes[11], Ok(vec![Value::I32(0)]));
+        assert_eq!(outcomes[12], Ok(vec![Value::I32(1)]));
+        assert_eq!(outcomes[13], Ok(vec![]));
+        assert_eq!(outcomes[14], Ok(vec![Value::I32(0)]));
+        assert_eq!(outcomes[15], Ok(vec![Value::I32(1)]));
+        assert!(matches!(
+            outcomes[16],
+            Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
+        ));
+        assert!(matches!(
+            outcomes[17],
+            Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
+        ));
+    }
+
+    #[test]
+    fn table_bulk_ops_match_the_interpreter_after_drop() {
+        use crate::module::{ElementMode, ElementSegment};
+        // A passive element segment is dropped by elem.drop; the table.size
+        // still reports the grown length, and a later table.init of nonzero
+        // length sees an empty segment and traps.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![]),
+                SubType::func(vec![ValType::I32, ValType::I32, ValType::I32], vec![]),
+            ],
+            functions: vec![0, 0, 1],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::ElemDrop(0)],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::TableInit {
+                            element_index: 0,
+                            table: 0,
+                        },
+                    ],
+                },
+            ],
+            tables: vec![Table {
+                ty: TableType {
+                    element: RefType::FUNC,
+                    limits: Limits {
+                        min: 4,
+                        max: None,
+                        shared: false,
+                    },
+                    table64: false,
+                },
+                init: None,
+            }],
+            elements: vec![ElementSegment {
+                ty: RefType::FUNC,
+                mode: ElementMode::Passive,
+                init: (0..3).map(|_| vec![Instr::RefFunc(0)]).collect(),
+            }],
+            ..Module::default()
+        };
+        let outcomes = run_seq(
+            &module,
+            &[
+                (2, vec![Value::I32(0), Value::I32(0), Value::I32(3)]),
+                (1, vec![]),
+                (2, vec![Value::I32(1), Value::I32(0), Value::I32(0)]),
+                // After the drop a zero-length init is fine (empty source) ...
+                (2, vec![Value::I32(0), Value::I32(0), Value::I32(0)]),
+                // ... but any nonzero length traps.
+                (2, vec![Value::I32(0), Value::I32(0), Value::I32(1)]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![]));
+        assert_eq!(outcomes[1], Ok(vec![]));
+        assert_eq!(outcomes[2], Ok(vec![]));
+        assert_eq!(outcomes[3], Ok(vec![]));
+        assert!(matches!(
+            outcomes[4],
+            Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
+        ));
+    }
+
+    #[test]
+    fn table64_bulk_ops_match_the_interpreter() {
+        use crate::module::{ElementMode, ElementSegment};
+        // A table64 funcref table: the address operands, `table.size`/`grow`
+        // results, and a same-table `table.copy` length are i64, while
+        // `table.init`'s element offset and length stay i32 — exactly the
+        // interpreter's width model.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![]),
+                SubType::func(vec![], vec![ValType::I64]),
+                SubType::func(vec![ValType::I64], vec![ValType::I64]),
+                SubType::func(vec![ValType::I64, ValType::I64], vec![]),
+                SubType::func(vec![ValType::I64, ValType::I32, ValType::I32], vec![]),
+                SubType::func(vec![ValType::I64, ValType::I64, ValType::I64], vec![]),
+            ],
+            functions: vec![0, 1, 2, 3, 4, 5],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![],
+                },
+                // 1: table.size (an i64 result).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::TableSize(0)],
+                },
+                // 2: grow by an i64 delta (null fill) -> old size or -1.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::RefNull(HeapType::Func),
+                        Instr::LocalGet(0),
+                        Instr::TableGrow(0),
+                    ],
+                },
+                // 3: table.fill with a null over [dst, dst + len) (i64).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::RefNull(HeapType::Func),
+                        Instr::LocalGet(1),
+                        Instr::TableFill(0),
+                    ],
+                },
+                // 4: table.init (i64 dst, i32 src/len).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::TableInit {
+                            element_index: 0,
+                            table: 0,
+                        },
+                    ],
+                },
+                // 5: overlapping same-table copy with an i64 length.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::TableCopy { dst: 0, src: 0 },
+                    ],
+                },
+            ],
+            tables: vec![Table {
+                ty: TableType {
+                    element: RefType::FUNC,
+                    limits: Limits {
+                        min: 3,
+                        max: None,
+                        shared: false,
+                    },
+                    table64: true,
+                },
+                init: None,
+            }],
+            elements: vec![ElementSegment {
+                ty: RefType::FUNC,
+                mode: ElementMode::Passive,
+                init: (0..4).map(|_| vec![Instr::RefFunc(0)]).collect(),
+            }],
+            ..Module::default()
+        };
+        let outcomes = run_seq(
+            &module,
+            &[
+                // 1: initial size.
+                (1, vec![]),
+                // 2: grow 2 -> old 3; size then 5.
+                (2, vec![Value::I64(2)]),
+                (1, vec![]),
+                // 2: grow by -1 (delta 2^64-1) overflows the address space
+                // -> -1.
+                (2, vec![Value::I64(-1)]),
+                (1, vec![]),
+                // 3: fill nulls over [1, 4).
+                (3, vec![Value::I64(1), Value::I64(3)]),
+                // 5: overlapping copy [0, 3) onto [2, 5).
+                (5, vec![Value::I64(2), Value::I64(0), Value::I64(3)]),
+                // 4: init the four items at a huge i64 dst -> OOB trap; a
+                // zero-length init at the very end of the address space is
+                // fine; a copy whose end wraps past 2^64 traps.
+                (4, vec![Value::I64(1 << 40), Value::I32(0), Value::I32(1)]),
+                (3, vec![Value::I64(5), Value::I64(0)]),
+                (5, vec![Value::I64(-8), Value::I64(0), Value::I64(9)]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![Value::I64(3)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I64(3)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::I64(5)]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I64(-1)]));
+        assert_eq!(outcomes[4], Ok(vec![Value::I64(5)]));
+        assert_eq!(outcomes[5], Ok(vec![]));
+        assert_eq!(outcomes[6], Ok(vec![]));
+        assert!(matches!(
+            outcomes[7],
+            Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
+        ));
+        assert_eq!(outcomes[8], Ok(vec![]));
+        assert!(matches!(
+            outcomes[9],
+            Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
         ));
     }
 }

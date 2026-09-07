@@ -2076,3 +2076,29 @@ fill, and a drop-then-init trap sequence. `wasmtest equiv` is green over
 the `bulk-memory` dir (8 suites, 0 diverged) and the whole core corpus
 stays at 254 suites / 0 diverged. 42 compile tests, 78 total with the
 feature, clippy clean in both configurations.
+
+The table bulk ops lower (the rest of the interpreter's bulk-memory wave
+surface): `table.size` (mode 9), `table.grow` (10), `table.fill` (11),
+`table.init` (12), `table.copy` (13), and `elem.drop` (14) run through
+the same runtime helper, with reference values riding scratch slots as
+the same tokens `table.get`/`set` already use (null decodes back to a
+null element, so fills/grows with nulls work). The helper mirrors the
+interpreter exactly: same-cell copies move through a temporary
+(`Vec::copy_within`), cross-cell copies snapshot the source first,
+`table.init` reads the instance's element segment (a dropped segment is
+empty, so any later nonzero-length init traps
+`OutOfBoundsTableAccess`), and growth caps follow the table's address
+type (`table.grow` returns the old length, or all-ones read at the
+table's width for a failed grow). Both address models lower: a table64's
+dst/len operands and `table.size`/`grow` results are i64, `table.copy`'s
+length is i64 only when both tables are table64, and `table.init`'s
+element offset and length stay i32 — exactly the interpreter's width
+model. The gate admits any table whose element type the compiled value
+model carries (funcref/externref/typed function ref) at either width.
+Unit coverage drives a passive element segment through init, overlapping
+same- and cross-table copies, a fill, grow/size incl. the 32-bit cap and
+the table64 overflow failure, an out-of-bounds fill/init pair, and a
+drop-then-init trap sequence, over both 32- and 64-bit tables. `wasmtest
+equiv` is green over the whole core corpus: 254 suites, 0 diverged. 45
+compile tests, 81 total with the feature, clippy clean in both
+configurations.
