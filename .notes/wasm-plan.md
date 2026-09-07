@@ -2454,17 +2454,48 @@ lower and the whole body stays interpreted. The control-flow fixtures
 (`br`, `br_table`, `block`/`if` "as-value", `switch`, `labels`, …) are
 full of these.
 
-- [ ] Function-label model: represent the implicit function label as the
+- [x] Function-label model: represent the implicit function label as the
 outermost control frame (an implicit block whose continuation emits the
 return), or special-case function-label targets in the branch lowerers.
-- [ ] `br` / `br_if` to the function label (carrying the function results).
-- [ ] `br_table` with a function-label target among block/loop targets (the
+- [x] `br` / `br_if` to the function label (carrying the function results).
+- [x] `br_table` with a function-label target among block/loop targets (the
 labels share one arity).
-- [ ] `br_on_null`/`br_on_non_null`/`br_on_cast`/`br_on_cast_fail` to the
+- [x] `br_on_null`/`br_on_non_null`/`br_on_cast`/`br_on_cast_fail` to the
 function label.
-- [ ] Unit tests mirroring the "as-…-value" fixture shapes; equiv over `br`,
+- [x] Unit tests mirroring the "as-…-value" fixture shapes; equiv over `br`,
 `br_if`, `br_table`, `block`, `if`, `switch`, `labels`, `fac`; coverage on
 the control-flow suites rises toward 100%.
+
+#### Wave A — status (2026-09-07)
+
+`lower_body` now opens the implicit function label as a real control frame
+(a block whose continuation receives the function results and returns
+them) before the first instruction, and closes it once the instruction
+stream is exhausted. The frame sits at index 0, so the existing
+`controls.len() - 1 - depth` indexing maps every structured branch to its
+construct and the depth-equal-to-nesting branch (the function label) to
+the new frame with no change to the branch lowerers — `br`, `br_if`,
+`br_table`, and the `br_on_*` family all branch to it through
+`frame_target`, and a dead body whose only exit was such a branch still
+closes the frame and emits the return (code after the branch is skipped as
+unreachable, leaving the dead construct's unused continuation inert).
+
+Corpus effect (release equiv over the whole core suite, 254 suites, 0
+diverged): compiled coverage rose 7842 → 7885 module-defined functions
+(94 → 95%), and the "lowering error" bucket fell 95 → 52. Per-suite
+coverage on the control-flow suites: `br` 55/55, `br_if` 74/74,
+`br_table` 62/63, `block` 78/78, `loop` 7/8, `if` 46/53, `switch` 18/18,
+`labels` 57/57, `fac` 83/83, `nop` 65/65, `select` 4/4 (549/558, 98%).
+The `br_on_cast`/`br_on_cast_fail` variants ride the same `frame_target`
+path as the null branches and are covered by the corpus sweep (the unit
+tests exercise `br_on_null`/`br_on_non_null` explicitly).
+
+The residual 52 "lowering error" bodies are no longer gated by the
+function-label machinery itself: a branch to the function label now lowers
+whenever the rest of the body does, so each residual either has no such
+branch or fails to lower for an independent reason. They belong under
+Wave D's latent-mismatch audit. The reason classifier is deliberately
+coarse there — it reports no per-function `lower()` message yet.
 
 ### Wave B — globals and calls
 

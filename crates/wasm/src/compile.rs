@@ -4511,13 +4511,22 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Lower a function body. The implicit function label is a real control
+    /// frame: it is opened before the first instruction (so any branch may
+    /// target it) as an empty-parameter block whose continuation receives
+    /// the function results and returns them. Its `end` is implicit — it is
+    /// closed once the instruction stream is exhausted, at which point a
+    /// live fall-through jumps to the continuation and `emit_return` fires.
     fn lower_body(&mut self, body: &FuncBody) -> Result<(), String> {
+        let results = self.results.clone();
+        self.open_block(&[], &results);
         for instr in &body.body {
             self.instruction(instr)?;
         }
-        if !self.controls.is_empty() {
+        if self.controls.len() != 1 {
             return Err("unclosed control frame at the end of a body".to_string());
         }
+        self.close_construct()?;
         if !self.dead {
             self.emit_return()?;
         }
@@ -5893,6 +5902,154 @@ mod tests {
             .map(|n| vec![Value::I32(n)])
             .collect::<Vec<_>>();
         assert_equiv(&sum, 0, &n_cases);
+    }
+
+    #[test]
+    fn function_label_branches_match_the_interpreter() {
+        // A branch whose target is the implicit function label returns from
+        // the function carrying the results. The lowering opens the label as
+        // the outermost control frame, so these bodies compile like any
+        // other; the interpreter is the oracle.
+
+        // 1. Top-level `br 0` (no construct open; the only label is the
+        // function's) returns the parameter.
+        let top_level = module_with(
+            vec![Instr::LocalGet(0), Instr::Br(0)],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+        );
+        let value_cases = [0i32, -1, 7, 1000]
+            .into_iter()
+            .map(|v| vec![Value::I32(v)])
+            .collect::<Vec<_>>();
+        assert_equiv(&top_level, 0, &value_cases);
+
+        // 2. A bare block whose only exit is `br 1` to the function label,
+        // with unreachable code after the block (its continuation is never
+        // branched to and stays inert).
+        let bare_block = module_with(
+            vec![
+                Instr::Block(BlockType::Val(ValType::I32)),
+                Instr::I32Const(9),
+                Instr::Br(1),
+                Instr::End,
+                Instr::I32Const(2),
+            ],
+            vec![],
+            vec![],
+            vec![ValType::I32],
+        );
+        assert_equiv(&bare_block, 0, &[vec![]]);
+
+        // 3. An early exit through the function label from a loop (the only
+        // construct): count `$i` up from 1 and return it once `$i >= $n`.
+        let loop_exit = module_with(
+            vec![
+                Instr::I32Const(0),
+                Instr::LocalSet(1),
+                Instr::Loop(BlockType::Empty),
+                Instr::LocalGet(1),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalSet(1),
+                // The br_if payload (the counter) sits below the condition.
+                Instr::LocalGet(1),
+                Instr::LocalGet(1),
+                Instr::LocalGet(0),
+                Instr::Num(NumOp::I32GeS),
+                Instr::BrIf(1),
+                Instr::Br(0),
+                Instr::End,
+                Instr::LocalGet(1),
+            ],
+            vec![ValType::I32],
+            vec![ValType::I32],
+            vec![ValType::I32],
+        );
+        let n_cases = [-3i32, 0, 1, 3, 10]
+            .into_iter()
+            .map(|n| vec![Value::I32(n)])
+            .collect::<Vec<_>>();
+        assert_equiv(&loop_exit, 0, &n_cases);
+
+        // 4. A br_table whose targets mix the enclosing block (depth 0) and
+        // the function label (depth 1): index 0 returns 7 immediately, every
+        // other index falls out of the block and adds 1.
+        let table = module_with(
+            vec![
+                Instr::Block(BlockType::Val(ValType::I32)),
+                Instr::I32Const(7),
+                Instr::LocalGet(0),
+                Instr::BrTable {
+                    targets: vec![1, 0],
+                    default: 1,
+                },
+                Instr::End,
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Add),
+            ],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+        );
+        let index_cases = [-1i32, 0, 1, 5]
+            .into_iter()
+            .map(|i| vec![Value::I32(i)])
+            .collect::<Vec<_>>();
+        assert_equiv(&table, 0, &index_cases);
+
+        // 5. `br_on_null` to the function label (top level): a null argument
+        // returns the constant below it, a non-null one falls through.
+        let on_null = module_with(
+            vec![
+                Instr::I32Const(7),
+                Instr::LocalGet(0),
+                Instr::BrOnNull(0),
+                Instr::Drop,
+            ],
+            vec![ValType::Ref(RefType::FUNC)],
+            vec![],
+            vec![ValType::I32],
+        );
+        let non_null = Value::Ref(RefValue::Func(FuncAddr {
+            instance: 0,
+            index: 0,
+        }));
+        assert_equiv(
+            &on_null,
+            0,
+            &[vec![Value::Ref(RefValue::Null)], vec![non_null]],
+        );
+
+        // 6. `br_on_non_null` to the function label (top level): a non-null
+        // argument returns `(42, r)`; the null path is unreachable.
+        let on_non_null = module_with(
+            vec![
+                Instr::I32Const(42),
+                Instr::LocalGet(0),
+                Instr::BrOnNonNull(0),
+                Instr::Unreachable,
+            ],
+            vec![ValType::Ref(RefType::FUNC)],
+            vec![],
+            vec![
+                ValType::I32,
+                ValType::Ref(RefType {
+                    nullable: false,
+                    heap: HeapType::Func,
+                }),
+            ],
+        );
+        let non_null = Value::Ref(RefValue::Func(FuncAddr {
+            instance: 0,
+            index: 0,
+        }));
+        assert_equiv(
+            &on_non_null,
+            0,
+            &[vec![non_null], vec![Value::Ref(RefValue::Null)]],
+        );
     }
 
     #[test]
