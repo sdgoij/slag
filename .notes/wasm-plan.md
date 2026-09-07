@@ -1909,3 +1909,42 @@ the memory + `multi-memory` regressions. 32 compile tests, 68 total with
 the feature, clippy clean in both configurations. Wave 2 remaining: the
 table/`call_indirect`/`ref.func` family (needs the compiled value model
 extended to refs and native↔interpreter function re-entry).
+
+Compiled `call`/`call_indirect`/`return_call`/`return_call_indirect`
+landed — the native↔interpreter function-boundary re-entry that
+unlocks non-leaf bodies. The entry ABI grew to `(args, nargs, mems,
+ncount, gvals, out, nout, store, instance, grow, call, scratch)`: params
+10-11 carry the call helper's address and a caller-owned u64 scratch
+region (`SCRATCH_SLOTS`, sized so any oversized call site stays
+interpreted). A call site spills its numeric params to `scratch[0..n)`,
+calls the helper through a helper-signature `call_indirect`, and loads
+the results back from `scratch[0..m)`; a nonzero trap-code return exits
+the entry verbatim. The helper (`exec::wasm_call_helper`) resolves the
+target exactly as the interpreter would (direct: the instance's func
+index space; indirect: table element with bounds/null checks and the
+`IndirectCallTypeMismatch` type check), decodes args by the declared
+type, and runs the callee to completion *through the interpreter* with
+`compile_off` forced — identical semantics, a bounded native stack (no
+compiled-to-compiled native recursion), and the interpreter's own
+frame-depth/host-boundary behavior. Non-trap errors park the exact
+`ExecFail` on the store and return a `TRAP_PENDING_ERROR` sentinel that
+`run_compiled` drains, so an escaping exception or external-host
+boundary surfaces identically to an interpreted run. After the callee
+runs, the helper refreshes the caller's memory descriptors in place (an
+interpreted callee can grow a memory, reallocating its `Vec`), and a
+call-bearing body that also uses globals stays interpreted (its `gvals`
+buffer is a snapshot the callee neither sees nor refreshes).
+`lowerable` also gates `call_indirect` on 32-bit-addressed tables and
+numeric callable types (the full trap-code table now round-trips every
+interpreter trap for nested subtrees). Unit coverage drives an add/
+wrapper/factorial-recursion module (every recursion step crosses the
+compiled/interpreter boundary through the helper) and a `call_indirect`
+module dispatching through a table element, including OOB element
+indices. `wasmtest equiv` is green over `call.wast`, `call_indirect.wast`,
+`fac.wast`, `func.wast`, `func_ptrs.wast`, `return_call.wast`,
+`return_call_indirect.wast`, `switch.wast` (all 0 diverged) plus the
+numeric/control and memory regressions. 34 compile tests, 70 total with
+the feature, clippy clean in both configurations. Wave 2 remaining: the
+table/`ref.func` value family whose refs must flow *through* compiled
+code (`table.get/set`, `call_ref`, `ref.func` results) — that needs an
+opaque ref representation on the compiled operand stack.

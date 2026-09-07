@@ -325,6 +325,12 @@ pub struct Store {
     /// interpreter (lets the equivalence tests compare both paths).
     #[cfg(feature = "compile")]
     compile_off: bool,
+    /// Cut 11: an error the call helper could not express as a trap code
+    /// (an external host boundary, an escaping exception, an unsupported
+    /// form), parked here so the compiled caller surfaces the exact error
+    /// the interpreter would have produced.
+    #[cfg(feature = "compile")]
+    pending_error: Option<ExecFail>,
 }
 
 impl Default for Store {
@@ -386,6 +392,200 @@ pub unsafe extern "C" fn memory_grow_helper(
     }
 }
 
+/// Decode one u64 call slot into an interpreter value of `ty` (the compiled
+/// entry ABI's argument marshaling, inverted). Returns `None` for a
+/// non-numeric type — the compiled-call subset is numeric only.
+#[cfg(feature = "compile")]
+fn value_from_call_slot(ty: ValType, slot: u64) -> Option<Value> {
+    match ty {
+        ValType::I32 => Some(Value::I32(slot as u32 as i32)),
+        ValType::I64 => Some(Value::I64(slot as i64)),
+        ValType::F32 => Some(Value::F32(slot as u32)),
+        ValType::F64 => Some(Value::F64(slot)),
+        _ => None,
+    }
+}
+
+/// Encode an interpreter value into its u64 call slot (numeric types only;
+/// the compiled-call subset never passes references through the boundary).
+#[cfg(feature = "compile")]
+fn value_to_call_slot(value: Value) -> Option<u64> {
+    match value {
+        Value::I32(bits) => Some(bits as u32 as u64),
+        Value::I64(bits) => Some(bits as u64),
+        Value::F32(bits) => Some(u64::from(bits)),
+        Value::F64(bits) => Some(bits),
+        _ => None,
+    }
+}
+
+/// Cut 11: the call helper for compiled bodies (its address rides the entry
+/// ABI as param 10). It resolves the call target the same way the interpreter
+/// would and runs it to completion through the interpreter engine — compiled
+/// bodies call out rather than re-entering other compiled bodies, which keeps
+/// the native stack bounded and preserves the interpreter's frame-depth and
+/// host-boundary semantics exactly. Arguments arrive as u64 slots at
+/// `scratch[0..params)`; the results overwrite `scratch[0..results)`. After
+/// the callee runs (success or trap — wasm traps do not roll back growth)
+/// the caller's memory descriptors at `mems` are refreshed from the store, so
+/// later compiled accesses see any memory the callee grew. Returns a trap
+/// code (0 = ok); a non-trap error is parked on the store and the
+/// [`crate::compile::TRAP_PENDING_ERROR`] sentinel returned.
+///
+/// `mode` selects the target: `0` = direct call to function index-space
+/// entry `x` (`y`/`z` unused); `1` = `call_indirect` through table `x` at
+/// element `y`, type-checked against `z`.
+///
+/// # Safety
+///
+/// The caller (a compiled body running under [`Store::start_owned`]) holds
+/// `&mut self` for the whole call, so `store` stays valid and uniquely
+/// borrowed; `scratch` and `mems` point into caller-owned buffers that stay
+/// alive for the call. The instance/table/type indices come from a validated
+/// module.
+#[cfg(feature = "compile")]
+pub unsafe extern "C" fn wasm_call_helper(
+    store: *mut Store,
+    instance: u64,
+    mode: u64,
+    x: u64,
+    y: u64,
+    z: u64,
+    nargs: u64,
+    scratch: *mut u64,
+    mems: *mut u64,
+) -> i32 {
+    let code_of = crate::compile::code_of_trap;
+    let store = unsafe { &mut *store };
+    // Resolve the target and the declared type with immutable reads only,
+    // dropping every borrow before the store is mutated below.
+    let caller = match store.instances.get(instance as usize) {
+        Some(instance) => instance,
+        None => return code_of(Trap::UnknownFunction),
+    };
+    let declared = match mode {
+        0 => {
+            let Some(ty) = store.func_type(instance as usize, x as usize) else {
+                return code_of(Trap::UnknownFunction);
+            };
+            let Some(target) = caller.funcs.get(x as usize).copied() else {
+                return code_of(Trap::UnknownFunction);
+            };
+            (ty, Some(target))
+        }
+        _ => {
+            let Some(ty) = caller.module.func_at_cloned(z as u32) else {
+                return code_of(Trap::UnknownFunction);
+            };
+            let Some(cell) = caller.tables.get(x as usize).copied() else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let Some(table) = store.tables.get(cell) else {
+                return code_of(Trap::OutOfBoundsTableAccess);
+            };
+            let Some(&entry) = table.elements.get(y as usize) else {
+                return code_of(Trap::UndefinedElement);
+            };
+            let RefValue::Func(address) = entry else {
+                return code_of(Trap::UninitializedElement);
+            };
+            let Some(target) = store
+                .instances
+                .get(address.instance)
+                .and_then(|i| i.funcs.get(address.index))
+                .copied()
+            else {
+                return code_of(Trap::UnknownFunction);
+            };
+            if !store.func_type_matches(&caller.module, z as u32, target) {
+                return code_of(Trap::IndirectCallTypeMismatch);
+            }
+            (ty, Some(target))
+        }
+    };
+    let Some(target) = declared.1 else {
+        return crate::compile::TRAP_PENDING_ERROR;
+    };
+    let ty = declared.0;
+    if ty.params.len() as u64 != nargs {
+        store.set_pending_error(ExecFail::Unsupported("compiled call arity"));
+        return crate::compile::TRAP_PENDING_ERROR;
+    }
+    // Decode the argument slots (the compiled subset is numeric-only, so a
+    // reference parameter here is an internal error, not a wasm trap).
+    let mut args = Vec::with_capacity(ty.params.len());
+    for (i, param) in ty.params.iter().enumerate() {
+        let slot = unsafe { *scratch.add(i) };
+        match value_from_call_slot(*param, slot) {
+            Some(value) => args.push(value),
+            None => {
+                store.set_pending_error(ExecFail::Unsupported(
+                    "non-numeric value across a compiled call",
+                ));
+                return crate::compile::TRAP_PENDING_ERROR;
+            }
+        }
+    }
+    // Run the callee through the interpreter (compile off for the whole
+    // subtree): identical semantics, bounded native stack.
+    let previous = store.compile_off;
+    store.compile_off = true;
+    let outcome = store.run_target(target, &args);
+    store.compile_off = previous;
+    // The callee may have grown a memory (its `Vec` reallocated): refresh
+    // the caller-owned descriptors so later compiled accesses see the new
+    // data pointer/length. Growth persists across traps, so do this on every
+    // return from the run.
+    refresh_descriptors(store, instance, mems);
+    match outcome {
+        Ok(results) => {
+            for (i, result) in results.iter().enumerate() {
+                let Some(slot) = value_to_call_slot(*result) else {
+                    store.set_pending_error(ExecFail::Unsupported(
+                        "non-numeric result across a compiled call",
+                    ));
+                    return crate::compile::TRAP_PENDING_ERROR;
+                };
+                unsafe { *scratch.add(i) = slot };
+            }
+            crate::compile::TRAP_NONE
+        }
+        Err(ExecFail::Trap(trap)) => code_of(trap),
+        Err(error) => {
+            store.set_pending_error(error);
+            crate::compile::TRAP_PENDING_ERROR
+        }
+    }
+}
+
+/// Rewrite the caller-owned memory descriptors at `mems` (one data-pointer +
+/// byte-length `u64` pair per memory index of `instance`) from the store's
+/// current cells. Called after an interpreted callee runs, since any
+/// `memory.grow` it performed reallocated the memory's backing `Vec`.
+#[cfg(feature = "compile")]
+fn refresh_descriptors(store: &mut Store, instance: u64, mems: *mut u64) {
+    let Some(cells) = store
+        .instances
+        .get(instance as usize)
+        .map(|inst| inst.memories.clone())
+    else {
+        return;
+    };
+    for (index, cell) in cells.iter().enumerate() {
+        let slot = unsafe { mems.add(2 * index) };
+        match store.memories.get(*cell) {
+            Some(memory) => unsafe {
+                *slot = memory.bytes.as_ptr() as u64;
+                *slot.add(1) = memory.bytes.len() as u64;
+            },
+            None => unsafe {
+                *slot = 0;
+                *slot.add(1) = 0;
+            },
+        }
+    }
+}
+
 impl Store {
     pub fn new() -> Self {
         Store {
@@ -403,7 +603,21 @@ impl Store {
             suspended: Vec::new(),
             #[cfg(feature = "compile")]
             compile_off: false,
+            #[cfg(feature = "compile")]
+            pending_error: None,
         }
+    }
+
+    /// Park a non-trap error for the running compiled call to drain.
+    #[cfg(feature = "compile")]
+    pub(crate) fn set_pending_error(&mut self, error: ExecFail) {
+        self.pending_error = Some(error);
+    }
+
+    /// Take the parked error, if any (cleared on read).
+    #[cfg(feature = "compile")]
+    pub(crate) fn take_pending_error(&mut self) -> Option<ExecFail> {
+        self.pending_error.take()
     }
 
     /// Force (or re-enable) the interpreter for this store's invocations,
@@ -1176,12 +1390,17 @@ impl Store {
                 })
                 .collect();
             // Runtime pointers the compiled body can call back into: the
-            // store address and instance index for the `memory.grow` helper,
-            // plus the helper's own code address (entry params 7-9).
+            // store address and instance index for the `memory.grow` and call
+            // helpers, the helpers' code addresses, and a caller-owned
+            // scratch region for call argument/result slots (entry params
+            // 7-11).
+            let scratch = vec![0u64; crate::compile::SCRATCH_SLOTS];
             let runtime = crate::compile::CompiledRuntime {
                 store: self as *mut Store as u64,
                 instance: instance as u64,
                 grow: memory_grow_helper as *const () as usize as u64,
+                call: wasm_call_helper as *const () as usize as u64,
+                scratch: scratch.as_ptr() as u64,
             };
             let result =
                 crate::compile::run_compiled(func, &signature, mems, &mut globals, args, runtime);

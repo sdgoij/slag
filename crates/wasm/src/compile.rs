@@ -31,18 +31,26 @@
 //! - `global.get`/`global.set` of numeric module-defined globals, through a
 //!   caller-owned buffer (one u64 slot per used global): the compiled body
 //!   reads and mutates slots in place, so its writes reach the store even
-//!   when it traps. Imported globals (whose cells can alias), tables, calls,
-//!   refs, SIMD, and GC are not lowered yet.
+//!   when it traps. Imported globals (whose cells can alias), tables, refs,
+//!   SIMD, and GC are not lowered yet;
+//! - direct `call`/`return_call` and `call_indirect`/`return_call_indirect`
+//!   (32-bit-addressed tables) over numeric signatures: the call site spills
+//!   its params into a caller-owned scratch region and calls a store-side
+//!   helper (entry params 10-11) that runs the callee through the
+//!   interpreter, so a compiled body can call anything — interpreted or
+//!   compiled, owned or host — without unbounded native recursion. A
+//!   call-bearing body that also uses globals stays interpreted (the `gvals`
+//!   snapshot would go stale across the callee).
 //!
 //! ABI: a compiled entry is
 //! `unsafe extern "C" fn(args, nargs, mems, ncount, gvals, out, nout,
-//! store, instance, grow) -> i32`. Arguments, the descriptor array
-//! pointer/count, the global-values and result buffers, and results travel
-//! as 64-bit values (an `i32` uses the low 32 bits), so the Rust trampoline
-//! and the Cranelift signature can never disagree about float argument
-//! classification. The returned `i32` is a trap code (0 = ok); the result
-//! buffer is written only when the function completes normally, so a trap
-//! never produces partial results.
+//! store, instance, grow, call, scratch) -> i32`. Arguments, the descriptor
+//! array pointer/count, the global-values, result, and scratch buffers, and
+//! results travel as 64-bit values (an `i32` uses the low 32 bits), so the
+//! Rust trampoline and the Cranelift signature can never disagree about
+//! float argument classification. The returned `i32` is a trap code (0 =
+//! ok); the result buffer is written only when the function completes
+//! normally, so a trap never produces partial results.
 
 use std::sync::{Arc, OnceLock};
 
@@ -70,6 +78,61 @@ pub const TRAP_UNREACHABLE: i32 = 1;
 pub const TRAP_INT_DIVIDE_BY_ZERO: i32 = 2;
 pub const TRAP_INT_OVERFLOW: i32 = 3;
 pub const TRAP_MEMORY_OOB: i32 = 4;
+pub const TRAP_INVALID_CONVERSION: i32 = 5;
+pub const TRAP_TABLE_OOB: i32 = 6;
+pub const TRAP_INDIRECT_TYPE_MISMATCH: i32 = 7;
+pub const TRAP_UNDEFINED_ELEMENT: i32 = 8;
+pub const TRAP_UNINITIALIZED_ELEMENT: i32 = 9;
+pub const TRAP_NULL_REFERENCE: i32 = 10;
+pub const TRAP_NULL_FUNCTION_REFERENCE: i32 = 11;
+pub const TRAP_NULL_EXCEPTION_REFERENCE: i32 = 12;
+pub const TRAP_NULL_STRUCT_REFERENCE: i32 = 13;
+pub const TRAP_NULL_ARRAY_REFERENCE: i32 = 14;
+pub const TRAP_NULL_I31_REFERENCE: i32 = 15;
+pub const TRAP_ARRAY_OOB: i32 = 16;
+pub const TRAP_CAST_FAILURE: i32 = 17;
+pub const TRAP_CALL_STACK_EXHAUSTED: i32 = 18;
+pub const TRAP_UNSUPPORTED_IMPORT: i32 = 19;
+pub const TRAP_UNKNOWN_FUNCTION: i32 = 20;
+/// The call helper reached an error that is not a plain trap (an external
+/// host boundary, an escaping exception, an unsupported form). The helper
+/// parks the exact [`ExecFail`] on the store and returns this sentinel;
+/// `run_compiled` drains it so the caller sees the identical error the
+/// interpreter would have produced.
+pub const TRAP_PENDING_ERROR: i32 = 21;
+
+/// Caller-owned scratch slots (u64s) for call argument/result marshaling
+/// (entry ABI param 11). A compiled call site spills `params` into slots
+/// `[0..params)` and the call helper rewrites `[0..results)`; a body whose
+/// any call site needs more than this stays interpreted.
+pub const SCRATCH_SLOTS: usize = 256;
+
+/// Map a [`Trap`] back to the interpreter's code used to report it from a
+/// compiled entry.
+pub fn code_of_trap(trap: Trap) -> i32 {
+    match trap {
+        Trap::Unreachable => TRAP_UNREACHABLE,
+        Trap::IntegerDivideByZero => TRAP_INT_DIVIDE_BY_ZERO,
+        Trap::IntegerOverflow => TRAP_INT_OVERFLOW,
+        Trap::InvalidConversionToInteger => TRAP_INVALID_CONVERSION,
+        Trap::OutOfBoundsMemoryAccess => TRAP_MEMORY_OOB,
+        Trap::OutOfBoundsTableAccess => TRAP_TABLE_OOB,
+        Trap::IndirectCallTypeMismatch => TRAP_INDIRECT_TYPE_MISMATCH,
+        Trap::UndefinedElement => TRAP_UNDEFINED_ELEMENT,
+        Trap::UninitializedElement => TRAP_UNINITIALIZED_ELEMENT,
+        Trap::NullReference => TRAP_NULL_REFERENCE,
+        Trap::NullFunctionReference => TRAP_NULL_FUNCTION_REFERENCE,
+        Trap::NullExceptionReference => TRAP_NULL_EXCEPTION_REFERENCE,
+        Trap::NullStructReference => TRAP_NULL_STRUCT_REFERENCE,
+        Trap::NullArrayReference => TRAP_NULL_ARRAY_REFERENCE,
+        Trap::NullI31Reference => TRAP_NULL_I31_REFERENCE,
+        Trap::OutOfBoundsArrayAccess => TRAP_ARRAY_OOB,
+        Trap::CastFailure => TRAP_CAST_FAILURE,
+        Trap::CallStackExhausted => TRAP_CALL_STACK_EXHAUSTED,
+        Trap::UnsupportedImport => TRAP_UNSUPPORTED_IMPORT,
+        Trap::UnknownFunction => TRAP_UNKNOWN_FUNCTION,
+    }
+}
 
 /// Map a compiled trap code back to the interpreter's [`Trap`].
 pub fn trap_of(code: i32) -> Trap {
@@ -78,34 +141,57 @@ pub fn trap_of(code: i32) -> Trap {
         TRAP_INT_DIVIDE_BY_ZERO => Trap::IntegerDivideByZero,
         TRAP_INT_OVERFLOW => Trap::IntegerOverflow,
         TRAP_MEMORY_OOB => Trap::OutOfBoundsMemoryAccess,
+        TRAP_INVALID_CONVERSION => Trap::InvalidConversionToInteger,
+        TRAP_TABLE_OOB => Trap::OutOfBoundsTableAccess,
+        TRAP_INDIRECT_TYPE_MISMATCH => Trap::IndirectCallTypeMismatch,
+        TRAP_UNDEFINED_ELEMENT => Trap::UndefinedElement,
+        TRAP_UNINITIALIZED_ELEMENT => Trap::UninitializedElement,
+        TRAP_NULL_REFERENCE => Trap::NullReference,
+        TRAP_NULL_FUNCTION_REFERENCE => Trap::NullFunctionReference,
+        TRAP_NULL_EXCEPTION_REFERENCE => Trap::NullExceptionReference,
+        TRAP_NULL_STRUCT_REFERENCE => Trap::NullStructReference,
+        TRAP_NULL_ARRAY_REFERENCE => Trap::NullArrayReference,
+        TRAP_NULL_I31_REFERENCE => Trap::NullI31Reference,
+        TRAP_ARRAY_OOB => Trap::OutOfBoundsArrayAccess,
+        TRAP_CAST_FAILURE => Trap::CastFailure,
+        TRAP_CALL_STACK_EXHAUSTED => Trap::CallStackExhausted,
+        TRAP_UNSUPPORTED_IMPORT => Trap::UnsupportedImport,
+        TRAP_UNKNOWN_FUNCTION => Trap::UnknownFunction,
         _ => Trap::Unreachable,
     }
 }
 
 /// Runtime pointers/helper addresses a compiled body may call back into,
-/// passed as entry params 7-9 (`store`, `instance`, `grow`).
+/// passed as entry params 7-11 (`store`, `instance`, `grow`, `call`,
+/// `scratch`).
 #[derive(Clone, Copy)]
 pub struct CompiledRuntime {
     /// Raw `*mut Store` address.
     pub store: u64,
     /// The invoked instance's index.
     pub instance: u64,
-    /// The `memory.grow` helper's address (0 when unused is fine; bodies that
-    /// grow load it from this param).
+    /// The `memory.grow` helper's address (bodies that grow load it from this
+    /// param).
     pub grow: u64,
+    /// The call helper's address (bodies that call load it from this param).
+    pub call: u64,
+    /// Caller-owned u64 scratch region (bodies that call spill argument/result
+    /// slots here; entry ABI param 11).
+    pub scratch: u64,
 }
 
 /// The native entry point produced by the compiler.
 ///
-/// `(args, nargs, mems, ncount, gvals, out, nout, store, instance, grow)`:
-/// `mems` points at a caller-owned descriptor array holding, per module
-/// memory index, its data pointer then byte length (each `u64`); `ncount`
-/// is the descriptor count. `gvals` is a caller-owned buffer, one u64 slot
-/// per module global the body uses, holding the initial values on entry and
-/// the (possibly mutated) values on return — so `global.set` is visible to
-/// the store even when a later instruction traps. `store`/`instance`/
-/// `grow` let a body call the `memory.grow` helper. Returns the trap code
-/// (0 = ok).
+/// `(args, nargs, mems, ncount, gvals, out, nout, store, instance, grow,
+/// call, scratch)`: `mems` points at a caller-owned descriptor array holding,
+/// per module memory index, its data pointer then byte length (each `u64`);
+/// `ncount` is the descriptor count. `gvals` is a caller-owned buffer, one
+/// u64 slot per module global the body uses, holding the initial values on
+/// entry and the (possibly mutated) values on return — so `global.set` is
+/// visible to the store even when a later instruction traps. `store`/
+/// `instance`/`grow`/`call` let a body call the `memory.grow` and call
+/// helpers; `scratch` is caller-owned space for call argument/result slots.
+/// Returns the trap code (0 = ok).
 pub type CompiledEntry = unsafe extern "C" fn(
     args: *const u64,
     nargs: u64,
@@ -117,6 +203,8 @@ pub type CompiledEntry = unsafe extern "C" fn(
     store: u64,
     instance: u64,
     grow: u64,
+    call: u64,
+    scratch: u64,
 ) -> i32;
 
 /// One compiled function body: the entry plus the executable-code
@@ -166,6 +254,8 @@ impl CompiledFunc {
                 runtime.store,
                 runtime.instance,
                 runtime.grow,
+                runtime.call,
+                runtime.scratch,
             )
         }
     }
@@ -197,6 +287,16 @@ pub fn run_compiled(
     }
     let mut output = vec![0u64; ty.results.len()];
     let code = func.call(&input, mems, globals, &mut output, runtime);
+    if code == TRAP_PENDING_ERROR {
+        // SAFETY: `runtime.store` is the owning store, kept alive (and
+        // uniquely borrowed) by the caller for the whole native call; the
+        // call helper parked the exact error there.
+        let store = unsafe { &mut *(runtime.store as *mut crate::exec::Store) };
+        if let Some(error) = store.take_pending_error() {
+            return Err(error);
+        }
+        return Err(ExecFail::Unsupported("pending error in a compiled call"));
+    }
     if code != TRAP_NONE {
         return Err(ExecFail::Trap(trap_of(code)));
     }
@@ -297,8 +397,8 @@ fn platform_call_conv(isa: &dyn TargetIsa) -> CallConv {
     }
 }
 
-/// `fn(args, nargs, mems, ncount, gvals, out, nout, store, instance,
-/// grow) -> i32` (trap code).
+/// `fn(args, nargs, mems, ncount, gvals, out, nout, store, instance, grow,
+/// call, scratch) -> i32` (trap code).
 fn entry_signature(conv: CallConv) -> Signature {
     let mut sig = Signature::new(conv);
     sig.params.push(AbiParam::new(types::I64)); // args pointer
@@ -311,6 +411,8 @@ fn entry_signature(conv: CallConv) -> Signature {
     sig.params.push(AbiParam::new(types::I64)); // store pointer
     sig.params.push(AbiParam::new(types::I64)); // instance index
     sig.params.push(AbiParam::new(types::I64)); // memory.grow helper address
+    sig.params.push(AbiParam::new(types::I64)); // call helper address
+    sig.params.push(AbiParam::new(types::I64)); // scratch buffer pointer
     sig.returns.push(AbiParam::new(types::I32)); // trap code
     sig
 }
@@ -391,6 +493,73 @@ fn defined_global(module: &Module, index: u32) -> Option<(ValType, bool)> {
     Some((global.ty.value, global.ty.mutable))
 }
 
+/// A function index-space entry's declared type (imported functions first,
+/// then the module's own), by value.
+fn func_type_of(module: &Module, index: u32) -> Option<FuncType> {
+    let imported = module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Func(_)))
+        .count() as u32;
+    if index < imported {
+        let ti = module
+            .imports
+            .iter()
+            .filter_map(|import| match import.desc {
+                ImportDesc::Func(ty) => Some(ty),
+                _ => None,
+            })
+            .nth(index as usize)?;
+        module.func_at_cloned(ti)
+    } else {
+        module
+            .functions
+            .get((index - imported) as usize)
+            .and_then(|ty| module.func_at_cloned(*ty))
+    }
+}
+
+/// A table index's declared `table64` flag, resolving index-space indices
+/// (imported tables first) so the call lowering can gate `call_indirect` on
+/// 32-bit-addressed tables (an i64 element index stays interpreter-side).
+fn table_is64(module: &Module, index: u32) -> Option<bool> {
+    let imported = module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Table(_)))
+        .count() as u32;
+    if index < imported {
+        let mut seen = 0u32;
+        for import in &module.imports {
+            if let ImportDesc::Table(table) = &import.desc {
+                if seen == index {
+                    return Some(table.table64);
+                }
+                seen += 1;
+            }
+        }
+        None
+    } else {
+        module
+            .tables
+            .get((index - imported) as usize)
+            .map(|table| table.ty.table64)
+    }
+}
+
+/// Whether a callee type fits the compiled-call subset: numeric parameters
+/// and results, each few enough to ride the caller-owned scratch buffer.
+fn callable_type(ty: Option<FuncType>) -> bool {
+    let Some(ty) = ty else { return false };
+    ty.params.len() <= SCRATCH_SLOTS
+        && ty.results.len() <= SCRATCH_SLOTS
+        && ty
+            .params
+            .iter()
+            .chain(ty.results.iter())
+            .all(|t| clif_type(*t).is_some())
+}
+
 /// The module global indices (index space) a body reads or writes, sorted
 /// and deduplicated (the order the `gvals` buffer slots use).
 fn body_globals(body: &FuncBody) -> Vec<u32> {
@@ -440,6 +609,25 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
     {
         return false;
     }
+    // A call-bearing body cannot also use globals: `global.get/set` lower
+    // through the caller-owned `gvals` buffer, which an interpreted callee
+    // (running against the store's real cells) neither sees nor refreshes.
+    let has_call = body.body.iter().any(|instr| {
+        matches!(
+            instr,
+            Instr::Call(_)
+                | Instr::ReturnCall(_)
+                | Instr::CallIndirect { .. }
+                | Instr::ReturnCallIndirect { .. }
+        )
+    });
+    let uses_globals = body
+        .body
+        .iter()
+        .any(|instr| matches!(instr, Instr::GlobalGet(_) | Instr::GlobalSet(_)));
+    if has_call && uses_globals {
+        return false;
+    }
     body.body.iter().all(|instr| match instr {
         Instr::Nop
         | Instr::Unreachable
@@ -470,6 +658,20 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
             defined_global(module, *index),
             Some((ty, true)) if clif_type(ty).is_some()
         ),
+        Instr::Call(index) | Instr::ReturnCall(index) => {
+            callable_type(func_type_of(module, *index))
+        }
+        Instr::CallIndirect {
+            type_index,
+            table_index,
+        }
+        | Instr::ReturnCallIndirect {
+            type_index,
+            table_index,
+        } => {
+            table_is64(module, *table_index) == Some(false)
+                && callable_type(module.func_at_cloned(*type_index))
+        }
         _ => false,
     })
 }
@@ -733,6 +935,10 @@ struct Lowerer<'a> {
     store: ClifValue,
     instance: ClifValue,
     grow: ClifValue,
+    /// Entry params 10-11: the call helper's address and the caller-owned
+    /// scratch region (bodies that call spill argument/result slots there).
+    call: ClifValue,
+    scratch: ClifValue,
     results: Vec<ValType>,
     controls: Vec<CtlFrame>,
     /// The current path ended in an unconditional jump/trap/return.
@@ -1789,6 +1995,158 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Widen a numeric SSA value to its u64 call-slot form (mirrors the
+    /// entry ABI's argument marshaling: an `i32` uses the low 32 bits, an
+    /// `f32` its raw bits).
+    fn slot_from(&mut self, ty: ValType, value: ClifValue) -> Result<ClifValue, String> {
+        match ty {
+            ValType::I32 => Ok(self.builder.ins().uextend(types::I64, value)),
+            ValType::I64 => Ok(value),
+            ValType::F32 => {
+                let bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I32, MemFlagsData::new(), value);
+                Ok(self.builder.ins().uextend(types::I64, bits))
+            }
+            ValType::F64 => Ok(self
+                .builder
+                .ins()
+                .bitcast(types::I64, MemFlagsData::new(), value)),
+            _ => Err("non-numeric value reached the call lowering".to_string()),
+        }
+    }
+
+    /// Narrow a u64 call-slot back to a numeric SSA value of `ty`.
+    fn value_from_slot(&mut self, ty: ValType, wide: ClifValue) -> Result<ClifValue, String> {
+        match ty {
+            ValType::I32 => Ok(self.builder.ins().ireduce(types::I32, wide)),
+            ValType::I64 => Ok(wide),
+            ValType::F32 => {
+                let bits = self.builder.ins().ireduce(types::I32, wide);
+                Ok(self
+                    .builder
+                    .ins()
+                    .bitcast(types::F32, MemFlagsData::new(), bits))
+            }
+            ValType::F64 => Ok(self
+                .builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), wide)),
+            _ => Err("non-numeric value reached the call lowering".to_string()),
+        }
+    }
+
+    /// Lower a `call`/`call_indirect` (or their `return_call*` tail forms)
+    /// against the store-side call helper. `mode`/`x`/`y`/`z` identify the
+    /// target (see `exec::wasm_call_helper`); `ty` is the declared callee
+    /// type, whose params are spilled to scratch slots `[0..params)` and
+    /// whose results are loaded back from `[0..results)`. A nonzero helper
+    /// return (a trap code, or the pending-error sentinel) returns from the
+    /// entry immediately. When `tail`, the results are the function's own
+    /// results and the body returns right away.
+    fn lower_call(
+        &mut self,
+        mode: i64,
+        x: ClifValue,
+        y: ClifValue,
+        z: i64,
+        ty: &FuncType,
+        tail: bool,
+    ) -> Result<(), String> {
+        // Spill the params (last on the operand stack) into scratch slots in
+        // parameter order.
+        for i in (0..ty.params.len()).rev() {
+            let value = self.pop().ok_or("operand stack underflow")?;
+            let wide = self.slot_from(ty.params[i], value)?;
+            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+        }
+        // The helper's ABI: (store, instance, mode, x, y, z, nargs, scratch,
+        // mems) -> i32 trap code, all u64 slots so no float classification
+        // can disagree with the Rust trampoline. `mems` lets the helper
+        // refresh this body's memory descriptors after the callee ran (an
+        // interpreted callee can grow a memory, reallocating its `Vec`).
+        let mut sig = Signature::new(self.conv);
+        for _ in 0..9 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let sig = self.builder.import_signature(sig);
+        let mode_v = self.iconst(types::I64, mode);
+        let z_v = self.iconst(types::I64, z);
+        let nargs = self.iconst(types::I64, ty.params.len() as i64);
+        let call = self.builder.ins().call_indirect(
+            sig,
+            self.call,
+            &[
+                self.store,
+                self.instance,
+                mode_v,
+                x,
+                y,
+                z_v,
+                nargs,
+                self.scratch,
+                self.mems,
+            ],
+        );
+        let code = self.builder.inst_results(call)[0];
+        // A nonzero code means the callee trapped (or a pending error):
+        // return it from the entry verbatim, then continue on success.
+        let zero = self.iconst(types::I32, 0);
+        let failed = self.builder.ins().icmp(IntCC::NotEqual, code, zero);
+        let trap_block = self.builder.create_block();
+        let cont = self.builder.create_block();
+        self.builder.ins().brif(failed, trap_block, &[], cont, &[]);
+        self.builder.switch_to_block(trap_block);
+        self.builder.ins().return_(&[code]);
+        self.builder.switch_to_block(cont);
+        for (i, ty) in ty.results.iter().enumerate() {
+            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
+            let wide =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), address, Offset32::new(0));
+            let value = self.value_from_slot(*ty, wide)?;
+            self.stack.push(value);
+        }
+        if tail {
+            self.emit_return()?;
+            self.dead = true;
+        }
+        Ok(())
+    }
+
+    /// A direct `call`/`return_call` to function index-space entry `index`.
+    fn do_call(&mut self, index: u32, tail: bool) -> Result<(), String> {
+        let ty = func_type_of(self.module, index).ok_or("unresolved call target type")?;
+        let x = self.iconst(types::I64, i64::from(index));
+        let zero = self.iconst(types::I64, 0);
+        self.lower_call(0, x, zero, 0, &ty, tail)
+    }
+
+    /// A `call_indirect`/`return_call_indirect` through `table_index` at the
+    /// element index on the operand stack, type-checked against
+    /// `type_index` (the table is 32-bit addressed in the compiled subset).
+    fn do_call_indirect(
+        &mut self,
+        type_index: u32,
+        table_index: u32,
+        tail: bool,
+    ) -> Result<(), String> {
+        let ty = self
+            .module
+            .func_at_cloned(type_index)
+            .ok_or("unresolved call_indirect type")?;
+        let element = self.pop().ok_or("operand stack underflow")?;
+        let element64 = self.builder.ins().uextend(types::I64, element);
+        let table = self.iconst(types::I64, i64::from(table_index));
+        self.lower_call(1, table, element64, i64::from(type_index), &ty, tail)
+    }
+
     /// Lower one instruction. Dead paths skip code but still track the
     /// structured markers so `end`s reach the right frames.
     fn instruction(&mut self, instr: &Instr) -> Result<(), String> {
@@ -1892,6 +2250,16 @@ impl<'a> Lowerer<'a> {
                 self.emit_return()?;
                 self.dead = true;
             }
+            Instr::Call(index) => self.do_call(*index, false)?,
+            Instr::ReturnCall(index) => self.do_call(*index, true)?,
+            Instr::CallIndirect {
+                type_index,
+                table_index,
+            } => self.do_call_indirect(*type_index, *table_index, false)?,
+            Instr::ReturnCallIndirect {
+                type_index,
+                table_index,
+            } => self.do_call_indirect(*type_index, *table_index, true)?,
             Instr::Unreachable => {
                 self.emit_trap(TRAP_UNREACHABLE);
                 self.dead = true;
@@ -1936,8 +2304,9 @@ fn lower(
     builder.append_block_params_for_function_params(entry_block);
     builder.switch_to_block(entry_block);
     let params = builder.block_params(entry_block).to_vec();
-    let (args_ptr, mems, globals_ptr, out_ptr, store, instance, grow) = (
-        params[0], params[2], params[4], params[5], params[7], params[8], params[9],
+    let (args_ptr, mems, globals_ptr, out_ptr, store, instance, grow, call, scratch) = (
+        params[0], params[2], params[4], params[5], params[7], params[8], params[9], params[10],
+        params[11],
     );
     // Each used module global gets a `gvals` buffer slot (slot == position).
     let globals = used_globals
@@ -2001,6 +2370,8 @@ fn lower(
         store,
         instance,
         grow,
+        call,
+        scratch,
         results: func_type.results.clone(),
         controls: Vec::new(),
         dead: false,
@@ -2046,8 +2417,8 @@ mod tests {
     use super::*;
     use crate::exec::Store;
     use crate::instr::StoreOp;
-    use crate::module::{FuncBody, Global, Module};
-    use crate::types::{BlockType, GlobalType, Limits, MemType, SubType};
+    use crate::module::{FuncBody, Global, Module, Table};
+    use crate::types::{BlockType, GlobalType, Limits, MemType, RefType, SubType, TableType};
 
     fn int_module(body: Vec<Instr>, params: Vec<ValType>, results: Vec<ValType>) -> Module {
         Module {
@@ -4187,5 +4558,126 @@ mod tests {
             ..Module::default()
         };
         assert_equiv(&sizes, 0, &[vec![]]);
+    }
+
+    #[test]
+    fn direct_calls_match_the_interpreter() {
+        // add(a, b), zero-argument wrappers calling it (one calling the
+        // other), and a recursive factorial — the recursion crosses the
+        // compiled/interpreter boundary through the call helper on every
+        // step, so it pins the marshaling and re-entry.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32, ValType::I32], vec![ValType::I32]),
+                SubType::func(vec![], vec![ValType::I32]),
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+            ],
+            functions: vec![0, 1, 1, 2],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::Num(NumOp::I32Add),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::I32Const(20), Instr::I32Const(22), Instr::Call(0)],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::Call(1)],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::Num(NumOp::I32LeS),
+                        Instr::If(BlockType::Val(ValType::I32)),
+                        Instr::I32Const(1),
+                        Instr::Else,
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::Num(NumOp::I32Sub),
+                        Instr::Call(3),
+                        Instr::Num(NumOp::I32Mul),
+                        Instr::End,
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        assert_equiv(&module, 1, &[vec![]]);
+        assert_equiv(&module, 2, &[vec![]]);
+        let fac_cases = [0, 1, 2, 5, 10, 20, -1]
+            .into_iter()
+            .map(|n| vec![Value::I32(n)])
+            .collect::<Vec<_>>();
+        assert_equiv(&module, 3, &fac_cases);
+    }
+
+    #[test]
+    fn call_indirect_matches_the_interpreter() {
+        // A one-slot table whose element segment points at `add`; the caller
+        // dispatches through it at a runtime index. Index 0 calls add; any
+        // other index is out of bounds (the table has one slot).
+        let module = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32, ValType::I32], vec![ValType::I32]),
+                SubType::func(
+                    vec![ValType::I32, ValType::I32, ValType::I32],
+                    vec![ValType::I32],
+                ),
+            ],
+            functions: vec![0, 1],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::Num(NumOp::I32Add),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::CallIndirect {
+                            type_index: 0,
+                            table_index: 0,
+                        },
+                    ],
+                },
+            ],
+            tables: vec![Table {
+                ty: TableType {
+                    element: RefType::FUNC,
+                    limits: Limits {
+                        min: 1,
+                        max: None,
+                        shared: false,
+                    },
+                    table64: false,
+                },
+                init: Some(vec![Instr::RefFunc(0)]),
+            }],
+            ..Module::default()
+        };
+        let cases = [
+            vec![Value::I32(2), Value::I32(3), Value::I32(0)],
+            vec![Value::I32(10), Value::I32(32), Value::I32(0)],
+            vec![Value::I32(-5), Value::I32(7), Value::I32(0)],
+            // Out-of-range element indices trap identically on both paths.
+            vec![Value::I32(2), Value::I32(3), Value::I32(1)],
+            vec![Value::I32(2), Value::I32(3), Value::I32(100)],
+        ];
+        assert_equiv(&module, 1, &cases);
     }
 }
