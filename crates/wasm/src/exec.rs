@@ -786,22 +786,13 @@ unsafe fn run_native_callee(
         }
     }
     // The callee's used globals ride a caller-owned buffer seeded from its
-    // cells (slot order = `used_globals()`), flushed back after the call.
+    // cells (word layout per `seed_globals`), flushed back after the call.
     let used = func.used_globals().to_vec();
     let cells: Vec<usize> = used
         .iter()
         .map(|index| store_ref.instances[own].globals[*index as usize])
         .collect();
-    let mut gvals: Vec<u64> = cells
-        .iter()
-        .map(|cell| match store_ref.globals[*cell] {
-            Value::I32(bits) => bits as u32 as u64,
-            Value::I64(bits) => bits as u64,
-            Value::F32(bits) => u64::from(bits),
-            Value::F64(bits) => bits,
-            _ => 0,
-        })
-        .collect();
+    let mut gvals = seed_globals(store_ref, &cells);
     let callee_scratch = vec![0u64; crate::compile::SCRATCH_SLOTS];
     let runtime = crate::compile::CompiledRuntime {
         store: store as u64,
@@ -828,16 +819,7 @@ unsafe fn run_native_callee(
     // refresh the caller's descriptors (the callee may have grown a memory
     // shared with the caller, or any memory the caller later touches).
     let store_ref = unsafe { &mut *store };
-    for (cell, bits) in cells.iter().zip(&gvals) {
-        let value = match store_ref.global_types[*cell].value {
-            ValType::I32 => Value::I32(*bits as u32 as i32),
-            ValType::I64 => Value::I64(*bits as i64),
-            ValType::F32 => Value::F32(*bits as u32),
-            ValType::F64 => Value::F64(*bits),
-            _ => continue,
-        };
-        store_ref.globals[*cell] = value;
-    }
+    flush_globals(store_ref, &cells, &gvals);
     refresh_descriptors(store_ref, call.caller_instance as u64, call.caller_mems);
     code
 }
@@ -2336,6 +2318,72 @@ fn refresh_descriptors(store: &mut Store, instance: u64, mems: *mut u64) {
     }
 }
 
+/// Seed a compiled body's `gvals` buffer from the store's global cells: one
+/// u64 word per numeric global, two (lo/hi) per v128, in `cells` order — the
+/// layout the compiled `do_global_get`/`set` use (cumulative word offsets).
+#[cfg(feature = "compile")]
+fn seed_globals(store: &Store, cells: &[usize]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(cells.len());
+    for &cell in cells {
+        match store.globals[cell] {
+            Value::I32(bits) => out.push(bits as u32 as u64),
+            Value::I64(bits) => out.push(bits as u64),
+            Value::F32(bits) => out.push(u64::from(bits)),
+            Value::F64(bits) => out.push(bits),
+            Value::V128(bits) => {
+                out.push(bits as u64);
+                out.push((bits >> 64) as u64);
+            }
+            _ => out.push(0),
+        }
+    }
+    out
+}
+
+/// Flush a compiled body's `gvals` buffer back to the store's global cells,
+/// consuming the same per-type word layout [`seed_globals`] produced.
+#[cfg(feature = "compile")]
+fn flush_globals(store: &mut Store, cells: &[usize], words: &[u64]) {
+    let mut word = 0usize;
+    for &cell in cells {
+        let value = match store.global_types[cell].value {
+            ValType::I32 => {
+                let bits = words[word];
+                word += 1;
+                Value::I32(bits as u32 as i32)
+            }
+            ValType::I64 => {
+                let bits = words[word];
+                word += 1;
+                Value::I64(bits as i64)
+            }
+            ValType::F32 => {
+                let bits = words[word];
+                word += 1;
+                Value::F32(bits as u32)
+            }
+            ValType::F64 => {
+                let bits = words[word];
+                word += 1;
+                Value::F64(bits)
+            }
+            ValType::V128 => {
+                let lo = words[word] as u128;
+                let hi = words[word + 1] as u128;
+                word += 2;
+                Value::V128(lo | (hi << 64))
+            }
+            _ => {
+                // A compiled body never touches a non-carried global type;
+                // keep the cursor in lockstep defensively.
+                word += 1;
+                continue;
+            }
+        };
+        store.globals[cell] = value;
+    }
+}
+
 impl Store {
     pub fn new() -> Self {
         Store {
@@ -3131,16 +3179,7 @@ impl Store {
                 .iter()
                 .map(|index| self.instances[instance].globals[*index as usize])
                 .collect::<Vec<_>>();
-            let mut globals: Vec<u64> = cells
-                .iter()
-                .map(|cell| match self.globals[*cell] {
-                    Value::I32(bits) => bits as u32 as u64,
-                    Value::I64(bits) => bits as u64,
-                    Value::F32(bits) => u64::from(bits),
-                    Value::F64(bits) => bits,
-                    _ => 0,
-                })
-                .collect();
+            let mut globals = seed_globals(self, &cells);
             // Runtime pointers the compiled body can call back into: the
             // store address and instance index for the `memory.grow` and call
             // helpers, the helpers' code addresses, and a caller-owned
@@ -3156,16 +3195,7 @@ impl Store {
             };
             let result =
                 crate::compile::run_compiled(func, &signature, mems, &mut globals, args, runtime);
-            for (cell, bits) in cells.iter().zip(&globals) {
-                let value = match self.global_types[*cell].value {
-                    ValType::I32 => Value::I32(*bits as u32 as i32),
-                    ValType::I64 => Value::I64(*bits as i64),
-                    ValType::F32 => Value::F32(*bits as u32),
-                    ValType::F64 => Value::F64(*bits),
-                    _ => continue,
-                };
-                self.globals[*cell] = value;
-            }
+            flush_globals(self, &cells, &globals);
             return Ok(RunProgress::Finished(result?));
         }
         let mut locals = args.to_vec();

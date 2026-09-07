@@ -2351,3 +2351,21 @@ path in the compiled store and the interpreted path in the oracle
 store, agreeing bit-for-bit. `wasmtest equiv` is green over the whole
 core corpus: 254 suites, 0 diverged. 59 compile tests, 95 total with
 the feature, clippy clean in both configurations.
+
+v128 globals landed: module-defined mutable/immutable v128 globals ride
+the `gvals` buffer as two u64 words per global, next to numeric ones,
+so `global.get`/`global.set` lower for them and the layout stays
+word-indexed — the lowering's used-global map now stores each global's
+cumulative word offset, `do_global_get` loads a v128 global as a raw
+`I128` (and `do_global_set` stores it back), and the store-side
+seed/flush loops became shared helpers (`seed_globals`/`flush_globals`)
+that write numeric globals as one word and v128 as two, used by both
+`start_owned` and the native re-entry path. `clif_type` maps `V128` to
+`I128` and the `GlobalGet`/`GlobalSet` lowering gates admit carried
+numeric or v128 module-defined globals (imported globals stay
+interpreted, as before). Unit coverage sets and reads a mutable v128
+global across compiled calls (plus a lane-extracting reader), agreeing
+bit-for-bit with the interpreter over the shared store. `wasmtest
+equiv` is green over the whole core corpus: 254 suites, 0 diverged. 60
+compile tests, 96 total with the feature, clippy clean in both
+configurations.
