@@ -2276,9 +2276,9 @@ impl JsObject {
         slots: &TypedArraySlots,
         index: u64,
     ) -> Result<Value, JsError> {
-        if typed_array_valid_index(slots, index as f64) {
+        if typed_array_element_in_bounds(slots, index) {
             let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
-            let size = element_bytes_into(slots, index as f64, &mut bytes)?;
+            let size = element_bytes_into(slots, index, &mut bytes)?;
             crate::typed_array::decode_element(slots.element_type, &bytes[..size], 0)
         } else {
             Ok(Value::Undefined)
@@ -2304,8 +2304,8 @@ impl JsObject {
         }
         let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
         let size = crate::typed_array::encode_element_into(slots.element_type, &value, &mut bytes)?;
-        if typed_array_valid_index(slots, index as f64) {
-            write_element_bytes(slots, index as f64, &bytes[..size])?;
+        if typed_array_element_in_bounds(slots, index) {
+            write_element_bytes(slots, index, &bytes[..size])?;
         }
         Ok(true)
     }
@@ -4248,22 +4248,36 @@ pub fn typed_array_effective_length(slots: &TypedArraySlots) -> usize {
     let element_size = slots.element_type.size();
     if slots.auto_length {
         slots.buffer.byte_length().saturating_sub(slots.byte_offset) / element_size
-    } else if slots.byte_offset + slots.byte_length <= slots.buffer.byte_length() {
+    } else if !slots.buffer.is_resizable()
+        || slots.byte_offset + slots.byte_length <= slots.buffer.byte_length()
+    {
+        // A fixed view over a non-resizable buffer was validated at creation
+        // and only detach can invalidate it, so its length is the stored
+        // [[ArrayLength]] — no live byte-length read (which borrows the block)
+        // per access. A fixed view over a resizable buffer keeps its length
+        // only while the buffer has not shrunk below its byte range.
         slots.array_length
     } else {
         0
     }
 }
 
+/// Whether a canonical u64 index (a non-negative integral value, as the
+/// runtime's numeric element fast paths produce) addresses an element of
+/// `slots`. A detached buffer covers none (spec 10.4.7.4 IsValidIntegerIndex
+/// is false).
+fn typed_array_element_in_bounds(slots: &TypedArraySlots, index: u64) -> bool {
+    (index as usize) < typed_array_effective_length(slots)
+}
+
 /// Whether a canonical numeric index is an in-bounds TypedArray element
 /// (spec 10.4.7.4 IsValidIntegerIndex): a detached buffer, a non-integer, and
 /// -0 are never valid.
 fn typed_array_valid_index(slots: &TypedArraySlots, index: f64) -> bool {
-    !slots.buffer.is_detached()
-        && index >= 0.0
+    index >= 0.0
         && !index.is_sign_negative()
         && index.trunc() == index
-        && (index as usize) < typed_array_effective_length(slots)
+        && typed_array_element_in_bounds(slots, index as u64)
 }
 
 /// Fill `out[..size]` with the element bytes at a valid canonical index;
@@ -4272,7 +4286,7 @@ fn typed_array_valid_index(slots: &TypedArraySlots, index: f64) -> bool {
 /// fresh `Vec` per element).
 fn element_bytes_into(
     slots: &TypedArraySlots,
-    index: f64,
+    index: u64,
     out: &mut [u8],
 ) -> Result<usize, JsError> {
     let size = slots.element_type.size();
@@ -4302,7 +4316,7 @@ fn typed_array_get_own_property(
     if let Some(index) = canonical_index(key) {
         if typed_array_valid_index(slots, index) {
             let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
-            let size = element_bytes_into(slots, index, &mut bytes)?;
+            let size = element_bytes_into(slots, index as u64, &mut bytes)?;
             let value = crate::typed_array::decode_element(slots.element_type, &bytes[..size], 0)?;
             return Ok(Some(Property::data(value, true, true, true)));
         }
@@ -4349,7 +4363,7 @@ fn typed_array_define_own_property(
             let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
             let size =
                 crate::typed_array::encode_element_into(slots.element_type, value, &mut bytes)?;
-            write_element_bytes(slots, index, &bytes[..size])?;
+            write_element_bytes(slots, index as u64, &bytes[..size])?;
         }
         return Ok(true);
     }
@@ -4365,7 +4379,7 @@ fn typed_array_define_own_property(
 }
 
 /// Write `bytes` to the buffer at element `index`.
-fn write_element_bytes(slots: &TypedArraySlots, index: f64, bytes: &[u8]) -> Result<(), JsError> {
+fn write_element_bytes(slots: &TypedArraySlots, index: u64, bytes: &[u8]) -> Result<(), JsError> {
     let offset = slots.byte_offset + index as usize * slots.element_type.size();
     slots.buffer.write(offset, bytes).map_err(|_| {
         JsError::new(
@@ -4386,7 +4400,7 @@ fn typed_array_get(
     if let Some(index) = canonical_index(key) {
         if typed_array_valid_index(slots, index) {
             let mut bytes = [0u8; crate::typed_array::MAX_ELEMENT_SIZE];
-            let size = element_bytes_into(slots, index, &mut bytes)?;
+            let size = element_bytes_into(slots, index as u64, &mut bytes)?;
             return crate::typed_array::decode_element(slots.element_type, &bytes[..size], 0);
         }
         // An invalid index (incl. a detached buffer) reads *undefined*
@@ -4423,7 +4437,7 @@ fn typed_array_set(
             let size =
                 crate::typed_array::encode_element_into(slots.element_type, &value, &mut bytes)?;
             if typed_array_valid_index(slots, index) {
-                write_element_bytes(slots, index, &bytes[..size])?;
+                write_element_bytes(slots, index as u64, &bytes[..size])?;
             }
             return Ok(true);
         }

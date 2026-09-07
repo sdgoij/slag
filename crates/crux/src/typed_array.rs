@@ -780,6 +780,20 @@ fn wrap_signed(number: f64, bits: u32) -> i64 {
     }
 }
 
+/// The exact integer form of `number` when its low-`bits` conversion is
+/// `number as i64` (spec truncation mod 2^bits): an integral value in
+/// [-2^31, 2^32), where the f64→i64 cast is exact and its low `bits`
+/// reproduce the wrap for every integer element width up to 32 — the
+/// overwhelmingly common in-range integer store (a count/byte loop) skips
+/// `wrap_signed`'s f64 `rem_euclid`.
+fn wrap_bits_fast(number: f64) -> Option<i64> {
+    if number.fract() == 0.0 && (-2147483648.0..=4294967295.0).contains(&number) {
+        Some(number as i64)
+    } else {
+        None
+    }
+}
+
 /// The IEEE 754 binary16 bit pattern nearest to `x` (round-half-to-even),
 /// used by the Float16 element conversion and `Math.f16round` (spec
 /// 25.2.4.2 / 21.3.2.15). Rounds directly from the full 53-bit f64
@@ -878,11 +892,17 @@ fn encode_number_into(
 ) -> Result<usize, JsError> {
     match element_type {
         ElementType::Int8 => {
-            out[0] = wrap_signed(number, 8) as i8 as u8;
+            out[0] = match wrap_bits_fast(number) {
+                Some(raw) => raw as i8 as u8,
+                None => wrap_signed(number, 8) as i8 as u8,
+            };
             Ok(1)
         }
         ElementType::Uint8 => {
-            out[0] = wrap_signed(number, 8) as u8;
+            out[0] = match wrap_bits_fast(number) {
+                Some(raw) => raw as u8,
+                None => wrap_signed(number, 8) as u8,
+            };
             Ok(1)
         }
         ElementType::Uint8Clamped => {
@@ -890,19 +910,35 @@ fn encode_number_into(
             Ok(1)
         }
         ElementType::Int16 => {
-            out[..2].copy_from_slice(&(wrap_signed(number, 16) as i16).to_ne_bytes());
+            let raw = match wrap_bits_fast(number) {
+                Some(raw) => raw as i16,
+                None => wrap_signed(number, 16) as i16,
+            };
+            out[..2].copy_from_slice(&raw.to_ne_bytes());
             Ok(2)
         }
         ElementType::Uint16 => {
-            out[..2].copy_from_slice(&(wrap_signed(number, 16) as u16).to_ne_bytes());
+            let raw = match wrap_bits_fast(number) {
+                Some(raw) => raw as u16,
+                None => wrap_signed(number, 16) as u16,
+            };
+            out[..2].copy_from_slice(&raw.to_ne_bytes());
             Ok(2)
         }
         ElementType::Int32 => {
-            out[..4].copy_from_slice(&(wrap_signed(number, 32) as i32).to_ne_bytes());
+            let raw = match wrap_bits_fast(number) {
+                Some(raw) => raw as i32,
+                None => wrap_signed(number, 32) as i32,
+            };
+            out[..4].copy_from_slice(&raw.to_ne_bytes());
             Ok(4)
         }
         ElementType::Uint32 => {
-            out[..4].copy_from_slice(&(wrap_signed(number, 32) as u32).to_ne_bytes());
+            let raw = match wrap_bits_fast(number) {
+                Some(raw) => raw as u32,
+                None => wrap_signed(number, 32) as u32,
+            };
+            out[..4].copy_from_slice(&raw.to_ne_bytes());
             Ok(4)
         }
         ElementType::Float16 => {

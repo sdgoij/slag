@@ -5725,6 +5725,137 @@ per call is the method dispatch + species create + result-array dense
 copies; `slice_concat.js`'s literal+slice+join portions are container
 creation / join machinery.
 
+### Function-expression instantiation probe: the closure-creation cost (measured 2026-09-07, NOT landed — the next-slice design)
+
+After the concat/coercion landings the two largest rows are the amplified
+fixtures `for-in/head-let-fresh-binding-per-iteration.js` (~1820ms
+jitless, ~16x node-jitless, jit ratio 0.93) and `template-literal/
+evaluation-order.js` (~1210ms, ~20x, 0.93): per-iteration ~18us and
+~12us respectively. Decomposition of the for-in fixture's __t262Body
+(isolated 100k-iteration probes, min of 2): object create + 3 defines
+~320ns; same + 3 member stores ~380ns; + 3 arrow closures ~2.4us; + 3
+`function(){}` closures ~4.7us; + a 3-key `for (let x in obj)` with
+per-iteration binding ~1.4us. So a plain `function(){}` expression costs
+~1.4us to instantiate and an arrow ~660ns (node-jitless ~40ns for both);
+function-object creation is the dominant remaining machinery (it also
+underpins `closure_capture` 147ms and `calls/*`). `register_function` per
+closure pays: a Function box, an `ecma_functions` HashMap record insert,
+`set_function_properties` (length/name defines), sloppy
+`caller`/`arguments` restricted-property defines, an eagerly-created
+`.prototype` ordinary object + MakeConstructor (its own `constructor`
+define), and the %Function.prototype% wiring — vs V8's lazy `.prototype`
+and shared boilerplate shapes. Sub-attribution (2026-09-07 probe): a
+strict-bodied `function(){}` (~1.4us) vs arrow (~0.8us) vs sloppy
+(~1.65us) splits the cost into core (~0.8us, arrow-level: Function box +
+record insert + length define + proto wiring), `.prototype`+MakeConstructor
+(~0.6us), and sloppy `caller`/`arguments` (~0.2-0.3us). Disabling
+`capture_source` (the per-closure source-slice + hash) measured zero,
+so the core is allocation/bookkeeping spread across many ~50ns steps
+(Function box + 528B object part + EcmaFunction record node + intrinsic
+wiring), not one removable term — cutting it 2-3x needs per-closure
+boilerplate shapes (shared pre-sized maps keyed per kind/arity for the
+function own-property set and the `.prototype` object) plus possibly lazy
+`caller`/`arguments`, i.e. engine-level work best gated behind an
+in-engine accounting pass.
+
+**In-engine accounting pass (SLAG_FN_PROFILE, temporary env-gated phase
+timers around register_function/instantiate_arrow, measured 2026-09-07):**
+steady-state ns/closure at 300k creations (cal = 30ns empty-phase
+overhead, so subtract ~30): `function(){}` sloppy fn_new ~115 + insert
+~65 + props ~710 (3 defines: length/caller/arguments) + proto_alloc ~380
+(ordinary_object_create of the `.prototype`) + make_ctor ~365 (2 defines)
++ set_proto ~36; arrow core fn_new ~110 + insert ~55 + props ~230 (1
+define) + set_proto ~31; strict fn (props ~250, 1 define) confirms the
+rest. A low-volume check (3000 creations, no GC pressure) measured the
+SAME per-closure totals (fn ~1.63us, arrow ~0.81us), so the phase costs
+are real machinery, not GC noise. OPEN (before building on these): the
+~190-220ns per fixed define and ~380ns ordinary-object create in this
+path are inconsistent with indirect object-literal measurements ({} +
+3 member stores ~317ns, {} + 1 literal key ~117ns), and `props`/`proto`
+phase boundaries may be misattributing work — the next step is a crux-
+level ns/define counter (same SLAG_FN_PROFILE style) over both the
+function path and a plain object-literal path from one build, which also
+decides whether batching the fixed boilerplate (length[/name]/
+caller/arguments/prototype + the `.prototype` constructor) is the right
+slice.
+
+**Direct crux-level define counter (SLAG_DEFINE_PROFILE, measured
+2026-09-07): RESOLVES the discrepancy — the phase inference was wrong.**
+Instrumenting fresh_data_define/fresh_data_define_attrs in crux with a
+receiver bucket (function object-part vs ordinary) measured fresh defines
+at ~69ns (fn object) and ~48-57ns (ordinary) INCLUDING ~30ns of Instant
+overhead — i.e. ~40ns real on function objects, only ~1.3x the ordinary
+path. The ~190-220ns/define phase numbers were misattribution (the phases
+carried non-define work plus per-phase overhead). With ~1.8M fixed
+defines over the 300k-closure probe at ~40ns real each, defines are only
+~15% of the ~1.6us/closure total — the batched-boilerplate slice would
+cap at ~7-15% and is NOT worth its risk. The ~1.2us core is elsewhere
+(Function box + 528B object-part allocation, the ecma_functions record
+insert, the compiled-body cache lookup, and the instantiate prelude) and
+needs finer alloc/record-level attribution before any engine surgery.
+
+Typed-array element access also
+re-probed at ~50-55ns/op interp (node ~12ns, jit flat): the store/read
+per-op index handling is the target if the boilerplate work lands first.
+
+### The lean typed-array element path: no per-op length borrow, u64 bounds, in-range integer encode (measured + landed 2026-09-07)
+
+The typed-array row re-probe decomposed to per-op costs above a ~23ns
+step-path loop skeleton: a masked-key read adds ~37ns, a store ~37.5ns,
+a dense-Array read only ~27ns — the typed-specific delta was the crux
+element machinery. Two structural facts framed the slice: (1) the corpus
+row's jit column EQUALS its jitless column (~230ms) not because the JIT
+is slow at element ops but because the body constructs its array
+(`var ta = new Uint8Array(...)` → a `Step::Construct`), which the whole-
+body JIT compile rejects — the row is interpreter-bound in both columns.
+The same masked store+read loop with the array passed as a parameter
+compiles and drops 232→106ms, so JIT coverage of `Construct` is a
+separate, later lever. (2) The interpreter element op carries removable
+fixed work: `typed_array_effective_length` borrowed the block's live
+byte length (a `RefCell` borrow) on EVERY read/write and re-checked
+detachment, although a fixed view over a non-resizable buffer was
+validated at creation and only detach can invalidate it.
+
+Landed (crates/crux):
+
+- `typed_array_effective_length` returns the stored `[[ArrayLength]]`
+  for a fixed view over a non-resizable buffer without touching the
+  live byte range (resizable-buffer and auto-length views keep the
+  byte-length recompute, which is exactly where a shrink can occur).
+- The runtime's numeric element fast paths (`typed_array_element_get`/
+  `set` and the `element_bytes_into`/`write_element_bytes` helpers they
+  share with `[[Get]]`/`[[Set]]`/`[[GetOwnProperty]]`/`[[DefineOwnProperty]]`)
+  now bounds-check the canonical u64 index directly — no f64 round-trip,
+  no redundant detached re-check (one gate), no re-derived index.
+- Integer element encodes (Int8/Uint8/Int16/Uint16/Int32/Uint32) skip
+  `wrap_signed`'s f64 `rem_euclid` when the value is an integral Number
+  in [-2^31, 2^32) (the f64→i64 cast is exact there and its low bits
+  reproduce the spec's trunc-mod-2^bits wrap); every other value keeps
+  the exact general path.
+
+A/B (interleaved, corpus arrays dir): `typed_array.js` ~230 → ~199ms in
+BOTH modes (~13-15%); the isolated read loop 119→100ms, store loop
+120→107ms (jl). The `--jit-bench` typed-array rows are unchanged
+(write interp ~34/jit ~12.4, length ~12.7/jit ~1.9) — those store rows
+use the register path, not the crux element helper.
+
+Gates: clippy clean, workspace tests green, and the three release sweeps
+at baseline (language 23721/3 skip, built-ins 23657/155 skip, annexB
+1086/1086, zero fail/crash/hang). A typed-array differential battery
+(all element types × fractional/negative/huge/NaN/±Inf/-0 values, OOB /
+negative / fractional index reads and writes, in-bounds own-property
+descriptors + keys, `transfer()` detachment, and resizable-buffer
+shrink/grow on both fixed-length and auto-length views) is byte-
+identical to Node under jit, jitless, and `--gc-stress`, and the
+37-workload corpus keeps jit/jitless/node result parity.
+
+The row's remaining big lever is NOT the element path: a body that
+constructs a typed array (or anything) locally never JITs, so the corpus
+row stays interpreter-bound in the jit column. Supporting `Step::Construct`
+(compile it as a slow construct call) would compile such bodies — the
+param-array analog measured 2.2x (232→106ms). That is an L3-coverage
+slice, separate from this element-path landing.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
