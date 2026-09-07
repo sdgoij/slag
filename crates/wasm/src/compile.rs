@@ -21,9 +21,10 @@
 //!   (parameters enter the body as its initial operand stack and ride a
 //!   loop's header as block parameters; a parameterized `if` needs an
 //!   explicit else branch);
-//! - numeric loads/stores and `memory.size` over a module's single 32-bit
-//!   memory (index 0), bounds-checked inline against a per-call memory
-//!   pointer/length passed in the entry ABI;
+//! - numeric loads/stores and `memory.size` over any 32-bit memory, each
+//!   access bounds-checking against a per-call descriptor array (one
+//!   (data pointer, byte length) pair per module memory index, entry ABI
+//!   params 2/3);
 //! - `global.get`/`global.set` of numeric module-defined globals, through a
 //!   caller-owned buffer (one u64 slot per used global): the compiled body
 //!   reads and mutates slots in place, so its writes reach the store even
@@ -80,8 +81,9 @@ pub fn trap_of(code: i32) -> Trap {
 
 /// The native entry point produced by the compiler.
 ///
-/// `(args, nargs, mem, mem_len, gvals, out, nout)`: `mem`/`mem_len` are the
-/// module's single memory's data pointer and byte length (0/0 when absent);
+/// `(args, nargs, mems, ncount, gvals, out, nout)`: `mems` points at a
+/// caller-owned descriptor array holding, per module memory index, its data
+/// pointer then byte length (each `u64`); `ncount` is the descriptor count.
 /// `gvals` is a caller-owned buffer, one u64 slot per module global the body
 /// uses, holding the initial values on entry and the (possibly mutated)
 /// values on return — so `global.set` is visible to the store even when a
@@ -89,8 +91,8 @@ pub fn trap_of(code: i32) -> Trap {
 pub type CompiledEntry = unsafe extern "C" fn(
     args: *const u64,
     nargs: u64,
-    mem: *const u8,
-    mem_len: u64,
+    mems: *const u64,
+    ncount: u64,
     gvals: *mut u64,
     out: *mut u64,
     nout: u64,
@@ -118,20 +120,20 @@ impl CompiledFunc {
     pub fn call(
         &self,
         args: &[u64],
-        mem: (*const u8, u64),
+        mems: (*const u64, u64),
         globals: &mut [u64],
         out: &mut [u64],
     ) -> i32 {
         // SAFETY: `entry` is a plain function pointer into `_code`, which
         // this struct keeps alive and executable for its whole lifetime; the
-        // caller passes buffers of the declared lengths and a memory pointer
-        // that stays valid for the (leaf) call.
+        // caller passes buffers of the declared lengths and a descriptor
+        // array that stays valid for the (leaf) call.
         unsafe {
             (self.entry)(
                 args.as_ptr(),
                 args.len() as u64,
-                mem.0,
-                mem.1,
+                mems.0,
+                mems.1,
                 globals.as_mut_ptr(),
                 out.as_mut_ptr(),
                 out.len() as u64,
@@ -145,7 +147,7 @@ impl CompiledFunc {
 pub fn run_compiled(
     func: &CompiledFunc,
     ty: &FuncType,
-    mem: (*const u8, u64),
+    mems: (*const u64, u64),
     globals: &mut [u64],
     args: &[Value],
 ) -> Result<Vec<Value>, ExecFail> {
@@ -164,7 +166,7 @@ pub fn run_compiled(
         input.push(bits);
     }
     let mut output = vec![0u64; ty.results.len()];
-    let code = func.call(&input, mem, globals, &mut output);
+    let code = func.call(&input, mems, globals, &mut output);
     if code != TRAP_NONE {
         return Err(ExecFail::Trap(trap_of(code)));
     }
@@ -313,11 +315,32 @@ fn block_sig(module: &Module, bt: &BlockType) -> Option<(Vec<ValType>, Vec<ValTy
     }
 }
 
-/// Whether a function body may use the module's single 32-bit memory: every
-/// memory instruction must target memory index 0, and that memory must not
-/// be memory64 (multi-memory, memory64, and growth keep the interpreter).
-fn mem0_supported(module: &Module) -> bool {
-    matches!(module.memories.first(), Some(mem) if !mem.memory64)
+/// A memory index's declared `memory64` flag, resolving index-space indices
+/// (imported memories first, then the module's own) so the lowering subset
+/// can accept any 32-bit memory.
+fn memory_is64(module: &Module, index: u32) -> Option<bool> {
+    let imported = module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Memory(_)))
+        .count() as u32;
+    if index < imported {
+        let mut seen = 0u32;
+        for import in &module.imports {
+            if let ImportDesc::Memory(memory) = &import.desc {
+                if seen == index {
+                    return Some(memory.memory64);
+                }
+                seen += 1;
+            }
+        }
+        None
+    } else {
+        module
+            .memories
+            .get((index - imported) as usize)
+            .map(|memory| memory.memory64)
+    }
 }
 
 /// A module global's declared `(ValType, mutable)`, resolving index-space
@@ -401,9 +424,9 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_sig(module, bt).is_some(),
         Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) | Instr::BrTable { .. } => true,
         Instr::Load { memory, .. } | Instr::Store { memory, .. } => {
-            mem0_supported(module) && *memory == 0
+            memory_is64(module, *memory) == Some(false)
         }
-        Instr::MemorySize(memory) => mem0_supported(module) && *memory == 0,
+        Instr::MemorySize(memory) => memory_is64(module, *memory) == Some(false),
         Instr::GlobalGet(index) => {
             matches!(defined_global(module, *index), Some((ty, _)) if clif_type(ty).is_some())
         }
@@ -654,9 +677,9 @@ struct Lowerer<'a> {
     /// `locals` and `stack` entry metadata mirror the interpreter's model.
     variables: Vec<Variable>,
     stack: Vec<ClifValue>,
-    /// The module memory's data pointer and byte length (entry params 2/3).
-    mem_ptr: ClifValue,
-    mem_len: ClifValue,
+    /// The per-call memory descriptor array (entry param 2): per module
+    /// memory index, its data pointer then byte length (each a `u64`).
+    mems: ClifValue,
     /// The per-call global-values buffer (entry param 4): one u64 slot per
     /// used module global. `globals` maps a module global index to its slot
     /// position and clif type.
@@ -872,26 +895,46 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// The byte address of a memory access: unsigned-widen the i32 address,
-    /// add the static offset, then trap when `addr + offset + width` exceeds
-    /// the memory's length. Returns the base-plus-effective-address pointer.
-    fn mem_ea(&mut self, addr: ClifValue, offset: u64, width: u64) -> Result<ClifValue, String> {
+    /// The byte address of a memory access: reload the memory's descriptor
+    /// (data pointer and length), unsigned-widen the i32 address, add the
+    /// static offset, then trap when `addr + offset + width` exceeds the
+    /// memory's length. Returns the base-plus-effective-address pointer.
+    fn mem_ea(
+        &mut self,
+        memory: u32,
+        addr: ClifValue,
+        offset: u64,
+        width: u64,
+    ) -> Result<ClifValue, String> {
+        let ptr_slot = self.builder.ins().iadd_imm_s(self.mems, 16 * memory as i64);
+        let len_slot = self
+            .builder
+            .ins()
+            .iadd_imm_s(self.mems, 16 * memory as i64 + 8);
+        let mem_ptr =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), ptr_slot, Offset32::new(0));
+        let mem_len =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), len_slot, Offset32::new(0));
         let addr64 = self.builder.ins().uextend(types::I64, addr);
         let ea = self.builder.ins().iadd_imm_s(addr64, offset as i64);
         let end = self.builder.ins().iadd_imm_s(ea, width as i64);
         let oob = self
             .builder
             .ins()
-            .icmp(IntCC::UnsignedGreaterThan, end, self.mem_len);
+            .icmp(IntCC::UnsignedGreaterThan, end, mem_len);
         self.trap_if(oob, TRAP_MEMORY_OOB);
-        Ok(self.builder.ins().iadd(self.mem_ptr, ea))
+        Ok(self.builder.ins().iadd(mem_ptr, ea))
     }
 
     /// Lower a numeric load (little-endian) with its sign/zero extension.
-    fn do_load(&mut self, op: LoadOp, offset: u64) -> Result<(), String> {
+    fn do_load(&mut self, memory: u32, op: LoadOp, offset: u64) -> Result<(), String> {
         use LoadOp::*;
         let addr = self.pop().ok_or("operand stack underflow")?;
-        let address = self.mem_ea(addr, offset, load_width(op))?;
+        let address = self.mem_ea(memory, addr, offset, load_width(op))?;
         let flags = MemFlagsData::new();
         let value = match op {
             I32 => self
@@ -992,11 +1035,11 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Lower a numeric store (little-endian), truncating to the store width.
-    fn do_store(&mut self, op: StoreOp, offset: u64) -> Result<(), String> {
+    fn do_store(&mut self, memory: u32, op: StoreOp, offset: u64) -> Result<(), String> {
         use StoreOp::*;
         let value = self.pop().ok_or("operand stack underflow")?;
         let addr = self.pop().ok_or("operand stack underflow")?;
-        let address = self.mem_ea(addr, offset, store_width(op))?;
+        let address = self.mem_ea(memory, addr, offset, store_width(op))?;
         let flags = MemFlagsData::new();
         let stored = match op {
             I32 => value,
@@ -1016,9 +1059,17 @@ impl<'a> Lowerer<'a> {
     }
 
     /// `memory.size`: current size in pages as an i32 (32-bit memory).
-    fn do_memory_size(&mut self) -> Result<(), String> {
+    fn do_memory_size(&mut self, memory: u32) -> Result<(), String> {
+        let len_slot = self
+            .builder
+            .ins()
+            .iadd_imm_s(self.mems, 16 * memory as i64 + 8);
+        let mem_len =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), len_slot, Offset32::new(0));
         let sixteen = self.iconst(types::I64, 16);
-        let pages = self.builder.ins().ushr(self.mem_len, sixteen);
+        let pages = self.builder.ins().ushr(mem_len, sixteen);
         let pages32 = self.builder.ins().ireduce(types::I32, pages);
         self.stack.push(pages32);
         Ok(())
@@ -1684,26 +1735,11 @@ impl<'a> Lowerer<'a> {
             Instr::Num(op) => self.lower_num(*op)?,
             Instr::Load {
                 memory, op, offset, ..
-            } => {
-                if *memory != 0 {
-                    return Err("unsupported memory index".to_string());
-                }
-                self.do_load(*op, *offset)?;
-            }
+            } => self.do_load(*memory, *op, *offset)?,
             Instr::Store {
                 memory, op, offset, ..
-            } => {
-                if *memory != 0 {
-                    return Err("unsupported memory index".to_string());
-                }
-                self.do_store(*op, *offset)?;
-            }
-            Instr::MemorySize(memory) => {
-                if *memory != 0 {
-                    return Err("unsupported memory index".to_string());
-                }
-                self.do_memory_size()?;
-            }
+            } => self.do_store(*memory, *op, *offset)?,
+            Instr::MemorySize(memory) => self.do_memory_size(*memory)?,
             Instr::Block(bt) => {
                 let (params, results) =
                     block_sig(self.module, bt).ok_or("unsupported block type")?;
@@ -1751,10 +1787,11 @@ impl<'a> Lowerer<'a> {
     }
 }
 
-/// Lower `body` into `func`. Entry params: `(args, nargs, mem, mem_len,
+/// Lower `body` into `func`. Entry params: `(args, nargs, mems, ncount,
 /// gvals, out, nout)`, all pointers/counts as `I64`; returns the trap code
-/// `I32`. `used_globals` lists the module globals the body touches (their
-/// initial values arrive and final values leave through the `gvals` buffer).
+/// `I32`. `mems` is the per-memory descriptor array; `used_globals` lists the
+/// module globals the body touches (their initial values arrive and final
+/// values leave through the `gvals` buffer).
 fn lower(
     module: &Module,
     body: &FuncBody,
@@ -1769,8 +1806,7 @@ fn lower(
     builder.append_block_params_for_function_params(entry_block);
     builder.switch_to_block(entry_block);
     let params = builder.block_params(entry_block).to_vec();
-    let (args_ptr, mem_ptr, mem_len, globals_ptr, out_ptr) =
-        (params[0], params[2], params[3], params[4], params[5]);
+    let (args_ptr, mems, globals_ptr, out_ptr) = (params[0], params[2], params[4], params[5]);
     // Each used module global gets a `gvals` buffer slot (slot == position).
     let globals = used_globals
         .iter()
@@ -1825,8 +1861,7 @@ fn lower(
         module,
         variables,
         stack: Vec::new(),
-        mem_ptr,
-        mem_len,
+        mems,
         globals_ptr,
         globals,
         out_ptr,
@@ -3562,5 +3597,98 @@ mod tests {
         ));
         assert_eq!(outcomes[1], Ok(vec![Value::I32(42)]));
         assert_eq!(outcomes[3], Ok(vec![Value::I32(-3)]));
+    }
+
+    #[test]
+    fn multi_memory_ops_match_the_interpreter() {
+        let two_memories = || {
+            vec![
+                MemType {
+                    limits: Limits {
+                        min: 1,
+                        max: None,
+                        shared: false,
+                    },
+                    memory64: false,
+                },
+                MemType {
+                    limits: Limits {
+                        min: 2,
+                        max: None,
+                        shared: false,
+                    },
+                    memory64: false,
+                },
+            ]
+        };
+        // Store different values in each memory, then read both back and add:
+        // if both loads hit the same descriptor the sum is wrong.
+        let module = Module {
+            types: vec![SubType::func(
+                vec![ValType::I32, ValType::I32],
+                vec![ValType::I32],
+            )],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body: vec![
+                    Instr::I32Const(0),
+                    Instr::LocalGet(0),
+                    Instr::Store {
+                        memory: 0,
+                        op: StoreOp::I32,
+                        align: 0,
+                        offset: 0,
+                    },
+                    Instr::I32Const(0),
+                    Instr::LocalGet(1),
+                    Instr::Store {
+                        memory: 1,
+                        op: StoreOp::I32,
+                        align: 0,
+                        offset: 0,
+                    },
+                    Instr::I32Const(0),
+                    Instr::Load {
+                        memory: 0,
+                        op: LoadOp::I32,
+                        align: 2,
+                        offset: 0,
+                    },
+                    Instr::I32Const(0),
+                    Instr::Load {
+                        memory: 1,
+                        op: LoadOp::I32,
+                        align: 2,
+                        offset: 0,
+                    },
+                    Instr::Num(NumOp::I32Add),
+                ],
+            }],
+            memories: two_memories(),
+            ..Module::default()
+        };
+        let cases = [(11i32, 22i32), (-1, 7), (i32::MAX, i32::MIN)]
+            .into_iter()
+            .map(|(a, b)| vec![Value::I32(a), Value::I32(b)])
+            .collect::<Vec<_>>();
+        assert_equiv(&module, 0, &cases);
+
+        // memory.size is per memory: 1 page + 2 pages.
+        let sizes = Module {
+            types: vec![SubType::func(vec![], vec![ValType::I32])],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body: vec![
+                    Instr::MemorySize(0),
+                    Instr::MemorySize(1),
+                    Instr::Num(NumOp::I32Add),
+                ],
+            }],
+            memories: two_memories(),
+            ..Module::default()
+        };
+        assert_equiv(&sizes, 0, &[vec![]]);
     }
 }

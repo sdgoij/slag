@@ -1083,16 +1083,25 @@ impl Store {
             // reference is only used to reach the native entry and the
             // function's global metadata while we mutate global/memory cells.
             let func = unsafe { &*func_ptr };
-            // The module's single memory (index 0), as a raw pointer/len the
-            // compiled body can bounds-check against. Nothing reallocates it
-            // during the leaf call (growth is not in the compiled subset).
-            let mem = match self.instances[instance].memories.first().copied() {
-                Some(cell) => match self.memories.get(cell) {
-                    Some(memory) => (memory.bytes.as_ptr(), memory.bytes.len() as u64),
-                    None => (std::ptr::null(), 0),
-                },
-                None => (std::ptr::null(), 0),
-            };
+            // Per-memory descriptors (data pointer, byte length) for the
+            // module's whole memory index space, caller-owned for the leaf
+            // call (nothing reallocates a memory mid-call — growth is not in
+            // the compiled subset).
+            let memory_cells = self.instances[instance].memories.clone();
+            let mut descriptors: Vec<u64> = Vec::with_capacity(2 * memory_cells.len());
+            for cell in memory_cells {
+                match self.memories.get(cell) {
+                    Some(memory) => {
+                        descriptors.push(memory.bytes.as_ptr() as u64);
+                        descriptors.push(memory.bytes.len() as u64);
+                    }
+                    None => {
+                        descriptors.push(0);
+                        descriptors.push(0);
+                    }
+                }
+            }
+            let mems = (descriptors.as_ptr(), descriptors.len() as u64);
             // The used globals' current bits ride a caller-owned buffer: the
             // compiled body reads and mutates slots in place, so its writes
             // are visible to the store even when it traps.
@@ -1111,7 +1120,7 @@ impl Store {
                     _ => 0,
                 })
                 .collect();
-            let result = crate::compile::run_compiled(func, &signature, mem, &mut globals, args);
+            let result = crate::compile::run_compiled(func, &signature, mems, &mut globals, args);
             for (cell, bits) in cells.iter().zip(&globals) {
                 let value = match self.global_types[*cell].value {
                     ValType::I32 => Value::I32(*bits as u32 as i32),

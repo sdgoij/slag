@@ -1830,3 +1830,22 @@ memory/numeric regressions. 26 compile tests, 62 total with the
 feature, clippy clean in both configurations. Wave 2 remaining:
 `memory.grow` (needs store-side realloc), memory64/multi-memory, and the
 table/`call_indirect` family.
+
+Multi-memory loads/stores/size landed: the snapshot `mem`/`mem_len`
+ABI pair became a per-call memory descriptor array (one (data pointer,
+byte length) `u64` pair per module memory index, entry ABI params 2/3),
+so compiled memory ops address any memory, not just index 0. `mem_ea`
+and `memory.size` reload the descriptor for the instruction's memory
+index at each access; the `lowerable` gate now resolves each used
+memory's type through the index space (imported memories first) and
+accepts it when not memory64. Growth still keeps a function
+interpreted (it would reallocate the buffer the descriptors snapshot),
+and memory64 addressing stays interpreter-side. Unit coverage adds a
+module with a 1-page and a 2-page memory storing/loading distinct
+values into each and summing the `memory.size`s, so a descriptor mixup
+diverges. `wasmtest equiv` is green over the whole `multi-memory` suite
+(41 suites) and `memory64` (25 suites, 0 diverged there as expected —
+memory64 bodies stay interpreted). 27 compile tests, 63 total with the
+feature, clippy clean in both configurations. Wave 2 remaining:
+`memory.grow` (needs a store-side realloc helper + descriptor
+refresh), memory64 addressing, and the table/`call_indirect` family.
