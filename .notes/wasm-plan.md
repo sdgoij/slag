@@ -2303,3 +2303,30 @@ green over the whole core corpus: 254 suites, 0 diverged. 57 compile
 tests, 93 total with the feature, clippy clean in both configurations.
 Next Wave 5 items: v128 memory loads/stores (incl. lane and
 load-extend forms) and `i8x16.shuffle`.
+
+v128 memory ops and `i8x16.shuffle` landed, completing the SIMD wave's
+compiled surface. Each vector memory instruction bounds-checks with the
+compiled `mem_ea` (same descriptor/OOB semantics as the numeric
+loads/stores, at the form's byte width) and then either runs natively or
+through the runtime helper: a plain `v128.store` is a native 16-byte
+`I128` store of the raw pattern; the `v128.load*` forms (mode 72)
+materialize the vector from the memory bytes at the effective address
+(`VecLoadOp::bytes`/`code`/`from_code` now live on the enum as the
+single source of truth, and the interpreter's duplicate `vec_load_bytes`
+was dropped); `v128.loadN_lane` (mode 73) merges the loaded bytes into
+the vector's lane; `v128.storeN_lane` (mode 74) writes a lane's bytes
+out; and `i8x16.shuffle` (mode 71) composes the result byte-by-byte
+from the 16 lane-index immediates (packed eight per helper word),
+mirroring the interpreter's byte selection exactly. `lowerable` admits
+the vector memory and shuffle instructions over any resolvable memory
+index, so the `simd` load/address/lane/shuffle corpus suites' leaf
+functions now run compiled. Unit coverage stores and re-loads v128
+patterns through the compiled boundary, sign-extends a `load8x8_s`
+read, merges a `load8_lane`, overwrites bytes with a `store32_lane`,
+and interleaves two vectors with a shuffle — each asserted bit-for-bit
+against the interpreter over shared memory. `wasmtest equiv` is green
+over the whole core corpus: 254 suites, 0 diverged. 58 compile tests,
+94 total with the feature, clippy clean in both configurations.
+Remaining Cut 11 gaps are by design: v128-typed *call* arguments,
+v128 globals/table elements/GC storage, and the resumable-host-call
+boundary keep those bodies interpreted.

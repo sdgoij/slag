@@ -7,7 +7,10 @@
 //!
 //! Supported subset (everything else bails to the interpreter, per
 //! function):
-//! - function signatures and locals over `i32`/`i64`/`f32`/`f64`;
+//! - function signatures, locals, and block types over
+//!   `i32`/`i64`/`f32`/`f64`/`v128` (a v128 rides the stack, locals, and
+//!   block params as a raw 128-bit pattern and crosses the entry boundary
+//!   as two u64 words);
 //! - `const`, `local.get/set/tee`, `drop`, `select`, numeric `Num` ops
 //!   (integer arithmetic/comparisons/shifts, `clz`/`ctz`/`popcnt`, the
 //!   float ops below, and `i64.wrap_i32`), `nop`, `unreachable`, and
@@ -17,11 +20,14 @@
 //!   `copysign` stay raw bit ops); `f32.min/max` and the
 //!   promote/demote conversions are deferred;
 //! - structured control flow (`block`/`loop`/`if`/`else`/`br`/`br_if`/
-//!   `br_table`) with numeric block types of any parameter/result count
+//!   `br_table`) with carried block types of any parameter/result count
 //!   (parameters enter the body as its initial operand stack and ride a
 //!   loop's header as block parameters; a parameterized `if` needs an
 //!   explicit else branch);
-//! - numeric loads/stores, `memory.size`, and `memory.grow` over any memory
+//! - numeric and v128 loads/stores (including the lane and sign/zero-
+//!   extending vector forms, `i8x16.shuffle`, and the pure-register SIMD
+//!   ops, which run through runtime helpers mirroring the interpreter),
+//!   `memory.size`, and `memory.grow` over any memory
 //!   (32- or 64-bit addressing, any index), each access bounds-checking
 //!   against a per-call descriptor array (one (data pointer, byte length)
 //!   pair per module memory index, entry ABI params 2/3). `memory.grow`
@@ -31,8 +37,8 @@
 //! - `global.get`/`global.set` of numeric module-defined globals, through a
 //!   caller-owned buffer (one u64 slot per used global): the compiled body
 //!   reads and mutates slots in place, so its writes reach the store even
-//!   when it traps. Imported globals (whose cells can alias), extern/GC
-//!   references, SIMD, and GC objects are not lowered yet;
+//!   when it traps. Imported globals (whose cells can alias), v128
+//!   globals, and GC objects are not lowered yet;
 //! - (nullable or not) function references ride the compiled stack as opaque
 //!   u64 tokens (0 = null; a function reference packs its address), so
 //!   `ref.func`/`ref.null func`/`ref.is_null`, `table.get`/`table.set` over
@@ -71,7 +77,7 @@ use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use crate::exec::ExecFail;
-use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
+use crate::instr::{Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{FuncBody, ImportDesc, Module};
 use crate::types::{
     BlockType, CompositeType, FieldType, FuncType, HeapType, RefType, StorageType, ValType,
@@ -1068,6 +1074,13 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         Instr::AnyConvertExtern | Instr::ExternConvertAny => true,
         Instr::RefTest { .. } | Instr::RefCast { .. } => true,
         Instr::V128Const(_) | Instr::Vec(_) | Instr::VecLane { .. } => true,
+        Instr::VecLoad { memory, .. } | Instr::VecStore { memory, .. } => {
+            memory_is64(module, *memory).is_some()
+        }
+        Instr::VecLaneLoad { memory, .. } | Instr::VecLaneStore { memory, .. } => {
+            memory_is64(module, *memory).is_some()
+        }
+        Instr::VecShuffle(_) => true,
         _ => false,
     })
 }
@@ -3864,6 +3877,126 @@ impl<'a> Lowerer<'a> {
         self.runtime_call(&args)
     }
 
+    /// Run one of the v128 memory/shuffle runtime helpers (modes 71-74) with
+    /// its u64 immediate/pointer args (`x`/`y`/`z`, mirroring the helper's
+    /// layout; see `exec::v128_mem`).
+    fn vec_mem_call(
+        &mut self,
+        mode: i64,
+        x: ClifValue,
+        y: ClifValue,
+        z: ClifValue,
+    ) -> Result<(), String> {
+        let mode_v = self.iconst(types::I64, mode);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode_v,
+            x,
+            y,
+            z,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// A `v128.store`: store the popped v128's 16 bytes at the effective
+    /// address (`mem_ea` bounds-checks the write), natively — a plain 16-byte
+    /// little-endian store of the raw pattern.
+    fn do_vec_store(&mut self, memory: u32, offset: u64) -> Result<(), String> {
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let addr = self.pop().ok_or("operand stack underflow")?;
+        let ptr = self.mem_ea(memory, addr, offset, 16)?;
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), value, ptr, Offset32::new(0));
+        Ok(())
+    }
+
+    /// A `v128.load` form: pop the address, bounds-check the form's byte read
+    /// with `mem_ea`, and let the runtime helper (mode 72) materialize the
+    /// vector from the memory bytes at the effective address.
+    fn do_vec_load(&mut self, memory: u32, op: VecLoadOp, offset: u64) -> Result<(), String> {
+        let addr = self.pop().ok_or("operand stack underflow")?;
+        let ptr = self.mem_ea(memory, addr, offset, op.bytes() as u64)?;
+        let x = self.iconst(types::I64, op.code() as i64);
+        let zero = self.iconst(types::I64, 0);
+        self.vec_mem_call(72, x, ptr, zero)?;
+        let out = self.load_v128(0);
+        self.stack.push(out);
+        Ok(())
+    }
+
+    /// A `v128.loadN_lane`: pop the vector then the address, bounds-check the
+    /// `size`-byte lane read, and let the runtime helper (mode 73) merge the
+    /// loaded bytes into the vector's lane.
+    fn do_vec_lane_load(
+        &mut self,
+        memory: u32,
+        size: u8,
+        offset: u64,
+        lane: u8,
+    ) -> Result<(), String> {
+        let vector = self.pop().ok_or("operand stack underflow")?;
+        let addr = self.pop().ok_or("operand stack underflow")?;
+        let ptr = self.mem_ea(memory, addr, offset, u64::from(size))?;
+        self.spill_v128(0, vector);
+        let x = self.iconst(types::I64, i64::from(size));
+        let y = self.iconst(types::I64, i64::from(lane));
+        self.vec_mem_call(73, x, y, ptr)?;
+        let out = self.load_v128(0);
+        self.stack.push(out);
+        Ok(())
+    }
+
+    /// A `v128.storeN_lane`: pop the vector then the address, bounds-check the
+    /// `size`-byte lane write, and let the runtime helper (mode 74) write the
+    /// lane's bytes to the effective address.
+    fn do_vec_lane_store(
+        &mut self,
+        memory: u32,
+        size: u8,
+        offset: u64,
+        lane: u8,
+    ) -> Result<(), String> {
+        let vector = self.pop().ok_or("operand stack underflow")?;
+        let addr = self.pop().ok_or("operand stack underflow")?;
+        let ptr = self.mem_ea(memory, addr, offset, u64::from(size))?;
+        self.spill_v128(0, vector);
+        let x = self.iconst(types::I64, i64::from(size));
+        let y = self.iconst(types::I64, i64::from(lane));
+        self.vec_mem_call(74, x, y, ptr)
+    }
+
+    /// An `i8x16.shuffle`: pop the two vectors (b on top), and let the runtime
+    /// helper (mode 71) compose the result byte-by-byte from the 16 lane-index
+    /// immediates (packed eight per `x`/`y` word).
+    fn do_vec_shuffle(&mut self, lanes: &[u8; 16]) -> Result<(), String> {
+        let b = self.pop().ok_or("operand stack underflow")?;
+        let a = self.pop().ok_or("operand stack underflow")?;
+        self.spill_v128(0, b);
+        self.spill_v128(2, a);
+        let mut lo = 0u64;
+        let mut hi = 0u64;
+        for (i, &lane) in lanes.iter().enumerate() {
+            if i < 8 {
+                lo |= u64::from(lane) << (8 * i);
+            } else {
+                hi |= u64::from(lane) << (8 * (i - 8));
+            }
+        }
+        let x = self.iconst(types::I64, lo as i64);
+        let y = self.iconst(types::I64, hi as i64);
+        let zero = self.iconst(types::I64, 0);
+        self.vec_mem_call(71, x, y, zero)?;
+        let out = self.load_v128(0);
+        self.stack.push(out);
+        Ok(())
+    }
+
     /// A pure-register v128 op (`Vec`/`VecLane`): pop the operands in the
     /// interpreter's pop order, spill them to the caller-owned scratch (a
     /// v128 occupies two u64 words, a scalar one), and run the runtime simd
@@ -4013,6 +4146,25 @@ impl<'a> Lowerer<'a> {
             Instr::V128Const(bits) => self.do_v128_const(*bits)?,
             Instr::Vec(sub) => self.do_simd_op(*sub, None)?,
             Instr::VecLane { op, lane } => self.do_simd_op(*op, Some(*lane))?,
+            Instr::VecLoad {
+                memory, op, offset, ..
+            } => self.do_vec_load(*memory, *op, *offset)?,
+            Instr::VecStore { memory, offset, .. } => self.do_vec_store(*memory, *offset)?,
+            Instr::VecLaneLoad {
+                memory,
+                size,
+                offset,
+                lane,
+                ..
+            } => self.do_vec_lane_load(*memory, *size, *offset, *lane)?,
+            Instr::VecLaneStore {
+                memory,
+                size,
+                offset,
+                lane,
+                ..
+            } => self.do_vec_lane_store(*memory, *size, *offset, *lane)?,
+            Instr::VecShuffle(lanes) => self.do_vec_shuffle(lanes)?,
             Instr::LocalGet(index) => {
                 let variable = self.variables[*index as usize];
                 let value = self.builder.use_var(variable);
@@ -8736,5 +8888,173 @@ mod tests {
         assert_equiv(&module, 5, &[vec![Value::V128(a), Value::V128(b)]]);
         assert_equiv(&module, 6, &[vec![Value::V128(a)]]);
         assert_equiv(&module, 7, &[vec![Value::V128(a), Value::V128(b)]]);
+    }
+
+    #[test]
+    fn v128_memory_ops_and_shuffle_match_the_interpreter() {
+        use crate::instr::VecLoadOp;
+        use crate::simd::set_lane;
+        // v128.store/load (plain and extending forms), the lane load/store
+        // forms, and i8x16.shuffle all run over the module's memory. Stores
+        // go first so the loads read known bytes; `run_seq` asserts each call
+        // agrees between the compiled path and the interpreter, and the
+        // spot-checked read-backs pin the exact semantics.
+        let v128 = ValType::V128;
+        let byte = |v: u128, i: usize| -> u64 { ((v >> (8 * i)) & 0xff) as u64 };
+        let module = Module {
+            types: vec![
+                // 0: (i32, v128) -> () stores.
+                SubType::func(vec![ValType::I32, v128], vec![]),
+                // 1: (i32) -> v128 loads.
+                SubType::func(vec![ValType::I32], vec![v128]),
+                // 2: (i32, v128) -> v128 lane load.
+                SubType::func(vec![ValType::I32, v128], vec![v128]),
+                // 3: (i32, v128) -> () lane store.
+                SubType::func(vec![ValType::I32, v128], vec![]),
+                // 4: (v128, v128) -> v128 shuffle.
+                SubType::func(vec![v128, v128], vec![v128]),
+            ],
+            functions: vec![0, 1, 2, 3, 4, 1],
+            bodies: vec![
+                // 0: v128.store at addr0.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::VecStore {
+                            memory: 0,
+                            align: 0,
+                            offset: 0,
+                        },
+                    ],
+                },
+                // 1: v128.load at addr0.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::VecLoad {
+                            memory: 0,
+                            op: VecLoadOp::V128,
+                            align: 0,
+                            offset: 0,
+                        },
+                    ],
+                },
+                // 2: v128.load8_lane 0 (size 1) of addr0 into the vector.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::VecLaneLoad {
+                            memory: 0,
+                            size: 1,
+                            align: 0,
+                            offset: 0,
+                            lane: 0,
+                        },
+                    ],
+                },
+                // 3: v128.store32_lane 2 (size 4) from the vector at addr0.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::VecLaneStore {
+                            memory: 0,
+                            size: 4,
+                            align: 0,
+                            offset: 0,
+                            lane: 2,
+                        },
+                    ],
+                },
+                // 4: i8x16.shuffle interleaving a's low bytes with b's.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::VecShuffle([0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23]),
+                    ],
+                },
+                // 5: v128.load8x8_s at addr0.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::VecLoad {
+                            memory: 0,
+                            op: VecLoadOp::I8x8S,
+                            align: 0,
+                            offset: 0,
+                        },
+                    ],
+                },
+            ],
+            memories: vec![MemType {
+                limits: Limits {
+                    min: 1,
+                    max: None,
+                    shared: false,
+                },
+                memory64: false,
+            }],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "v128 memory module did not compile"
+        );
+        // x: byte i = i; y: byte i = 0x10 + i; zz: every byte 0xab.
+        let x = (0..16u128).fold(0u128, |acc, i| acc | (i << (8 * i)));
+        let y = (0..16u128).fold(0u128, |acc, i| acc | ((0x10 + i) << (8 * i)));
+        let zz = (0..16u128).fold(0u128, |acc, i| acc | (0xab << (8 * i)));
+        let outcomes = run_seq(
+            &module,
+            &[
+                (0, vec![Value::I32(0), Value::V128(x)]),
+                (1, vec![Value::I32(0)]),
+                (0, vec![Value::I32(16), Value::V128(y)]),
+                (1, vec![Value::I32(16)]),
+                // Sign-extend the first 8 bytes of x into i16 lanes.
+                (5, vec![Value::I32(0)]),
+                // Load byte 0 of x into lane 0 of zz.
+                (2, vec![Value::I32(0), Value::V128(zz)]),
+                // Store zz at 8, then write zz's lane-2 i32 (bytes 8-12).
+                (0, vec![Value::I32(8), Value::V128(zz)]),
+                (3, vec![Value::I32(8), Value::V128(zz)]),
+                (1, vec![Value::I32(8)]),
+                (4, vec![Value::V128(x), Value::V128(y)]),
+            ],
+        );
+        // Round trips.
+        assert_eq!(outcomes[1], Ok(vec![Value::V128(x)]));
+        assert_eq!(outcomes[3], Ok(vec![Value::V128(y)]));
+        // load8x8_s of bytes 0..8 of x.
+        let mut ext = 0u128;
+        for i in 0..8 {
+            let b = byte(x, i) as u8;
+            ext = set_lane(ext, i, 2, (b as i8 as i16 as u16) as u64);
+        }
+        assert_eq!(outcomes[4], Ok(vec![Value::V128(ext)]));
+        // load8_lane: zz with byte 0 replaced by byte 0 of x.
+        assert_eq!(
+            outcomes[5],
+            Ok(vec![Value::V128(set_lane(zz, 0, 1, byte(x, 0)))])
+        );
+        // The lane store overwrote zz's bytes 8..12 with zz's own bytes 8..12
+        // (all 0xab), so the read-back is still zz.
+        assert_eq!(outcomes[8], Ok(vec![Value::V128(zz)]));
+        // Shuffle interleaves a's bytes 0..8 with b's bytes 0..8.
+        let mut shuffled = 0u128;
+        for k in 0..16u128 {
+            let (source, i) = if k % 2 == 0 { (x, k / 2) } else { (y, k / 2) };
+            shuffled |= u128::from(byte(source, i as usize)) << (8 * k);
+        }
+        assert_eq!(outcomes[9], Ok(vec![Value::V128(shuffled)]));
     }
 }

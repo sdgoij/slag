@@ -226,6 +226,66 @@ pub enum VecLoadOp {
     I64Zero,
 }
 
+impl VecLoadOp {
+    /// The number of bytes the load form reads from memory.
+    pub fn bytes(self) -> usize {
+        match self {
+            VecLoadOp::V128 => 16,
+            VecLoadOp::I8x8S
+            | VecLoadOp::I8x8U
+            | VecLoadOp::I16x4S
+            | VecLoadOp::I16x4U
+            | VecLoadOp::I32x2S
+            | VecLoadOp::I32x2U
+            | VecLoadOp::I64Splat
+            | VecLoadOp::I64Zero => 8,
+            VecLoadOp::I8Splat => 1,
+            VecLoadOp::I16Splat => 2,
+            VecLoadOp::I32Splat | VecLoadOp::I32Zero => 4,
+        }
+    }
+
+    /// A stable code for the compiled runtime helper (mode 72) to identify
+    /// the load form.
+    pub fn code(self) -> u64 {
+        match self {
+            VecLoadOp::V128 => 0,
+            VecLoadOp::I8x8S => 1,
+            VecLoadOp::I8x8U => 2,
+            VecLoadOp::I16x4S => 3,
+            VecLoadOp::I16x4U => 4,
+            VecLoadOp::I32x2S => 5,
+            VecLoadOp::I32x2U => 6,
+            VecLoadOp::I8Splat => 7,
+            VecLoadOp::I16Splat => 8,
+            VecLoadOp::I32Splat => 9,
+            VecLoadOp::I64Splat => 10,
+            VecLoadOp::I32Zero => 11,
+            VecLoadOp::I64Zero => 12,
+        }
+    }
+
+    /// The inverse of [`VecLoadOp::code`].
+    pub fn from_code(code: u64) -> Option<VecLoadOp> {
+        Some(match code {
+            0 => VecLoadOp::V128,
+            1 => VecLoadOp::I8x8S,
+            2 => VecLoadOp::I8x8U,
+            3 => VecLoadOp::I16x4S,
+            4 => VecLoadOp::I16x4U,
+            5 => VecLoadOp::I32x2S,
+            6 => VecLoadOp::I32x2U,
+            7 => VecLoadOp::I8Splat,
+            8 => VecLoadOp::I16Splat,
+            9 => VecLoadOp::I32Splat,
+            10 => VecLoadOp::I64Splat,
+            11 => VecLoadOp::I32Zero,
+            12 => VecLoadOp::I64Zero,
+            _ => return None,
+        })
+    }
+}
+
 /// A decoded instruction. The list produced by the code-section decoder is
 /// flat: structured control keeps its `Block`/`Loop`/`If`/`TryTable`/`Else`/`End`
 /// markers so validation can re-derive nesting.

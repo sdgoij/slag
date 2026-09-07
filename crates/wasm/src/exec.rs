@@ -468,7 +468,8 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// token `x` (see [`gc_convert_op`]); `50`-`56` = the array bulk ops (see
 /// [`array_bulk_op`]); `60` = the `ref.test`/`ref.cast` type match check
 /// (see [`ref_cast_op`]); `70` = a v128 register op mirroring `simd_exec`
-/// over operands in `scratch` (see [`simd_op`]).
+/// over operands in `scratch` (see [`simd_op`]); `71`-`74` = the v128
+/// memory/shuffle ops (see [`v128_mem`]).
 ///
 /// # Safety
 ///
@@ -524,6 +525,11 @@ pub unsafe extern "C" fn wasm_call_helper(
     // `simd_exec` over operands spilled to the caller-owned scratch.
     if mode == 70 {
         return simd_op(store, x, y, scratch);
+    }
+    // Compiled v128 memory/shuffle ops (modes 71-74) mirror the interpreter's
+    // vector loads/stores over a bounds-checked effective address.
+    if (71..=74).contains(&mode) {
+        return v128_mem(store, mode, x, y, z, scratch);
     }
     // Table reads/writes (modes 3/4), the bulk-memory ops (modes 5-8), and
     // the table bulk ops (modes 9-14) resolve cells/segments directly.
@@ -2179,6 +2185,87 @@ fn simd_op(store: &mut Store, x: u64, y: u64, scratch: *mut u64) -> i32 {
     }
 }
 
+/// A compiled v128 memory/shuffle op (runtime helper modes 71-74): shuffle
+/// (71) composes a vector from the two vectors in scratch by the lane-index
+/// bytes packed into `x`/`y` (eight per word); a `v128.load*` form (72)
+/// materializes the vector from the `op` code in `x` over the `size` bytes at
+/// `y` (the effective address, bounds-checked by the compiled `mem_ea`); a
+/// lane load (73) reads `x` bytes at `z` into lane `y` of the vector in
+/// scratch; a lane store (74) writes lane `y`'s `x` bytes to `z`. Vector
+/// results land in `scratch[0]`; all mirror the interpreter's v128 memory
+/// instructions exactly.
+#[cfg(feature = "compile")]
+fn v128_mem(store: &mut Store, mode: u64, x: u64, y: u64, z: u64, scratch: *mut u64) -> i32 {
+    match mode {
+        71 => {
+            let b = unsafe { scratch_read_v128(scratch, 0) };
+            let a = unsafe { scratch_read_v128(scratch, 2) };
+            let mut out = 0u128;
+            for i in 0..16usize {
+                let lane = if i < 8 {
+                    (x >> (8 * i)) as u8
+                } else {
+                    (y >> (8 * (i - 8))) as u8
+                };
+                let source = if lane < 16 { a } else { b };
+                let byte = crate::simd::lane_bits(source, (lane & 15) as usize, 1);
+                out = crate::simd::set_lane(out, i, 1, byte);
+            }
+            unsafe { scratch_write_v128(scratch, 0, out) };
+            crate::compile::TRAP_NONE
+        }
+        72 => {
+            let Some(op) = crate::instr::VecLoadOp::from_code(x) else {
+                return gc_unsupported(store, "simd load form");
+            };
+            let ptr = y as *const u8;
+            let size = op.bytes();
+            // SAFETY: the compiled `mem_ea` bounds-checked `size` bytes at
+            // this effective address, and no growth can intervene between the
+            // check and this call, so the slice stays in bounds.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, size) };
+            match load_vec(op, bytes) {
+                Some(out) => {
+                    unsafe { scratch_write_v128(scratch, 0, out) };
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "simd load form"),
+            }
+        }
+        73 => {
+            let size = x as usize;
+            let lane = y as u8;
+            let ptr = z as *const u8;
+            let vector = unsafe { scratch_read_v128(scratch, 0) };
+            // SAFETY: the compiled `mem_ea` bounds-checked `size` bytes at
+            // this effective address (see mode 72).
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, size) };
+            let mut bits = 0u64;
+            for (i, &byte) in bytes.iter().enumerate() {
+                bits |= u64::from(byte) << (8 * i);
+            }
+            let out = crate::simd::set_lane(vector, lane as usize, size, bits);
+            unsafe { scratch_write_v128(scratch, 0, out) };
+            crate::compile::TRAP_NONE
+        }
+        74 => {
+            let size = x as usize;
+            let lane = y as u8;
+            let ptr = z as *mut u8;
+            let vector = unsafe { scratch_read_v128(scratch, 0) };
+            let bits = crate::simd::lane_bits(vector, lane as usize, size);
+            // SAFETY: the compiled `mem_ea` bounds-checked `size` bytes at
+            // this effective address (see mode 72).
+            let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = (bits >> (8 * i)) as u8;
+            }
+            crate::compile::TRAP_NONE
+        }
+        _ => gc_unsupported(store, "v128 memory op"),
+    }
+}
+
 /// Decode a value of `storage` from its u64 scratch slot (a reference decodes
 /// its token). V128 storage has no slot representation in the compiled subset.
 #[cfg(feature = "compile")]
@@ -3800,7 +3887,7 @@ impl<'a> Engine<'a> {
                 let instance = self.frames[frame_index].instance;
                 let cell = self.mem_cell(instance, memory)?;
                 let addr = self.pop_mem_addr(instance, memory)?;
-                let size = vec_load_bytes(op) as u64;
+                let size = op.bytes() as u64;
                 let ea = addr
                     .checked_add(offset)
                     .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
@@ -5576,24 +5663,6 @@ fn load_size(op: LoadOp) -> usize {
         I32Load8S | I32Load8U | I64Load8S | I64Load8U => 1,
         I32Load16S | I32Load16U | I64Load16S | I64Load16U => 2,
         I64Load32S | I64Load32U => 4,
-    }
-}
-
-/// Bytes a `v128.load*` reads (spec 2.4.5).
-fn vec_load_bytes(op: VecLoadOp) -> usize {
-    match op {
-        VecLoadOp::V128 => 16,
-        VecLoadOp::I8x8S
-        | VecLoadOp::I8x8U
-        | VecLoadOp::I16x4S
-        | VecLoadOp::I16x4U
-        | VecLoadOp::I32x2S
-        | VecLoadOp::I32x2U
-        | VecLoadOp::I64Splat
-        | VecLoadOp::I64Zero => 8,
-        VecLoadOp::I8Splat => 1,
-        VecLoadOp::I16Splat => 2,
-        VecLoadOp::I32Splat | VecLoadOp::I32Zero => 4,
     }
 }
 
