@@ -5574,6 +5574,54 @@ species-create share — their per-element native-handler dispatch and the
 @@isConcatSpreadable/LengthOfArrayLike reads are the next dense-array
 residuals.
 
+### Dense element visits in the higher-order array methods (measured + landed 2026-09-07)
+
+The species verdict landed `arrays/hof_methods.js` (a 150-iteration
+map/filter/reduce over a 1000-element dense array) still at ~340ms
+jitless / ~309ms jit (vs node-jit ~2.4ms). Decomposition probe (isolated
+150k element-steps): map ~900ns/step, filter ~950, reduce ~730, forEach
+~750, with the JIT column barely moving — the cost is the BUILTIN loop's
+general per-element machinery, not the callback: a manual interpreted
+dense loop (`b[k]=a[k]+1`) is ~92ns/step and a plain read scan ~98ns/step,
+and the `function calls` row puts a callback call near ~60ns. Each
+element paid a fresh `key(k)` JsString + a chain HasProperty + a general
+[[Get]] (and map/filter a string-key CreateDataProperty on the result) —
+the general `context::get_property` path is ~600ns over the fused read
+floor.
+
+Landing: the element-visiting builtins (forEach/map/filter/reduce/reduceRight)
+read each element through `dense_own_element` (a new helper) — when
+the receiver is a dense Array whose buffer holds the index below the
+current length, that own canonical w/e/c element IS the HasProperty and
+[[Get]] result (a present own data property shadows the chain, spec
+7.3.1), so the read is a buffer slot with no string key, no chain walk, no
+general dispatch. A hole, a beyond-length index (a mid-loop length shrink
+is observed), a spilled array, or an exotic receiver returns `None` and
+the element takes the existing exact HasProperty + Get path — the
+callback can delete/overwrite/append/shadow mid-loop and every later
+element still observes it. Result writes use `create_data_property_index`
+(the concat/slice dense define; falls back to the string-key define when
+the result is not a dense extensible Array).
+
+Results (isolated 150k element-steps, min of 3 runs): map ~135 -> ~25ms
+jitless / ~128 -> ~20ms jit (~5x); filter ~143 -> ~28ms / ~134 -> ~23;
+reduce ~109 -> ~24.5ms / ~103 -> ~19; forEach ~113 -> ~24ms / ~107 ->
+~20. `arrays/hof_methods.js` ~340 -> ~65.5ms jitless / ~309 -> ~55-58ms
+jit (~5x). Correctness: a 40-case node-differential battery (dense,
+holes skipped, chain shadowing of holes incl. %Array.prototype% index
+props and setPrototypeOf receivers, mid-loop delete/overwrite/append/
+length-shrink observed per element, spilled and frozen and non-w-e-c
+sources, proxies with has/get trap logs, array-likes with index getters,
+subclass species sources and results, huge-hole-span sources) is
+byte-identical to node in jit, jitless, and `--gc-stress`. Gates: clippy
+clean; workspace tests green; test262 sweeps at baseline — language
+23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang. All 13 `--jit-bench` rows result-ok; 37-workload corpus
+result-identical jit vs jitless. Follow-ups: the same dense visit for the
+some/every/find family and `Array.from`'s per-item reads, plus the ~60ns
+callback call itself (the compiled/leaf path from a native loop) once the
+reads are at the floor.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

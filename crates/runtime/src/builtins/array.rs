@@ -95,6 +95,26 @@ fn key(index: u64) -> JsString {
     JsString::from_utf8(&index.to_string())
 }
 
+/// The own dense element at `index` when `value` is a dense Array whose
+/// buffer holds it below the current length — a canonical w/e/c own data
+/// element, so HasProperty and [[Get]] serve a present own element without
+/// consulting the chain. `None` for a hole, a beyond-length index, or a
+/// non-dense/exotic receiver: the caller keeps the exact per-element
+/// machinery (which observes chain shadowing of holes and proxy traps).
+fn dense_own_element(value: &Value, index: u64) -> Option<Value> {
+    let ValueKind::Object(object) = value.kind() else {
+        return None;
+    };
+    let ObjectKind::Array(slots) = &object.kind else {
+        return None;
+    };
+    if !slots.dense.get() || (index as f64) >= slots.length.get() {
+        return None;
+    }
+    let elements = slots.elements.borrow();
+    elements.get(index as usize).copied().flatten()
+}
+
 /// IsArray (spec 7.2.2): Array exotics and proxies whose target is an
 /// array (recursively).
 pub fn is_array(value: &Value) -> bool {
@@ -922,18 +942,26 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let array = array_species_create(agent, &object, 0.0)?;
     let mut to_index = 0u64;
     for k in 0..length {
-        if has_property(&object, &key(k))? {
-            let k_value = get(agent, &object, &key(k))?;
-            let selected = crate::function::call(
-                agent,
-                &callbackfn,
-                this_arg,
-                &[k_value, Value::Number(k as f64), object],
-            )?;
-            if to_boolean(&selected) {
-                array.create_data_property_or_throw(&key(to_index), k_value)?;
-                to_index += 1;
+        let k_value = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => {
+                if !has_property(&object, &key(k))? {
+                    continue;
+                }
+                get(agent, &object, &key(k))?
             }
+        };
+        let selected = crate::function::call(
+            agent,
+            &callbackfn,
+            this_arg,
+            &[k_value, Value::Number(k as f64), object],
+        )?;
+        if to_boolean(&selected) {
+            if !array.create_data_property_index(to_index, k_value)? {
+                array.create_data_property_or_throw(&key(to_index), k_value)?;
+            }
+            to_index += 1;
         }
     }
     array.set(
@@ -1158,15 +1186,21 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..length {
-        if has_property(&object, &key(k))? {
-            let k_value = get(agent, &object, &key(k))?;
-            crate::function::call(
-                agent,
-                &callbackfn,
-                this_arg,
-                &[k_value, Value::Number(k as f64), object],
-            )?;
-        }
+        let k_value = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => {
+                if !has_property(&object, &key(k))? {
+                    continue;
+                }
+                get(agent, &object, &key(k))?
+            }
+        };
+        crate::function::call(
+            agent,
+            &callbackfn,
+            this_arg,
+            &[k_value, Value::Number(k as f64), object],
+        )?;
     }
     Ok(Value::Undefined)
 }
@@ -1317,14 +1351,22 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let array = array_species_create(agent, &object, length as f64)?;
     for k in 0..length {
-        if has_property(&object, &key(k))? {
-            let k_value = get(agent, &object, &key(k))?;
-            let mapped = crate::function::call(
-                agent,
-                &callbackfn,
-                this_arg,
-                &[k_value, Value::Number(k as f64), object],
-            )?;
+        let k_value = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => {
+                if !has_property(&object, &key(k))? {
+                    continue;
+                }
+                get(agent, &object, &key(k))?
+            }
+        };
+        let mapped = crate::function::call(
+            agent,
+            &callbackfn,
+            this_arg,
+            &[k_value, Value::Number(k as f64), object],
+        )?;
+        if !array.create_data_property_index(k, mapped)? {
             array.create_data_property_or_throw(&key(k), mapped)?;
         }
     }
@@ -1449,16 +1491,23 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         }
     }
     while k < length {
-        if has_property(&object, &key(k))? {
-            let k_value = get(agent, &object, &key(k))?;
-            let current = accumulator.take().unwrap_or(Value::Undefined);
-            accumulator = Some(crate::function::call(
-                agent,
-                &callbackfn,
-                Value::Undefined,
-                &[current, k_value, Value::Number(k as f64), object],
-            )?);
-        }
+        let k_value = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => {
+                if !has_property(&object, &key(k))? {
+                    k += 1;
+                    continue;
+                }
+                get(agent, &object, &key(k))?
+            }
+        };
+        let current = accumulator.take().unwrap_or(Value::Undefined);
+        accumulator = Some(crate::function::call(
+            agent,
+            &callbackfn,
+            Value::Undefined,
+            &[current, k_value, Value::Number(k as f64), object],
+        )?);
         k += 1;
     }
     Ok(accumulator.unwrap_or(Value::Undefined))
@@ -1498,16 +1547,23 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         }
     }
     while k >= 0 {
-        if has_property(&object, &key(k as u64))? {
-            let k_value = get(agent, &object, &key(k as u64))?;
-            let current = accumulator.take().unwrap_or(Value::Undefined);
-            accumulator = Some(crate::function::call(
-                agent,
-                &callbackfn,
-                Value::Undefined,
-                &[current, k_value, Value::Number(k as f64), object],
-            )?);
-        }
+        let k_value = match dense_own_element(&object, k as u64) {
+            Some(value) => value,
+            None => {
+                if !has_property(&object, &key(k as u64))? {
+                    k -= 1;
+                    continue;
+                }
+                get(agent, &object, &key(k as u64))?
+            }
+        };
+        let current = accumulator.take().unwrap_or(Value::Undefined);
+        accumulator = Some(crate::function::call(
+            agent,
+            &callbackfn,
+            Value::Undefined,
+            &[current, k_value, Value::Number(k as f64), object],
+        )?);
         k -= 1;
     }
     Ok(accumulator.unwrap_or(Value::Undefined))
