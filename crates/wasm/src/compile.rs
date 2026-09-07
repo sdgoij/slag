@@ -632,6 +632,44 @@ fn func_type_of(module: &Module, index: u32) -> Option<FuncType> {
     }
 }
 
+/// A tag index-space entry's declared payload type (imported tags first,
+/// then the module's own), by value. Exceptions are func types whose results
+/// are empty by validation.
+fn tag_type_of(module: &Module, index: u32) -> Option<FuncType> {
+    let imported = module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Tag(_)))
+        .count() as u32;
+    let type_index = if index < imported {
+        module
+            .imports
+            .iter()
+            .filter_map(|import| match import.desc {
+                ImportDesc::Tag(ty) => Some(ty),
+                _ => None,
+            })
+            .nth(index as usize)?
+    } else {
+        *module.tags.get((index - imported) as usize)?
+    };
+    module.func_at_cloned(type_index)
+}
+
+/// Whether a `throw` of tag index-space entry `index` can lower: its payload
+/// values all ride the compiled value model and fit the caller-owned scratch
+/// (an escaping exception; bodies that could catch it keep `try_table`
+/// interpreted).
+fn throwable_tag(module: &Module, index: u32) -> bool {
+    tag_type_of(module, index).is_some_and(|ty| {
+        ty.params.len() <= SCRATCH_SLOTS
+            && ty
+                .params
+                .iter()
+                .all(|param| carrier_type(module, *param).is_some())
+    })
+}
+
 /// A table index's declared `table64` flag, resolving index-space indices
 /// (imported tables first) so the call lowering can gate `call_indirect` on
 /// 32-bit-addressed tables (an i64 element index stays interpreter-side).
@@ -848,6 +886,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
                 && table_carried_ref(module, *src)
         }
         Instr::ElemDrop(_) => true,
+        Instr::Throw(index) => throwable_tag(module, *index),
         Instr::RefNull(heap) => heap_is_carried(module, heap),
         Instr::RefFunc(_) | Instr::RefIsNull | Instr::RefAsNonNull => true,
         Instr::BrOnNull(_) | Instr::BrOnNonNull(_) => true,
@@ -2730,6 +2769,47 @@ impl<'a> Lowerer<'a> {
         self.runtime_call(&args)
     }
 
+    /// A `throw` of tag `index`: spill the payload (the tag's parameters,
+    /// already on the operand stack in parameter order) to the caller-owned
+    /// scratch and run the throw helper (mode 15), which parks an in-flight
+    /// exception on the store and returns the pending-error sentinel so the
+    /// entry surfaces it as [`crate::exec::ExecFail::Exception`]. The body is
+    /// dead afterwards (a throw diverges; no compiled body contains a
+    /// `try_table` catch).
+    fn do_throw(&mut self, index: u32) -> Result<(), String> {
+        let ty = tag_type_of(self.module, index).ok_or("unresolved throw tag")?;
+        for i in (0..ty.params.len()).rev() {
+            let value = self.pop().ok_or("operand stack underflow")?;
+            let wide = self.slot_from(ty.params[i], value)?;
+            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+        }
+        let mode = self.iconst(types::I64, 15);
+        let tag_v = self.iconst(types::I64, i64::from(index));
+        let zero = self.iconst(types::I64, 0);
+        let nargs = self.iconst(types::I64, ty.params.len() as i64);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            tag_v,
+            zero,
+            zero,
+            nargs,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        // The helper never returns success, so the fall-through block is
+        // unreachable; terminate it so the block is valid (any later
+        // instruction is on a dead path).
+        self.emit_trap(TRAP_UNREACHABLE);
+        self.dead = true;
+        Ok(())
+    }
+
     /// Pop a table instruction's address operand (i32 for a 32-bit table,
     /// zero-extended; i64 for a table64) as a u64 slot.
     fn pop_table_addr(&mut self, table: u32) -> Result<ClifValue, String> {
@@ -2886,6 +2966,7 @@ impl<'a> Lowerer<'a> {
             Instr::BrOnNonNull(label) => self.do_br_on_non_null(*label)?,
             Instr::TableGet(table) => self.do_table_get(*table)?,
             Instr::TableSet(table) => self.do_table_set(*table)?,
+            Instr::Throw(index) => self.do_throw(*index)?,
             Instr::TableSize(table) => self.do_table_size(*table)?,
             Instr::TableGrow(table) => self.do_table_grow(*table)?,
             Instr::TableFill(table) => self.do_table_fill(*table)?,
@@ -6200,5 +6281,113 @@ mod tests {
             outcomes[9],
             Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
         ));
+    }
+
+    #[test]
+    fn compiled_throws_match_the_interpreter() {
+        // Directly-invoked exports that throw (no enclosing `try_table`, so
+        // their bodies lower): the thrown payload's marshaling order and
+        // types must match the interpreter exactly, and the exception must
+        // escape the compiled entry as `ExecFail::Exception`.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![]),
+                SubType::func(vec![ValType::I32, ValType::I32], vec![]),
+                SubType::func(vec![ValType::F32], vec![]),
+                SubType::func(vec![ValType::I64], vec![]),
+                SubType::func(vec![ValType::F64], vec![]),
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+            ],
+            tags: vec![0, 1, 2, 3, 4],
+            functions: vec![5, 0, 2, 3, 4],
+            bodies: vec![
+                // 0: throw-if: a nonzero parameter throws $e0; zero falls
+                // through and returns 0 (an if-then-only with a dead then
+                // branch).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::If(BlockType::Empty),
+                        Instr::Throw(0),
+                        Instr::End,
+                        Instr::I32Const(0),
+                    ],
+                },
+                // 1: throw two i32s through $e1 (payload order).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::I32Const(1), Instr::I32Const(2), Instr::Throw(1)],
+                },
+                // 2: throw an f32 through $e2.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Throw(2)],
+                },
+                // 3: throw an i64 through $e3.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Throw(3)],
+                },
+                // 4: throw an f64 through $e4.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Throw(4)],
+                },
+            ],
+            ..Module::default()
+        };
+        // Every body must compile (the assert_equiv gate), so the comparison
+        // below is not vacuous.
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "throw module did not compile"
+        );
+
+        fn check(module: &Module, function: usize, cases: &[Vec<Value>]) {
+            let mut compiled = Store::new();
+            let compiled_instance = compiled
+                .instantiate(module, &mut |_, _| None)
+                .expect("module instantiates");
+            let mut interpreter = Store::new();
+            interpreter.set_compile(false);
+            let interpreter_instance = interpreter
+                .instantiate(module, &mut |_, _| None)
+                .expect("module instantiates");
+            for args in cases {
+                let via_compiled = compiled.invoke(compiled_instance, function, args);
+                let via_interpreter = interpreter.invoke(interpreter_instance, function, args);
+                assert_eq!(
+                    format!("{via_compiled:?}"),
+                    format!("{via_interpreter:?}"),
+                    "paths diverge for {args:?}"
+                );
+                // The stored payload must be identical (parameter order and
+                // types) so a later catch sees the same values.
+                if let (Err(ExecFail::Exception(a)), Err(ExecFail::Exception(b))) =
+                    (&via_compiled, &via_interpreter)
+                {
+                    assert_eq!(
+                        compiled.exception_args(*a),
+                        interpreter.exception_args(*b),
+                        "exception payload diverges for {args:?}"
+                    );
+                }
+            }
+        }
+
+        check(
+            &module,
+            0,
+            &[
+                vec![Value::I32(0)],
+                vec![Value::I32(1)],
+                vec![Value::I32(-1)],
+            ],
+        );
+        check(&module, 1, &[vec![]]);
+        check(&module, 2, &[vec![Value::F32(5.0f32.to_bits())]]);
+        check(&module, 3, &[vec![Value::I64(5)]]);
+        check(&module, 4, &[vec![Value::F64(5.0f64.to_bits())]]);
     }
 }

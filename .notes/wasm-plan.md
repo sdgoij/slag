@@ -2102,3 +2102,21 @@ drop-then-init trap sequence, over both 32- and 64-bit tables. `wasmtest
 equiv` is green over the whole core corpus: 254 suites, 0 diverged. 45
 compile tests, 81 total with the feature, clippy clean in both
 configurations.
+
+Escaping exceptions lower: a compiled `throw` (runtime helper mode 15)
+spills the tag's payload to the caller-owned scratch in parameter order
+and runs a new throw helper that decodes it back into interpreter values
+and parks an in-flight exception (`ExecFail::Exception`) as the store's
+pending error, exactly like the interpreter's `throw`. The gate admits a
+tag whose payload types all ride the compiled value model, so directly-
+invoked exports that throw without an enclosing `try_table` now run
+compiled; bodies that could catch (`try_table`) still stay interpreted,
+and `throw_ref`/exnref payloads remain interpreted. The lowerer sets the
+path dead after the helper (with a trap-return terminator on the
+unreachable fall-through block, since a throw never returns success).
+Unit coverage drives throws with empty, two-i32, f32, i64, and f64
+payloads through both paths and asserts the stored exception payloads
+match bit-for-bit (parameter order and types), plus a throw inside an
+if-then-only body with a dead then-branch. `wasmtest equiv` is green
+over the whole core corpus: 254 suites, 0 diverged. 46 compile tests, 82
+total with the feature, clippy clean in both configurations.

@@ -460,7 +460,9 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// token `x`, type-checked against `z`; `3` = `table.get` at table `x` slot
 /// `y`, token written to `scratch[0]`; `4` = `table.set` of token `z` at
 /// table `x` slot `y`; `5`-`8` = the bulk-memory ops (see [`bulk_op`]);
-/// `9`-`14` = the table bulk ops (see [`table_bulk_op`]).
+/// `9`-`14` = the table bulk ops (see [`table_bulk_op`]); `15` = a `throw`
+/// of tag index-space entry `x` whose payload rides `scratch[0..nargs)`,
+/// parked as an in-flight exception (see [`throw_op`]).
 ///
 /// # Safety
 ///
@@ -483,6 +485,12 @@ pub unsafe extern "C" fn wasm_call_helper(
 ) -> i32 {
     let code_of = crate::compile::code_of_trap;
     let store = unsafe { &mut *store };
+    // A compiled `throw` (mode 15) parks an in-flight exception as a pending
+    // error for the entry to drain (no compiled body can contain a `try_table`
+    // catch, so the exception always escapes the native path).
+    if mode == 15 {
+        return throw_op(store, instance, x, nargs, scratch);
+    }
     // Table reads/writes (modes 3/4), the bulk-memory ops (modes 5-8), and
     // the table bulk ops (modes 9-14) resolve cells/segments directly.
     if (3..=14).contains(&mode) {
@@ -1125,6 +1133,46 @@ fn table_cell_is64(store: &Store, cell: usize) -> bool {
         .get(cell)
         .map(|table_type| table_type.table64)
         .unwrap_or(false)
+}
+
+/// A compiled `throw` of tag index-space entry `x` (runtime helper mode 15):
+/// decode the payload from `scratch[0..nargs)` in parameter order and park an
+/// in-flight exception on the store as a pending error, exactly like the
+/// interpreter's `throw` (the exception escapes — no compiled body can
+/// contain a `try_table` catch, so there is nothing to catch inside the
+/// native path and the entry drains it into [`ExecFail::Exception`]).
+#[cfg(feature = "compile")]
+fn throw_op(store: &mut Store, instance: u64, x: u64, nargs: u64, scratch: *mut u64) -> i32 {
+    let Some(cell) = store
+        .instances
+        .get(instance as usize)
+        .and_then(|inst| inst.tags.get(x as usize))
+        .copied()
+    else {
+        return crate::compile::code_of_trap(Trap::UnknownFunction);
+    };
+    let Some(tag) = store.tags.get(cell) else {
+        return crate::compile::code_of_trap(Trap::UnknownFunction);
+    };
+    let params = tag.ty.params.clone();
+    if params.len() as u64 != nargs {
+        store.set_pending_error(ExecFail::Unsupported("compiled throw arity"));
+        return crate::compile::TRAP_PENDING_ERROR;
+    }
+    let mut args = Vec::with_capacity(params.len());
+    for (i, param) in params.iter().enumerate() {
+        let slot = unsafe { *scratch.add(i) };
+        let Some(value) = value_from_call_slot(*param, slot) else {
+            store.set_pending_error(ExecFail::Unsupported(
+                "unsupported payload across a compiled throw",
+            ));
+            return crate::compile::TRAP_PENDING_ERROR;
+        };
+        args.push(value);
+    }
+    let exn = store.new_exception(cell, args);
+    store.set_pending_error(ExecFail::Exception(exn));
+    crate::compile::TRAP_PENDING_ERROR
 }
 
 /// Rewrite the caller-owned memory descriptors at `mems` (one data-pointer +
