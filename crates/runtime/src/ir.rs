@@ -19397,6 +19397,30 @@ fn lower_step(
                         });
                         stack.push(RegOperand::Acc);
                     }
+                    // Direct-RHS local compounds (`s += t` / `s += 1` with t
+                    // a frame slot, a constant, or a capture): load the RHS
+                    // into the accumulator and read the frame-slot LEFT at
+                    // the combine (`BinLeftReg`), so a following store back
+                    // into the SAME slot collapses to `BinStoreReg` — the
+                    // RMW is [load RHS, BinStoreReg] instead of [LoadReg
+                    // left, BinX, StoreReg]. Both reads are pure (tdz-free
+                    // slots, a constant, a capture), so the swapped read
+                    // order is unobservable, and the late left-read is the
+                    // same contract `BinLeftReg` already has under the
+                    // right-in-acc shapes.
+                    (
+                        RegOperand::Reg { slot, tdz: false },
+                        right @ (RegOperand::Reg { tdz: false, .. }
+                        | RegOperand::Const(_)
+                        | RegOperand::Ctx { .. }
+                        | RegOperand::PerIter { .. }),
+                    ) => {
+                        if !load_operand(ops, right) {
+                            return None;
+                        }
+                        ops.push(LeafOp::BinLeftReg { op: *op, slot });
+                        stack.push(RegOperand::Acc);
+                    }
                     (left, right) => {
                         if !load_operand(ops, left) {
                             return None;

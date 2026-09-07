@@ -3337,6 +3337,67 @@ mod tests {
     }
 
     #[test]
+    fn direct_rhs_local_compounds_fuse_into_bin_store_reg() {
+        // Re-evaluation (2026-09-07) of the 2026-09-04 dismissal
+        // ("direct-operand local compounds do NOT fuse profitably"): the
+        // rejected FAT single-op form regressed, but routing the direct-RHS
+        // compound through the PROVEN composed shape wins — load the RHS
+        // into the accumulator, combine via `BinLeftReg`, and let the store
+        // tail fuse to `BinStoreReg`. `s += t` (a frame-slot RHS) and
+        // `s += 1` (a constant RHS) lower to two ops
+        // (`[load RHS, BinStoreReg]`) instead of three
+        // (`[LoadReg left, BinX, StoreReg]`); a cross-slot store
+        // (`s = a + b`) keeps the un-fused three-op form.
+        fn register_runs(
+            agent: &mut Agent,
+            src: &str,
+            name: &str,
+        ) -> Vec<Box<[crate::ir::LeafOp]>> {
+            agent.run_script(src).unwrap();
+            let ir = compiled_body_of(agent, name);
+            ir.steps
+                .iter()
+                .filter_map(|s| match s {
+                    crate::ir::Step::RunRegBody { ops } => Some(ops.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let slot = register_runs(
+            &mut agent,
+            "function g(n, t) { var s = 0; for (var i = 0; i < n; i++) { s += t; } return s; }",
+            "g",
+        );
+        assert_eq!(slot.len(), 1, "the s += t body must lower");
+        assert!(
+            slot[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::BinStoreReg { .. })),
+            "s += t must fuse its store into BinStoreReg"
+        );
+        assert!(
+            !slot[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::StoreReg { .. })),
+            "the fused form must not keep a separate store"
+        );
+        let constant = register_runs(
+            &mut agent,
+            "function h(n) { var s = 0; for (var i = 0; i < n; i++) { s += 1; } return s; }",
+            "h",
+        );
+        assert!(
+            constant[0]
+                .iter()
+                .any(|op| matches!(op, crate::ir::LeafOp::BinStoreReg { .. })),
+            "s += 1 must fuse its store into BinStoreReg"
+        );
+        assert_eq!(slot[0].len(), constant[0].len());
+    }
+
+    #[test]
     fn fused_slot_compounds_match_the_pair_semantics() {
         // The fused tail must agree with the unfused pair over binary ops
         // and the string-concat slow path (the exact apply_binary
@@ -4221,8 +4282,8 @@ mod tests {
         assert!(
             braced[0]
                 .iter()
-                .any(|op| matches!(op, crate::ir::LeafOp::StoreReg { .. })),
-            "the run must contain the accumulator store"
+                .any(|op| matches!(op, crate::ir::LeafOp::BinStoreReg { .. })),
+            "the run must end in the fused accumulator store"
         );
         // The unbraced equivalent lowers to the same run.
         let unbraced = register_runs(

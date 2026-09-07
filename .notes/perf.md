@@ -4073,6 +4073,28 @@ stay three ops. Conclusion: the register-run local-compound arc's
 remaining shapes are closed by measurement — the per-op dispatch floor
 dominates, and the row levers move on to the L1c read/write end state.
 
+### CORRECTED (2026-09-07): the composed-ops route for direct-RHS compounds WINS — the fat-op dismissal does not transfer (landed)
+
+Re-evaluated under the binary-freshness discipline (the 2026-09-04
+measurement predates it): the rejected FAT single-op form was not the
+only way to fuse the direct-right shapes. Routing the compound through
+the PROVEN composed shape — in `lower_step`'s `Step::Binary` arm, a
+frame-slot LEFT with a direct right operand (`Reg tdz:false` / `Const` /
+`Ctx` / `PerIter`) loads the RHS into the accumulator and combines via
+`BinLeftReg`, so the store tail's existing fuse collapses it to
+`BinStoreReg` — turns `s += t` / `s += 1` from three ops
+(`[LoadReg left, BinX, StoreReg]`) into two (`[load RHS, BinStoreReg]`).
+Semantics identical (both reads pure, tdz-free slots, order
+unobservable; a battery of 14 shapes incl. self-compound `s += s`,
+string compounds, captured RHS, and cross-slot `s = a + b` is
+node-identical in jit/jitless/`--gc-stress`). A/B (fresh builds,
+interleaved 3 rounds, jitless): slot-RHS `s += t` ~22.9-23.1ms →
+~21.8-22.2 (~4%), `s += 1` and `s = s + t` flat-to-positive; jit flat;
+full corpus within noise. Gates: clippy clean, workspace green (one
+lowering-shape test updated to the fused form + a new
+`direct_rhs_local_compounds_fuse_into_bin_store_reg`), the three release
+sweeps at baseline.
+
 ### L1c record discipline — warm stores stop bumping the generation (measured 2026-09-04)
 
 The write-side half of the L1c program (row 1.1, stones 1-3). The
@@ -5897,6 +5919,297 @@ Gates: clippy clean, workspace tests green (177 jit incl. the 3 new), and
 the three release sweeps at baseline (language 23721/3 skip, built-ins
 23657/155 skip, annexB 1086/1086, zero fail/crash/hang); 37-workload
 corpus parity across all four modes.
+
+### The post-Construct row decomposition: the remaining mass is allocation walls or node-IC domains (probed 2026-09-07, no code)
+
+With the crux element path and the `Construct` JIT arm landed, the corpus
+was re-baselined (jl ~9.34s total, jit ~7.2s) and the remaining flat rows
+decomposed to pick the next lever. Findings:
+
+- **The interpreter's native-call floor is at node-jitless parity.** An
+  isolated 600k-loop split a Set op into a ~26ns member read (`st.has`,
+  proto-chain, flat in jit) + a ~160ns native call; a *trivial* native
+  (`Math.abs`) is ~115ns and `parseInt` ~190ns, and node jitless shows
+  the SAME ~100ns floor for `Math.abs`. So slag's generic native dispatch
+  is NOT the gap — the wide gaps are node's per-domain interpreter ICs
+  (Set.has ~18ns, Object.keys ~0.4µs/3-call, string ops) that slag has no
+  analog for, plus genuine allocation. Registered builtins do pay a
+  per-call `is_eval_function` realm lookup + a TLS `RefCell` HashMap probe
+  (`BUILTIN_HANDLERS` by function id) before the handler — real but small
+  against the floor, and matching node's Set ICs would need per-domain
+  fused ops (a big program, not a slice).
+- **`set_churn`/`map_churn` (~276/224ms jl, flat in jit at ~0.9) are
+  node-IC-artifact rows**: the hash-index + O(1) registration landings
+  left each op at ~190ns of call machinery, and jit cannot help because
+  the callee is native (a member read + a general native call per op).
+- **Generator resume is a ~1.05µs/`next()` driver in BOTH engines**
+  (200k-yield rows ~216-222ms jl and ~196-206ms jit, body-cost
+  invariant — empty/const/`i++` yields all identical). Per resume the
+  driver does a generators-HashMap probe + Rc clone, an
+  execution-context push/pop, `run_jit_resume`'s fresh work-buffer
+  rebuild + JitCallContext re-setup + jit_work save/restore, and an
+  `iterator_result` object per yield. Diffuse; node jl is ~45ns/next.
+- **The register-run model cannot fuse the masked computed-key shape**
+  (`ta[k & 65535]`): the computed key lands in the accumulator, and the
+  member ops reject an `Acc` key (only `Reg`/`Counter`/`Ctx`/`Const`);
+  there is no scratch-slot spill. Fusing it needs a new Acc-keyed
+  `*ComputedLocal` op form (the object is a frame slot, so the
+  accumulator is free to hold the key) — a compiler slice, bounded but
+  intricate.
+- **The dominant jl mass is allocation walls** (the ~34% of the jl total
+  in the two language fixture amplifiers at 1.89s + 1.28s — closure
+  instantiation + per-iteration envs + template/rope — plus destructure
+  437ms, construct_churn 332, spread_assign 313): the L4 bump arena for
+  fresh ordinary objects / closures is the standing fix.
+
+No code lands (probe-only; the tree is untouched beyond the scratch
+probes). The recommended next egg by measured torque is L4's arena for
+fresh-object/closure allocation, or — if a bounded compiler slice is
+preferred — the Acc-keyed computed-member register-run fusion.
+
+### L4 RE-OPENED: the 2026-09-04 closure counted boxes, not box cost — fresh-object creation is now the dominant lever (probed 2026-09-07, no code)
+
+The 2026-09-04 L4 probe closed the arena idea by counting BOXES per
+iteration (construct = 1/iter, buildString ~0) and concluded the bump
+arena already exists. That closure never measured the per-box COST; the
+interpreter-series landings since then have made everything around
+object creation cheap enough that the creation itself is now the
+bottleneck. Fresh box counts (re-added TLS counter in `Gc::new`/
+`new_in_place`, drained per workload through the corpus driver —
+identical to the 2026-09-04 method): destructure 2 boxes/iter, a `{}`
+1/iter, a `[]` 2/iter, `generator next()` 1/iter, a closure 4 boxes,
+head-let 25/body, json_roundtrip ~18/iter — all spec-required and
+UNCHANGED by perf work. But timing the isolated create rows (jl,
+min-of-corpus): `{}` ~79ns/iter, `[]` ~110ns/box, a closure create
++capture ~1.4µs — vs node jitless `{}` ~5ns, `[]` ~2.7ns/box, a
+closure ~31ns (10-50x). The object/closure churn rows (destructure
+437ms, construct_churn 332, spread_assign 313, the language fixture
+amplifiers at 1.89s + 1.28s with 25/15 boxes per 18µs/13µs body) are
+now ~25-50% per-object creation cost, not step dispatch.
+
+Reading the create path, `{}` = realm resolution + `intrinsics
+.object_prototype()` (per object) + `canonical_empty_map` (a TLS
+`RefCell` VEC LINEAR SCAN keyed by prototype id, per object — grows
+with the number of distinct prototypes) + `Handle::new_in_place` (bump
+alloc + free-list + live-list register + `init_ordinary`'s ~17 field
+writes) + `link_self_handle`. The 79ns splits across several ~15-25ns
+pieces; a nursery would NOT help (allocation is already bump — the
+2026-09-04 closure is still right on that point), but trimming the
+per-object realm/proto + canonical-empty-map resolution (pre-resolve
+the realm's Object.prototype empty map once per realm, or store the
+canonical empty map on the prototype object) and the register/init cost
+is the concrete next slice. First step is an instrumented split of the
+~79ns before building.
+
+### Design: object-literal register-run fusion (scoped, 2026-09-07)
+
+Target: the interpreter pays ~25-30ns/iter of step dispatch on object
+literals because they can never fuse into `RunRegBody` (obj_lit jl 90ms
+vs jit 58ms with an identical shared crux create; no `LeafOp` exists for
+`ObjectBegin`/`ObjectInitName`). Full design, both engines:
+
+- **The blocker.** A literal's fresh object lives on the value stack
+  across its prop-value steps; the register executor is single-acc, so
+  the object must be spilled (the existing `PushAcc` real-stack spill)
+  while values compute in acc, and the shadow needs a marker that
+  re-spills it per prop. Add `RegOperand::Literal` (the object is on the
+  real stack): `ObjectBegin` lowers to `LeafOp::ObjectBegin` +
+  `PushAcc`; each fast-form `ObjectInitName` (ident key, no shorthand /
+  `set_name` / `__proto__`) pops the value (acc or a direct
+  late-read operand) + the `Literal`, defines via the existing
+  `create_data_property_key` fast path, re-pushes the object, and
+  re-pushes `Literal`; `load_operand(Literal)` emits a `PopLiteral`
+  (pop the real stack into acc) so any terminal (`InitLocal`, a member
+  read, a binary) consumes it. The spills are self-balancing per run.
+  The compiler's exhaustive `RegOperand` matches surface every arm that
+  must bail (`Dup`, computed-store keys, ...) — most already have
+  `_ => None` fallbacks.
+- **Both engines.** `RunRegBody` ops are lowered by the interpreter's
+  `run_leaf_ops` AND the JIT's `emit_leaf_op` (the four-file mirror:
+  executor, JIT emit, `trace_leaf_op_heaps` for the `Const` operand,
+  `max_stack_usage`). The JIT arms reuse the existing step helpers
+  (`Helper::ObjectBegin`, `Helper::ObjectInitName`) with its working-
+  stack push/pop discipline. JIT side is plumbing only (the JIT already
+  compiles literals step-wise at ~58ms); the win is interpreter-only.
+- **Evaluation order is preserved**: props define left-to-right on the
+  unexposed object; a throwing value just leaves an unobservable partial
+  object (spec-identical), and the fast define runs no user code.
+- **Validation**: obj_lit/destructure jl A/B, `--jit-bench` unchanged
+  (results), a literal semantic battery (shorthand/computed/method/
+  accessor/spread/`__proto__`/set_name stay step-path via `None`),
+  gc-stress, full sweeps.
+
+Estimated ~300-450 lines across `ir.rs` + the jit mirror — a dedicated
+slice, not a tail-of-session change.
+
+**Instrumented split (2026-09-07, same probe run): the ~70-83ns `{}` is
+DIFFUSE — no single dominant removable piece.** Per-create cost is flat
+~70ns from 100k to 2M creates (the free-list keeps GC amortization
+flat), ~20-25ns of it is the interpreter's step dispatch on the object
+literal (a `{}` loop: jl ~93ms vs jit ~60ms on obj_lit — the register
+executor has NO object/array-literal ops, so every literal pays step
+dispatch inside an otherwise-register loop) and ~45-55ns is the crux
+create: the `canonical_empty_map` TLS+`RefCell`+Vec scan, a ~530B
+`JsObject` in-place init (~17 field writes incl. 3 `RefCell`s and the
+4-wide `in_fields` Cell array), the arena register, and `link_self_handle`.
+On the literal rows the subsequent FIRST DEFINES add ~40-60ns each
+through the map-transition machinery (`create_data_property_key` on a
+fresh canonical-empty-map object). Node jl does the whole
+`{a:i,b:i+1,c:{d:i+2}}` + reads shape in ~38ns/iter vs slag ~380. So
+there is no first micro-slice: closing the 10x is the object-
+representation program (cheaper `JsObject` init / shape-cached literal
+creation / cheaper map-transition defines / register-op literals to kill
+the ~20ns dispatch), which is L1c-adjacent, not an allocator change.
+The register-op-literal piece is feasible with the EXISTING spill
+mechanism (a `PushAcc` spill of the fresh object + a new
+`ObjectInit*Pop`-style op reusing the spilled object), but it is a
+compiler+executor slice (~200-300 lines) that needs its own focused
+turn and full gate.
+
+### FALSIFIED by direct A/B: the object-literal register-run fusion is a small net REGRESSION — REVERTED (measured 2026-09-07)
+
+The design above was implemented in full (Cut 71): `RegOperand::Literal`
+shadow marker, `LeafOp::ObjectBegin`/`ObjectInitName`/`PopLiteral`,
+`lower_step` arms for `ObjectBegin` and the fast `ObjectInitName`
+(ident key, no shorthand / `set_name` / `__proto__`), a `PopLiteral`
+load for the literal's consumer, the JIT `emit_leaf_op`/`leaf_operand`
+mirror arms (reusing `Helper::ObjectBegin`/`Helper::ObjectInitName`),
+`trace_leaf_op_heaps`/`leaf_op_has_heap_const`/`load_const` coverage,
+and the counter-read cap relaxed 2 → 64 (the cap is vestigial since Cut
+35 slice 21 moved the counter to a field each read resolves directly;
+a multi-read literal `{a:i,b:i+1,c:{d:i+2}}` reads the head var three
+times, and the 2-read cap kept the whole literal on the step path).
+Semantics were byte-identical to node across a ~28-case battery in jit,
+jitless, and jit+`--gc-stress`; workspace tests and clippy were green.
+
+The mechanism WORKED (a `--dump` of `{a:i,b:i+1,c:{d:i+2}}` in a slot
+loop collapsed the literal's 12 step dispatches into one 20-op
+`RunRegBody`) but the interpreter rows did not move: a 3-round
+interleaved A/B (baseline binary vs fused binary, same machine, jitless)
+showed the fused build CONSISTENTLY SLOWER — obj_lit 86→92ms (~7%),
+obj_survive 128→137 (~7%), obj_die 84→87 (~4%), obj_2m 142→146 (~3%),
+destructure flat (~395 both). The slice's premise — that the jl-vs-jit
+gap on the literal rows is removable interpreter STEP DISPATCH — is
+false: `run_leaf_ops` match-dispatches each op exactly like the step
+path, so a small literal run (ObjectBegin+PushAcc+…+PopLiteral) costs
+MORE op matches than the 2-3 step dispatches it replaces, and the
+crux-level create/define machinery the register form still calls is
+unchanged. The jl-jit gap on these rows is per-op cost inside
+`ordinary_object_create`/`create_data_property_key` (the crux
+machinery the JIT shares), not the interpreter's outer dispatch.
+Reverted in full; the only lasting value is this falsification — do not
+re-propose register-op literals without first moving the crux
+create/define per-object cost.
+
+### The crux create/define split: every near-term lever is measured flat (probed 2026-09-07, no code)
+
+Direct release-mode crux probes of the create + first-define machinery
+(a `tmp` timing test in `crates/crux/src/object.rs`, since removed) split
+the ~395ns/iter jl destructure row into per-key defines (~50-65ns each)
+and creates (~65-80ns each) and then falsified each bounded lever in
+turn:
+
+- **The canonical-empty-map lookup is NOT the create cost**: the TLS+
+  `RefCell`+Vec scan measures ~2.5ns; `ordinary_object_create` is
+  ~65-80ns with the rest in `Handle::new_in_place` (bump + free-list +
+  live-register), `init_ordinary`'s ~17 field writes on the 408B
+  `JsObject`, `next_object_id`, and `link_self_handle`.
+- **Pre-built final maps do NOT cut the define cost**: an object created
+  on a pre-transitioned 4-field map and filled in place measures the SAME
+  ~50-65ns/key as the transition path (the map already describes each
+  key, so there is no transition/descriptor-search cost to remove).
+- **Batching does NOT cut it either**: four fills under ONE `properties`
+  `RefCell` borrow measure flat vs four separate borrows — the per-key
+  cost is the dual-store write itself (the `in_fields` mirror + the
+  authoritative `SmallProps` push + `Property`/key construction), i.e.
+  the irreducible tax of keeping two synchronized stores per property.
+- **`map_set` alone is ~9ns**, so the field write is cheap; the ~40-50ns
+  remainder per define is the vector push + property record + bookkeeping.
+  The earlier L2846 rejection (vector write ~5ns of a warm store) does NOT
+  transfer to defines: a fresh define PUSHES (with the 2-entry inline
+  spill to a heap `Vec` on the 3rd key) rather than rewriting a pinned slot.
+- **Real-row cross-check**: construct_churn (constructor boilerplate path,
+  `new Item(i)` with two `this.x =` stores) is NOT faster than the literal
+  path — slag jl ~318ms / jit ~281ms vs node-jl ~31ms for 500k (~10x off,
+  same as destructure). There is no in-repo reference path that is fast;
+  the constructor final-shape machinery shares the same per-store tax.
+
+Conclusion: no bounded crux slice moves these rows. Closing the ~10x on
+object/closure churn is the object-representation program — fewer/smaller
+per-object fields (the 408B `JsObject` init is a large fixed cost), or a
+single-store representation where the map descriptors own keys/attrs and
+the object owns ONE value array (the field-authoritative Option 3, whose
+L2846 rejection was measured on warm pinned-slot stores, not on fresh
+defines). Do not re-open the arena/L4 or register-op-literal levers;
+re-probe Option 3's define path specifically (a fresh-define prototype
+that writes one store) before a full migration.
+
+### CORRECTED (2026-09-07): the numbers above were a NO-GC harness artifact; steady-state GC overturns the "no bounded slice" conclusion
+
+The in-process split above timed tight create loops with NO collection —
+the arena bumped into ever-fresh cache-cold pages, inflating every
+absolute number ~5x (create ~70-80ns → ~13.5ns) and muddying the deltas.
+Re-run at steady state (objects dropped + a `Heap::collect` every 512
+batch, maps/proto rooted, min of 9; stable across runs):
+
+| shape (ns/op, steady state) | result |
+|---|---|
+| `create(empty)` alone | 13.5 |
+| `create(empty)` + 4 defines (current literal path) | ~270-315 |
+| `create(final-map)` + 4 in-place defines | ~230-285 |
+| `create(final-map)` + 4 `fresh_data_defines` (no `has_own` pre-check) | ~200 |
+| `create(final-map)` + 4 `map_set` ONLY (Option-3 store, no vector) | ~22 |
+| `create(final-map)` alone | 9.4 |
+
+So a fresh define is ~55ns = ~8ns `has_own_property_key` pre-check + ~44ns
+authoritative-`SmallProps` push/`Property` record/borrow + ~3ns `map_set`
+field write — the push/record is ~90% of the define, and the map-field
+write is ~3ns. The earlier L2846 rejection does NOT transfer: it measured
+warm pinned-slot REWRITES (~5ns); fresh DEFINES push (with the 2-entry
+inline spill) and pay ~44ns/key for the vector. The Option-3 single-store
+(field-authoritative: keys/attrs in the map descriptors, values in the
+map-assigned fields, no per-object vector for mapped keys) removes ~44ns
+of each ~55ns define — a 4-field literal drops from ~300ns to ~22ns at
+the crux level (a ~13x), which is the node-jl order for destructure. The
+create is also ~13ns, not ~65-80ns — so the object-churn rows are
+overwhelmingly DEFINE-side, not create-side. Re-opened for planning: a
+field-authoritative fresh-define prototype is the highest-torque lever on
+the object/closure rows, pending the Option-3 consumer-migration plan.
+
+### Standing note: dismissals are conditional on the machinery at measurement time (2026-09-07)
+
+Re-evaluating dismissed ideas under the binary-freshness discipline exposed
+that several dismissals were not just possibly-stale measurements — they
+were "tested too early," conditional on optimizations that had not landed
+(or not fallen) yet:
+
+- **Per-site member-IC (Slice 4)** is conditional on the read probe chain:
+  its own verdict names the ceiling — "the shape-end-state offset model
+  where a single validated map id serves slot arithmetic inline." On that
+  model a per-site record is one compare; today it adds validation loads on
+  top of a dependent-load chain. Re-test AFTER Option-3's offset reads.
+- **Object-literal register fusion (Cut 71)** is conditional on the define
+  cost: the A/B ran while crux defines (~55ns each) dominated, so fusion
+  could not pay. Once Option-3 cuts defines to ~3-8ns (create ~13ns), the
+  literal's remaining cost is the per-op dispatch + field fills, and a
+  fused/map_set-only literal is exactly the shape that would eat it. Re-test
+  AFTER Option-3.
+- **The L2846 field-authoritative rejection** measured warm pinned-slot
+  rewrites — a surface the L1a cells had ALREADY optimized, so the vector
+  looked ~5ns; the un-optimized fresh-DEFINE surface carries the ~44ns
+  push. Overturned above.
+- **Read-side direct-mapped thrash FALSIFIED** is a statement about the
+  map-cell design (the map work had just landed and absorbs misses), not
+  about reads generally.
+- **"The per-op dispatch floor dominates"** (cited by the register-run
+  arcs and #3) is a property of the current Rust-match register executor;
+  an executor redesign (superinstructions, wider fusion, threaded dispatch)
+  moves the floor and reopens every dismissal that cited it.
+
+Rule of thumb going forward: record each dismissal's dependency conditions
+at dismissal time so a later machinery change is checked against the list.
+Option-3 is the keystone — it cuts the object rows directly AND unlocks
+re-testing the literal-fusion and per-site-IC dismissals on top.
 
 ## Deferred milestones
 
