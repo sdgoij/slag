@@ -2197,3 +2197,19 @@ round-trips, a null box, and host-value box/unbox through both paths.
 `wasmtest equiv` is green over the whole core corpus: 254 suites, 0
 diverged. 52 compile tests, 88 total with the feature, clippy clean in
 both configurations.
+
+The array bulk forms lower through a new runtime helper (modes 50-56)
+mirroring the interpreter exactly: `array.new_fixed`, `array.fill`, a
+cross-array (snapshot) `array.copy`, `array.new_data`/`array.new_elem`
+building arrays from passive data/element segments (a dropped segment
+is empty; an oversized read traps with the memory/table trap kind the
+segment's source uses), and `array.init_data`/`array.init_elem` writing
+segments into an existing array. The gates admit a fixed array whose
+values are carried, fill/copy over any array token, and the segment
+forms per their element storage (numeric/vector for data, reference for
+elem). Unit coverage drives a fixed array's length, a fill + read-back,
+a cross-array copy, a `new_data` element read from a passive data
+segment, a `new_elem` funcref array's length, and an `init_elem` write
+read back through `array.get`/`ref.is_null`. `wasmtest equiv` is green
+over the whole core corpus: 254 suites, 0 diverged. 54 compile tests,
+90 total with the feature, clippy clean in both configurations.

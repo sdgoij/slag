@@ -465,7 +465,8 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// parked as an in-flight exception (see [`throw_op`]); `16` = a `throw_ref`
 /// re-raising the exception whose pool id is `x` (see [`rethrow_op`]);
 /// `40`/`41` = `extern.convert_any`/`any.convert_extern` re-tagging the
-/// token `x` (see [`gc_convert_op`]).
+/// token `x` (see [`gc_convert_op`]); `50`-`56` = the array bulk ops (see
+/// [`array_bulk_op`]).
 ///
 /// # Safety
 ///
@@ -506,6 +507,11 @@ pub unsafe extern "C" fn wasm_call_helper(
     // Compiled extern/any conversion (modes 40-41) re-tag a reference token.
     if mode == 40 || mode == 41 {
         return gc_convert_op(store, mode, x, scratch);
+    }
+    // Compiled array bulk ops (modes 50-56) mirror the interpreter's array
+    // segment/fill/copy semantics against the store's object pool.
+    if (50..=56).contains(&mode) {
+        return array_bulk_op(store, instance, mode, x, y, z, nargs, scratch);
     }
     // Table reads/writes (modes 3/4), the bulk-memory ops (modes 5-8), and
     // the table bulk ops (modes 9-14) resolve cells/segments directly.
@@ -1400,6 +1406,267 @@ fn gc_op(
             write(0, len);
             crate::compile::TRAP_NONE
         }
+    }
+}
+
+/// A compiled array bulk op (runtime helper modes 50-56), mirroring the
+/// interpreter's array segment/fill/copy semantics exactly. Operands ride the
+/// caller-owned scratch as u64 slots (array references as tokens, i32
+/// offsets/lengths zero-extended). Modes: `50` = `array.new_fixed` (ty=`x`,
+/// `nargs` elements at `scratch[0..nargs)`), `51` = `array.fill` (object at
+/// `scratch[0]`, start `scratch[1]`, value `scratch[2]`, length `scratch[3]`),
+/// `52` = `array.copy` (dst object `scratch[0]`, dst offset `scratch[1]`, src
+/// object `scratch[2]`, src offset `scratch[3]`, length `scratch[4]`),
+/// `53` = `array.new_data` (ty=`x`, data index=`y`, src `scratch[0]`, length
+/// `scratch[1]`), `54` = `array.new_elem` (ty=`x`, elem index=`y`, src
+/// `scratch[0]`, length `scratch[1]`), `55` = `array.init_data` (ty=`x`, data
+/// index=`y`, object `scratch[0]`, dst offset `scratch[1]`, src `scratch[2]`,
+/// length `scratch[3]`), `56` = `array.init_elem` (ty=`x`, elem index=`y`,
+/// same slots as `55`). Newly allocated array tokens land in `scratch[0]`;
+/// out-of-bounds ranges trap with the interpreter's trap kind per source
+/// (array, memory for a data segment, table for an element segment).
+#[cfg(feature = "compile")]
+#[allow(clippy::too_many_arguments)]
+fn array_bulk_op(
+    store: &mut Store,
+    instance: u64,
+    mode: u64,
+    x: u64,
+    y: u64,
+    _z: u64,
+    nargs: u64,
+    scratch: *mut u64,
+) -> i32 {
+    let code_of = crate::compile::code_of_trap;
+    let slot = |i: usize| unsafe { *scratch.add(i) };
+    let write = |i: usize, value: u64| unsafe { *scratch.add(i) = value };
+    let instance = instance as usize;
+    let array_id = |object: u64| -> Option<usize> { array_object_of(object) };
+    match mode {
+        50 => {
+            // array.new_fixed: the elements arrive in slot order.
+            let Some(storage) = gc_type_array_storage(store, instance, x as u32) else {
+                return code_of(Trap::UnknownFunction);
+            };
+            let mut cells = Vec::with_capacity(nargs as usize);
+            for i in 0..nargs as usize {
+                let Some(value) = storage_from_slot(storage, slot(i)) else {
+                    return gc_unsupported(store, "unsupported array.new_fixed element");
+                };
+                let cell = match wrap_cell(storage, value) {
+                    Ok(cell) => cell,
+                    Err(_) => return gc_unsupported(store, "packed array element write"),
+                };
+                cells.push(cell);
+            }
+            let id = alloc_array(store, instance, x as u32, cells);
+            match crate::values::array_ref_token(id) {
+                Some(token) => {
+                    write(0, token);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "array pool id overflow"),
+            }
+        }
+        51 => {
+            // array.fill: object, start, value, length.
+            let Some(id) = array_id(slot(0)) else {
+                return gc_object_error(store, code_of, slot(0), Trap::NullArrayReference);
+            };
+            let start = slot(1) as u32 as usize;
+            let len = slot(3) as u32 as usize;
+            let Some(storage) = gc_array_storage(store, id).ok() else {
+                return gc_unsupported(store, "array object layout");
+            };
+            let Some(value) = storage_from_slot(storage, slot(2)) else {
+                return gc_unsupported(store, "unsupported array.fill value");
+            };
+            let cell = match wrap_cell(storage, value) {
+                Ok(cell) => cell,
+                Err(_) => return gc_unsupported(store, "packed array element write"),
+            };
+            let cells = match &mut store.objects[id].data {
+                GcData::Array(cells) => cells,
+                _ => return gc_unsupported(store, "array.fill of non-array"),
+            };
+            let Some(end) = start.checked_add(len) else {
+                return code_of(Trap::OutOfBoundsArrayAccess);
+            };
+            if end > cells.len() {
+                return code_of(Trap::OutOfBoundsArrayAccess);
+            }
+            cells[start..end].fill(cell);
+            crate::compile::TRAP_NONE
+        }
+        52 => {
+            // array.copy: dst object, dst offset, src object, src offset, len.
+            let Some(dst) = array_id(slot(0)) else {
+                return gc_object_error(store, code_of, slot(0), Trap::NullArrayReference);
+            };
+            let Some(src) = array_id(slot(2)) else {
+                return gc_object_error(store, code_of, slot(2), Trap::NullArrayReference);
+            };
+            let dst_off = slot(1) as u32 as usize;
+            let src_off = slot(3) as u32 as usize;
+            let n = slot(4) as u32 as usize;
+            let (src_len, dst_len) = match (&store.objects[src].data, &store.objects[dst].data) {
+                (GcData::Array(a), GcData::Array(b)) => (a.len(), b.len()),
+                _ => return gc_unsupported(store, "array.copy of non-array"),
+            };
+            let Some(src_end) = src_off.checked_add(n) else {
+                return code_of(Trap::OutOfBoundsArrayAccess);
+            };
+            let Some(dst_end) = dst_off.checked_add(n) else {
+                return code_of(Trap::OutOfBoundsArrayAccess);
+            };
+            if src_end > src_len || dst_end > dst_len {
+                return code_of(Trap::OutOfBoundsArrayAccess);
+            }
+            let values = match &store.objects[src].data {
+                GcData::Array(cells) => cells[src_off..src_end].to_vec(),
+                _ => return gc_unsupported(store, "array.copy of non-array"),
+            };
+            match &mut store.objects[dst].data {
+                GcData::Array(cells) => cells[dst_off..dst_end].copy_from_slice(&values),
+                _ => return gc_unsupported(store, "array.copy of non-array"),
+            }
+            crate::compile::TRAP_NONE
+        }
+        53 | 54 => {
+            // array.new_data / array.new_elem: src and length, built from the
+            // data/element segment.
+            let Some(storage) = gc_type_array_storage(store, instance, x as u32) else {
+                return code_of(Trap::UnknownFunction);
+            };
+            let src = slot(0) as u32 as u64;
+            let n = slot(1) as u32 as u64;
+            let mut cells = Vec::with_capacity(n as usize);
+            if mode == 53 {
+                let Some(width) = storage_width(storage) else {
+                    return gc_unsupported(store, "array.new_data of references");
+                };
+                let bytes = match store.instances[instance].data_segments.get(y as usize) {
+                    Some(segment) => segment.as_deref().unwrap_or(&[]),
+                    None => return code_of(Trap::OutOfBoundsMemoryAccess),
+                };
+                let total = match n.checked_mul(width as u64) {
+                    Some(total) => total,
+                    None => return code_of(Trap::OutOfBoundsMemoryAccess),
+                };
+                let end = match src.checked_add(total) {
+                    Some(end) => end,
+                    None => return code_of(Trap::OutOfBoundsMemoryAccess),
+                };
+                if end > bytes.len() as u64 {
+                    return code_of(Trap::OutOfBoundsMemoryAccess);
+                }
+                for i in 0..n {
+                    match data_element(storage, bytes, (src + i * width as u64) as usize) {
+                        Some(cell) => cells.push(cell),
+                        None => return gc_unsupported(store, "array.new_data element read"),
+                    }
+                }
+            } else {
+                let items = match store.instances[instance].element_segments.get(y as usize) {
+                    Some(segment) => segment.as_deref().unwrap_or(&[]),
+                    None => return code_of(Trap::OutOfBoundsTableAccess),
+                };
+                let end = match src.checked_add(n) {
+                    Some(end) => end,
+                    None => return code_of(Trap::OutOfBoundsTableAccess),
+                };
+                if end > items.len() as u64 {
+                    return code_of(Trap::OutOfBoundsTableAccess);
+                }
+                for i in 0..n {
+                    cells.push(Value::Ref(items[(src + i) as usize]));
+                }
+            }
+            let id = alloc_array(store, instance, x as u32, cells);
+            match crate::values::array_ref_token(id) {
+                Some(token) => {
+                    write(0, token);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "array pool id overflow"),
+            }
+        }
+        55 | 56 => {
+            // array.init_data / array.init_elem: dst object, dst offset, src,
+            // length.
+            let Some(id) = array_id(slot(0)) else {
+                return gc_object_error(store, code_of, slot(0), Trap::NullArrayReference);
+            };
+            let dst_off = slot(1) as u32 as usize;
+            let src = slot(2) as u32 as u64;
+            let n = slot(3) as u32 as u64;
+            let Some(storage) = gc_array_storage(store, id).ok() else {
+                return gc_unsupported(store, "array object layout");
+            };
+            let len = match &store.objects[id].data {
+                GcData::Array(cells) => cells.len(),
+                _ => return gc_unsupported(store, "array.init of non-array"),
+            };
+            let Some(dst_end) = dst_off.checked_add(n as usize) else {
+                return code_of(Trap::OutOfBoundsArrayAccess);
+            };
+            if dst_end > len {
+                return code_of(Trap::OutOfBoundsArrayAccess);
+            }
+            let cells = match &mut store.objects[id].data {
+                GcData::Array(cells) => cells,
+                _ => return gc_unsupported(store, "array.init of non-array"),
+            };
+            if mode == 55 {
+                let Some(width) = storage_width(storage) else {
+                    return gc_unsupported(store, "array.init_data of references");
+                };
+                let bytes = match store.instances[instance].data_segments.get(y as usize) {
+                    Some(segment) => segment.as_deref().unwrap_or(&[]),
+                    None => return code_of(Trap::OutOfBoundsMemoryAccess),
+                };
+                let total = match n.checked_mul(width as u64) {
+                    Some(total) => total,
+                    None => return code_of(Trap::OutOfBoundsMemoryAccess),
+                };
+                let end = match src.checked_add(total) {
+                    Some(end) => end,
+                    None => return code_of(Trap::OutOfBoundsMemoryAccess),
+                };
+                if end > bytes.len() as u64 {
+                    return code_of(Trap::OutOfBoundsMemoryAccess);
+                }
+                for i in 0..n {
+                    let value =
+                        match data_element(storage, bytes, (src + i * width as u64) as usize) {
+                            Some(value) => value,
+                            None => return gc_unsupported(store, "array.init_data element read"),
+                        };
+                    let cell = match wrap_cell(storage, value) {
+                        Ok(cell) => cell,
+                        Err(_) => return gc_unsupported(store, "packed array element write"),
+                    };
+                    cells[dst_off + i as usize] = cell;
+                }
+            } else {
+                let items = match store.instances[instance].element_segments.get(y as usize) {
+                    Some(segment) => segment.as_deref().unwrap_or(&[]),
+                    None => return code_of(Trap::OutOfBoundsTableAccess),
+                };
+                let end = match src.checked_add(n) {
+                    Some(end) => end,
+                    None => return code_of(Trap::OutOfBoundsTableAccess),
+                };
+                if end > items.len() as u64 {
+                    return code_of(Trap::OutOfBoundsTableAccess);
+                }
+                for i in 0..n {
+                    cells[dst_off + i as usize] = Value::Ref(items[(src + i) as usize]);
+                }
+            }
+            crate::compile::TRAP_NONE
+        }
+        _ => gc_unsupported(store, "bad array bulk mode"),
     }
 }
 

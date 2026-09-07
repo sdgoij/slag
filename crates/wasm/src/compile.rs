@@ -1002,6 +1002,18 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         }
         Instr::ArraySet(ty) => array_value_lowerable(module, *ty),
         Instr::ArrayLen => true,
+        Instr::ArrayNewFixed { ty, n } => {
+            array_value_lowerable(module, *ty) && *n as usize <= SCRATCH_SLOTS
+        }
+        Instr::ArrayFill(ty) => array_value_lowerable(module, *ty),
+        Instr::ArrayNewData { ty, .. } | Instr::ArrayInitData { ty, .. } => {
+            array_field_of(module, *ty)
+                .is_some_and(|field| !matches!(field.ty, StorageType::Ref(_)))
+        }
+        Instr::ArrayNewElem { ty, .. } | Instr::ArrayInitElem { ty, .. } => {
+            array_field_of(module, *ty).is_some_and(|field| matches!(field.ty, StorageType::Ref(_)))
+        }
+        Instr::ArrayCopy { .. } => true,
         Instr::AnyConvertExtern | Instr::ExternConvertAny => true,
         _ => false,
     })
@@ -3299,6 +3311,230 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Spill an i32 operand (zero-extended) into a scratch slot.
+    fn spill_i32(&mut self, slot: usize, value: ClifValue) {
+        let wide = self.builder.ins().uextend(types::I64, value);
+        self.spill_u64(slot, wide);
+    }
+
+    /// An `array.new_fixed` of `n` elements: spill them in element order and
+    /// run the GC helper (mode 50).
+    fn do_array_new_fixed(&mut self, ty: u32, n: u32) -> Result<(), String> {
+        let value_ty = storage_val_type(
+            array_field_of(self.module, ty)
+                .ok_or("unresolved array")?
+                .ty,
+        )
+        .ok_or("unsupported array element type")?;
+        for i in (0..n as usize).rev() {
+            let value = self.pop().ok_or("operand stack underflow")?;
+            let wide = self.slot_from(value_ty, value)?;
+            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+        }
+        let mode = self.iconst(types::I64, 50);
+        let ty_v = self.iconst(types::I64, i64::from(ty));
+        let zero = self.iconst(types::I64, 0);
+        let nargs = self.iconst(types::I64, i64::from(n));
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            ty_v,
+            zero,
+            zero,
+            nargs,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(ty),
+        }))
+    }
+
+    /// An `array.fill`: pop (object, start, value, length) and run the GC
+    /// helper (mode 51).
+    fn do_array_fill(&mut self, ty: u32) -> Result<(), String> {
+        let value_ty = storage_val_type(
+            array_field_of(self.module, ty)
+                .ok_or("unresolved array")?
+                .ty,
+        )
+        .ok_or("unsupported array element type")?;
+        let len = self.pop().ok_or("operand stack underflow")?;
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let start = self.pop().ok_or("operand stack underflow")?;
+        let object = self.pop().ok_or("operand stack underflow")?;
+        self.spill_u64(0, object);
+        self.spill_i32(1, start);
+        let wide = self.slot_from(value_ty, value)?;
+        self.spill_u64(2, wide);
+        self.spill_i32(3, len);
+        let mode = self.iconst(types::I64, 51);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            zero,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// An `array.copy`: pop (dst object, dst offset, src object, src offset,
+    /// length) and run the GC helper (mode 52).
+    fn do_array_copy(&mut self) -> Result<(), String> {
+        let len = self.pop().ok_or("operand stack underflow")?;
+        let src_off = self.pop().ok_or("operand stack underflow")?;
+        let src = self.pop().ok_or("operand stack underflow")?;
+        let dst_off = self.pop().ok_or("operand stack underflow")?;
+        let dst = self.pop().ok_or("operand stack underflow")?;
+        self.spill_u64(0, dst);
+        self.spill_i32(1, dst_off);
+        self.spill_u64(2, src);
+        self.spill_i32(3, src_off);
+        self.spill_i32(4, len);
+        let mode = self.iconst(types::I64, 52);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            zero,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// An `array.new_data` (ty, data index): pop (src, length) and run the GC
+    /// helper (mode 53); the array token lands in `scratch[0]`.
+    fn do_array_new_data(&mut self, ty: u32, data: u32) -> Result<(), String> {
+        let n = self.pop().ok_or("operand stack underflow")?;
+        let src = self.pop().ok_or("operand stack underflow")?;
+        self.spill_i32(0, src);
+        self.spill_i32(1, n);
+        let mode = self.iconst(types::I64, 53);
+        let ty_v = self.iconst(types::I64, i64::from(ty));
+        let data_v = self.iconst(types::I64, i64::from(data));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            ty_v,
+            data_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(ty),
+        }))
+    }
+
+    /// An `array.new_elem` (ty, elem index): pop (src, length) and run the GC
+    /// helper (mode 54); the array token lands in `scratch[0]`.
+    fn do_array_new_elem(&mut self, ty: u32, elem: u32) -> Result<(), String> {
+        let n = self.pop().ok_or("operand stack underflow")?;
+        let src = self.pop().ok_or("operand stack underflow")?;
+        self.spill_i32(0, src);
+        self.spill_i32(1, n);
+        let mode = self.iconst(types::I64, 54);
+        let ty_v = self.iconst(types::I64, i64::from(ty));
+        let elem_v = self.iconst(types::I64, i64::from(elem));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            ty_v,
+            elem_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(ty),
+        }))
+    }
+
+    /// An `array.init_data` (ty, data index): pop (object, dst offset, src,
+    /// length) and run the GC helper (mode 55).
+    fn do_array_init_data(&mut self, ty: u32, data: u32) -> Result<(), String> {
+        let _ = ty;
+        let n = self.pop().ok_or("operand stack underflow")?;
+        let src = self.pop().ok_or("operand stack underflow")?;
+        let dst_off = self.pop().ok_or("operand stack underflow")?;
+        let object = self.pop().ok_or("operand stack underflow")?;
+        self.spill_u64(0, object);
+        self.spill_i32(1, dst_off);
+        self.spill_i32(2, src);
+        self.spill_i32(3, n);
+        let mode = self.iconst(types::I64, 55);
+        let data_v = self.iconst(types::I64, i64::from(data));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            zero,
+            data_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// An `array.init_elem` (ty, elem index): pop (object, dst offset, src,
+    /// length) and run the GC helper (mode 56).
+    fn do_array_init_elem(&mut self, ty: u32, elem: u32) -> Result<(), String> {
+        let _ = ty;
+        let n = self.pop().ok_or("operand stack underflow")?;
+        let src = self.pop().ok_or("operand stack underflow")?;
+        let dst_off = self.pop().ok_or("operand stack underflow")?;
+        let object = self.pop().ok_or("operand stack underflow")?;
+        self.spill_u64(0, object);
+        self.spill_i32(1, dst_off);
+        self.spill_i32(2, src);
+        self.spill_i32(3, n);
+        let mode = self.iconst(types::I64, 56);
+        let elem_v = self.iconst(types::I64, i64::from(elem));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            zero,
+            elem_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
     /// An `extern.convert_any`: re-tag an internal `any` token as its `extern`
     /// box (mode 40; a null stays null).
     fn do_extern_convert_any(&mut self) -> Result<(), String> {
@@ -3513,6 +3749,13 @@ impl<'a> Lowerer<'a> {
             Instr::ArrayGetU(ty) => self.do_array_get(*ty, 2)?,
             Instr::ArraySet(ty) => self.do_array_set(*ty)?,
             Instr::ArrayLen => self.do_array_len()?,
+            Instr::ArrayNewFixed { ty, n } => self.do_array_new_fixed(*ty, *n)?,
+            Instr::ArrayFill(ty) => self.do_array_fill(*ty)?,
+            Instr::ArrayCopy { .. } => self.do_array_copy()?,
+            Instr::ArrayNewData { ty, data } => self.do_array_new_data(*ty, *data)?,
+            Instr::ArrayNewElem { ty, elem } => self.do_array_new_elem(*ty, *elem)?,
+            Instr::ArrayInitData { ty, data } => self.do_array_init_data(*ty, *data)?,
+            Instr::ArrayInitElem { ty, elem } => self.do_array_init_elem(*ty, *elem)?,
             Instr::ExternConvertAny => self.do_extern_convert_any()?,
             Instr::AnyConvertExtern => self.do_any_convert_extern()?,
             Instr::BrOnNull(label) => self.do_br_on_null(*label)?,
@@ -7657,5 +7900,198 @@ mod tests {
             4,
             &[Value::Ref(RefValue::Null)],
         );
+    }
+
+    #[test]
+    fn array_bulk_ops_match_the_interpreter() {
+        use crate::module::{DataMode, DataSegment};
+        use crate::types::{CompositeType, FieldType, StorageType};
+        // The array bulk forms over an i32 array type: array.new_fixed,
+        // array.fill, a cross-array array.copy, and array.new_data reading a
+        // passive data segment as little-endian elements.
+        let array_ref = ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(1),
+        });
+        let array_type = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Array(FieldType {
+                ty: StorageType::I32,
+                mutable: true,
+            }),
+        };
+        let mut bytes = vec![0u8; 8];
+        bytes[4] = 0x78; // i32 120 at data offset 4.
+        let module = Module {
+            types: vec![SubType::func(vec![], vec![ValType::I32]), array_type],
+            data: vec![DataSegment {
+                mode: DataMode::Passive,
+                bytes,
+            }],
+            functions: vec![0, 0, 0, 0],
+            bodies: vec![
+                // 0: array.new_fixed of [10, 20, 30]; its length is 3.
+                FuncBody {
+                    locals: vec![array_ref],
+                    body: vec![
+                        Instr::I32Const(10),
+                        Instr::I32Const(20),
+                        Instr::I32Const(30),
+                        Instr::ArrayNewFixed { ty: 1, n: 3 },
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::ArrayLen,
+                    ],
+                },
+                // 1: fill [1, 3) of a zeroed length-4 array with 7; read back.
+                FuncBody {
+                    locals: vec![array_ref],
+                    body: vec![
+                        Instr::I32Const(0),
+                        Instr::I32Const(4),
+                        Instr::ArrayNew(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::I32Const(7),
+                        Instr::I32Const(2),
+                        Instr::ArrayFill(1),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+                // 2: copy b <- a[1..3), then read b[0] = a[1] = 5.
+                FuncBody {
+                    locals: vec![array_ref, array_ref],
+                    body: vec![
+                        Instr::I32Const(5),
+                        Instr::I32Const(4),
+                        Instr::ArrayNew(1),
+                        Instr::LocalSet(0),
+                        Instr::I32Const(0),
+                        Instr::I32Const(4),
+                        Instr::ArrayNew(1),
+                        Instr::LocalSet(1),
+                        Instr::LocalGet(1),
+                        Instr::I32Const(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::I32Const(2),
+                        Instr::ArrayCopy { dst: 1, src: 1 },
+                        Instr::LocalGet(1),
+                        Instr::I32Const(0),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+                // 3: array.new_data from the passive segment; element 0 reads
+                // the 120 stored at data offset 4.
+                FuncBody {
+                    locals: vec![array_ref],
+                    body: vec![
+                        Instr::I32Const(4),
+                        Instr::I32Const(1),
+                        Instr::ArrayNewData { ty: 1, data: 0 },
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(0),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "array bulk module did not compile"
+        );
+        let outcomes = run_seq(
+            &module,
+            &[(0, vec![]), (1, vec![]), (2, vec![]), (3, vec![])],
+        );
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(3)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(7)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::I32(5)]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(120)]));
+    }
+
+    #[test]
+    fn array_elem_bulk_ops_match_the_interpreter() {
+        use crate::module::{ElementMode, ElementSegment};
+        use crate::types::{CompositeType, FieldType, StorageType};
+        // array.new_elem / array.init_elem over a funcref array: a passive
+        // element segment of `ref.func 0` builds an array (length 2), and
+        // init_elem writes two references into a defaulted array (element 1
+        // reads back non-null).
+        let func_array_ref = ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(1),
+        });
+        let array_type = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Array(FieldType {
+                ty: StorageType::Ref(RefType::FUNC),
+                mutable: true,
+            }),
+        };
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![ValType::I32]),
+                array_type,
+                SubType::func(vec![], vec![]),
+            ],
+            functions: vec![2, 0, 0],
+            bodies: vec![
+                // 0: the referenced no-op function.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![],
+                },
+                // 1: array.new_elem from element segment 0; its length is 2.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(0),
+                        Instr::I32Const(2),
+                        Instr::ArrayNewElem { ty: 1, elem: 0 },
+                        Instr::ArrayLen,
+                    ],
+                },
+                // 2: array.init_elem writes refs at offset 1 of a length-3
+                // defaulted funcref array; element 1 is non-null.
+                FuncBody {
+                    locals: vec![func_array_ref],
+                    body: vec![
+                        Instr::I32Const(3),
+                        Instr::ArrayNewDefault(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::I32Const(0),
+                        Instr::I32Const(2),
+                        Instr::ArrayInitElem { ty: 1, elem: 0 },
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::ArrayGet(1),
+                        Instr::RefIsNull,
+                    ],
+                },
+            ],
+            elements: vec![ElementSegment {
+                ty: RefType::FUNC,
+                mode: ElementMode::Passive,
+                init: (0..2).map(|_| vec![Instr::RefFunc(0)]).collect(),
+            }],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "array elem bulk module did not compile"
+        );
+        let outcomes = run_seq(&module, &[(1, vec![]), (2, vec![])]);
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(2)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(0)]));
     }
 }
