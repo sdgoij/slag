@@ -1882,3 +1882,30 @@ over `memory_grow.wast` (106 commands agree) and the memory +
 tests, 65 total with the feature, clippy clean in both configurations.
 Wave 2 remaining: memory64 addressing and the table/`call_indirect`
 family.
+
+Memory64 addressing landed: compiled memory ops now accept any memory
+(32- or 64-bit) and resolve each instruction's address-operand width
+per its memory index, so one function can touch a memory32 and a
+memory64 side by side. `mem_ea` keeps the memory's index type: a memory32
+address is zero-extended from the i32 operand; a memory64 address is the
+i64 operand as-is, with the offset/width adds wrapping mod 2^64 and each
+carry trapping as OOB — the interpreter's `checked_add` semantics
+(an access whose end passes 2^64 is out of bounds whatever the wrapped
+bits look like). `memory.size`/`memory.grow` return the memory's index
+type too (i64 for a memory64: i64 delta in, old-pages-or-i64-(-1) out),
+and growth caps follow the cell's address type through the store helper.
+The equivalence gate immediately caught a real bug in this slice: the
+refactored `mem_ea` returned the access's *end* (`base + ea + width`)
+as the pointer instead of its start, so every store/load landed one
+access-width past its address — symmetric store-then-load unit tests
+masked it (both shifted together), while the `memory64` corpus exposed
+it (wrong values, out-of-bounds reads). Unit coverage adds a memory64
+store/load/size module over in-bounds and huge addresses (including
+i64::MAX, i64::MIN, and −8 whose 8-byte width carries past 2^64), a
+bounded memory64 grow sequence, and a mixed memory32+memory64 module.
+`wasmtest equiv` is green over `memory64/` (25 suites, 0 diverged — now
+exercising compiled memory64 bodies, not interpreter-vs-interpreter) and
+the memory + `multi-memory` regressions. 32 compile tests, 68 total with
+the feature, clippy clean in both configurations. Wave 2 remaining: the
+table/`call_indirect`/`ref.func` family (needs the compiled value model
+extended to refs and native↔interpreter function re-entry).

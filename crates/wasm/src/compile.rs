@@ -21,17 +21,18 @@
 //!   (parameters enter the body as its initial operand stack and ride a
 //!   loop's header as block parameters; a parameterized `if` needs an
 //!   explicit else branch);
-//! - numeric loads/stores, `memory.size`, and `memory.grow` over any 32-bit
-//!   memory, each access bounds-checking against a per-call descriptor array
-//!   (one (data pointer, byte length) pair per module memory index, entry
-//!   ABI params 2/3). `memory.grow` calls a runtime helper (entry params
-//!   7-9) that reallocates the store cell's backing `Vec` and rewrites the
-//!   descriptor entry, so later accesses see the grown buffer;
+//! - numeric loads/stores, `memory.size`, and `memory.grow` over any memory
+//!   (32- or 64-bit addressing, any index), each access bounds-checking
+//!   against a per-call descriptor array (one (data pointer, byte length)
+//!   pair per module memory index, entry ABI params 2/3). `memory.grow`
+//!   calls a runtime helper (entry params 7-9) that reallocates the store
+//!   cell's backing `Vec` and rewrites the descriptor entry, so later
+//!   accesses see the grown buffer;
 //! - `global.get`/`global.set` of numeric module-defined globals, through a
 //!   caller-owned buffer (one u64 slot per used global): the compiled body
 //!   reads and mutates slots in place, so its writes reach the store even
-//!   when it traps. Imported globals (whose cells can alias), memory64,
-//!   tables, calls, refs, SIMD, and GC are not lowered yet.
+//!   when it traps. Imported globals (whose cells can alias), tables, calls,
+//!   refs, SIMD, and GC are not lowered yet.
 //!
 //! ABI: a compiled entry is
 //! `unsafe extern "C" fn(args, nargs, mems, ncount, gvals, out, nout,
@@ -457,10 +458,11 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_sig(module, bt).is_some(),
         Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) | Instr::BrTable { .. } => true,
         Instr::Load { memory, .. } | Instr::Store { memory, .. } => {
-            memory_is64(module, *memory) == Some(false)
+            memory_is64(module, *memory).is_some()
         }
-        Instr::MemorySize(memory) => memory_is64(module, *memory) == Some(false),
-        Instr::MemoryGrow(memory) => memory_is64(module, *memory) == Some(false),
+        Instr::MemorySize(memory) | Instr::MemoryGrow(memory) => {
+            memory_is64(module, *memory).is_some()
+        }
         Instr::GlobalGet(index) => {
             matches!(defined_global(module, *index), Some((ty, _)) if clif_type(ty).is_some())
         }
@@ -941,9 +943,13 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The byte address of a memory access: reload the memory's descriptor
-    /// (data pointer and length), unsigned-widen the i32 address, add the
-    /// static offset, then trap when `addr + offset + width` exceeds the
-    /// memory's length. Returns the base-plus-effective-address pointer.
+    /// (data pointer and length), widen/keep the address to u64 per the
+    /// memory's index type (i32 zero-extended, or i64 as-is for memory64),
+    /// add the static offset, then trap when the access end passes the
+    /// memory's length. A memory64 effective address is computed with
+    /// wrapping 64-bit arithmetic, and any carry past 2^64 traps — the
+    /// interpreter's `checked_add` semantics. Returns the base-plus-effective-
+    /// address pointer.
     fn mem_ea(
         &mut self,
         memory: u32,
@@ -951,6 +957,7 @@ impl<'a> Lowerer<'a> {
         offset: u64,
         width: u64,
     ) -> Result<ClifValue, String> {
+        let memory64 = memory_is64(self.module, memory).ok_or("unresolved memory index")?;
         let ptr_slot = self.builder.ins().iadd_imm_s(self.mems, 16 * memory as i64);
         let len_slot = self
             .builder
@@ -964,9 +971,31 @@ impl<'a> Lowerer<'a> {
             self.builder
                 .ins()
                 .load(types::I64, MemFlagsData::new(), len_slot, Offset32::new(0));
-        let addr64 = self.builder.ins().uextend(types::I64, addr);
-        let ea = self.builder.ins().iadd_imm_s(addr64, offset as i64);
-        let end = self.builder.ins().iadd_imm_s(ea, width as i64);
+        let (ea, end) = if memory64 {
+            // A memory64 address is an i64 bit pattern (unsigned u64). The
+            // offset and width adds wrap mod 2^64; each carry means the true
+            // end passed 2^64, so it is out of bounds whatever the wrapped
+            // value looks like.
+            let off = self.iconst(types::I64, offset as i64);
+            let width_v = self.iconst(types::I64, width as i64);
+            let ea = self.builder.ins().iadd(addr, off);
+            let carried = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, addr, ea);
+            self.trap_if(carried, TRAP_MEMORY_OOB);
+            let end = self.builder.ins().iadd(ea, width_v);
+            let carried = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, ea, end);
+            self.trap_if(carried, TRAP_MEMORY_OOB);
+            (ea, end)
+        } else {
+            // A memory32 address is an i32, zero-extended; addr + offset +
+            // width never reaches 2^64, so no carry can occur.
+            let addr64 = self.builder.ins().uextend(types::I64, addr);
+            let ea = self.builder.ins().iadd_imm_s(addr64, offset as i64);
+            let end = self.builder.ins().iadd_imm_s(ea, width as i64);
+            (ea, end)
+        };
         let oob = self
             .builder
             .ins()
@@ -1103,8 +1132,10 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    /// `memory.size`: current size in pages as an i32 (32-bit memory).
+    /// `memory.size`: current size in pages as the memory's index type (an
+    /// i32 for memory32, an i64 for memory64).
     fn do_memory_size(&mut self, memory: u32) -> Result<(), String> {
+        let memory64 = memory_is64(self.module, memory).ok_or("unresolved memory index")?;
         let len_slot = self
             .builder
             .ins()
@@ -1115,24 +1146,34 @@ impl<'a> Lowerer<'a> {
                 .load(types::I64, MemFlagsData::new(), len_slot, Offset32::new(0));
         let sixteen = self.iconst(types::I64, 16);
         let pages = self.builder.ins().ushr(mem_len, sixteen);
-        let pages32 = self.builder.ins().ireduce(types::I32, pages);
-        self.stack.push(pages32);
+        let value = if memory64 {
+            pages
+        } else {
+            self.builder.ins().ireduce(types::I32, pages)
+        };
+        self.stack.push(value);
         Ok(())
     }
 
-    /// `memory.grow`: pop the i32 delta and call the runtime grow helper
-    /// (entry params 7-9) with the store/instance pointers, this memory's
-    /// module index, the widened delta, and this memory's descriptor-slot
-    /// address in the caller-owned array. The helper grows the store cell's
-    /// backing `Vec` (enforcing the declared maximum and the memory32 2^16
-    /// cap) and, on success, rewrites the descriptor entry in place — its
-    /// data pointer is unstable across a resize, and every later access
-    /// reloads the descriptor. The helper returns the old page count or
-    /// `u64::MAX` (-1) on failure; narrowing to i32 reproduces wasm's
-    /// "old pages or -1" result exactly (growth caps far below 2^32).
+    /// `memory.grow`: pop the delta (i32 for memory32, i64 for memory64) and
+    /// call the runtime grow helper (entry params 7-9) with the store/instance
+    /// pointers, this memory's module index, the delta, and this memory's
+    /// descriptor-slot address in the caller-owned array. The helper grows
+    /// the store cell's backing `Vec` (enforcing the declared maximum and the
+    /// address type's page cap) and, on success, rewrites the descriptor
+    /// entry in place — its data pointer is unstable across a resize, and
+    /// every later access reloads the descriptor. The helper returns the old
+    /// page count or all-ones (-1) on failure; that narrows to i32 for a
+    /// memory32 or stays i64 for a memory64, reproducing wasm's "old pages or
+    /// -1" result exactly.
     fn do_memory_grow(&mut self, memory: u32) -> Result<(), String> {
+        let memory64 = memory_is64(self.module, memory).ok_or("unresolved memory index")?;
         let delta = self.pop().ok_or("operand stack underflow")?;
-        let delta64 = self.builder.ins().uextend(types::I64, delta);
+        let delta64 = if memory64 {
+            delta
+        } else {
+            self.builder.ins().uextend(types::I64, delta)
+        };
         let desc = self.builder.ins().iadd_imm_s(self.mems, 16 * memory as i64);
         let memory_index = self.iconst(types::I64, i64::from(memory));
         // The helper's ABI: (store, instance, memory index, delta, desc
@@ -1152,8 +1193,12 @@ impl<'a> Lowerer<'a> {
             &[self.store, self.instance, memory_index, delta64, desc],
         );
         let old = self.builder.inst_results(call)[0];
-        let old32 = self.builder.ins().ireduce(types::I32, old);
-        self.stack.push(old32);
+        let value = if memory64 {
+            old
+        } else {
+            self.builder.ins().ireduce(types::I32, old)
+        };
+        self.stack.push(value);
         Ok(())
     }
 
@@ -2745,6 +2790,27 @@ mod tests {
         }
     }
 
+    /// A single-function module with one 1-page 64-bit memory (index 0).
+    fn mem64_module(body: Vec<Instr>, params: Vec<ValType>, results: Vec<ValType>) -> Module {
+        Module {
+            types: vec![SubType::func(params.clone(), results.clone())],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body,
+            }],
+            memories: vec![MemType {
+                limits: Limits {
+                    min: 1,
+                    max: None,
+                    shared: false,
+                },
+                memory64: true,
+            }],
+            ..Module::default()
+        }
+    }
+
     /// A single-function module with module-defined globals (`ty`, init expr).
     fn global_module(
         body: Vec<Instr>,
@@ -3847,6 +3913,187 @@ mod tests {
         assert_eq!(outcomes[0], Ok(vec![Value::I32(2)]));
         assert_eq!(outcomes[1], Ok(vec![Value::I32(-2)]));
         assert_eq!(outcomes[2], Ok(vec![Value::I32(7)]));
+    }
+
+    #[test]
+    fn memory64_ops_match_the_interpreter() {
+        use crate::instr::LoadOp::*;
+        // A memory64 whose address operands are i64: store/load an i64 at the
+        // address, then add `memory.size` (also i64) to the loaded value.
+        // Huge addresses exercise the 64-bit EA overflow traps: `i64::MAX`
+        // and `i64::MIN` pass the end past the 1-page length (no carry), and
+        // -8 (= u64::MAX - 7) plus the 8-byte width carries past 2^64.
+        let module = mem64_module(
+            vec![
+                Instr::LocalGet(0),
+                Instr::LocalGet(1),
+                Instr::Store {
+                    memory: 0,
+                    op: StoreOp::I64,
+                    align: 3,
+                    offset: 0,
+                },
+                Instr::LocalGet(0),
+                Instr::Load {
+                    memory: 0,
+                    op: I64,
+                    align: 3,
+                    offset: 0,
+                },
+                Instr::MemorySize(0),
+                Instr::Num(NumOp::I64Add),
+            ],
+            vec![ValType::I64, ValType::I64],
+            vec![ValType::I64],
+        );
+        let cases = [
+            vec![Value::I64(0), Value::I64(0x1122_3344_5566_7788)],
+            vec![Value::I64(8), Value::I64(-1)],
+            vec![Value::I64(0x1234), Value::I64(7)],
+            vec![Value::I64(i64::MAX), Value::I64(5)],
+            vec![Value::I64(i64::MIN), Value::I64(9)],
+            vec![Value::I64(-8), Value::I64(5)],
+        ];
+        assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn memory64_grow_matches_the_interpreter() {
+        // Memory64 (1 2): the delta and every result are i64. func 0 grows to
+        // the max (old pages 1) and reports the i64 size (2); func 1 then
+        // grows again (must fail with i64 -1); func 2 stores at the grown
+        // page boundary through an i64 address and reads it back.
+        let module = Module {
+            types: vec![SubType::func(vec![], vec![ValType::I64])],
+            functions: vec![0, 0, 0],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I64Const(1),
+                        Instr::MemoryGrow(0),
+                        Instr::MemorySize(0),
+                        Instr::Num(NumOp::I64Mul),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::I64Const(1), Instr::MemoryGrow(0)],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I64Const(0x1_0000),
+                        Instr::I64Const(7),
+                        Instr::Store {
+                            memory: 0,
+                            op: StoreOp::I64,
+                            align: 3,
+                            offset: 0,
+                        },
+                        Instr::I64Const(0x1_0000),
+                        Instr::Load {
+                            memory: 0,
+                            op: LoadOp::I64,
+                            align: 3,
+                            offset: 0,
+                        },
+                    ],
+                },
+            ],
+            memories: vec![MemType {
+                limits: Limits {
+                    min: 1,
+                    max: Some(2),
+                    shared: false,
+                },
+                memory64: true,
+            }],
+            ..Module::default()
+        };
+        let outcomes = run_seq(&module, &[(0, vec![]), (1, vec![]), (2, vec![])]);
+        assert_eq!(outcomes[0], Ok(vec![Value::I64(2)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I64(-1)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::I64(7)]));
+    }
+
+    #[test]
+    fn mixed_memory_widths_match_the_interpreter() {
+        use crate::instr::LoadOp::*;
+        // One 32-bit and one 64-bit memory in the same module: each memory
+        // instruction's address operand is sized by its own memory (i32 for
+        // index 0, i64 for index 1), so the lowering must branch per
+        // instruction. Store 5 into memory 0 and 6 into memory 1, read both
+        // back as i32, and add.
+        let module = Module {
+            types: vec![SubType::func(
+                vec![ValType::I32, ValType::I64],
+                vec![ValType::I32],
+            )],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body: vec![
+                    Instr::LocalGet(0),
+                    Instr::I32Const(5),
+                    Instr::Store {
+                        memory: 0,
+                        op: StoreOp::I32,
+                        align: 2,
+                        offset: 0,
+                    },
+                    Instr::LocalGet(1),
+                    Instr::I32Const(6),
+                    Instr::Store {
+                        memory: 1,
+                        op: StoreOp::I32,
+                        align: 2,
+                        offset: 0,
+                    },
+                    Instr::LocalGet(0),
+                    Instr::Load {
+                        memory: 0,
+                        op: I32,
+                        align: 2,
+                        offset: 0,
+                    },
+                    Instr::LocalGet(1),
+                    Instr::Load {
+                        memory: 1,
+                        op: I32,
+                        align: 2,
+                        offset: 0,
+                    },
+                    Instr::Num(NumOp::I32Add),
+                ],
+            }],
+            memories: vec![
+                MemType {
+                    limits: Limits {
+                        min: 1,
+                        max: None,
+                        shared: false,
+                    },
+                    memory64: false,
+                },
+                MemType {
+                    limits: Limits {
+                        min: 1,
+                        max: None,
+                        shared: false,
+                    },
+                    memory64: true,
+                },
+            ],
+            ..Module::default()
+        };
+        let cases = [
+            vec![Value::I32(0), Value::I64(0)],
+            vec![Value::I32(0x100), Value::I64(0x2000)],
+            // The i64 memory OOB-traps through a huge 64-bit address.
+            vec![Value::I32(4), Value::I64(i64::MAX)],
+        ];
+        assert_equiv(&module, 0, &cases);
     }
 
     #[test]
