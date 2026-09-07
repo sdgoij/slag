@@ -2265,3 +2265,41 @@ would diverge. `wasmtest equiv` is green over the whole core corpus:
 clippy clean in both configurations. Remaining Cut 11 surface: the
 v128 SIMD/relaxed-SIMD wave (the interpreter's `simd`/`relaxed-simd`
 corpus suites are still interpreter-on-both-sides).
+
+### Cut 11 Wave 5: v128 substrate — carrier, boundary, register ops (2026-09-07)
+
+The SIMD wave starts with the compiled v128 value model and its
+function boundary. A v128 rides the compiled operand stack, locals,
+and block parameters as its raw 128-bit pattern on a Cranelift `I128`
+(`carrier_type` now maps `ValType::V128`), and the compiled entry's
+args/out buffers carry each v128 param/result as **two** u64 words
+(`slot_words`), so `(func (param v128 …) (result v128) …)` bodies
+compile and cross the boundary: `lower()` loads v128 params at their
+word offsets, `emit_return` stores v128 results the same way, and
+`run_compiled` marshals `Value::V128` in/out. The v128 *call* machinery
+is untouched — spilling a v128 call argument through `slot_from` still
+errors, so bodies that call v128-typed functions stay interpreted (the
+corpus SIMD functions are leaves).
+
+Pure-register v128 ops lower through a new runtime helper (mode 70)
+that reproduces the interpreter's `simd_exec` dispatch exactly, over
+operands the body spills to the caller-owned scratch in interpreter pop
+order (a v128 is two words, a scalar one word): `v128.const` builds the
+`I128` from its halves, and `Vec`/`VecLane` cover every `simd::sig`
+family — unop/not/binop/ternop (bitselect)/shift/splat/extract/replace
+lane/test/bitmask — plus the relaxed-SIMD opcodes (executed through
+`simd::exec_relaxed`, before the category match, exactly like the
+interpreter). Scalar operands ride scratch in their u64 slot form and
+the helper rebuilds the interpreter value from the lane kind;
+extract/test/bitmask results come back as a scalar word. `lowerable`
+admits `V128Const`/`Vec`/`VecLane`, so the corpus `simd` suites' leaf
+functions now run compiled. Vector memory ops (`VecLoad`/`VecStore`/
+`VecLaneLoad`/`VecLaneStore`) and `VecShuffle` are not lowered yet
+(their bodies stay interpreted). Unit coverage drives i32x4 add/sub/
+extract_lane 0, v128.and, i8x16.splat, v128.any_true, a v128.const,
+and a v128 identity through the compiled boundary vs the interpreter
+(the non-commutative sub guards operand order). `wasmtest equiv` is
+green over the whole core corpus: 254 suites, 0 diverged. 57 compile
+tests, 93 total with the feature, clippy clean in both configurations.
+Next Wave 5 items: v128 memory loads/stores (incl. lane and
+load-extend forms) and `i8x16.shuffle`.

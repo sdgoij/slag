@@ -467,7 +467,8 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// `40`/`41` = `extern.convert_any`/`any.convert_extern` re-tagging the
 /// token `x` (see [`gc_convert_op`]); `50`-`56` = the array bulk ops (see
 /// [`array_bulk_op`]); `60` = the `ref.test`/`ref.cast` type match check
-/// (see [`ref_cast_op`]).
+/// (see [`ref_cast_op`]); `70` = a v128 register op mirroring `simd_exec`
+/// over operands in `scratch` (see [`simd_op`]).
 ///
 /// # Safety
 ///
@@ -518,6 +519,11 @@ pub unsafe extern "C" fn wasm_call_helper(
     // type-lattice test against the store.
     if mode == 60 {
         return ref_cast_op(store, instance, x, y, z, scratch);
+    }
+    // A compiled v128 register op (mode 70) reproduces the interpreter's
+    // `simd_exec` over operands spilled to the caller-owned scratch.
+    if mode == 70 {
+        return simd_op(store, x, y, scratch);
     }
     // Table reads/writes (modes 3/4), the bulk-memory ops (modes 5-8), and
     // the table bulk ops (modes 9-14) resolve cells/segments directly.
@@ -1992,6 +1998,185 @@ fn ref_cast_op(store: &mut Store, frame: u64, x: u64, y: u64, z: u64, scratch: *
         None => return gc_unsupported(store, "cast target resolution"),
     }
     crate::compile::TRAP_NONE
+}
+
+/// Read the v128 (two u64 words, little-endian) at `scratch[word]`.
+///
+/// # Safety
+///
+/// `scratch` must point at `word + 2` writable u64 slots.
+#[cfg(feature = "compile")]
+unsafe fn scratch_read_v128(scratch: *mut u64, word: usize) -> u128 {
+    // SAFETY: `scratch` points at `word + 2` readable u64 slots (enforced by
+    // this helper's `# Safety` contract).
+    unsafe {
+        let lo = *scratch.add(word);
+        let hi = *scratch.add(word + 1);
+        u128::from(lo) | (u128::from(hi) << 64)
+    }
+}
+
+/// Write the v128 `value` at `scratch[word]` (two u64 words, little-endian).
+///
+/// # Safety
+///
+/// `scratch` must point at `word + 2` writable u64 slots.
+#[cfg(feature = "compile")]
+unsafe fn scratch_write_v128(scratch: *mut u64, word: usize, value: u128) {
+    // SAFETY: `scratch` points at `word + 2` writable u64 slots (enforced by
+    // this helper's `# Safety` contract).
+    unsafe {
+        *scratch.add(word) = value as u64;
+        *scratch.add(word + 1) = (value >> 64) as u64;
+    }
+}
+
+/// A compiled v128 register op (runtime helper mode 70): reproduce the
+/// interpreter's `simd_exec` dispatch over operand values read from the
+/// caller-owned scratch (in interpreter pop order: a v128 operand is two u64
+/// words, a scalar one word), writing the result back over `scratch[0]` — a
+/// v128 as two words, a scalar as one. `sub` = x; the extract/replace lane
+/// immediate = y. Relaxed ops dispatch first, exactly like the interpreter.
+#[cfg(feature = "compile")]
+fn simd_op(store: &mut Store, x: u64, y: u64, scratch: *mut u64) -> i32 {
+    use crate::simd::{VecSig, lane_bits_to_value, scalar_to_lane_bits};
+    let sub = x as u16;
+    let lane = y as u8;
+    let read = |word: usize| unsafe { scratch_read_v128(scratch, word) };
+    let read_word = |index: usize| unsafe { *scratch.add(index) };
+    let write = |word: usize, value: u128| unsafe { scratch_write_v128(scratch, word, value) };
+    let write_word = |index: usize, bits: u64| unsafe { *scratch.add(index) = bits };
+    let write_value = |value: Value| {
+        let bits = match value {
+            Value::I32(v) => v as u32 as u64,
+            Value::I64(v) => v as u64,
+            Value::F32(bits) => u64::from(bits),
+            Value::F64(bits) => bits,
+            // Scalar simd results are numeric; a V128/ref here is a bug.
+            _ => 0,
+        };
+        write_word(0, bits);
+    };
+    // Relaxed SIMD ops take a fixed v128 operand count and one deterministic
+    // behavior each (spec: any result in the allowed set). The operands ride
+    // scratch slots in pop order (c, b, a for arity 3; b, a for 2; a for 1).
+    if crate::simd::is_relaxed(sub) {
+        let arity = crate::simd::relaxed_arity(sub);
+        let out = match arity {
+            1 => crate::simd::exec_relaxed(sub, read(0), None, None),
+            2 => {
+                let b = read(0);
+                let a = read(2);
+                crate::simd::exec_relaxed(sub, a, Some(b), None)
+            }
+            _ => {
+                let c = read(0);
+                let b = read(2);
+                let a = read(4);
+                crate::simd::exec_relaxed(sub, a, Some(b), Some(c))
+            }
+        };
+        return match out {
+            Some(out) => {
+                write(0, out);
+                crate::compile::TRAP_NONE
+            }
+            None => gc_unsupported(store, "relaxed simd opcode"),
+        };
+    }
+    match crate::simd::sig(sub) {
+        Some(VecSig::Not) => {
+            write(0, crate::simd::exec_not(read(0)));
+            crate::compile::TRAP_NONE
+        }
+        Some(VecSig::Unop) => match crate::simd::exec_unop(sub, read(0)) {
+            Some(out) => {
+                write(0, out);
+                crate::compile::TRAP_NONE
+            }
+            None => gc_unsupported(store, "simd unop"),
+        },
+        Some(VecSig::Binop) => {
+            let b = read(0);
+            let a = read(2);
+            match crate::simd::exec_binop(sub, a, b) {
+                Some(out) => {
+                    write(0, out);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "simd binop"),
+            }
+        }
+        Some(VecSig::Ternop) => {
+            let c = read(0);
+            let b = read(2);
+            let a = read(4);
+            write(0, crate::simd::exec_bitselect(a, b, c));
+            crate::compile::TRAP_NONE
+        }
+        Some(VecSig::Shift) => {
+            let count = read_word(0) as u32;
+            let v = read(1);
+            match crate::simd::exec_shift(sub, v, count) {
+                Some(out) => {
+                    write(0, out);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "simd shift"),
+            }
+        }
+        Some(VecSig::Splat(kind)) => {
+            let scalar = lane_bits_to_value(read_word(0), kind);
+            let Some(bits) = scalar_to_lane_bits(scalar, kind) else {
+                return gc_unsupported(store, "simd splat operand");
+            };
+            match crate::simd::exec_splat(sub, bits) {
+                Some(out) => {
+                    write(0, out);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "simd splat"),
+            }
+        }
+        Some(VecSig::ExtractS(_) | VecSig::ExtractU(_) | VecSig::Extract(_)) => {
+            match crate::simd::exec_extract(sub, read(0), lane as usize) {
+                Some(value) => {
+                    write_value(value);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "simd extract"),
+            }
+        }
+        Some(VecSig::Replace(kind)) => {
+            let scalar = lane_bits_to_value(read_word(0), kind);
+            let Some(bits) = scalar_to_lane_bits(scalar, kind) else {
+                return gc_unsupported(store, "simd replace operand");
+            };
+            let v = read(1);
+            match crate::simd::exec_replace(sub, v, lane as usize, bits) {
+                Some(out) => {
+                    write(0, out);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "simd replace"),
+            }
+        }
+        Some(VecSig::Test) => match crate::simd::exec_any_all_true(sub, read(0)) {
+            Some(out) => {
+                write_word(0, out as u32 as u64);
+                crate::compile::TRAP_NONE
+            }
+            None => gc_unsupported(store, "simd all_true"),
+        },
+        Some(VecSig::Bitmask) => match crate::simd::exec_bitmask(sub, read(0)) {
+            Some(out) => {
+                write_word(0, out as u32 as u64);
+                crate::compile::TRAP_NONE
+            }
+            None => gc_unsupported(store, "simd bitmask"),
+        },
+        None => gc_unsupported(store, "simd opcode"),
+    }
 }
 
 /// Decode a value of `storage` from its u64 scratch slot (a reference decodes

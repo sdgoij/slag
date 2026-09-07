@@ -326,24 +326,28 @@ pub fn run_compiled(
     }
     let mut input = Vec::with_capacity(args.len());
     for (value, param) in args.iter().zip(&ty.params) {
-        let bits = match (param, value) {
-            (ValType::I32, Value::I32(bits)) => *bits as u32 as u64,
-            (ValType::I64, Value::I64(bits)) => *bits as u64,
-            (ValType::F32, Value::F32(bits)) => u64::from(*bits),
-            (ValType::F64, Value::F64(bits)) => *bits,
+        match (param, value) {
+            (ValType::V128, Value::V128(bits)) => {
+                input.push(*bits as u64);
+                input.push((*bits >> 64) as u64);
+            }
+            (ValType::I32, Value::I32(bits)) => input.push(*bits as u32 as u64),
+            (ValType::I64, Value::I64(bits)) => input.push(*bits as u64),
+            (ValType::F32, Value::F32(bits)) => input.push(u64::from(*bits)),
+            (ValType::F64, Value::F64(bits)) => input.push(*bits),
             (ValType::Ref(_), Value::Ref(_)) => {
                 let Some(token) = ref_to_token(*value) else {
                     return Err(ExecFail::Unsupported(
                         "function-reference argument across the compiled boundary",
                     ));
                 };
-                token
+                input.push(token);
             }
             _ => return Err(ExecFail::Unsupported("compiled function argument type")),
         };
-        input.push(bits);
     }
-    let mut output = vec![0u64; ty.results.len()];
+    let out_words: usize = ty.results.iter().map(|result| slot_words(*result)).sum();
+    let mut output = vec![0u64; out_words];
     let code = func.call(&input, mems, globals, &mut output, runtime);
     if code == TRAP_PENDING_ERROR {
         // SAFETY: `runtime.store` is the owning store, kept alive (and
@@ -359,22 +363,28 @@ pub fn run_compiled(
         return Err(ExecFail::Trap(trap_of(code)));
     }
     let mut results = Vec::with_capacity(ty.results.len());
-    for (bits, result) in output.into_iter().zip(&ty.results) {
+    let mut word = 0usize;
+    for result in &ty.results {
         let value = match result {
-            ValType::I32 => Value::I32(bits as u32 as i32),
-            ValType::I64 => Value::I64(bits as i64),
-            ValType::F32 => Value::F32(bits as u32),
-            ValType::F64 => Value::F64(bits),
+            ValType::V128 => {
+                let lo = output[word] as u128;
+                let hi = output[word + 1] as u128;
+                Value::V128(lo | (hi << 64))
+            }
+            ValType::I32 => Value::I32(output[word] as u32 as i32),
+            ValType::I64 => Value::I64(output[word] as i64),
+            ValType::F32 => Value::F32(output[word] as u32),
+            ValType::F64 => Value::F64(output[word]),
             ValType::Ref(_) => {
-                let Some(value) = token_to_ref(bits) else {
+                let Some(value) = token_to_ref(output[word]) else {
                     return Err(ExecFail::Unsupported(
                         "function-reference result across the compiled boundary",
                     ));
                 };
                 value
             }
-            _ => return Err(ExecFail::Unsupported("compiled function result type")),
         };
+        word += slot_words(*result);
         results.push(value);
     }
     Ok(results)
@@ -553,15 +563,34 @@ fn heap_is_carried(module: &Module, heap: &HeapType) -> bool {
 }
 
 /// The compiled carrier type of a value the lowering actually carries — a
-/// numeric scalar, or a function-/extern-reference token (`I64`) — or `None`
-/// when the type stays interpreted.
+/// numeric scalar, a function-/extern-reference token (`I64`), or a v128
+/// as its raw 128-bit pattern (`I128`) — or `None` when the type stays
+/// interpreted.
 fn carrier_type(module: &Module, ty: ValType) -> Option<Type> {
     match num_type(ty) {
         Some(t) => Some(t),
         None => match ty {
             ValType::Ref(reference) if heap_is_carried(module, &reference.heap) => Some(types::I64),
+            ValType::V128 => Some(types::I128),
             _ => None,
         },
+    }
+}
+
+/// How many u64 words a value occupies in the compiled entry's args/out
+/// buffers (and the call scratch): one per numeric/ref value, two for a v128.
+fn slot_words(ty: ValType) -> usize {
+    if matches!(ty, ValType::V128) { 2 } else { 1 }
+}
+
+/// The scalar value type of a SIMD lane kind (`i8x16.splat` pops an i32, etc).
+fn lane_valtype(kind: crate::simd::LaneKind) -> ValType {
+    use crate::simd::LaneKind;
+    match kind {
+        LaneKind::I8 | LaneKind::I16 | LaneKind::I32 => ValType::I32,
+        LaneKind::I64 => ValType::I64,
+        LaneKind::F32 => ValType::F32,
+        LaneKind::F64 => ValType::F64,
     }
 }
 
@@ -1038,6 +1067,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         Instr::ArrayCopy { .. } => true,
         Instr::AnyConvertExtern | Instr::ExternConvertAny => true,
         Instr::RefTest { .. } | Instr::RefCast { .. } => true,
+        Instr::V128Const(_) | Instr::Vec(_) | Instr::VecLane { .. } => true,
         _ => false,
     })
 }
@@ -1336,34 +1366,54 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Store the results and return trap code 0. `stack` must hold exactly
-    /// the results, in order (result 0 deepest).
+    /// the results, in order (result 0 deepest). A v128 result occupies two
+    /// out-buffer words.
     fn emit_return(&mut self) -> Result<(), String> {
         if self.stack.len() != self.results.len() {
             return Err("compiled return arity mismatch".to_string());
         }
-        for (index, (value, ty)) in self.stack.iter().zip(&self.results).enumerate() {
-            let address = self
-                .builder
-                .ins()
-                .iadd_imm_s(self.out_ptr, 8 * index as i64);
-            let wide = match ty {
-                ValType::I32 => self.builder.ins().uextend(types::I64, *value),
+        let mut word = 0usize;
+        for (value, ty) in self.stack.iter().zip(&self.results) {
+            let address = self.builder.ins().iadd_imm_s(self.out_ptr, 8 * word as i64);
+            match ty {
+                ValType::V128 => {
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), *value, address, Offset32::new(0))
+                }
+                ValType::I32 => {
+                    let wide = self.builder.ins().uextend(types::I64, *value);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), wide, address, Offset32::new(0))
+                }
                 ValType::F32 => {
                     let bits = self
                         .builder
                         .ins()
                         .bitcast(types::I32, MemFlagsData::new(), *value);
-                    self.builder.ins().uextend(types::I64, bits)
+                    let wide = self.builder.ins().uextend(types::I64, bits);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), wide, address, Offset32::new(0))
                 }
-                ValType::F64 => self
-                    .builder
-                    .ins()
-                    .bitcast(types::I64, MemFlagsData::new(), *value),
-                _ => *value,
+                ValType::F64 => {
+                    let wide = self
+                        .builder
+                        .ins()
+                        .bitcast(types::I64, MemFlagsData::new(), *value);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), wide, address, Offset32::new(0))
+                }
+                // A reference result is already its u64 token.
+                _ => {
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), *value, address, Offset32::new(0))
+                }
             };
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+            word += slot_words(*ty);
         }
         let ok = self.iconst(types::I32, 0);
         self.builder.ins().return_(&[ok]);
@@ -3767,6 +3817,159 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// A `v128.const`: push the 128-bit pattern as an `I128` (assembled from
+    /// its low and high u64 halves).
+    fn do_v128_const(&mut self, bits: u128) -> Result<(), String> {
+        let lo = self.iconst(types::I64, bits as u64 as i64);
+        let hi = self.iconst(types::I64, (bits >> 64) as u64 as i64);
+        let value = self.builder.ins().iconcat(lo, hi);
+        self.stack.push(value);
+        Ok(())
+    }
+
+    /// Store a v128 (an `I128` SSA value) at `scratch[word]` (two u64 words).
+    fn spill_v128(&mut self, word: usize, value: ClifValue) {
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * word as i64);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), value, address, Offset32::new(0));
+    }
+
+    /// Load the v128 at `scratch[word]` (two u64 words) as an `I128` SSA value.
+    fn load_v128(&mut self, word: usize) -> ClifValue {
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * word as i64);
+        self.builder
+            .ins()
+            .load(types::I128, MemFlagsData::new(), address, Offset32::new(0))
+    }
+
+    /// Run the runtime simd helper (mode 70) over operands already spilled to
+    /// the caller-owned scratch. The helper mirrors `simd_exec` exactly.
+    fn simd_helper_call(&mut self, sub: u16, lane: u8) -> Result<(), String> {
+        let mode = self.iconst(types::I64, 70);
+        let sub_v = self.iconst(types::I64, i64::from(sub));
+        let lane_v = self.iconst(types::I64, i64::from(lane));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            sub_v,
+            lane_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// A pure-register v128 op (`Vec`/`VecLane`): pop the operands in the
+    /// interpreter's pop order, spill them to the caller-owned scratch (a
+    /// v128 occupies two u64 words, a scalar one), and run the runtime simd
+    /// helper, which reproduces `simd_exec` exactly. The result — a v128 in
+    /// `scratch[0..2]` or a scalar in `scratch[0]` — is pushed with its static
+    /// type.
+    fn do_simd_op(&mut self, sub: u16, lane: Option<u8>) -> Result<(), String> {
+        use crate::simd::VecSig;
+        // Relaxed ops take a fixed v128 operand count and one deterministic
+        // behavior each; dispatch them before the category match (the
+        // interpreter does the same, so ternary forms do not fall into the
+        // bitselect-only `Ternop` arm).
+        if crate::simd::is_relaxed(sub) {
+            let arity = crate::simd::relaxed_arity(sub) as usize;
+            // Pop order (top first): c, b, a for arity 3; b, a for 2; a for 1.
+            let mut slots = Vec::with_capacity(arity);
+            for _ in 0..arity {
+                slots.push(self.pop().ok_or("operand stack underflow")?);
+            }
+            for (k, value) in slots.iter().enumerate() {
+                self.spill_v128(2 * k, *value);
+            }
+            self.simd_helper_call(sub, lane.unwrap_or(0))?;
+            let out = self.load_v128(0);
+            self.stack.push(out);
+            return Ok(());
+        }
+        let Some(shape) = crate::simd::sig(sub) else {
+            return Err("unsupported simd opcode reached the lowerer".to_string());
+        };
+        match shape {
+            VecSig::Not | VecSig::Unop => {
+                let v = self.pop().ok_or("operand stack underflow")?;
+                self.spill_v128(0, v);
+                self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                let out = self.load_v128(0);
+                self.stack.push(out);
+            }
+            VecSig::Binop => {
+                let b = self.pop().ok_or("operand stack underflow")?;
+                let a = self.pop().ok_or("operand stack underflow")?;
+                self.spill_v128(0, b);
+                self.spill_v128(2, a);
+                self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                let out = self.load_v128(0);
+                self.stack.push(out);
+            }
+            VecSig::Ternop => {
+                let c = self.pop().ok_or("operand stack underflow")?;
+                let b = self.pop().ok_or("operand stack underflow")?;
+                let a = self.pop().ok_or("operand stack underflow")?;
+                self.spill_v128(0, c);
+                self.spill_v128(2, b);
+                self.spill_v128(4, a);
+                self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                let out = self.load_v128(0);
+                self.stack.push(out);
+            }
+            VecSig::Shift => {
+                let count = self.pop().ok_or("operand stack underflow")?;
+                let v = self.pop().ok_or("operand stack underflow")?;
+                let wide = self.builder.ins().uextend(types::I64, count);
+                self.spill_u64(0, wide);
+                self.spill_v128(1, v);
+                self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                let out = self.load_v128(0);
+                self.stack.push(out);
+            }
+            VecSig::Splat(kind) => {
+                let scalar = self.pop().ok_or("operand stack underflow")?;
+                let wide = self.slot_from(lane_valtype(kind), scalar)?;
+                self.spill_u64(0, wide);
+                self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                let out = self.load_v128(0);
+                self.stack.push(out);
+            }
+            VecSig::ExtractS(kind) | VecSig::ExtractU(kind) | VecSig::Extract(kind) => {
+                let v = self.pop().ok_or("operand stack underflow")?;
+                self.spill_v128(0, v);
+                self.simd_helper_call(sub, lane.ok_or("missing extract lane")?)?;
+                let wide = self.read_scratch(types::I64);
+                let value = self.value_from_slot(lane_valtype(kind), wide)?;
+                self.stack.push(value);
+            }
+            VecSig::Replace(kind) => {
+                let scalar = self.pop().ok_or("operand stack underflow")?;
+                let v = self.pop().ok_or("operand stack underflow")?;
+                let wide = self.slot_from(lane_valtype(kind), scalar)?;
+                self.spill_u64(0, wide);
+                self.spill_v128(1, v);
+                self.simd_helper_call(sub, lane.ok_or("missing replace lane")?)?;
+                let out = self.load_v128(0);
+                self.stack.push(out);
+            }
+            VecSig::Test | VecSig::Bitmask => {
+                let v = self.pop().ok_or("operand stack underflow")?;
+                self.spill_v128(0, v);
+                self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                let wide = self.read_scratch(types::I64);
+                let value = self.value_from_slot(ValType::I32, wide)?;
+                self.stack.push(value);
+            }
+        }
+        Ok(())
+    }
+
     /// Lower one instruction. Dead paths skip code but still track the
     /// structured markers so `end`s reach the right frames.
     fn instruction(&mut self, instr: &Instr) -> Result<(), String> {
@@ -3807,6 +4010,9 @@ impl<'a> Lowerer<'a> {
                 let v = self.fconst(types::F64, *bits);
                 self.stack.push(v);
             }
+            Instr::V128Const(bits) => self.do_v128_const(*bits)?,
+            Instr::Vec(sub) => self.do_simd_op(*sub, None)?,
+            Instr::VecLane { op, lane } => self.do_simd_op(*op, Some(*lane))?,
             Instr::LocalGet(index) => {
                 let variable = self.variables[*index as usize];
                 let value = self.builder.use_var(variable);
@@ -4014,32 +4220,57 @@ fn lower(
         })
         .collect::<Vec<_>>();
 
-    // Locals: params come from the args buffer; declared locals default 0.
+    // Locals: params come from the args buffer (one u64 word per numeric/ref
+    // value, two per v128); declared locals default 0.
     let mut value_types: Vec<ValType> = func_type.params.clone();
     value_types.extend(body.locals.iter().copied());
+    // The args-buffer word offset of each parameter (v128 occupies two).
+    let mut param_words = Vec::with_capacity(func_type.params.len());
+    {
+        let mut words = 0usize;
+        for ty in &func_type.params {
+            param_words.push(words);
+            words += slot_words(*ty);
+        }
+    }
     let mut variables = Vec::with_capacity(value_types.len());
     for (index, ty) in value_types.iter().enumerate() {
         let variable =
             builder.declare_var(carrier_type(module, *ty).expect("checked by lowerable"));
         let value = if index < func_type.params.len() {
-            // Load the i-th param (an I64 slot) and narrow/narrow-convert it
-            // to the parameter's value type.
-            let address = builder.ins().iadd_imm_s(args_ptr, 8 * index as i64);
-            let wide =
-                builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), address, Offset32::new(0));
+            let address = builder
+                .ins()
+                .iadd_imm_s(args_ptr, 8 * param_words[index] as i64);
             match ty {
-                ValType::I32 => builder.ins().ireduce(types::I32, wide),
-                ValType::I64 => wide,
-                ValType::F32 => {
-                    let bits = builder.ins().ireduce(types::I32, wide);
-                    builder.ins().bitcast(types::F32, MemFlagsData::new(), bits)
+                // A v128 param arrives as its raw 16-byte pattern.
+                ValType::V128 => {
+                    builder
+                        .ins()
+                        .load(types::I128, MemFlagsData::new(), address, Offset32::new(0))
                 }
-                ValType::F64 => builder.ins().bitcast(types::F64, MemFlagsData::new(), wide),
-                // A reference parameter arrives as its u64 token.
-                ValType::Ref(reference) if heap_is_carried(module, &reference.heap) => wide,
-                _ => return Err("unsupported parameter type".to_string()),
+                // Load the param word and narrow/convert it to its value type.
+                _ => {
+                    let wide = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        address,
+                        Offset32::new(0),
+                    );
+                    match ty {
+                        ValType::I32 => builder.ins().ireduce(types::I32, wide),
+                        ValType::I64 => wide,
+                        ValType::F32 => {
+                            let bits = builder.ins().ireduce(types::I32, wide);
+                            builder.ins().bitcast(types::F32, MemFlagsData::new(), bits)
+                        }
+                        ValType::F64 => {
+                            builder.ins().bitcast(types::F64, MemFlagsData::new(), wide)
+                        }
+                        // A reference parameter arrives as its u64 token.
+                        ValType::Ref(reference) if heap_is_carried(module, &reference.heap) => wide,
+                        _ => return Err("unsupported parameter type".to_string()),
+                    }
+                }
             }
         } else {
             match ty {
@@ -4047,6 +4278,11 @@ fn lower(
                 ValType::I64 => builder.ins().iconst(types::I64, 0),
                 ValType::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
                 ValType::F64 => builder.ins().f64const(Ieee64::with_bits(0)),
+                // A v128 local defaults to the all-zero vector.
+                ValType::V128 => {
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    builder.ins().iconcat(zero, zero)
+                }
                 // A reference local defaults to the null token.
                 ValType::Ref(reference) if heap_is_carried(module, &reference.heap) => {
                     builder.ins().iconst(types::I64, 0)
@@ -8418,5 +8654,87 @@ mod tests {
         assert_eq!(outcomes[1], Ok(vec![Value::I32(1)]));
         assert_eq!(outcomes[2], Ok(vec![Value::I32(1)]));
         assert_eq!(outcomes[3], Ok(vec![Value::I32(0)]));
+    }
+
+    #[test]
+    fn v128_register_ops_match_the_interpreter() {
+        // v128 rides the compiled value model as a raw I128; params/results
+        // cross the boundary as two u64 words, and the pure-register ops run
+        // through the runtime simd helper (mode 70) which reproduces
+        // `simd_exec` exactly.
+        let v128 = ValType::V128;
+        let module = Module {
+            types: vec![
+                // 0: v128 v128 -> v128 (i32x4.add, v128.and).
+                SubType::func(vec![v128, v128], vec![v128]),
+                // 1: -> v128 (v128.const).
+                SubType::func(vec![], vec![v128]),
+                // 2: v128 -> i32 (extract_lane, any_true).
+                SubType::func(vec![v128], vec![ValType::I32]),
+                // 3: i32 -> v128 (i8x16.splat).
+                SubType::func(vec![ValType::I32], vec![v128]),
+                // 4: v128 -> v128 (identity).
+                SubType::func(vec![v128], vec![v128]),
+            ],
+            functions: vec![0, 1, 2, 3, 2, 0, 4, 0],
+            bodies: vec![
+                // 0: i32x4.add (0xae).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0xae)],
+                },
+                // 1: v128.const with a lane-spanning pattern.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::V128Const(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210)],
+                },
+                // 2: i32x4.extract_lane 0 (0x1b).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::VecLane { op: 0x1b, lane: 0 }],
+                },
+                // 3: i8x16.splat (0x0f).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Vec(0x0f)],
+                },
+                // 4: v128.any_true (0x53).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Vec(0x53)],
+                },
+                // 5: v128.and (0x4e).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0x4e)],
+                },
+                // 6: identity: pass a v128 param straight through.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0)],
+                },
+                // 7: i32x4.sub (0xb1) — non-commutative, so an operand
+                // swap would diverge.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0xb1)],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "v128 module did not compile"
+        );
+        let a = 0x0001_0002_0003_0004_0005_0006_0007_0008u128;
+        let b = 0x0100_0200_0300_0400_0500_0600_0700_0800u128;
+        assert_equiv(&module, 0, &[vec![Value::V128(a), Value::V128(b)]]);
+        assert_equiv(&module, 1, &[vec![]]);
+        assert_equiv(&module, 2, &[vec![Value::V128(a)]]);
+        assert_equiv(&module, 3, &[vec![Value::I32(-7)]]);
+        assert_equiv(&module, 4, &[vec![Value::V128(0)], vec![Value::V128(a)]]);
+        assert_equiv(&module, 5, &[vec![Value::V128(a), Value::V128(b)]]);
+        assert_equiv(&module, 6, &[vec![Value::V128(a)]]);
+        assert_equiv(&module, 7, &[vec![Value::V128(a), Value::V128(b)]]);
     }
 }
