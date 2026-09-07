@@ -2058,3 +2058,21 @@ green over `table_get`, `table_set`, `table`, `ref_func`, and `call_ref`
 41 compile tests, 77 total with the feature, clippy clean in both
 configurations. GC heap types (i31/struct/array/exn and their tables)
 and the GC object instructions remain interpreted.
+
+Bulk-memory instructions lower: `memory.copy` (mode 5), `memory.fill`
+(mode 6), `memory.init` (mode 7), and `data.drop` (mode 8) run through
+the runtime helper with their operands spilled to the caller-owned
+scratch region (addresses/offsets/length as u64 slots, each sized by the
+memory's index type). The helper mirrors the interpreter exactly:
+same-cell copies move through a temporary (`Vec::copy_within`, so
+overlapping regions behave like memmove), cross-cell copies snapshot
+the source first, `memory.init` reads the instance's data segment (a
+dropped segment is empty, so any later init of nonzero length traps
+`OutOfBoundsMemoryAccess`), and `memory.fill` truncates the byte value.
+All memory widths lower (`memory.copy`'s length is i64 only when both
+memories are memory64, per the interpreter). Unit coverage drives a
+passive data segment through init, an overlapping same-memory copy, a
+fill, and a drop-then-init trap sequence. `wasmtest equiv` is green over
+the `bulk-memory` dir (8 suites, 0 diverged) and the whole core corpus
+stays at 254 suites / 0 diverged. 42 compile tests, 78 total with the
+feature, clippy clean in both configurations.

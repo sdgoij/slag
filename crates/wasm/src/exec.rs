@@ -482,9 +482,13 @@ pub unsafe extern "C" fn wasm_call_helper(
 ) -> i32 {
     let code_of = crate::compile::code_of_trap;
     let store = unsafe { &mut *store };
-    // Table reads/writes (modes 3/4) resolve the cell and element directly.
-    if mode == 3 || mode == 4 {
-        return table_op(store, instance, mode, x, y, z, scratch);
+    // Table reads/writes (modes 3/4) and the bulk-memory ops (modes 5-8)
+    // resolve cells/segments directly.
+    if (3..=8).contains(&mode) {
+        if mode == 3 || mode == 4 {
+            return table_op(store, instance, mode, x, y, z, scratch);
+        }
+        return bulk_op(store, instance, mode, x, y, scratch);
     }
     // Resolve the target and the declared type with immutable reads only,
     // dropping every borrow before the store is mutated below.
@@ -812,6 +816,110 @@ fn table_op(
         };
         store.tables[cell].elements[y as usize] = reference;
         crate::compile::TRAP_NONE
+    }
+}
+
+/// A compiled bulk-memory op (runtime helper modes 5-8). The operand slots
+/// (addresses/offsets/length, each a u64) ride `scratch[0..3]`:
+/// `memory.copy` (5, `x`=dst memory, `y`=src memory), `memory.fill` (6,
+/// `x`=memory, value in slot 1), `memory.init` (7, `x`=data index, `y`=
+/// memory), `data.drop` (8, `x`=data index). Bounds failures are
+/// `OutOfBoundsMemoryAccess`, mirroring the interpreter exactly (overlapping
+/// copies move through a temporary; a dropped data segment is empty).
+#[cfg(feature = "compile")]
+fn bulk_op(store: &mut Store, instance: u64, mode: u64, x: u64, y: u64, scratch: *mut u64) -> i32 {
+    let code_of = crate::compile::code_of_trap;
+    let Some(inst) = store.instances.get(instance as usize) else {
+        return code_of(Trap::UnknownFunction);
+    };
+    let slot = |i: usize| unsafe { *scratch.add(i) };
+    match mode {
+        5 => {
+            // memory.copy: dst address, src address, length.
+            let Some(&dst_cell) = inst.memories.get(x as usize) else {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            };
+            let Some(&src_cell) = inst.memories.get(y as usize) else {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            };
+            let (dst, src, len) = (slot(0), slot(1), slot(2));
+            let Some(dst_size) = store.memories.get(dst_cell).map(|m| m.bytes.len() as u64) else {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            };
+            let Some(src_size) = store.memories.get(src_cell).map(|m| m.bytes.len() as u64) else {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            };
+            if dst.checked_add(len).is_none_or(|end| end > dst_size)
+                || src.checked_add(len).is_none_or(|end| end > src_size)
+            {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            }
+            let (dst, src, len) = (dst as usize, src as usize, len as usize);
+            if dst_cell == src_cell {
+                let bytes = &mut store.memories[dst_cell].bytes;
+                bytes.copy_within(src..src + len, dst);
+            } else {
+                let source = store.memories[src_cell].bytes[src..src + len].to_vec();
+                store.memories[dst_cell].bytes[dst..dst + len].copy_from_slice(&source);
+            }
+            crate::compile::TRAP_NONE
+        }
+        6 => {
+            // memory.fill: dst address, byte value, length.
+            let Some(&cell) = inst.memories.get(x as usize) else {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            };
+            let Some(memory) = store.memories.get_mut(cell) else {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            };
+            let (dst, len) = (slot(0) as usize, slot(2) as usize);
+            if dst
+                .checked_add(len)
+                .is_none_or(|end| end > memory.bytes.len())
+            {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            }
+            memory.bytes[dst..dst + len].fill(slot(1) as u8);
+            crate::compile::TRAP_NONE
+        }
+        7 => {
+            // memory.init: dst address, data offset, length.
+            let Some(&cell) = inst.memories.get(y as usize) else {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            };
+            let Some(memory) = store.memories.get(cell) else {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            };
+            let dst = slot(0) as usize;
+            let src = slot(1) as usize;
+            let len = slot(2) as usize;
+            let segment = inst
+                .data_segments
+                .get(x as usize)
+                .and_then(Option::as_deref)
+                .unwrap_or(&[]);
+            if dst
+                .checked_add(len)
+                .is_none_or(|end| end > memory.bytes.len())
+                || src.checked_add(len).is_none_or(|end| end > segment.len())
+            {
+                return code_of(Trap::OutOfBoundsMemoryAccess);
+            }
+            let bytes = &mut store.memories[cell].bytes;
+            bytes[dst..dst + len].copy_from_slice(&segment[src..src + len]);
+            crate::compile::TRAP_NONE
+        }
+        _ => {
+            // data.drop: the segment becomes empty (a later init reads none).
+            let Some(segment) = store.instances[instance as usize]
+                .data_segments
+                .get_mut(x as usize)
+            else {
+                return code_of(Trap::UnknownFunction);
+            };
+            *segment = None;
+            crate::compile::TRAP_NONE
+        }
     }
 }
 

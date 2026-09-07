@@ -801,6 +801,13 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         Instr::MemorySize(memory) | Instr::MemoryGrow(memory) => {
             memory_is64(module, *memory).is_some()
         }
+        Instr::MemoryCopy { dst, src } => {
+            memory_is64(module, *dst).is_some() && memory_is64(module, *src).is_some()
+        }
+        Instr::MemoryFill(memory) | Instr::MemoryInit { memory, .. } => {
+            memory_is64(module, *memory).is_some()
+        }
+        Instr::DataDrop(_) => true,
         Instr::GlobalGet(index) => {
             matches!(defined_global(module, *index), Some((ty, _)) if num_type(ty).is_some())
         }
@@ -2402,6 +2409,142 @@ impl<'a> Lowerer<'a> {
         self.runtime_call(&args)
     }
 
+    /// Store a u64 call-slot value into the caller-owned scratch region.
+    fn spill_u64(&mut self, slot: usize, value: ClifValue) {
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * slot as i64);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), value, address, Offset32::new(0));
+    }
+
+    /// Pop a memory instruction's address operand (i32 for a memory32,
+    /// zero-extended; i64 for a memory64) as a u64 slot.
+    fn pop_addr(&mut self, memory: u32) -> Result<ClifValue, String> {
+        let value = self.pop().ok_or("operand stack underflow")?;
+        if memory_is64(self.module, memory).ok_or("unresolved memory index")? {
+            Ok(value)
+        } else {
+            Ok(self.builder.ins().uextend(types::I64, value))
+        }
+    }
+
+    /// A `memory.copy`: pop (dst, src, len), spill them to scratch, and run
+    /// the runtime bulk-memory helper (mode 5).
+    fn do_memory_copy(&mut self, dst: u32, src: u32) -> Result<(), String> {
+        let dst64 = memory_is64(self.module, dst).ok_or("unresolved memory index")?;
+        let src64 = memory_is64(self.module, src).ok_or("unresolved memory index")?;
+        // The length is i64 only when both memories are memory64; the src and
+        // dst addresses follow their own memories.
+        let len = if dst64 && src64 {
+            self.pop().ok_or("operand stack underflow")?
+        } else {
+            let value = self.pop().ok_or("operand stack underflow")?;
+            self.builder.ins().uextend(types::I64, value)
+        };
+        let src_a = self.pop_addr(src)?;
+        let dst_a = self.pop_addr(dst)?;
+        self.spill_u64(0, dst_a);
+        self.spill_u64(1, src_a);
+        self.spill_u64(2, len);
+        let mode = self.iconst(types::I64, 5);
+        let dst_v = self.iconst(types::I64, i64::from(dst));
+        let src_v = self.iconst(types::I64, i64::from(src));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            dst_v,
+            src_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// A `memory.fill`: pop (dst, value, len), spill them to scratch, and run
+    /// the runtime bulk-memory helper (mode 6).
+    fn do_memory_fill(&mut self, memory: u32) -> Result<(), String> {
+        let memory64 = memory_is64(self.module, memory).ok_or("unresolved memory index")?;
+        let len = if memory64 {
+            self.pop().ok_or("operand stack underflow")?
+        } else {
+            let value = self.pop().ok_or("operand stack underflow")?;
+            self.builder.ins().uextend(types::I64, value)
+        };
+        let byte = self.pop().ok_or("operand stack underflow")?;
+        let byte64 = self.builder.ins().uextend(types::I64, byte);
+        let dst = self.pop_addr(memory)?;
+        self.spill_u64(0, dst);
+        self.spill_u64(1, byte64);
+        self.spill_u64(2, len);
+        let mode = self.iconst(types::I64, 6);
+        let mem_v = self.iconst(types::I64, i64::from(memory));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            mem_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// A `memory.init`: pop (dst, data offset, len), spill them to scratch,
+    /// and run the runtime bulk-memory helper (mode 7).
+    fn do_memory_init(&mut self, data_index: u32, memory: u32) -> Result<(), String> {
+        let len_value = self.pop().ok_or("operand stack underflow")?;
+        let len = self.builder.ins().uextend(types::I64, len_value);
+        let src_value = self.pop().ok_or("operand stack underflow")?;
+        let src = self.builder.ins().uextend(types::I64, src_value);
+        let dst = self.pop_addr(memory)?;
+        self.spill_u64(0, dst);
+        self.spill_u64(1, src);
+        self.spill_u64(2, len);
+        let mode = self.iconst(types::I64, 7);
+        let data_v = self.iconst(types::I64, i64::from(data_index));
+        let mem_v = self.iconst(types::I64, i64::from(memory));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            data_v,
+            mem_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// A `data.drop`: run the runtime bulk-memory helper (mode 8).
+    fn do_data_drop(&mut self, data_index: u32) -> Result<(), String> {
+        let mode = self.iconst(types::I64, 8);
+        let data_v = self.iconst(types::I64, i64::from(data_index));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            data_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
     /// A `ref.as_non_null`: trap on the null token (0), else keep it.
     fn do_ref_as_non_null(&mut self) -> Result<(), String> {
         let reference = self.pop().ok_or("operand stack underflow")?;
@@ -2561,6 +2704,12 @@ impl<'a> Lowerer<'a> {
             } => self.do_store(*memory, *op, *offset)?,
             Instr::MemorySize(memory) => self.do_memory_size(*memory)?,
             Instr::MemoryGrow(memory) => self.do_memory_grow(*memory)?,
+            Instr::MemoryCopy { dst, src } => self.do_memory_copy(*dst, *src)?,
+            Instr::MemoryFill(memory) => self.do_memory_fill(*memory)?,
+            Instr::MemoryInit { data_index, memory } => {
+                self.do_memory_init(*data_index, *memory)?
+            }
+            Instr::DataDrop(data_index) => self.do_data_drop(*data_index)?,
             Instr::Block(bt) => {
                 let (params, results) =
                     block_sig(self.module, bt).ok_or("unsupported block type")?;
@@ -2758,7 +2907,7 @@ impl ExecutableCode {
 mod tests {
     use super::*;
     use crate::exec::Store;
-    use crate::instr::StoreOp;
+    use crate::instr::{LoadOp, StoreOp};
     use crate::module::{FuncBody, Global, Module, Table};
     use crate::types::{
         BlockType, GlobalType, HeapType, Limits, MemType, RefType, SubType, TableType,
@@ -5329,5 +5478,112 @@ mod tests {
             vec![Value::Ref(RefValue::Null)],
         ];
         assert_equiv(&module, 0, &cases);
+    }
+
+    #[test]
+    fn bulk_memory_ops_match_the_interpreter() {
+        use crate::module::DataMode;
+        // A passive data segment drives memory.init; then memory.copy (an
+        // overlapping same-memory move), memory.fill, and data.drop (after
+        // which a further init sees an empty segment and traps).
+        let module = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32, ValType::I32, ValType::I32], vec![]),
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                SubType::func(vec![], vec![]),
+            ],
+            functions: vec![0, 0, 0, 1, 2],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::MemoryInit {
+                            data_index: 0,
+                            memory: 0,
+                        },
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::MemoryCopy { dst: 0, src: 0 },
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::MemoryFill(0),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::Load {
+                            memory: 0,
+                            op: LoadOp::I32Load8U,
+                            align: 0,
+                            offset: 0,
+                        },
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::DataDrop(0)],
+                },
+            ],
+            memories: vec![MemType {
+                limits: Limits {
+                    min: 1,
+                    max: None,
+                    shared: false,
+                },
+                memory64: false,
+            }],
+            data: vec![crate::module::DataSegment {
+                mode: DataMode::Passive,
+                bytes: b"abcdefghij".to_vec(),
+            }],
+            ..Module::default()
+        };
+        let outcomes = run_seq(
+            &module,
+            &[
+                // init "abcdef" at address 8.
+                (0, vec![Value::I32(8), Value::I32(0), Value::I32(6)]),
+                (3, vec![Value::I32(8)]),
+                // copy [8, 14) over [0, 6) (same memory, overlapping move).
+                (1, vec![Value::I32(0), Value::I32(8), Value::I32(6)]),
+                (3, vec![Value::I32(0)]),
+                // fill the first two bytes with 0xFF.
+                (2, vec![Value::I32(0), Value::I32(0xff), Value::I32(2)]),
+                (3, vec![Value::I32(0)]),
+                (3, vec![Value::I32(2)]),
+                // drop the segment; a later init of any length now traps.
+                (4, vec![]),
+                (0, vec![Value::I32(0), Value::I32(0), Value::I32(1)]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(i32::from(b'a'))]));
+        assert_eq!(outcomes[2], Ok(vec![]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(i32::from(b'a'))]));
+        assert_eq!(outcomes[4], Ok(vec![]));
+        assert_eq!(outcomes[5], Ok(vec![Value::I32(0xff)]));
+        assert_eq!(outcomes[6], Ok(vec![Value::I32(i32::from(b'c'))]));
+        assert_eq!(outcomes[7], Ok(vec![]));
+        assert!(matches!(
+            outcomes[8],
+            Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))
+        ));
     }
 }
