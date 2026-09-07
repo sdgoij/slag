@@ -2157,3 +2157,28 @@ and traps on a null, plus a `ref.null exn`/`ref.is_null` round-trip.
 `wasmtest equiv` is green over the whole core corpus: 254 suites, 0
 diverged. 49 compile tests, 85 total with the feature, clippy clean in
 both configurations.
+
+GC struct and array objects ride the compiled token model (the `any`-
+pool-id region: bit 59 with a struct/array kind and the object's
+store-pool id), and the core aggregate instructions lower through a new
+runtime GC helper (modes 30-38) that mirrors the interpreter exactly:
+`struct.new`/`struct.new_default`, `struct.get`/`_s`/`_u`/`struct.set`
+(with packed i8/i16 cells wrapped on write and sign-/zero-extended on
+read), `array.new`/`array.new_default`, `array.get`/`_s`/`_u`,
+`array.set`, and `array.len` — a null struct/array operand traps its
+null-reference trap, an index past the end traps the array out-of-
+bounds access, and oversized array allocations report the same trap the
+interpreter's allocation guard does. The carrier gate now admits
+type-indexed heaps that resolve to struct/array types plus the abstract
+`any`/`eq`/`struct`/`array` heaps (the values they can hold — i31 or
+pool-id objects — are all carried), so `(ref $t)` object refs flow
+through params/locals/results/block types and `ref.eq` compares object
+identity by token. The non-object GC surface (`array.new_fixed/data/
+elem`, `array.fill/copy/init*`, `ref.test`/`ref.cast`/`br_on_cast*`,
+`any.convert_extern`/`extern.convert_any`) stays interpreted for now.
+Unit coverage drives struct default/filled construction, a packed i8
+set with `get_s`/`get_u` round-trips, a null-struct get trap, and array
+new/default/len/set/get with an out-of-bounds get trap, through both
+paths. `wasmtest equiv` is green over the whole core corpus: 254
+suites, 0 diverged. 51 compile tests, 87 total with the feature,
+clippy clean in both configurations.

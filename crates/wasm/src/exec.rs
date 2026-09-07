@@ -496,6 +496,11 @@ pub unsafe extern "C" fn wasm_call_helper(
         }
         return rethrow_op(store, x);
     }
+    // Compiled GC aggregate ops (modes 30-38) mirror the interpreter's
+    // struct/array semantics against the store's object pool.
+    if (30..=38).contains(&mode) {
+        return gc_op(store, instance, mode, x, y, z, nargs, scratch);
+    }
     // Table reads/writes (modes 3/4), the bulk-memory ops (modes 5-8), and
     // the table bulk ops (modes 9-14) resolve cells/segments directly.
     if (3..=14).contains(&mode) {
@@ -1188,6 +1193,356 @@ fn throw_op(store: &mut Store, instance: u64, x: u64, nargs: u64, scratch: *mut 
 fn rethrow_op(store: &mut Store, x: u64) -> i32 {
     store.set_pending_error(ExecFail::Exception(x as usize));
     crate::compile::TRAP_PENDING_ERROR
+}
+
+/// A compiled GC aggregate op (runtime helper modes 30-38), mirroring the
+/// interpreter's struct/array semantics exactly. Operands ride the caller-
+/// owned scratch as u64 slots (reference values as tokens); a single result
+/// value is written back to `scratch[0]`. Modes: `30` = `struct.new` (ty=`x`,
+/// field values at `scratch[0..nargs)`), `31` = `struct.new_default` (ty=`x`),
+/// `32` = `struct.get`/`_s`/`_u` (field=`x`, read mode=`y`, object token at
+/// `scratch[0]`, result to `scratch[0]`), `33` = `struct.set` (field=`x`,
+/// object at `scratch[0]`, value at `scratch[1]`), `34` = `array.new` (ty=`x`,
+/// value at `scratch[0]`, length at `scratch[1]`), `35` = `array.new_default`
+/// (ty=`x`, length at `scratch[0]`), `36` = `array.get`/`_s`/`_u` (read mode=
+/// `y`, object at `scratch[0]`, index at `scratch[1]`), `37` = `array.set`
+/// (object at `scratch[0]`, index at `scratch[1]`, value at `scratch[2]`),
+/// `38` = `array.len` (object at `scratch[0]`, length to `scratch[0]`).
+/// Newly allocated struct/array tokens land in `scratch[0]`.
+#[cfg(feature = "compile")]
+#[allow(clippy::too_many_arguments)]
+fn gc_op(
+    store: &mut Store,
+    instance: u64,
+    mode: u64,
+    x: u64,
+    y: u64,
+    _z: u64,
+    nargs: u64,
+    scratch: *mut u64,
+) -> i32 {
+    let code_of = crate::compile::code_of_trap;
+    let slot = |i: usize| unsafe { *scratch.add(i) };
+    let write = |i: usize, value: u64| unsafe { *scratch.add(i) = value };
+    let instance = instance as usize;
+    match mode {
+        30 | 31 => {
+            // struct.new / struct.new_default.
+            let Some(storages) = gc_type_struct_fields(store, instance, x as u32) else {
+                return code_of(Trap::UnknownFunction);
+            };
+            if mode == 30 && storages.len() as u64 != nargs {
+                return gc_unsupported(store, "compiled struct.new arity");
+            }
+            let mut cells = Vec::with_capacity(storages.len());
+            for (i, storage) in storages.into_iter().enumerate() {
+                let cell = if mode == 31 {
+                    match default_storage(storage) {
+                        Ok(value) => value,
+                        Err(_) => return gc_unsupported(store, "non-defaultable struct field"),
+                    }
+                } else {
+                    let Some(value) = storage_from_slot(storage, slot(i)) else {
+                        return gc_unsupported(store, "unsupported struct.new field");
+                    };
+                    match wrap_cell(storage, value) {
+                        Ok(value) => value,
+                        Err(_) => return gc_unsupported(store, "packed struct field write"),
+                    }
+                };
+                cells.push(cell);
+            }
+            let id = alloc_struct(store, instance, x as u32, cells);
+            match crate::values::struct_ref_token(id) {
+                Some(token) => {
+                    write(0, token);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "struct pool id overflow"),
+            }
+        }
+        32 => {
+            // struct.get[_s|_u]: field `x`, read mode from `y`.
+            let Some(id) = struct_object_of(slot(0)) else {
+                return gc_object_error(store, code_of, slot(0), Trap::NullStructReference);
+            };
+            let out = match gc_read_struct(store, id, x as usize, y) {
+                Ok(out) => out,
+                Err(fail) => return fail,
+            };
+            match value_to_call_slot(out) {
+                Some(bits) => {
+                    write(0, bits);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "unsupported struct.get result"),
+            }
+        }
+        33 => {
+            // struct.set: field `x`, object at slot 0, value at slot 1.
+            let Some(id) = struct_object_of(slot(0)) else {
+                return gc_object_error(store, code_of, slot(0), Trap::NullStructReference);
+            };
+            let Some(fields) = gc_object_struct_fields(store, id) else {
+                return gc_unsupported(store, "struct object layout");
+            };
+            let Some(&storage) = fields.get(x as usize) else {
+                return gc_unsupported(store, "struct field out of range");
+            };
+            let Some(value) = storage_from_slot(storage, slot(1)) else {
+                return gc_unsupported(store, "unsupported struct.set value");
+            };
+            let cell = match wrap_cell(storage, value) {
+                Ok(cell) => cell,
+                Err(_) => return gc_unsupported(store, "packed struct field write"),
+            };
+            match &mut store.objects[id].data {
+                GcData::Struct(cells) => {
+                    cells[x as usize] = cell;
+                    crate::compile::TRAP_NONE
+                }
+                _ => gc_unsupported(store, "struct.set of non-struct"),
+            }
+        }
+        34 | 35 => {
+            // array.new / array.new_default: ty=`x`, value+length or length.
+            let Some(storage) = gc_type_array_storage(store, instance, x as u32) else {
+                return code_of(Trap::UnknownFunction);
+            };
+            let len_slot = if mode == 34 { slot(1) } else { slot(0) };
+            let cell = if mode == 34 {
+                let Some(value) = storage_from_slot(storage, slot(0)) else {
+                    return gc_unsupported(store, "unsupported array.new value");
+                };
+                match wrap_cell(storage, value) {
+                    Ok(cell) => cell,
+                    Err(_) => return gc_unsupported(store, "packed array element write"),
+                }
+            } else {
+                match default_storage(storage) {
+                    Ok(value) => value,
+                    Err(_) => return gc_unsupported(store, "non-defaultable array element"),
+                }
+            };
+            let len = len_slot as u32 as i32;
+            match alloc_array_filled(store, instance, x as u32, len, cell) {
+                Ok(id) => match crate::values::array_ref_token(id) {
+                    Some(token) => {
+                        write(0, token);
+                        crate::compile::TRAP_NONE
+                    }
+                    None => gc_unsupported(store, "array pool id overflow"),
+                },
+                Err(ExecFail::Trap(trap)) => code_of(trap),
+                Err(_) => gc_unsupported(store, "array allocation"),
+            }
+        }
+        36 => {
+            // array.get[_s|_u]: object at slot 0, index at slot 1.
+            let Some(id) = array_object_of(slot(0)) else {
+                return gc_object_error(store, code_of, slot(0), Trap::NullArrayReference);
+            };
+            let index = slot(1) as u32 as usize;
+            let out = match gc_read_array(store, id, index, y) {
+                Ok(out) => out,
+                Err(fail) => return fail,
+            };
+            match value_to_call_slot(out) {
+                Some(bits) => {
+                    write(0, bits);
+                    crate::compile::TRAP_NONE
+                }
+                None => gc_unsupported(store, "unsupported array.get result"),
+            }
+        }
+        37 => {
+            // array.set: object at slot 0, index at slot 1, value at slot 2.
+            let Some(id) = array_object_of(slot(0)) else {
+                return gc_object_error(store, code_of, slot(0), Trap::NullArrayReference);
+            };
+            let index = slot(1) as u32 as usize;
+            let Some(storage) = gc_array_storage(store, id).ok() else {
+                return gc_unsupported(store, "array object layout");
+            };
+            let Some(value) = storage_from_slot(storage, slot(2)) else {
+                return gc_unsupported(store, "unsupported array.set value");
+            };
+            let cell = match wrap_cell(storage, value) {
+                Ok(cell) => cell,
+                Err(_) => return gc_unsupported(store, "packed array element write"),
+            };
+            match &mut store.objects[id].data {
+                GcData::Array(cells) => {
+                    if index >= cells.len() {
+                        return code_of(Trap::OutOfBoundsArrayAccess);
+                    }
+                    cells[index] = cell;
+                    crate::compile::TRAP_NONE
+                }
+                _ => gc_unsupported(store, "array.set of non-array"),
+            }
+        }
+        _ => {
+            // array.len: object at slot 0 -> its length.
+            let Some(id) = array_object_of(slot(0)) else {
+                return gc_object_error(store, code_of, slot(0), Trap::NullArrayReference);
+            };
+            let len = match &store.objects[id].data {
+                GcData::Array(cells) => cells.len() as u64,
+                _ => return gc_unsupported(store, "array.len of non-array"),
+            };
+            write(0, len);
+            crate::compile::TRAP_NONE
+        }
+    }
+}
+
+/// The struct/array field storage types declared at type index `ty` of
+/// `instance`'s module.
+#[cfg(feature = "compile")]
+fn gc_type_struct_fields(store: &Store, instance: usize, ty: u32) -> Option<Vec<StorageType>> {
+    let module = &store.instances.get(instance)?.module;
+    struct_field_types(module, ty).map(|fields| fields.iter().map(|field| field.ty).collect())
+}
+
+/// The array element storage declared at type index `ty` of `instance`'s
+/// module.
+#[cfg(feature = "compile")]
+fn gc_type_array_storage(store: &Store, instance: usize, ty: u32) -> Option<StorageType> {
+    let module = &store.instances.get(instance)?.module;
+    array_element_type(module, ty).map(|field| field.ty)
+}
+
+/// The storage types of an existing struct object (from its own type).
+#[cfg(feature = "compile")]
+fn gc_object_struct_fields(store: &Store, object: usize) -> Option<Vec<StorageType>> {
+    let gc_object = &store.objects.get(object)?;
+    let module = &store.instances.get(gc_object.owner)?.module;
+    struct_field_types(module, gc_object.ty)
+        .map(|fields| fields.iter().map(|field| field.ty).collect())
+}
+
+/// The store-pool id when `token` is a struct object token, else `None`.
+#[cfg(feature = "compile")]
+fn struct_object_of(token: u64) -> Option<usize> {
+    match crate::values::token_to_ref(token) {
+        Some(Value::Ref(RefValue::Struct(id))) => Some(id),
+        _ => None,
+    }
+}
+
+/// The store-pool id when `token` is an array object token, else `None`.
+#[cfg(feature = "compile")]
+fn array_object_of(token: u64) -> Option<usize> {
+    match crate::values::token_to_ref(token) {
+        Some(Value::Ref(RefValue::Array(id))) => Some(id),
+        _ => None,
+    }
+}
+
+/// A `struct.get[_s|_u]` read of field `field` (read mode `read`) of the
+/// struct object `id`. `Ok` carries the read value; a non-trap failure is
+/// parked on the store and reported as the pending-error sentinel.
+#[cfg(feature = "compile")]
+fn gc_read_struct(store: &mut Store, id: usize, field: usize, read: u64) -> Result<Value, i32> {
+    let storage = match gc_object_struct_fields(store, id) {
+        Some(storage) => storage,
+        None => return Err(gc_unsupported(store, "struct object layout")),
+    };
+    let Some(st) = storage.get(field).copied() else {
+        return Err(gc_unsupported(store, "struct field out of range"));
+    };
+    let Some(&cell) = (match &store.objects[id].data {
+        GcData::Struct(cells) => cells.get(field),
+        _ => None,
+    }) else {
+        return Err(gc_unsupported(store, "struct.get of non-struct"));
+    };
+    let mode = match read {
+        1 => GcRead::Signed,
+        2 => GcRead::Unsigned,
+        _ => GcRead::Plain,
+    };
+    match mode {
+        GcRead::Plain => Ok(cell),
+        GcRead::Signed => extend_cell(st, cell, true)
+            .map_err(|_| gc_unsupported(store, "packed signed struct read")),
+        GcRead::Unsigned => extend_cell(st, cell, false)
+            .map_err(|_| gc_unsupported(store, "packed unsigned struct read")),
+    }
+}
+
+/// An `array.get[_s|_u]` read of element `index` (read mode `read`) of the
+/// array object `id`. `Ok` carries the read value; an index past the end is
+/// the out-of-bounds-array trap and other failures are parked.
+#[cfg(feature = "compile")]
+fn gc_read_array(store: &mut Store, id: usize, index: usize, read: u64) -> Result<Value, i32> {
+    let code_of = crate::compile::code_of_trap;
+    let st = match gc_array_storage(store, id) {
+        Ok(st) => st,
+        Err(_) => return Err(gc_unsupported(store, "array object layout")),
+    };
+    let Some(&cell) = (match &store.objects[id].data {
+        GcData::Array(cells) => cells.get(index),
+        _ => None,
+    }) else {
+        return match &store.objects[id].data {
+            GcData::Array(_) => Err(code_of(Trap::OutOfBoundsArrayAccess)),
+            _ => Err(gc_unsupported(store, "array.get of non-array")),
+        };
+    };
+    let mode = match read {
+        1 => GcRead::Signed,
+        2 => GcRead::Unsigned,
+        _ => GcRead::Plain,
+    };
+    match mode {
+        GcRead::Plain => Ok(cell),
+        GcRead::Signed => extend_cell(st, cell, true)
+            .map_err(|_| gc_unsupported(store, "packed signed array read")),
+        GcRead::Unsigned => extend_cell(st, cell, false)
+            .map_err(|_| gc_unsupported(store, "packed unsigned array read")),
+    }
+}
+
+/// An object read/write hit an object that is not the expected struct/array
+/// kind: a null operand is its null-reference trap; anything else is an
+/// unsupported (parked) error.
+#[cfg(feature = "compile")]
+fn gc_object_error(
+    store: &mut Store,
+    code_of: fn(Trap) -> i32,
+    token: u64,
+    null_trap: Trap,
+) -> i32 {
+    match crate::values::token_to_ref(token) {
+        Some(Value::Ref(RefValue::Null)) => code_of(null_trap),
+        _ => gc_unsupported(store, "non-object GC operand"),
+    }
+}
+
+/// Park a non-trap error for the compiled entry to drain and return the
+/// pending-error sentinel.
+#[cfg(feature = "compile")]
+fn gc_unsupported(store: &mut Store, what: &'static str) -> i32 {
+    store.set_pending_error(ExecFail::Unsupported(what));
+    crate::compile::TRAP_PENDING_ERROR
+}
+
+/// Decode a value of `storage` from its u64 scratch slot (a reference decodes
+/// its token). V128 storage has no slot representation in the compiled subset.
+#[cfg(feature = "compile")]
+fn storage_from_slot(storage: StorageType, value: u64) -> Option<Value> {
+    match storage {
+        StorageType::I8 | StorageType::I16 | StorageType::I32 => {
+            Some(Value::I32(value as u32 as i32))
+        }
+        StorageType::I64 => Some(Value::I64(value as i64)),
+        StorageType::F32 => Some(Value::F32(value as u32)),
+        StorageType::F64 => Some(Value::F64(value)),
+        StorageType::Ref(reference) => value_from_call_slot(ValType::Ref(reference), value),
+        StorageType::V128 => None,
+    }
 }
 
 /// Rewrite the caller-owned memory descriptors at `mems` (one data-pointer +

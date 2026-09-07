@@ -73,7 +73,9 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crate::exec::ExecFail;
 use crate::instr::{Instr, LoadOp, NumOp, StoreOp};
 use crate::module::{FuncBody, ImportDesc, Module};
-use crate::types::{BlockType, FuncType, HeapType, RefType, ValType};
+use crate::types::{
+    BlockType, CompositeType, FieldType, FuncType, HeapType, RefType, StorageType, ValType,
+};
 use crate::values::{QNAN32, QNAN64, Trap, Value, ref_to_token, token_to_ref};
 
 /// Trap code returned by a compiled entry; 0 means success.
@@ -528,7 +530,26 @@ fn heap_is_func(module: &Module, heap: &HeapType) -> bool {
 /// a function reference, or the abstract `extern` heap (an externref — its
 /// payload packs into the token). Exn/GC-heap references stay interpreted.
 fn heap_is_carried(module: &Module, heap: &HeapType) -> bool {
-    heap_is_func(module, heap) || matches!(heap, HeapType::Extern | HeapType::I31 | HeapType::Exn)
+    match heap {
+        HeapType::Func
+        | HeapType::Extern
+        | HeapType::I31
+        | HeapType::Exn
+        | HeapType::Any
+        | HeapType::Eq
+        | HeapType::Struct
+        | HeapType::Array => true,
+        HeapType::Type(index) => {
+            heap_is_func(module, heap)
+                || module.types.get(*index as usize).is_some_and(|sub| {
+                    matches!(
+                        sub.composite,
+                        CompositeType::Struct(_) | CompositeType::Array(_)
+                    )
+                })
+        }
+        _ => false,
+    }
 }
 
 /// The compiled carrier type of a value the lowering actually carries — a
@@ -671,6 +692,73 @@ fn throwable_tag(module: &Module, index: u32) -> bool {
                 .params
                 .iter()
                 .all(|param| carrier_type(module, *param).is_some())
+    })
+}
+
+/// The struct fields declared at module type index `ty`.
+fn struct_fields_of(module: &Module, ty: u32) -> Option<&[FieldType]> {
+    module
+        .types
+        .get(ty as usize)
+        .and_then(|sub| match &sub.composite {
+            CompositeType::Struct(fields) => Some(fields.as_slice()),
+            _ => None,
+        })
+}
+
+/// The array field declared at module type index `ty`.
+fn array_field_of(module: &Module, ty: u32) -> Option<&FieldType> {
+    module
+        .types
+        .get(ty as usize)
+        .and_then(|sub| match &sub.composite {
+            CompositeType::Array(field) => Some(field),
+            _ => None,
+        })
+}
+
+/// The value type a field/element of `storage` has on the wasm stack (packed
+/// cells are i32). V128 storage has no compiled representation yet.
+fn storage_val_type(storage: StorageType) -> Option<ValType> {
+    match storage {
+        StorageType::I8 | StorageType::I16 | StorageType::I32 => Some(ValType::I32),
+        StorageType::I64 => Some(ValType::I64),
+        StorageType::F32 => Some(ValType::F32),
+        StorageType::F64 => Some(ValType::F64),
+        StorageType::V128 => None,
+        StorageType::Ref(reference) => Some(ValType::Ref(reference)),
+    }
+}
+
+/// Whether a struct type index's field values can all ride the compiled value
+/// model and fit the scratch, and whether a single field's value can.
+fn struct_values_lowerable(module: &Module, ty: u32) -> bool {
+    struct_fields_of(module, ty).is_some_and(|fields| {
+        fields.len() <= SCRATCH_SLOTS
+            && fields.iter().all(|field| {
+                storage_val_type(field.ty)
+                    .is_some_and(|value_ty| carrier_type(module, value_ty).is_some())
+            })
+    })
+}
+
+/// Whether field `field` of struct type `ty` (or the sole array element of
+/// array type `ty`) has a value the compiled model carries.
+fn field_value_lowerable(module: &Module, ty: u32, field: usize) -> bool {
+    struct_fields_of(module, ty)
+        .and_then(|fields| fields.get(field))
+        .or_else(|| array_field_of(module, ty))
+        .is_some_and(|field| {
+            storage_val_type(field.ty)
+                .is_some_and(|value_ty| carrier_type(module, value_ty).is_some())
+        })
+}
+
+/// Whether array type `ty`'s element value (needed to construct/read it) is
+/// carried.
+fn array_value_lowerable(module: &Module, ty: u32) -> bool {
+    array_field_of(module, ty).is_some_and(|field| {
+        storage_val_type(field.ty).is_some_and(|value_ty| carrier_type(module, value_ty).is_some())
     })
 }
 
@@ -901,6 +989,19 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         | Instr::I31GetU
         | Instr::ThrowRef => true,
         Instr::BrOnNull(_) | Instr::BrOnNonNull(_) => true,
+        Instr::StructNew(ty) => struct_values_lowerable(module, *ty),
+        Instr::StructNewDefault(ty) => struct_fields_of(module, *ty).is_some(),
+        Instr::StructGet { ty, field }
+        | Instr::StructGetS { ty, field }
+        | Instr::StructGetU { ty, field } => field_value_lowerable(module, *ty, *field as usize),
+        Instr::StructSet { ty, field } => field_value_lowerable(module, *ty, *field as usize),
+        Instr::ArrayNew(ty) => array_value_lowerable(module, *ty),
+        Instr::ArrayNewDefault(ty) => array_field_of(module, *ty).is_some(),
+        Instr::ArrayGet(ty) | Instr::ArrayGetS(ty) | Instr::ArrayGetU(ty) => {
+            array_value_lowerable(module, *ty)
+        }
+        Instr::ArraySet(ty) => array_value_lowerable(module, *ty),
+        Instr::ArrayLen => true,
         _ => false,
     })
 }
@@ -2902,6 +3003,301 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Load a value of `value_ty` from the u64 at `scratch[0]` and push it
+    /// (a helper wrote the result scalar/token there).
+    fn push_scratch_value(&mut self, value_ty: ValType) -> Result<(), String> {
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 0);
+        let wide =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), address, Offset32::new(0));
+        let value = self.value_from_slot(value_ty, wide)?;
+        self.stack.push(value);
+        Ok(())
+    }
+
+    /// A `struct.new` of type `ty`: spill the field values (in field order)
+    /// to the scratch and run the GC helper (mode 30); the object's token
+    /// lands in `scratch[0]`.
+    fn do_struct_new(&mut self, ty: u32) -> Result<(), String> {
+        let fields = struct_fields_of(self.module, ty).ok_or("unresolved struct type")?;
+        for (i, field) in fields.iter().enumerate().rev() {
+            let value = self.pop().ok_or("operand stack underflow")?;
+            let value_ty = storage_val_type(field.ty).ok_or("unsupported struct field")?;
+            let wide = self.slot_from(value_ty, value)?;
+            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+        }
+        let mode = self.iconst(types::I64, 30);
+        let ty_v = self.iconst(types::I64, i64::from(ty));
+        let zero = self.iconst(types::I64, 0);
+        let nargs = self.iconst(types::I64, fields.len() as i64);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            ty_v,
+            zero,
+            zero,
+            nargs,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(ty),
+        }))
+    }
+
+    /// A `struct.new_default` of type `ty`: run the GC helper (mode 31) and
+    /// push the object's token.
+    fn do_struct_new_default(&mut self, ty: u32) -> Result<(), String> {
+        let mode = self.iconst(types::I64, 31);
+        let ty_v = self.iconst(types::I64, i64::from(ty));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            ty_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(ty),
+        }))
+    }
+
+    /// A `struct.get[_s|_u]` (read mode 0/1/2) of field `field` of the popped
+    /// struct token: run the GC helper (mode 32) and push the field value.
+    fn do_struct_get(&mut self, ty: u32, field: u32, read: i64) -> Result<(), String> {
+        let value_ty = storage_val_type(
+            struct_fields_of(self.module, ty)
+                .and_then(|fields| fields.get(field as usize))
+                .ok_or("unresolved struct field")?
+                .ty,
+        )
+        .ok_or("unsupported struct field type")?;
+        let object = self.pop().ok_or("operand stack underflow")?;
+        self.spill_u64(0, object);
+        let mode = self.iconst(types::I64, 32);
+        let field_v = self.iconst(types::I64, i64::from(field));
+        let read_v = self.iconst(types::I64, read);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            field_v,
+            read_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(value_ty)
+    }
+
+    /// A `struct.set` of field `field`: spill the struct token and the value
+    /// and run the GC helper (mode 33).
+    fn do_struct_set(&mut self, ty: u32, field: u32) -> Result<(), String> {
+        let value_ty = storage_val_type(
+            struct_fields_of(self.module, ty)
+                .and_then(|fields| fields.get(field as usize))
+                .ok_or("unresolved struct field")?
+                .ty,
+        )
+        .ok_or("unsupported struct field type")?;
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let object = self.pop().ok_or("operand stack underflow")?;
+        self.spill_u64(0, object);
+        let wide = self.slot_from(value_ty, value)?;
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 8);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+        let mode = self.iconst(types::I64, 33);
+        let field_v = self.iconst(types::I64, i64::from(field));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            field_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// An `array.new` of element type `ty`: spill the value and length and run
+    /// the GC helper (mode 34); the array's token lands in `scratch[0]`.
+    fn do_array_new(&mut self, ty: u32) -> Result<(), String> {
+        let value_ty = storage_val_type(
+            array_field_of(self.module, ty)
+                .ok_or("unresolved array")?
+                .ty,
+        )
+        .ok_or("unsupported array element type")?;
+        let len = self.pop().ok_or("operand stack underflow")?;
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let wide = self.slot_from(value_ty, value)?;
+        self.spill_u64(0, wide);
+        let len64 = self.builder.ins().uextend(types::I64, len);
+        self.spill_u64(1, len64);
+        let mode = self.iconst(types::I64, 34);
+        let ty_v = self.iconst(types::I64, i64::from(ty));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            ty_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(ty),
+        }))
+    }
+
+    /// An `array.new_default` of element type `ty`: run the GC helper (mode
+    /// 35) over the popped length.
+    fn do_array_new_default(&mut self, ty: u32) -> Result<(), String> {
+        let len = self.pop().ok_or("operand stack underflow")?;
+        let len64 = self.builder.ins().uextend(types::I64, len);
+        self.spill_u64(0, len64);
+        let mode = self.iconst(types::I64, 35);
+        let ty_v = self.iconst(types::I64, i64::from(ty));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            ty_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(ty),
+        }))
+    }
+
+    /// An `array.get[_s|_u]` (read mode 0/1/2) of the popped array at the
+    /// popped index: run the GC helper (mode 36) and push the element.
+    fn do_array_get(&mut self, ty: u32, read: i64) -> Result<(), String> {
+        let value_ty = storage_val_type(
+            array_field_of(self.module, ty)
+                .ok_or("unresolved array")?
+                .ty,
+        )
+        .ok_or("unsupported array element type")?;
+        let index = self.pop().ok_or("operand stack underflow")?;
+        let object = self.pop().ok_or("operand stack underflow")?;
+        self.spill_u64(0, object);
+        let index64 = self.builder.ins().uextend(types::I64, index);
+        self.spill_u64(1, index64);
+        let mode = self.iconst(types::I64, 36);
+        let read_v = self.iconst(types::I64, read);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            zero,
+            read_v,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        self.push_scratch_value(value_ty)
+    }
+
+    /// An `array.set` of the popped array at the popped index: spill the
+    /// object, index, and value and run the GC helper (mode 37).
+    fn do_array_set(&mut self, ty: u32) -> Result<(), String> {
+        let value_ty = storage_val_type(
+            array_field_of(self.module, ty)
+                .ok_or("unresolved array")?
+                .ty,
+        )
+        .ok_or("unsupported array element type")?;
+        let value = self.pop().ok_or("operand stack underflow")?;
+        let index = self.pop().ok_or("operand stack underflow")?;
+        let object = self.pop().ok_or("operand stack underflow")?;
+        self.spill_u64(0, object);
+        let index64 = self.builder.ins().uextend(types::I64, index);
+        self.spill_u64(1, index64);
+        let wide = self.slot_from(value_ty, value)?;
+        self.spill_u64(2, wide);
+        let mode = self.iconst(types::I64, 37);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            zero,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
+    }
+
+    /// An `array.len`: run the GC helper (mode 38) and push the length as an
+    /// i32.
+    fn do_array_len(&mut self) -> Result<(), String> {
+        let object = self.pop().ok_or("operand stack underflow")?;
+        self.spill_u64(0, object);
+        let mode = self.iconst(types::I64, 38);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            zero,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        let address = self.builder.ins().iadd_imm_s(self.scratch, 0);
+        let len =
+            self.builder
+                .ins()
+                .load(types::I32, MemFlagsData::new(), address, Offset32::new(0));
+        self.stack.push(len);
+        Ok(())
+    }
+
     /// Pop a table instruction's address operand (i32 for a 32-bit table,
     /// zero-extended; i64 for a table64) as a u64 slot.
     fn pop_table_addr(&mut self, table: u32) -> Result<ClifValue, String> {
@@ -3058,6 +3454,19 @@ impl<'a> Lowerer<'a> {
             Instr::RefI31 => self.do_ref_i31()?,
             Instr::I31GetS => self.do_i31_get(true)?,
             Instr::I31GetU => self.do_i31_get(false)?,
+            Instr::StructNew(ty) => self.do_struct_new(*ty)?,
+            Instr::StructNewDefault(ty) => self.do_struct_new_default(*ty)?,
+            Instr::StructGet { ty, field } => self.do_struct_get(*ty, *field, 0)?,
+            Instr::StructGetS { ty, field } => self.do_struct_get(*ty, *field, 1)?,
+            Instr::StructGetU { ty, field } => self.do_struct_get(*ty, *field, 2)?,
+            Instr::StructSet { ty, field } => self.do_struct_set(*ty, *field)?,
+            Instr::ArrayNew(ty) => self.do_array_new(*ty)?,
+            Instr::ArrayNewDefault(ty) => self.do_array_new_default(*ty)?,
+            Instr::ArrayGet(ty) => self.do_array_get(*ty, 0)?,
+            Instr::ArrayGetS(ty) => self.do_array_get(*ty, 1)?,
+            Instr::ArrayGetU(ty) => self.do_array_get(*ty, 2)?,
+            Instr::ArraySet(ty) => self.do_array_set(*ty)?,
+            Instr::ArrayLen => self.do_array_len()?,
             Instr::BrOnNull(label) => self.do_br_on_null(*label)?,
             Instr::BrOnNonNull(label) => self.do_br_on_non_null(*label)?,
             Instr::TableGet(table) => self.do_table_get(*table)?,
@@ -6814,5 +7223,227 @@ mod tests {
             &compiled.invoke(compiled_instance, 2, &[]),
             &interpreter.invoke(interpreter_instance, 2, &[]),
         );
+    }
+
+    #[test]
+    fn gc_structs_match_the_interpreter() {
+        use crate::types::{CompositeType, FieldType, StorageType};
+        // Struct objects ride the compiled token model (pool-id tokens):
+        // struct.new (packed i8 wrapping on set), struct.get_s/u (signed/
+        // zero extension), a set-then-get round-trip, and a null-struct get
+        // trap, all through the runtime GC helper.
+        let ref1 = ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(1),
+        });
+        let struct_type = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Struct(vec![
+                FieldType {
+                    ty: StorageType::I32,
+                    mutable: true,
+                },
+                FieldType {
+                    ty: StorageType::I8,
+                    mutable: true,
+                },
+                FieldType {
+                    ty: StorageType::F64,
+                    mutable: false,
+                },
+            ]),
+        };
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![ValType::I32]),
+                struct_type,
+                SubType::func(vec![], vec![ref1]),
+            ],
+            functions: vec![2, 2, 0, 0, 0, 0],
+            bodies: vec![
+                // 0: struct.new_default.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::StructNewDefault(1)],
+                },
+                // 1: struct.new of three fields (5, 200 as an i8, 1.5).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(5),
+                        Instr::I32Const(200),
+                        Instr::F64Const(1.5f64.to_bits()),
+                        Instr::StructNew(1),
+                    ],
+                },
+                // 2: set field 0 to 300 and read it back.
+                FuncBody {
+                    locals: vec![ref1],
+                    body: vec![
+                        Instr::StructNewDefault(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(300),
+                        Instr::StructSet { ty: 1, field: 0 },
+                        Instr::LocalGet(0),
+                        Instr::StructGet { ty: 1, field: 0 },
+                    ],
+                },
+                // 3: store 511 in the i8 field; struct.get_s sign-extends.
+                FuncBody {
+                    locals: vec![ref1],
+                    body: vec![
+                        Instr::StructNewDefault(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(511),
+                        Instr::StructSet { ty: 1, field: 1 },
+                        Instr::LocalGet(0),
+                        Instr::StructGetS { ty: 1, field: 1 },
+                    ],
+                },
+                // 4: struct.get_u of the same stored byte zero-extends.
+                FuncBody {
+                    locals: vec![ref1],
+                    body: vec![
+                        Instr::StructNewDefault(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(511),
+                        Instr::StructSet { ty: 1, field: 1 },
+                        Instr::LocalGet(0),
+                        Instr::StructGetU { ty: 1, field: 1 },
+                    ],
+                },
+                // 5: struct.get on a null struct traps.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::RefNull(HeapType::Type(1)),
+                        Instr::StructGet { ty: 1, field: 0 },
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "gc struct module did not compile"
+        );
+        let outcomes = run_seq(
+            &module,
+            &[
+                (0, vec![]),
+                (1, vec![]),
+                (2, vec![]),
+                (3, vec![]),
+                (4, vec![]),
+                (5, vec![]),
+            ],
+        );
+        assert!(
+            matches!(&outcomes[0], Ok(v) if matches!(v.as_slice(), [Value::Ref(RefValue::Struct(_))]))
+        );
+        assert!(
+            matches!(&outcomes[1], Ok(v) if matches!(v.as_slice(), [Value::Ref(RefValue::Struct(_))]))
+        );
+        assert_eq!(outcomes[2], Ok(vec![Value::I32(300)]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(-1)]));
+        assert_eq!(outcomes[4], Ok(vec![Value::I32(255)]));
+        assert!(matches!(
+            outcomes[5],
+            Err(ExecFail::Trap(Trap::NullStructReference))
+        ));
+    }
+
+    #[test]
+    fn gc_arrays_match_the_interpreter() {
+        use crate::types::{CompositeType, FieldType, StorageType};
+        // Array objects ride the compiled token model: array.new (value +
+        // length), array.new_default, array.set/get, array.len, and the
+        // out-of-bounds get trap through the runtime GC helper.
+        let ref_array = ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(1),
+        });
+        let array_type = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Array(FieldType {
+                ty: StorageType::I32,
+                mutable: false,
+            }),
+        };
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![ValType::I32]),
+                array_type,
+                SubType::func(vec![], vec![ref_array]),
+            ],
+            functions: vec![2, 0, 0, 0],
+            bodies: vec![
+                // 0: an array of 4 sevens.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::I32Const(7), Instr::I32Const(4), Instr::ArrayNew(1)],
+                },
+                // 1: array.new_default of length 5, then array.len.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(5),
+                        Instr::ArrayNewDefault(1),
+                        Instr::ArrayLen,
+                    ],
+                },
+                // 2: set element 1 to 42 and read it back.
+                FuncBody {
+                    locals: vec![ref_array],
+                    body: vec![
+                        Instr::I32Const(0),
+                        Instr::I32Const(3),
+                        Instr::ArrayNew(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::I32Const(42),
+                        Instr::ArraySet(1),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+                // 3: array.get past the end traps.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(0),
+                        Instr::I32Const(1),
+                        Instr::ArrayNew(1),
+                        Instr::I32Const(9),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "gc array module did not compile"
+        );
+        let outcomes = run_seq(
+            &module,
+            &[(0, vec![]), (1, vec![]), (2, vec![]), (3, vec![])],
+        );
+        assert!(
+            matches!(&outcomes[0], Ok(v) if matches!(v.as_slice(), [Value::Ref(RefValue::Array(_))]))
+        );
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(5)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::I32(42)]));
+        assert!(matches!(
+            outcomes[3],
+            Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess))
+        ));
     }
 }

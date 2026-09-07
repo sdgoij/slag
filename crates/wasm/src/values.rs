@@ -16,8 +16,11 @@ use crate::instr::NumOp;
 /// `any`-hierarchy reference the compiled subset carries) is tagged with bit
 /// 60 (bits 61-63 clear) and packs its canonicalized 31-bit value; an
 /// exception reference (`exnref`) is tagged with bit 61 (bits 60/62/63
-/// clear) and packs the exception's store-pool id. An address/payload that
-/// does not fit stays interpreted.
+/// clear) and packs the exception's store-pool id; an internal struct or
+/// array object (`any`-hierarchy pool ids) is tagged with bit 59 (bits
+/// 57-58 hold the struct/array kind, bits 60-63 clear) and packs the
+/// object's store-pool id. An address/payload that does not fit stays
+/// interpreted.
 pub const REF_NULL_TOKEN: u64 = 0;
 pub const REF_FUNC_TAG: u64 = 1 << 63;
 pub const REF_EXTERN_TAG: u64 = 1 << 62;
@@ -35,6 +38,30 @@ const REF_I31_VALUE_MASK: u64 = 0x7fff_ffff;
 /// store-pool id in the low 60 bits.
 pub const REF_EXN_TAG: u64 = 1 << 61;
 pub const REF_EXN_PAYLOAD_MASK: u64 = (1 << 60) - 1;
+/// An internal struct/array object: bit 59 with the struct/array kind in bits
+/// 57-58 and the object's store-pool id in the low 57 bits (bits 60-63
+/// clear, so it cannot collide with the func/extern/i31/exn regions).
+pub const REF_GC_TAG: u64 = 1 << 59;
+pub const REF_GC_KIND_SHIFT: u64 = 57;
+pub const REF_GC_PAYLOAD_MASK: u64 = (1 << 57) - 1;
+const GC_STRUCT: u64 = 0;
+const GC_ARRAY: u64 = 1;
+
+/// The compiled token for an internal struct object's pool id.
+pub fn struct_ref_token(id: usize) -> Option<u64> {
+    if id > REF_GC_PAYLOAD_MASK as usize {
+        return None;
+    }
+    Some(REF_GC_TAG | GC_STRUCT << REF_GC_KIND_SHIFT | id as u64)
+}
+
+/// The compiled token for an internal array object's pool id.
+pub fn array_ref_token(id: usize) -> Option<u64> {
+    if id > REF_GC_PAYLOAD_MASK as usize {
+        return None;
+    }
+    Some(REF_GC_TAG | GC_ARRAY << REF_GC_KIND_SHIFT | id as u64)
+}
 
 /// The compiled token for a function address, when both parts fit.
 pub fn func_ref_token(instance: usize, index: usize) -> Option<u64> {
@@ -73,6 +100,8 @@ pub fn ref_to_token(value: Value) -> Option<u64> {
             }
             Some(REF_EXN_TAG | id as u64)
         }
+        Value::Ref(RefValue::Struct(id)) => struct_ref_token(id),
+        Value::Ref(RefValue::Array(id)) => array_ref_token(id),
         _ => None,
     }
 }
@@ -106,6 +135,13 @@ pub fn token_to_ref(token: u64) -> Option<Value> {
         return Some(Value::Ref(RefValue::Exn(
             (token & REF_EXN_PAYLOAD_MASK) as usize,
         )));
+    }
+    if token & REF_GC_TAG != 0 {
+        let id = (token & REF_GC_PAYLOAD_MASK) as usize;
+        return Some(match (token >> REF_GC_KIND_SHIFT) & 1 {
+            GC_STRUCT => Value::Ref(RefValue::Struct(id)),
+            _ => Value::Ref(RefValue::Array(id)),
+        });
     }
     None
 }
