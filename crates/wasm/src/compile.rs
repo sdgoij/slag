@@ -409,6 +409,68 @@ pub fn compile_module(module: &Module) -> Vec<Option<CompiledFunc>> {
         .collect()
 }
 
+/// A coarse reason a module-defined body is not compiled, for the coverage
+/// report: the structural gates first (non-carried types, a call-bearing
+/// body that uses globals, a `try_table` handler, an imported global), then
+/// the per-instruction subset. A body that passes the gate but still fails
+/// to lower is normally a branch to the implicit function label, a
+/// parameterized `if` without an `else`, or a latent lowerer mismatch — the
+/// message reflects that.
+pub fn body_compile_reason(module: &Module, defined: usize) -> &'static str {
+    let Some(body) = module.bodies.get(defined) else {
+        return "no body";
+    };
+    let Some(type_index) = module.functions.get(defined).copied() else {
+        return "no function type";
+    };
+    let Some(func_type) = module.func_at(type_index) else {
+        return "no function type";
+    };
+    let carried = |ty: ValType| carrier_type(module, ty).is_some();
+    if func_type.params.iter().any(|t| !carried(*t))
+        || func_type.results.iter().any(|t| !carried(*t))
+        || body.locals.iter().any(|t| !carried(*t))
+    {
+        return "non-carried parameter/result/local type";
+    }
+    let has_call = body.body.iter().any(|instr| {
+        matches!(
+            instr,
+            Instr::Call(_)
+                | Instr::ReturnCall(_)
+                | Instr::CallIndirect { .. }
+                | Instr::ReturnCallIndirect { .. }
+        )
+    });
+    let uses_globals = body
+        .body
+        .iter()
+        .any(|instr| matches!(instr, Instr::GlobalGet(_) | Instr::GlobalSet(_)));
+    if has_call && uses_globals {
+        return "call-bearing body uses globals";
+    }
+    if body
+        .body
+        .iter()
+        .any(|instr| matches!(instr, Instr::TryTable { .. }))
+    {
+        return "try_table exception-handling body";
+    }
+    let imported_global = body.body.iter().any(|instr| match instr {
+        Instr::GlobalGet(index) | Instr::GlobalSet(index) => {
+            defined_global(module, *index).is_none()
+        }
+        _ => false,
+    });
+    if imported_global {
+        return "imported global";
+    }
+    if !lowerable(module, func_type, body) {
+        return "instruction outside the lowering subset";
+    }
+    "lowering error (function-label branch, parameterized if without an else, or a latent mismatch)"
+}
+
 /// The process-wide native `TargetIsa`, built once (an ISA construction runs
 /// a host-CPU feature scan, far too expensive to repeat per module).
 fn native_isa() -> Result<Arc<dyn TargetIsa>, String> {

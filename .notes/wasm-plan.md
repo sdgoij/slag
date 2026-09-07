@@ -2387,3 +2387,131 @@ NaN edge pairs and demote/promote over NaN, signed zero, and
 infinity, agreeing bit-for-bit with the interpreter. `wasmtest equiv`
 is green over the whole core corpus: 254 suites, 0 diverged. 61 compile
 tests, 97 total with the feature, clippy clean in both configurations.
+
+## Cut 11 — compiled coverage: completion checklist (2026-09-07)
+
+**Definition of done: every runnable, valid module-defined function in
+`waspec/test/core` compiles natively.** Coverage is measured — the equiv
+gate alone cannot detect a fallback (an uncompiled body is compared
+interpreter-vs-interpreter), so Gate 0 below is the tracking source of
+truth. The interpreter stays the correctness oracle throughout.
+
+### Gate 0 — measure coverage (prerequisite for the DoD)
+
+- [x] `wasmtest coverage` (or `equiv --report-compiled`): per suite and in
+total, report how many module-defined functions compiled vs. fell back,
+listing each fallback body's index and its first blocking reason (the
+unlowerable instruction, a non-carried signature/local type, or a
+`lower()` error).
+- [x] Add a coverage summary line to `equiv` output so every run shows the
+compiled-function fraction.
+- [x] Triage sweep: run the report over the whole core corpus, classify every
+non-compiling body by cause, and record the baseline numbers here.
+
+#### Gate 0 — status (2026-09-07)
+
+Coverage is now measured directly on the equiv path. `exec.rs` gained
+`Store::compile_coverage` (feature-gated; interpreter-forced stores skip it
+— their instances carry no `compiled` entries), backed by
+`compile::body_compile_reason`, which classifies each module-defined body's
+first blocking gate: structural (non-carried signature/local type,
+`try_table` body, call-bearing body that uses globals, imported global) or
+the lowering fall-through (`lowerable` returns true but `lower` errored —
+mostly function-label branches and parameterized `if` without an `else`).
+`wasmtest` collects these per suite and prints, after each equiv suite line
+and again in the aggregate, `coverage N/M functions compiled (P%)`, plus a
+sorted histogram of fallback reasons for the whole run.
+
+Baseline over the whole core corpus (release equiv, 254 suites, 0
+diverged):
+
+```
+coverage 7842/8264 module-defined functions compiled (94%)
+uncompiled fallback reasons:
+    258  instruction outside the lowering subset
+     95  lowering error (function-label branch, parameterized if without an else, or a latent mismatch)
+     44  try_table exception-handling body
+     13  call-bearing body uses globals
+      8  imported global
+      4  non-carried parameter/result/local type
+```
+
+The buckets map onto the waves below (95 → Wave A, 13+8 → Wave B, 44 →
+Wave C, 258+4 plus the latent-mismatch residue → Wave D). The "lowering
+error" bucket is a coarse fall-through with no per-function `lower()`
+message and should shrink as Wave A/D land. Granularity note: the report
+aggregates by reason, not per body index; extend `compile_coverage` to emit
+per-index reasons if a wave needs to pinpoint stragglers.
+
+Gates: wasm lib tests 36 (no feature) / 97 (compile feature), and clippy
+`-D warnings` on both `wasm` configs plus `wasmtest` are clean.
+
+### Wave A — branches to the implicit function label (largest known gap)
+
+The lowering has no function-level control frame, so a branch whose target
+is the implicit function label (depth = number of open constructs) fails to
+lower and the whole body stays interpreted. The control-flow fixtures
+(`br`, `br_table`, `block`/`if` "as-value", `switch`, `labels`, …) are
+full of these.
+
+- [ ] Function-label model: represent the implicit function label as the
+outermost control frame (an implicit block whose continuation emits the
+return), or special-case function-label targets in the branch lowerers.
+- [ ] `br` / `br_if` to the function label (carrying the function results).
+- [ ] `br_table` with a function-label target among block/loop targets (the
+labels share one arity).
+- [ ] `br_on_null`/`br_on_non_null`/`br_on_cast`/`br_on_cast_fail` to the
+function label.
+- [ ] Unit tests mirroring the "as-…-value" fixture shapes; equiv over `br`,
+`br_if`, `br_table`, `block`, `if`, `switch`, `labels`, `fac`; coverage on
+the control-flow suites rises toward 100%.
+
+### Wave B — globals and calls
+
+- [ ] Imported globals: `global.get`/`set` over imported cells, including
+the aliasing case (one imported global reached through two import slots) —
+decide the buffer/snapshot rule.
+- [ ] Call-bearing bodies that use globals: refresh the `gvals` buffer from
+the store after a callee runs (mirroring the descriptor refresh), then drop
+the `has_call && uses_globals` gate.
+- [ ] Unit tests: imported global read/write, an aliased import, and a
+global mutated through an interpreted callee then read natively.
+equiv over `global`, `linking`, `imports`, and `memory_grow`.
+
+### Wave C — exception handling (`try_table`)
+
+Compiled bodies can `throw`/`throw_ref` but none may contain a `try_table`
+catch.
+
+- [ ] Decide the mechanism: native unwinding of a compiled throw into a
+compiled catch, or a documented interpreter boundary for
+handling bodies (the latter keeps those bodies off the DoD).
+- [ ] If native: tag-match dispatch and `catch_ref` payload delivery, plus
+the label/frame bookkeeping `catch_branch` needs.
+- [ ] equiv over the `exceptions` suites; the coverage report rises there.
+
+### Wave D — remaining type-model gaps
+
+- [ ] v128 GC storage: struct/array fields of `StorageType::V128`
+(word-indexed field slots in the GC helpers, `storage_from_slot` and the
+object writers, defaults, `struct.get`/`set`, the `array.*` family).
+- [ ] Non-carried abstract-bottom signatures: params/results/locals of
+`(ref null none)`/`nofunc`/`noextern`/`noexn` (only null rides the model).
+- [ ] Parameterized `if` without an `else` (valid wasm; the lowerer rejects
+it today) — give it an empty-else path.
+- [ ] Latent-mismatch audit: every `Instr` variant `lowerable` admits must
+lower without error — eliminate silent `lower()` fallbacks (the Gate 0
+report is the detector).
+- [ ] Oversized call sites: revisit `SCRATCH_SLOTS` (size the scratch per
+call, or document the bound as in-scope/out-of-scope for the DoD).
+- [ ] Resumable external-host imports (JS-API): decide in/out of scope for
+the DoD (no corpus presence; architectural).
+
+### Definition of done (all must hold)
+
+- [ ] Gate 0 report exists and is the tracking source of truth.
+- [ ] Coverage: 100% of runnable module-defined functions in
+`waspec/test/core` compile (0 fallback bodies) with equiv 0 diverged.
+- [ ] `cargo test -p wasm --features compile --lib`, the no-feature lib
+tests, and `cargo clippy -p wasm --all-targets -- -D warnings` in both
+configurations are clean.

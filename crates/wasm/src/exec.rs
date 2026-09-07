@@ -2428,6 +2428,33 @@ impl Store {
         self.compile_off = !enabled;
     }
 
+    /// Compiled-coverage totals across every live instance: how many
+    /// module-defined functions compiled vs. the total, plus a coarse reason
+    /// per function that did not (see [`crate::compile::body_compile_reason`]).
+    /// An interpreter-forced store reports zeros.
+    #[cfg(feature = "compile")]
+    pub fn compile_coverage(&self) -> (usize, usize, Vec<&'static str>) {
+        let mut compiled = 0usize;
+        let mut defined = 0usize;
+        let mut reasons = Vec::new();
+        for instance in &self.instances {
+            if instance.compiled.is_empty() {
+                // Interpreter-forced store: nothing was compiled.
+                continue;
+            }
+            let bodies = instance.module.bodies.len();
+            defined += bodies;
+            for (index, entry) in instance.compiled.iter().enumerate().take(bodies) {
+                if entry.is_some() {
+                    compiled += 1;
+                } else {
+                    reasons.push(crate::compile::body_compile_reason(&instance.module, index));
+                }
+            }
+        }
+        (compiled, defined, reasons)
+    }
+
     /// Register a type-only host function (spectest `print*` family); returns
     /// its id.
     pub fn host_func(&mut self, ty: FuncType) -> usize {

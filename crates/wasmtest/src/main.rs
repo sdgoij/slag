@@ -217,7 +217,7 @@ fn run(paths: &[PathBuf]) -> ExitCode {
     let mut totals = Tally::default();
     for (source, is_json) in items {
         if is_json {
-            let (tally, _) = run_json_mode(&source, false, true);
+            let (tally, _, _) = run_json_mode(&source, false, true);
             println!(
                 "\n{}: {} pass, {} fail, {} pending",
                 source.display(),
@@ -243,7 +243,7 @@ fn run(paths: &[PathBuf]) -> ExitCode {
                 continue;
             }
         };
-        let (tally, _) = run_json_mode(&json, false, true);
+        let (tally, _, _) = run_json_mode(&json, false, true);
         println!(
             "\n{}: {} pass, {} fail, {} pending",
             json.display(),
@@ -266,10 +266,37 @@ fn run(paths: &[PathBuf]) -> ExitCode {
     }
 }
 
+/// Compiled-coverage summary for one suite run (meaningful only on the
+/// compiled path; the interpreter-forced store reports zeros).
+#[derive(Default)]
+struct Coverage {
+    compiled: usize,
+    defined: usize,
+    reasons: Vec<&'static str>,
+}
+
+impl Coverage {
+    fn merge(&mut self, other: &Coverage) {
+        self.compiled += other.compiled;
+        self.defined += other.defined;
+        self.reasons.extend(other.reasons.iter().copied());
+    }
+}
+
+/// Percentage of compiled functions, or 0 when nothing is defined yet.
+fn coverage_percent(compiled: usize, defined: usize) -> usize {
+    compiled
+        .checked_mul(100)
+        .and_then(|n| n.checked_div(defined))
+        .unwrap_or(0)
+}
+
 /// Run each suite twice — compiled bodies and the interpreter forced — and
 /// fail on the first command whose outcome diverges between the paths. The
 /// interpreter run is the oracle: a compiled body must reproduce it exactly
-/// (Cut 11's equivalence gate).
+/// (Cut 11's equivalence gate). Every run also reports how many of the
+/// suite's module-defined functions actually compiled, so a green equiv is
+/// never mistaken for coverage.
 fn equiv(paths: &[PathBuf]) -> ExitCode {
     let exclusions = load_exclusions();
     let mut items: Vec<(PathBuf, bool)> = Vec::new();
@@ -285,6 +312,7 @@ fn equiv(paths: &[PathBuf]) -> ExitCode {
 
     let mut diverged = 0usize;
     let mut compared = 0usize;
+    let mut total = Coverage::default();
     for (source, is_json) in items {
         if !is_json && let Some(reason) = excluded(&source, &exclusions) {
             println!("skip  {}: {reason}", source.display());
@@ -302,9 +330,10 @@ fn equiv(paths: &[PathBuf]) -> ExitCode {
                 }
             }
         };
-        let (compiled_tally, compiled_log) = run_json_mode(&json, true, false);
-        let (interpreter_tally, interpreter_log) = run_json_mode(&json, false, false);
+        let (compiled_tally, compiled_log, compiled_coverage) = run_json_mode(&json, true, false);
+        let (interpreter_tally, interpreter_log, _) = run_json_mode(&json, false, false);
         compared += 1;
+        total.merge(&compiled_coverage);
         if compiled_log == interpreter_log {
             println!(
                 "equiv  {}: {} commands agree ({:?})",
@@ -332,8 +361,37 @@ fn equiv(paths: &[PathBuf]) -> ExitCode {
                 }
             }
         }
+        if compiled_coverage.defined > 0 {
+            let percent = coverage_percent(compiled_coverage.compiled, compiled_coverage.defined);
+            println!(
+                "  coverage {}/{} functions compiled ({percent}%)",
+                compiled_coverage.compiled, compiled_coverage.defined
+            );
+        }
     }
-    println!("\nequiv: {compared} suites compared, {diverged} diverged");
+    if total.defined > 0 {
+        let percent = coverage_percent(total.compiled, total.defined);
+        println!(
+            "\nequiv: {compared} suites compared, {diverged} diverged; coverage {}/{} module-defined functions compiled ({percent}%)",
+            total.compiled, total.defined
+        );
+        if !total.reasons.is_empty() {
+            println!("uncompiled fallback reasons:");
+            let mut reasons: Vec<(&str, usize)> = Vec::new();
+            for reason in &total.reasons {
+                match reasons.iter_mut().find(|(r, _)| r == reason) {
+                    Some((_, count)) => *count += 1,
+                    None => reasons.push((reason, 1)),
+                }
+            }
+            reasons.sort_by_key(|r| std::cmp::Reverse(r.1));
+            for (reason, count) in reasons {
+                println!("  {count:5}  {reason}");
+            }
+        }
+    } else {
+        println!("\nequiv: {compared} suites compared, {diverged} diverged");
+    }
     if diverged == 0 {
         ExitCode::SUCCESS
     } else {
@@ -422,7 +480,7 @@ fn run_json_mode(
     json_path: &Path,
     compiled: bool,
     verbose: bool,
-) -> (Tally, Vec<(String, Outcome)>) {
+) -> (Tally, Vec<(String, Outcome)>, Coverage) {
     let mut tally = Tally::default();
     let mut log = Vec::new();
     let dir = json_path.parent().unwrap_or_else(|| Path::new("."));
@@ -431,7 +489,7 @@ fn run_json_mode(
         Err(error) => {
             tally.fail += 1;
             println!("read {}: {error}", json_path.display());
-            return (tally, log);
+            return (tally, log, Coverage::default());
         }
     };
     let root: Value = match serde_json::from_str(&text) {
@@ -439,13 +497,13 @@ fn run_json_mode(
         Err(error) => {
             tally.fail += 1;
             println!("parse {}: {error}", json_path.display());
-            return (tally, log);
+            return (tally, log, Coverage::default());
         }
     };
     let Some(commands) = root.get("commands").and_then(Value::as_array) else {
         tally.fail += 1;
         println!("parse {}: no commands array", json_path.display());
-        return (tally, log);
+        return (tally, log, Coverage::default());
     };
 
     // Instance state across a file's commands: the store of live instances,
@@ -819,7 +877,17 @@ fn run_json_mode(
             }
         }
     }
-    (tally, log)
+    let coverage = if compiled {
+        let (compiled_count, defined, reasons) = store.compile_coverage();
+        Coverage {
+            compiled: compiled_count,
+            defined,
+            reasons,
+        }
+    } else {
+        Coverage::default()
+    };
+    (tally, log, coverage)
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
