@@ -2121,12 +2121,32 @@ pub struct MemberChainCell {
 /// `GetMemberName` probe reads the shared cells at fixed offsets
 /// (`offset_of!`), mirroring `MemberValueCell`; `empty()`'s impossible map
 /// id never matches.
+///
+/// The `clean`/`proto_id`/`proto_gen` fields gate the compiled vector-free
+/// FILL (a fresh define, unlike the read the other fields serve): a
+/// map-described key whose field is an unwritten hole is spec-absent, so
+/// [[Set]] must consult the prototype chain (an accessor/non-writable there
+/// blocks or redirects the define). The interpreter records `clean` only
+/// after its chain-verified fill (`fast_fresh_store`), together with the
+/// receiver's direct prototype (id, generation); the machine fill re-checks
+/// that the fill-time receiver's direct prototype is the same, unchanged
+/// object before writing the field inline. A mutation of the direct
+/// prototype (an accessor conversion, a defineProperty) bumps its
+/// generation and declines the fill to the exact helper.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MemberMapCell {
     pub map_id: u64,
     pub name: crux::AtomId,
     pub slot: usize,
+    /// 1 when the cell was recorded by a chain-verified fill (the receiver's
+    /// prototype chain held no accessor/non-writable for `name`); 0 for a
+    /// read-record, which never validates the chain.
+    pub clean: u32,
+    /// The recording receiver's direct prototype id (0 when it had none).
+    pub proto_id: u64,
+    /// The recording receiver's direct prototype generation.
+    pub proto_gen: u32,
 }
 
 impl MemberMapCell {
@@ -2138,6 +2158,9 @@ impl MemberMapCell {
             map_id: u64::MAX,
             name: 0,
             slot: 0,
+            clean: 0,
+            proto_id: 0,
+            proto_gen: 0,
         }
     }
 }
@@ -3591,6 +3614,17 @@ impl Vm {
         (map_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
     }
 
+    /// The direct prototype (id, generation) of `object`, for the map cell's
+    /// chain-clean provenance: 0/0 when there is no prototype. The machine
+    /// fill gate re-checks the fill-time receiver's own direct prototype
+    /// against the pair recorded by the last chain-verified fill.
+    fn member_map_proto(object: &Handle<crux::object::JsObject>) -> (u64, u32) {
+        match object.get_prototype_of() {
+            Ok(Some(proto)) => (proto.id(), proto.generation()),
+            _ => (0, 0),
+        }
+    }
+
     /// The object part of a value whose own properties the member cells can
     /// serve: plain/array objects and functions (a function's own data
     /// properties — `length`/`name`/`prototype` — live in the ordinary
@@ -3660,11 +3694,23 @@ impl Vm {
             return Some(value);
         }
         // Cache miss (a cold shape or an evicted entry): resolve through the
-        // descriptor scan and re-cache the offset.
+        // descriptor scan and re-cache the offset. A read-record never
+        // validates the prototype chain (the own property shadows it), so
+        // `clean` is 0 — the compiled vector-free FILL gate (which needs a
+        // chain-verified record) declines on this cell until a fill
+        // re-records it.
         let key = PropertyKey::String(name);
         let slot = map.field_offset(&key)?;
         let value = object.map_field(slot)?;
-        agent.member_map_cells[index] = MemberMapCell { map_id, name, slot };
+        let (proto_id, proto_gen) = Self::member_map_proto(object);
+        agent.member_map_cells[index] = MemberMapCell {
+            map_id,
+            name,
+            slot,
+            clean: 0,
+            proto_id,
+            proto_gen,
+        };
         agent.member_value_cells[Self::member_cell_index(object.id(), name)] = MemberValueCell {
             id: object.id(),
             name,
@@ -4220,10 +4266,18 @@ impl Vm {
         {
             let map_id = map.id();
             let index = Self::member_map_cell_index(map_id, *atom);
+            let (proto_id, proto_gen) = Self::member_map_proto(&receiver);
+            // `clean` 1: this fill only succeeded because the chain-verified
+            // verdict (the probe above) held, so the cell records the
+            // receiver's direct prototype for the compiled vector-free fill
+            // gate to re-check.
             agent.member_map_cells[index] = crate::ir::MemberMapCell {
                 map_id,
                 name: *atom,
                 slot,
+                clean: 1,
+                proto_id,
+                proto_gen,
             };
         }
         if ok {

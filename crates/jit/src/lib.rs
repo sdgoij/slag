@@ -1723,6 +1723,41 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_constructor_fill_defers_to_a_mid_run_prototype_setter() {
+        // The compiled vector-free constructor fill (a map-described presize
+        // hole written inline) must stay exact against the prototype chain:
+        // once a hot constructor's fills have warmed the compiled path, a
+        // setter installed on the prototype must intercept the NEXT store
+        // ([[Set]] consults the chain while the field is still a hole). The
+        // map cell's chain-clean provenance records the receiver's direct
+        // prototype (id, generation); the defineProperty bumps it and
+        // declines the inline fill to the exact helper. Without the gate the
+        // machine fill would define an own property and bypass the setter.
+        let source = "var hits = 0;\n\
+                     function C() { this.x = 1; }\n\
+                     var s = 0;\n\
+                     for (var i = 0; i < 40; i++) { var o = new C(); s += o.x; }\n\
+                     Object.defineProperty(C.prototype, 'x', {\n\
+                       set: function (v) { hits += v; },\n\
+                       configurable: true\n\
+                     });\n\
+                     var o2 = new C();\n\
+                     s * 100000 + hits * 10 + (Object.prototype.hasOwnProperty.call(o2, 'x') ? 1 : 0);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled fill must match the interpreter"
+        );
+        assert_eq!(value.as_number(), Some(40.0 * 100000.0 + 1.0 * 10.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_statement_local_updates_match_the_interpreter() {
         // Statement-position local updates (`l++;`, `++l;`, `l--;`) now fuse
         // into the loop body's register run (`LeafOp::UpdateReg`), so the

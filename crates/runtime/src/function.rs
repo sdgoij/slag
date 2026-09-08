@@ -2826,9 +2826,15 @@ pub(crate) fn construct_this_object(
                 map
             }
         };
-        return Ok(Value::Object(
-            crux::object::JsObject::ordinary_object_create_with_map(Some(proto_obj), map),
-        ));
+        let receiver =
+            crux::object::JsObject::ordinary_object_create_with_map(Some(proto_obj), map);
+        // The presize map pre-describes the pattern keys as unwritten holes,
+        // so the receiver can be born vector-free (the state a first define
+        // would enter anyway): the compiled constructor store then serves
+        // even the FIRST body-store fill inline (its machine fill gate
+        // requires the deferred state).
+        receiver.enter_vector_free();
+        return Ok(Value::Object(receiver));
     }
     Ok(Value::Object(JsObject::ordinary_object_create(proto)))
 }

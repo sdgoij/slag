@@ -727,12 +727,14 @@ pub struct JsObject {
     /// authoritative vector push (the measured ~44ns/key define cost) and
     /// hot reads are served by `map_field`; `materialize_properties`
     /// rebuilds the vector from the descriptors and clears the bit the
-    /// first time a structural consumer needs it. Only Ordinary objects
-    /// built by the fast define path from a canonical-empty map enter it —
-    /// constructor-boilerplate objects (pre-described but possibly-unwritten
-    /// fields) never set it, so a hole can never be mistaken for an own
-    /// property.
-    props_deferred: Cell<bool>,
+    /// first time a structural consumer needs it. A constructor-presize
+    /// object enters the state on its first body-store fill (the map already
+    /// describes the presized fields as unwritten holes), so a hole can
+    /// never be mistaken for an own property — presence stays field-checked
+    /// (`field_written`/`map_field` return `None` on an unwritten field).
+    /// `pub` so the JIT's inline vector-free store gate reads it in place
+    /// (`offset_of!`).
+    pub props_deferred: Cell<bool>,
     /// Lazy key→position index over `properties`, built on the first lookup
     /// once the vector is large enough and invalidated by structural changes
     /// (insert/delete). Value updates in place keep it valid. The property
@@ -3316,6 +3318,22 @@ impl JsObject {
     /// leave the vector-free state first (see `define_fresh`).
     fn higher_field_written(&self, map: &Handle<Map>, ord: usize) -> bool {
         (ord + 1..map.descriptor_count()).any(|higher| self.field_written(higher))
+    }
+
+    /// Enter the vector-free state on a freshly created receiver whose map
+    /// pre-describes its keys as unwritten holes (the constructor-presize
+    /// birth). The state's invariant — vector empty, every own property a
+    /// map descriptor below `INLINE_FIELDS` whose value lives in
+    /// `in_fields` — holds from creation (holes read absent through
+    /// `field_written`), so marking it deferred at birth is what the
+    /// ordinary first define would do anyway, one define earlier. The
+    /// runtime's constructor path calls this so the COMPILED constructor
+    /// store can serve even the first body-store fill inline (the JIT's
+    /// machine fill gate requires the deferred state).
+    pub fn enter_vector_free(&self) {
+        debug_assert!(self.map.get().is_some());
+        debug_assert!(self.properties.borrow().is_empty());
+        self.props_deferred.set(true);
     }
 
     /// The shared Option-3 vector-free fresh define (both the all-true

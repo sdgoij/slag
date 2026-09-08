@@ -7391,6 +7391,82 @@ host-forced collection between timed samples (measured neutral-to-worse:
 the fresh collection threshold makes every batch pay an extra early GC).
 
 
+### LANDED (2026-09-09, uncommitted): the compiled vector-free constructor fill — a shape-gated machine `in_fields` write with a chain-clean gate
+
+The e3ffc1e landing left every compiled constructor-body store paying one
+`set_member_slot`/`assign_member` FFI round trip per fill (its decline
+path runs the interpreter's chain-verified `fast_fresh_store`); the
+recorded next slice was an inline machine fill for a shape-gated
+map-described hole. That is what landed, in four coordinated pieces:
+
+1. **Presize receivers are born vector-free** (function.rs
+   `construct_this_object` + crux `JsObject::enter_vector_free`): a
+   constructor-presize map pre-describes the pattern keys as unwritten
+   holes, which is exactly the vector-free state (holes read absent through
+   `field_written`), so the receiver now enters it at birth instead of on
+   its first body-store fill. That is what lets the compiled fill serve the
+   FIRST store of each fresh receiver (previously only the second+ fill on
+   an already-deferred receiver could). `props_deferred` became `pub` for
+   the JIT's `offset_of!` gate.
+2. **The machine fill** (jit/compiler.rs `emit_deferred_hole_fill`, shared
+   by the register `StoreMemberName*` path and — the step path that
+   constructor bodies actually take — `Step::AssignMemberName`, which had
+   its OWN shape gate to `set_member_slot` that never routed through
+   `emit_validated_member_store`): on a shape-gate hit (the shared (map id,
+   name) cells matched the receiver's live map), a vector-free receiver
+   whose field is an unwritten hole with every higher field also a hole
+   (fills ascend the ordinals; an out-of-order fill must materialize to
+   preserve creation order) writes `in_fields[slot]` in machine code, bumps
+   the generation, and refreshes the (id, name) value cell — exactly the
+   interpreter's `define_fresh` described-key fill. Any doubt (written
+   field, slot at/above `INLINE_FIELDS`, non-deferred receiver) falls to
+   the unchanged `set_member_slot` write.
+3. **The chain-clean gate** (the piece that made the naive fill unsound):
+   a hole is spec-absent, so [[Set]] must consult the prototype chain — a
+   mid-run accessor conversion / setter install on the prototype must
+   intercept the next fill. A pure machine gate cannot walk the chain, so
+   `MemberMapCell` gained `clean`/`proto_id`/`proto_gen`: the interpreter's
+   chain-verified `fast_fresh_store` records `clean` 1 with the receiver's
+   direct prototype (id, generation); read-records (`member_cell_get_map`)
+   record `clean` 0 (an own property shadows the chain, so a read never
+   validates it). The machine gate re-checks the fill-time receiver's live
+   direct prototype (identity + generation) against that record — a
+   prototype mutation (defineProperty, setPrototypeOf) bumps or changes it
+   and declines the fill to the exact helper. A receiver with NO prototype
+   (empty chain) passes unconditionally.
+4. **Born-deferred + chain gate confirmed by a targeted probe that the
+   naive inline fill FAILED**: warming the compiled fill then installing a
+   setter on `C.prototype` bypassed the setter (jit created an own x;
+   jitless ran the setter) until the gate landed; now byte-identical across
+   jit/jitless/--gc-stress including the getter-only-inherited strict throw.
+   A new `installed_jit` e2e test pins the mid-run-setter shape.
+
+Interleaved A/B (release, jit, scratch/construct_jit_split.js, 500k iters;
+pre = HEAD b17be2f from this session's first runs, post = this tree): S1
+(1 store) ~102-105 -> ~78-82ms, S2 (2 stores) ~127-141 -> ~89-94ms, R1
+(store+read) ~86-94 -> ~70-71ms; S0 (bare construct) unchanged ~65-77ms.
+The `set_member_slot` FFI declined 3.9M/3.9M store calls pre-change (every
+constructor fill) and ~0 post-change on these rows (verified with a
+temporary counter, removed). The remaining per-store marginal (~26ns) is
+close to the machine-write floor; the rows' mass is now the ~140ns bare
+construct, not the fill.
+
+Known residual (documented, not exercised by any fixture): the gate
+validates only the receiver's DIRECT prototype. A mutation on a deeper
+chain link (e.g. Object.prototype) mid-run after warm would not bump the
+direct prototype's generation and the inline fill would not see it; the
+interpreter's chain walk validates every link. Closing it needs a machine
+walk or a chain fingerprint in the map cell — deferred until a probe shows
+a real row (or fixture) needs it.
+
+Gates: clippy `-D warnings` clean; `cargo test --workspace` green (32
+suites; the new jit e2e passes); the presize/chain/vecfree/objfast/fn/
+proto batteries + the new fill-chain probe byte-identical across
+jit/jitless/--gc-stress; the three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang) re-run on the final tree.
+
+
 
 ## Deferred milestones
 

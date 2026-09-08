@@ -1589,7 +1589,11 @@ impl<'a> Lowerer<'a> {
     /// map-described key — any object whose CURRENT map pins it, so no
     /// per-object identity or generation — to the same narrow write, keeping
     /// a store loop whose object working set exceeds the 16-entry value cells
-    /// O(1) with no full-helper round trip. Every other receiver falls to the
+    /// O(1) with no full-helper round trip. A vector-free (deferred) receiver
+    /// whose map describes an unwritten presize hole — the fresh-constructor
+    /// fill — is served entirely inline (see below): the shape-gate hit,
+    /// the field-hole + higher-fields check, then a machine `in_fields`
+    /// write with the interpreter's fill generation bump. Every other receiver falls to the
     /// full `SetMemberName` helper (nullish check + assign machinery), which
     /// is also the authoritative fallback when `set_member_slot`'s own
     /// writable check fails (a read-warmed cell never checked it, and a
@@ -1623,6 +1627,7 @@ impl<'a> Lowerer<'a> {
         let merge = self.builder.create_block();
         let fast = self.builder.create_block();
         let shape = self.builder.create_block();
+        let shape_hit = self.builder.create_block();
         self.builder.ins().brif(obj_ok, validate, &[], slow, &[]);
         // The value-cell probe (mirrors `GetMemberName`/the step store): the
         // live id/generation must match the cell the run's read or a prior
@@ -1694,11 +1699,14 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().brif(ok, fast, &[], shape, &[]);
         // The shape store: on a value-cell miss (a working set larger than
         // the cell), a map-described key is gated by the shared (map id,
-        // name) cells and routed to the same narrow write;
-        // `set_member_slot`'s own writable check stays the authoritative
-        // backstop.
+        // name) cells; the vector-free presize-hole fill is then served
+        // inline (see `emit_deferred_hole_fill`), and every other shape
+        // falls to the narrow `set_member_slot` write (`set_member_slot`'s
+        // own writable check stays the authoritative backstop).
         self.builder.switch_to_block(shape);
-        self.emit_shape_store_probe(object, name_imm, fast, slow)?;
+        self.emit_shape_store_probe(object, name_imm, shape_hit, slow)?;
+        self.builder.switch_to_block(shape_hit);
+        self.emit_deferred_hole_fill(object, name_imm, value, name, fast, merge)?;
         // The fast path: the helper writes the property vector in place and
         // refreshes the cell (no generation bump). The store's result is
         // discarded by the run truncate.
@@ -1720,6 +1728,308 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().jump(merge, &[]);
         self.builder.seal_block(merge);
         self.builder.switch_to_block(merge);
+        Ok(())
+    }
+
+    /// The vector-free machine fill, shared by the step and register
+    /// member-store paths (the register `StoreMemberName*` ops and the step
+    /// `AssignMemberName` both route a shape-gate hit here). Entry: the
+    /// current block is the shape-gate HIT block — the shared (map id,
+    /// name) cells matched the receiver's live map, so its CURRENT map
+    /// describes `name`. For a vector-free (deferred) receiver
+    /// `in_fields[field_slot]` is the authoritative value slot (there is no
+    /// property-vector copy); when the field is an unwritten presize hole
+    /// and every higher field is also a hole (fills ascend the ordinals; a
+    /// fill below an already-written descriptor must materialize to
+    /// preserve creation order), the store is exactly the interpreter's
+    /// `define_fresh` described-key fill: write the field, bump the
+    /// generation, and refresh the (object id, name) value cell at the new
+    /// generation. Any other receiver — vector-authoritative
+    /// (`props_deferred` clear), a written field (the in-place update /
+    /// writability-check paths), an at-or-above-`INLINE_FIELDS` slot, or an
+    /// out-of-order fill — jumps to `fallback` (the narrow `set_member_slot`
+    /// write). A successful fill jumps to `ok`. The current block is
+    /// unspecified on return (the fill block is current, terminated).
+    fn emit_deferred_hole_fill(
+        &mut self,
+        object: ClifValue,
+        name_imm: ClifValue,
+        value: ClifValue,
+        name: crux::AtomId,
+        fallback: Block,
+        ok: Block,
+    ) -> Result<(), Unsupported> {
+        let ctx = self.vm();
+        let fill = self.builder.create_block();
+        // The gates below are emitted into the CURRENT (shape-gate hit)
+        // block.
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let deferred_bit = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, props_deferred) as i32),
+        );
+        let deferred_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, deferred_bit, 0);
+        // Re-derive the cell's recorded descriptor slot (the probe validated
+        // the (map id, name) pair; the map cell is direct-mapped, so the
+        // slot must be re-read under the validated map id).
+        let map_handle = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
+        );
+        let map_data = self
+            .builder
+            .ins()
+            .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let map_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            map_data,
+            Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+        );
+        let cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_map_cells) as i32),
+        );
+        let cell_index = self.builder.ins().bxor(map_id, name_imm);
+        let cell_index = self
+            .builder
+            .ins()
+            .band_imm_u(cell_index, (MEMBER_CELLS - 1) as i64);
+        let cell_index = self
+            .builder
+            .ins()
+            .imul_imm_s(cell_index, std::mem::size_of::<MemberMapCell>() as i64);
+        let cell = self.builder.ins().iadd(cells, cell_index);
+        let field_slot = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, slot) as i32),
+        );
+        let slot_inline = self.builder.ins().icmp_imm_u(
+            IntCC::UnsignedLessThan,
+            field_slot,
+            crux::object::INLINE_FIELDS as i64,
+        );
+        let field_base = self.builder.ins().iadd_imm_s(
+            obj_ptr,
+            std::mem::offset_of!(crux::JsObject, in_fields) as i64,
+        );
+        let field_bytes = self.builder.ins().ishl_imm_u(field_slot, 3);
+        let field_addr = self.builder.ins().iadd(field_base, field_bytes);
+        let field_bits = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            field_addr,
+            Offset32::new(0),
+        );
+        let is_hole = self.builder.ins().icmp_imm_u(
+            IntCC::Equal,
+            field_bits,
+            crux::value::UNINITIALIZED_BITS as i64,
+        );
+        // The higher-field check: every field above `field_slot` must be an
+        // unwritten hole. `INLINE_FIELDS` is 4, so fields 1..3 always exist
+        // and the loads below are in bounds for any validated slot; field i
+        // only constrains the fill when the fill targets a slot below i
+        // (`hole_i` OR `field_slot >= i`).
+        let gate = self.builder.ins().band(deferred_ok, slot_inline);
+        let mut gate = self.builder.ins().band(gate, is_hole);
+        for i in 1..crux::object::INLINE_FIELDS {
+            let f_bits = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                field_base,
+                Offset32::new((i * std::mem::size_of::<Value>()) as i32),
+            );
+            let f_hole = self.builder.ins().icmp_imm_u(
+                IntCC::Equal,
+                f_bits,
+                crux::value::UNINITIALIZED_BITS as i64,
+            );
+            let at_or_above = self.builder.ins().icmp_imm_u(
+                IntCC::UnsignedGreaterThanOrEqual,
+                field_slot,
+                i as i64,
+            );
+            let f_ok = self.builder.ins().bor(f_hole, at_or_above);
+            gate = self.builder.ins().band(gate, f_ok);
+        }
+        // The prototype-chain gate: the map-cell record carries chain
+        // provenance only from a chain-verified fill (`clean`), and only for
+        // the recording receiver's DIRECT prototype (id, generation). A
+        // fill-time receiver with no prototype (an empty chain) is always
+        // exact; otherwise the live direct prototype must be the same,
+        // unchanged object the clean record captured — a mutation (an
+        // accessor conversion, a defineProperty, a setPrototypeOf) bumps its
+        // generation or changes its identity and declines the fill to the
+        // exact helper, which re-runs the interpreter's full chain check.
+        let proto_handle = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, prototype) as i32),
+        );
+        let no_proto = self.builder.ins().icmp_imm_u(IntCC::Equal, proto_handle, 0);
+        let has_proto = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, proto_handle, 0);
+        let clean = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, clean) as i32),
+        );
+        let clean_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, clean, 0);
+        let clean_gate = self.builder.ins().bor(no_proto, clean_ok);
+        let gate = self.builder.ins().band(gate, clean_gate);
+        // The direct-prototype identity/generation deref checks run only when
+        // a prototype exists (dereferencing the null handle would fault);
+        // the no-proto path defaults the deref gate to true.
+        let gate_var = self.builder.declare_var(types::I8);
+        let deref_var = self.builder.declare_var(types::I8);
+        self.builder.def_var(gate_var, gate);
+        let one = self.builder.ins().iconst(types::I8, 1);
+        self.builder.def_var(deref_var, one);
+        let proto_check = self.builder.create_block();
+        let proto_merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(has_proto, proto_check, &[], proto_merge, &[]);
+        self.builder.switch_to_block(proto_check);
+        let proto_data = self
+            .builder
+            .ins()
+            .iadd_imm_s(proto_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let proto_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            proto_data,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let proto_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            proto_data,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let cell_proto_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, proto_id) as i32),
+        );
+        let cell_proto_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, proto_gen) as i32),
+        );
+        let id_ok = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, proto_id, cell_proto_id);
+        let gen_ok = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, proto_gen, cell_proto_gen);
+        let deref_ok = self.builder.ins().band(id_ok, gen_ok);
+        self.builder.def_var(deref_var, deref_ok);
+        self.builder.ins().jump(proto_merge, &[]);
+        self.builder.switch_to_block(proto_merge);
+        self.builder.seal_block(proto_merge);
+        let gate = self.builder.use_var(gate_var);
+        let deref_ok = self.builder.use_var(deref_var);
+        let gate = self.builder.ins().band(gate, deref_ok);
+        self.builder.ins().brif(gate, fill, &[], fallback, &[]);
+        // The fill: write the field, bump the generation (the interpreter's
+        // `define_fresh` fill bumps; the cells refreshed below are recorded
+        // at the new generation), then refresh the (object id, name) value
+        // cell exactly like the runtime fast-store paths so the
+        // store-then-read pattern stays warm.
+        self.builder.switch_to_block(fill);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), value, field_addr, Offset32::new(0));
+        let live_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let gen1 = self.builder.ins().iadd_imm_u(live_gen, 1);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            gen1,
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let live_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let vcells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+        );
+        let vindex = self.builder.ins().bxor(live_id, name_imm);
+        let vindex = self
+            .builder
+            .ins()
+            .band_imm_u(vindex, (MEMBER_CELLS - 1) as i64);
+        let vindex = self
+            .builder
+            .ins()
+            .imul_imm_s(vindex, std::mem::size_of::<MemberValueCell>() as i64);
+        let vcell = self.builder.ins().iadd(vcells, vindex);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            live_id,
+            vcell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+        );
+        let name_imm32 = self.builder.ins().iconst(types::I32, name as i64);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            name_imm32,
+            vcell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+        );
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            gen1,
+            vcell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+        );
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            value,
+            vcell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
+        );
+        self.builder.ins().jump(ok, &[]);
         Ok(())
     }
 
@@ -3808,24 +4118,32 @@ impl<'a> Lowerer<'a> {
                     self.builder.ins().brif(ok, fast, &[], slow, &[]);
                 } else {
                     // Slice 2: on a value-cell miss a map-described key
-                    // routes through the shared (map id, name) cells to the
-                    // narrow `set_member_slot` write (the helper's own
-                    // writable check is the backstop). Every other shape
-                    // falls to the full assign helper below. Compounds keep
-                    // the old miss-to-helper behavior (their cached old value
-                    // came from the value-cell-validated read).
+                    // routes through the shared (map id, name) cells; the
+                    // vector-free presize-hole fill is served inline
+                    // (`emit_deferred_hole_fill`), and every other shape
+                    // falls to the narrow `set_member_slot` write below (the
+                    // helper's own writable check is the backstop) or the
+                    // full assign helper. Compounds keep the old
+                    // miss-to-helper behavior (their cached old value came
+                    // from the value-cell-validated read).
                     let shape = self.builder.create_block();
                     let shape_hit = self.builder.create_block();
+                    let shape_filled = self.builder.create_block();
                     self.builder.ins().brif(ok, fast, &[], shape, &[]);
                     self.builder.switch_to_block(shape);
                     self.emit_shape_store_probe(object, name_imm, shape_hit, slow)?;
                     self.builder.switch_to_block(shape_hit);
-                    let stored = self.call_slow(
-                        self.sig_set_name,
-                        Helper::SetMemberSlot,
-                        &[object, name_imm, value],
+                    self.emit_deferred_hole_fill(
+                        object,
+                        name_imm,
+                        value,
+                        *name,
+                        fast,
+                        shape_filled,
                     )?;
-                    self.push(stored);
+                    // The machine fill's result is the stored value.
+                    self.builder.switch_to_block(shape_filled);
+                    self.push(value);
                     self.builder.ins().jump(merge, &[]);
                 }
                 // The fast path: the helper writes the property vector in
