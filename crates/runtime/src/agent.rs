@@ -319,6 +319,21 @@ pub struct Agent {
     /// scalar — no trace edges. Boxed per the Cut 27 lesson.
     pub(crate) member_chain_cells:
         Box<[Option<crate::ir::MemberChainCell>; crate::ir::MEMBER_CELLS]>,
+    /// The shape-keyed prototype-chain read cache (Cut 75): like
+    /// `member_chain_cells` but keyed by the RECEIVER'S MAP id instead of
+    /// its object id, so a per-iteration-fresh object (every `new`, every
+    /// fresh-literal method read) shares one cell with every other object on
+    /// the same map — the identity cell can never hit a fresh receiver, and
+    /// each read otherwise pays a full spec [[Get]] (~500ns, measured
+    /// 2026-09-08). The hit re-validates that the CURRENT receiver's map is
+    /// still the recorded one AND that it does not own `name`
+    /// (has_own_property_atom — authoritative for both the deferred
+    /// map-field state and the materialized vector state), then walks the
+    /// recorded links' (id, generation) exactly like the identity cell. `id`
+    /// holds the map id; the hit ignores `generation`. All-scalar — no
+    /// trace edges.
+    pub(crate) member_chain_map_cells:
+        Box<[Option<crate::ir::MemberChainCell>; crate::ir::MEMBER_CELLS]>,
     /// The fronting array-element value cache (Cut 35 slice 13): (id, index,
     /// generation, value) — a hit returns the element with no
     /// property-vector borrow. Boxed per the Cut 27 lesson.
@@ -1008,6 +1023,7 @@ impl Agent {
                     .unwrap_or_else(|_| unreachable!("sized exactly MEMBER_MAP_WRITE_CELLS"))
             },
             member_chain_cells: Box::new(std::array::from_fn(|_| None)),
+            member_chain_map_cells: Box::new(std::array::from_fn(|_| None)),
             array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
             array_length_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],

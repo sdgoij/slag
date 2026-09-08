@@ -7052,6 +7052,104 @@ batteries node-identical across jit/jitless/gc-stress, and the three
 release test262 sweeps at baseline (language 23721/3 skip, built-ins
 23657/155 skip, annexB 1086/1086).
 
+### PROBE: construct_churn decomposition — the mass is the FRESH-RECEIVER chain read, not true defines (measured 2026-09-08)
+
+The largest remaining property-row mass (construct_churn ~453ms jl, 15.6x,
+jit equal) decomposed by isolated jl variants (500k, self-contained
+bench-shaped loops, min-of-2/3; full body ~540ms here matches the row):
+`new Empty()` bare construct ~174ns; `new Item(i)` (2 static this-stores)
+~410ns vs the same data as an ObjectFast literal ~225ns; the corpus's
+`.sum()` method call on the per-iteration-FRESH instance adds ~670ns
+marginal (total ~1.08us), while the SAME `.sum()` call on a fixed
+instance costs ~117ns. The 2 this.x stores are ~in-place (not the
+define-class cost); true defines are NOT the story in this row.
+
+The dominant term is the READ of a prototype property on a fresh
+receiver. The chain-read cache (member_chain_cells) is keyed by receiver
+IDENTITY (object id, name): a per-iteration-fresh object (every
+construct, every fresh-literal method read) can never hit, so each read
+falls to the full spec [[Get]] (context::get_property) then records a
+cell the next fresh object never reuses. Isolated micros (jl, 500k,
+min-of-3): a proto data prop read on a STABLE receiver ~70ns; the same
+read on a per-iteration fresh receiver ~550-660ns (~8x); a fresh
+literal's Object.prototype method read ~570ns over the literal create;
+one warm member CALL o.hasOwnProperty('x') on a stable receiver ~340ns
+vs ~830ns on a fresh receiver. So every fresh-object method/prototype
+read pays ~500-570ns of full-Get that a SHAPE-keyed chain cell would
+serve at the ~70ns warm cost: key the chain cache by the receiver's MAP
+id (validated live; the map pins the own-key set, the recorded links pin
+the chain — the construct_maps presize already gives every Item instance
+the SAME map), exactly the standing "chain-member-read slice (a)" and the
+L1c shape end-state's read application. Expected: construct_churn's
+fresh-receiver read term collapses toward the warm cost; in-suite rows:
+construct_churn, method-call-on-fresh shapes, spread/assign rows.
+
+### LANDED (2026-09-08, uncommitted): the map-keyed chain read cell (Cut 75)
+
+The decomposition's fix, implemented: a second chain-read table
+(`member_chain_map_cells`, same scalar MemberChainCell layout) keyed by
+(receiver MAP id, name) instead of receiver identity, so every fresh
+object on a shared map hits one cell. Recorded in `resolve_chain_cell`
+alongside the identity cell when the receiver carries a map (the found
+link + slot + links are identical to the identity record). The HIT
+re-validates per receiver: the current map is still the recorded one AND
+`!has_own_property_atom(name)` — authoritative for both the deferred
+map-field state and the materialized vector state, so a vector-only own
+`name` (a non-enumerable defineProperty that keeps the map) or an
+accessor-converted / deleted-to-dictionary receiver can never be masked;
+then the shared `chain_cell_read` tail (extracted from the identity
+probe) walks the recorded links' (id, generation) and re-reads the found
+property LIVE, exactly as before. The empty-vector guard from the first
+draft was WRONG (diagnosed with temporary instrumentation: hot
+construct/literal objects are aligned dual-store — vlen == mdesc — never
+vector-empty), and the map-descriptor-membership test alone would miss
+vector-only owns; `has_own_property_atom` covers both. Soundness edges in
+a 16-case battery: non-enumerable vector-only own shadow, accessor
+conversion, delete-to-dictionary, setPrototypeOf replacement, proto
+growth, live proto value updates, proto accessors, map isolation,
+arrays (shared canonical empty map), function receivers (shared
+boilerplate map), 2-link chains, instances that grow off the map,
+churn — node-identical across jit/jitless/gc-stress, plus the
+objlit/vecfree/proto-lazy/objfast/fn batteries. Interleaved flip A/B
+(jl, min-of-3, probe on/off adjacent builds): fresh chain READ ~362 vs
+~179ms (~51%), fresh chain CALL ~423 vs ~240ms (~44%), construct_churn
+full body ~539-542 vs ~235-254ms (~54%, the corpus row ~330ms jl in the
+noisy capture moved ~-19%); stable-receiver and pure-construct controls
+flat. Gates: workspace 32 suites green (re-run on the final source),
+clippy clean, the three release test262 sweeps at baseline (language
+23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086). The fresh-
+receiver prototype-read gap — the dominant term in every method-call-on-
+fresh-object row — is closed; it was the read application of the L1c
+shape end-state and needed no storage migration (the map was already the
+shared shape).
+
+### PROBE: the compiled chain path after Cut 75 — the JIT inherits the map-keyed cell through its slow call; an inline probe is unsound or has no hot case (measured 2026-09-08)
+
+The queued follow-up (emit the chain shape-key inline in machine code so
+a compiled fresh-receiver chain read skips the slow helper) opened with
+its probe. Corpus rows post-Cut-75 (single runs): construct_churn jit
+176ms vs jl 215 (PRE-Cut-75 it was jit 467 > jl 453 — the JIT now LEADS
+jl and both dropped ~55-60%); method_call jit 123 vs jl 175; proto_read
+jit 91 vs jl 147; closure_capture jit 91 vs jl 149. The compiled
+GetMemberName inline probe (Slice 1) covers only OWN reads (value/map
+cells at fixed offsets); a chain miss calls the shared get_member_name,
+which now hits the map-keyed cell — so the compiled path already rides
+Cut 75 and beats the interpreter. The residual compiled fresh-receiver
+method-call cost over a warm receiver (~60ns/read on construct_churn's
+.sum(), V10 jit ~425ns/iter = construct+reads ~290 + fresh call ~135 vs
+warm ~76) is call-shaped, and a compiled INLINE chain probe cannot be
+sound for materialized receivers: own-absence needs the vector scan or
+the deferred map-find (has_own_property_atom) — not inlineable — and a
+def erred-only probe (map pins own-absence there) has no hot beneficiary
+(measured earlier: hot construct/literal receivers are materialized
+vlen==mdesc; deferred receivers in practice are function boilerplate,
+whose chain reads f.apply/f.bind sit on STABLE functions already served
+by the identity cell). Disposition: measured-closed — do not emit a
+compiled chain inline probe; the compiled path's correct shape is the
+slow-call map-chain hit it now has. The remaining construct_churn mass
+is the CONSTRUCT overhead itself (~140-180ns over the ObjectFast literal
+for the same fields) plus the fresh-object method CALL — next lever.
+
 
 ## Deferred milestones
 

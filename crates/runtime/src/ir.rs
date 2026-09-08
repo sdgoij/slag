@@ -3764,42 +3764,94 @@ impl Vm {
         (object_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
     }
 
-    /// The cached prototype-chain member read: returns the value when the
-    /// receiver's id/name/generation and every cached link's (id,
+    /// The cached prototype-chain member read: returns the value when a
+    /// chain cell validates — either the identity-keyed cell (Cut 23/2026-09-
+    /// 01: receiver id/name/generation and every cached link's (id,
     /// generation) still match — an own property appearing on the receiver,
     /// a link's own structural mutation (a define, a delete, a proto
-    /// replacement) bumps a generation and misses. Links below the found
+    /// replacement) bumps a generation and misses) or the map-keyed cell
+    /// (Cut 75: receiver's CURRENT map matches the recorded map id AND it
+    /// does not own `name`, re-checked per hit with `has_own_property_atom`;
+    /// the links are then validated the same way). Links below the found
     /// one cannot shadow its own data property, so the probe never walks
-    /// past the cached links. The resolved value is re-read LIVE from the
-    /// found link (its member value cell when warm, else the recorded
-    /// vector slot): the chain cell caches the resolution, not the value,
-    /// so a VALUE write to the found link's own property — a warm store
-    /// that must not bump the link's generation under the L1c record
-    /// discipline — is always observed. `None` falls back to the full Get
-    /// (which then re-resolves).
+    /// past the cached links. The resolved value is re-read LIVE from
+    /// the found link (its member value cell when warm, else the recorded
+    /// vector slot): the chain cell caches the resolution, not the value, so
+    /// a VALUE write to the found link's own property — a warm store that
+    /// must not bump the link's generation under the L1c record discipline —
+    /// is always observed. `None` falls back to the full Get (which then
+    /// re-resolves).
     fn member_chain_get(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
         let object = Self::cell_object(object)?;
+        // (a) Identity-keyed: the receiver itself re-reads its resolution.
         let index = Self::member_chain_index(object.id(), name);
-        let cell = agent.member_chain_cells[index].as_ref()?;
-        if cell.id != object.id() || cell.name != name {
-            return None;
-        }
-        // The receiver generation is the cheap proof that no own `name`
-        // appeared since the resolution was recorded — but dense element
-        // writes (push/pop/length ops) bump it too, so a stack built with
-        // `push` re-resolves its method reads on every iteration even
-        // though the writes never touch the vector's string keys. For an
-        // Array whose own non-index names live only in the (small)
-        // properties vector, absence of the name is authoritative and
-        // generation-free, so a mismatched stamp need not miss.
-        if cell.generation != object.generation()
-            && !Self::chain_shadow_free_without_generation(&object, name)
+        if let Some(cell) = agent.member_chain_cells[index].as_ref()
+            && cell.id == object.id()
+            && cell.name == name
+            // The receiver generation is the cheap proof that no own `name`
+            // appeared since the resolution was recorded — but dense element
+            // writes (push/pop/length ops) bump it too, so a stack built with
+            // `push` re-resolves its method reads on every iteration even
+            // though the writes never touch the vector's string keys. For an
+            // Array whose own non-index names live only in the (small)
+            // properties vector, absence of the name is authoritative and
+            // generation-free, so a mismatched stamp need not miss.
+            && (cell.generation == object.generation()
+                || Self::chain_shadow_free_without_generation(&object, name))
+            && let Some(value) = Self::chain_cell_read(
+                agent,
+                &object,
+                name,
+                cell.slot,
+                cell.link_count,
+                cell.links,
+            )
         {
-            return None;
+            return Some(value);
         }
+        // (b) Map-keyed (Cut 75): a per-iteration-fresh receiver never hits
+        // the identity cell, so every read pays the full [[Get]]. Any
+        // receiver whose CURRENT map matches the recorded map id SHARES the
+        // recorded resolution when it does not own `name` (re-checked per
+        // hit with `has_own_property_atom` — authoritative for both the
+        // deferred map-field state and the materialized vector state, so a
+        // vector-only or accessor-converted own `name` cannot be masked).
+        // A structural change since the record either transitions the map
+        // (id mismatch), adds an own `name` (the re-check misses), or drops
+        // the object to dictionary mode (map None) — all miss.
+        let map = object.map.get()?;
+        let map_index = Self::member_map_cell_index(map.id(), name);
+        if let Some(cell) = agent.member_chain_map_cells[map_index].as_ref()
+            && cell.id == map.id()
+            && cell.name == name
+            && !object.has_own_property_atom(name)
+            && let Some(value) =
+                Self::chain_cell_read(agent, &object, name, cell.slot, cell.link_count, cell.links)
+        {
+            return Some(value);
+        }
+        None
+    }
+
+    /// The shared chain-cell hit tail: validate the recorded links against
+    /// the receiver's CURRENT prototype chain (walking from the receiver's
+    /// prototype and comparing each link's (id, generation) — a mutation
+    /// anywhere bumps one and misses), then re-read the found property LIVE
+    /// (the found link's member value cell when warm, else the recorded
+    /// vector slot — the slot is stable while the link's generation is
+    /// unchanged, which the walk just validated). `None` on any validation
+    /// miss.
+    fn chain_cell_read(
+        agent: &mut Agent,
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+        slot: usize,
+        link_count: u8,
+        links: [(u64, u32); 2],
+    ) -> Option<Value> {
         let mut link = object.get_prototype_of().ok().flatten();
         let mut found: Option<Handle<crux::object::JsObject>> = None;
-        for (expected_id, expected_gen) in cell.links.iter().take(cell.link_count as usize) {
+        for (expected_id, expected_gen) in links.iter().take(link_count as usize) {
             let current = link?;
             if current.id() != *expected_id || current.generation() != *expected_gen {
                 return None;
@@ -3823,7 +3875,7 @@ impl Vm {
         }
         let key = PropertyKey::String(name);
         let props = found_link.properties.borrow();
-        let (stored, property) = props.get(cell.slot)?;
+        let (stored, property) = props.get(slot)?;
         if *stored != key {
             return None;
         }
@@ -3922,6 +3974,26 @@ impl Vm {
                             link_count: count as u8,
                             links,
                         });
+                        // Cut 75: also record the MAP-keyed chain cell so
+                        // every OTHER fresh object on the same map shares
+                        // this resolution (the identity cell above is
+                        // per-receiver and can never serve a fresh
+                        // instance). The receiver's map is the sharing key;
+                        // each hit re-checks that the CURRENT receiver does
+                        // not own `name` (has_own_property_atom), so only
+                        // the recording instance's own-absence (the entry
+                        // guard above) plus the shared map are baked in.
+                        if let Some(map) = object.map.get() {
+                            let map_index = Self::member_map_cell_index(map.id(), name);
+                            agent.member_chain_map_cells[map_index] = Some(MemberChainCell {
+                                id: map.id(),
+                                name,
+                                generation: object.generation(),
+                                slot,
+                                link_count: count as u8,
+                                links,
+                            });
+                        }
                         // Warm the found link's (link, name) member value
                         // cell: a chain hit re-reads the found property
                         // through that oracle (see `member_chain_get`), so
