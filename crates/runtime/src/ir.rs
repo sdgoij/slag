@@ -6625,52 +6625,63 @@ impl Vm {
                     // Cut 72: the whole-literal fast create — the N value
                     // expressions already pushed (in source order) and this
                     // step pops them, creates the object on the pre-forked
-                    // N-key shape, and adopts the fields in one map set (the
-                    // values are unobservable until the object escapes).
+                    // shape, and adopts the fields (the values are
+                    // unobservable until the object escapes). The first
+                    // INLINE_FIELDS keys adopt vector-free in one map set;
+                    // the tail (a 5th+ key) is defined per-key — its define
+                    // materializes the vector and appends, the same
+                    // end-state the sequential path produces.
                     let n = names.len();
                     let base = self.stack.len() - n;
-                    let mut values = [Value::Undefined; crux::object::INLINE_FIELDS];
-                    for (i, value) in values.iter_mut().enumerate().take(n) {
-                        *value = self.stack[base + i];
-                    }
-                    self.stack.truncate(base);
                     let proto = agent
                         .current_realm()?
                         .intrinsics
                         .object_prototype()
                         .and_then(|value| crate::context::as_object(&value));
                     let object = crux::object::JsObject::ordinary_object_create(proto);
-                    // Resolve the N-key shape from the object's (empty) map —
-                    // the cached child chain shared by every literal with the
-                    // same key sequence — then adopt all fields at once.
-                    let shape = {
-                        let mut shape = object.map.get().ok_or_else(|| {
-                            JsError::new(ErrorKind::TypeError, "fresh object without a map".into())
-                        })?;
-                        let attrs = crux::MapAttrs::new(true, true, true);
-                        for name in names.iter() {
-                            shape = shape
-                                .get_or_create_child(crux::PropertyKey::String(*name), attrs)
-                                .ok_or_else(|| {
-                                    JsError::new(
-                                        ErrorKind::TypeError,
-                                        "cannot fork the literal shape".into(),
-                                    )
-                                })?;
+                    // Resolve the vector-free head shape from the object's
+                    // (empty) map — the cached child chain shared by every
+                    // literal with the same key prefix — then adopt.
+                    let head = n.min(crux::object::INLINE_FIELDS);
+                    let mut shape = object.map.get().ok_or_else(|| {
+                        JsError::new(ErrorKind::TypeError, "fresh object without a map".into())
+                    })?;
+                    let attrs = crux::MapAttrs::new(true, true, true);
+                    for name in names.iter().take(head) {
+                        shape = shape
+                            .get_or_create_child(crux::PropertyKey::String(*name), attrs)
+                            .ok_or_else(|| {
+                                JsError::new(
+                                    ErrorKind::TypeError,
+                                    "cannot fork the literal shape".into(),
+                                )
+                            })?;
+                    }
+                    let mut values = [Value::Undefined; crux::object::INLINE_FIELDS];
+                    for (i, value) in values.iter_mut().enumerate().take(head) {
+                        *value = self.stack[base + i];
+                    }
+                    if object.adopt_vector_free_fields(shape, &values[..head]) {
+                        for (name, value) in
+                            names[head..].iter().zip(&self.stack[base + head..base + n])
+                        {
+                            object.create_data_property_key(
+                                &crux::PropertyKey::String(*name),
+                                *value,
+                            )?;
                         }
-                        shape
-                    };
-                    if !object.adopt_vector_free_fields(shape, &values[..n]) {
+                    } else {
                         // Defensive fallback (the fresh-object guards hold, so
                         // this is unreachable): define sequentially — the same
                         // result, one key at a time.
-                        for (name, value) in names.iter().zip(&values[..n]) {
+                        for (name, value) in names.iter().zip(&self.stack[base..base + n]) {
                             object.create_data_property_key(
                                 &crux::PropertyKey::String(*name),
                                 *value,
                             )?;
                         }
                     }
+                    self.stack.truncate(base);
                     self.stack.push(Value::Object(object));
                 }
                 Step::ObjectInitName {
@@ -12388,8 +12399,11 @@ pub(crate) fn array_set(array: &Value, key: &str, value: Value) -> Result<(), Js
 ///
 /// Cut 72: whether a whole literal can take the `ObjectFast` batch path —
 /// every property is an `Init` with a static, non-`__proto__`, unique key
-/// and a value that needs no SetFunctionName, at most `INLINE_FIELDS`
-/// keys. Returns the keys in source order.
+/// and a value that needs no SetFunctionName. Returns the keys in source
+/// order. The first `INLINE_FIELDS` keys are adopted vector-free; longer
+/// literals' remaining keys fall to the per-key define inside the executor
+/// (the 5th define materializes the vector — the same end-state as the
+/// sequential path).
 fn fast_object_names(literal: &ObjectLiteral) -> Option<Box<[crux::AtomId]>> {
     let mut names: Vec<crux::AtomId> = Vec::with_capacity(literal.props.len());
     for property in &literal.props {
@@ -12427,7 +12441,7 @@ fn fast_object_names(literal: &ObjectLiteral) -> Option<Box<[crux::AtomId]>> {
         }
         names.push(id);
     }
-    if names.is_empty() || names.len() > crux::object::INLINE_FIELDS {
+    if names.is_empty() {
         return None;
     }
     Some(names.into_boxed_slice())

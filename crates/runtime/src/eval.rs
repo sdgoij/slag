@@ -2959,7 +2959,9 @@ mod tests {
         );
         // Boundary exclusions stay on the step path: duplicate keys
         // (last-wins in place), __proto__ (the setter), computed keys,
-        // methods, anonymous-function set_name, and > INLINE_FIELDS keys.
+        // methods, and anonymous-function set_name. A > INLINE_FIELDS-key
+        // literal takes the fast path too — the first four keys adopt
+        // vector-free and the tail defines materialize the vector.
         assert_eq!(
             run("(function () { var d = { a: 1, a: 2 }; return d.a + Object.keys(d).length; })()")
                 .unwrap(),

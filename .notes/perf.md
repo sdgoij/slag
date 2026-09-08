@@ -6852,7 +6852,7 @@ DeclarativeEnv GC box itself (Handle::new of the 5-RefCell struct) — a
 dedicated slim per-iteration env variant would harvest more but carries
 the EnvRecord match-site churn; deferred.
 
-### LANDED (2026-09-08, uncommitted): the whole-simple object literal takes the `ObjectFast` batch path (Cut 72)
+### LANDED (2026-09-08, commit 1efedbd): the whole-simple object literal takes the `ObjectFast` batch path (Cut 72)
 
 The "destructure" workload (832ms, 19.5x — the third-largest jl mass) is
 object-literal creation: a fresh `{a,b,c:{d}}` + reads costs ~400ns/iter
@@ -6889,9 +6889,34 @@ post-materialize growth) is node-identical across jit/jitless/gc-stress;
 a new eval.rs regression test covers ordering + the boundary exclusions.
 Gates: workspace 32 suites green, clippy clean, all three release test262
 sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip,
-annexB 1086/1086). Follow-ups: fuse multi-key runs WITHIN mixed literals
-(a run of batchable props between slow props), and >4-key shapes (the
-5th+ key materializes the vector after a 4-key adopt).
+annexB 1086/1086). Follow-up: fuse multi-key runs WITHIN mixed literals
+(a run of batchable props between slow props).
+
+### LANDED (2026-09-08, uncommitted): the ObjectFast batch path extends past INLINE_FIELDS keys (Cut 72 follow-up)
+
+The >4-key follow-up: `fast_object_names` no longer caps at
+`INLINE_FIELDS`, so a whole-simple literal of ANY length takes the batch
+path (the gate is now just uniqueness/static-key/__proto__/set_name — no
+length bound). The interpreter executor splits the work: the first
+`min(n, INLINE_FIELDS)` keys fork the head shape from the empty map and
+adopt vector-free in one map set, then each tail key defines via
+`create_data_property_key` — the 5th define materializes the vector and
+appends, the identical end-state the sequential path produced (and the
+≤4 landing already proved for post-adopt growth), so the tail needs no
+new machinery. The defensive sequential fallback is unchanged. The JIT
+expansion always iterated every name, so JIT bodies were already
+>4-capable and stay flat. Interleaved release A/B jl vs the capped parent
+(min-of-3, recorded in-session): f6 (6-key churn) -22-35%, f8 -18-33%;
+re-measured on the final tree, f6 churn lands ~126-150ms/200k iters jl.
+Gates: workspace 32 suites green, clippy clean, a 23-case >4-key battery
+(5/8-key values+order, growth/delete/readd after materialize,
+integer-like keys interleaved, tail side-effect order, nested >4,
+`__proto__: null`, descriptors, and the duplicate/computed/method/anon-fn/
+spread/accessor exclusions at the boundary) node-identical across
+jit/jitless/gc-stress, the objlit/vecfree/proto-lazy batteries
+node-identical, all three release test262 sweeps at baseline (language
+23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086). Next: fuse
+multi-key runs WITHIN mixed literals.
 
 
 ## Deferred milestones
