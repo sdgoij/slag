@@ -4459,12 +4459,26 @@ impl Vm {
     ) -> bool {
         // A receiver with NO own properties has no vector slot and no pinned
         // field a store cell could address — the map/direct probes below are
-        // doomed. A fresh constructor `this` before its first field store is
-        // the hot case (every `this.x =` define pays this fallback before the
-        // fast fresh-define path); a store cell can only be valid for a
-        // non-empty vector (records resolve a real slot), so skipping is
-        // exact, not just a fast path.
+        // doomed. The vector-free (deferred) state is the hot case: its own
+        // properties live as written map fields, so an in-place update on a
+        // written, writable described field is a direct field write under
+        // the L1c no-bump discipline (no vector to touch, nothing to
+        // record); a hole (an absent property — the store is a fresh define
+        // the fast fresh-define path handles) or a non-writable descriptor
+        // falls through to the full [[Set]].
         if object.properties.borrow().is_empty() {
+            let key = PropertyKey::String(name);
+            if object.deferred_field_write(&key, value) {
+                let generation = object.generation();
+                let read_index = Self::member_cell_index(object.id(), name);
+                agent.member_value_cells[read_index] = MemberValueCell {
+                    id: object.id(),
+                    name,
+                    generation,
+                    value,
+                };
+                return true;
+            }
             return false;
         }
         Self::warm_store_map_put(agent, object, name, value)

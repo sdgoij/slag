@@ -2442,10 +2442,16 @@ impl JsObject {
         // the map instead of materializing — the typed-array and chain
         // callers probe presence on hot read paths.
         if self.props_deferred.get() {
-            return self
-                .map
-                .get()
-                .is_some_and(|m| m.find(&PropertyKey::String(name)).is_some());
+            let Some(map) = self.map.get() else {
+                return false;
+            };
+            let Some(ord) = map.find(&PropertyKey::String(name)) else {
+                return false;
+            };
+            // A descriptor is an own property only once its field is
+            // written: a constructor-presize descriptor the body skipped is
+            // a hole (absent), never an own property.
+            return self.field_written(ord);
         }
         let key = PropertyKey::String(name);
         self.properties
@@ -2901,15 +2907,49 @@ impl JsObject {
         Some((map.id(), offset))
     }
 
+    /// The vector-free (deferred) in-place value update: when `key` is a
+    /// map-described own data property — its field written, the descriptor
+    /// writable — mirror `value` into the field and return true. A deferred
+    /// object has no vector slot to record a store cell against, so the
+    /// caller re-probes per store (no cell is returned). False for a hole
+    /// (an absent property: the store is a fresh define, not an update), a
+    /// non-writable descriptor (length/caller/arguments boilerplate — the
+    /// full [[Set]] must enforce the writability outcome), or any
+    /// non-deferred object (the vector-scan paths serve those).
+    pub fn deferred_field_write(&self, key: &PropertyKey, value: Value) -> bool {
+        if !self.props_deferred.get() {
+            return false;
+        }
+        let Some(map) = self.map.get() else {
+            return false;
+        };
+        let Some(ord) = map.find(key) else {
+            return false;
+        };
+        let Some((_, offset, attrs)) = map.descriptor_at(ord) else {
+            return false;
+        };
+        if offset >= INLINE_FIELDS
+            || !attrs.writable()
+            || self.in_fields[offset].get().is_uninitialized()
+        {
+            return false;
+        }
+        self.in_fields[offset].set(value);
+        true
+    }
+
     /// Rebuild `properties` from the map descriptors and clear the
     /// `props_deferred` bit (Option-3 vector-free exit). While the bit is
     /// set the vector is empty and NOT authoritative: every own property is
     /// a map descriptor (with the descriptor's own attrs at an ordinal <
     /// `INLINE_FIELDS`) whose value is live in `in_fields[ordinal]`.
     /// Materializing reproduces
-    /// exactly the vector the defines would have pushed — the descriptors in
-    /// order (the map forked down its transition chain in define order) with
-    /// the field values — so every structural consumer that reads the vector
+    /// exactly the vector the defines would have pushed — the written
+    /// descriptors in order (the map forked down its transition chain in
+    /// define order; a constructor-presize descriptor the body never wrote
+    /// is a hole and contributes nothing) with the field values — so every
+    /// structural consumer that reads the vector
     /// (enumeration, delete, redefinition, slot resolution) sees the same
     /// object a never-deferred build would have. The map is unchanged (it
     /// keeps describing the same shape, now aligned with the vector), so the
@@ -2933,14 +2973,17 @@ impl JsObject {
             let Some((key, offset, attrs)) = map.descriptor_at(i) else {
                 break;
             };
-            let value = match offset < INLINE_FIELDS {
-                true => self.in_fields[offset].get(),
-                false => break,
-            };
-            // The deferred invariant: no field is ever left unset, so an
-            // uninitialized field here would mean a violated invariant, not a
-            // legitimate hole.
-            debug_assert!(!value.is_uninitialized());
+            if offset >= INLINE_FIELDS {
+                break;
+            }
+            let value = self.in_fields[offset].get();
+            if value.is_uninitialized() {
+                // A presize hole the body never wrote: not an own property,
+                // so the rebuild skips it (a fully-written deferred object
+                // has no holes — every descriptor was created by a define
+                // that also wrote the field).
+                continue;
+            }
             rebuilt.push((
                 key,
                 Property::data(
@@ -3245,6 +3288,25 @@ impl JsObject {
         true
     }
 
+    /// Whether a map-described key (whose descriptor `ord` `Map::find`
+    /// returned) is an own property in the vector-free state: its field must
+    /// be written. A constructor-presize descriptor the body never wrote is
+    /// a hole (absent), never an own property — the distinction the deferred
+    /// presence probes enforce now that presize objects can enter the
+    /// deferred state.
+    fn field_written(&self, ord: usize) -> bool {
+        ord < INLINE_FIELDS && !self.in_fields[ord].get().is_uninitialized()
+    }
+
+    /// Whether any descriptor above `ord` (in ordinal order) holds a written
+    /// field. The deferred rebuild emits written descriptors in ordinal
+    /// order, which equals creation order only while writes ascend the
+    /// ordinals, so a hole fill below an already-written descriptor must
+    /// leave the vector-free state first (see `define_fresh`).
+    fn higher_field_written(&self, map: &Handle<Map>, ord: usize) -> bool {
+        (ord + 1..map.descriptor_count()).any(|higher| self.field_written(higher))
+    }
+
     /// The shared Option-3 vector-free fresh define (both the all-true
     /// CreateDataProperty form and the explicit-attrs boilerplate form): an
     /// ordinary object whose vector is empty and whose map describes only
@@ -3274,25 +3336,38 @@ impl JsObject {
             return false;
         }
         let attrs = MapAttrs::new(writable, enumerable, configurable);
-        // Entry stays canonical-empty (empty map + empty vector): the
-        // vector-free machinery reads presence as field-set and materialize
-        // assumes no unwritten pre-described holes, so constructor-presize
-        // objects (a non-empty map with unwritten fields) must not enter.
+        // Deferred (vector-free) service: keep map + in_fields as the only
+        // store while every own property is a field-addressed descriptor.
+        // Entry is the first define on a vector-empty object — either the
+        // canonical empty map (a fresh literal or boilerplate object) or a
+        // constructor-boilerplate presize map (a non-empty map pre-
+        // describing in-object holes, B5.4). While deferred a fill of a
+        // described key or a fresh transition below `INLINE_FIELDS` writes
+        // the field with NO authoritative-vector push; a fresh key on a full
+        // map materializes first and appends through the standard path
+        // below (its storage is the vector).
         if let Some(map) = self.map.get()
-            && (self.props_deferred.get()
-                || (self.properties.borrow().is_empty() && map.is_empty()))
+            && (self.props_deferred.get() || self.properties.borrow().is_empty())
         {
-            if map.find(key).is_some() {
-                // A duplicate define on a described key (only reachable by a
-                // direct caller — presence probes catch duplicates before
-                // this): the property already exists, so a field update is
-                // the whole store.
-                self.props_deferred.set(true);
-                let _ = self.map_set(key, value);
-                self.bump_generation();
-                return true;
-            }
-            if map.descriptor_count() < INLINE_FIELDS {
+            if let Some(ord) = map.find(key) {
+                // A map-described key. On the presize entry path the
+                // descriptor may still be an unwritten hole — filling it is
+                // a fresh define, not a duplicate update. Vector-free
+                // exactness: the deferred rebuild emits written descriptors
+                // in ordinal order, which equals creation order only while
+                // writes ascend the descriptor ordinals, so a hole fill that
+                // lands BELOW an already-written descriptor materializes
+                // first (the rebuild preserves creation order so far) and
+                // appends through the standard path in execution order.
+                let written = self.field_written(ord);
+                if written || !self.higher_field_written(&map, ord) {
+                    self.props_deferred.set(true);
+                    let _ = self.map_set(key, value);
+                    self.bump_generation();
+                    return true;
+                }
+                self.materialize_properties();
+            } else if map.descriptor_count() < INLINE_FIELDS {
                 if self.map_add_property_cell(key.clone(), attrs).is_some() {
                     // Transition to the fresh descriptor and write the field.
                     self.props_deferred.set(true);
@@ -3302,10 +3377,10 @@ impl JsObject {
                 }
                 // The map could not fork (a shared-handle mutation limit):
                 // fall through to the standard append with the flag clear.
-            } else if self.props_deferred.get() {
-                // Deferred with a full map and a fresh key: the next
+            } else {
+                // Deferred/presize with a full map and a fresh key: the next
                 // descriptor would address the vector at ordinal
-                // `INLINE_FIELDS`, which the deferred state has never
+                // `INLINE_FIELDS`, which the vector-free state has never
                 // pushed — materialize and append normally below.
                 self.materialize_properties();
             }
@@ -5805,14 +5880,13 @@ mod tests {
     }
 
     #[test]
-    fn presized_object_never_enters_the_vector_free_state() {
+    fn presized_object_enters_vector_free_state_on_first_define() {
         // Constructor-boilerplate presize starts the object on a map that
         // ALREADY describes the body's fields, with the vector empty and the
-        // fields unwritten. That is exactly the state inference would
-        // confuse with a vector-free object (a hole is not an own property),
-        // so the define path must NOT enter the deferred state on it: the
-        // first store pushes to the vector, and an unwritten pre-described
-        // key stays absent.
+        // fields unwritten. The first body store enters the deferred state
+        // (hole-aware: a described key is an own property only once its
+        // field is written), so fills write fields with NO authoritative-
+        // vector push — the presize store fast path.
         let map = canonical_empty_map(None);
         let mut map = map;
         let m1 = map
@@ -5824,14 +5898,13 @@ mod tests {
             .unwrap();
         let obj = JsObject::ordinary_object_create_with_map(None, m2);
         assert!(!obj.props_deferred.get());
-        // Defining the pre-described key a writes the field and pushes; the
-        // unwritten pre-described b is still NOT an own property (a hole).
+        assert!(obj.properties.borrow().is_empty());
+        // Defining the pre-described key a enters the deferred state: the
+        // fill writes the field, the vector stays empty, and the unwritten
+        // pre-described b is still NOT an own property (a hole).
         assert!(obj.fresh_data_define(&PropertyKey::from_utf8("a"), Value::Number(1.0)));
-        assert!(
-            !obj.props_deferred.get(),
-            "presized objects never enter the deferred state"
-        );
-        assert_eq!(obj.properties.borrow().len(), 1);
+        assert!(obj.props_deferred.get());
+        assert_eq!(obj.properties.borrow().len(), 0);
         assert!(
             obj.has_own_property_key(&PropertyKey::from_utf8("a"))
                 .unwrap()
@@ -5841,13 +5914,173 @@ mod tests {
                 .unwrap(),
             "an unwritten presized field is a hole, not an own property"
         );
-        // A fresh key beyond the presize transitions (aligned) and pushes.
-        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("c"), Value::Number(3.0)));
+        // Filling b stays deferred (ascending descriptor order).
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("b"), Value::Number(2.0)));
+        assert!(obj.props_deferred.get());
+        assert_eq!(obj.properties.borrow().len(), 0);
+        assert!(
+            obj.has_own_property_key(&PropertyKey::from_utf8("b"))
+                .unwrap()
+        );
+        // Enumeration materializes the written descriptors in ordinal order
+        // (== creation order for in-order fills) and skips nothing here.
+        assert_eq!(
+            obj.own_property_keys().unwrap(),
+            vec![PropertyKey::from_utf8("a"), PropertyKey::from_utf8("b")]
+        );
+        assert!(!obj.props_deferred.get());
         assert_eq!(obj.properties.borrow().len(), 2);
+    }
+
+    #[test]
+    fn presize_hole_stays_absent_and_materialize_skips_it() {
+        // A presize body may skip a field conditionally: the hole reads
+        // absent (falls through to the prototype / reads as no own
+        // property), and materializing enumerates only the written keys.
+        let map = canonical_empty_map(None);
+        let mut map = map;
+        let m1 = map
+            .get_or_create_child(PropertyKey::from_utf8("x"), MapAttrs::new(true, true, true))
+            .unwrap();
+        let mut m1 = m1;
+        let m2 = m1
+            .get_or_create_child(PropertyKey::from_utf8("y"), MapAttrs::new(true, true, true))
+            .unwrap();
+        let obj = JsObject::ordinary_object_create_with_map(None, m2);
+        // Only y is written: x stays a hole below it (still ascending — a
+        // single write).
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("y"), Value::Number(9.0)));
+        assert!(obj.props_deferred.get());
+        assert!(
+            !obj.has_own_property_key(&PropertyKey::from_utf8("x"))
+                .unwrap()
+        );
+        assert!(
+            obj.has_own_property_key(&PropertyKey::from_utf8("y"))
+                .unwrap()
+        );
+        assert_eq!(
+            obj.get_key(&PropertyKey::from_utf8("x")).unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            obj.own_property_keys().unwrap(),
+            vec![PropertyKey::from_utf8("y")]
+        );
+        assert_eq!(obj.properties.borrow().len(), 1);
+        // Filling the earlier hole now (descending: y is already written)
+        // materializes first and appends in execution order.
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+        assert!(!obj.props_deferred.get());
+        assert_eq!(
+            obj.own_property_keys().unwrap(),
+            vec![PropertyKey::from_utf8("y"), PropertyKey::from_utf8("x")]
+        );
+    }
+
+    #[test]
+    fn presize_fresh_keys_transition_then_overflow_materializes_and_appends() {
+        // A body may write keys the pattern did not record: while the map
+        // has room below INLINE_FIELDS they transition (still vector-free);
+        // a fresh key on a full map materializes the written prefix
+        // (skipping the unwritten b hole) and appends through the standard
+        // path (its storage is the vector).
+        let map = canonical_empty_map(None);
+        let mut map = map;
+        for name in ["a", "b"] {
+            map = map
+                .get_or_create_child(
+                    PropertyKey::from_utf8(name),
+                    MapAttrs::new(true, true, true),
+                )
+                .unwrap();
+        }
+        let obj = JsObject::ordinary_object_create_with_map(None, map);
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("a"), Value::Number(1.0)));
+        // Fresh keys beyond the presize transition below the field cap.
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("c"), Value::Number(3.0)));
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("d"), Value::Number(4.0)));
+        assert!(obj.props_deferred.get());
+        assert_eq!(obj.properties.borrow().len(), 0);
         assert!(
             obj.has_own_property_key(&PropertyKey::from_utf8("c"))
                 .unwrap()
         );
+        assert!(
+            !obj.has_own_property_key(&PropertyKey::from_utf8("b"))
+                .unwrap()
+        );
+        // The map is now full (a,b,c,d); a 5th fresh key materializes the
+        // written prefix and appends vector-only.
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("e"), Value::Number(5.0)));
+        assert!(!obj.props_deferred.get());
+        assert_eq!(
+            obj.own_property_keys().unwrap(),
+            vec![
+                PropertyKey::from_utf8("a"),
+                PropertyKey::from_utf8("c"),
+                PropertyKey::from_utf8("d"),
+                PropertyKey::from_utf8("e"),
+            ]
+        );
+        assert!(
+            obj.has_own_property_key(&PropertyKey::from_utf8("e"))
+                .unwrap()
+        );
+        assert!(
+            !obj.has_own_property_key(&PropertyKey::from_utf8("b"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn deferred_field_write_updates_only_written_writable_described_fields() {
+        // The runtime's warm-store fallback on a vector-free receiver uses
+        // this: an in-place value update on a written, writable,
+        // map-described field. A hole (absent property), a non-writable
+        // descriptor, and a non-deferred object all decline so the full
+        // [[Set]] runs.
+        let map = canonical_empty_map(None);
+        let mut map = map;
+        let m1 = map
+            .get_or_create_child(PropertyKey::from_utf8("w"), MapAttrs::new(true, true, true))
+            .unwrap();
+        let mut m1 = m1;
+        // rw: writable; ro: non-writable (a length-style boilerplate key).
+        let m2 = m1
+            .get_or_create_child(
+                PropertyKey::from_utf8("ro"),
+                MapAttrs::new(false, true, true),
+            )
+            .unwrap();
+        let obj = JsObject::ordinary_object_create_with_map(None, m2);
+        let w = PropertyKey::from_utf8("w");
+        let ro = PropertyKey::from_utf8("ro");
+        // Before any fill the fields are holes: an update must decline (the
+        // store is a define).
+        assert!(!obj.deferred_field_write(&w, Value::Number(1.0)));
+        // Fill both fields through defines (w writable, ro not).
+        assert!(obj.fresh_data_define(&w, Value::Number(1.0)));
+        assert!(obj.fresh_data_define(&ro, Value::Number(2.0)));
+        // In-place update on the writable field writes the field, keeps the
+        // deferred state (no vector materializes), and does not bump.
+        let generation = obj.generation();
+        assert!(obj.deferred_field_write(&w, Value::Number(7.0)));
+        assert_eq!(obj.map_get(&w), Some(Value::Number(7.0)));
+        assert!(obj.props_deferred.get());
+        assert_eq!(obj.properties.borrow().len(), 0);
+        assert_eq!(obj.generation(), generation, "no bump on a value write");
+        // A non-writable described field declines.
+        assert!(!obj.deferred_field_write(&ro, Value::Number(9.0)));
+        assert_eq!(obj.map_get(&ro), Some(Value::Number(2.0)));
+        // An undescribed key declines.
+        assert!(!obj.deferred_field_write(&PropertyKey::from_utf8("other"), Value::Number(1.0)));
+        // A non-deferred (materialized) object declines: the vector-scan
+        // paths serve it.
+        let _ = obj.own_property_keys().unwrap();
+        assert!(!obj.props_deferred.get());
+        assert!(!obj.deferred_field_write(&w, Value::Number(8.0)));
+        assert_eq!(obj.map_get(&w), Some(Value::Number(7.0)));
     }
 
     #[test]

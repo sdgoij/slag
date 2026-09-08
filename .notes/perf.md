@@ -7186,6 +7186,114 @@ lever: that store-path slice (recognize a presized hole and fill it
 without the dual-store push), which the vector-free machinery is the
 precedent for.
 
+### LANDED (2026-09-08): presize objects enter the vector-free state on their first define — the presized-hole store fill (Cut 76's queued next lever)
+
+Cut 76's presize made the map describe the constructor's fields up front,
+but a store to a map-described-but-unset field still ran the full define
+(field write + vector Property push + generation bump): the vector-free
+branch of define_fresh required props_deferred, and a presize object's map
+is non-empty from birth, so it never entered. This slice removes the
+dual-store push: the first define on a vector-empty object now enters the
+deferred state whether the map is empty (the canonical path) or a
+constructor-presize map (B5.4), so a fill of a described hole — or a
+fresh-key transition below INLINE_FIELDS — is a field write with NO
+authoritative-vector push. The object leaves the constructor vector-free;
+reads of written fields serve from in_fields/member cells, unwritten
+presize fields stay holes (absent), and the map + fields remain the only
+store until a structural consumer (enumeration, delete, redefine, slot
+resolution) materializes.
+
+Hole-aware machinery (presize descriptors can be unwritten, unlike the
+canonical-empty deferred state where every descriptor was created by a
+define that wrote its field):
+- `has_own_property_atom`'s deferred arm now tests field-written (map
+  describes AND the field holds a real value), not just map membership —
+  the Cut-75 chain-cell validation gets the true own-answer for a
+  described-but-unwritten key.
+- `materialize_properties` skips unwritten descriptors when rebuilding the
+  vector (a presize hole contributes no own property); the debug_assert
+  that no field is ever unset is gone.
+- Exactness gate in `define_fresh`: the deferred rebuild emits written
+  descriptors in ORDINAL order, which equals creation order only while
+  writes ascend the descriptor ordinals, so a hole fill that lands BELOW an
+  already-written descriptor (an out-of-order execution — a nested
+  this-store in an RHS, a branch that stores later fields first)
+  materializes first (the rebuild preserves creation order so far) and the
+  fill appends through the standard path in execution order. Conditional
+  skips (a mid-chain hole) stay vector-free safely: the rebuild skips them.
+
+Measured (release, jl; the pre-change binary is the clean Cut-76 HEAD, the
+same construct_store_probe file run ~40 min apart with the literal
+controls flat — C0/C1 ~within the ~7% drift band, so the multi-field rows
+are the signal): 500k constructs + reads, C2 (2 fields) 203-215 -> 179-186
+ms (-13%), C3 335-363 -> 236-242 (-32%), C4 445-447 -> 291-303 (-33%),
+C0 (no-field control) 114-118 -> 106-110, C1 ~130 -> ~125, L1/L2 literal
+controls 79-80/111-115 -> 79-80/109-110. construct_decomp4 (500k, jl):
+V11 (2-field + own reads) 195 -> 176-177 (-10%), V10-full (2-field + fresh
+.sum()) 250 -> 229-230 (-8%). Jit rows on the same probes are flat
+(pre-existing jit-vs-jl divergence on construct rows, below). Corpus
+re-baseline (37 workloads, --corpus, results identical to the
+corpus_cut75b_jl.tsv capture at HEAD 36d6260): every row improved
+0.63-0.99 (machine ~10-15% cooler); construct_churn 275.6 -> 171-179 ms
+stably (3 runs; bundles Cut 76's ~5-8% + this slice + drift); the top
+movers are the fresh-object/construct family (construct_churn 0.63,
+direct_leaf 0.72, spread_assign 0.72, generator_loop 0.73, try_catch 0.75,
+for_in 0.76, template-literal 0.78, destructure 0.78), controls flat.
+
+Gates: crux 227 tests green (the old presized_object_never_enters test
+rewritten to presized_object_enters_vector_free_state_on_first_define,
+plus presize_hole_stays_absent_and_materialize_skips_it and
+presize_fresh_keys_transition_then_overflow_materializes_and_appends),
+workspace 32 suites green, clippy `-D warnings` clean, eleven node-parity
+batteries node-identical across jit/jitless/--gc-stress — the constructor
+battery extended with 12 new cases exercising the changed surface
+(out-of-order execution via a nested RHS this-store keeps creation order,
+hasOwnProperty/`in`/getOwnPropertyDescriptor on a skipped hole vs a
+filled field, conditional skip then a post-construct fill, an interleaved
+fresh key between presize fields, delete/re-add of a presized field, a 5th
+key past a 4-field presize, for-in over deferred presize objects,
+Object.assign growth, post-construct overwrite, non-writable sloppy no-op,
+non-writable strict throw) — and the three release test262 sweeps at
+baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang), re-run on the final tree after the follow-up below.
+
+Follow-ups (not this slice): the jit construct-row divergence — jit is
+~2.7-5x SLOWER than jl on construct-heavy rows at HEAD (corpus
+construct_churn jit 431 vs jl 173 in the re-baseline; scratch V10-full jit
+~1173 vs jl ~229) — pre-existing (flat across this slice's before/after
+probes) and uncharacterized: the compiled leaf-constructor body's member
+stores route through the compiled set_member_slot shape gate, which on a
+fresh presize-deferred this (empty vector) falls to the full store helper
+per store, so the compiled path does not inherit the deferred fill. A
+compiled-store arm for a map-pinned deferred field is the jit-side of this
+same lever.
+
+### Follow-up LANDED in the same change: the deferred in-place field-write arm in the runtime's warm-store fallback
+
+The deferred state this slice introduces left one regression vector: a
+post-construct warm store on a fresh presize-deferred object (a
+construct-then-store-per-iteration loop) fell through the empty-vector
+store-cell bail to fast_fresh_store's existing check (field written → not
+fresh) and then the FULL [[Set]], which materialized the object — ~one
+full [[Set]] per object where the pre-deferred dual-store path had served
+the same store via warm_store_direct_put. Measured (release, jl, 500k
+construct+2-post-construct-stores, construct_poststore_probe): V1 325-340
+ms vs the store-in-body twin V2 ~175. Fix: warm_store_fallback's
+empty-vector branch now tries `JsObject::deferred_field_write` (new crux
+helper: the map describes the key, its field is written, and the
+descriptor is WRITABLE — length/caller/arguments and accessor-converted
+descriptors decline, so the full [[Set]] still enforces the writability
+outcome), which mirrors the value into the field under the L1c no-bump
+discipline (no vector slot exists, so no store cell is recorded — each
+store re-probes) and fronts the read value cell. V1 -> 196-218 ms
+(~= V2's 175-184). Batteries extended with post-overwrite,
+non-writable-sloppy-no-op, and non-writable-strict-throw cases,
+node-identical across jit/jitless/--gc-stress; workspace + clippy green,
+and the three release sweeps re-run at baseline on the final tree.
+
+
+
 
 ## Deferred milestones
 
