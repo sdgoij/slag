@@ -7347,6 +7347,50 @@ and the construct rows' residual is the ~150ns bare-construct overhead
 (new Empty vs a literal) plus fresh-object method-call machinery.
 
 
+### LANDED (2026-09-09, uncommitted): stabilize the --jit-bench protocol for allocation-heavy rows
+
+The suite's `string concat` row (s += 'x' x100k, a 100k-node rope build per
+call) reported wildly unstable jit/interp ratios on a clean binary: 0.41-2.86
+across consecutive runs (spread ~2.5), where every other row was stable at
+<=0.11. Root cause: the row is GC-bound and the mark-sweep collector's rare,
+LARGE pauses (safe-point gated, not per-allocation) land inside unlucky
+single calls and double them; `bench_once` timed only 3 single calls after 2
+warmups (min), so whichever column caught a pause lost. A robust 30-call
+in-process measurement showed the true steady state is jit FASTER (jit ~2-4ms
+vs jl ~4-6ms per build); the suite's single-call protocol was bimodal, not
+the engine. (A false alarm along the way: an env-var counter added inside
+the concat helper for call counting inflated jit ~10ms — ~100ns/call x 100k
+— removed; the tree is clean.)
+
+Fixes in `bench_once` + `run_jit_benchmarks` (crates/cli/src/main.rs):
+1. Timed samples are now batched to a 100ms floor (`SAMPLE_FLOOR`, the
+   corpus runner's existing `batch_target` mechanism) so each sample spans
+   ~25+ calls and the row's own GC cadence is amortized into every sample.
+   Rows whose single call clears the floor (reps = 1, e.g. the buildString
+   rows) are unchanged. The same row now reads ~0.67-0.95 across runs (jit
+   consistently ahead, no parity/slower outliers) and the suite's worst
+   spread drops from ~2.5 to ~0.3. Suite cost: ~2.5s -> ~9-11s.
+2. A forced collection right after `Context::new`: the crux heap is
+   thread-global and shared across the suite's rows, so the previous row's
+   garbage would otherwise set the allocation-heavy row's first-collection
+   point. Every row now starts from a bounded heap.
+3. The differential value is captured from a call after the identical
+   WARMUP prefix instead of the last timed call: batching sizes `reps` from
+   each column's probe, so a STATEFUL bench (compound assign mutates its
+   argument object) would otherwise sit at a different state per column and
+   false-flag `MISMATCH` (observed once at 100ms batching).
+
+Verified: clippy `-D warnings` clean, workspace 32 suites green, and the
+corpus sweep's 37 workload results are byte-identical to the pre-change
+capture (bench_once is shared; the corpus keeps its own 20ms floor). The
+amortized values for the non-allocating rows are unchanged (mean = min
+there); the allocation rows now report their amortized steady per-call,
+which is the representative number. Follow-ups if ever needed: a per-row
+variance probe to batch only noisy rows (saves the suite time), or a
+host-forced collection between timed samples (measured neutral-to-worse:
+the fresh collection threshold makes every batch pay an extra early GC).
+
+
 
 ## Deferred milestones
 

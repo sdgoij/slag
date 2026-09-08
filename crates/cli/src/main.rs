@@ -557,6 +557,20 @@ fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
 /// code agrees with the interpreter.
 #[cfg(feature = "jit")]
 fn run_jit_benchmarks() -> Result<(), u8> {
+    // Timed samples are batched to this floor (bench_once's `batch_target`):
+    // a sample shorter than the floor would be a single call, and the
+    // allocation-heavy rows (string concat builds a 100k-node rope per call)
+    // are bimodal at that scale — the mark-sweep collector's rare, large
+    // pauses (safe-point gated) double an unlucky call, so min-of-3 single
+    // calls swung the reported ratio run to run (measured 2026-09-09 on the
+    // clean binary: string concat ratio 0.41-2.86 across suite runs, spread
+    // ~2.5; every other row was stable at <=0.11). Batching ~25+ calls per
+    // sample amortizes the row's own GC cadence into every sample: at a
+    // 100ms floor the same row reads ~0.7-0.95 across runs (jit consistently
+    // ahead, no parity/slower outliers), and the whole suite's worst spread
+    // drops from ~2.5 to ~0.3. Rows whose single call already
+    // clears the floor (reps = 1) are unchanged.
+    const SAMPLE_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
     let benchmarks: &[(&str, &str)] = &[
         (
             "arithmetic",
@@ -616,8 +630,8 @@ fn run_jit_benchmarks() -> Result<(), u8> {
     println!("slag {VERSION} JIT vs interpreter micro-benchmarks");
     println!("(ratio < 1 means the JIT is faster; ~1 means the body did not JIT)");
     for (name, source) in benchmarks {
-        let (interp, interp_result) = bench_once(source, false, None)?;
-        let (jit, jit_result) = bench_once(source, true, None)?;
+        let (interp, interp_result) = bench_once(source, false, Some(SAMPLE_FLOOR))?;
+        let (jit, jit_result) = bench_once(source, true, Some(SAMPLE_FLOOR))?;
         let ratio = jit.as_secs_f64() / interp.as_secs_f64();
         let agrees = interp_result == jit_result;
         if agrees {
@@ -732,6 +746,12 @@ fn bench_once(
     // split the same way as the in-table rows.
     let source = source.trim_end();
     let mut context = Context::new().map_err(report)?;
+    // The crux heap is thread-global and shared across the suite's rows, so
+    // the previous row's garbage would otherwise carry into this one's first
+    // collections (allocation-heavy rows are sensitive to where the first
+    // big mark-sweep lands). Collect before warming so every row starts from
+    // a bounded heap.
+    context.agent().collect_garbage();
     if jit {
         jit::install(context.agent_mut()).map_err(report)?;
     }
@@ -777,6 +797,15 @@ fn bench_once(
     for _ in 0..WARMUP {
         context.call(&bench_fn, &this, &args).map_err(report)?;
     }
+    // The differential value: a call after the identical WARMUP prefix.
+    // The timed samples below may run a different number of calls per
+    // column once batching sizes `reps` from each column's probe, which
+    // would leave a STATEFUL bench (compound assign mutates its argument
+    // object) at a different state per column — the value must come from
+    // the common prefix so the suite's interp-vs-jit result check stays
+    // meaningful. (The corpus workloads are stateless, so this is their
+    // normal single-call value too.)
+    let value = context.call(&bench_fn, &this, &args).map_err(report)?;
     // Batch sizing: probe one call and, when it is below the target floor,
     // time batches of `reps` calls instead so each sample clears the floor
     // (a warm batch also absorbs any steady-state transition).
@@ -798,11 +827,10 @@ fn bench_once(
     // pressure the previous timed calls' garbage creates on allocation-heavy
     // rows like the rope builds).
     let mut best = f64::INFINITY;
-    let mut value = JsValue::undefined();
     for _ in 0..TIMED {
         let start = Instant::now();
         for _ in 0..reps {
-            value = context.call(&bench_fn, &this, &args).map_err(report)?;
+            context.call(&bench_fn, &this, &args).map_err(report)?;
         }
         let per_call = start.elapsed().as_secs_f64() / reps as f64;
         if per_call < best {
