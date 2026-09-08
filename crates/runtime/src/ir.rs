@@ -531,6 +531,19 @@ pub enum Step {
         key_count: usize,
     },
     ObjectBegin,
+    /// Cut 72: a whole-literal fast create — every property is a static-key
+    /// data init (no methods/accessors/spread/computed/`__proto__`/
+    /// duplicate keys / anonymous-function set_name), so the object is
+    /// unobservable while its values evaluate (spec defines each property
+    /// as its value completes, but the half-built object never escapes). The
+    /// compiler emits the N value expressions first, then this step pops
+    /// them, creates the object on the pre-forked N-key shape, and adopts
+    /// the fields in ONE map set (no per-key transition walk — the
+    /// vector-free `adopt_vector_free_fields`). At most `INLINE_FIELDS`
+    /// keys.
+    ObjectFast {
+        names: Box<[crux::AtomId]>,
+    },
     ObjectInitName {
         name: crux::AtomId,
         set_name: bool,
@@ -6608,6 +6621,58 @@ impl Vm {
                     let object = crux::object::JsObject::ordinary_object_create(proto);
                     self.stack.push(Value::Object(object));
                 }
+                Step::ObjectFast { names } => {
+                    // Cut 72: the whole-literal fast create — the N value
+                    // expressions already pushed (in source order) and this
+                    // step pops them, creates the object on the pre-forked
+                    // N-key shape, and adopts the fields in one map set (the
+                    // values are unobservable until the object escapes).
+                    let n = names.len();
+                    let base = self.stack.len() - n;
+                    let mut values = [Value::Undefined; crux::object::INLINE_FIELDS];
+                    for (i, value) in values.iter_mut().enumerate().take(n) {
+                        *value = self.stack[base + i];
+                    }
+                    self.stack.truncate(base);
+                    let proto = agent
+                        .current_realm()?
+                        .intrinsics
+                        .object_prototype()
+                        .and_then(|value| crate::context::as_object(&value));
+                    let object = crux::object::JsObject::ordinary_object_create(proto);
+                    // Resolve the N-key shape from the object's (empty) map —
+                    // the cached child chain shared by every literal with the
+                    // same key sequence — then adopt all fields at once.
+                    let shape = {
+                        let mut shape = object.map.get().ok_or_else(|| {
+                            JsError::new(ErrorKind::TypeError, "fresh object without a map".into())
+                        })?;
+                        let attrs = crux::MapAttrs::new(true, true, true);
+                        for name in names.iter() {
+                            shape = shape
+                                .get_or_create_child(crux::PropertyKey::String(*name), attrs)
+                                .ok_or_else(|| {
+                                    JsError::new(
+                                        ErrorKind::TypeError,
+                                        "cannot fork the literal shape".into(),
+                                    )
+                                })?;
+                        }
+                        shape
+                    };
+                    if !object.adopt_vector_free_fields(shape, &values[..n]) {
+                        // Defensive fallback (the fresh-object guards hold, so
+                        // this is unreachable): define sequentially — the same
+                        // result, one key at a time.
+                        for (name, value) in names.iter().zip(&values[..n]) {
+                            object.create_data_property_key(
+                                &crux::PropertyKey::String(*name),
+                                *value,
+                            )?;
+                        }
+                    }
+                    self.stack.push(Value::Object(object));
+                }
                 Step::ObjectInitName {
                     name,
                     set_name,
@@ -12320,6 +12385,54 @@ pub(crate) fn array_set(array: &Value, key: &str, value: Value) -> Result<(), Js
 
 /// Object literal `Init` property definition (spec 13.2.5.5 step 4): the
 /// `__proto__` prototype-setter special case plus name inference.
+///
+/// Cut 72: whether a whole literal can take the `ObjectFast` batch path —
+/// every property is an `Init` with a static, non-`__proto__`, unique key
+/// and a value that needs no SetFunctionName, at most `INLINE_FIELDS`
+/// keys. Returns the keys in source order.
+fn fast_object_names(literal: &ObjectLiteral) -> Option<Box<[crux::AtomId]>> {
+    let mut names: Vec<crux::AtomId> = Vec::with_capacity(literal.props.len());
+    for property in &literal.props {
+        let ObjectProperty::Init { key, value, .. } = property else {
+            return None;
+        };
+        if crate::function::is_anonymous_function_definition(value) {
+            return None;
+        }
+        let id = match key {
+            PropertyName::Ident(id) => {
+                if *id == crux::proto_atom() {
+                    return None;
+                }
+                *id
+            }
+            PropertyName::Str(text) => {
+                if crux::intern(text.as_slice()) == crux::proto_atom() {
+                    return None;
+                }
+                crux::intern(text.as_slice())
+            }
+            PropertyName::Number(n) => {
+                // The canonical decimal text (the same text the step path's
+                // ObjectInitName interns — `{1: ..}` and `{"1": ..}` collide
+                // on one atom, so the duplicate check below sees them).
+                let text = crux::convert::to_string(&Value::Number(*n)).ok()?;
+                crux::intern(text.as_slice())
+            }
+            PropertyName::Computed(_) => return None,
+        };
+        if names.contains(&id) {
+            // A duplicate key is an in-place update, not a fresh define.
+            return None;
+        }
+        names.push(id);
+    }
+    if names.is_empty() || names.len() > crux::object::INLINE_FIELDS {
+        return None;
+    }
+    Some(names.into_boxed_slice())
+}
+
 pub(crate) fn object_init(
     object: &Value,
     key: &PropertyName,
@@ -18628,6 +18741,24 @@ impl Compiler {
     }
 
     fn compile_object(&mut self, literal: &ObjectLiteral) -> Result<(), JsError> {
+        // Cut 72: when the WHOLE literal is batchable (every property is a
+        // static-key data init — no methods/accessors/spread/computed /
+        // `__proto__` / duplicate keys / anonymous-function set_name, at most
+        // INLINE_FIELDS keys), the object is unobservable while its values
+        // evaluate, so the values are computed first and ONE `ObjectFast`
+        // step creates the object on the pre-forked shape and adopts all
+        // fields (no per-key define machinery). Anything else keeps the
+        // per-property steps below.
+        if let Some(names) = fast_object_names(literal) {
+            for property in &literal.props {
+                let ObjectProperty::Init { value, .. } = property else {
+                    unreachable!("fast_object_names only passes Init props")
+                };
+                self.compile_expr(value)?;
+            }
+            self.emit(Step::ObjectFast { names });
+            return Ok(());
+        }
         self.emit(Step::ObjectBegin);
         for property in &literal.props {
             match property {

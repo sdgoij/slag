@@ -2934,6 +2934,58 @@ mod tests {
     }
 
     #[test]
+    fn fast_object_literal_preserves_key_order_and_shape() {
+        // Cut 72: a whole-simple literal (static unique data keys) takes the
+        // `ObjectFast` batch path — key order must match the source, reads
+        // serve the fields, and materializing (enumeration) after later
+        // growth keeps the define order. The value expressions run
+        // left-to-right before any define (the half-built object never
+        // escapes, so the reorder is invisible).
+        assert_eq!(
+            run("(function () { var out = []; for (var k in { a: 1, b: 2, c: 3 }) { out.push(k); } return out.join(''); })()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("abc")))
+        );
+        assert_eq!(
+            run("var o = { a: 1, b: 2, c: { d: 3 } }; o.a + o.b + o.c.d + Object.keys(o).join('')")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("6abc")))
+        );
+        // String + numeric keys keep their texts; a later growth past the
+        // batch keys materializes in define order.
+        assert_eq!(
+            run("var o = { b: 1, a: 2 }; o.x = 3; Object.getOwnPropertyNames(o).join('')").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("bax")))
+        );
+        // Boundary exclusions stay on the step path: duplicate keys
+        // (last-wins in place), __proto__ (the setter), computed keys,
+        // methods, anonymous-function set_name, and > INLINE_FIELDS keys.
+        assert_eq!(
+            run("(function () { var d = { a: 1, a: 2 }; return d.a + Object.keys(d).length; })()")
+                .unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            run("(function () { var p = {}; var d = { __proto__: p, a: 1 }; return Object.getPrototypeOf(d) === p && d.a === 1; })()")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("(function () { var k = 'y'; return { x: 1, [k]: 2 }.y; })()").unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            run("(function () { var o = { f: function () {} }; return o.f.name; })()").unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("f")))
+        );
+        assert_eq!(
+            run("(function () { var o = { a: 1, b: 2, c: 3, d: 4, e: 5 }; return Object.keys(o).join(''); })()")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("abcde")))
+        );
+    }
+
+    #[test]
     fn for_let_head_is_lexical_not_a_global_var() {
         // A `let`-headed for loop must not create a global binding (the
         // var-scoped-declaration collector previously treated every for-head

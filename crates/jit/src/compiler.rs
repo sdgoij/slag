@@ -234,6 +234,11 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             // method/accessor/key/spread steps keep it net-neutral or pop
             // the property's value.
             Step::ObjectBegin => depth += 1,
+            // Cut 72: the value expressions pushed `names.len()` values;
+            // ObjectFast pops them all and pushes the object.
+            Step::ObjectFast { names } => {
+                depth = depth.saturating_sub(names.len()).saturating_add(1)
+            }
             Step::ObjectInitName { .. }
             | Step::ObjectMethodComputed { .. }
             | Step::ObjectAccessorComputed { .. }
@@ -491,6 +496,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ArrayHole
         | Step::ArrayEnd => "ArrayLiteral",
         Step::ObjectBegin
+        | Step::ObjectFast { .. }
         | Step::ObjectInitName { .. }
         | Step::ObjectInitComputed { .. }
         | Step::ObjectKeyToPropertyKey
@@ -5321,6 +5327,34 @@ impl<'a> Lowerer<'a> {
             // back from the running body, the Cut 44 pattern).
             Step::ObjectBegin => {
                 let object = self.call_slow(self.sig_tdz, Helper::ObjectBegin, &[])?;
+                self.push(object);
+                self.fall_through(index);
+            }
+            Step::ObjectFast { names } => {
+                // Cut 72: the interpreter's fused path adopts all fields in
+                // one map set; the JIT expands the step into the per-key
+                // helpers. The values sit on the work stack (vN on top), so
+                // pop them into locals first, then define in SOURCE order
+                // (key order is observable via enumeration). The object rides
+                // a Cranelift variable while each value defines.
+                let n = names.len();
+                let mut object = self.call_slow(self.sig_tdz, Helper::ObjectBegin, &[])?;
+                let mut popped: Vec<ClifValue> = Vec::with_capacity(n);
+                for _ in 0..n {
+                    popped.push(self.pop());
+                }
+                for (index, name) in names.iter().enumerate() {
+                    let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    // popped[0] is the LAST value (vN); source-order value i
+                    // is popped[n - 1 - i].
+                    let value = popped[n - 1 - index];
+                    object = self.call_slow(
+                        self.sig_assign,
+                        Helper::ObjectInitName,
+                        &[object, name_imm, zero, zero, value],
+                    )?;
+                }
                 self.push(object);
                 self.fall_through(index);
             }

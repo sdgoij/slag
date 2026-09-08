@@ -6852,6 +6852,47 @@ DeclarativeEnv GC box itself (Handle::new of the 5-RefCell struct) — a
 dedicated slim per-iteration env variant would harvest more but carries
 the EnvRecord match-site churn; deferred.
 
+### LANDED (2026-09-08, uncommitted): the whole-simple object literal takes the `ObjectFast` batch path (Cut 72)
+
+The "destructure" workload (832ms, 19.5x — the third-largest jl mass) is
+object-literal creation: a fresh `{a,b,c:{d}}` + reads costs ~400ns/iter
+with reads adding only ~23ns. Per-key literal defines route through
+`create_data_property_key` → the vector-free `fresh_data_define`, which
+still pays ~60-70ns/key (map borrow, find, transition HashMap lookup, two
+generation bumps). Cut 71's register-run literal fusion was falsified
+(2026-09-07), but the session's `adopt_vector_free_fields` (built for the
+function-boilerplate batch) is the primitive a literal can use instead:
+when the WHOLE literal is simple (all `Init` props with static,
+non-`__proto__`, unique keys; no methods/accessors/spread/computed /
+anonymous-function set_name; ≤ INLINE_FIELDS keys), the half-built object
+never escapes, so the compiler emits the N values first then ONE
+`Step::ObjectFast { names }`: the executor pops the values, creates the
+object, forks the N-key shape from its empty map (cached child chain), and
+adopts all fields in one map set + N field writes.
+
+JIT: an unhandled step would bail whole bodies (literals are everywhere),
+so the JIT expands `ObjectFast` into the existing ObjectBegin +
+ObjectInitName helpers — values popped into locals (the FIRST attempt
+defines in reverse pop order and broke enumeration — caught by the
+`installed_jit_captured_for_in_head`/`for_in_key_loop` tests), then
+defines forward in source order. Interpreter rows take the fused adopt;
+JIT rows keep the per-key helpers (no regression: jit ~flat).
+
+Interleaved release A/B vs HEAD (jl, 1M iters): nested-literal+reads
+~276-291 vs ~353-368ms (-20-23%), nested create ~243-248 vs ~368-383
+(-35%), flat 3-key ~188-210 vs ~268-274 (-23-30%). A 25-line literal
+battery (fast shapes, key order incl. numeric/string keys, duplicate
+keys, `__proto__` incl. the string form, computed, methods,
+anonymous-function set_name, shorthand, 5-key boundary, spread,
+accessors, mixed method-in-literal, side-effect evaluation order,
+post-materialize growth) is node-identical across jit/jitless/gc-stress;
+a new eval.rs regression test covers ordering + the boundary exclusions.
+Gates: workspace 32 suites green, clippy clean, all three release test262
+sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086). Follow-ups: fuse multi-key runs WITHIN mixed literals
+(a run of batchable props between slow props), and >4-key shapes (the
+5th+ key materializes the vector after a 4-key adopt).
+
 
 ## Deferred milestones
 
