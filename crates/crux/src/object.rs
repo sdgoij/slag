@@ -2767,6 +2767,17 @@ impl JsObject {
         {
             return false;
         }
+        // A vector-free (deferred) receiver stores its own writable data
+        // properties as written map fields — the vector scan below would
+        // find nothing. The in-place update is the field write (the
+        // compiled `set_member_slot` caller validated the own property
+        // through its cache; a hole — an absent property — or a
+        // non-writable descriptor declines so the full [[Set]] defines or
+        // enforces the outcome). A materialized receiver pays one cell read
+        // for the gate.
+        if self.deferred_field_write(key, value) {
+            return true;
+        }
         let mut props = self.properties.borrow_mut();
         let position = if props.len() >= 16 {
             let index = self.property_index.borrow();

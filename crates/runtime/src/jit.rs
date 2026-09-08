@@ -34,9 +34,7 @@ use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use crate::agent::Agent;
 use crate::context::ReferenceBase;
 use crate::env::EnvRecord;
-use crate::ir::{
-    CompiledBody, EnvStack, MEMBER_CELLS, MemberValueCell, PropertyKeyName, Vm, member_reference,
-};
+use crate::ir::{CompiledBody, EnvStack, MEMBER_CELLS, MemberValueCell, PropertyKeyName, Vm};
 use crux::error::{ErrorKind, JsError};
 
 /// The compiled entry ABI (mirrors `jit::JitEntry`; all arguments are
@@ -1867,9 +1865,28 @@ extern "C" fn set_member_slot(ctx: *mut c_void, object: u64, name: u64, value: u
             };
         return value.bits();
     }
-    let reference = member_reference(&object, &crate::ir::PropertyKeyName::Name(name), vm.strict);
-    match crate::context::put_value(agent, &reference, value) {
-        Ok(()) => value.bits(),
+    // The narrow write declined. The common case on a FRESH constructor
+    // `this` is a map-described hole (the shape gate hit pins the map, not
+    // presence): the store is a fresh define, which the interpreter's lean
+    // `fast_fresh_store` serves after the warm-store probe. Running the
+    // full assign machinery here (not a straight [[Set]]) keeps that
+    // constructor fill on the fast fresh-define route; the remaining
+    // declines (a non-writable own property, an accessor-converted chain,
+    // an exotic receiver) land in the same full [[Set]] the assign path
+    // uses. `assign_member` pushed the result; pop it back so the value
+    // stack stays balanced across the JIT body's helpers.
+    match vm.assign_member(
+        agent,
+        object,
+        crate::ir::PropertyKeyName::Name(name),
+        None,
+        value,
+        syntax::ast::AssignOp::Assign,
+    ) {
+        Ok(()) => match vm.stack.pop() {
+            Some(result) => result.bits(),
+            None => value.bits(),
+        },
         Err(error) => slow_error(ctx, error),
     }
 }

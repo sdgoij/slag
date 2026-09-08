@@ -7294,6 +7294,59 @@ and the three release sweeps re-run at baseline on the final tree.
 
 
 
+### LANDED (2026-09-08, uncommitted): the compiled constructor store serves the presized-hole fill — jit construct rows flip from ~4x slower than jl to ~1.3x faster (the jit-side of the presize slice)
+
+The presize-vector-free landing made jl construct rows fast, but exposed a
+jit divergence the probes then pinned: jit was ~2.7-5x SLOWER than jl on
+construct-heavy rows at HEAD (scratch V10-full jit ~860-1170 vs jl
+~215-230ms/500k; corpus construct_churn jit ~430 vs jl ~175). Decomposition
+(construct_jit_split, jit, 500k): a bare `new Empty()` is jit-fine
+(~65ms), but each constructor `this.x =` store added ~350-370ns marginal
+under jit vs ~60ns under jl — every compiled constructor-body store went
+through the machine value-cell probe + shape gate (a HIT: the previous
+iteration's define records the (map id, name) read cell) to the narrow
+`set_member_slot` helper, whose `write_data_property` scans the property
+VECTOR — empty on the now-deferred presize `this` — and declined, so the
+helper fell to the FULL [[Set]] per store (its fallback was a straight
+put_value, skipping the interpreter's lean `fast_fresh_store`). A
+fresh object's first store of each key is a map-described HOLE fill, never
+an in-place update, so every iteration paid the full path.
+
+Fix (two small changes): `write_data_property` (crux) first tries the
+vector-free in-place field write (`deferred_field_write`: described,
+written, writable — the deferred arm from the interpreter slice) so a
+second store to the same deferred key is a field write; and
+`set_member_slot`'s decline path now runs the interpreter's `assign_member`
+(warm-store probe + lean fresh define + the same full [[Set]] the old
+fallback used) instead of a straight put_value, so the common constructor
+fill — a shape-gated map-described hole on a clean chain — lands on
+`fast_fresh_store`'s deferred fill. Exactness: `assign_member` is the
+interpreter's own store dispatch; every old put_value outcome is preserved
+(the final [[Set]] is identical), and the fast paths in front are exact.
+
+Interleaved flip A/B (release, jit, whole corpus, min-of-2 adjacent
+new/old runs, env-gated fallback then removed): construct_churn 480 -> 162
+ms (~3x); every other row 0.97-1.05 (noise) — object_keys 0.94 (noise),
+for_in/many_objects_read/concat_loop ~1.04-1.05 (noise). Scratch rows:
+V6-one jit ~230 -> ~90, V7-two ~410 -> ~120, V11 ~430 -> ~125, V10-full
+~860-1170 -> ~185-190 — jit now LEADS jl on every construct row (jl V7
+~175, V10 ~225). Gates: workspace 32 suites green, clippy `-D warnings`
+clean, the seven presize/chain/vecfree/objfast/fn/proto batteries
+node-identical across jit/jitless/--gc-stress, and the three release
+test262 sweeps at baseline (language 23721/3 skip, built-ins 23657/155
+skip, annexB 1086/1086) re-run on the final tree. (The earlier whole-corpus
+jit capture showing every row up 1.1-1.6x was machine heat — pure
+machine-loop rows my change cannot touch moved identically; the
+interleaved flip is the reliable read.)
+
+Next (open): the compiled path still pays one set_member_slot/assign_member
+FFI round-trip per constructor fill (the shape gate + narrow-write helper);
+an inline machine fill for a shape-gated map-described hole (map-id compare
++ in_fields write) would close the remaining gap to the ~55ns warm floor,
+and the construct rows' residual is the ~150ns bare-construct overhead
+(new Empty vs a literal) plus fresh-object method-call machinery.
+
+
 
 ## Deferred milestones
 
