@@ -6598,6 +6598,71 @@ fail/crash/hang). Regression tests: map.rs same-key-different-attrs forks
 distinct children; object.rs cross-object same-key-different-attrs keeps
 each object's own descriptor attrs.
 
+### NEGATIVE PROBE: caching the per-site source slice is not a lever (measured 2026-09-08)
+
+Ranked follow-up #1 proposed caching the per-closure `capture_source`
+JsString slice (each `register_function` stores the definition text for
+Function.prototype.toString, so a loop creating closures from one site
+allocates + copies the body text per create). Interleaved release A/B
+(baseline 5b67e98 vs an instrumented build whose `capture_source` returns
+None — the MAXIMAL win, bigger than any cache), alternating builds
+~2 min apart: cf0_call/cf0_sloppy/cf2_strict/cf4_periter/cf5_readproto
+all overlap within noise (the first single-run probe showing cf4 -25% /
+cf5 -22% was a cool-machine outlier, falsified by the interleave). A
+long-body probe (100k creates of a ~365-unit arrow body) showed at most
+~4% (baseline ~117-128ms, no-slice ~114-120ms). The slice copy is NOT on
+the closure-create critical path; the follow-up is dismissed until a
+probe on a realistic toString-heavy or longer-body corpus says otherwise.
+
+### LANDED (2026-09-08, uncommitted): the function boilerplate as ONE pre-forked shape (Cut 67)
+
+Ranked follow-up #2: batch the length/name(/caller/arguments) boilerplate
+instead of 2-4 sequential defines. A mechanism probe first — skipping
+just the caller/arguments defines (an instrumented build, cf2_strict as
+the no-restricted-props control stayed flat) showed each restricted
+boilerplate define costs ~100-150ns even vector-free: the per-key
+`define_fresh` machinery (map find/transition lookups, `intern_utf8` key
+construction, RefCell borrows, 2 generation bumps) on a FRESH object.
+
+The boilerplate shape is (key, attrs) — CONSTANT per function kind
+(length/name = (f,f,t); caller/arguments = (f,f,f); the length count and
+name text are field VALUES, so every ordinary function of a kind shares
+ONE map). Landing: pre-fork the 2- and 4-descriptor maps once from the
+prototype-less canonical empty map (the map a fresh `Function::new`
+object starts on — identical to the chain the defines walk) and adopt
+map + in-field values in one step. New crux `adopt_vector_free_fields`
+(sets map + deferred bit + direct in-field writes, offset-guarded;
+rejects a non-fresh object so the no-hole invariant holds; no generation
+bump — a brand-new object has no cached readers). Runtime
+`set_function_properties_batched` replaces `set_function_properties` +
+the AddRestrictedFunctionProperties loop at both the register_function
+and arrow sites; sequential defines remain as the fallback. Atom ids are
+process-global u32s, so the pre-interned boilerplate keys live in a
+`OnceLock` (a PropertyKey static would not be Send/Sync — the Symbol
+variant holds a GC handle).
+
+Interleaved release A/B vs HEAD 5b67e98 (jl, cfprobe): cf0_call
+~197-207 -> ~118-127 ms (-40%), cf0_sloppy ~185-188 -> ~103-105 ms
+(-44%), cf2_strict ~144 -> ~122-126 ms (-13%), cf4_periter ~631-687 ->
+~428-443 ms (-33%), cf5_readproto ~254-262 -> ~210-218 ms (-17%). jit
+mode moves with the interpreter (closure creation is shared runtime
+machinery): cf0_sloppy ~104, cf2 ~111-119. The saved ~400ns/create on a
+sloppy closure matches the per-define probe. A 30-line boilerplate
+semantics battery (descriptor flags, own-names order, restricted
+props, anonymous name, arrows, materialize-then-add, toString source)
+is byte-identical between HEAD and the batched build.
+
+Gates: workspace 32 suites green, clippy clean, both node-parity
+batteries node-identical, all three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip — the two copyWithin
+coerced-values detach fixtures hung once under batch load at ~12-15s
+each and passed a re-run, the known load-wobble — annexB 1086/1086,
+zero fail/crash). Two new crux tests: adoption matches sequential
+defines field-for-field + guards.
+
+Next ranked item: the per-iteration capture env (~2us on the head-let
+closure row) — not started.
+
 
 ## Deferred milestones
 

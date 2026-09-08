@@ -3201,6 +3201,50 @@ impl JsObject {
         self.define_fresh(key, value, writable, enumerable, configurable)
     }
 
+    /// Cut 67 batch entry: adopt a pre-forked vector-free shape in one step.
+    /// `map` must describe exactly `values.len()` keys at ordinals 0..n (all
+    /// below `INLINE_FIELDS`, each descriptor's offset equal to its ordinal —
+    /// the shape a child-fork chain produces) and this object must be a fresh
+    /// ordinary object (empty map AND empty vector), so no pre-described-but-
+    /// unwritten hole can be fabricated and no existing property overwritten.
+    /// Each value lands in its in-field and the deferred bit is set — the
+    /// state is exactly what n sequential `define_fresh` calls would have
+    /// left, minus the per-key transition walk, key interning, and generation
+    /// bumps (a brand-new object has no cached readers to invalidate). Used by
+    /// the runtime's function boilerplate (`length`/`name`[/`caller`/
+    /// `arguments`]) which otherwise pays ~100-140ns per define on the fresh
+    /// object. Returns false when a guard fails; the caller falls back to the
+    /// sequential defines.
+    pub fn adopt_vector_free_fields(&self, map: Handle<Map>, values: &[Value]) -> bool {
+        if !matches!(self.kind, ObjectKind::Ordinary) || !self.extensible.get() {
+            return false;
+        }
+        if map.descriptor_count() != values.len() || values.len() > INLINE_FIELDS {
+            return false;
+        }
+        // Fresh-only guard: the current map (the canonical empty map a new
+        // ordinary object starts on) is empty and the vector is empty.
+        if self.map.get().is_some_and(|map| !map.is_empty()) || !self.properties.borrow().is_empty()
+        {
+            return false;
+        }
+        // Write each value at its descriptor ordinal. The offset check keeps
+        // the in-field write honest for any caller (a fork chain always
+        // assigns offset == ordinal, so this is the identity on the shapes
+        // this method exists for).
+        for (i, value) in values.iter().enumerate() {
+            match map.descriptor_at(i) {
+                Some((_, offset, _)) if offset == i => {
+                    self.in_fields[i].set(*value);
+                }
+                _ => return false,
+            }
+        }
+        self.map.set(Some(map));
+        self.props_deferred.set(true);
+        true
+    }
+
     /// The shared Option-3 vector-free fresh define (both the all-true
     /// CreateDataProperty form and the explicit-attrs boilerplate form): an
     /// ordinary object whose vector is empty and whose map describes only
@@ -5487,6 +5531,152 @@ mod tests {
             .unwrap()
             .expect("post-materialize own constructor");
         assert!(!enumed.enumerable);
+    }
+
+    #[test]
+    fn adopt_vector_free_fields_matches_sequential_defines() {
+        // The Cut 67 function-boilerplate batch (length/name[/caller/
+        // arguments] adopted as one pre-forked shape) must leave an object
+        // in exactly the state the sequential defines would: the same shared
+        // map (identical descriptor attrs), the same field values, the
+        // deferred bit set, an identical materialized vector, and identical
+        // behavior on later structural changes.
+        let boilerplate = [
+            (
+                PropertyKey::from_utf8("length"),
+                MapAttrs::new(false, false, true),
+            ),
+            (
+                PropertyKey::from_utf8("name"),
+                MapAttrs::new(false, false, true),
+            ),
+            (
+                PropertyKey::from_utf8("caller"),
+                MapAttrs::new(false, false, false),
+            ),
+            (
+                PropertyKey::from_utf8("arguments"),
+                MapAttrs::new(false, false, false),
+            ),
+        ];
+        let mut shape = crate::map::canonical_empty_map(None);
+        for (key, attrs) in &boilerplate {
+            shape = shape.get_or_create_child(key.clone(), *attrs).unwrap();
+        }
+        let length = Value::Number(2.0);
+        let name = Value::String(Handle::new(JsString::from_utf8("f")));
+
+        let batched = JsObject::ordinary_object_create(None);
+        assert!(
+            batched.adopt_vector_free_fields(
+                shape,
+                &[length, name, Value::Undefined, Value::Undefined]
+            )
+        );
+        assert!(batched.props_deferred.get());
+        assert!(batched.properties.borrow().is_empty());
+
+        let sequential = JsObject::ordinary_object_create(None);
+        for (key, value, writable, enumerable, configurable) in [
+            (PropertyKey::from_utf8("length"), length, false, false, true),
+            (PropertyKey::from_utf8("name"), name, false, false, true),
+            (
+                PropertyKey::from_utf8("caller"),
+                Value::Undefined,
+                false,
+                false,
+                false,
+            ),
+            (
+                PropertyKey::from_utf8("arguments"),
+                Value::Undefined,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            assert!(sequential.fresh_data_define_attrs(
+                &key,
+                value,
+                writable,
+                enumerable,
+                configurable
+            ));
+        }
+        assert!(sequential.props_deferred.get());
+        // Identical shared shape and field values.
+        assert_eq!(
+            batched.map.get().unwrap().id(),
+            sequential.map.get().unwrap().id()
+        );
+        for key in ["length", "name", "caller", "arguments"] {
+            let prop_key = PropertyKey::from_utf8(key);
+            let a = batched
+                .get_own_property_key(&prop_key)
+                .unwrap()
+                .expect("batched own");
+            let b = sequential
+                .get_own_property_key(&prop_key)
+                .unwrap()
+                .expect("sequential own");
+            assert_eq!(a.value(), b.value(), "{key} value");
+            assert_eq!(a.writable(), b.writable(), "{key} writable");
+            assert_eq!(a.enumerable, b.enumerable, "{key} enumerable");
+            assert_eq!(a.configurable, b.configurable, "{key} configurable");
+        }
+        // Identical materialized vectors (enumeration order + attrs).
+        assert_eq!(
+            batched.own_property_keys().unwrap(),
+            sequential.own_property_keys().unwrap()
+        );
+        assert!(!batched.props_deferred.get());
+        assert!(!sequential.props_deferred.get());
+        // A later fresh define behaves identically on both (the batched
+        // object's materialized vector is the same shape the defines built).
+        for object in [&batched, &sequential] {
+            assert!(object.fresh_data_define(&PropertyKey::from_utf8("extra"), Value::Number(1.0)));
+        }
+        assert_eq!(
+            batched.map.get().unwrap().id(),
+            sequential.map.get().unwrap().id()
+        );
+        assert_eq!(
+            batched.get_key(&PropertyKey::from_utf8("extra")).unwrap(),
+            sequential
+                .get_key(&PropertyKey::from_utf8("extra"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn adopt_vector_free_fields_guards() {
+        // Rejects: a non-empty current map, a non-empty vector, a count
+        // that does not match the shape's descriptors, and an offset that is
+        // not the value's ordinal.
+        let mut shape = crate::map::canonical_empty_map(None);
+        shape = shape
+            .get_or_create_child(PropertyKey::from_utf8("a"), MapAttrs::new(true, true, true))
+            .unwrap();
+        // Count mismatch (map describes 1 key, 2 values offered).
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(!obj.adopt_vector_free_fields(shape, &[Value::Number(1.0), Value::Number(2.0)]));
+        // A non-empty current map (an object that already has a property).
+        let used = JsObject::ordinary_object_create(None);
+        assert!(used.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+        assert!(!used.adopt_vector_free_fields(shape, &[Value::Number(9.0)]));
+        // A non-empty vector (materialized then adoption attempted).
+        let materialized = JsObject::ordinary_object_create(None);
+        assert!(materialized.fresh_data_define(&PropertyKey::from_utf8("y"), Value::Number(2.0)));
+        let _ = materialized.own_property_keys().unwrap();
+        assert!(!materialized.adopt_vector_free_fields(shape, &[Value::Number(3.0)]));
+        // A fresh object with a matching shape adopts.
+        let fresh = JsObject::ordinary_object_create(None);
+        assert!(fresh.adopt_vector_free_fields(shape, &[Value::Number(7.0)]));
+        assert!(fresh.props_deferred.get());
+        assert_eq!(
+            fresh.map_get(&PropertyKey::from_utf8("a")),
+            Some(Value::Number(7.0))
+        );
     }
 
     #[test]

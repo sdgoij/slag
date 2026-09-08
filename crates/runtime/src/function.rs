@@ -334,6 +334,84 @@ fn set_function_properties(
     Ok(())
 }
 
+/// The pre-interned (key, attrs) boilerplate prefix shared by every ordinary
+/// function shape (Cut 67): SetFunctionLength's `length` and SetFunctionName's
+/// `name` — both (writable, enumerable, configurable) = (f, f, t) — plus, for
+/// a sloppy ordinary function, AddRestrictedFunctionProperties' `caller`/
+/// `arguments` ((f, f, f)). The attributes are constant per key, so each
+/// function kind's shape is ONE shared map: only the field VALUES (the length
+/// count, the name text) vary per function. Atom ids are process-global u32s,
+/// so the once-initialized keys are safe to reuse across threads and creates.
+fn function_boilerplate_entries() -> &'static [(crux::AtomId, crux::MapAttrs)] {
+    use std::sync::OnceLock;
+    static ENTRIES: OnceLock<Vec<(crux::AtomId, crux::MapAttrs)>> = OnceLock::new();
+    ENTRIES.get_or_init(|| {
+        vec![
+            (
+                crux::intern_utf8("length"),
+                crux::MapAttrs::new(false, false, true),
+            ),
+            (
+                crux::intern_utf8("name"),
+                crux::MapAttrs::new(false, false, true),
+            ),
+            (
+                crux::intern_utf8("caller"),
+                crux::MapAttrs::new(false, false, false),
+            ),
+            (
+                crux::intern_utf8("arguments"),
+                crux::MapAttrs::new(false, false, false),
+            ),
+        ]
+    })
+}
+
+/// Resolve the pre-forked boilerplate shape for a function kind: the
+/// 2-descriptor `length`/`name` map, or the 4-descriptor map with
+/// `caller`/`arguments` for a sloppy ordinary function. Forked from the
+/// prototype-less canonical empty map — the map a fresh `Function::new`
+/// object starts on, so the shape chain the sequential defines would walk is
+/// reused and a per-create resolution is cached child lookups after the first
+/// creation of the kind.
+fn function_boilerplate_map(restricted: bool) -> Option<Handle<crux::Map>> {
+    let entries = function_boilerplate_entries();
+    let count = if restricted { 4 } else { 2 };
+    let mut map = crux::canonical_empty_map(None);
+    for (atom, attrs) in &entries[..count] {
+        map = map.get_or_create_child(PropertyKey::String(*atom), *attrs)?;
+    }
+    Some(map)
+}
+
+/// SetFunctionLength + SetFunctionName (+ the restricted `caller`/
+/// `arguments` when `restricted`) as ONE shape adoption: pre-fork the
+/// constant (key, attrs) shape and write the field values in place, instead
+/// of 2-4 sequential `fresh_data_define_attrs` calls each paying the
+/// transition/interning/RefCell machinery on the fresh object (~100-140ns per
+/// key, measured 2026-09-08). Returns false when the shape cannot be forked
+/// or adopted; the caller then runs the sequential defines (identical result).
+fn set_function_properties_batched(
+    function: &Handle<Function>,
+    params: &[BindingElement],
+    name: Option<&JsString>,
+    restricted: bool,
+) -> bool {
+    let Some(map) = function_boilerplate_map(restricted) else {
+        return false;
+    };
+    let name_value = Value::String(Handle::new(
+        name.cloned().unwrap_or_else(|| JsString::from_utf8("")),
+    ));
+    let mut values = [Value::Undefined; 4];
+    values[0] = Value::Number(function_length(params) as f64);
+    values[1] = name_value;
+    // `caller`/`arguments` (when restricted) hold undefined on a fresh
+    // function with no caller — already in `values`.
+    let n = if restricted { 4 } else { 2 };
+    function.object.adopt_vector_free_fields(map, &values[..n])
+}
+
 /// IsAnonymousFunctionDefinition (spec 14.1.9): a FunctionExpression without
 /// a name, an ArrowFunction, or a ClassExpression without a name. Such
 /// definitions receive their name from the surrounding binding or property
@@ -1115,7 +1193,12 @@ fn register_function(
     // Cut 35 slice 30: store collected `this.*` property writes for
     // constructor store-cache pre-warming in `construct_this_object`.
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
-    set_function_properties(&function, &params, name.as_ref())?;
+    // Cut 67: SetFunctionLength + SetFunctionName + (for sloppy ordinary
+    // functions) AddRestrictedFunctionProperties as ONE pre-forked-shape
+    // adoption instead of 2-4 sequential boilerplate defines (the shape's
+    // (key, attrs) are constant per kind — see
+    // `set_function_properties_batched`). Falls back to the sequential
+    // defines when the shape cannot be forked.
     // AddRestrictedFunctionProperties (spec 10.2.1): sloppy ordinary
     // functions carry own `caller`/`arguments` (value undefined when no
     // caller is known, non-writable, non-configurable). Strict, async, and
@@ -1123,16 +1206,20 @@ fn register_function(
     // the %Function.prototype% accessors. Methods never get them either
     // (spec 10.2.4: own caller/arguments are created only for ordinary
     // non-method functions).
-    if !strict && !kind.is_method && !kind.is_async && !kind.is_generator {
-        for name in ["caller", "arguments"] {
-            // Cut 66: fresh-object fast append (see `set_function_properties`).
-            function.object.fresh_data_define_attrs(
-                &PropertyKey::from_utf8(name),
-                Value::Undefined,
-                false,
-                false,
-                false,
-            );
+    let restricted = !strict && !kind.is_method && !kind.is_async && !kind.is_generator;
+    if !set_function_properties_batched(&function, &params, name.as_ref(), restricted) {
+        set_function_properties(&function, &params, name.as_ref())?;
+        if restricted {
+            for name in ["caller", "arguments"] {
+                // Cut 66: fresh-object fast append (see `set_function_properties`).
+                function.object.fresh_data_define_attrs(
+                    &PropertyKey::from_utf8(name),
+                    Value::Undefined,
+                    false,
+                    false,
+                    false,
+                );
+            }
         }
     }
     // Plain async functions are never constructors and have no `prototype`;
@@ -1417,7 +1504,10 @@ pub fn instantiate_arrow(
     let params = data.params.clone();
     agent.ecma_functions.insert(function.id(), data);
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
-    set_function_properties(&function, &params, None)?;
+    // Arrows never carry restricted `caller`/`arguments` (no fallback loop).
+    if !set_function_properties_batched(&function, &params, None, false) {
+        set_function_properties(&function, &params, None)?;
+    }
     set_function_prototype(agent, &function, false, is_async)?;
     Ok(Value::Function(function))
 }
