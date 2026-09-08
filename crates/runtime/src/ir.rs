@@ -7091,8 +7091,10 @@ impl Vm {
                     let env = new_declarative_environment(Some(outer));
                     for name in names {
                         let value = last.get_binding_value(name, false)?;
-                        env.create_mutable_binding(name, false)?;
-                        env.initialize_binding(name, value)?;
+                        // The env is fresh: one push instead of the
+                        // create_mutable_binding duplicate scan +
+                        // initialize_binding re-find.
+                        env.push_initialized_binding(name, value)?;
                     }
                     // The per-iteration environment replaces the lexical
                     // environment without joining the stack; the loop's exit
@@ -7114,8 +7116,8 @@ impl Vm {
                     let env = new_declarative_environment(Some(self.lexical_env));
                     for name in names {
                         let value = source.get_binding_value(name, false)?;
-                        env.create_mutable_binding(name, false)?;
-                        env.initialize_binding(name, value)?;
+                        // Fresh env: one push (see `Step::PerIteration`).
+                        env.push_initialized_binding(name, value)?;
                     }
                     if let EnvRecord::Declarative(declarative) = &*env {
                         declarative.mark_context_transparent();

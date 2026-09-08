@@ -4301,8 +4301,9 @@ fn per_iteration_env(
     let env = crate::env::new_declarative_environment(Some(outer));
     for name in names {
         let value = source.get_binding_value(name, false)?;
-        env.create_mutable_binding(name, false)?;
-        env.initialize_binding(name, value)?;
+        // Fresh env: one push instead of the create_mutable_binding
+        // duplicate scan + initialize_binding re-find.
+        env.push_initialized_binding(name, value)?;
     }
     if let crate::env::EnvRecord::Declarative(declarative) = &*env {
         declarative.mark_context_transparent();

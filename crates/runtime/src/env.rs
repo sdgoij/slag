@@ -113,6 +113,37 @@ impl EnvRecord {
         }
     }
 
+    /// Push a fully-initialized mutable binding (a fresh per-iteration env's
+    /// head copy): one step instead of create_mutable_binding +
+    /// initialize_binding. The env is freshly created, so no duplicate or
+    /// missing-binding error can arise; the Object form is unreachable from
+    /// the per-iteration creators (they use `new_declarative_environment`)
+    /// and falls back to the two-step form for totality.
+    pub fn push_initialized_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {
+        match self {
+            EnvRecord::Declarative(e) => {
+                e.push_initialized_binding(name, value);
+                Ok(())
+            }
+            EnvRecord::Function(e) => {
+                e.declarative.push_initialized_binding(name, value);
+                Ok(())
+            }
+            EnvRecord::Global(e) => {
+                e.declarative.push_initialized_binding(name, value);
+                Ok(())
+            }
+            EnvRecord::Module(e) => {
+                e.declarative.push_initialized_binding(name, value);
+                Ok(())
+            }
+            EnvRecord::Object(e) => {
+                e.create_mutable_binding(name, false)?;
+                e.initialize_binding(name, value)
+            }
+        }
+    }
+
     /// spec 9.2.1.3 InitializeBinding.
     pub fn initialize_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {
         match self {
@@ -617,6 +648,26 @@ impl DeclarativeEnv {
             },
         ));
         Ok(())
+    }
+
+    /// Push a fully-initialized mutable binding in ONE step (the per-iteration
+    /// env copy). The environment was JUST created empty, so the duplicate
+    /// scan (`create_mutable_binding`) and the re-find (`initialize_binding`)
+    /// are both redundant — one borrow + push leaves exactly the Binding the
+    /// two-step form would. `deletable`/`strict`/`parameter` mirror the
+    /// per-iteration creator's arguments.
+    pub fn push_initialized_binding(&self, name: &JsString, value: Value) {
+        self.bindings.borrow_mut().push((
+            name.clone(),
+            Binding {
+                value: Some(value),
+                mutable: true,
+                strict: false,
+                deletable: false,
+                indirect: None,
+                parameter: false,
+            },
+        ));
     }
 
     fn initialize_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {

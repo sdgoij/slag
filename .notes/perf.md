@@ -6663,6 +6663,195 @@ defines field-for-field + guards.
 Next ranked item: the per-iteration capture env (~2us on the head-let
 closure row) — not started.
 
+### PROBE: per-iteration capture env — elision already present; env alloc ~90-125ns/iter; the residual is general-path call cost (measured 2026-09-08)
+
+The ranked per-iteration-capture item rested on a ~2us/create figure
+measured pre-lazy-prototype/pre-batch. Re-decomposed on the current tree
+(release, jl, HEAD d3c636f): a certified `for (let i...)` loop creating an
+arrow that captures the head costs ~790ns/iter; the same loop with a
+non-capturing arrow ~445ns; an arrow capturing a `var` head ~700ns
+(thermal spread ~±10%). Interleaved A/B with the compiled
+`Step::PerIteration` env creation no-op'd (ceiling probe, semantically
+wrong) saved ~90-125ns/iter (~15%) on the capture row and NOTHING on the
+no-capture loop — the compiler ALREADY elides the per-iteration env when
+the body cannot capture the head. The env alloc premium over a var-capture
+closure is essentially the whole per-iteration overhead.
+
+The cf4-shape rows (an inner closure created inside a called IIFE each
+iteration) initially looked like a ~2x create-context differential
+(create inside an IIFE ~1025ns vs ~520ns in a top-level loop), but a
+controlled matrix FALSIFIED that: identical creates in an inline loop, a
+called helper, and inside an IIFE body all cost the same ~557ns. The
+residual rows decompose into STACKED parts, not a context penalty: pure
+closure create ~557ns/iter; a per-iteration certified function CALL
+~160ns (h_nocaps 719 vs a_inline 557); a nested function whose body
+references an enclosing frame var (env capture) ~80ns/call on a
+called-once helper (h_caps 799 vs h_nocaps 719) and ~167ns/iter on an
+IIFE re-created per iteration (i_caps 1407 vs i_nocaps 1240); an IIFE
+create + call stacks to ~1240ns with a second inner create
+(i_nocaps ≈ a_inline + IIFE-create + call). The base closure create
+~557ns (register_function after the boilerplate batch removed ~400ns of
+defines) is the remaining fish, not any create-context effect.
+
+The per-iteration env is NOT the head-let/cf4 residual: those rows are
+general-path function-call cost (the L3/jit-coverage mass the records
+already flag), and a slim per-iteration env would harvest only the
+~90-125ns/iter on true per-iteration-let capture rows. Deferred unless a
+per-iteration-let-heavy corpus probe shows otherwise. Next thread: the
+~557ns base create itself (register_function record/insert/pattern-store
+composition probe).
+
+### PROBE: the ~557ns base closure create is at its architectural floor — no single register_function component dominates (measured 2026-09-08)
+
+Composition probes on the base create (a sloppy `function(){return 1}`
+created 200k times in a register-run loop, ~557ns/create on HEAD
+d3c636f): skipping `set_function_prototype` per create measured ~0 (the
+intrinsic is realm-cached and the proto set is cheap); `shared_compiled_body`
+is a per-site cache HIT after the first create (Cut 43 — cheap); the
+`ecma_functions.insert` cannot be skipped to isolate its cost — the
+create flow reads the just-inserted record back immediately (a skip
+crashes with "Function body is not registered"), so the insert is
+architecturally required mid-create. The boilerplate batch's own residual
+is small (the batch itself removed ~415ns of defines).
+
+The remaining ~500ns is spread across the per-closure machinery with no
+dominant piece: the Function GC box (crux::Function embedding the fresh
+JsObject + in_fields), the FULL per-closure EcmaFunction record (name
+Option + Rc clones of params/body/compiled-body/ir + the outer_chain and
+per_iteration_chain Vec fields) + its HashMap node, the boilerplate map
+resolution (canonical_empty_map + 2-4 cached child lookups + adoption),
+body_is_strict, realm/env wiring. Every counted candidate is either ~0 or
+architecturally required per create — the base create is at the floor of
+the "one full record + box per closure" design.
+
+The architectural gap vs node's ~22ns/create is the THIN-CLOSURE model:
+Cut 43/64 already share body/params/compiled per SITE, but each closure
+still inserts a full standalone record; node's closure is a small
+instance (env + id) over shared Code. A real slice would shrink the
+per-instance record to an id + env + name instance pointing at a shared
+site record — a wide refactor (every `agent.ecma_functions.get(id)`
+consumer) gated on its own probe, not started.
+
+### PROBE: the head-let/template-literal "jit-equal" rows are NOT a JIT-coverage gap — the bodies compile; the mass is runtime member+call machinery (measured 2026-09-08)
+
+The two largest jl masses (head-let ~1.3-1.7s, template-literal ~1.2s)
+were recorded as "jit-equal (general path)", implying the bodies never
+reach the JIT (the L3 Sparkplug thread). Instrumented ground truth
+falsifies that: `compile_body` scope traces show bench() AND the fixture
+body __t262Body certify (scope Some) in every head-let variant, and no
+Cranelift lowering bail fires (the compile trace stayed silent). The
+fixture body DOES machine-compile — a payload-controlled A/B proves it: a
+nested __t262Body with a 200-add arithmetic payload drops 2.85us ->
+0.53us/iter under jit when alone (5.4x, body compiles), and adding the
+fixture constructs leaves the arithmetic machine-fast while the ~10us/iter
+fixture machinery (3 closure creates + per-iteration for-in-let envs +
+property stores + the 16 member/call steps of the 8 assert.sameValue(
+fns.a(), ...) lines) stays runtime-bound — jl 12.9us vs jit 10.3us per
+iteration reconciles exactly as payload-compiled + fixture-runtime.
+
+A for-in-let + closure body INLINE with heavy arithmetic also compiled
+(machine arithmetic visible under the runtime create cost), and a
+closure-in-a-plain-loop body compiled too — earlier "ratio ~1 means not
+compiled" readings on create-dominated rows were wrong (closure creation
+is runtime machinery shared by both modes, so machine loop control moves
+those rows only a few percent regardless).
+
+So the rows are NOT the L3 coverage mass: the head-let residual is the
+runtime member+call machinery — ~1.4us per assert.sameValue(fns.a(), ...)
+step (member load + argument closure call + call) — which is the L5
+call-breadth territory (method-call inline paths for o.m()) already noted
+in the plan, and the ~10us/iter fixture base is closure create +
+per-iteration env + property-store machinery measured across this
+session's other probes. No L3 code lands from this probe.
+
+### PROBE: L5 method-call breadth is already warm — the head-let assert lines inherit the fresh-object machinery (measured 2026-09-08)
+
+Follow-up on the entry above: decompose the assert.sameValue(fns.a(), 'a')
+line to find the member-call overhead (the L5 o.m() slice). Isolated
+200k rows (release, jl): a direct certified call ~206ns/call; a member
+call on a STABLE object ~240ns/call (+34ns — the member-call path is
+already near the direct-call floor); a full head-let assert line
+(assert.sameValue + fns.a() arg over a freshly-built fns) ~470ns/line.
+The real head-let shape (200k iters): building fns (for-in over a
+3-key object creating 3 per-iteration closures + fresh objects) costs
+~6.77us/iter; the 8 assert lines add ~3.77us (~0.47us/line). The lines
+are slow because fns and its closures are FRESH every iteration — reads
+and calls on fresh-object machinery, not the member-call path (a stable
+receiver's method call already costs ~direct-call). No L5 member-call
+slice lands; the earlier ~1.4us/call attribution was pre-batch and
+stale. The head-let row's residual is the closure-create + per-iteration
++ fresh-object machinery this session's create probes already
+characterized (the thin-closure record model is the one architectural
+lever on it).
+
+### PROBE: template-literal row — tagged-template machinery is NOT the mass; same per-create/capture/call cluster (measured 2026-09-08)
+
+Decomposition of the other big jl mass (language/expressions/template-
+literal/evaluation-order, ~1.2s at 100k iters = ~12us/iter) on 200k
+rows (release, jl): an untagged template with 3 ${i++} substitutions
+costs ~1.06us/iter (the substitutions are 3 post-increments + rope
+concat — the string machinery, not the template form); the sameValue
+compare adds ~160ns; a TAGGED template call with a trivial tag adds only
+~0.22us over the untagged form (template objects are cached per site; a
+direct tag call rides the certified path) — the tagged-template machinery
+is NOT the mass. The full body (per-iteration tag closure create
+capturing callCount + 4 assert.sameValue member calls + the tagged call)
+is ~3.85us/iter; the extra ~2.6us over the parts is the closure create +
+capture-context wiring + the member calls — the SAME per-create/capture/
+cold-call cluster every closure-family row in this session decomposed to.
+Jit moves nothing (runtime machinery, machine loop control moot). Both
+top jl masses are now attributed to that single cluster; the thin-closure
+record model remains the one architectural lever on it.
+
+### SCOPED (not started): the thin-closure record refactor — consumer survey + gate probe (2026-09-08)
+
+The one architectural lever the session's probes converge on: replace the
+full per-closure `EcmaFunction` record (name + environment + Rc clones of
+params/body/compiled/ir + outer_chain + per_iteration_chain Vec fields +
+kind/strict flags, ~300B inserted into the `ecma_functions` HashMap per
+create) with a small per-instance record (id + environment + name) over a
+SHARED per-site record (Cut 43/64 already share body/params/compiled per
+site; the site record would own the rest). Blast-radius survey:
+`outer_chain` 53 sites, `per_iteration_chain` 44, `ecma_functions` 51
+across function.rs/ir.rs/eval.rs/jit.rs — the lookup `fn(agent, id) ->
+&EcmaFunction` feeds the IR compiler, call machinery, leaf/construct
+verdicts, the JIT, and the env machinery, so every consumer dereferences
+fields the split would move behind the site record. A full in-place
+refactor is a dedicated multi-session effort, NOT a same-session landing.
+
+Required gate probe BEFORE any refactor (the discipline the session
+applied elsewhere): instrument register_function phase timings (Function
+box alloc, record construction, HashMap insert, boilerplate batch,
+pattern store) to confirm the record+insert share of the ~500ns base
+create is the largest phase — the skip probes could not isolate the
+insert (the create flow reads the record back mid-create), so the split's
+ceiling is unmeasured. Then slice 1 would move the site-constant fields
+(params/body/compiled/kind/strict/is_async/generator/method flags) into
+an Rc site record and re-point the consumers that need them, keeping
+per-closure name/environment on the instance; each slice gated on
+workspace + clippy + the three sweeps.
+
+### LANDED (2026-09-08, uncommitted): one-push per-iteration head bindings
+
+The first contained slice of the per-iteration env cost (the probe above
+measured the whole env alloc at ~90-125ns/iter): the per-iteration env
+copy per head did create_mutable_binding (a duplicate scan over a fresh
+empty env) + initialize_binding (a re-find), three RefCell borrows per
+name. New `push_initialized_binding` on DeclarativeEnv/EnvRecord pushes
+the fully-initialized Binding in one borrow — the env is freshly created,
+so no duplicate/missing-binding error can arise — and all four per-
+iteration creators use it (ir.rs `Step::PerIteration`/
+`EnterPerIteration`, eval.rs `create_per_iteration_environment`, jit.rs
+`per_iteration_env`). Interleaved release A/B (jl, 200k c_let_capture):
+~148-152ms vs ~156-158ms head (~35ns/iter of the env cost, ~4-5% on the
+row); c_let_call moves with it. Gates: workspace 32 suites green, clippy
+clean, both parity batteries node-identical, all three release test262
+sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086). The remaining per-iteration env cost is the
+DeclarativeEnv GC box itself (Handle::new of the 5-RefCell struct) — a
+dedicated slim per-iteration env variant would harvest more but carries
+the EnvRecord match-site churn; deferred.
+
 
 ## Deferred milestones
 

@@ -922,8 +922,9 @@ fn create_per_iteration_environment(
     let env = new_declarative_environment(Some(outer));
     for name in per_iteration {
         let value = last.get_binding_value(name, false)?;
-        env.create_mutable_binding(name, false)?;
-        env.initialize_binding(name, value)?;
+        // Fresh env: one push instead of the create_mutable_binding
+        // duplicate scan + initialize_binding re-find.
+        env.push_initialized_binding(name, value)?;
     }
     Ok(env)
 }
