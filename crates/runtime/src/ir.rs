@@ -4092,6 +4092,12 @@ impl Vm {
             return Ok(false);
         }
         let property_key = PropertyKey::String(*atom);
+        // Lazy `prototype`: writing a pending function's `prototype`
+        // property must materialize it first — the fresh define below would
+        // otherwise create a w/e/c property instead of updating the fixed
+        // spec descriptor in place (the existing check after this then sees
+        // the property and falls back to the in-place update path).
+        crate::function::maybe_materialize_prototype_of_object(agent, &receiver, &property_key)?;
         // An existing property: the in-place update path handles it. For a
         // map-shaped object (the map describes the key) the field state is
         // the authoritative own-property signal — the field is written iff

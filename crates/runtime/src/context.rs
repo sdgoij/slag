@@ -677,6 +677,12 @@ pub fn get_property_key(
             obj.get_with_receiver_key(key, receiver)
         }
         ValueKind::Function(f) => {
+            // Lazy `prototype`: a pending function's own `prototype` property
+            // is materialized on first observation (every full-get read of a
+            // function property funnels here when the member cells miss —
+            // user `f.prototype`, `instanceof`, species paths, the construct
+            // fallback).
+            crate::function::maybe_materialize_prototype_of_object(agent, &f.object, key)?;
             if let Some(getter) = find_ecma_accessor(agent, &f.object, key, AccessorKind::Get)? {
                 return crate::function::call(agent, &getter, receiver, &[]);
             }
@@ -909,6 +915,12 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
             // setter sees `this` as the primitive, and a write that reaches
             // the end of the chain fails (strict) instead of landing on the
             // ephemeral wrapper.
+            // Lazy `prototype`: a write of a pending function's `prototype`
+            // property must materialize it first — the define below would
+            // otherwise create a fresh w/e/c property instead of updating the
+            // fixed spec descriptor (writable, non-enumerable,
+            // non-configurable) in place.
+            crate::function::maybe_materialize_prototype_value(agent, base, key)?;
             let receiver = get_this_value(reference);
             let base = if matches!(base.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 *base
@@ -990,9 +1002,16 @@ pub fn delete_property_or_throw(agent: &mut Agent, reference: &Reference) -> Res
                     // A deferred namespace triggers its module's evaluation on
                     // a non-symbol-like delete (import-defer).
                     crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, key)?;
+                    // Lazy `prototype`: deleting a pending function's own
+                    // `prototype` must see the non-configurable property (so
+                    // the delete reports false, not the absent-property true).
+                    crate::function::maybe_materialize_prototype_of_object(agent, &obj, key)?;
                     obj.delete_key(key)?
                 }
-                ValueKind::Function(f) => f.object.delete_key(key)?,
+                ValueKind::Function(f) => {
+                    crate::function::maybe_materialize_prototype_of_object(agent, &f.object, key)?;
+                    f.object.delete_key(key)?
+                }
                 _ => true,
             };
             if !deleted && reference.strict {

@@ -219,6 +219,14 @@ pub struct EcmaFunction {
     /// self-tail-call — statically the running body itself — which compiles
     /// to an in-place frame rebind + jump instead of a runtime round-trip.
     pub named_expression: bool,
+    /// Lazy `prototype` (MakeConstructor deferral): set on plain ordinary
+    /// functions at register — the own `prototype` property and its
+    /// prototype object are NOT created eagerly; the first observation of
+    /// the property (a read, `new`, `instanceof`, own-key enumeration,
+    /// descriptor access, delete, or redefine) materializes them through
+    /// `ensure_function_prototype`. Arrows, methods, async functions, and
+    /// generators never set it (they keep the eager path).
+    pub prototype_pending: bool,
 }
 
 impl Trace for EcmaFunction {
@@ -443,6 +451,120 @@ fn make_constructor(
         false,
     );
     Ok(())
+}
+
+/// Materialize a plain ordinary function's lazy `prototype` (the
+/// MakeConstructor deferral in `register_function`): create the prototype
+/// object (an ordinary object inheriting %Object.prototype%) and define the
+/// function's own `prototype` property (writable, non-enumerable,
+/// non-configurable) plus the prototype's `constructor` back-reference —
+/// exactly what the eager `make_constructor` path produced at register. A
+/// no-op when the function has no pending prototype (already materialized,
+/// a builtin, an arrow/method/async/generator — which never defer). Callers
+/// observe the own `prototype` property (a read, a write that would define
+/// it, `new`, `instanceof`, own-key enumeration, a descriptor access, a
+/// delete, or a redefine) and run this first so the observation sees the
+/// real spec descriptor instead of an absent property.
+pub(crate) fn ensure_function_prototype(
+    agent: &mut Agent,
+    function: &Handle<Function>,
+) -> Result<(), JsError> {
+    let Some(data) = agent.ecma_functions.get_mut(&function.id()) else {
+        return Ok(());
+    };
+    if !data.prototype_pending {
+        return Ok(());
+    }
+    // `prototype` must inherit the intrinsic of the function's OWN realm,
+    // not the calling realm (a cross-realm construct reads
+    // `new_target.prototype` through the constructor's realm —
+    // proto-from-ctor-realm-prototype.js). The realm is copied out so the
+    // mutable record borrow ends before the allocation-heavy materialize.
+    let realm = data.realm;
+    let proto = realm
+        .intrinsics
+        .object_prototype()
+        .and_then(|value| crate::context::as_object(&value));
+    let prototype = crux::object::JsObject::ordinary_object_create(proto);
+    make_constructor(function, prototype, true, true)?;
+    let data = agent
+        .ecma_functions
+        .get_mut(&function.id())
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Function body is not registered".into(),
+            )
+        })?;
+    data.prototype_pending = false;
+    Ok(())
+}
+
+/// Materialize the pending `prototype` of an ECMAScript function given its
+/// object part (a function's object part carries the `function_self`
+/// back-reference). Returns whether a function was materialized.
+fn ensure_prototype_of_object_part(
+    agent: &mut Agent,
+    obj: &crux::object::JsObject,
+) -> Result<bool, JsError> {
+    let Some(function) = obj.function_self.get() else {
+        return Ok(false);
+    };
+    ensure_function_prototype(agent, &function)?;
+    Ok(true)
+}
+
+/// The lazy-`prototype` read barrier for an own-property observation of
+/// `key` on `obj` (the object part of a language value): when the key names
+/// the pending `prototype` property of an ECMAScript function, materialize
+/// it first. A cheap miss — the key compare (String keys only), a
+/// `function_self` read, and the pending-flag check — so it can sit on the
+/// shared property paths. Returns whether anything was materialized.
+pub(crate) fn maybe_materialize_prototype_of_object(
+    agent: &mut Agent,
+    obj: &crux::object::JsObject,
+    key: &crux::property::PropertyKey,
+) -> Result<bool, JsError> {
+    let crux::property::PropertyKey::String(id) = key else {
+        return Ok(false);
+    };
+    if *id != prototype_atom() {
+        return Ok(false);
+    }
+    ensure_prototype_of_object_part(agent, obj)
+}
+
+/// The lazy-`prototype` read barrier over a language value: like
+/// `maybe_materialize_prototype_of_object`, resolving the function from a
+/// `Value` (a `ValueKind::Function`, or an Object that is a function's
+/// object part).
+pub(crate) fn maybe_materialize_prototype_value(
+    agent: &mut Agent,
+    value: &Value,
+    key: &crux::property::PropertyKey,
+) -> Result<bool, JsError> {
+    match value.kind() {
+        ValueKind::Function(function) => {
+            maybe_materialize_prototype_of_object(agent, &function.object, key)
+        }
+        ValueKind::Object(obj) => maybe_materialize_prototype_of_object(agent, &obj, key),
+        _ => Ok(false),
+    }
+}
+
+/// The keyless form of the barrier: materialize any pending function
+/// `prototype` from a language value — the all-own-key enumeration and
+/// integrity-level ops (ownKeys, getOwnPropertyNames, freeze/seal) observe
+/// every own key, so they need it regardless of which key is addressed.
+pub(crate) fn materialize_pending_prototype_value(
+    agent: &mut Agent,
+    value: &Value,
+) -> Result<bool, JsError> {
+    match value.kind() {
+        ValueKind::Function(function) => ensure_prototype_of_object_part(agent, &function.object),
+        ValueKind::Object(obj) => ensure_prototype_of_object_part(agent, &obj),
+        _ => Ok(false),
+    }
 }
 
 /// InstantiateOrdinaryFunctionObject (spec 15.2.4): register a function
@@ -971,6 +1093,10 @@ fn register_function(
         outer_chain,
         per_iteration_chain: Vec::new(),
         named_expression,
+        // Plain ordinary functions defer MakeConstructor: the own
+        // `prototype` property + prototype object are materialized lazily on
+        // first observation (see `ensure_function_prototype`).
+        prototype_pending: !kind.is_generator && !kind.is_method && !kind.is_async,
     };
     // Every body compiles to the step IR; the VM executes ordinary bodies
     // the same way it runs the resumable kinds. The Function is created
@@ -1013,29 +1139,24 @@ fn register_function(
     // generator and async-generator functions *and methods* get a `prototype`
     // that inherits %Generator.prototype% / %AsyncGenerator.prototype%,
     // writable per MakeConstructor's default (spec 15.4.5 GeneratorMethod).
-    if kind.is_generator || (!kind.is_method && !kind.is_async) {
-        let prototype = if kind.is_generator {
-            let intrinsic = if kind.is_async {
-                "%AsyncGenerator.prototype%"
-            } else {
-                "%Generator.prototype%"
-            };
-            let proto = agent
-                .current_realm()?
-                .intrinsics
-                .function_prototype(intrinsic)
-                .and_then(|value| crate::context::as_object(&value));
-            JsObject::ordinary_object_create(proto)
+    // Generator functions keep the EAGER path (their prototype feeds the
+    // resume machinery and generator creation); a plain ordinary function's
+    // MakeConstructor is DEFERRED — the `prototype_pending` flag set in the
+    // record above — and materialized on first observation of the own
+    // `prototype` property (a read, `new`, `instanceof`, own-key
+    // enumeration, descriptor access, delete, or redefine).
+    if kind.is_generator {
+        let intrinsic = if kind.is_async {
+            "%AsyncGenerator.prototype%"
         } else {
-            // MakeConstructor (spec 10.2.5 step 2): the prototype is an
-            // ordinary object with %Object.prototype% as its prototype.
-            let proto = agent
-                .current_realm()?
-                .intrinsics
-                .object_prototype()
-                .and_then(|value| crate::context::as_object(&value));
-            JsObject::ordinary_object_create(proto)
+            "%Generator.prototype%"
         };
+        let proto = agent
+            .current_realm()?
+            .intrinsics
+            .function_prototype(intrinsic)
+            .and_then(|value| crate::context::as_object(&value));
+        let prototype = JsObject::ordinary_object_create(proto);
         make_constructor(&function, prototype, true, !kind.is_generator)?;
     }
     // Cut 66: the flags come from the caller's `kind` (no second
@@ -1283,6 +1404,8 @@ pub fn instantiate_arrow(
         outer_chain,
         per_iteration_chain,
         named_expression: false,
+        // Arrows have no `prototype` (spec 15.3.2) — never pending.
+        prototype_pending: false,
     };
     // The Function is created before the compile so a `--gc-stress`
     // collection at `Function::new` cannot sweep the compiled body's literal

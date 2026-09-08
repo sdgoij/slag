@@ -154,6 +154,13 @@ pub fn dispatch_construct(
     {
         let target = args.first().cloned().unwrap_or(Value::Undefined);
         let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
+        // A trap-less proxy forwards its own-property ops to the target with
+        // no runtime barrier in between, so a pending function target must be
+        // materialized here (its `prototype` must already exist for the
+        // forwards to see).
+        if let Err(error) = crate::function::materialize_pending_prototype_value(agent, &target) {
+            return Some(Err(error));
+        }
         let proxy = match crux::proxy::proxy_create(target, handler) {
             Ok(proxy) => proxy,
             Err(error) => return Some(Err(error)),
@@ -176,6 +183,9 @@ pub fn dispatch_construct(
 fn proxy_revocable(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
+    // As in the Proxy constructor: materialize a pending function target so
+    // the trap-less forwards observe its real `prototype`.
+    crate::function::materialize_pending_prototype_value(agent, &target)?;
     let proxy = crux::proxy::proxy_create(target, handler)?;
     if !crate::function::is_constructor(agent, &target)
         && let crux::object::ObjectKind::Proxy(slots) = &proxy.kind

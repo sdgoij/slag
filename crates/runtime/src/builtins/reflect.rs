@@ -202,6 +202,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
         "defineProperty" => {
             let obj = object_of(&arg(0))?;
             let key = crate::context::to_property_key(agent, &arg(1))?;
+            crate::function::maybe_materialize_prototype_of_object(agent, &obj, &key)?;
             let desc = crux::property::to_property_descriptor(&arg(2))?;
             let status = obj.define_property_key(&key, &desc)?;
             Ok(Value::Boolean(status))
@@ -209,6 +210,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
         "deleteProperty" => {
             let obj = object_of(&arg(0))?;
             let key = crate::context::to_property_key(agent, &arg(1))?;
+            crate::function::maybe_materialize_prototype_of_object(agent, &obj, &key)?;
             Ok(Value::Boolean(obj.delete_key(&key)?))
         }
         "get" => {
@@ -227,6 +229,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
             // evaluation for non-symbol-like keys, and the descriptor reads
             // the live binding (import-defer).
             crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
+            crate::function::maybe_materialize_prototype_of_object(agent, &obj, &key)?;
             let Some(property) = obj.get_own_property_key(&key)? else {
                 return Ok(Value::Undefined);
             };
@@ -251,6 +254,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
         "has" => {
             let obj = object_of(&arg(0))?;
             let key = crate::context::to_property_key(agent, &arg(1))?;
+            crate::function::maybe_materialize_prototype_of_object(agent, &obj, &key)?;
             Ok(Value::Boolean(obj.has_property_key(&key)?))
         }
         "isExtensible" => {
@@ -262,6 +266,7 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
             // A deferred namespace's [[OwnPropertyKeys]] triggers its module's
             // evaluation (import-defer).
             crate::module::ensure_deferred_namespace_evaluation(agent, &obj)?;
+            crate::function::materialize_pending_prototype_value(agent, &arg(0))?;
             let keys = obj.own_property_keys()?;
             // GC-2: define each key on the result array as it is boxed — a
             // local `Vec<Value>` of freshly-boxed keys would sit in a heap

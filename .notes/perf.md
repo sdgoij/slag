@@ -6439,6 +6439,114 @@ closer to node; the residual per-field cost is the fast-fresh-define
 wrapper itself (existing check + chain probe + fresh_data_define), the
 next slice if the ctor rows stay hot.
 
+### LANDED (2026-09-08, uncommitted): lazy function `prototype` (MakeConstructor deferral)
+
+Implements the scoped design above: plain ordinary functions (non-method,
+non-async, non-generator — the hot closure/function-expression shapes) no
+longer create their `prototype` object + property eagerly at register; the
+EcmaFunction record carries `prototype_pending`, and the first observation
+of the own `prototype` property materializes it through
+`ensure_function_prototype` (which creates the prototype object inheriting
+%Object.prototype% from the function's OWN realm — a cross-realm construct
+must see the constructor's realm intrinsics — plus the `constructor`
+back-reference and the fixed w/e/c descriptor). Arrows/methods/async/
+generators/class-constructors never defer (eager path unchanged).
+
+Read/write barriers (each a cheap key compare + `function_self` read on the
+cold path; the hot member cells never see the absent property):
+- Reads: `context::get_property_key`'s Function arm (covers user
+  `f.prototype`, `instanceof`, species, the construct fallback).
+- Writes: `context::put_value` and `ir.rs` `fast_fresh_store` (a fresh
+  define would otherwise create a w/e/c property instead of updating the
+  fixed descriptor in place).
+- Own-introspection: Reflect defineProperty/deleteProperty/getOwnProperty
+  Descriptor/has/ownKeys; Object defineProperty/defineProperties,
+  getOwnPropertyDescriptor(s), hasOwn/hasOwnProperty, getOwnPropertyNames
+  (own_keys_of), freeze/seal (SetIntegrityLevel), legacy accessor defines;
+  the `in` operator's has-property walk.
+- Proxies: a trap-less proxy forwards its own-property ops agent-free in
+  crux, so any pending function target is materialized at Proxy/Proxy.
+  revocable creation (the fixture-triggered gap found by the built-ins
+  sweep: defineProperty/deleteProperty/getOwnPropertyDescriptor through a
+  proxy onto a fresh function).
+
+Interleaved release A/B (same machine, ~minutes apart; the eager HEAD is
+c882570): sloppy closure create 1550-1615 -> 1070-1085 ns (-31%),
+per-iteration capture 4030-4190 -> 3000-3080 ns (-26%), the head-let
+fixture 2072 -> 1668 ms (-19.5%); strict create 1168 -> ~720 ns (-38%).
+Gates: workspace 4743 green, clippy clean, a 40-line lazy-prototype
+semantics battery node-identical across jit/jitless/--gc-stress (descriptor
+flags, `in`/hasOwn, own-key enumeration incl. order, reassignment keeping
+attrs, delete/defineProperty rejection, new/instanceof, freeze/seal,
+arrays-vs-methods, per-iteration closures), the vecfree battery still
+node-identical, and all three release test262 sweeps at baseline (language
+23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang). Two sweep-found bugs fixed during the landing: the
+materialize used the CALLING realm instead of the function's own (cross-
+realm construct), and the barrier never fired through trap-less proxy
+forwards.
+
+### Closure-instantiation probe: ~1.4-2.1us/create, composed of boilerplate defines + eager prototype (measured 2026-09-08)
+
+Corpus standings after the two landings (release, jl, vs node): total ~9.0s
+vs ~1.36s (6.6x); the two language-fixture amplifiers (head-let 1738ms,
+template-literal 1219ms) are the top mass and are jit-equal (general
+path). Decomposing head-let (jl, 100k iters) showed the fixture is
+~17.4us/iter ≈ 8 assert JS-calls (~11us, 33x node — general-path calls)
++ 3 per-iteration captured closures (~2.1us each) + base. Isolated
+closure-create rows (200k creates, jl, jit-equal):
+
+| kind | slag/create | node | x |
+|---|---|---|---|
+| arrow | 603ns | 21ns | 28x |
+| strict fn (no caller/arguments) | 1168ns | 22ns | 53x |
+| sloppy fn | 1553ns | 23ns | 67x |
+| + per-iteration env capture | 3563ns | 55ns | 65x |
+
+Composition per sloppy create (register_function + helpers): ~600ns core
+(Function::new record + the ~530B JsObject + length/name boilerplate via
+2 full `fresh_data_define_attrs` + `capture_source` (a per-create source
+JsString slice) + ecma/pattern inserts), ~565ns `make_constructor` (an
+EAGER prototype JsObject alloc + its `constructor` define + the
+function's `prototype` define — for a property these hot closures never
+read), ~385ns sloppy caller/arguments (2 more full defines). The
+full `fresh_data_define_attrs` boilerplate defines measure ~190ns each at
+this level (vs ~40ns for a deferred literal define) — multiple map.find
+scans + RefCell borrows + push each.
+
+Recommended slice (scoped, not yet implemented): LAZY function
+`prototype` — defer `make_constructor` (the ~565ns line, ~36% of a
+sloppy create) until the property is observed. V8 does exactly this.
+Touch points (read barrier sites, each has the agent):
+1. `context::get_property_key` when the key is the prototype atom on a
+   Function value (covers every full-get read: user `f.prototype`,
+   `instanceof`'s OrdinaryHasInstance get_property at expr.rs 1422,
+   species paths, and the construct fallback).
+2. `construct_this_object` (function.rs 2431) — every `new F` reads
+   new_target's prototype through its member-value-cell oracle + get_property
+   fallback; must materialize before reading.
+3. Own-introspection builtins that call crux own-ops directly with the
+   prototype key on a Function: `Object.getOwnPropertyDescriptor`,
+   `'prototype' in f` (has_property_key), delete (the non-configurable
+   rejection needs presence), defineProperty (the existing descriptor for
+   invariant checks), getOwnPropertyNames/Reflect.ownKeys (own_property_keys).
+
+Materialize = run the recorded make_constructor-equivalent for the
+function's kind (prototype object inherits %Object.prototype% or the
+resumable intrinsic). The pending state needs a per-function marker
+(EcmaFunction record or the Function object's generation-synced bit) set
+at register for kinds that would have created one eagerly; functions
+that get `f.prototype = x` assigned or are never constructed/read never
+pay. The read barrier fires only on the prototype atom on a Function — a
+name+kind compare on cold paths, nothing on the hot member-cell path
+(the property is absent, so the cells never cache it).
+
+Follow-ups in the same family (ranked, not started): cache the per-site
+source slice (drop the per-create `capture_source` JsString); batch the
+length/name/caller/arguments boilerplate into a pre-built shape with
+in-place field fills instead of 4 full defines; the per-iteration capture
+env (~2us) after those.
+
 
 ## Deferred milestones
 
