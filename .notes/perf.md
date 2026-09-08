@@ -6176,6 +6176,28 @@ overwhelmingly DEFINE-side, not create-side. Re-opened for planning: a
 field-authoritative fresh-define prototype is the highest-torque lever on
 the object/closure rows, pending the Option-3 consumer-migration plan.
 
+### Define-path trims measured within noise on real rows — REVERTED (2026-09-07)
+
+First attempt at a bounded slice toward the define cost: (1) a map-aware
+presence gate in `create_data_property_key`'s fast path (an aligned
+ordinary object's vector is exactly the map's described prefix, so
+presence is `map.find` — no full `has_own_property_key` [[GetOwnProperty]]
+scan) and (2) single map resolution in `fresh_data_define` (one `find`,
+with the aligned-transition child's offset written to `in_fields`
+directly, dropping `map_set`'s re-find and the double generation bump on
+transitions). Semantically clean: 214 crux tests + workspace green, a
+14-shape define battery (duplicate keys, attr drift, delete-then-define,
+spread, 5-key literals, frozen objects, symbol keys, __proto__) is
+node-identical in jit/jitless/`--gc-stress`. But the interleaved A/B on
+destructure_lite / construct_churn / obj rows is within the machine's
+~±2% noise (destructure_lite ~1.5% better, construct_churn ~1.5% worse,
+5 rounds) — the expected ~7-10% from the probe's ~8-11ns/define
+attribution did NOT transfer, so the real-engine define is even more
+vector-push-dominated than the probe suggested. REVERTED per the row-gate
+discipline. Confirms: only the Option-3 vector-free migration (removing
+the push itself) moves these rows; the map/`has_own` bookkeeping around it
+is not the lever.
+
 ### Standing note: dismissals are conditional on the machinery at measurement time (2026-09-07)
 
 Re-evaluating dismissed ideas under the binary-freshness discipline exposed
@@ -6210,6 +6232,136 @@ Rule of thumb going forward: record each dismissal's dependency conditions
 at dismissal time so a later machinery change is checked against the list.
 Option-3 is the keystone — it cuts the object rows directly AND unlocks
 re-testing the literal-fusion and per-site-IC dismissals on top.
+
+### Option-3 vector-free defines — implementation plan (committed program, 2026-09-07)
+
+The committed multi-session program. Goal: fresh ordinary objects keep their
+map + `in_fields` as the ONLY store while every own key is map-described
+(default w/e/c attrs, offsets < `INLINE_FIELDS`, values live in the fields),
+so `fresh_data_define` skips the ~44ns/key authoritative-`SmallProps` push;
+the vector is materialized lazily the first time a structural consumer needs
+it. Established ground truth (this session): the vector is the sole crux
+spec authority (`get_own_property_key` is a pure vector scan; a
+map-described key with no vector entry is invisible to spec ops, and today
+only exists in the unobservable post-`create_with_map` window before a
+constructor's first store); the JIT reads `JsObject` fields only through
+compile-time `offset_of!`, so layout changes are safe; and the map/`has_own`
+bookkeeping around the push is NOT the lever (measured within noise) — only
+removing the push moves the rows.
+
+Encoding decision: an explicit `map_authoritative: Cell<bool>` on `JsObject`
+(init false in every create site). Inference is UNSOUND — a constructor-
+boilerplate object with some unwritten pre-described fields (a hole) is
+indistinguishable from a vector-free object by (vector empty, descriptors
+non-empty) alone, and materializing a hole would fabricate an own property.
+The flag says "the vector is NOT authoritative; every map descriptor is an
+own default-attrs property with a live `in_fields` value".
+
+Invariant while set: the map is non-empty and describes exactly the own
+properties, each with default w/e/c attrs at an ordinal < `INLINE_FIELDS`,
+value live in `in_fields[ordinal]`; the vector and `property_index` are
+empty. Entry: the first `fresh_data_define` append from a canonical-empty
+map on an ordinary object (vector empty, descriptor_count 0) — or,
+alternatively, only objects built by the fast literal/construct define path
+enter it. Exit: `materialize_properties()` clears it (any structural
+consumer, or a define whose ordinal would reach `INLINE_FIELDS`).
+
+Slice order (each lands clippy-clean + workspace green + three sweeps at
+baseline + row A/B where a row exists):
+1. Layout + plumbing: add the flag + init it false in every creation site
+   (`init_ordinary`, `basic_object_create_with_map`, `with_kind`, the
+   host/htmldda/external constructors, arrays, strings, functions); no
+   behavior change; verify JsObject size delta and the create rows do not
+   move.
+2. `materialize_properties()`: when the flag is set, build the vector from
+   the map descriptors in order (key, attrs) + `map_field` values, clear
+   the flag. Unit-test it reproduces the exact vector a normal build
+   produces (enumeration/descriptor/delete parity on the same keys).
+3. Define-path entry: `fresh_data_define` on an aligned ordinary object
+   with the flag clear enters it (skips the push); duplicate-key updates
+   (map describes key) write `in_fields` in place; a define at
+   `INLINE_FIELDS` materializes first then pushes. `create_data_property_key`
+   routes presence via the map while the flag is set. Both `fresh_data_define`
+   and `fresh_data_define_attrs` stay exact.
+4. Consumer guards (materialize-first at the ~6 choke points that can be
+   reached on a vector-free object by user code; every other `.properties`
+   site is internal to arrays/exotics/helpers and only runs after one of
+   these materialized): `ordinary_property_lookup` (covers
+   `get_own_property_key`/`has_own`/descriptor reads), `own_property_keys` /
+   the ordinary own-key iteration, the `delete` path, `define_property_key`
+   /`validate_and_apply`/`sync_map_after_define`, `property_slot`,
+   `has_own_property_atom`. Audit the runtime for direct `properties`
+   reach-ins that can observe a vector-free ordinary object and guard those.
+5. Hot-read confirmation: reads of map-described keys stay on
+   `map_field`/member cells and never materialize (the whole point); verify
+   destructure/construct rows drop toward the ~60ns/object crux floor
+   (4 defines + 1 create, no pushes) with the sweeps at baseline.
+6. Overflow / full Option-3: objects past `INLINE_FIELDS` keys, the
+   out-of-line value array for ordinals >= 4, and dropping the vector for
+   mapped keys entirely (enumeration from descriptors) — deferred beyond
+   the vector-free slices.
+
+Re-test gates after the vector-free slices land: Cut-71 literal fusion and
+Slice-4 per-site IC (both conditional on the cheap define/offset reads).
+
+### Option-3 vector-free defines — slices 1-4 LANDED (implemented + measured 2026-09-08, uncommitted at HEAD 70f6cfd)
+
+Implemented per the committed program above (the flag field is named
+`props_deferred`). What changed:
+- `map.rs`: `descriptor_at(i)` exposes (key, offset, attrs) for the rebuild.
+- `object.rs`: `materialize_properties()` (private; rebuilds the vector
+  from the map descriptors in order + the `in_fields` values, clears the
+  flag, keeps the map — the object returns to the normal aligned vector
+  state with the read-side map cells still valid). Entry + continuation
+  in `fresh_data_define`: the first fresh define on a fresh Ordinary object
+  (empty map + empty vector — constructor-presize objects start on a
+  NON-empty map and can never enter, so an unwritten pre-described hole
+  can never be fabricated) transitions the map and writes the field with
+  NO authoritative push; subsequent fresh keys continue while
+  `descriptor_count() < INLINE_FIELDS`; a define at `INLINE_FIELDS`
+  materializes first and appends through the standard path (the 5th key
+  lands at vector slot == ordinal 4). `fresh_data_define_attrs`
+  materializes-if-deferred defensively. Guards: `ordinary_property_lookup`
+  and `has_own_property_atom` serve map-described own properties WITHOUT
+  materializing (presence/read consumers — a literal's duplicate-key
+  probe, [[GetOwnProperty]] on a hot constructed object — never rebuild
+  the vector; the hot interpreter read path is unaffected because the
+  member-value/map cells serve `in_fields` first); `property_slot`,
+  `delete_key` (ordinary), `ordinary_define_own_property`, and
+  `ordinary_own_property_keys` materialize first. `has_index_keyed_own_property`
+  scans the map descriptors while deferred (chain-clean verdicts must see
+  a deferred link's index-keyed own props). A missed in-place init in
+  `array_create`'s `new_in_place` path (the flag was never written there
+  — garbage on every array) was caught by the workspace tests and fixed.
+- `runtime/function.rs`: the construct `prototype` probe called
+  `property_slot` while holding a `properties` borrow — reordered (a
+  materialize inside the borrow would have panicked the RefCell). The
+  other direct `properties` reach-ins (globals, arrays, spilled arrays,
+  the chain/member cell paths) are unreachable on a deferred object or
+  call `property_slot`/materializing entry points first.
+
+Gates run: crux 219 tests green (5 new: entry/continuation, materialize
+parity incl. index+symbol keys, delete/redefine materialize, 5th-key
+overflow, presize-never-enters), workspace tests green, clippy
+`-D warnings` clean workspace-wide, a 67-line node-parity battery
+(literals incl. accessors, spread/assign/destructure, delete, descriptors
++ accessor conversion, 5+-key objects, freeze/seal/preventExtensions,
+classes, Array.from/Sets, for-in order, symbols/index keys, hot loops)
+is output-identical across node 24 / jit / jitless / `--gc-stress`.
+
+Row A/B (release, same machine, interleaved 2026-09-08; the no-props
+control `obj_lit` is flat so the machine held): `destructure_lite`
+(`{a:i,b:i+1,c:{d:i+2}}` + reads, 1M) HEAD 460/444/446 ms → 371/396/397/403
+ms jl (~-11%), jit ~406 → ~300-347 ms (~-15%). The first Option-3 slice
+moves the literal rows the ~44ns/define push savings predict at the crux
+level; the remaining row gap is the interpreter's per-literal step
+dispatch + create cost (the Cut-71 literal-fusion and cheaper-create
+items, both re-testable now that defines are cheap).
+
+Outstanding before this is called landed per the repo gate: the three
+release test262 sweeps at baseline (language/built-ins/annexB) on the
+final tree.
+
 
 ## Deferred milestones
 

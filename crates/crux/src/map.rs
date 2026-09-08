@@ -163,6 +163,18 @@ impl Map {
             .find_map(|(k, offset, _)| if k == key { Some(*offset) } else { None })
     }
 
+    /// The descriptor at `index`, in descriptor order (the order keys were
+    /// added as the map forked down its transition chain): the key, its
+    /// field offset, and its attributes. `None` past the end. The Option-3
+    /// vector-free materialize rebuilds an object's property vector from
+    /// these (a map describes every key its object stores while the object's
+    /// vector is deferred, in exactly the vector order the defines produced).
+    pub fn descriptor_at(&self, index: usize) -> Option<(PropertyKey, usize, MapAttrs)> {
+        self.descriptors
+            .get(index)
+            .map(|(key, offset, attrs)| (key.clone(), *offset, *attrs))
+    }
+
     /// Add a property descriptor, returning the assigned field offset.
     pub fn add_descriptor(&mut self, key: PropertyKey, _offset: usize, attrs: MapAttrs) -> usize {
         let field = self.descriptors.len();

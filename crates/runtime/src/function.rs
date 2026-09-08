@@ -2460,18 +2460,18 @@ pub(crate) fn construct_this_object(
                 *new_target,
             )?;
             let key = crux::PropertyKey::String(name);
-            let own_data = {
-                let props = object.properties.borrow();
-                match object.property_slot(&key) {
-                    Some(slot) => match props.get(slot) {
+            let own_data = match object.property_slot(&key) {
+                Some(slot) => {
+                    let props = object.properties.borrow();
+                    match props.get(slot) {
                         Some((stored, property)) => {
                             *stored == key
                                 && matches!(property.kind, crux::object::PropertyKind::Data { .. })
                         }
                         None => false,
-                    },
-                    None => false,
+                    }
                 }
+                None => false,
             };
             if own_data {
                 agent.member_value_cells[index] = crate::ir::MemberValueCell {
