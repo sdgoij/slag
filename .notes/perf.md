@@ -7140,7 +7140,7 @@ method-call cost over a warm receiver (~60ns/read on construct_churn's
 warm ~76) is call-shaped, and a compiled INLINE chain probe cannot be
 sound for materialized receivers: own-absence needs the vector scan or
 the deferred map-find (has_own_property_atom) — not inlineable — and a
-def erred-only probe (map pins own-absence there) has no hot beneficiary
+deferred-only probe (map pins own-absence there) has no hot beneficiary
 (measured earlier: hot construct/literal receivers are materialized
 vlen==mdesc; deferred receivers in practice are function boilerplate,
 whose chain reads f.apply/f.bind sit on STABLE functions already served
@@ -7149,6 +7149,42 @@ compiled chain inline probe; the compiled path's correct shape is the
 slow-call map-chain hit it now has. The remaining construct_churn mass
 is the CONSTRUCT overhead itself (~140-180ns over the ObjectFast literal
 for the same fields) plus the fresh-object method CALL — next lever.
+
+### LANDED (2026-09-08, uncommitted): the constructor this-write pattern collector was dead — `this` is ExprKind::This, not an Ident (Cut 76)
+
+The construct-overhead decomposition (the queued next lever) found the
+root cause before any deeper slicing. Instrumented probes: every `new`
+in the rows takes the certified-construct LEAF path (step_construct
+leaf=100%, general=0), and `new Empty()` steady ~174-210ns is the
+this-object alloc + leaf setup; but the 2 `this.x`/`this.y` constructor
+stores cost ~110-160ns EACH vs the ~55ns warm in-place store, and the
+B5.4 presize branch in construct_this_object NEVER fired (5M constructs,
+count=0) even though store_construct_patterns was recording. Root cause:
+the this-write collector in compile_member_assign checked
+`ExprKind::Ident` whose identifier is the `this` keyword — but `this`
+parses to `ExprKind::This`, a DISTINCT variant, so the pattern cache
+(this_writes, and with it the B5.4 constructor presize AND the Cut 35
+slice 30 member-store pre-warm) was silently DEAD since the parser
+introduced the This variant. Fixed to match ExprKind::This. Interleaved
+flip A/B (jl, construct_churn full body, min-of-3, adjacent builds): fix
+ON ~236-248ms vs OFF ~256-259ms (~5-8%). Gates: workspace 32 suites
+green, clippy clean, a 15-case constructor battery (basic, conditional
+stores read absent / fall to the prototype, store order, compound and
+computed this-writes, overwrite, real-class subclass after super(), lazy
+prototype interplay, read-then-write, defineProperty-on-this,
+delete-this, churn, setter-less proto accessor making the sloppy store a
+silent no-op) node-identical across jit/jitless/gc-stress, all seven
+prior batteries node-identical, and the three release test262 sweeps at
+baseline (language 23721/3 skip, built-ins 23657/155 skip, annexB
+1086/1086). The presize's full intended win is NOT yet realized: a store
+to a map-described-but-unset presize field still runs the full define
+(field write + vector Property push + generation bump) because the
+vector-free branch of define_fresh requires props_deferred and
+ordinary_object_create_with_map does not set it — so the "fill the
+presized slot without the push" fast path does not exist yet. Next
+lever: that store-path slice (recognize a presized hole and fill it
+without the dual-store push), which the vector-free machinery is the
+precedent for.
 
 
 ## Deferred milestones

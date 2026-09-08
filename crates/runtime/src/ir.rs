@@ -18163,10 +18163,12 @@ impl Compiler {
             MemberProperty::Name(name) => {
                 // Cut 35 slice 30: detect `this.name = value` in constructor
                 // bodies to collect property patterns for store-cache pre-warm.
+                // (`this` parses to `ExprKind::This`, a distinct variant — the
+                // pattern cache silently never fired until the This match; the
+                // B5.4 presize and the store-cache pre-warm it feeds were
+                // dead.)
                 if matches!(op, AssignOp::Assign)
-                    && let ExprKind::Ident(ident) = &member.object.kind
-                    && syntax::keywords::from_identifier(*ident)
-                        == Some(syntax::keywords::Keyword::This)
+                    && matches!(member.object.kind, ExprKind::This)
                     && self.scope.as_ref().is_some_and(|s| s.this_slot.is_some())
                 {
                     let (count, arr) = &mut self.this_writes;
