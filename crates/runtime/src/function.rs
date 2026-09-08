@@ -1195,7 +1195,14 @@ fn register_function(
     // and the compiled body's literal `Value`s are only rooted once the
     // record lands in `ecma_functions` — a collection in that window would
     // sweep them (GC-2).
-    let function = Function::new(name.clone());
+    // Cut 74: the function is born with its kind's [[Prototype]] intrinsic
+    // (resolved from the realm cache), so the trailing `set_prototype_of` —
+    // a generic cycle scan + generation bump on an object nothing can have
+    // observed yet — disappears.
+    let function = Function::new_with_prototype(
+        name.clone(),
+        function_kind_prototype(&realm, kind.is_generator, kind.is_async),
+    );
     // The paired `this_writes` pattern is re-applied to each fresh
     // constructor record below (Cut 43: the compiled body is shared per
     // site, so the pattern is computed once and copied).
@@ -1259,10 +1266,8 @@ fn register_function(
         let prototype = JsObject::ordinary_object_create(proto);
         make_constructor(&function, prototype, true, !kind.is_generator)?;
     }
-    // Cut 66: the flags come from the caller's `kind` (no second
-    // `ecma_functions` lookup — the record was just inserted), and the
-    // intrinsic itself is cached per realm after the first resolution.
-    set_function_prototype(agent, &function, kind.is_generator, kind.is_async)?;
+    // Cut 74: no trailing set_function_prototype — the object was born with
+    // its [[Prototype]] (see above).
     Ok(Value::Function(function))
 }
 
@@ -1279,29 +1284,34 @@ pub(crate) fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString
     Some(JsString::from_utf16(slice))
 }
 
-/// OrdinaryFunctionCreate step: `F.[[Prototype]]` is the intrinsic prototype
-/// of the function's kind — %Function.prototype% for ordinary functions,
+/// OrdinaryFunctionCreate step: the [[Prototype]] intrinsic of a function's
+/// kind — %Function.prototype% for ordinary functions,
 /// %GeneratorFunction.prototype% / %AsyncFunction.prototype% /
-/// %AsyncGeneratorFunction.prototype% for the resumable kinds.
-fn set_function_prototype(
-    agent: &Agent,
-    function: &Handle<Function>,
-    is_generator: bool,
-    is_async: bool,
-) -> Result<(), JsError> {
-    let intrinsic = match (is_generator, is_async) {
+/// %AsyncGeneratorFunction.prototype% for the resumable kinds. Cut 74: the
+/// creation sites resolve this BEFORE `Function::new_with_prototype`, so the
+/// fresh (unobservable) object is born with its prototype and the post-hoc
+/// `set_prototype_of` — its generic cycle scan and generation bump — never
+/// runs.
+fn function_kind_prototype_intrinsic(is_generator: bool, is_async: bool) -> &'static str {
+    match (is_generator, is_async) {
         (true, true) => "%AsyncGeneratorFunction.prototype%",
         (true, false) => "%GeneratorFunction.prototype%",
         (false, true) => "%AsyncFunction.prototype%",
         (false, false) => "%Function.prototype%",
-    };
-    let proto = agent
-        .current_realm()?
+    }
+}
+
+/// The resolved [[Prototype]] object for a function kind, from the realm's
+/// cached intrinsic.
+fn function_kind_prototype(
+    realm: &crate::realm::Realm,
+    is_generator: bool,
+    is_async: bool,
+) -> Option<Handle<crux::JsObject>> {
+    realm
         .intrinsics
-        .function_prototype(intrinsic)
-        .and_then(|value| crate::context::as_object(&value));
-    function.object.set_prototype_of(proto)?;
-    Ok(())
+        .function_prototype(function_kind_prototype_intrinsic(is_generator, is_async))
+        .and_then(|value| crate::context::as_object(&value))
 }
 
 /// FunctionBodyContainsUseStrict for a body block (spec 15.2.1).
@@ -1510,7 +1520,10 @@ pub fn instantiate_arrow(
     // The Function is created before the compile so a `--gc-stress`
     // collection at `Function::new` cannot sweep the compiled body's literal
     // `Value`s while they are unrooted (GC-2, see `register_function`).
-    let function = Function::new(None);
+    // Cut 74: arrows are born with their [[Prototype]] intrinsic (%AsyncFunction
+    // for async arrows), skipping the trailing set_prototype_of.
+    let function =
+        Function::new_with_prototype(None, function_kind_prototype(&realm, false, is_async));
     let entry = shared_compiled_body(agent, &data, body_key)?;
     let this_writes = entry.this_writes;
     data.set_compiled(entry.compiled);
@@ -1521,7 +1534,6 @@ pub fn instantiate_arrow(
     if !set_function_properties_batched(agent, &function, &params, None, false) {
         set_function_properties(&function, &params, None)?;
     }
-    set_function_prototype(agent, &function, false, is_async)?;
     Ok(Value::Function(function))
 }
 

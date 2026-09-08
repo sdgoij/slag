@@ -275,12 +275,25 @@ impl Function {
     }
 
     /// A bare ECMAScript function value: identity and name only, used until
-    /// the Phase 7 evaluator fills in the callable body.
+    /// the Phase 7 evaluator fills in the callable body. The object starts
+    /// with a null prototype.
     pub fn new(name: Option<JsString>) -> Handle<Function> {
+        Self::new_with_prototype(name, None)
+    }
+
+    /// [`Function::new`] with the ECMAScript function's `[[Prototype]]` set
+    /// at creation (Cut 74: the runtime resolves the %Function.prototype% /
+    /// generator / async intrinsic before registering the body), so the
+    /// fresh, unobservable object never needs a later `set_prototype_of`
+    /// with its generic cycle scan.
+    pub fn new_with_prototype(
+        name: Option<JsString>,
+        prototype: Option<Handle<JsObject>>,
+    ) -> Handle<Function> {
         let function = Handle::new(Self {
             id: NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed),
             name,
-            object: JsObject::ordinary_object_create(None),
+            object: JsObject::ordinary_object_create(prototype),
             kind: FunctionKind::EcmaScript,
             self_handle: Cell::new(None),
         });

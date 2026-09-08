@@ -7025,6 +7025,33 @@ release test262 sweeps at baseline (language 23721/3 skip, built-ins
 object-side (func_new box + adopt + set_proto, ~55%) — the
 object-representation program, not the record split.
 
+### LANDED (2026-09-08, uncommitted): functions are born with their [[Prototype]] intrinsic (Cut 74)
+
+The register_function phase split's `set_proto` phase (~29-31ns, 9%)
+was a second `current_realm` + intrinsic lookup + `set_prototype_of` on
+the freshly created function object — a generic call that runs the
+kind/immutable/extensible checks and a CYCLE SCAN (walking
+%Function.prototype% → %Object.prototype% → null) plus a generation
+bump on an object nothing could have observed yet. New crux
+`Function::new_with_prototype`: the creation site resolves the kind's
+[[Prototype]] intrinsic (already realm-cached) from the realm it has in
+hand and `ordinary_object_create(proto)` initializes the prototype Cell
+at birth — the whole trailing `set_function_prototype` (and its generic
+`set_prototype_of`) disappears for register_function and instantiate_arrow
+alike. End state identical (same boilerplate map, same prototype Cell);
+the only difference is the object's generation starts at 0 instead of 1
+(nothing caches a pre-return function object, so the relative
+validation is unaffected). Interleaved release A/B (jl, bare create+call
+churn, 200k, min-of-3, born-with-proto vs create-then-set adjacent
+builds): t1 ~139-144 vs ~145-160ms (~5%), t2 ~200-217 vs ~215-234ms
+(~6%). Gates: workspace 32 suites green, clippy clean, a 20-case
+function-prototype battery (chain identity + instanceof + chain reads
+across ordinary/strict/method/arrow/async/generator/async-generator,
+churn loops) plus the fn-boilerplate/objlit/vecfree/proto-lazy/objfast
+batteries node-identical across jit/jitless/gc-stress, and the three
+release test262 sweeps at baseline (language 23721/3 skip, built-ins
+23657/155 skip, annexB 1086/1086).
+
 
 ## Deferred milestones
 
