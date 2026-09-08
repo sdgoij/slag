@@ -6547,6 +6547,57 @@ length/name/caller/arguments boilerplate into a pre-built shape with
 in-place field fills instead of 4 full defines; the per-iteration capture
 env (~2us) after those.
 
+### LANDED (2026-09-08, uncommitted): explicit-attrs boilerplate enters the vector-free define path (+ the transition-tree attrs fix it exposed)
+
+With `prototype` lazy, an ordinary function's eager boilerplate is exactly
+four keys (length/name/caller/arguments), all below `INLINE_FIELDS` — so
+`fresh_data_define_attrs` (the boilerplate define) no longer needs to
+materialize-then-push. Merged it and `fresh_data_define` into one shared
+`define_fresh(key, value, writable, enumerable, configurable)`: the map
+carries the explicit attrs, the deferred state (empty vector + map + fields
+as the only store) represents non-default attribute sets too, and
+`materialize_properties` rebuilds the vector from the descriptors with
+their real attrs. Entry stays canonical-empty-only (empty map AND empty
+vector), so a constructor-presize object with unwritten holes never
+fabricates one; duplicate defines on a described key set the bit and write
+the field.
+
+Interleaved release A/B vs HEAD 72fc404 (jl, cfprobe, paired runs ~2 min
+apart; the machine swings thermally, so each pair brackets a build):
+cf0_call ~197-205 -> ~263 ms (-25%), cf0_sloppy ~184-197 -> ~212-219 ms
+(-11-13%), cf2_strict ~151-182 -> ~182-184 ms (mixed, ~4-18%), cf4_periter
+~625-670 -> ~729-848 ms (-15-25%, noisy). cf5_readproto flat (~250-265) —
+that row forces `prototype` per iteration, so the deferred state never
+survives. Jit column moves with the interpreter (closure creation is
+runtime machinery in both modes).
+
+The language sweep then caught 3 failures in the changed surface —
+statements/function/S13.2_A4_T1/T2 and 13.2-17-1 all assert the fresh
+function-prototype's own `constructor` is NON-enumerable, and for-in
+enumerated it. Root cause: the map transition tree (`Map::transitions`)
+was keyed by PropertyKey ONLY, so two defines of the same key with
+different attrs from the same parent map (a `{ constructor: 1 }` literal
+vs a prototype's non-enumerable `constructor` back-reference) silently
+reused the FIRST define's child map. The old attrs path masked it — it
+always pushed a true-attrs vector entry, so descriptor reads never served
+the poisoned map attrs; the merged vector-free state made the map
+descriptors authoritative (`materialize_properties` rebuilds from them)
+and exposed it. Also a latent bug: HEAD 72fc404 alone already fails the
+reverse order (a function prototype first makes a later literal's
+`constructor` non-enumerable, so `Object.keys({constructor: 1})` = `[]`).
+
+Fix: key the transition tree by `(PropertyKey, MapAttrs)` so same-key
+different-attrs defines fork distinct children (the V8 model — transitions
+keyed by key + property details). Shape sharing is unaffected for
+attribute-consistent keys (all function boilerplate walks identical
+(key, attrs) sequences from the shared empty map). Gates: workspace 32
+suites green, clippy clean, both batteries node-identical across
+jit/jitless/--gc-stress, and all three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang). Regression tests: map.rs same-key-different-attrs forks
+distinct children; object.rs cross-object same-key-different-attrs keeps
+each object's own descriptor attrs.
+
 
 ## Deferred milestones
 

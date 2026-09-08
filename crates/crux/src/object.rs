@@ -721,16 +721,17 @@ pub struct JsObject {
     /// order for ordinary objects).
     pub properties: RefCell<SmallProps>,
     /// The Option-3 vector-free state: when set, `properties` is EMPTY and
-    /// NOT authoritative — every own property is a map descriptor (default
-    /// w/e/c attrs, ordinal < `INLINE_FIELDS`) whose value is live in
-    /// `in_fields[ordinal]`. A fresh define then skips the authoritative
-    /// vector push (the measured ~44ns/key define cost) and hot reads are
-    /// served by `map_field`; `materialize_properties` rebuilds the vector
-    /// from the descriptors and clears the bit the first time a structural
-    /// consumer needs it. Only Ordinary objects built by the fast define
-    /// path from a canonical-empty map enter it — constructor-boilerplate
-    /// objects (pre-described but possibly-unwritten fields) never set it,
-    /// so a hole can never be mistaken for an own property.
+    /// NOT authoritative — every own property is a map descriptor (with the
+    /// descriptor's own attrs, ordinal < `INLINE_FIELDS`) whose value is
+    /// live in `in_fields[ordinal]`. A fresh define then skips the
+    /// authoritative vector push (the measured ~44ns/key define cost) and
+    /// hot reads are served by `map_field`; `materialize_properties`
+    /// rebuilds the vector from the descriptors and clears the bit the
+    /// first time a structural consumer needs it. Only Ordinary objects
+    /// built by the fast define path from a canonical-empty map enter it —
+    /// constructor-boilerplate objects (pre-described but possibly-unwritten
+    /// fields) never set it, so a hole can never be mistaken for an own
+    /// property.
     props_deferred: Cell<bool>,
     /// Lazy key→position index over `properties`, built on the first lookup
     /// once the vector is large enough and invalidated by structural changes
@@ -2903,8 +2904,9 @@ impl JsObject {
     /// Rebuild `properties` from the map descriptors and clear the
     /// `props_deferred` bit (Option-3 vector-free exit). While the bit is
     /// set the vector is empty and NOT authoritative: every own property is
-    /// a map descriptor (default w/e/c attrs at an ordinal < `INLINE_FIELDS`)
-    /// whose value is live in `in_fields[ordinal]`. Materializing reproduces
+    /// a map descriptor (with the descriptor's own attrs at an ordinal <
+    /// `INLINE_FIELDS`) whose value is live in `in_fields[ordinal]`.
+    /// Materializing reproduces
     /// exactly the vector the defines would have pushed — the descriptors in
     /// order (the map forked down its transition chain in define order) with
     /// the field values — so every structural consumer that reads the vector
@@ -3176,104 +3178,7 @@ impl JsObject {
     /// machinery. Returns false when the receiver is not extensible (the
     /// caller then falls back to the full [[Set]]).
     pub fn fresh_data_define(&self, key: &PropertyKey, value: Value) -> bool {
-        if !self.extensible.get() {
-            return false;
-        }
-        // Option-3 vector-free defines: an ordinary object that starts from
-        // an empty map and an empty vector keeps its map + `in_fields` as the
-        // ONLY store while every key is map-described (default w/e/c attrs at
-        // an ordinal < `INLINE_FIELDS`), skipping the authoritative-vector
-        // push (the measured ~44ns/key define cost). Entry: the first fresh
-        // define on a canonical-empty ordinary object. Continuation: a fresh
-        // key while the bit is set transitions the map and writes the field
-        // only. A define whose ordinal would reach `INLINE_FIELDS` (the 5th
-        // key) materializes first and takes the standard path below, so the
-        // deferred invariant — every own property is a described, written
-        // field — never lets the map address a vector slot the object has not
-        // pushed.
-        if let Some(map) = self.map.get() {
-            if self.props_deferred.get() {
-                if map.find(key).is_some() {
-                    // A duplicate define on a described key (only reachable
-                    // by a direct caller — `create_data_property_key` probes
-                    // presence first): the property already exists with
-                    // default attrs, so a field update is the whole store.
-                    let _ = self.map_set(key, value);
-                    self.bump_generation();
-                    return true;
-                }
-                if map.descriptor_count() >= INLINE_FIELDS {
-                    // The next descriptor would address the property vector
-                    // at ordinal `INLINE_FIELDS`, which the deferred state
-                    // has never pushed: materialize and append normally.
-                    self.materialize_properties();
-                } else {
-                    if self
-                        .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
-                        .is_some()
-                    {
-                        let _ = self.map_set(key, value);
-                        self.bump_generation();
-                        return true;
-                    }
-                }
-            } else if matches!(self.kind, ObjectKind::Ordinary)
-                && map.is_empty()
-                && self.properties.borrow().is_empty()
-            {
-                // Entry: the first fresh define on a fresh ordinary object
-                // enters the vector-free state (transition to the first
-                // descriptor + field write, no push). The object is fresh —
-                // empty map AND empty vector — so no pre-described-but-
-                // unwritten boilerplate hole can be mistaken for an own
-                // property (the constructor-presize path starts on a NON-
-                // empty map and never enters here).
-                if self
-                    .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
-                    .is_some()
-                {
-                    let _ = self.map_set(key, value);
-                    self.props_deferred.set(true);
-                    self.bump_generation();
-                    return true;
-                }
-            }
-        }
-        // Part B, B5.3/B5.4: transition the map for the fresh w/e/c data
-        // property and write the value into the field it assigned, so the
-        // map-based read path serves it without a property-vector borrow. A
-        // key the object's map ALREADY describes (a constructor-boilerplate
-        // pre-sized object) writes the field in place — the shape is fixed,
-        // so there is no transition (the `||` short-circuits it). A fresh
-        // key transitions only when the append is aligned (the vector holds
-        // exactly the map's described prefix), so the new descriptor's
-        // ordinal equals the key's vector position; a misaligned append (a
-        // non-transitionable define or a skipped boilerplate field earlier)
-        // leaves the key vector-only — the map keeps describing only keys
-        // whose ordinal equals their vector slot.
-        if self.map.get().is_some_and(|m| m.find(key).is_some())
-            || (self.map_transition_aligned()
-                && self
-                    .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
-                    .is_some())
-        {
-            let _ = self.map_set(key, value);
-        }
-        let mut props = self.properties.borrow_mut();
-        let position = props.len();
-        props.push((key.clone(), Property::data(value, true, true, true)));
-        drop(props);
-        // The lazy index's incremental maintenance (an append shifts
-        // nothing, so the new key maps to its pushed position). Only pay
-        // the RefCell borrow for the index when it already exists — for
-        // fresh objects the index starts as None and is built lazily.
-        if self.property_index.borrow().is_some()
-            && let Some(index) = &mut *self.property_index.borrow_mut()
-        {
-            index.insert(key.clone(), position);
-        }
-        self.bump_generation();
-        true
+        self.define_fresh(key, value, true, true, true)
     }
 
     /// Append a fresh data property with EXPLICIT attributes on an ordinary,
@@ -3293,21 +3198,86 @@ impl JsObject {
         enumerable: bool,
         configurable: bool,
     ) -> bool {
+        self.define_fresh(key, value, writable, enumerable, configurable)
+    }
+
+    /// The shared Option-3 vector-free fresh define (both the all-true
+    /// CreateDataProperty form and the explicit-attrs boilerplate form): an
+    /// ordinary object whose vector is empty and whose map describes only
+    /// field-addressed keys (< `INLINE_FIELDS`) keeps its map + `in_fields`
+    /// as the ONLY store while its own properties are map-described — each
+    /// define transitions (or fills) a descriptor and writes the field with
+    /// NO authoritative-vector push. The map carries the explicit attrs, so
+    /// the vector-free state represents non-default attribute sets too (the
+    /// function boilerplate — `length`/`name`/`caller`/`arguments`, exactly
+    /// four keys now that `prototype` is lazy — stays vector-free and
+    /// never spills the property vector). Entry: the first define on a fresh
+    /// ordinary object (empty map + empty vector — no pre-described hole can
+    /// be fabricated). While deferred: a described key (a duplicate define)
+    /// writes the field only; a fresh key transitions while
+    /// `descriptor_count() < INLINE_FIELDS`; a fresh key at a full map
+    /// materializes first and appends through the standard path below (its
+    /// storage is the vector).
+    fn define_fresh(
+        &self,
+        key: &PropertyKey,
+        value: Value,
+        writable: bool,
+        enumerable: bool,
+        configurable: bool,
+    ) -> bool {
         if !matches!(self.kind, ObjectKind::Ordinary) || !self.extensible.get() {
             return false;
         }
-        // Non-default attributes on a vector-free object would leave the map
-        // describing attrs the read/define paths then have to reconcile with
-        // an empty vector; the explicit-attrs path is the function/prototype
-        // boilerplate, which never runs on a deferred object — but if one
-        // ever reaches it, materialize first so the append lands on a real
-        // vector.
-        self.materialize_properties();
         let attrs = MapAttrs::new(writable, enumerable, configurable);
-        // The map transition follows the same alignment discipline as
-        // `fresh_data_define`: a key the map already describes fills in
-        // place; a fresh key transitions only when its append lands at the
-        // descriptor boundary.
+        // Entry stays canonical-empty (empty map + empty vector): the
+        // vector-free machinery reads presence as field-set and materialize
+        // assumes no unwritten pre-described holes, so constructor-presize
+        // objects (a non-empty map with unwritten fields) must not enter.
+        if let Some(map) = self.map.get()
+            && (self.props_deferred.get()
+                || (self.properties.borrow().is_empty() && map.is_empty()))
+        {
+            if map.find(key).is_some() {
+                // A duplicate define on a described key (only reachable by a
+                // direct caller — presence probes catch duplicates before
+                // this): the property already exists, so a field update is
+                // the whole store.
+                self.props_deferred.set(true);
+                let _ = self.map_set(key, value);
+                self.bump_generation();
+                return true;
+            }
+            if map.descriptor_count() < INLINE_FIELDS {
+                if self.map_add_property_cell(key.clone(), attrs).is_some() {
+                    // Transition to the fresh descriptor and write the field.
+                    self.props_deferred.set(true);
+                    let _ = self.map_set(key, value);
+                    self.bump_generation();
+                    return true;
+                }
+                // The map could not fork (a shared-handle mutation limit):
+                // fall through to the standard append with the flag clear.
+            } else if self.props_deferred.get() {
+                // Deferred with a full map and a fresh key: the next
+                // descriptor would address the vector at ordinal
+                // `INLINE_FIELDS`, which the deferred state has never
+                // pushed — materialize and append normally below.
+                self.materialize_properties();
+            }
+        }
+        // Part B, B5.3/B5.4: transition the map for the fresh data
+        // property and write the value into the field it assigned, so the
+        // map-based read path serves it without a property-vector borrow. A
+        // key the object's map ALREADY describes (a constructor-boilerplate
+        // pre-sized object) writes the field in place — the shape is fixed,
+        // so there is no transition (the `||` short-circuits it). A fresh
+        // key transitions only when the append is aligned (the vector holds
+        // exactly the map's described prefix), so the new descriptor's
+        // ordinal equals the key's vector position; a misaligned append (a
+        // non-transitionable define or a skipped boilerplate field earlier)
+        // leaves the key vector-only — the map keeps describing only keys
+        // whose ordinal equals their vector slot.
         if self.map.get().is_some_and(|m| m.find(key).is_some())
             || (self.map_transition_aligned()
                 && self.map_add_property_cell(key.clone(), attrs).is_some())
@@ -3321,6 +3291,10 @@ impl JsObject {
             Property::data(value, writable, enumerable, configurable),
         ));
         drop(props);
+        // The lazy index's incremental maintenance (an append shifts
+        // nothing, so the new key maps to its pushed position). Only pay
+        // the RefCell borrow for the index when it already exists — for
+        // fresh objects the index starts as None and is built lazily.
         if self.property_index.borrow().is_some()
             && let Some(index) = &mut *self.property_index.borrow_mut()
         {
@@ -5391,6 +5365,128 @@ mod tests {
             obj.props_deferred.get(),
             "presence/read consumers must not materialize"
         );
+    }
+
+    #[test]
+    fn explicit_attrs_defines_enter_vector_free_and_materialize_faithfully() {
+        // The function/prototype boilerplate uses the explicit-attrs form
+        // (length/name/caller/arguments with non-default writable/enumerable/
+        // configurable). With the `prototype` now lazy there are exactly
+        // four boilerplate keys, all below INLINE_FIELDS — so the attrs form
+        // must enter the vector-free state too: the map carries the non-
+        // default attrs, reads serve the descriptor attrs, and materializing
+        // rebuilds the vector with those attrs intact.
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(obj.fresh_data_define_attrs(
+            &PropertyKey::from_utf8("length"),
+            Value::Number(1.0),
+            false,
+            false,
+            true,
+        ));
+        assert!(obj.props_deferred.get(), "the attrs define enters");
+        assert!(obj.properties.borrow().is_empty());
+        assert!(obj.fresh_data_define_attrs(
+            &PropertyKey::from_utf8("name"),
+            Value::String(Handle::new(JsString::from_utf8("f"))),
+            false,
+            false,
+            true,
+        ));
+        // Descriptor reads serve the map's explicit attrs without
+        // materializing.
+        let length = obj
+            .get_own_property_key(&PropertyKey::from_utf8("length"))
+            .unwrap()
+            .expect("own length");
+        assert_eq!(length.value(), Some(Value::Number(1.0)));
+        assert_eq!(length.writable(), Some(false));
+        assert!(!length.enumerable);
+        assert!(length.configurable);
+        // A non-writable own property rejects writes through the map attrs.
+        assert!(
+            !obj.set_key(&PropertyKey::from_utf8("length"), Value::Number(9.0), false)
+                .unwrap()
+        );
+        assert!(obj.props_deferred.get());
+        // Enumeration materializes with the explicit attrs intact.
+        assert_eq!(
+            obj.own_property_keys().unwrap(),
+            vec![
+                PropertyKey::from_utf8("length"),
+                PropertyKey::from_utf8("name"),
+            ]
+        );
+        assert!(!obj.props_deferred.get());
+        let length = obj
+            .get_own_property_key(&PropertyKey::from_utf8("length"))
+            .unwrap()
+            .expect("own length");
+        assert_eq!(length.value(), Some(Value::Number(1.0)));
+        assert_eq!(length.writable(), Some(false));
+        assert!(!length.enumerable);
+        assert!(length.configurable);
+        assert_eq!(
+            obj.map_get(&PropertyKey::from_utf8("length")),
+            Some(Value::Number(1.0))
+        );
+    }
+
+    #[test]
+    fn same_key_different_attrs_keep_their_own_descriptors_across_objects() {
+        // Two fresh objects share the canonical empty map. The first defines
+        // `constructor` with default attrs (a `{ constructor: 1 }` literal);
+        // the second defines it non-enumerable (a function prototype's
+        // back-reference). The transition tree must fork a DIFFERENT child
+        // map per (key, attrs) — a key-only transition cache would hand the
+        // second object the first define's map, and its descriptor reads and
+        // materialized vector would report `constructor` as enumerable (the
+        // S13.2_A4 / 13.2-17 language fixtures).
+        let literal = JsObject::ordinary_object_create(None);
+        assert!(
+            literal.fresh_data_define(&PropertyKey::from_utf8("constructor"), Value::Number(1.0))
+        );
+        let proto = JsObject::ordinary_object_create(None);
+        assert!(proto.fresh_data_define_attrs(
+            &PropertyKey::from_utf8("constructor"),
+            Value::Number(2.0),
+            true,
+            false,
+            true,
+        ));
+        // Distinct shapes: the non-default define must not reuse the
+        // literal's child map.
+        assert_ne!(
+            literal.map.get().unwrap().id(),
+            proto.map.get().unwrap().id()
+        );
+        // Each object's descriptors report its own attributes.
+        let lit_desc = literal
+            .get_own_property_key(&PropertyKey::from_utf8("constructor"))
+            .unwrap()
+            .expect("literal own constructor");
+        assert!(lit_desc.enumerable);
+        let proto_desc = proto
+            .get_own_property_key(&PropertyKey::from_utf8("constructor"))
+            .unwrap()
+            .expect("proto own constructor");
+        assert!(!proto_desc.enumerable);
+        assert_eq!(proto_desc.writable(), Some(true));
+        assert!(proto_desc.configurable);
+        // Materializing (enumeration) rebuilds with the same attrs: the
+        // literal's keys include constructor, the prototype's enumeration
+        // does not surface it as enumerable.
+        assert_eq!(
+            literal.own_property_keys().unwrap(),
+            vec![PropertyKey::from_utf8("constructor")]
+        );
+        let proto_keys = proto.own_property_keys().unwrap();
+        assert_eq!(proto_keys, vec![PropertyKey::from_utf8("constructor")]);
+        let enumed = proto
+            .get_own_property_key(&PropertyKey::from_utf8("constructor"))
+            .unwrap()
+            .expect("post-materialize own constructor");
+        assert!(!enumed.enumerable);
     }
 
     #[test]

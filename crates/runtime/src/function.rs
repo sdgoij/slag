@@ -4352,4 +4352,60 @@ mod tests {
             Value::Boolean(true)
         );
     }
+
+    #[test]
+    fn same_key_attrs_isolated_between_literal_and_function_prototype() {
+        // The map transition tree keys child maps by (key, attributes): a
+        // `{ constructor: 1 }` literal (default attrs) and a function
+        // prototype's non-enumerable `constructor` back-reference share the
+        // canonical empty map but must fork DISTINCT shapes. A key-only
+        // transition cache reused whichever defined first, so the other
+        // object's descriptor reported the wrong attrs — a literal first
+        // made the prototype's constructor enumerable (the S13.2_A4_T1/T2
+        // and 13.2-17-1 language fixtures), a prototype first made the
+        // literal's constructor non-enumerable (`Object.keys` dropped it).
+        // Each `run` is a fresh realm, so the orders are independent.
+        //
+        // Literal first, then a sloppy function prototype.
+        assert_eq!(
+            run("var x = { constructor: 1 }; \
+                 function f() {} \
+                 var fd = Object.getOwnPropertyDescriptor(f.prototype, 'constructor'); \
+                 var xd = Object.getOwnPropertyDescriptor(x, 'constructor'); \
+                 var enumed = false; \
+                 for (var k in f.prototype) { if (k === 'constructor') enumed = true; } \
+                 fd.enumerable === false && fd.writable === true && fd.configurable === true \
+                   && fd.value === f && enumed === false && xd.enumerable === true")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        // Function prototype first, then a `{ constructor: ... }` literal.
+        assert_eq!(
+            run("function f() {} \
+                 var x = { constructor: 2 }; \
+                 var fd = Object.getOwnPropertyDescriptor(f.prototype, 'constructor'); \
+                 var xd = Object.getOwnPropertyDescriptor(x, 'constructor'); \
+                 fd.enumerable === false && xd.enumerable === true && x.constructor === 2 \
+                   && Object.keys(x).indexOf('constructor') >= 0")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        // 13.2-17-1: defining the prototype's own `constructor` must not
+        // invoke an inherited constructor accessor (the fresh define is a
+        // create, not a set), and the fixed descriptor stays own data.
+        assert_eq!(
+            run("var data = 'data'; \
+                 Object.defineProperty(Object.prototype, 'constructor', { \
+                   get: function () { return 100; }, \
+                   set: function (v) { data = v; }, \
+                   configurable: true \
+                 }); \
+                 var fun = function () {}; \
+                 var d = Object.getOwnPropertyDescriptor(fun.prototype, 'constructor'); \
+                 fun.prototype.constructor === fun && d.writable === true \
+                   && d.enumerable === false && d.configurable === true && data === 'data'")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+    }
 }

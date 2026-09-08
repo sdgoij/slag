@@ -28,7 +28,7 @@ use crate::property::PropertyKey;
 ///
 /// Attributes are stored as a bitmask: bit 0 = writable, bit 1 = enumerable,
 /// bit 2 = configurable (matching PropertyDescriptor semantics).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MapAttrs(u8);
 
 impl MapAttrs {
@@ -66,11 +66,17 @@ pub struct Map {
     descriptors: Vec<MapEntry>,
     /// Prototype of objects described by this map.
     prototype: Option<Handle<JsObject>>,
-    /// Transition tree: property name → child map created when that property
-    /// is added. Fx-hashed (Cut 66): the closure-creation path forks the
+    /// Transition tree: (property name, attributes) → child map created when
+    /// a property with exactly those attributes is added. The attributes are
+    /// part of the shape: two defines of the same key with different
+    /// w/e/c sets (a `{ constructor: 1 }` literal vs a function prototype's
+    /// non-enumerable `constructor`) must fork DIFFERENT child maps — a
+    /// key-only cache silently reuses the first define's attributes, which
+    /// the descriptor-serving read paths then report for the second object.
+    /// Fx-hashed (Cut 66): the closure-creation path forks the
     /// function/prototype shapes per property append, and the keys are atom
     /// ids / symbol pointers — not attacker-controlled.
-    transitions: HashMap<PropertyKey, Handle<Map>, BuildHasherDefault<FxHasher>>,
+    transitions: HashMap<(PropertyKey, MapAttrs), Handle<Map>, BuildHasherDefault<FxHasher>>,
     /// Back-pointer to the parent map in the transition tree.
     back_pointer: Option<Handle<Map>>,
     /// Generation counter: bumped when this map's shape changes.
@@ -104,7 +110,7 @@ impl Trace for Map {
         for entry in &self.descriptors {
             entry.0.trace(visit);
         }
-        for (key, child) in &self.transitions {
+        for ((key, _attrs), child) in &self.transitions {
             key.trace(visit);
             child.trace(visit);
         }
@@ -191,7 +197,7 @@ impl Map {
         _offset: usize,
         attrs: MapAttrs,
     ) -> Handle<Map> {
-        if let Some(child) = self.transitions.get(&key) {
+        if let Some(child) = self.transitions.get(&(key.clone(), attrs)) {
             return *child;
         }
         // Create a back-pointer handle to *this* allocation (not a new box).
@@ -206,7 +212,7 @@ impl Map {
         // descriptor count is the child's field offset for the new key).
         child.descriptors = self.descriptors.clone();
         child.add_descriptor(key.clone(), 0, attrs);
-        self.transitions.insert(key, child);
+        self.transitions.insert((key, attrs), child);
         child
     }
 
@@ -221,7 +227,7 @@ impl Map {
         key: PropertyKey,
         attrs: MapAttrs,
     ) -> Option<Handle<Map>> {
-        if let Some(child) = self.transitions.get(&key) {
+        if let Some(child) = self.transitions.get(&(key.clone(), attrs)) {
             return Some(*child);
         }
         // GcBox header is mark(1) + padding(3) + size(4) = 8 bytes before data.
@@ -235,7 +241,7 @@ impl Map {
         // descriptor count is the child's field offset for the new key).
         child.descriptors = self.descriptors.clone();
         child.add_descriptor(key.clone(), 0, attrs);
-        self.transitions.insert(key, child);
+        self.transitions.insert((key, attrs), child);
         Some(child)
     }
 
@@ -342,6 +348,33 @@ mod tests {
         );
         assert_eq!(child1.id(), child2.id());
         assert_eq!(map.transitions.len(), 1);
+    }
+
+    #[test]
+    fn same_key_different_attrs_fork_distinct_children() {
+        // A transition's child map bakes in the define's attributes; two
+        // defines of the same key with different w/e/c sets from the same
+        // parent must fork DIFFERENT children (a key-only cache would reuse
+        // the first define's attributes and report them for the second
+        // object's descriptors — the `{constructor: 1}`-literal vs function
+        // prototype poisoning).
+        let mut map = Map::new_empty(None);
+        let key = PropertyKey::from_utf8("constructor");
+        let default = map
+            .get_or_create_child(key.clone(), MapAttrs::new(true, true, true))
+            .unwrap();
+        let non_enum = map
+            .get_or_create_child(key.clone(), MapAttrs::new(true, false, true))
+            .unwrap();
+        assert_ne!(default.id(), non_enum.id());
+        assert!(default.descriptor_at(0).unwrap().2.enumerable());
+        assert!(!non_enum.descriptor_at(0).unwrap().2.enumerable());
+        assert_eq!(map.transitions.len(), 2);
+        // The same (key, attrs) pair still dedupes.
+        let again = map
+            .get_or_create_child(key.clone(), MapAttrs::new(true, false, true))
+            .unwrap();
+        assert_eq!(non_enum.id(), again.id());
     }
 
     #[test]
