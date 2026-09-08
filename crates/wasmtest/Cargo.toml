@@ -6,7 +6,15 @@ license.workspace = true
 
 [dependencies]
 serde_json = "1"
-wasm = { path = "../wasm", features = ["compile"] }
+wasm = { path = "../wasm" }
 wast = { version = "258.0.0", default-features = false, features = ["wasm-module"] }
 wat = { version = "1.258.0", default-features = false }
 runtime = { path = "../runtime" }
+
+[features]
+# The WIP native-compile backend (`wasm/compile`): OFF by default so a plain
+# workspace build does not enable it inside `runtime`'s wasm Store through
+# feature unification (the JS-API tests must stay on the interpreter).
+# `equiv` and the coverage report compare compiled bodies and need it:
+#   cargo run -p wasmtest --features compile -- equiv waspec/test/core
+compile = ["wasm/compile"]

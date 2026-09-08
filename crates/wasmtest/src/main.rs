@@ -114,7 +114,7 @@ fn main() -> ExitCode {
                 eprintln!("wasmtest equiv: missing path\n\n{USAGE}");
                 return ExitCode::from(2);
             }
-            equiv(&paths)
+            equiv_command(&paths)
         }
         "jsapi" => {
             let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
@@ -267,7 +267,10 @@ fn run(paths: &[PathBuf]) -> ExitCode {
 }
 
 /// Compiled-coverage summary for one suite run (meaningful only on the
-/// compiled path; the interpreter-forced store reports zeros).
+/// compiled path; the interpreter-forced store reports zeros). Exists in
+/// every build because `run_json_mode` returns it; without the `compile`
+/// feature it is only ever the zero default (fields never populated).
+#[cfg_attr(not(feature = "compile"), allow(dead_code))]
 #[derive(Default)]
 struct Coverage {
     compiled: usize,
@@ -275,6 +278,7 @@ struct Coverage {
     reasons: Vec<&'static str>,
 }
 
+#[cfg(feature = "compile")]
 impl Coverage {
     fn merge(&mut self, other: &Coverage) {
         self.compiled += other.compiled;
@@ -284,11 +288,28 @@ impl Coverage {
 }
 
 /// Percentage of compiled functions, or 0 when nothing is defined yet.
+#[cfg(feature = "compile")]
 fn coverage_percent(compiled: usize, defined: usize) -> usize {
     compiled
         .checked_mul(100)
         .and_then(|n| n.checked_div(defined))
         .unwrap_or(0)
+}
+
+/// Run `equiv`, or explain that the WIP native backend is not compiled in
+/// (the command would be a vacuous interpreter-vs-interpreter comparison).
+#[cfg(feature = "compile")]
+fn equiv_command(paths: &[PathBuf]) -> ExitCode {
+    equiv(paths)
+}
+
+#[cfg(not(feature = "compile"))]
+fn equiv_command(_paths: &[PathBuf]) -> ExitCode {
+    eprintln!(
+        "wasmtest equiv compares the WIP native backend against the interpreter and\n\
+         needs the `compile` feature: cargo run -p wasmtest --features compile -- equiv ..."
+    );
+    ExitCode::FAILURE
 }
 
 /// Run each suite twice — compiled bodies and the interpreter forced — and
@@ -297,6 +318,7 @@ fn coverage_percent(compiled: usize, defined: usize) -> usize {
 /// (Cut 11's equivalence gate). Every run also reports how many of the
 /// suite's module-defined functions actually compiled, so a green equiv is
 /// never mistaken for coverage.
+#[cfg(feature = "compile")]
 fn equiv(paths: &[PathBuf]) -> ExitCode {
     let exclusions = load_exclusions();
     let mut items: Vec<(PathBuf, bool)> = Vec::new();
@@ -510,6 +532,7 @@ fn run_json_mode(
     // an import registry (spectest plus every `register`-named module), the
     // most recent module id, and module ids given a name by `register`.
     let mut store = Store::new();
+    #[cfg(feature = "compile")]
     store.set_compile(compiled);
     let mut registry = spectest_exports(&mut store);
     let mut last: Option<usize> = None;
@@ -878,11 +901,18 @@ fn run_json_mode(
         }
     }
     let coverage = if compiled {
-        let (compiled_count, defined, reasons) = store.compile_coverage();
-        Coverage {
-            compiled: compiled_count,
-            defined,
-            reasons,
+        #[cfg(feature = "compile")]
+        {
+            let (compiled_count, defined, reasons) = store.compile_coverage();
+            Coverage {
+                compiled: compiled_count,
+                defined,
+                reasons,
+            }
+        }
+        #[cfg(not(feature = "compile"))]
+        {
+            Coverage::default()
         }
     } else {
         Coverage::default()

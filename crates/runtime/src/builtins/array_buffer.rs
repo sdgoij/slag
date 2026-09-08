@@ -246,9 +246,6 @@ fn allocate_shared_array_buffer(
     );
     let cell = agent.buffer_data.get(&object.id()).expect("inserted");
     cell.borrow().shared.mark_shared();
-    // SharedArrayBuffer instances are nonextensible (spec 25.3.3): with no
-    // own properties that makes every instance `Object.isFrozen`.
-    object.prevent_extensions()?;
     Ok(())
 }
 
@@ -921,8 +918,6 @@ pub fn shared_array_buffer_from_block(
             immutable: false,
         }),
     );
-    // SharedArrayBuffer instances are nonextensible (spec 25.3.3).
-    object.prevent_extensions()?;
     Ok(Value::Object(object))
 }
 
@@ -1862,9 +1857,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_array_buffer_instances_are_nonextensible() {
-        assert!(bool("Object.isFrozen(new SharedArrayBuffer(4))"));
-        assert!(!bool("Object.isExtensible(new SharedArrayBuffer(4))"));
+    fn shared_array_buffers_are_extensible() {
+        // SharedArrayBuffer instances are ordinary extensible objects (the
+        // pinned test262 corpus's SAB species fixtures assign `constructor`
+        // in strict mode and must not throw).
+        assert!(!bool("Object.isFrozen(new SharedArrayBuffer(4))"));
+        assert!(bool("Object.isExtensible(new SharedArrayBuffer(4))"));
         assert!(!bool("Object.isFrozen(new ArrayBuffer(4))"));
         assert!(bool("Object.isExtensible(new ArrayBuffer(4))"));
     }

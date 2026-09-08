@@ -1121,7 +1121,19 @@ fn memory_is_shared(agent: &Agent, cell: usize) -> bool {
 fn materialize_memory_buffer(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
     let bytes = memory_cell_bytes(agent, cell)?;
     let buffer = if memory_is_shared(agent, cell) {
-        let block = SharedBuffer::new(bytes.len());
+        // A shared memory's block must absorb every later grow in place (the
+        // workers `SharedBuffer` block is fixed-capacity and `resize` refuses
+        // to grow past it), so allocate the block at the declared maximum
+        // page count up front rather than at the current byte length.
+        let capacity = agent
+            .wasm_store
+            .borrow()
+            .memory_type(cell)
+            .and_then(|ty| ty.limits.max)
+            .map(|pages| (pages as usize).saturating_mul(wasm::exec::PAGE_SIZE as usize))
+            .unwrap_or(bytes.len())
+            .max(bytes.len());
+        let block = SharedBuffer::new_with_capacity(bytes.len(), capacity);
         block.write(0, &bytes)?;
         array_buffer::shared_array_buffer_from_block(agent, block, bytes.len())?
     } else {
@@ -3558,7 +3570,7 @@ mod tests {
                 "(function(){ const m = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true });",
                 " const sab = m.buffer;",
                 " if (Object.prototype.toString.call(sab) !== '[object SharedArrayBuffer]') return false;",
-                " if (!Object.isFrozen(sab) || Object.isExtensible(sab)) return false;",
+                " if (Object.isFrozen(sab) || !Object.isExtensible(sab)) return false;",
                 " if (m.grow(1) !== 1) return false;",
                 " const cur = m.buffer;",
                 " if (sab === cur || sab.byteLength !== 65536 || cur.byteLength !== 131072) return false;",
