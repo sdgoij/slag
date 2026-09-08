@@ -4366,6 +4366,16 @@ impl Vm {
         name: crux::AtomId,
         value: Value,
     ) -> bool {
+        // A receiver with NO own properties has no vector slot and no pinned
+        // field a store cell could address — the map/direct probes below are
+        // doomed. A fresh constructor `this` before its first field store is
+        // the hot case (every `this.x =` define pays this fallback before the
+        // fast fresh-define path); a store cell can only be valid for a
+        // non-empty vector (records resolve a real slot), so skipping is
+        // exact, not just a fast path.
+        if object.properties.borrow().is_empty() {
+            return false;
+        }
         Self::warm_store_map_put(agent, object, name, value)
             || Self::warm_store_direct_put(agent, object, name, value)
     }

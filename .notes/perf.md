@@ -6362,6 +6362,83 @@ Outstanding before this is called landed per the repo gate: the three
 release test262 sweeps at baseline (language/built-ins/annexB) on the
 final tree.
 
+### Constructor rows probed post-landing: the per-field cost is the field-store path, NOT the vector push or the chain probe (measured 2026-09-08)
+
+Slice 5's literal half landed (destructure jl -11%); the constructor half
+DID NOT — constructors stay ~2.3x the literal cost for the same shape, and
+jit == jitless there (shared crux machinery, not dispatch). A shape probe
+(release corpus, 3M constructs / 4M literals, ns/iter):
+
+| row | jl | jit |
+|---|---|---|
+| `{}` | 72 | 61 |
+| `{a}` + read | 121 | 94 |
+| `{a,b,c}` + reads | 233 | 184 |
+| `new F()` (empty body) | 107 | 111 |
+| `new F` 1 field + read | 213 | 202 |
+| `new F` 2 fields + reads | 352 | 319 |
+| `new F` 4 fields + reads | 750 | 647 |
+
+So a constructor per-field store costs ~100ns vs the literal path's ~35ns
+(define + read); an empty-body `new F` is ~107ns vs `{}` ~72 (construct
+overhead ~35ns, not addressed here).
+
+Attempted next slice: extend the vector-free state to constructor-presize
+objects (hole-aware: presence = map-described AND field written;
+`materialize_properties` skips unwritten presize fields; entry on the
+first body store of a presized `this`). Semantically clean — 220 crux
+tests, workspace 4744 green, clippy clean, two new presize-hole tests —
+but the interleaved row A/B is ~flat: c2 352 -> ~338ms (~4%), c1/c4 flat,
+obj_lit control flat. REVERTED per the row gate. Conclusion: the
+constructor per-field cost is NOT the authoritative push (a 1-2-field
+vector never spills past the 2-entry inline capacity, so those pushes are
+cheap; the ~44ns figure was the spilled 3rd+ push) and NOT the
+chain-probe (a null-prototype constructor — `F.prototype = null` — is
+identical, ~1000ms/3M both ways). The ~100ns/field is the field-store
+dispatch itself: a `this.x =` write on a fresh receiver runs the full
+[[Set]]/receiver machinery where a literal key runs
+`create_data_property_key`'s lean fresh-define. The next constructor
+lever is that store path (make a certified body's `this.x =` on a fresh
+this take the fast fresh-define route), opened with a probe of where the
+~100ns splits. The presize extension is sound and validated if that path
+is ever fixed first. (CORRECTED by the landing below: the split found
+that a ctor field define already takes the fast fresh-define route —
+`assign_member` → `fast_fresh_store` — and the ~100ns was the doomed
+`warm_store_put` FALLBACK that runs before it, whose `property_slot`
+materialized the empty-vector deferred object per store.)
+
+### LANDED (2026-09-08, uncommitted): warm-store fallback skips empty-vector receivers — the constructor field-store split
+
+The `this.x =` dispatch split (follow-up to the probe above) found the
+~100ns/field: a ctor field store runs `assign_member` → `warm_store_put`
+→ cell miss → `warm_store_fallback` (map-put + direct-put). On a
+canonical-empty ctor `this` the vector-free landing leaves the vector
+EMPTY through the body, so `direct_put`'s `property_slot` MATERIALIZED
+the deferred object (rebuilding the accumulated vector) on EVERY field
+store — a growing O(n) rebuild per define that then failed anyway (the
+key is a fresh define, not an existing warm property). Instrumentation
+confirmed the flow: the ctor is NOT presized here (map count grows
+0→1→2→3 across the body; the certified-construct presize did not fire),
+so each define entered the deferred state and stayed vector-free.
+
+Fix: `warm_store_fallback` bails when the receiver's property vector is
+empty — an empty-vector object has no vector slot and no pinned field a
+store cell could address, so the map/direct probes are doomed (exact,
+not just a fast path: store cells are only recorded against a real slot,
+and `write_data_property_slot` fails on an empty vector anyway). Interleaved
+row A/B (release, jl ns/iter): c1 (1 field + read) 213 → ~190 (-11%),
+c2 (2 fields) 352 → ~300 (-15%), c4 (4 fields) 750 → ~500 (-33%), jit c4
+647 → ~426 (-34%); the no-field c0 and the `{}`/literal controls flat;
+destructure_lite jl (which mixes 4 defines + reads on deferred objects)
+~403 → ~323 ms (-20%) on top of the landing's earlier -11%. Gates:
+workspace 4743 green, clippy clean, 67-line node-parity battery identical
+across node/jit/jitless/--gc-stress, and all three release test262 sweeps
+at baseline (language 23721/3 skip, built-ins 23657/155 skip, annexB
+1086/1086, zero fail/crash/hang). The constructor rows are now ~2.2x
+closer to node; the residual per-field cost is the fast-fresh-define
+wrapper itself (existing check + chain probe + fresh_data_define), the
+next slice if the ctor rows stay hot.
+
 
 ## Deferred milestones
 
