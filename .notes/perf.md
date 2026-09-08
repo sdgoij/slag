@@ -6916,7 +6916,114 @@ spread/accessor exclusions at the boundary) node-identical across
 jit/jitless/gc-stress, the objlit/vecfree/proto-lazy batteries
 node-identical, all three release test262 sweeps at baseline (language
 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086). Next: fuse
-multi-key runs WITHIN mixed literals.
+multi-key runs WITHIN mixed literals (probed below — measured-closed
+2026-09-08).
+
+### Corpus re-baseline at HEAD 1625bf6 (measured 2026-09-08)
+
+Four-mode corpus scan (37 workloads, bench.js, jl = the machinery
+comparison since node-jit folds the create-churn loops to closed forms):
+overall mean-jlGap 10.93, mismatches 0. The objects family is now the
+LOWEST jl gap (mean 4.23x — compound_assign 2.4x, own_read 1.8x,
+warm_store 1.9x) — the closure/literal landings closed it. The top
+remaining jl masses are the language rows (both fresh-object/closure per
+iteration): for-in head-let ~1455ms/100k (12.6x), template-literal
+evaluation-order ~1156ms (21.4x), then construct_churn ~453ms (15.6x),
+destructure ~337ms (6.5x), set_churn ~278ms (20.6x), generator_loop
+~234ms (27.4x, jit ~equal — the resume machinery is interpreted). vs
+the pre-landing jl capture (corpus_postlazy, 17:19, HEAD 72fc404 — the
+five landings 5b67e98..1625bf6 in between), the closure/object rows move
+broadly -8-22% (destructure -22%, direct_leaf -19%, for_in/try_catch
+-15%, head-let -14%, recursive_fib -13%, generator -16%, typed_array
+-21%, math_intrinsics -15%; single-run day-to-day variance is ±10-15%,
+so directional only).
+
+### PROBE: mixed-literal run fusion — no in-suite hot row; synthetic deltas are closure-create or define-tax bound (measured 2026-09-08)
+
+Cut 72's queued follow-up (fuse runs of batchable keys WITHIN a literal
+that also has method/accessor/computed/spread/anon-fn props) opened with
+its probe. Corpus scan: NO per-iteration hot literal mixes fast+slow
+props — every churn literal in-suite is whole-simple all-data
+(destructure, spread_assign's `{x,y,z}`, method_call's one-time
+`counter`) — so there is no in-suite row for a partial-batch slice to
+move. Synthetic quantification (jl, 100k iters, min-of-3): v0 = 4-key
+all-data literal (ObjectFast path) 32-33ms; the SAME keys with ONE slow
+prop — v1 `m: function(){}` (method) 171-182ms; v2 `cb: function(){}`
+(anon-fn set_name gate) 167-182ms; v3 `...src` 2-key spread 89-101ms;
+v4 `[k]` computed 77-87ms. The v1/v2 +1.4us/iter is the per-create
+FUNCTION machinery (closure create ~1us, not the literal defines); v3/v4
+(+0.5-0.6us) mix the general define/spread tax with the lost data-run
+batch. A partial batch would need a vector-append adopt primitive (the
+object is mid-transition after a slow prop) whose only measured
+beneficiary is synthetic. Disposition: measured-closed — do not build
+the slice until a measured row needs it (reopen if a spread-churn or
+callback-object-churn workload enters the corpus); the real per-iteration
+mixed shapes are function-value-bound, which is the closure-create lever
+below.
+
+### PROBE: register_function phase split — the thin-closure ceiling is ~21%, and props_batch is the largest phase (measured 2026-09-08)
+
+Executes the 6806 gate probe (temporary SLAG_RF_STATS instrumentation
+in register_function, since removed). 800k closure creates (bare
+create+call churn, jl): total ~410ns/create including ~9 Instant::now
+reads (~380ns true). Phases: prelude 26ns (6.5%), record 28ns (6.9%),
+func_new 79ns (19.4%), compiled 46ns (11.4%), insert 58ns (14.2%),
+props_batch 112ns (27.4%), gen_proto 25ns (6.2%), set_proto 33ns
+(8.0%). The thin-closure record split moves only record+insert ≈ 86ns ≈
+21% of create — its realistic net (indirection added for consumers) is
+~10-15%, NOT the create lever the closure family needed; the SCOPED
+entry's ceiling is now measured and it is modest. The create is instead
+~55% object-side (func_new box + props_batch boilerplate + set_proto),
+with props_batch alone 27% — Cut 67's batched boilerplate still costs
+112ns for a 3-key function shape. Bare create+call churn frame: slag jl
+~850ns/create+call uncaptured / ~1.2us captured vs node-jl ~40ns (~21x).
+The next create lever, if any, is props_batch (why 112ns for the batched
+adopt) or the box/func_new side — not the record split.
+
+### PROBE: head-let body decomposition — the 14.6us/body is diffuse across call/env/create machinery (measured 2026-09-08)
+
+jl variants of the corpus body (ms/100k bodies, min-of-2; full body
+~1400 matches the ~1455 corpus row): dropping the 9 assert.sameValue
+calls ~380ms (27%); dropping the 3 fns.x() invocations ~170ms (12%);
+non-capturing closures instead of head-binding capture ~330ms (24%); no
+closures (plain strings) ~370ms; fresh objects + defines only ~146ms.
+No single mechanism dominates: the residual is ~40% general function-
+call machinery (asserts + method calls at ~200-500ns/call), ~24%
+per-iteration capture env creation + captured reads, ~26% fresh-object /
+for-in machinery. Node-jl runs the whole body in ~1.18us. Together with
+the register_function split this closes the closure-family queue: the
+language rows' residual is the aggregate interpreter gap on call/env/
+create machinery (each op ~10-20x node-jl), not any single removable
+piece — the standing L1c shapes + call-breadth programs are the levers,
+not another micro-slice.
+
+### LANDED (2026-09-08, uncommitted): the per-agent cached function boilerplate shape (Cut 73)
+
+The register_function phase split (above) measured props_batch at 112ns
+(27% of the ~410ns create) — Cut 67's "batched" boilerplate still
+re-forked the `length`/`name`[/`caller`/`arguments`] shape on EVERY
+create: `canonical_empty_map` + a 2-4-child `get_or_create_child` walk
+per `register_function`. The (key, attrs) inputs are process constants, so
+the final map is forked ONCE per agent (two slots indexed by `restricted`,
+stored on the Agent and traced with it — a process-static GC handle would
+be swept, the Handle=Gc liveness rule — and never invalidated); every
+later create reads the cached handle and goes straight to the adopt.
+Interleaved release A/B (jl, bare create+call churn, 200k, min-of-3, two
+rounds of cache-on/off flips): t1 uncaptured ~160 vs ~149ms (~6-7%), t2
+captured ~226-244 vs ~209-229ms (~5%); the tight before/after triples
+rule out drift. props_batch's residual is the adopt itself (~40-50ns of
+the former 112ns) — the fork is gone. Gates: workspace 32 suites green,
+clippy clean, a 27-case function-boilerplate battery (name/length/desc
+flags across sloppy/strict/arrow/method/async/generator, restricted
+caller/arguments, props forked off the shared shape, no value bleed)
+node-identical across jit/jitless/gc-stress (pre-existing node-vs-slag
+divergences excluded: var-binding SetFunctionName, the restricted
+caller/arguments OWN VALUE undefined-vs-null — no fixture pins it), the
+objlit/vecfree/proto-lazy/objfast batteries node-identical, and the three
+release test262 sweeps at baseline (language 23721/3 skip, built-ins
+23657/155 skip, annexB 1086/1086). The remaining create cost is
+object-side (func_new box + adopt + set_proto, ~55%) — the
+object-representation program, not the record split.
 
 
 ## Deferred milestones

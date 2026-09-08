@@ -367,14 +367,15 @@ fn function_boilerplate_entries() -> &'static [(crux::AtomId, crux::MapAttrs)] {
     })
 }
 
-/// Resolve the pre-forked boilerplate shape for a function kind: the
+/// Fork the pre-forked boilerplate shape for a function kind: the
 /// 2-descriptor `length`/`name` map, or the 4-descriptor map with
 /// `caller`/`arguments` for a sloppy ordinary function. Forked from the
 /// prototype-less canonical empty map — the map a fresh `Function::new`
 /// object starts on, so the shape chain the sequential defines would walk is
-/// reused and a per-create resolution is cached child lookups after the first
-/// creation of the kind.
-fn function_boilerplate_map(restricted: bool) -> Option<Handle<crux::Map>> {
+/// reused. Pure: the caller caches the result per agent (Cut 73) so the
+/// per-create resolution is a cached-handle read after the first creation of
+/// the kind, not a child-chain walk.
+fn fork_function_boilerplate_map(restricted: bool) -> Option<Handle<crux::Map>> {
     let entries = function_boilerplate_entries();
     let count = if restricted { 4 } else { 2 };
     let mut map = crux::canonical_empty_map(None);
@@ -382,6 +383,17 @@ fn function_boilerplate_map(restricted: bool) -> Option<Handle<crux::Map>> {
         map = map.get_or_create_child(PropertyKey::String(*atom), *attrs)?;
     }
     Some(map)
+}
+
+/// The per-agent cached ordinary-function boilerplate shape (Cut 73): fork
+/// once per (restricted) kind and keep the handle on the agent (traced), so
+/// every later `register_function` skips the child-chain walk.
+fn function_boilerplate_map(agent: &mut Agent, restricted: bool) -> Option<Handle<crux::Map>> {
+    let slot = &mut agent.function_boilerplate_maps[usize::from(restricted)];
+    if slot.is_none() {
+        *slot = fork_function_boilerplate_map(restricted);
+    }
+    *slot
 }
 
 /// SetFunctionLength + SetFunctionName (+ the restricted `caller`/
@@ -392,12 +404,13 @@ fn function_boilerplate_map(restricted: bool) -> Option<Handle<crux::Map>> {
 /// key, measured 2026-09-08). Returns false when the shape cannot be forked
 /// or adopted; the caller then runs the sequential defines (identical result).
 fn set_function_properties_batched(
+    agent: &mut Agent,
     function: &Handle<Function>,
     params: &[BindingElement],
     name: Option<&JsString>,
     restricted: bool,
 ) -> bool {
-    let Some(map) = function_boilerplate_map(restricted) else {
+    let Some(map) = function_boilerplate_map(agent, restricted) else {
         return false;
     };
     let name_value = Value::String(Handle::new(
@@ -1207,7 +1220,7 @@ fn register_function(
     // (spec 10.2.4: own caller/arguments are created only for ordinary
     // non-method functions).
     let restricted = !strict && !kind.is_method && !kind.is_async && !kind.is_generator;
-    if !set_function_properties_batched(&function, &params, name.as_ref(), restricted) {
+    if !set_function_properties_batched(agent, &function, &params, name.as_ref(), restricted) {
         set_function_properties(&function, &params, name.as_ref())?;
         if restricted {
             for name in ["caller", "arguments"] {
@@ -1505,7 +1518,7 @@ pub fn instantiate_arrow(
     agent.ecma_functions.insert(function.id(), data);
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
     // Arrows never carry restricted `caller`/`arguments` (no fallback loop).
-    if !set_function_properties_batched(&function, &params, None, false) {
+    if !set_function_properties_batched(agent, &function, &params, None, false) {
         set_function_properties(&function, &params, None)?;
     }
     set_function_prototype(agent, &function, false, is_async)?;

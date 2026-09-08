@@ -944,6 +944,15 @@ pub struct Agent {
     /// object on the final map (see [`crate::ir::ConstructMapCell`]).
     pub(crate) construct_maps:
         Box<[Option<crate::ir::ConstructMapCell>; crate::ir::CONSTRUCT_PROTO_CELLS]>,
+    /// Cut 73: the pre-forked ordinary-function boilerplate shapes — the
+    /// 2-key `length`/`name` map (strict/async/generator/method functions)
+    /// and the 4-key map adding the restricted `caller`/`arguments` (sloppy
+    /// ordinary functions), forked ONCE per agent and reused by every
+    /// `register_function` (the (key, attrs) inputs are process constants, so
+    /// the cache never invalidates). Indexed by `restricted`; traced below so
+    /// a collection between creates cannot free the shape (`function.rs`
+    /// `function_boilerplate_map`).
+    pub(crate) function_boilerplate_maps: [Option<crux::Handle<crux::Map>>; 2],
 }
 
 impl Drop for Agent {
@@ -1015,6 +1024,7 @@ impl Agent {
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             construct_maps: Box::new(std::array::from_fn(|_| None)),
+            function_boilerplate_maps: [None; 2],
             vm_pool: Vec::new(),
             jit_hook: None,
             jit_depth: 0,
@@ -1495,6 +1505,10 @@ impl Agent {
         // B5.4: the cached constructor boilerplate maps keep the shapes alive.
         for cell in self.construct_maps.iter().flatten() {
             cell.trace(visit);
+        }
+        // Cut 73: the cached ordinary-function boilerplate shapes.
+        for map in self.function_boilerplate_maps.iter().flatten() {
+            map.trace(visit);
         }
         self.vm_pool.trace(visit);
         self.promise_jobs.trace(visit);
