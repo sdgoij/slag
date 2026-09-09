@@ -1545,15 +1545,19 @@ impl<'a> Lowerer<'a> {
         self.builder.switch_to_block(cont);
     }
 
-    /// Store the results and return trap code 0. `stack` must hold exactly
-    /// the results, in order (result 0 deepest). A v128 result occupies two
-    /// out-buffer words.
+    /// Store the results and return trap code 0. The top `results` stack
+    /// entries are the results, in order (result 0 deepest); deeper entries
+    /// are junk an explicit `return`/`return_call` legitimately leaves
+    /// beneath its operands (the spec types such an instruction
+    /// `[t1* t2*] -> [t2*]`) and are dropped with the frame. A v128 result
+    /// occupies two out-buffer words.
     fn emit_return(&mut self) -> Result<(), String> {
-        if self.stack.len() != self.results.len() {
+        if self.stack.len() < self.results.len() {
             return Err("compiled return arity mismatch".to_string());
         }
+        let first = self.stack.len() - self.results.len();
         let mut word = 0usize;
-        for (value, ty) in self.stack.iter().zip(&self.results) {
+        for (value, ty) in self.stack[first..].iter().zip(&self.results) {
             let address = self.builder.ins().iadd_imm_s(self.out_ptr, 8 * word as i64);
             match ty {
                 ValType::V128 => {
@@ -6382,6 +6386,69 @@ mod tests {
             0,
             &[vec![non_null], vec![Value::Ref(RefValue::Null)]],
         );
+    }
+
+    #[test]
+    fn junk_beneath_return_operands_match_the_interpreter() {
+        // An explicit `return` is typed `[t1* t2*] -> [t2*]`: values beneath
+        // its operands are legal and drop with the frame (the interpreter
+        // takes the top `results` values on finish). The lowering used to
+        // require the operand stack to hold exactly the results, so these
+        // bodies stayed interpreted (unwind.wast's `*-by-return` and
+        // `*-after-return` shapes); a return reads only the stack top.
+
+        // 1. Two junk values beneath a value `return`.
+        let junk_then_value = module_with(
+            vec![
+                Instr::I32Const(3),
+                Instr::I64Const(1),
+                Instr::I32Const(9),
+                Instr::Return,
+            ],
+            vec![],
+            vec![],
+            vec![ValType::I32],
+        );
+        assert_equiv(&junk_then_value, 0, &[vec![]]);
+
+        // 2. Dead code after the `return` (unreachable in wasm; the lowerer
+        // ignores it once the path is dead).
+        let dead_after = module_with(
+            vec![
+                Instr::F32Const(0),
+                Instr::I32Const(9),
+                Instr::Return,
+                Instr::I64Const(2),
+                Instr::Num(NumOp::I64Eqz),
+            ],
+            vec![],
+            vec![],
+            vec![ValType::I32],
+        );
+        assert_equiv(&dead_after, 0, &[vec![]]);
+
+        // 3. A void `return` over junk (the top `results` slice is empty).
+        let void_return = module_with(
+            vec![Instr::I32Const(3), Instr::Return],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert_equiv(&void_return, 0, &[vec![]]);
+
+        // 4. Multi-value `return` with junk beneath both results.
+        let multi_value = module_with(
+            vec![
+                Instr::I32Const(3),
+                Instr::I32Const(11),
+                Instr::I32Const(22),
+                Instr::Return,
+            ],
+            vec![],
+            vec![],
+            vec![ValType::I32, ValType::I32],
+        );
+        assert_equiv(&multi_value, 0, &[vec![]]);
     }
 
     #[test]
