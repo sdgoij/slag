@@ -166,6 +166,23 @@ fn key(index: u64) -> JsString {
     JsString::from_utf8(&index.to_string())
 }
 
+/// Read the element at `index` of a VALIDATED typed array directly — no
+/// key-string allocation, no [[HasProperty]]/[[Get]] dispatch. A typed
+/// array's integer-indexed own elements in `0..length` are always present
+/// and cannot be overridden (spec 10.4.7.1 / 10.4.7.5), so the spec's
+/// HasProperty(O, ToString(k)) + Get(O, ToString(k)) reduce to the raw
+/// element decode; an out-of-range index (or a mid-loop detach/resize of
+/// the underlying buffer) reads *undefined* like the exotic get.
+fn element_read(this: &Value, slots: &TypedArraySlots, index: u64) -> Result<Value, JsError> {
+    let ValueKind::Object(obj) = this.kind() else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Method called on an incompatible receiver".into(),
+        ));
+    };
+    obj.typed_array_element_get(slots, index)
+}
+
 /// IsTypedArray (spec 25.2.4.4): an Integer-Indexed exotic object.
 fn is_typed_array(value: &Value) -> bool {
     match value.kind() {
@@ -820,7 +837,7 @@ fn copy_typed_array(
         dst_slots.buffer.write(0, &data)?;
     } else {
         for k in 0..source_length {
-            let value = get(agent, source, &key(k as u64))?;
+            let value = element_read(source, &source_slots, k as u64)?;
             set_property(&dst, &key(k as u64), value)?;
         }
     }
@@ -1003,7 +1020,7 @@ fn at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError>
     if k >= length {
         return Ok(Value::Undefined);
     }
-    get(agent, this, &key(k))
+    element_read(this, &slots, k)
 }
 
 /// spec 25.2.3.32 get %TypedArray%.prototype[@@toStringTag]: the element
@@ -1079,7 +1096,7 @@ fn copy_within(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         let current = typed_array_effective_length(&slots) as u64;
         for _ in 0..count {
             if from < current && to < current {
-                let value = get(agent, this, &key(from))?;
+                let value = element_read(this, &slots, from)?;
                 set_property(this, &key(to), value)?;
             }
             from = (from as i64 + direction) as u64;
@@ -1111,7 +1128,7 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = get(agent, this, &key(k))?;
+        let k_value = element_read(this, &slots, k)?;
         let test = crate::function::call(
             agent,
             &callbackfn,
@@ -1194,7 +1211,7 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let _stress = crate::ir::StressSuppress::new();
     let mut kept = Vec::new();
     for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = get(agent, this, &key(k))?;
+        let k_value = element_read(this, &slots, k)?;
         let selected = crate::function::call(
             agent,
             &callbackfn,
@@ -1229,7 +1246,7 @@ fn find_common(
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = get(agent, this, &key(k))?;
+        let k_value = element_read(this, &slots, k)?;
         let test = crate::function::call(
             agent,
             &predicate,
@@ -1279,7 +1296,7 @@ fn find_last_common(
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut k = typed_array_effective_length(&slots) as i64 - 1;
     while k >= 0 {
-        let k_value = get(agent, this, &key(k as u64))?;
+        let k_value = element_read(this, &slots, k as u64)?;
         let test = crate::function::call(
             agent,
             &predicate,
@@ -1324,7 +1341,7 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = get(agent, this, &key(k))?;
+        let k_value = element_read(this, &slots, k)?;
         crate::function::call(
             agent,
             &callbackfn,
@@ -1339,6 +1356,12 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 fn includes(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
     let search_element = args.first().cloned().unwrap_or(Value::Undefined);
+    // The length and the len==0 return come BEFORE the fromIndex coercion
+    // (the loop bound and negative-index math use this pre-coercion length),
+    // and the reads are LIVE: a fromIndex coercion that detaches or shrinks
+    // the buffer makes the in-loop element reads return *undefined*, which
+    // CAN match an undefined search (TypedArrayIncludes has no presence
+    // check).
     let length = typed_array_effective_length(&slots) as u64;
     if length == 0 {
         return Ok(Value::Boolean(false));
@@ -1353,7 +1376,7 @@ fn includes(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         (length as i64).saturating_add(n as i64).max(0) as u64
     };
     for k in k..length {
-        let element = get(agent, this, &key(k))?;
+        let element = element_read(this, &slots, k)?;
         if same_value_zero(&element, &search_element) {
             return Ok(Value::Boolean(true));
         }
@@ -1365,6 +1388,12 @@ fn includes(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
 fn index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
     let search_element = args.first().cloned().unwrap_or(Value::Undefined);
+    // The length, the len==0 return, and the negative-index math use the
+    // PRE-coercion length; only the per-element reads are live. TypedArray
+    // IndexOf keeps its HasProperty presence check, so a fromIndex coercion
+    // that detaches or shrinks the buffer makes every out-of-range read
+    // ABSENT (-1), never a false undefined match — the post-coercion live
+    // length (fixed once the coercion's user code returns) is the gate.
     let length = typed_array_effective_length(&slots) as u64;
     if length == 0 {
         return Ok(Value::Number(-1.0));
@@ -1373,17 +1402,15 @@ fn index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         agent,
         &args.get(1).cloned().unwrap_or(Value::Undefined),
     )?);
+    let live = typed_array_effective_length(&slots) as u64;
     let k = if n >= 0.0 {
         n as u64
     } else {
         (length as i64).saturating_add(n as i64).max(0) as u64
     };
     for k in k..length {
-        let present = as_object(this)
-            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Incompatible receiver".into()))?
-            .has_property_key(&PropertyKey::from_utf8(&k.to_string()))?;
-        if present {
-            let element = get(agent, this, &key(k))?;
+        if k < live {
+            let element = element_read(this, &slots, k)?;
             if is_strictly_equal(&element, &search_element) {
                 return Ok(Value::Number(k as f64));
             }
@@ -1406,7 +1433,7 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         if k > 0 {
             result.push_str(&separator);
         }
-        let element = get(agent, this, &key(k))?;
+        let element = element_read(this, &slots, k)?;
         let text = if matches!(element.kind(), ValueKind::Undefined | ValueKind::Null) {
             String::new()
         } else {
@@ -1431,14 +1458,25 @@ fn keys(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsErr
 fn last_index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let slots = validate_typed_array(agent, this)?;
     let search_element = args.first().cloned().unwrap_or(Value::Undefined);
+    // See index_of: the length, len==0 return, default fromIndex (len - 1),
+    // and the negative-index k = len + n math use the PRE-coercion length;
+    // the descending reads are live and presence-gated on the post-coercion
+    // length (a coercion that detaches/shrinks the buffer yields -1, never a
+    // false undefined match).
     let length = typed_array_effective_length(&slots) as u64;
     if length == 0 {
         return Ok(Value::Number(-1.0));
     }
-    let n = if args.len() < 2 {
-        length as f64 - 1.0
-    } else {
-        to_integer_or_infinity(crate::context::to_number(agent, &args[1])?)
+    let coerced = match args.get(1) {
+        Some(value) => Some(to_integer_or_infinity(crate::context::to_number(
+            agent, value,
+        )?)),
+        None => None,
+    };
+    let live = typed_array_effective_length(&slots) as u64;
+    let n = match coerced {
+        Some(n) => n,
+        None => length as f64 - 1.0,
     };
     let mut k: i64 = if n >= 0.0 {
         (n as u64).min(length - 1) as i64
@@ -1447,11 +1485,9 @@ fn last_index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
         (length as i64).saturating_add(n as i64)
     };
     while k >= 0 {
-        let present = as_object(this)
-            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Incompatible receiver".into()))?
-            .has_property_key(&PropertyKey::from_utf8(&k.to_string()))?;
-        if present {
-            let element = get(agent, this, &key(k as u64))?;
+        let index = k as u64;
+        if index < live {
+            let element = element_read(this, &slots, index)?;
             if is_strictly_equal(&element, &search_element) {
                 return Ok(Value::Number(k as f64));
             }
@@ -1478,7 +1514,7 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     let length = typed_array_effective_length(&slots) as u64;
     let result = typed_array_species_create(agent, this, length as usize)?;
     for k in 0..length {
-        let k_value = get(agent, this, &key(k))?;
+        let k_value = element_read(this, &slots, k)?;
         let mapped = crate::function::call(
             agent,
             &callbackfn,
@@ -1512,11 +1548,11 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
                 "Reduce of empty TypedArray with no initial value".into(),
             ));
         }
-        accumulator = get(agent, this, &key(0))?;
+        accumulator = element_read(this, &slots, 0)?;
         k = 1;
     }
     while k < length {
-        let k_value = get(agent, this, &key(k))?;
+        let k_value = element_read(this, &slots, k)?;
         accumulator = crate::function::call(
             agent,
             &callbackfn,
@@ -1550,11 +1586,11 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
                 "Reduce of empty TypedArray with no initial value".into(),
             ));
         }
-        accumulator = get(agent, this, &key(length - 1))?;
+        accumulator = element_read(this, &slots, length - 1)?;
         k -= 1;
     }
     while k >= 0 {
-        let k_value = get(agent, this, &key(k as u64))?;
+        let k_value = element_read(this, &slots, k as u64)?;
         accumulator = crate::function::call(
             agent,
             &callbackfn,
@@ -1573,8 +1609,8 @@ fn reverse(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, Js
     let mut lower = 0u64;
     while lower < length / 2 {
         let upper = length - 1 - lower;
-        let lower_value = get(agent, this, &key(lower))?;
-        let upper_value = get(agent, this, &key(upper))?;
+        let lower_value = element_read(this, &slots, lower)?;
+        let upper_value = element_read(this, &slots, upper)?;
         set_property(this, &key(lower), upper_value)?;
         set_property(this, &key(upper), lower_value)?;
         lower += 1;
@@ -1635,7 +1671,7 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
             target_slots.buffer.write(dst_start, &data[..count])?;
         } else {
             for k in 0..source_length {
-                let value = get(agent, &source, &key(k as u64))?;
+                let value = element_read(&source, &source_slots, k as u64)?;
                 set_property(this, &key((offset + k) as u64), value)?;
             }
         }
@@ -1706,7 +1742,7 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     let current = typed_array_effective_length(&slots) as u64;
     let copy_count = count.min(current.saturating_sub(k));
     for i in 0..copy_count {
-        let value = get(agent, this, &key(k + i))?;
+        let value = element_read(this, &slots, k + i)?;
         set_property(&result, &key(i), value)?;
     }
     Ok(result)
@@ -1724,7 +1760,7 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = get(agent, this, &key(k))?;
+        let k_value = element_read(this, &slots, k)?;
         let test = crate::function::call(
             agent,
             &callbackfn,
@@ -1793,9 +1829,10 @@ fn sort_indexed_properties(
     // allocates) — suppress `--gc-stress` for the whole sort so the buffer
     // cannot be swept out from under the comparisons.
     let _stress = crate::ir::StressSuppress::new();
+    let slots = typed_array_slots_required(object)?;
     let mut items: Vec<Value> = Vec::with_capacity(length as usize);
     for k in 0..length {
-        items.push(get(agent, object, &key(k))?);
+        items.push(element_read(object, &slots, k)?);
     }
     // Insertion sort: a comparefn abrupt completion propagates immediately,
     // so no further comparisons happen (spec 25.2.3.29: the sort stops on
@@ -1878,7 +1915,7 @@ fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         if k > 0 {
             result.push(',');
         }
-        let element = get(agent, this, &key(k))?;
+        let element = element_read(this, &slots, k)?;
         if matches!(element.kind(), ValueKind::Undefined | ValueKind::Null) {
             continue;
         }
@@ -1896,7 +1933,7 @@ fn to_reversed(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value
     let length = typed_array_effective_length(&slots);
     let result = typed_array_create_same_type(agent, &slots, length)?;
     for k in 0..length as u64 {
-        let value = get(agent, this, &key(length as u64 - 1 - k))?;
+        let value = element_read(this, &slots, length as u64 - 1 - k)?;
         set_property(&result, &key(k), value)?;
     }
     Ok(result)
@@ -1914,7 +1951,7 @@ fn to_sorted(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     }
     let result = typed_array_create_same_type(agent, &slots, typed_array_effective_length(&slots))?;
     for k in 0..typed_array_effective_length(&slots) as u64 {
-        let value = get(agent, this, &key(k))?;
+        let value = element_read(this, &slots, k)?;
         set_property(&result, &key(k), value)?;
     }
     sort_indexed_properties(
@@ -1987,7 +2024,7 @@ fn with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         let new_value = if k == actual_index {
             value
         } else {
-            get(agent, this, &key(k))?
+            element_read(this, &slots, k)?
         };
         set_property(&result, &key(k), new_value)?;
     }
@@ -3841,5 +3878,105 @@ mod tests {
         // catches it before any write).
         assert!(run("(function(){ var b = new ArrayBuffer(8); var v = new Uint8Array(b); b.transfer(); v.fill(1); })()").is_err());
         assert!(run("(function(){ var b = new ArrayBuffer(8, {maxByteLength: 16}); var v = new Uint8Array(b, 0, 8); b.resize(0); v.fill(1); })()").is_err());
+    }
+
+    #[test]
+    fn element_read_serves_the_iteration_methods() {
+        // The direct element-read path (element_read) backs the search /
+        // iteration / copy methods; the reads must be indistinguishable from
+        // the exotic integer-indexed get.
+        assert_eq!(
+            number(
+                "(function(){ var a = new Int32Array([10, 20, 30, 20]); return a.indexOf(20); })()"
+            ),
+            1.0
+        );
+        assert_eq!(
+            number(
+                "(function(){ var a = new Int32Array([10, 20, 30, 20]); return a.indexOf(20, 2); })()"
+            ),
+            3.0
+        );
+        assert_eq!(
+            number("(function(){ var a = new Int32Array([10, 20, 30]); return a.indexOf(99); })()"),
+            -1.0
+        );
+        // includes uses SameValueZero: NaN is found on a Float typed array.
+        assert!(bool(
+            "(function(){ var a = new Float64Array([1, NaN, 3]); return a.includes(NaN); })()"
+        ));
+        assert_eq!(
+            number(
+                "(function(){ var a = new Int32Array([10, 20, 30, 20]); return a.lastIndexOf(20); })()"
+            ),
+            3.0
+        );
+        assert_eq!(
+            text("(function(){ var a = new Uint8Array([1, 2, 3]); return a.join('-'); })()"),
+            "1-2-3"
+        );
+        assert_eq!(
+            number("(function(){ var a = new Int32Array([1, 2, 3]); return a.at(-1); })()"),
+            3.0
+        );
+        assert_eq!(
+            text(
+                "(function(){ var a = new Int32Array([1, 2, 3]); return a.reverse().join(','); })()"
+            ),
+            "3,2,1"
+        );
+        assert_eq!(
+            text(
+                "(function(){ var a = new Int32Array([1, 2, 3, 4, 5]); return a.slice(1, 3).join(','); })()"
+            ),
+            "2,3"
+        );
+        assert_eq!(
+            text(
+                "(function(){ var a = new Int32Array([1, 2, 3, 4]); a.copyWithin(0, 2); return a.join(','); })()"
+            ),
+            "3,4,3,4"
+        );
+        assert_eq!(
+            text(
+                "(function(){ var a = new Int32Array([3, 1, 2]); return a.toSorted().join(','); })()"
+            ),
+            "1,2,3"
+        );
+        assert_eq!(
+            text(
+                "(function(){ var a = new Int32Array([1, 2, 3]); return a.map(x => x * 2).join(','); })()"
+            ),
+            "2,4,6"
+        );
+        assert_eq!(
+            number(
+                "(function(){ var a = new Int32Array([1, 2, 3, 4]); return a.reduce((s, x) => s + x, 0); })()"
+            ),
+            10.0
+        );
+        assert_eq!(
+            number(
+                "(function(){ var a = new Int32Array([5, 2, 8]); return a.find(x => x > 3); })()"
+            ),
+            5.0
+        );
+        // Cross-type constructor copy and set read the source element-wise.
+        assert_eq!(
+            text("(function(){ return new Float64Array(new Int32Array([1, 2, 3])).join(','); })()"),
+            "1,2,3"
+        );
+        assert_eq!(
+            text(
+                "(function(){ var d = new Float64Array(3); d.set(new Int32Array([7, 8, 9])); return d.join(','); })()"
+            ),
+            "7,8,9"
+        );
+        assert_eq!(
+            text(
+                "(function(){ var a = new Int32Array([1, 2, 3]); return a.toReversed().join(','); })()"
+            ),
+            "3,2,1"
+        );
     }
 }

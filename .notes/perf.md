@@ -8152,6 +8152,56 @@ collected its real wins (keyed, String, Object, DataView, Array,
 Date); the rest are body-bound or cold — stop here rather than add
 mechanical shims with no measured row behind them.
 
+### LANDED (2026-09-09): typed-array native methods read elements directly (Cut 89)
+
+The probe's one body-bound finding: the typed-array native methods read
+elements through a per-element key-string + [[HasProperty]]/[[Get]]
+dispatch (`index_of` also probed presence with a fresh `k.to_string()`
+key every element) at ~350ns/read — 13x the compiled read. New
+element_read helper (crux `JsObject::typed_array_element_get`: the raw
+decode, no key-string, no dispatch) replaces the per-element reads in
+at/copy_within/every/filter/find/findLast/forEach/includes/indexOf/
+join/lastIndexOf/map/reduce/reduceRight/reverse/slice/some/
+toLocaleString/toReversed/toSorted/with, the typed-source cross-type
+copies (set, the constructor path), and the sort collector. Spec-exact
+for a validated typed array: its integer-indexed elements in `0..len`
+are always present and unoverridable, so HasProperty + Get reduce to
+the decode — except the search methods' resizable-buffer semantics,
+which the first landing got wrong and the sweep caught (see below).
+
+A/B (release, scratch/ta_method_probe.js + chain_tax_probe2.js,
+K=300000): `a.indexOf(i%32)` on a 32-element Int32Array jit ~3486-3561
+-> 1128-1133ms (~3.1x, ~11.7µs -> ~3.8µs/call) / jl ~5500 -> ~1170;
+the hand-rolled equivalent scan is ~0.9µs (the residual is the native
+decode + Value boxing per read). Correctness — TWO sweep-caught
+regressions fixed during the landing: (1) removing indexOf/lastIndexOf's
+per-element HasProperty probe changed the resizable-buffer semantics
+(the probe had doubled as the live presence gate: 6 built-ins failures
+after a coercion detached/shrunk the buffer — a raw read of the
+out-of-range index returned *undefined*, false-matching an undefined
+search); (2) the first fix over-corrected by moving the length read
+after the coercion (13 more failures: the length-zero fixtures require
+the len==0 return BEFORE the fromIndex coercion, the loop bound and
+negative-index math use the PRE-coercion length, and includes has NO
+presence gate — a detached/shrunk read may match undefined — while
+indexOf/lastIndexOf keep TypedArrayIndexOf's presence gate so
+out-of-range reads are absent). Final shape: pre-coercion length for
+the bound/index math + len==0 early return; post-coercion live length
+as a one-time presence gate for indexOf/lastIndexOf only; includes
+reads live unguarded. All 130 includes/indexOf/lastIndexOf fixtures
+pass, then the full gate: 737 runtime release (incl. a new
+element_read regression test) + 182 jit e2e green; clippy `-D warnings`
+clean; workspace green; batteries byte-identical; three release sweeps
+at baseline (language 23721/3, built-ins 23657/155 with zero failures,
+annexB 1086/1086); corpus parity 37/37.
+
+Open (measured, not started): the remaining ~3.8µs on the search rows
+is the chain dispatch (typed_array is still off the call-side registry)
+plus the per-element decode — the prototype methods are shared across
+kinds (unlike the loop-shaped constructors), so they can register
+cleanly like the Date members did, and the decode could get a
+same-type fast path.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
