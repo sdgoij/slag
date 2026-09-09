@@ -647,10 +647,12 @@ pub struct JitSlowPaths {
     pub call_vector:
         extern "C" fn(ctx: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64,
     /// `Step::Construct` (the vector form): the callee on the JIT buffer,
-    /// the arguments in the Vm's vector — run the construct machinery (the
-    /// construct-inline leaf fast path or the general path) and return the
-    /// constructed value.
-    pub construct: extern "C" fn(ctx: *mut c_void, callee: u64) -> u64,
+    /// the arguments in the Vm's vector, and the caller's current working
+    /// `sp` — run the construct machinery (the construct-inline leaf fast
+    /// path or the general path) and return the constructed value. The `sp`
+    /// lets an environment-free leaf body run on the caller's ctx with a
+    /// frame carved from its buffer.
+    pub construct: extern "C" fn(ctx: *mut c_void, callee: u64, sp: u64) -> u64,
     /// `Step::TailCall` (the vector form): like `tail_call`, reading the
     /// arguments from the Vm's vector instead of the JIT buffer.
     pub tail_call_vector:
@@ -2419,15 +2421,18 @@ extern "C" fn call_vector(ctx: *mut c_void, this: u64, callee: u64, direct_eval:
     }
 }
 
-extern "C" fn construct(ctx: *mut c_void, callee: u64) -> u64 {
-    let ctx = unsafe { ctx_of(ctx) };
+extern "C" fn construct(ctx_raw: *mut c_void, callee: u64, sp: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx_raw) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
     // Mirror the interpreter's `Step::Construct`: pop the argument
     // boundary and run the construct-inline leaf fast path or the general
     // construct machinery, returning the constructed value (the machine
-    // code pushes it onto the work stack).
-    match vm.step_construct(agent, Value::from_bits(callee)) {
+    // code pushes it onto the work stack). The caller's ctx + current
+    // working `sp` ride along so an environment-free leaf body can run on
+    // the caller's ctx with a frame carved from its buffer (no per-construct
+    // ctx rebuild) — see `step_construct_shared`.
+    match vm.step_construct_shared(agent, Value::from_bits(callee), ctx_raw, sp) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
     }

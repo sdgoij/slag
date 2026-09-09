@@ -4605,8 +4605,13 @@ impl<'a> Lowerer<'a> {
                 // pops the argument boundary and runs the interpreter's
                 // construct machinery (the construct-inline leaf fast path
                 // or the general path), returning the constructed value.
+                // The current working `sp` rides along so an
+                // environment-free leaf body can run on THIS ctx with a
+                // frame carved from the buffer above `sp` (no per-construct
+                // ctx rebuild).
                 let callee = self.pop();
-                let result = self.call_slow(self.sig_bool, Helper::Construct, &[callee])?;
+                let sp = self.builder.use_var(self.sp_var);
+                let result = self.call_slow(self.sig_get_name, Helper::Construct, &[callee, sp])?;
                 self.push(result);
                 self.fall_through(index);
             }

@@ -10351,6 +10351,7 @@ impl Vm {
     /// plus the base-constructor return rule — an object `return` wins,
     /// anything else yields `this` — mirroring `ordinary_construct`'s
     /// certified fast path without the context push.
+    #[allow(clippy::too_many_arguments)]
     fn run_leaf_construct(
         &mut self,
         agent: &mut Agent,
@@ -10359,8 +10360,28 @@ impl Vm {
         strict: bool,
         new_target: &Value,
         args: &[Value],
+        shared: Option<(*mut std::os::raw::c_void, usize)>,
     ) -> Result<Value, JsError> {
         let this = crate::function::construct_this_object(agent, new_target)?;
+        // The shared-ctx construct leaf run (the compiled caller's helper):
+        // when the caller's machine code provided its ctx + current working
+        // sp, an environment-free leaf body runs directly on the CALLER's ctx
+        // with its frame carved from the caller's buffer — no per-construct
+        // JitCallContext/private-buffer/root rebuild. Any doubt (an env
+        // leaf, the body not compiled, no room above `sp`) falls through to
+        // the materialize-args + `run_jit_leaf` path below.
+        if let Some((ctx_ptr, sp)) = shared
+            && environment.is_none()
+            && let Some(value) =
+                self.try_shared_construct_leaf(agent, strict, this, ir, args, ctx_ptr, sp)?
+        {
+            // spec 10.2.1 [[Construct]] steps 15-21 (base): an object
+            // return wins; anything else falls back to `this`.
+            return match value.kind() {
+                ValueKind::Object(_) | ValueKind::Function(_) => Ok(value),
+                _ => Ok(this),
+            };
+        }
         // The JIT path: the machine code reads its arguments off the value
         // stack (its frame is a private buffer), so the construct args are
         // materialized first — the same layout the leaf-inline run uses —
@@ -10399,6 +10420,96 @@ impl Vm {
         }
     }
 
+    /// The shared-ctx construct-leaf run (the compiled caller's helper
+    /// path): run the leaf body's compiled entry on the CALLER's live
+    /// `JitCallContext` with its frame carved from the caller's working
+    /// buffer just above the caller's current `sp` — no per-construct ctx
+    /// rebuild, private buffer, or re-rooting (the caller's whole buffer is
+    /// rooted for the duration of its run, exactly the region `emit_call`'s
+    /// machine leaf-inline carves into). Restricted to environment-free
+    /// leaves (an env leaf needs the per-run env swap `run_jit_leaf` does)
+    /// and leaves with a `this` slot (a base constructor always has one).
+    /// Returns `Ok(None)` when the shared run cannot serve the body (no JIT
+    /// hook, the depth cap, the body not compiled, no room above `sp`) — the
+    /// caller falls back to `run_jit_leaf`. `Ok(Some(value))` is the leaf's
+    /// result (the caller applies the base-constructor return rule).
+    #[allow(clippy::too_many_arguments)]
+    fn try_shared_construct_leaf(
+        &mut self,
+        agent: &mut Agent,
+        strict: bool,
+        this: Value,
+        ir: &std::rc::Rc<CompiledBody>,
+        args: &[Value],
+        ctx_ptr: *mut std::os::raw::c_void,
+        sp: usize,
+    ) -> Result<Option<Value>, JsError> {
+        let Some(hook) = agent.jit_hook else {
+            return Ok(None);
+        };
+        if agent.jit_depth >= crate::jit::MAX_JIT_DEPTH {
+            return Ok(None);
+        }
+        let scope = ir.scope.as_ref().expect("a leaf is certified");
+        // A base-constructor leaf may have no `this` slot (an empty body or
+        // one that never references `this`) — the frame then simply carries
+        // no `this`, and the receiver is returned by the caller's return
+        // rule regardless.
+        // The per-body compiled entry (see `run_jit_leaf`): null means not
+        // JIT-compilable — fall back.
+        let info_ptr = crate::jit::lookup_info(hook, ir, agent.jit_depth > 0);
+        if info_ptr.is_null() {
+            return Ok(None);
+        }
+        let info = unsafe { &*info_ptr };
+        let ctx = unsafe { &mut *(ctx_ptr as *mut crate::jit::JitCallContext) };
+        // The frame + working area + helper slack must fit above `sp` in the
+        // caller's buffer (the machine code's current working pointer is the
+        // carve base; the region above it is transient free space up to
+        // `buf_end`, the same check the machine leaf-inline applies).
+        let need_slots = scope.frame_size + info.stack_usage + crate::jit::JIT_STACK_SLACK;
+        let bytes = need_slots * std::mem::size_of::<Value>();
+        let buf_end = ctx.buf_end as usize;
+        if sp.checked_add(bytes).is_none_or(|end| end > buf_end) {
+            return Ok(None);
+        }
+        // The frame fill mirrors `run_jit_leaf`: `this` in its slot, the
+        // params from the construct args (missing stay undefined), the TDZ
+        // slots uninitialized, the vars undefined. The carve is inside the
+        // caller's rooted buffer, so the values it holds are rooted.
+        let this_value = self.bind_this_value(agent, scope, strict, this)?;
+        let stack_len = self.stack.len();
+        let frame_ptr = sp as *mut Value;
+        let frame = unsafe { std::slice::from_raw_parts_mut(frame_ptr, scope.frame_size) };
+        for (slot, cell) in frame.iter_mut().enumerate() {
+            *cell = if Some(slot) == scope.this_slot {
+                this_value
+            } else if slot < scope.arity {
+                args.get(slot).copied().unwrap_or(Value::Undefined)
+            } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                Value::uninitialized()
+            } else {
+                Value::Undefined
+            };
+        }
+        let entry: crate::jit::JitEntry = unsafe { std::mem::transmute(info.entry) };
+        let stack_ptr =
+            (sp + scope.frame_size * std::mem::size_of::<Value>()) as *mut std::os::raw::c_void;
+        agent.jit_depth += 1;
+        let result = unsafe { (entry)(frame_ptr as *mut std::os::raw::c_void, stack_ptr, ctx_ptr) };
+        agent.jit_depth -= 1;
+        // The leaf's helpers keep the VM value stack balanced; be
+        // conservative like `run_jit_leaf` and drop anything transient.
+        self.stack.truncate(stack_len);
+        if ctx.pending {
+            // The leaf's own throwing slow path set the pending byte (and
+            // error); surface it — the caller helper re-routes it through
+            // the pending ABI.
+            return Err(ctx.error.take().expect("a pending JIT error is present"));
+        }
+        Ok(Some(Value::from_bits(result)))
+    }
+
     /// The shared `Step::Construct` core (the interpreter handler and the
     /// JIT's `construct` helper): pop the argument boundary, then run the
     /// certified base-constructor LEAF inline when the callee qualifies
@@ -10409,6 +10520,30 @@ impl Vm {
         &mut self,
         agent: &mut Agent,
         callee: Value,
+    ) -> Result<Value, JsError> {
+        self.step_construct_impl(agent, callee, None)
+    }
+
+    /// The JIT helper's construct entry: like [`Self::step_construct`], but
+    /// the caller's machine code also passes its live `JitCallContext` and
+    /// current working-stack pointer, so an environment-free certified leaf
+    /// body can run directly on that ctx with a frame carved from the
+    /// caller's buffer (see `run_leaf_construct`).
+    pub(crate) fn step_construct_shared(
+        &mut self,
+        agent: &mut Agent,
+        callee: Value,
+        ctx: *mut std::os::raw::c_void,
+        sp: u64,
+    ) -> Result<Value, JsError> {
+        self.step_construct_impl(agent, callee, Some((ctx, sp as usize)))
+    }
+
+    fn step_construct_impl(
+        &mut self,
+        agent: &mut Agent,
+        callee: Value,
+        shared: Option<(*mut std::os::raw::c_void, usize)>,
     ) -> Result<Value, JsError> {
         let base = self.args_base_stack.pop().ok_or_else(|| {
             JsError::new(
@@ -10457,7 +10592,7 @@ impl Vm {
             } else {
                 None
             };
-            self.run_leaf_construct(agent, &ir, environment, strict, &callee, &args)
+            self.run_leaf_construct(agent, &ir, environment, strict, &callee, &args, shared)
         } else {
             let _stress = StressSuppress::new();
             let args = self.args.split_off(base);

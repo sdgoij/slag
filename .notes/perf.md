@@ -7467,6 +7467,127 @@ jit/jitless/--gc-stress; the three release test262 sweeps at baseline
 fail/crash/hang) re-run on the final tree.
 
 
+### PROBE: the bare-construct residual is the un-inlined FFI construct cascade — architectural, not a bounded slice (measured 2026-09-09, no code)
+
+The next-slice note above names the ~140ns bare `new C()` (S0) as the
+rows' remaining mass. With the fill FFI gone, a fresh probe isolates the
+construct machinery cleanly for the first time. scratch/construct_bare_probe.js
+(500k iters, release, min-of-3, same machine):
+
+| row (ns/iter) | jit | jitless |
+|---|---|---|
+| M0 `{}` literal + keep-alive | ~80 | ~70 |
+| M1 `new C()` empty body, no args | ~128 | ~172 |
+| M2 `new C(i)` one arg bound | ~126 | ~168 |
+| M3 `C()` plain call of the same empty leaf | ~22 | ~82 |
+| M4 `new C(i)` body `return x` | ~128-144 | ~174 |
+
+construct minus literal is ~45ns (jit) / ~15ns (jl) of machinery ABOVE
+object creation; construct minus a plain leaf CALL of the same empty body
+is ~105ns (jit) / ~90ns (jl). The jit call floor (M3 ~22ns) proves the
+machine leaf path is cheap: `emit_call`'s leaf-inline (the leaf-call site
+cache + `emit_leaf_call_tail` — the callee's compiled body runs as a plain
+machine call on the CALLER's frame region, no ctx rebuild). A CONSTRUCT
+has no analog: `Step::Construct` emits one FFI (`Helper::Construct`) that
+re-runs `step_construct` (boundary pop + `can_inline_leaf` + realm check +
+`agent.leaf_lookup` HashMap probe + `construct_inline` verdict + args Cow
++ env logic) then `run_leaf_construct` (construct_this_object + args
+re-materialization) then `run_jit_leaf` (the full per-run JitCallContext
+rebuild: ~30 fields, the leaf-cache array, the frame-buffer fill loop,
+global resolution, clean-chain walk, jit_roots push/pop) — for a body
+that does nothing. The interpreter side is similar (`run_leaf_body` is
+~90ns of construct glue over `run_inline_leaf`-class call machinery).
+
+This is the third probe to call the construct overhead diffuse (L6382
+"~35ns, not addressed"; the pre-fill decompositions), and it now pins the
+CAUSE: the per-construct cost is the FFI + eligibility-re-derivation +
+per-run ctx rebuild cascade, not any single piece. Bounded micro-trims
+(step_construct's prelude, the redundant arg re-materialization, the
+oracle read in construct_this_object) are each ~5-15ns and would measure
+within noise on real rows.
+
+Scoped (NOT started — needs its own focused turn + full gate): a
+machine-inline leaf CONSTRUCT mirroring `emit_call`'s leaf path — a
+construct-site cache validating (callee, `construct_inline`, leaf state),
+an FFI `construct_this_object` (receiver creation), the leaf body run via
+`emit_leaf_call_tail`-class machinery with `this` = the fresh receiver in
+its frame slot, and the base-constructor return rule (object/function
+wins, else `this`) applied in machine code. Two wrinkles vs the call path:
+`Step::Construct` is the VECTOR form (the argc is in `Vm::args`, not the
+step) so the site needs its static argc, and the `new.target`-free leaf
+subset is the only body shape runnable this way (leaf bodies are already
+`NewTarget`-excluded). Estimated ~200-350 lines across the four-file
+helper mirror + compiler + a new runtime entry.
+
+CORRECTED by the follow-up probe below: the intermediate "fused static-argc
+ConstructFast step" sub-slice is FALSIFIED — M1 (`new C()`, no args: the
+step stream is ArgsBase + Construct, no ArgsPush) measures the SAME as M2
+(`new C(i)`, one extra ArgsPush FFI) at ~128ns jit / ~168ns jl. So the
+ArgsBase/ArgsPush vector-form FFI chain is NOT the ~80ns mass over the
+22ns machine-inline call floor; that mass is the CONSTRUCT CORE shared by
+both: `step_construct`'s eligibility prelude (boundary pop, `can_inline_leaf`,
+realm check, `agent.leaf_lookup` HashMap probe, `construct_inline`, args
+`Cow`/truncate, `ir` clone) + `construct_this_object` + `run_jit_leaf`'s
+full per-construct JitCallContext rebuild — the ctx rebuild leaf CALLS
+only avoid because `emit_call` machine-inlines them on the caller's ctx.
+A static-argc step would save one FFI at best (~15-25ns, within row
+noise) and leaves the core untouched. The only real fix remains the
+machine-inline leaf construct (above), which is architectural: the
+receiver allocation + vector-form args keep the leaf off the caller's
+frame model, so it needs the site cache + create-this FFI + return rule.
+Deferred as a dedicated program, not a tail slice; the construct rows'
+remaining mass is accepted for now.
+
+
+### LANDED (2026-09-09, uncommitted): the shared-ctx construct leaf — the machine-inline construct's ctx-rebuild half
+
+Rather than the full machine-inline construct (receiver allocation + the
+vector-form args keep the leaf off the caller's frame model), this landing
+removes the other half of the recorded core cost: `run_jit_leaf`'s full
+per-construct JitCallContext/private-buffer/root rebuild, by running an
+environment-free certified construct LEAF directly on the CALLER's live ctx
+with its frame carved from the caller's working buffer just above the
+caller's current `sp` — the exact model `emit_call`'s machine leaf-inline
+already uses for leaf CALLS. The compiled `Step::Construct` now passes the
+machine's current `sp` to the `construct` helper (a 3-arg signature through
+the four-file mirror); `step_construct_shared`/`run_leaf_construct`
+(`ir.rs`) attempt the carve first and fall back to the materialize-args +
+`run_jit_leaf` path on any doubt (an env leaf, the body not compiled —
+`lookup_info` null — the depth cap, or no room above `sp`). The carve is
+inside the caller's already-rooted buffer, so no re-rooting; the leaf's own
+helpers keep the VM stack balanced and the caller's leaf-cache slots/epoch
+are only ever re-validated on a collision (the emit_call gate is exact).
+The frame fill mirrors `run_jit_leaf` (this slot when present — a leaf may
+have none, an empty body never references `this` and the receiver is
+returned regardless — params from the construct args, TDZ/var slots); the
+base-constructor return rule applies to the leaf's result.
+
+Interleaved A/B (release, jit, scratch/construct_bare_probe.js, 500k, same
+session): M1 `new C()` ~61-68 -> ~56-58ms (~11%), M2 `new C(i)` ~63-71 ->
+~51-58ms (~15-20%), M4 (`return x` body) ~65-72 -> ~53ms (~20%); the
+literal floor M0 and the leaf-call floor M3 (~10ms) are unchanged. So the
+shared path saves ~15-25ns/construct — the ctx rebuild was only ~20ns of
+the ~100ns core (the rest is the eligibility prelude + `construct_this_object`
++ the FFI, as the probes concluded). jitless is unchanged by construction
+(the interpreter passes no shared ctx).
+
+Correctness: 179 jit e2e tests green (incl. the existing construct-leaf /
+construct-error e2e, which now exercise the shared carve, plus a new
+`installed_jit_shared_ctx_construct_leaf_recovers_after_a_throw` pinning
+a constructor leaf whose body CALLS a helper and throws mid-loop); a
+10-shape stress probe (ctor body calls, throws caught, nested constructs,
+closures, 6 args, object returns, env-capture fallback, deep chains,
+throw-then-continue) byte-identical across jit/jitless/--gc-stress; the
+presize/chain/vecfree/objfast/fn/proto batteries byte-identical across
+modes. clippy `-D warnings` clean; workspace 32 suites green; three release
+test262 sweeps at baseline (language 23721/3 skip, built-ins 23657/155
+skip, annexB 1086/1086, zero fail/crash/hang).
+
+Remaining construct mass (journaled, not started): the eligibility prelude
++ `construct_this_object` + the FFI — a machine site-cache + create-this
+FFI would need the receiver allocation moved out of the core to cut further.
+
+
 
 ## Deferred milestones
 

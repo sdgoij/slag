@@ -1781,6 +1781,34 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_shared_ctx_construct_leaf_recovers_after_a_throw() {
+        // The shared-ctx construct leaf: a compiled loop's `new C(i)` runs an
+        // environment-free leaf body on the CALLER's ctx with a frame carved
+        // from its buffer (no per-construct ctx rebuild). The body CALLS a
+        // helper (an internal leaf-call site on the shared ctx) and throws
+        // at one iteration; the pending byte must route to the caller's
+        // catch and the loop must construct cleanly AFTER the throw (the
+        // shared ctx's error/pending state and the caller's leaf-cache slots
+        // are left consistent).
+        let source = "function h(x) { return x * 2; }\n\
+                     function C(x) { this.a = h(x); if (x === 50) { throw new Error('boom'); } this.b = x; }\n\
+                     var s = 0, c = 0;\n\
+                     for (var i = 0; i < 100; i++) { try { var o = new C(i); s += o.a + o.b; } catch (e) { c++; } }\n\
+                     s * 1000 + c * 10 + new C(7).a;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the shared-ctx construct leaf must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_fused_slot_compounds_match_the_interpreter() {
         // A statement-position slot compound whose RHS resolved into the
         // accumulator (`s += i`) now fuses the `[BinLeftReg, StoreReg]` tail

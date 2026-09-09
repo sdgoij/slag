@@ -547,10 +547,11 @@ pub struct JitHelpers {
     pub call_vector:
         Option<extern "C" fn(vm: *mut c_void, this: u64, callee: u64, direct_eval: u64) -> u64>,
     /// The compiled `Step::Construct`: the callee on the JIT buffer, the
-    /// arguments in the Vm's vector. Runs the interpreter's construct
-    /// machinery (the construct-inline leaf fast path or the general path)
-    /// and returns the constructed value.
-    pub construct: Option<extern "C" fn(vm: *mut c_void, callee: u64) -> u64>,
+    /// arguments in the Vm's vector, and the caller's current working `sp`.
+    /// Runs the interpreter's construct machinery (the construct-inline
+    /// leaf fast path or the general path) and returns the constructed
+    /// value.
+    pub construct: Option<extern "C" fn(vm: *mut c_void, callee: u64, sp: u64) -> u64>,
     /// The compiled `Step::CallApply` (.notes/perf.md "remaining apply floor"):
     /// `args` points at the JIT buffer's argument region (`argc` slots, the
     /// `thisArg` first); `kind` is 0 for `apply`, 1 for `call`. Runs the
@@ -1359,7 +1360,7 @@ pub extern "C" fn test_call_vector(
     Value::Number(53.0).bits()
 }
 
-pub extern "C" fn test_construct(_vm: *mut c_void, _callee: u64) -> u64 {
+pub extern "C" fn test_construct(_vm: *mut c_void, _callee: u64, _sp: u64) -> u64 {
     Value::Number(53.5).bits()
 }
 
