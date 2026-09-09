@@ -102,6 +102,19 @@ fn this_string_value(this: &Value) -> Result<JsString, JsError> {
     }
 }
 
+/// `this` as a boxed string for the range methods (`slice`/`substring`/
+/// `substr`): spec §ToString of the receiver, but a string PRIMITIVE keeps
+/// its own box — so a `JsString::slice_view` can window the receiver
+/// instead of boxing an owned copy per call. Non-primitives coerce through
+/// the agent (a wrapper object's `@@toPrimitive`/`toString` may run user
+/// code) and the result is boxed fresh.
+fn this_string_box(agent: &mut Agent, this: &Value) -> Result<Handle<JsString>, JsError> {
+    match this.kind() {
+        ValueKind::String(s) => Ok(s),
+        _ => Ok(Handle::new(crate::context::to_string(agent, this)?)),
+    }
+}
+
 /// The "substring of `s` from `from` to `to`" helper (spec §substring),
 /// clamping both ends into range.
 fn substring(s: &JsString, from: usize, to: usize) -> JsString {
@@ -840,8 +853,8 @@ fn search(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
 /// spec 22.1.3.25 String.prototype.slice.
 fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = crate::context::to_string(agent, this)?;
-    let len = s.len();
+    let parent = this_string_box(agent, this)?;
+    let len = parent.len();
     let from = to_clamped_index(
         agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
@@ -854,7 +867,7 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     if from >= to {
         return Ok(Value::String(Handle::new(JsString::from_utf8(""))));
     }
-    Ok(Value::String(Handle::new(substring(&s, from, to))))
+    Ok(Value::String(JsString::slice_view(&parent, from, to)))
 }
 
 /// spec 22.1.3.26 String.prototype.split: `@@split` delegation, then the pure
@@ -949,8 +962,8 @@ fn starts_with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 /// Annex B.2.3.1 String.prototype.substr.
 fn substr(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = crate::context::to_string(agent, this)?;
-    let size = s.len();
+    let parent = this_string_box(agent, this)?;
+    let size = parent.len();
     let int_start = to_clamped_index(
         agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
@@ -962,16 +975,19 @@ fn substr(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             .clamp(0.0, size as f64) as usize,
     };
     let int_end = (int_start + int_length).min(size);
-    Ok(Value::String(Handle::new(substring(
-        &s, int_start, int_end,
-    ))))
+    if int_start >= int_end {
+        return Ok(Value::String(Handle::new(JsString::from_utf8(""))));
+    }
+    Ok(Value::String(JsString::slice_view(
+        &parent, int_start, int_end,
+    )))
 }
 
 /// spec 22.1.3.28 String.prototype.substring.
 fn substring_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let s = crate::context::to_string(agent, this)?;
-    let len = s.len();
+    let parent = this_string_box(agent, this)?;
+    let len = parent.len();
     let final_start = to_integer_or_infinity(crate::context::to_number(
         agent,
         &args.first().cloned().unwrap_or(Value::Undefined),
@@ -984,7 +1000,10 @@ fn substring_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     };
     let from = final_start.min(final_end);
     let to = final_start.max(final_end);
-    Ok(Value::String(Handle::new(substring(&s, from, to))))
+    if from >= to {
+        return Ok(Value::String(Handle::new(JsString::from_utf8(""))));
+    }
+    Ok(Value::String(JsString::slice_view(&parent, from, to)))
 }
 
 /// spec 22.1.3.30 String.prototype.toLocaleLowerCase: TransformCase with the

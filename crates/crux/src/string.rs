@@ -67,6 +67,19 @@ pub enum JsString {
         /// flattened through two handles flattens twice.)
         flat: OnceLock<Arc<[u16]>>,
     },
+    /// An O(1) substring view (V8's SlicedString): the code units of `parent`
+    /// at `[offset, offset + len)`. `substring`/`slice` return this instead of
+    /// copying when the range is large, so a slice whose content is only
+    /// measured (`slice(...).length`) or identity-compared never materializes
+    /// the parent. `len` is O(1); the first content access (`as_slice`)
+    /// materializes the parent once (Arc clone for a `Flat`, else a flatten)
+    /// and windows it — no per-node copy of the range.
+    Sliced {
+        parent: Handle<JsString>,
+        offset: usize,
+        len: usize,
+        flat: OnceLock<Arc<[u16]>>,
+    },
 }
 
 /// A flattened-node worklist element: either a JsString node to process.
@@ -77,7 +90,9 @@ enum FlattenLeaf<'a> {
 /// The flatten cache of a rope node, if `s` is one.
 fn rope_cache(s: &JsString) -> Option<&OnceLock<Arc<[u16]>>> {
     match s {
-        JsString::ConsString { flat, .. } | JsString::Rope { flat, .. } => Some(flat),
+        JsString::ConsString { flat, .. }
+        | JsString::Rope { flat, .. }
+        | JsString::Sliced { flat, .. } => Some(flat),
         _ => None,
     }
 }
@@ -108,6 +123,9 @@ impl Trace for JsString {
                 if let Some(r) = right {
                     r.trace(visit);
                 }
+            }
+            JsString::Sliced { parent, .. } => {
+                parent.trace(visit);
             }
         }
     }
@@ -222,6 +240,34 @@ impl JsString {
         })
     }
 
+    /// An O(1) substring view over `parent`'s code units at `[from, to)`
+    /// (V8's SlicedString), so `slice`/`substring` don't copy the range.
+    /// The result is a [`JsString::Sliced`] node holding the parent handle;
+    /// `len` and `as_slice` serve from the parent, and the parent is only
+    /// materialized on a content read (never for `len`/equality of lengths).
+    /// Windows of at most [`SMALL_STRING_CAP`] units stay eager inline copies:
+    /// a view that small would pay a node allocation plus a later parent
+    /// materialization to serve content an inline copy already covers. `to`
+    /// must be within `parent.len()`.
+    pub fn slice_view(parent: &Handle<JsString>, from: usize, to: usize) -> Handle<JsString> {
+        debug_assert!(to <= parent.len() && from <= to);
+        if to - from <= SMALL_STRING_CAP {
+            return Handle::new(JsString::from_utf16(&parent.as_slice()[from..to]));
+        }
+        Handle::new_in_place(|ptr: *mut JsString| {
+            // SAFETY: `new_in_place` hands back the fresh slot; this
+            // closure writes every field before returning.
+            unsafe {
+                ptr.write(JsString::Sliced {
+                    parent: *parent,
+                    offset: from,
+                    len: to - from,
+                    flat: OnceLock::new(),
+                });
+            }
+        })
+    }
+
     /// Whether the string is a leaf (`Flat` or `Small`): `as_slice` returns
     /// the units directly with no flatten cost.
     fn is_leaf(&self) -> bool {
@@ -231,7 +277,7 @@ impl JsString {
     /// The tree depth: 0 for a flat string, else the node's cached depth.
     fn depth(&self) -> u32 {
         match self {
-            JsString::Flat(_) | JsString::Small { .. } => 0,
+            JsString::Flat(_) | JsString::Small { .. } | JsString::Sliced { .. } => 0,
             JsString::ConsString { depth, .. } | JsString::Rope { depth, .. } => *depth,
         }
     }
@@ -241,7 +287,9 @@ impl JsString {
         match self {
             JsString::Flat(units) => units.len(),
             JsString::Small { len, .. } => *len as usize,
-            JsString::ConsString { len, .. } | JsString::Rope { len, .. } => *len,
+            JsString::ConsString { len, .. }
+            | JsString::Rope { len, .. }
+            | JsString::Sliced { len, .. } => *len,
         }
     }
 
@@ -255,6 +303,21 @@ impl JsString {
             JsString::Small { len, units } => &units[..*len as usize],
             JsString::ConsString { flat, .. } | JsString::Rope { flat, .. } => {
                 flat.get_or_init(|| self.flatten()).as_ref()
+            }
+            // Materialize the PARENT once (an Arc clone for a Flat — O(1) —
+            // else a flatten) and window it; the cache is the whole parent so
+            // a Flat parent needs no range copy.
+            JsString::Sliced {
+                parent,
+                offset,
+                len,
+                flat,
+            } => {
+                let arc = flat.get_or_init(|| match &**parent {
+                    JsString::Flat(units) => units.clone(),
+                    other => Arc::from(other.as_slice()),
+                });
+                &arc[*offset..*offset + *len]
             }
         }
     }
@@ -277,8 +340,13 @@ impl JsString {
                 len: *len,
                 units: *units,
             },
-            JsString::ConsString { .. } | JsString::Rope { .. } => {
-                let _ = handle.as_slice(); // flatten + cache in the box (once)
+            // A non-leaf node (`ConsString`/`Rope`/`Sliced`) whose box cache may
+            // be unseeded: flatten + cache in the box (once), clone (fresh
+            // cache), then seed the copy from the boxed buffer so owned reads
+            // don't re-flatten. For a `Sliced` the boxed buffer is the whole
+            // parent materialization; the copy windows it the same way.
+            JsString::ConsString { .. } | JsString::Rope { .. } | JsString::Sliced { .. } => {
+                let _ = handle.as_slice();
                 let copy = (**handle).clone();
                 if let Some(boxed) = rope_cache(handle).and_then(|cache| cache.get())
                     && let Some(fresh) = rope_cache(&copy)
@@ -359,6 +427,16 @@ impl JsString {
                             stack.push(FlattenLeaf::String(l));
                         }
                     }
+                    // A Sliced child materializes its parent (cached per box)
+                    // and contributes its window; the flatten walk then ends.
+                    JsString::Sliced {
+                        parent,
+                        offset,
+                        len,
+                        ..
+                    } => {
+                        units.extend_from_slice(&parent.as_slice()[*offset..*offset + *len]);
+                    }
                 },
             }
         }
@@ -397,6 +475,17 @@ impl Clone for JsString {
                 right: *right,
                 len: *len,
                 depth: *depth,
+                flat: OnceLock::new(),
+            },
+            JsString::Sliced {
+                parent,
+                offset,
+                len,
+                ..
+            } => JsString::Sliced {
+                parent: *parent,
+                offset: *offset,
+                len: *len,
                 flat: OnceLock::new(),
             },
         }
@@ -921,5 +1010,78 @@ mod tests {
         assert_eq!(s.code_point_at(21), Some((0x1F600, false, 2)));
         // Content is correct (Flat after emoji merge).
         assert_eq!(s.as_slice().len(), 23);
+    }
+
+    #[test]
+    fn slice_view_windows_the_parent_without_copying() {
+        // A Flat parent > SMALL_STRING_CAP: the view is a `Sliced` node, its
+        // `len` is O(1), and a content read windows the parent's Arc buffer
+        // (no range copy).
+        let units: Vec<u16> = (0..100).map(|i| b'a' as u16 + (i % 26) as u16).collect();
+        let parent = Handle::new(JsString::from_utf16(&units));
+        let view = JsString::slice_view(&parent, 10, 90);
+        assert!(matches!(*view, JsString::Sliced { .. }));
+        assert_eq!(view.len(), 80);
+        assert_eq!(view.as_slice(), &units[10..90]);
+        // Small windows stay eager inline copies.
+        let small = JsString::slice_view(&parent, 0, 16);
+        assert!(matches!(*small, JsString::Small { .. }));
+        assert_eq!(small.as_slice(), &units[..16]);
+        // A full-range view is not a node at all.
+        let full = JsString::slice_view(&parent, 0, 100);
+        assert_eq!(full.as_slice(), units.as_slice());
+    }
+
+    #[test]
+    fn slice_view_len_never_materializes_an_unflattened_parent() {
+        // The corpus pattern `hay.slice(0, k).length` reads only `.length` of
+        // the view: on an unflattened ConsString parent, that must NOT
+        // materialize the parent (the whole point of the lazy view).
+        let mut s = Handle::new(JsString::from_utf8(""));
+        let x = Handle::new(JsString::from_utf8("x"));
+        for _ in 0..200 {
+            s = JsString::concat(&s, &x);
+        }
+        assert!(rope_cache(&s).is_some_and(|c| c.get().is_none()));
+        let view = JsString::slice_view(&s, 3, 97);
+        assert_eq!(view.len(), 94);
+        assert!(rope_cache(&s).is_some_and(|c| c.get().is_none()));
+        // A content read materializes the parent once and windows it.
+        assert_eq!(view.as_slice(), &[b'x' as u16; 94][..]);
+        assert!(rope_cache(&s).is_some_and(|c| c.get().is_some()));
+        // A second view over the now-flat parent shares the buffer.
+        let again = JsString::slice_view(&s, 0, 100);
+        assert_eq!(again.len(), 100);
+    }
+
+    #[test]
+    fn slice_view_of_a_view_and_concat_content_parity() {
+        // Views nest (offsets are relative to the immediate parent) and a
+        // concat that walks into a Sliced child flattens the window.
+        let units: Vec<u16> = (0..200).map(|i| b'a' as u16 + (i % 26) as u16).collect();
+        let parent = Handle::new(JsString::from_utf16(&units));
+        let outer = JsString::slice_view(&parent, 40, 160);
+        let inner = JsString::slice_view(&outer, 20, 80);
+        assert_eq!(inner.len(), 60);
+        assert_eq!(inner.as_slice(), &units[60..120]);
+        // A concat whose left child is a Sliced flatten-walks the window.
+        let tail = Handle::new(JsString::from_utf16(&units[120..130]));
+        let joined = JsString::concat(&inner, &tail);
+        assert_eq!(joined.as_slice(), &units[60..130]);
+    }
+
+    #[test]
+    fn owned_of_a_view_seeds_the_copy_cache() {
+        let units: Vec<u16> = (0..100).map(|i| b'a' as u16 + (i % 26) as u16).collect();
+        let parent = Handle::new(JsString::from_utf16(&units));
+        let view = JsString::slice_view(&parent, 10, 90);
+        let owned = JsString::owned_of(&view);
+        assert_eq!(owned.len(), 80);
+        assert_eq!(owned.as_slice(), &units[10..90]);
+        // The box materialized once and the copy's cache carries the buffer.
+        assert_eq!(
+            rope_cache(&owned).and_then(|c| c.get().map(|a| a.len())),
+            Some(100)
+        );
     }
 }

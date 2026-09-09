@@ -8351,6 +8351,16 @@ the out-of-line overflow region is the only scaling answer; both stay
 gated behind a real >16-key (or >8-key, if 16 proves too fat) hot
 workload. STOPPING the extension arc here by the no-hot-row gate.
 
+### LANDED (2026-09-09): substring views — `JsString::Sliced` makes slice/substring/substr O(1) nodes
+
+The `strings/search_slice.js` corpus row (100k `hay.slice(0, i%400+1).length` + indexOf over a 1200-unit `hay`) still ran at ~66ms jit / ~83ms jl after the flatten-cache landing. Its slice term is a range COPY per call: the corpus reads only `.length` of each slice, so the copy is pure waste. Added a `JsString::Sliced` variant (V8's SlicedString): `{ parent, offset, len, flat }` — `len` O(1), and `as_slice` materializes the PARENT once (an Arc clone for a Flat parent) and windows it, so the range is never copied. `Trace` walks the parent (views keep it alive under GC); clone/owned_of/flatten-walk got arms (owned_of seeds the copy's fresh cache from the boxed whole-parent buffer, mirroring the rope path). New `JsString::slice_view(parent, from, to)`: windows > `SMALL_STRING_CAP` (16) units as a `Sliced` node; small windows stay eager inline `Small` copies (a node + later parent materialize would cost more than the inline copy).
+
+Runtime wiring: `slice`/`substring`/`substr` in `crates/runtime/src/builtins/string.rs` now go through a `this_string_box` helper — a string PRIMITIVE receiver keeps its own box (the spec §ToString result) as the view parent, so the per-call `to_string` owned copy disappears too; non-primitive receivers coerce through the agent and get boxed fresh. Result: `slice`/`substring`/`substr` return views instead of eager `from_utf16` copies; the corpus `.length` reads never touch the parent's content. `split`'s per-token pieces, `startsWith`'s bounded compare, and `endsWith`/`includes` deliberately stay eager (their substrings are small or immediately content-compared).
+
+A/B (release corpus, interleaved): `search_slice` jit ~60.5/60.7/77.0 (mean ~66) -> ~42.1/43.9/41.6/44.8/47.4 (mean ~44, ~1.5x) / jl ~82.2/83.7 -> ~55.7/55.7/54.4/52.8 (~1.55x). Every other corpus row within cross-run noise (char_ops ~72ms, coercion_concat ~165ms, split_join ~130-146ms jit — all at their recorded recent baselines). Correctness: 4 new crux tests (window/len-no-materialize/view-of-view-concat/owned_of-seeding); a 250-case x 3-parent x 3-method deterministic differential matrix plus ~55 spot checks (edge args, wrapper/number/object receivers, view-of-view, views feeding concat/indexOf/split/startsWith/replace/toUpperCase/iteration/trim/regexp) diff byte-identical vs node in jit, jitless, AND --gc-stress. Gates: clippy `-D warnings` clean; workspace green; three release test262 sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang); corpus parity 37/37 ok.
+
+Open (measured, not started): the same per-call copy pattern likely sits in `repeat`/`padStart`/`padEnd` filler paths and `String.prototype.split`'s empty-separator unit loop; and a view whose parent is a small `Flat` could adopt the parent's Arc directly. Neither has a hot corpus row behind it yet.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
