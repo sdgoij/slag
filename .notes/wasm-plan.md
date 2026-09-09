@@ -2641,6 +2641,18 @@ entirely `trunc*`). Unit coverage in
 `reinterpret_and_extend_bits_match_the_interpreter` (bit patterns incl. NaN
 payloads and -0.0).
 
+The float→int `trunc*` slice closed the `Num` family: all sixteen
+`i32/i64.trunc*_f32/f64` forms (trapping and `_sat`) lower through
+`lower_float_to_int`, which promotes `_f32` operands to f64 (the interpreter
+upcasts), traps NaN / out-of-range truncations exactly like `values.rs`'s
+half-open range checks, and uses saturating conversions (NaN → 0, clamp) for
+`_sat`. Corpus effect: coverage 7998 → 8045 (97%), "outside the lowering
+subset" 131 → 84 with **no `Num` blockers left** (GlobalGet 58 on ref-typed
+globals is now the largest family, then TableGet 8, GlobalSet 7, CallIndirect
+5, TableSet 4, RefNull 2). Unit coverage in
+`float_to_int_truncs_match_the_interpreter` (float bit corpora plus exact
+trap/clamp boundary magnitudes).
+
 ### Definition of done (all must hold)
 
 - [ ] Gate 0 report exists and is the tracking source of truth.

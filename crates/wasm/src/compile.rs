@@ -1250,6 +1250,24 @@ fn supported_num(op: NumOp) -> bool {
             | I64GeU
             // Conversions.
             | I32WrapI64
+            // Float-to-int truncations (trapping and `_sat` forms): the
+            // remaining float conversion family.
+            | I32TruncF32S
+            | I32TruncF32U
+            | I32TruncF64S
+            | I32TruncF64U
+            | I64TruncF32S
+            | I64TruncF32U
+            | I64TruncF64S
+            | I64TruncF64U
+            | I32TruncSatF32S
+            | I32TruncSatF32U
+            | I32TruncSatF64S
+            | I32TruncSatF64U
+            | I64TruncSatF32S
+            | I64TruncSatF32U
+            | I64TruncSatF64S
+            | I64TruncSatF64U
             // Reinterpretations (pure bit moves between equal-width int/float
             // types).
             | I32ReinterpretF32
@@ -1584,6 +1602,29 @@ impl<'a> Lowerer<'a> {
         ) {
             return self.lower_bit_op(op);
         }
+        // Float-to-int truncations mirror the interpreter's range traps and
+        // saturating clamps; they take their own path too.
+        if matches!(
+            op,
+            I32TruncF32S
+                | I32TruncF32U
+                | I32TruncF64S
+                | I32TruncF64U
+                | I64TruncF32S
+                | I64TruncF32U
+                | I64TruncF64S
+                | I64TruncF64U
+                | I32TruncSatF32S
+                | I32TruncSatF32U
+                | I32TruncSatF64S
+                | I32TruncSatF64U
+                | I64TruncSatF32S
+                | I64TruncSatF32U
+                | I64TruncSatF64S
+                | I64TruncSatF64U
+        ) {
+            return self.lower_float_to_int(op);
+        }
         // Float ops take their own path (they produce typed float values and
         // canonicalize NaN results per the interpreter's policy).
         if is_f32_op(op) {
@@ -1744,6 +1785,96 @@ impl<'a> Lowerer<'a> {
     fn sign_extend(&mut self, narrow: Type, wide: Type, value: ClifValue) -> ClifValue {
         let reduced = self.builder.ins().ireduce(narrow, value);
         self.builder.ins().sextend(wide, reduced)
+    }
+
+    /// The float→int truncation `Num` ops (`i32/i64.trunc*_f32/f64`, both the
+    /// trapping and `trunc_sat` forms), mirroring the interpreter's
+    /// `values.rs` helpers exactly. A `_f32` operand is promoted to f64 first
+    /// (the interpreter upcasts, so the truncation and range checks run at
+    /// f64 precision). The saturating forms are Cranelift's saturating
+    /// conversions (NaN → 0, out-of-range clamps); the trapping forms trap on
+    /// NaN (`InvalidConversionToInteger`) and when the truncated value leaves
+    /// the target's range (`IntegerOverflow`), then convert — inside the
+    /// checked range the saturating conversion is exact, so it doubles as the
+    /// truncating convert.
+    fn lower_float_to_int(&mut self, op: NumOp) -> Result<(), String> {
+        use NumOp::*;
+        let (saturating, signed, wide, from_f32) = match op {
+            I32TruncF32S => (false, true, false, true),
+            I32TruncF32U => (false, false, false, true),
+            I32TruncF64S => (false, true, false, false),
+            I32TruncF64U => (false, false, false, false),
+            I64TruncF32S => (false, true, true, true),
+            I64TruncF32U => (false, false, true, true),
+            I64TruncF64S => (false, true, true, false),
+            I64TruncF64U => (false, false, true, false),
+            I32TruncSatF32S => (true, true, false, true),
+            I32TruncSatF32U => (true, false, false, true),
+            I32TruncSatF64S => (true, true, false, false),
+            I32TruncSatF64U => (true, false, false, false),
+            I64TruncSatF32S => (true, true, true, true),
+            I64TruncSatF32U => (true, false, true, true),
+            I64TruncSatF64S => (true, true, true, false),
+            I64TruncSatF64U => (true, false, true, false),
+            _ => return Err("non-trunc Num opcode reached the float-to-int lowering".to_string()),
+        };
+        let a = self.pop().ok_or("operand stack underflow")?;
+        let a = if from_f32 {
+            self.builder.ins().fpromote(types::F64, a)
+        } else {
+            a
+        };
+        let result_ty = if wide { types::I64 } else { types::I32 };
+        if saturating {
+            let out = if signed {
+                self.builder.ins().fcvt_to_sint_sat(result_ty, a)
+            } else {
+                self.builder.ins().fcvt_to_uint_sat(result_ty, a)
+            };
+            self.stack.push(out);
+            return Ok(());
+        }
+        // Trapping form: NaN is an invalid conversion; the truncated value
+        // must stay inside the target's range. The bounds mirror the
+        // interpreter's half-open range checks on the f64-truncated value.
+        let nan = self.builder.ins().fcmp(FloatCC::Unordered, a, a);
+        self.trap_if(nan, TRAP_INVALID_CONVERSION);
+        let t = self.builder.ins().trunc(a);
+        let (lo, lo_exclusive, hi): (f64, bool, f64) = if wide {
+            if signed {
+                (
+                    -9_223_372_036_854_775_808.0,
+                    false,
+                    9_223_372_036_854_775_808.0,
+                )
+            } else {
+                (-1.0, true, 18_446_744_073_709_551_616.0)
+            }
+        } else if signed {
+            (-2_147_483_648.0, false, 2_147_483_648.0)
+        } else {
+            (-1.0, true, 4_294_967_296.0)
+        };
+        let lo_v = self.fconst(types::F64, lo.to_bits());
+        let hi_v = self.fconst(types::F64, hi.to_bits());
+        let too_low = if lo_exclusive {
+            self.builder.ins().fcmp(FloatCC::LessThanOrEqual, t, lo_v)
+        } else {
+            self.builder.ins().fcmp(FloatCC::LessThan, t, lo_v)
+        };
+        self.trap_if(too_low, TRAP_INT_OVERFLOW);
+        let too_high = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::GreaterThanOrEqual, t, hi_v);
+        self.trap_if(too_high, TRAP_INT_OVERFLOW);
+        let out = if signed {
+            self.builder.ins().fcvt_to_sint_sat(result_ty, t)
+        } else {
+            self.builder.ins().fcvt_to_uint_sat(result_ty, t)
+        };
+        self.stack.push(out);
+        Ok(())
     }
 
     /// Shift with the count masked to the type width (wasm semantics; never
@@ -6508,6 +6639,63 @@ mod tests {
             );
             assert_equiv(&module, 0, &i32_patterns);
         }
+    }
+
+    #[test]
+    fn float_to_int_truncs_match_the_interpreter() {
+        // The trapping and `trunc_sat` float-to-int conversions, over the
+        // float bit corpora (NaN, infinities, subnormals, and boundary
+        // magnitudes): compiled and interpreter must agree on every result and
+        // trap kind.
+        use NumOp::*;
+        let module_of = |op: NumOp, results: Vec<ValType>| {
+            module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::F64],
+                vec![],
+                results,
+            )
+        };
+        let f32_module_of = |op: NumOp, results: Vec<ValType>| {
+            module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::F32],
+                vec![],
+                results,
+            )
+        };
+        let i32 = vec![ValType::I32];
+        let i64 = vec![ValType::I64];
+        for op in [I32TruncF64S, I32TruncF64U, I32TruncSatF64S, I32TruncSatF64U] {
+            assert_equiv(&module_of(op, i32.clone()), 0, &f64_unary());
+        }
+        for op in [I64TruncF64S, I64TruncF64U, I64TruncSatF64S, I64TruncSatF64U] {
+            assert_equiv(&module_of(op, i64.clone()), 0, &f64_unary());
+        }
+        for op in [I32TruncF32S, I32TruncSatF32S, I32TruncF32U, I32TruncSatF32U] {
+            assert_equiv(&f32_module_of(op, i32.clone()), 0, &f32_unary());
+        }
+        for op in [I64TruncF32S, I64TruncSatF32S, I64TruncF32U, I64TruncSatF32U] {
+            assert_equiv(&f32_module_of(op, i64.clone()), 0, &f32_unary());
+        }
+        // Exact boundary magnitudes pin the trap/clamp edges the bit corpus
+        // only samples.
+        let boundary = vec![
+            vec![Value::F64((-2_147_483_648.0f64).to_bits())],
+            vec![Value::F64((2_147_483_647.0f64).to_bits())],
+            vec![Value::F64((2_147_483_648.0f64).to_bits())],
+            vec![Value::F64((-2_147_483_649.0f64).to_bits())],
+            vec![Value::F64((4_294_967_295.0f64).to_bits())],
+            vec![Value::F64((4_294_967_296.0f64).to_bits())],
+            vec![Value::F64((-1.0f64).to_bits())],
+            vec![Value::F64((-0.5f64).to_bits())],
+            vec![Value::F64((9_223_372_036_854_775_808.0f64).to_bits())],
+            vec![Value::F64((-9_223_372_036_854_775_808.0f64).to_bits())],
+        ];
+        assert_equiv(&module_of(I32TruncF64S, i32.clone()), 0, &boundary);
+        assert_equiv(&module_of(I32TruncSatF64S, i32.clone()), 0, &boundary);
+        assert_equiv(&module_of(I64TruncSatF64U, i64.clone()), 0, &boundary);
+        assert_equiv(&module_of(I64TruncF64U, i64.clone()), 0, &boundary);
     }
 
     #[test]
