@@ -41,6 +41,12 @@ struct JsonParser<'a> {
     agent: &'a mut Agent,
     text: &'a [u8],
     pos: usize,
+    /// Whether to build the `ParseRecord` tree (sources, entry/element
+    /// lists) the reviver needs. A no-reviver parse (the common case)
+    /// discards the whole tree, so the scaffolding is skipped entirely:
+    /// primitives record no source, objects collect no entries, arrays
+    /// collect no element records.
+    records: bool,
 }
 
 impl<'a> JsonParser<'a> {
@@ -103,11 +109,15 @@ impl<'a> JsonParser<'a> {
             _ => return Err(self.syntax_error()),
         };
         let end = self.pos;
-        let source = match value.kind() {
-            ValueKind::Object(_) | ValueKind::Function(_) => None,
-            _ => Some(JsString::from_utf8(
-                std::str::from_utf8(&self.text[start..end]).unwrap_or(""),
-            )),
+        let source = if self.records {
+            match value.kind() {
+                ValueKind::Object(_) | ValueKind::Function(_) => None,
+                _ => Some(JsString::from_utf8(
+                    std::str::from_utf8(&self.text[start..end]).unwrap_or(""),
+                )),
+            }
+        } else {
+            None
         };
         Ok(ParseRecord {
             value,
@@ -146,7 +156,11 @@ impl<'a> JsonParser<'a> {
             }
             let value = self.parse_value()?;
             object.create_data_property_or_throw(&key, value.value)?;
-            entries.push((key, value));
+            if self.records {
+                entries.push((key, value));
+            } else {
+                let _ = value;
+            }
             self.skip_ws();
             if self.eat(b'}') {
                 break;
@@ -163,10 +177,13 @@ impl<'a> JsonParser<'a> {
         })
     }
 
-    /// `[ elements ]`: JSONArray with the element records kept.
+    /// `[ elements ]`: JSONArray with the element records kept for the
+    /// reviver. Elements are defined densely on the pre-sized array (no
+    /// per-element index-string key, mirroring `array_from_values`).
     fn parse_array_record(&mut self) -> Result<ParseRecord, JsError> {
         self.eat(b'[');
-        let mut elements = Vec::new();
+        let mut elements: Vec<ParseRecord> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
         self.skip_ws();
         if self.eat(b']') {
             let array = crate::builtins::array::array_create(self.agent, 0.0)?;
@@ -178,8 +195,12 @@ impl<'a> JsonParser<'a> {
             });
         }
         loop {
-            let value = self.parse_value()?;
-            elements.push(value);
+            let record = self.parse_value()?;
+            let value = record.value;
+            if self.records {
+                elements.push(record);
+            }
+            values.push(value);
             self.skip_ws();
             if self.eat(b']') {
                 break;
@@ -188,12 +209,9 @@ impl<'a> JsonParser<'a> {
                 return Err(self.syntax_error());
             }
         }
-        let array = crate::builtins::array::array_create(self.agent, elements.len() as f64)?;
-        for (index, element) in elements.iter().enumerate() {
-            array.create_data_property_or_throw(
-                &JsString::from_utf8(&index.to_string()),
-                element.value,
-            )?;
+        let array = crate::builtins::array::array_create(self.agent, values.len() as f64)?;
+        for (index, value) in values.iter().enumerate() {
+            array.create_data_property_index(index as u64, *value)?;
         }
         Ok(ParseRecord {
             value: Value::Object(array),
@@ -208,6 +226,27 @@ impl<'a> JsonParser<'a> {
         if !self.eat(b'"') {
             return Err(self.syntax_error());
         }
+        // Fast path: a plain segment with no escape, no multi-byte UTF-8,
+        // and no control byte (all illegal unescaped in JSON strings) is the
+        // byte range verbatim — one `from_utf8`, no per-unit decode loop, no
+        // Vec<u16>. Keys and typical string values have no escapes, so this
+        // is the common shape.
+        let start = self.pos;
+        let mut scan = self.pos;
+        while let Some(&byte) = self.text.get(scan) {
+            if byte == b'"' || byte == b'\\' || byte >= 0x80 || byte <= 0x1F {
+                break;
+            }
+            scan += 1;
+        }
+        if self.text.get(scan) == Some(&b'"') {
+            self.pos = scan + 1;
+            return Ok(JsString::from_utf8(
+                std::str::from_utf8(&self.text[start..scan]).unwrap_or(""),
+            ));
+        }
+        // Slow path: escapes, multi-byte UTF-8, control bytes, or an
+        // unterminated string.
         let mut units: Vec<u16> = Vec::new();
         loop {
             let Some(&byte) = self.text.get(self.pos) else {
@@ -359,6 +398,12 @@ fn str(text: &str) -> Value {
     Value::String(Handle::new(JsString::from_utf8(text)))
 }
 
+/// A serialized property key as a String value (spec Str/SerializeJSONProperty
+/// calls the replacer/toJSON with the key).
+fn strv(s: &JsString) -> Value {
+    Value::String(Handle::new(s.clone()))
+}
+
 /// IsRawJSON (spec 26.6.4): an object registered in the raw-JSON table.
 fn is_raw_json(agent: &Agent, value: &Value) -> bool {
     match value.kind() {
@@ -383,6 +428,8 @@ fn json_primitive_value(agent: &mut Agent, text: &JsString) -> Result<Option<Val
         agent,
         text: &bytes,
         pos: 0,
+        // A primitive-only parse; the record tree is unused beyond .value.
+        records: false,
     };
     let record = match parser.parse_value() {
         Ok(record) => record,
@@ -418,6 +465,8 @@ pub(crate) fn validate_json(agent: &mut Agent, text: &str) -> Result<(), JsError
         agent,
         text: bytes,
         pos: 0,
+        // Validation only; the parsed value (and its record tree) is discarded.
+        records: false,
     };
     parser.parse_value()?;
     parser.skip_ws();
@@ -439,18 +488,19 @@ fn json_parse(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     let _ = this;
     let text_value = args.first().cloned().unwrap_or(Value::Undefined);
     let text = to_string_arg(agent, &text_value)?;
+    let reviver = args.get(1).cloned().unwrap_or(Value::Undefined);
     let bytes = text.to_string_lossy().into_bytes();
     let mut parser = JsonParser {
         agent,
         text: &bytes,
         pos: 0,
+        records: is_callable(&reviver),
     };
     let record = parser.parse_value()?;
     parser.skip_ws();
     if parser.pos != parser.text.len() {
         return Err(parser.syntax_error());
     }
-    let reviver = args.get(1).cloned().unwrap_or(Value::Undefined);
     if !is_callable(&reviver) {
         return Ok(record.value);
     }
@@ -652,7 +702,12 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
             .and_then(|value| as_object(&value)),
     );
     wrapper.create_data_property_or_throw(&JsString::from_utf8(""), value)?;
-    let result = serialize_json_property(agent, &mut state, "", &Value::Object(wrapper))?;
+    let result = serialize_json_property(
+        agent,
+        &mut state,
+        &JsString::from_utf8(""),
+        &Value::Object(wrapper),
+    )?;
     Ok(result
         .map(|text| Value::String(Handle::new(text)))
         .unwrap_or(Value::Undefined))
@@ -725,22 +780,21 @@ fn property_list_from(agent: &mut Agent, replacer: &Value) -> Result<Vec<JsStrin
 fn serialize_json_property(
     agent: &mut Agent,
     state: &mut StringifyState,
-    key: &str,
+    key: &JsString,
     holder: &Value,
 ) -> Result<Option<JsString>, JsError> {
-    let key_string = JsString::from_utf8(key);
-    let mut value = get_property(agent, holder, &key_string, *holder)?;
+    let mut value = get_property(agent, holder, key, *holder)?;
     if matches!(
         value.kind(),
         ValueKind::Object(_) | ValueKind::Function(_) | ValueKind::BigInt(_)
     ) {
         let to_json = get_property(agent, &value, &JsString::from_utf8("toJSON"), value)?;
         if is_callable(&to_json) {
-            value = crate::function::call(agent, &to_json, value, &[str(key)])?;
+            value = crate::function::call(agent, &to_json, value, &[strv(key)])?;
         }
     }
     if let Some(replacer_function) = &state.replacer_function {
-        value = crate::function::call(agent, replacer_function, *holder, &[str(key), value])?;
+        value = crate::function::call(agent, replacer_function, *holder, &[strv(key), value])?;
     }
     if let ValueKind::Object(obj) = value.kind() {
         if is_raw_json(agent, &value) {
@@ -809,37 +863,64 @@ fn serialize_json_object(
         Some(list) => list.clone(),
         None => enumerable_string_keys(agent, value)?,
     };
-    let mut parts: Vec<String> = Vec::new();
+    // Assemble the member text directly in UTF-16 units: quoting keys and
+    // appending the serialized values (already UTF-16 JsStrings) avoids the
+    // per-member UTF-16 -> UTF-8 -> UTF-16 round trips and String/format!
+    // allocations the String-part builder paid.
+    let inner = state.indent.encode_utf16().collect::<Vec<u16>>();
+    let step = stepback.encode_utf16().collect::<Vec<u16>>();
+    let mut out: Vec<u16> = Vec::new();
+    let mut first = true;
     for key in &keys {
-        let result = serialize_json_property(agent, state, &key.to_string_lossy(), value)?;
-        if let Some(text) = result {
-            let mut member = quote_json_string(key).to_string_lossy().to_string();
-            member.push(':');
-            if !state.gap.is_empty() {
-                member.push(' ');
-            }
-            member.push_str(&text.to_string_lossy());
-            parts.push(member);
+        let Some(text) = serialize_json_property(agent, state, key, value)? else {
+            continue;
+        };
+        if first {
+            first = false;
+        } else if state.gap.is_empty() {
+            out.push(b',' as u16);
+        } else {
+            out.extend_from_slice(
+                b",\n"
+                    .iter()
+                    .map(|&b| b as u16)
+                    .collect::<Vec<u16>>()
+                    .as_slice(),
+            );
+            out.extend_from_slice(&inner);
         }
+        quote_into(&mut out, key);
+        out.push(b':' as u16);
+        if !state.gap.is_empty() {
+            out.push(b' ' as u16);
+        }
+        out.extend_from_slice(text.as_slice());
     }
-    let inner_indent = state.indent.clone();
     state.indent = stepback.clone();
     state.stack.pop();
-    if parts.is_empty() {
+    if first {
         Ok(Some(JsString::from_utf8("{}")))
     } else if state.gap.is_empty() {
-        Ok(Some(JsString::from_utf8(&format!(
-            "{{{}}}",
-            parts.join(",")
-        ))))
+        let mut body = Vec::with_capacity(out.len() + 2);
+        body.push(b'{' as u16);
+        body.extend_from_slice(&out);
+        body.push(b'}' as u16);
+        Ok(Some(JsString::from_utf16(&body)))
     } else {
-        let separator = format!(",\n{}", inner_indent);
-        Ok(Some(JsString::from_utf8(&format!(
-            "{{\n{}{}\n{}}}",
-            inner_indent,
-            parts.join(&separator),
-            stepback
-        ))))
+        let mut body = Vec::with_capacity(out.len() + 4 + inner.len() + step.len());
+        body.extend_from_slice(
+            b"{\n"
+                .iter()
+                .map(|&b| b as u16)
+                .collect::<Vec<u16>>()
+                .as_slice(),
+        );
+        body.extend_from_slice(&inner);
+        body.extend_from_slice(&out);
+        body.push(b'\n' as u16);
+        body.extend_from_slice(&step);
+        body.push(b'}' as u16);
+        Ok(Some(JsString::from_utf16(&body)))
     }
 }
 
@@ -859,35 +940,68 @@ fn serialize_json_array(
     let stepback = state.indent.clone();
     state.indent = format!("{}{}", state.indent, state.gap);
     let length = length_of_array_like(agent, value)?;
-    let mut parts: Vec<String> = Vec::new();
-    for index in 0..length {
-        let result = serialize_json_property(agent, state, &index.to_string(), value)?;
-        parts.push(
-            result
-                .map(|text| text.to_string_lossy())
-                .unwrap_or_else(|| "null".to_string()),
-        );
+    if length == 0 {
+        // spec 26.6.3.5 step 4: an empty array serializes to "[]" even with
+        // a gap (the object path has the same empty special-case).
+        state.indent = stepback;
+        state.stack.pop();
+        return Ok(Some(JsString::from_utf8("[]")));
     }
-    let inner_indent = state.indent.clone();
+    let inner = state.indent.encode_utf16().collect::<Vec<u16>>();
+    let step = stepback.encode_utf16().collect::<Vec<u16>>();
+    let mut out: Vec<u16> = Vec::new();
+    for index in 0..length {
+        let key = JsString::from_utf8(&index.to_string());
+        let result = serialize_json_property(agent, state, &key, value)?;
+        if !out.is_empty() {
+            if state.gap.is_empty() {
+                out.push(b',' as u16);
+            } else {
+                out.extend_from_slice(
+                    b",\n"
+                        .iter()
+                        .map(|&b| b as u16)
+                        .collect::<Vec<u16>>()
+                        .as_slice(),
+                );
+                out.extend_from_slice(&inner);
+            }
+        }
+        match result {
+            Some(text) => out.extend_from_slice(text.as_slice()),
+            None => out.extend_from_slice(&[b'n' as u16, b'u' as u16, b'l' as u16, b'l' as u16]),
+        }
+    }
     state.indent = stepback.clone();
     state.stack.pop();
     if state.gap.is_empty() {
-        Ok(Some(JsString::from_utf8(&format!("[{}]", parts.join(",")))))
+        let mut body = Vec::with_capacity(out.len() + 2);
+        body.push(b'[' as u16);
+        body.extend_from_slice(&out);
+        body.push(b']' as u16);
+        Ok(Some(JsString::from_utf16(&body)))
     } else {
-        let separator = format!(",\n{}", inner_indent);
-        Ok(Some(JsString::from_utf8(&format!(
-            "[\n{}{}\n{}]",
-            inner_indent,
-            parts.join(&separator),
-            stepback
-        ))))
+        let mut body = Vec::with_capacity(out.len() + 4 + inner.len() + step.len());
+        body.extend_from_slice(
+            b"[\n"
+                .iter()
+                .map(|&b| b as u16)
+                .collect::<Vec<u16>>()
+                .as_slice(),
+        );
+        body.extend_from_slice(&inner);
+        body.extend_from_slice(&out);
+        body.push(b'\n' as u16);
+        body.extend_from_slice(&step);
+        body.push(b']' as u16);
+        Ok(Some(JsString::from_utf16(&body)))
     }
 }
 
 /// QuoteJSONString (spec 26.6.3.6): escape quotes, backslashes, control
-/// characters, and lone surrogates.
-fn quote_json_string(s: &JsString) -> JsString {
-    let mut out = Vec::with_capacity(s.len() + 2);
+/// characters, and lone surrogates, APPENDING the quoted form to `out` (the
+/// serializer assembles member text directly in UTF-16 units).
+fn quote_into(out: &mut Vec<u16>, s: &JsString) {
     out.push(b'"' as u16);
     let units = s.as_slice();
     let mut index = 0;
@@ -960,6 +1074,12 @@ fn quote_json_string(s: &JsString) -> JsString {
         index += 1;
     }
     out.push(b'"' as u16);
+}
+
+/// QuoteJSONString (spec 26.6.3.6) as a standalone string.
+fn quote_json_string(s: &JsString) -> JsString {
+    let mut out = Vec::with_capacity(s.len() + 2);
+    quote_into(&mut out, s);
     JsString::from_utf16(&out)
 }
 
