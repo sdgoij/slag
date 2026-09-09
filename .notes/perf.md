@@ -7868,6 +7868,87 @@ identity constraint), and the object/array allocation floor. No bounded
 row slice is open; the next landable lever is one of these programs,
 gated on its own design probe.
 
+### PROBE: builtin constructors are 20-50x node — the construct side never got the call-side direct dispatch (measured 2026-09-09)
+
+Fresh construct-creation probes (release, min-of-2, per 300k): `new
+Object()` ~600ns jit/jl, `new Array()` ~870ns, `new Map()` ~5.4us,
+`new Error('x')` ~7.3us, `new Date(0)` ~9.4us (node: ~20ns/~40ns/~60ns/
+~100ns — a 20-50x gap), while the LITERAL equivalents are `{}` ~70ns
+jit and `[]` ~230ns. EcmaScript certified constructors are healthy
+(`new E(){}` empty ~100ns, `this.x=1` ~130-220ns jit after the
+construct-leaf/fill work). The builtin-constructor gap decomposes:
+`Object()` as a CALL (the Cut-79 direct registered handler →
+`object_constructor`) is ~370ns vs the ~70ns literal — the
+`intrinsics.get("%Object.prototype%")` JsString-alloc lookup +
+`ordinary_object_create` body sits above the literal floor; and `new
+Object()` at ~600ns adds the CONSTRUCT machinery the call path does not
+have: `step_construct_impl`'s per-construct `split_off` Vec +
+`function::construct`'s crux-hook round trip + `construct_inner`'s
+un-memoized dispatch_construct chain walk (no analog of the call side's
+`builtin_dispatch_cache`/`BUILTIN_HANDLERS`). `Array()` as a call is
+~990ns (its `array_call` body). No corpus row is builtin-constructor-hot
+(the rows use EcmaScript ctors or construct once), so this is a real-code
+anomaly, not a row lever — the bounded slice (register builtin construct
+handlers O(1) + a direct warm-construct arm in `step_construct_impl`, the
+construct-side mirror of Cuts 79/80) would need a row or a real-code
+justification before the full gate.
+
+### LANDED (2026-09-09): registered builtin CONSTRUCT handlers dispatch O(1) from `step_construct_impl` — the construct-side mirror of Cut 79 (Cut 83)
+
+The probe above measured every builtin constructor paying the full general
+construct path: `step_construct_impl`'s per-construct `split_off` Vec +
+`function::construct`'s crux-hook round trip + `construct_inner`'s realm
+scan and UN-MEMOIZED `dispatch_construct` chain walk (the call side got
+its O(1) `BUILTIN_HANDLERS` registration in Cut 79/80; the construct side
+had no analog). New `CONSTRUCT_HANDLERS` (function id -> BuiltinCtor =
+`fn(agent, callee, args, new_target)`) registered at `Intrinsics::define`
+time from per-module `construct_handler_for(name)` tables, mirroring the
+call-side `handler_for` arc; a direct-mapped per-agent `builtin_ctor_cells`
+cache (Cut-81 pattern); and a warm arm in `step_construct_impl`'s general
+path (single-realm guard, args copied into a small Cow buffer so the
+handler's re-entry cannot touch the Vm's stacks, gc-stress suppressed for
+the unrooted window) that runs the registered constructor directly. A
+registered constructor is exactly what the chain arm would have run
+(registration happens only for the intrinsic the chain matches by
+identity); the arm serves direct `new` (new_target == callee), while
+Reflect.construct / derived `super` still route through `construct_inner`
+unchanged.
+
+Registered in this landing (clean single-name arms): Object, Array,
+Map/Set/WeakMap/WeakSet, Date, RegExp, Number, String, ArrayBuffer/
+SharedArrayBuffer, DataView. The loop-shaped dispatches (the %Error%
+subtypes' ERROR_CTORS loop, Boolean's inline closure, typed-array kinds,
+Intl/Temporal) are left on the chain — their bodies dominate, and the
+fn-pointer registry cannot capture the per-type flags without named
+shims.
+
+Interleaved A/B (release, scratch/object_call_vs_new.js + newx_probe.js,
+min-of-3): `new Object()` jit 176-200 -> 102-110ms / jl 193-202 ->
+113-126 (~1.8x — now equal to the `Object()` CALL form); `new Array()`
+jit 252-278 -> 146-153 / jl 266-278 -> 162-169 (~1.8x, now faster than
+`Array()` call); `new Map()` ~1.6s -> ~0.9s / `new Date(0)` ~2.8s ->
+~1.7s (~1.7-1.8x, the dispatch share of constructors whose bodies
+allocate). Error/Boolean/EcmaScript rows unchanged (not registered / a
+different path). Correctness: 182 jit e2e green (incl. a new
+`installed_jit_registered_builtin_constructs_match_the_interpreter`
+pinning compiled `new Object/Map/Date` churn + a subclassed `new`); the
+construct batteries (16 + 22 cases: empty/value/derived/Reflect.construct
+new-target/subclass/species/iterator-arg/error paths/gc churn)
+byte-identical across jit/jitless/--gc-stress (the one
+`Reflect.construct(Map, ..., C)` TypeError is pre-existing — that path is
+`construct_inner`, untouched); clippy `-D warnings` clean; workspace 32
+suites green; three release test262 sweeps at baseline (language 23721/3
+skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang);
+corpus parity 37/37 ok, 0 mismatches.
+
+Open (measured, not started): the residual `new Object()` ~350ns vs the
+~70ns literal is `object_constructor`'s own body — the uncached
+`intrinsics.get("%Object.prototype%")` + `ordinary_object_create` (the
+realm's cached `object_prototype` accessor exists but is not used here)
+and the per-construct arg-copy + step dispatch; and the loop-shaped
+module dispatches (error/typed-array/Intl) could get named-shim
+registration if a row ever shows them hot.
+
 
 
 ## Deferred milestones

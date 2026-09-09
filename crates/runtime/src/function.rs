@@ -1771,6 +1771,22 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// An installed builtin constructor's native construct handler (the
+/// construct-side mirror of [`BuiltinHandler`]): every `dispatch_construct`
+/// chain arm has this shape — `(agent, callee, args, new_target)`. A warm
+/// `new` dispatches through the registry in O(1) instead of scanning the
+/// `dispatch_construct` chains in `construct_inner`.
+pub(crate) type BuiltinCtor = fn(&mut Agent, &Value, &[Value], &Value) -> Result<Value, JsError>;
+
+thread_local! {
+    /// Agent-dependent builtin constructors by function id, registered by
+    /// `Intrinsics::define` at install time (the construct-side mirror of
+    /// [`BUILTIN_HANDLERS`]). A warm construct dispatches in O(1).
+    static CONSTRUCT_HANDLERS:
+        std::cell::RefCell<std::collections::HashMap<u64, BuiltinCtor>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Register a builtin function's native handler (called from
 /// `Intrinsics::define`).
 pub(crate) fn register_builtin_handler(id: u64, handler: BuiltinHandler) {
@@ -1782,6 +1798,19 @@ pub(crate) fn register_builtin_handler(id: u64, handler: BuiltinHandler) {
 /// The registered native handler for a builtin function id, if any.
 pub(crate) fn builtin_handler(id: u64) -> Option<BuiltinHandler> {
     BUILTIN_HANDLERS.with(|registry| registry.borrow().get(&id).copied())
+}
+
+/// Register a builtin constructor's construct handler (called from
+/// `Intrinsics::define`).
+pub(crate) fn register_builtin_ctor(id: u64, ctor: BuiltinCtor) {
+    CONSTRUCT_HANDLERS.with(|registry| {
+        registry.borrow_mut().insert(id, ctor);
+    });
+}
+
+/// The registered construct handler for a builtin function id, if any.
+pub(crate) fn builtin_ctor(id: u64) -> Option<BuiltinCtor> {
+    CONSTRUCT_HANDLERS.with(|registry| registry.borrow().get(&id).copied())
 }
 
 fn builtin_dispatch_at(

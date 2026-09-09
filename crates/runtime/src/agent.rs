@@ -422,6 +422,13 @@ pub struct Agent {
     /// on a hit. Boxed per the Cut 27 lesson.
     pub(crate) builtin_handler_cells:
         Box<[Option<(u64, crate::function::BuiltinHandler)>; crate::ir::BUILTIN_HANDLER_CELLS]>,
+    /// The installed-builtin CONSTRUCT handler cache (the construct-side
+    /// mirror of `builtin_handler_cells`): function id → the registered
+    /// agent-dependent constructor, so a warm `new` skips the thread-local
+    /// `CONSTRUCT_HANDLERS` RefCell<HashMap> get. Boxed per the Cut 27
+    /// lesson.
+    pub(crate) builtin_ctor_cells:
+        Box<[Option<(u64, crate::function::BuiltinCtor)>; crate::ir::BUILTIN_HANDLER_CELLS]>,
     /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
     /// construct fast path, and the script/eval paths take one, run, and
     /// return it — a pooled Vm is never handed to a suspended
@@ -1045,6 +1052,7 @@ impl Agent {
             for_in_cells: Box::new(std::array::from_fn(|_| None)),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
             builtin_handler_cells: Box::new(std::array::from_fn(|_| None)),
+            builtin_ctor_cells: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             construct_maps: Box::new(std::array::from_fn(|_| None)),
             function_boilerplate_maps: [None; 2],
@@ -1307,6 +1315,23 @@ impl Agent {
         let handler = crate::function::builtin_handler(id)?;
         *slot = Some((id, handler));
         Some(handler)
+    }
+
+    /// The registered agent-dependent builtin CONSTRUCT handler for `id` (the
+    /// construct-side mirror of `builtin_handler_lookup`): a direct-mapped
+    /// probe that fills from the thread-local `CONSTRUCT_HANDLERS` on a miss.
+    pub(crate) fn builtin_ctor_lookup(&mut self, id: u64) -> Option<crate::function::BuiltinCtor> {
+        let index = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize
+            & (crate::ir::BUILTIN_HANDLER_CELLS - 1);
+        let slot = &mut self.builtin_ctor_cells[index];
+        if let Some((cached_id, ctor)) = slot
+            && *cached_id == id
+        {
+            return Some(*ctor);
+        }
+        let ctor = crate::function::builtin_ctor(id)?;
+        *slot = Some((id, ctor));
+        Some(ctor)
     }
 
     /// spec 9.7.1 AgentSignifier.

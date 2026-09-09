@@ -1487,6 +1487,15 @@ fn set_year(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     Ok(Value::Number(clipped))
 }
 
+/// The registered construct handler for %Date% (the construct-side mirror of
+/// `handler_for`): `new Date` dispatches O(1) from the construct fast path.
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        DATE => Some(|agent, _callee, args, new_target| date_construct(agent, args, new_target)),
+        _ => None,
+    }
+}
+
 pub fn dispatch_construct(
     agent: &mut Agent,
     callee: &Value,

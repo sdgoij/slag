@@ -2501,6 +2501,23 @@ pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler>
     }
 }
 
+/// The registered construct handler for the module's constructible
+/// intrinsics (the construct-side mirror of `handler_for`): the keyed
+/// collections' `new` dispatches O(1) from the construct fast path.
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        MAP => Some(|agent, _callee, args, new_target| map_construct(agent, args, new_target)),
+        SET => Some(|agent, _callee, args, new_target| set_construct(agent, args, new_target)),
+        WEAK_MAP => {
+            Some(|agent, _callee, args, new_target| weak_map_construct(agent, args, new_target))
+        }
+        WEAK_SET => {
+            Some(|agent, _callee, args, new_target| weak_set_construct(agent, args, new_target))
+        }
+        _ => None,
+    }
+}
+
 /// Dispatch by intrinsic identity from `runtime::function::call`.
 pub fn dispatch_call(
     agent: &mut Agent,

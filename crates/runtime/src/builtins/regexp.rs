@@ -1724,6 +1724,15 @@ pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler>
     }
 }
 
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        REGEXP => {
+            Some(|agent, _callee, args, new_target| regexp_construct(agent, args, new_target))
+        }
+        _ => None,
+    }
+}
+
 pub fn dispatch_construct(
     agent: &mut Agent,
     callee: &Value,

@@ -10601,6 +10601,35 @@ impl Vm {
                 None
             };
             self.run_leaf_construct(agent, &ir, environment, strict, &callee, &args, shared)
+        } else if agent.realm_count.get() == 1
+            && let ValueKind::Function(function) = callee.kind()
+            && let Some(ctor) = agent.builtin_ctor_lookup(function.id())
+        {
+            // Registered-builtin construct fast path (the construct-side
+            // mirror of `fast_call_core`'s Cut-79 arm): a constructible
+            // builtin (Object/Array/...) whose construct handler was
+            // registered at `Intrinsics::define` runs it directly — no
+            // per-construct `split_off` Vec, no `function::construct` crux-
+            // hook round trip, no `construct_inner` realm scan +
+            // `dispatch_construct` chain walk. The args are copied out
+            // first (the handler may re-enter — a Map/Array/Date construct
+            // argument runs user code that pushes onto the Vm's stacks),
+            // and gc-stress is suppressed for the unrooted window like the
+            // general path. A registered constructor is exactly what the
+            // chain arm would have run (registration happens only for the
+            // intrinsic the chain matches by identity), and the single-
+            // realm guard preserves the cross-realm owning-realm push.
+            let argc = self.args.len() - base;
+            let mut args_buf = [Value::Undefined; 3];
+            let args: std::borrow::Cow<'_, [Value]> = if argc <= args_buf.len() {
+                args_buf[..argc].copy_from_slice(&self.args[base..]);
+                std::borrow::Cow::Borrowed(&args_buf[..argc])
+            } else {
+                std::borrow::Cow::Owned(self.args.split_off(base))
+            };
+            self.args.truncate(base);
+            let _stress = StressSuppress::new();
+            ctor(agent, &callee, &args, &callee)
         } else {
             let _stress = StressSuppress::new();
             let args = self.args.split_off(base);

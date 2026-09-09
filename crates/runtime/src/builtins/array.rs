@@ -3116,6 +3116,16 @@ pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler>
     }
 }
 
+/// The registered construct handler for the module's constructible
+/// intrinsic (the construct-side mirror of `handler_for`): %Array%'s `new`
+/// dispatches O(1) from the construct fast path.
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        ARRAY => Some(|agent, _callee, args, new_target| array_construct(agent, args, new_target)),
+        _ => None,
+    }
+}
+
 /// The Array members that need the agent, dispatched by intrinsic identity
 /// from `runtime::function::call`/`construct`.
 pub fn dispatch_call(

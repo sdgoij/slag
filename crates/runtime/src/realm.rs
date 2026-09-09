@@ -269,6 +269,25 @@ impl Intrinsics {
         {
             crate::function::register_builtin_handler(function.id(), handler);
         }
+        // The construct-side mirror: register a constructible builtin's
+        // native construct handler so a warm `new` dispatches in O(1)
+        // instead of the `dispatch_construct` chain walk in
+        // `construct_inner`. Functions without a registered construct
+        // handler (methods, prototypes, crux-native constructors with no
+        // agent-dependent chain arm) keep the chain / crux fallback.
+        if let Some(function) = value.as_function()
+            && let Some(ctor) = crate::builtins::array::construct_handler_for(name)
+                .or_else(|| crate::builtins::regexp::construct_handler_for(name))
+                .or_else(|| crate::builtins::string::construct_handler_for(name))
+                .or_else(|| crate::builtins::number::construct_handler_for(name))
+                .or_else(|| crate::builtins::keyed::construct_handler_for(name))
+                .or_else(|| crate::builtins::object::construct_handler_for(name))
+                .or_else(|| crate::builtins::dataview::construct_handler_for(name))
+                .or_else(|| crate::builtins::date::construct_handler_for(name))
+                .or_else(|| crate::builtins::array_buffer::construct_handler_for(name))
+        {
+            crate::function::register_builtin_ctor(function.id(), ctor);
+        }
     }
 
     pub fn is_empty(&self) -> bool {

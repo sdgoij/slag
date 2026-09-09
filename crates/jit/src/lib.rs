@@ -1699,6 +1699,31 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_registered_builtin_constructs_match_the_interpreter() {
+        // The construct-side fast path (Cut 83): a compiled loop's
+        // `new Object()` / `new Map()` / `new Date()` run the registered
+        // builtin construct handler directly from `step_construct_impl`,
+        // skipping the `dispatch_construct` chain walk. Must agree with the
+        // interpreter on the churn result, and a subclassed `new` (callee =
+        // the EcmaScript subclass, not the registered builtin) must still
+        // construct through the ordinary path.
+        let source = "function f(n) { var s = 0; for (var i = 0; i < n; i++) { var o = new Object(); var m = new Map(); m.set('k', i); var d = new Date(i); if (m.get('k') === i && d.getTime() === i) { s++; } } return s; }\n\
+                     function g() { class M extends Map {} var m = new M(); m.set(1, 2); return m.get(1) === 2 && m instanceof M ? 1 : 0; }\n\
+                     f(20000) + g();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled registered-builtin constructs must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_shape_read_serves_cycling_same_shape_objects() {
         // Slice 1: the compiled `GetMemberName` read falls back to an
         // inline shape read when the (id, name) value cell misses — probe

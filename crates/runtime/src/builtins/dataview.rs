@@ -756,6 +756,17 @@ pub fn dispatch_construct(
     None
 }
 
+/// The registered construct handler for %DataView% (the construct-side
+/// mirror of `handler_for`): `new DataView` dispatches O(1).
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        DATA_VIEW => {
+            Some(|agent, _callee, args, new_target| data_view_construct(agent, args, new_target))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -616,6 +616,17 @@ fn to_locale_string_method(
     Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
 }
 
+/// The registered construct handler for %Number% (the construct-side mirror
+/// of `handler_for`): `new Number` dispatches O(1).
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        NUMBER => {
+            Some(|agent, _callee, args, new_target| number_construct(agent, args, new_target))
+        }
+        _ => None,
+    }
+}
+
 pub fn dispatch_construct(
     agent: &mut Agent,
     callee: &Value,

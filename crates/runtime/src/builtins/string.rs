@@ -2165,6 +2165,17 @@ pub fn dispatch_construct(
     None
 }
 
+/// The registered construct handler for %String% (the construct-side mirror
+/// of `handler_for`): `new String` dispatches O(1).
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        STRING => {
+            Some(|agent, _callee, args, new_target| string_construct(agent, args, new_target))
+        }
+        _ => None,
+    }
+}
+
 /// CreateHTML (spec B.2.3.2.1): the Annex B wrapper with `"` escaping in the
 /// attribute value.
 fn create_html(

@@ -1538,6 +1538,20 @@ pub fn dispatch_construct(
     None
 }
 
+/// The registered construct handlers for %ArrayBuffer%/%SharedArrayBuffer%
+/// (the construct-side mirror of `handler_for`).
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        ARRAY_BUFFER => {
+            Some(|agent, _callee, args, new_target| array_buffer_construct(agent, args, new_target))
+        }
+        SHARED_ARRAY_BUFFER => Some(|agent, _callee, args, new_target| {
+            shared_array_buffer_construct(agent, args, new_target)
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

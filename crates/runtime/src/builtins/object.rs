@@ -830,6 +830,17 @@ pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler>
     }
 }
 
+/// The registered construct handler for the module's constructible
+/// intrinsic (the construct-side mirror of `handler_for`): %Object%'s
+/// `new` dispatches O(1) from the construct fast path instead of the
+/// `dispatch_construct` chain walk.
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        OBJECT => Some(object_constructor),
+        _ => None,
+    }
+}
+
 /// Object.prototype.hasOwnProperty (spec 20.1.3.4): [[HasOwnProperty]] on
 /// the ToObject'd receiver, with the deferred-namespace and live-binding
 /// handling for module namespace objects.
