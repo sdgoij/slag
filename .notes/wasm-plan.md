@@ -2653,6 +2653,20 @@ globals is now the largest family, then TableGet 8, GlobalSet 7, CallIndirect
 `float_to_int_truncs_match_the_interpreter` (float bit corpora plus exact
 trap/clamp boundary magnitudes).
 
+The ref-globals slice followed the triage: ref-typed `global.get`/`set`
+compile for any carried reference (func/extern/i31/exn/struct/array tokens).
+The cell helpers (modes 17/18) now carry a reference as its u64 token (a
+v128 still takes two words), and the `gvals` buffer stays numeric/v128-only,
+so a ref global of a call-free body routes through the store-cell helper too.
+`lowerable` admits a `GlobalGet`/`Set` when the global's type is carried.
+Corpus effect: coverage 8045 → 8105 (98%), "outside the lowering subset"
+84 → 24 — `GlobalSet` 7 → 0 and `GlobalGet` 58 → 5. The residual 24 are
+ref-table ops over non-carried tables (TableGet 8, TableSet 4), CallIndirect
+5 (non-carried signatures), GlobalGet 5 (bottom-heap globals), and RefNull 2
+(bottom heaps). Unit coverage in `ref_globals_match_the_interpreter`
+(defined externref/funcref set-get round-trips incl. null/host/i31/function
+tokens, and the aliased-import ref cell).
+
 ### Definition of done (all must hold)
 
 - [ ] Gate 0 report exists and is the tracking source of truth.

@@ -35,14 +35,15 @@
 //!   calls a runtime helper (entry params 7-9) that reallocates the store
 //!   cell's backing `Vec` and rewrites the descriptor entry, so later
 //!   accesses see the grown buffer;
-//! - `global.get`/`global.set` of numeric and v128 globals, whether
-//!   module-defined or imported. A module-defined global of a call-free body
-//!   rides the caller-owned `gvals` buffer (one u64 word per numeric global,
-//!   two per v128), so its writes reach the store even when the body traps;
-//!   imported globals (whose cells can alias) and every global of a
+//! - `global.get`/`global.set` of carried globals, whether module-defined or
+//!   imported: numeric and v128 module-defined globals of a call-free body
+//!   ride the caller-owned `gvals` buffer (one u64 word per numeric global,
+//!   two per v128), so their writes reach the store even when the body traps;
+//!   imported globals, ref-typed globals, and every global of a
 //!   call-bearing body go straight to the store cell through a runtime helper
-//!   instead, because an aliased import slot or a callee can change a shared
-//!   cell between accesses. GC objects are not lowered yet;
+//!   instead (a reference crosses as its u64 token), because an aliased
+//!   import slot or a callee can change a shared cell between accesses. GC
+//!   objects are not lowered yet;
 //! - (nullable or not) function references ride the compiled stack as opaque
 //!   u64 tokens (0 = null; a function reference packs its address), so
 //!   `ref.func`/`ref.null func`/`ref.is_null`, `table.get`/`table.set` over
@@ -991,9 +992,16 @@ fn body_has_calls(body: &FuncBody) -> bool {
 
 /// The module-defined global indices (index space) a call-free body reads or
 /// writes, sorted and deduplicated (the order the `gvals` buffer slots use).
-/// Imported indices are excluded: they access the store cell directly.
+/// Imported indices are excluded (they access the store cell directly), as
+/// are ref-typed globals — only numeric and v128 values ride the buffer.
 fn body_globals(module: &Module, body: &FuncBody) -> Vec<u32> {
     let imported = imported_globals(module);
+    let bufferable = |index: u32| {
+        matches!(
+            global_at(module, index),
+            Some((ty, _)) if num_type(ty).is_some() || matches!(ty, ValType::V128)
+        )
+    };
     let mut indices: Vec<u32> = body
         .body
         .iter()
@@ -1001,7 +1009,7 @@ fn body_globals(module: &Module, body: &FuncBody) -> Vec<u32> {
             Instr::GlobalGet(index) | Instr::GlobalSet(index) => Some(*index),
             _ => None,
         })
-        .filter(|index| *index >= imported)
+        .filter(|index| *index >= imported && bufferable(*index))
         .collect();
     indices.sort_unstable();
     indices.dedup();
@@ -1091,14 +1099,11 @@ fn instr_lowerable(module: &Module, instr: &Instr) -> bool {
             memory_is64(module, *memory).is_some()
         }
         Instr::DataDrop(_) => true,
-        Instr::GlobalGet(index) => matches!(
-            global_at(module, *index),
-            Some((ty, _)) if num_type(ty).is_some() || matches!(ty, ValType::V128)
-        ),
-        Instr::GlobalSet(index) => matches!(
-            global_at(module, *index),
-            Some((ty, true)) if num_type(ty).is_some() || matches!(ty, ValType::V128)
-        ),
+        Instr::GlobalGet(index) => {
+            global_at(module, *index).is_some_and(|(ty, _)| carrier_type(module, ty).is_some())
+        }
+        Instr::GlobalSet(index) => global_at(module, *index)
+            .is_some_and(|(ty, mutable)| mutable && carrier_type(module, ty).is_some()),
         Instr::Call(index) | Instr::ReturnCall(index) => {
             callable_type(module, func_type_of(module, *index))
         }
@@ -6699,6 +6704,162 @@ mod tests {
     }
 
     #[test]
+    fn ref_globals_match_the_interpreter() {
+        // Ref-typed globals cross the store boundary as u64 tokens through
+        // the cell helpers (modes 17/18): a defined mutable externref global's
+        // setter/getter pair must round-trip every token (null, host, i31
+        // externs), and a funcref global its function tokens.
+        use crate::values::ExternInner;
+        let externref = || {
+            ValType::Ref(RefType {
+                nullable: true,
+                heap: HeapType::Extern,
+            })
+        };
+        let ref_module =
+            |params: Vec<ValType>, global_ty: ValType, init: Instr, values: &[Value]| {
+                let module = Module {
+                    types: vec![
+                        SubType::func(params.clone(), vec![]),
+                        SubType::func(vec![], vec![global_ty]),
+                    ],
+                    functions: vec![0, 1],
+                    bodies: vec![
+                        FuncBody {
+                            locals: vec![],
+                            body: vec![Instr::LocalGet(0), Instr::GlobalSet(0)],
+                        },
+                        FuncBody {
+                            locals: vec![],
+                            body: vec![Instr::GlobalGet(0)],
+                        },
+                    ],
+                    globals: vec![Global {
+                        ty: GlobalType {
+                            value: global_ty,
+                            mutable: true,
+                        },
+                        init: vec![init],
+                    }],
+                    ..Module::default()
+                };
+                assert!(
+                    compile_module(&module).iter().all(|entry| entry.is_some()),
+                    "module did not compile; the comparison is vacuous"
+                );
+                let mut sequence = Vec::new();
+                for value in values {
+                    sequence.push((0, vec![*value]));
+                    sequence.push((1, vec![]));
+                }
+                let outcomes = run_seq(&module, &sequence);
+                for (k, value) in values.iter().enumerate() {
+                    assert_eq!(outcomes[2 * k], Ok(vec![]));
+                    assert_eq!(outcomes[2 * k + 1], Ok(vec![*value]));
+                }
+            };
+        let extern_values = vec![
+            Value::Ref(RefValue::Null),
+            Value::Ref(RefValue::Extern(ExternInner::Host(7))),
+            Value::Ref(RefValue::Extern(ExternInner::I31(0x123_4567))),
+        ];
+        ref_module(
+            vec![externref()],
+            externref(),
+            Instr::RefNull(HeapType::Extern),
+            &extern_values,
+        );
+        let func_values = vec![
+            Value::Ref(RefValue::Null),
+            Value::Ref(RefValue::Func(FuncAddr {
+                instance: 0,
+                index: 0,
+            })),
+            Value::Ref(RefValue::Func(FuncAddr {
+                instance: 0,
+                index: 1,
+            })),
+        ];
+        ref_module(
+            vec![ValType::Ref(RefType {
+                nullable: true,
+                heap: HeapType::Func,
+            })],
+            ValType::Ref(RefType {
+                nullable: true,
+                heap: HeapType::Func,
+            }),
+            Instr::RefNull(HeapType::Func),
+            &func_values,
+        );
+
+        // The aliased-import case for a ref cell: a write through one slot is
+        // read through the other, exactly as the interpreter aliases them.
+        let module = Module {
+            types: vec![
+                // 0: (externref) -> (): set through slot 0.
+                SubType::func(vec![externref()], vec![]),
+                // 1: () -> externref: get through slot 1.
+                SubType::func(vec![], vec![externref()]),
+            ],
+            imports: vec![
+                Import {
+                    module: "m".into(),
+                    name: "g".into(),
+                    desc: ImportDesc::Global(GlobalType {
+                        value: externref(),
+                        mutable: true,
+                    }),
+                },
+                Import {
+                    module: "m".into(),
+                    name: "g".into(),
+                    desc: ImportDesc::Global(GlobalType {
+                        value: externref(),
+                        mutable: true,
+                    }),
+                },
+            ],
+            functions: vec![0, 1],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::GlobalSet(0)],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::GlobalGet(1)],
+                },
+            ],
+            ..Module::default()
+        };
+        let make_imports = |store: &mut Store| {
+            let cell = store.global(
+                GlobalType {
+                    value: externref(),
+                    mutable: true,
+                },
+                Value::Ref(RefValue::Null),
+            );
+            vec![ExternVal::Global(cell), ExternVal::Global(cell)]
+        };
+        let outcomes = run_imported_seq(
+            &make_imports,
+            &module,
+            &[
+                (0, vec![extern_values[1]]),
+                (1, vec![]),
+                (0, vec![extern_values[2]]),
+                (1, vec![]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![]));
+        assert_eq!(outcomes[1], Ok(vec![extern_values[1]]));
+        assert_eq!(outcomes[2], Ok(vec![]));
+        assert_eq!(outcomes[3], Ok(vec![extern_values[2]]));
+    }
+
+    #[test]
     fn memory_ops_match_the_interpreter() {
         use crate::instr::LoadOp::*;
         // i32.store then i32.load at the same address (in-bounds and OOB).
@@ -7339,9 +7500,9 @@ mod tests {
     #[test]
     fn call_bearing_globals_stay_synced_through_an_interpreted_callee() {
         // The same shape with the callee forced onto the interpreter (it
-        // reads a non-carried externref global, so it never compiles): the
-        // interpreted callee runs against the store cells, and the compiled
-        // caller's reads and writes must meet it there.
+        // reads a non-carried `(ref null noextern)` global, so it never
+        // compiles): the interpreted callee runs against the store cells, and
+        // the compiled caller's reads and writes must meet it there.
         let module = Module {
             types: vec![
                 // 0: () -> i32 (caller).
@@ -7385,11 +7546,11 @@ mod tests {
                     ty: GlobalType {
                         value: ValType::Ref(RefType {
                             nullable: true,
-                            heap: HeapType::Extern,
+                            heap: HeapType::NoExtern,
                         }),
                         mutable: false,
                     },
-                    init: vec![Instr::RefNull(HeapType::Extern)],
+                    init: vec![Instr::RefNull(HeapType::NoExtern)],
                 },
             ],
             ..Module::default()

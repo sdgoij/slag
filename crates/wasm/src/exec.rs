@@ -2405,8 +2405,9 @@ fn flush_globals(store: &mut Store, cells: &[usize], words: &[u64]) {
 /// another import slot, and a call-bearing body's writes must be visible to
 /// (and reads fresh from) callees, so these access the store cell the way the
 /// interpreter does instead of riding the caller-owned `gvals` snapshot. A
-/// `get` writes the cell's word(s) to `scratch` (two for a v128); a `set`
-/// reads them back from `scratch`.
+/// `get` writes the cell's value to `scratch` as its compiled slots (a v128
+/// occupies two words; a reference rides its u64 token); a `set` reads them
+/// back from `scratch`.
 #[cfg(feature = "compile")]
 fn global_op(store: &mut Store, instance: u64, mode: u64, x: u64, scratch: *mut u64) -> i32 {
     let cell = match store
@@ -2423,39 +2424,72 @@ fn global_op(store: &mut Store, instance: u64, mode: u64, x: u64, scratch: *mut 
             return crate::compile::TRAP_PENDING_ERROR;
         }
     };
-    match mode {
-        17 => {
-            let words = seed_globals(store, &[cell]);
-            // SAFETY: `scratch` is the caller-owned scratch region, sized for
-            // any call site the body can lower (two words for a v128).
-            unsafe {
-                for (i, word) in words.iter().enumerate() {
-                    *scratch.add(i) = *word;
+    let value_ty = match store.global_types.get(cell).map(|ty| ty.value) {
+        Some(value_ty) => value_ty,
+        None => {
+            store.set_pending_error(ExecFail::Unsupported(
+                "unresolved global in a compiled body",
+            ));
+            return crate::compile::TRAP_PENDING_ERROR;
+        }
+    };
+    if mode == 17 {
+        // SAFETY: `scratch` is the caller-owned scratch region, sized for any
+        // call site the body can lower (two words for a v128).
+        unsafe {
+            match store.globals[cell] {
+                Value::V128(bits) => {
+                    *scratch = bits as u64;
+                    *scratch.add(1) = (bits >> 64) as u64;
+                }
+                value => match value_to_call_slot(value) {
+                    Some(slot) => *scratch = slot,
+                    None => {
+                        store.set_pending_error(ExecFail::Unsupported(
+                            "unsupported value across a compiled global.get",
+                        ));
+                        return crate::compile::TRAP_PENDING_ERROR;
+                    }
+                },
+            }
+        }
+        return crate::compile::TRAP_NONE;
+    }
+    // Set: rebuild the value from the spilled slots and write the cell.
+    let value = match value_ty {
+        ValType::V128 => {
+            // SAFETY: the compiled `global.set` spilled both words.
+            let lo = unsafe { *scratch } as u128;
+            let hi = unsafe { *scratch.add(1) } as u128;
+            Value::V128(lo | (hi << 64))
+        }
+        ValType::Ref(_) => {
+            // SAFETY: the compiled `global.set` spilled the token.
+            let token = unsafe { *scratch };
+            match crate::values::token_to_ref(token) {
+                Some(value) => value,
+                None => {
+                    store.set_pending_error(ExecFail::Unsupported(
+                        "unsupported token across a compiled global.set",
+                    ));
+                    return crate::compile::TRAP_PENDING_ERROR;
                 }
             }
         }
         _ => {
-            let width = match store.global_types.get(cell).map(|ty| ty.value) {
-                Some(ValType::V128) => 2,
-                Some(_) => 1,
+            // SAFETY: the compiled `global.set` spilled the scalar slot.
+            match value_from_call_slot(value_ty, unsafe { *scratch }) {
+                Some(value) => value,
                 None => {
                     store.set_pending_error(ExecFail::Unsupported(
-                        "unresolved global in a compiled body",
+                        "unsupported value across a compiled global.set",
                     ));
                     return crate::compile::TRAP_PENDING_ERROR;
                 }
-            };
-            let mut words = vec![0u64; width];
-            // SAFETY: `scratch` holds the value words the compiled `global.set`
-            // spilled before the call.
-            unsafe {
-                for (i, word) in words.iter_mut().enumerate() {
-                    *word = *scratch.add(i);
-                }
             }
-            flush_globals(store, &[cell], &words);
         }
-    }
+    };
+    store.globals[cell] = value;
     crate::compile::TRAP_NONE
 }
 
