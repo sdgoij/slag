@@ -2186,6 +2186,14 @@ pub const GLOBAL_CELLS: usize = 256;
 /// Cut 27 lesson: an inline copy regressed the leaf path).
 pub(crate) const LEAF_CACHE: usize = 16;
 
+/// The direct-mapped installed-builtin handler cache (Cut 81): function id
+/// -> the agent-dependent builtin's native handler, populated lazily from
+/// the thread-local `BUILTIN_HANDLERS` registry on a miss. Registrations
+/// happen once at realm bootstrap and never change, so a filled cell is
+/// never stale (mirrors `leaf_cache`); ids are never reused, so a hit needs
+/// no generation check. Boxed per the Cut 27 lesson.
+pub(crate) const BUILTIN_HANDLER_CELLS: usize = 128;
+
 /// A cached leaf-inline record: everything the inline call path reads off
 /// the `ecma_functions` record, captured so the per-call HashMap lookup is
 /// skipped on a hit.
@@ -11878,7 +11886,7 @@ impl Vm {
         // cross-realm handler creates its errors in the right realm.
         if agent.realm_count.get() == 1
             && let ValueKind::Function(function) = callee.kind()
-            && let Some(handler) = crate::function::builtin_handler(function.id())
+            && let Some(handler) = agent.builtin_handler_lookup(function.id())
         {
             let result = handler(agent, &this, args)?;
             self.stack.truncate(arg_start - below);

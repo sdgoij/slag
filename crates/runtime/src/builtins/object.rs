@@ -1024,8 +1024,8 @@ fn object_entries(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         let text = crux::lookup(id);
         let value = crate::context::get_property(agent, &object, &text, object)?;
         let pair = crate::builtins::array::array_create(agent, 2.0)?;
-        pair.create_data_property(&JsString::from_utf8("0"), str(&text.to_string_lossy()))?;
-        pair.create_data_property(&JsString::from_utf8("1"), value)?;
+        pair.create_data_property_index(0, Value::String(Handle::new(text)))?;
+        pair.create_data_property_index(1, value)?;
         entries.push(Value::Object(pair));
     }
     array_of(agent, &entries)
@@ -1072,7 +1072,7 @@ fn object_keys(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let _stress = crate::ir::StressSuppress::new();
     let values: Vec<Value> = keys
         .into_iter()
-        .map(|key| str(&key.to_string_lossy()))
+        .map(|key| Value::String(Handle::new(key)))
         .collect();
     array_of(agent, &values)
 }
@@ -1658,6 +1658,31 @@ mod tests {
             run("Object.keys(Object.defineProperty({}, 'x', { value: 1, enumerable: false })).length")
                 .unwrap(),
             Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn keys_and_entries_preserve_lone_surrogate_keys() {
+        // Object.keys/entries box the interned key string directly rather
+        // than a lossy UTF-8 round-trip, which would replace an unpaired
+        // surrogate with U+FFFD: a lone-surrogate computed key must survive.
+        assert_eq!(
+            run("var k = '\\ud800'; var o = {}; o[k] = 1; \
+                 Object.keys(o)[0] === k")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("var k = '\\ud800'; var o = {}; o[k] = 1; \
+                 Object.entries(o)[0][0] === k && Object.entries(o)[0][1] === 1")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("var k = '\\ud800'; var o = {}; o[k] = 1; \
+                 Object.keys(o)[0].charCodeAt(0)")
+            .unwrap(),
+            Value::Number(0xD800 as f64)
         );
     }
 

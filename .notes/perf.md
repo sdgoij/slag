@@ -7766,6 +7766,108 @@ architectural floors, the FFI helpers mirror the interpreter handlers
 without redundant work, and the row's real mass is general-path assert
 calls + closure/object machinery in BOTH engines (~10-20x node-jl).
 
+### LANDED (2026-09-09): the installed-builtin handler lookup goes direct-mapped on the Agent (Cut 81)
+
+The Cut-79 fast arm's per-call `builtin_handler(id)` is a thread-local
+RefCell<HashMap> get. A per-agent direct-mapped cell cache
+(`Agent::builtin_handler_cells`, boxed per the Cut 27 lesson, filled
+lazily from the registry on a miss) serves the same handler with an
+array probe + id compare on a hit. Registrations complete at realm
+bootstrap and never change, so a fill is final — no epoch needed, and
+non-registered ids (eval hosts, crux-native builtins) just probe an
+empty slot and return None. `fast_call_core`'s Cut-79 arm reads it via
+the new `Agent::builtin_handler_lookup`. Interleaved A/B (release,
+probes, min-of-3): map rows ~3-5% (W4 `m.has` jit 34-35 -> 32-33 / jl
+50-51 -> 46-49; W1 the has+get+set triple jit 99-102 -> 94 / jl 115-122
+-> 117) — small and broad, applied to every registered-builtin call.
+The journal's earlier ~50ns estimate was too high; the RefCell<HashMap>
+get is ~10-15ns. Gates: 181 jit e2e green, clippy `-D warnings` clean,
+workspace 32 suites green, three release sweeps at baseline, corpus
+parity 37/37 ok.
+
+### LANDED (2026-09-09): Object.keys/values/entries box keys directly and define pair elements by index (Cut 82)
+
+The `object_keys` corpus row (~160-167ms jl/jit, the third-largest
+builtins mass) decomposed to per-call BODY cost, not the call:
+`Object.keys` ~1.6us / `Object.values` ~1.0us / `Object.entries` ~5.6us
+per 6-key call (probe, min-of-3) while a for-in over the same keys is
+~50ns and a 6-string array literal ~400ns — vs node-jl's ~127ns for the
+whole triple. Two body wastes: (1) `object_keys` re-copied every key
+through `key.to_string_lossy()` + `str()` — a full UTF-8 re-encode +
+re-alloc of an already-owned interned `JsString` (~100ns/key) that ALSO
+corrupts lone-surrogate keys (lossy substitutes U+FFFD); the fix boxes
+the owned `JsString` directly (`Value::String(Handle::new(key))`),
+exactly as `own_keys_of` already does. (2) `object_entries` built each
+[key, value] pair with `array_create` + two STRING-key
+`create_data_property("0")` defines; the fresh pair's elements are
+dense indices, so the defines now go through `create_data_property_index`
+(no per-define `JsString` alloc + array-index canonicalization).
+Interleaved A/B (release, scratch/object_keys_probe.js, min-of-3):
+`Object.keys` jit 31-33 -> 22-24 / jl 36-39 -> 25-27; the corpus
+keys+values+entries triple jit 165-168 -> 102-110 / jl 161-186 ->
+110-114 (~35%). Corpus re-baseline (4-mode): object_keys jit 167.1 ->
+104.5 / jl 160.2 -> 112.7 (~35%); map/set jl also down ~10-16% (the
+Cut-81 cells); every other row within single-run noise. Correctness:
+735 runtime release tests + 181 jit e2e green (incl. a new
+`keys_and_entries_preserve_lone_surrogate_keys` pinning that a
+lone-surrogate computed key round-trips through keys/entries — the lossy
+path would have replaced it); clippy `-D warnings` clean; workspace 32
+suites green; three release test262 sweeps at baseline (language
+23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang); corpus parity 37/37 ok, 0 mismatches.
+
+Open (measured, not started): `object_entries` still pays per key the
+descriptor recheck + `get_property` + a fresh 2-element `array_create`
+(~700ns/key of the ~1.9us/key residual over node) — a fused pair build
+or a cheaper own-value read would cut the row further; and the same
+direct-box pattern likely applies elsewhere (the remaining
+`text.to_string_lossy()` re-copies in the builtins).
+
+### PROBE: the post-Cut-82 corpus top rows decompose to architectural machinery — no bounded slice in any (measured 2026-09-09)
+
+Fresh probes on the remaining largest rows (all interleaved jit/jl,
+min-of-2/3):
+
+- **recursive_fib** (~396 jit / ~518 jl, the #2 row after head-let): 3.44M
+  self-recursive non-tail calls. A machine-inlined LEAF call is ~6ns jit;
+  fib's recursive calls are ~126ns jit / ~150ns jl. Each certified non-leaf
+  call goes `ordinary_call` -> `run_compiled_body` -> a POOLED fresh Vm
+  (`take_vm`) + execution-context push per call — the general certified
+  call path. Cutting it needs the non-leaf callee to run on a shared Vm
+  with a carved frame (the leaf-inline / shared-ctx-construct pattern
+  generalized to re-entrant bodies) — the L5 call-breadth core,
+  architectural.
+- **generator_loop** (~225 jit / ~233 jl, node-jl 9.6ms — 24x): the
+  known interpreted-resume row. Per `g.next()` ~1.35us; the result-object
+  literal is ~160ns of it and a leaf call ~10ns — the resume machinery
+  itself is the ~1.2us. A fresh-generator-per-iteration row is ~30us per
+  create (generator creation, out of the corpus row). The suspension
+  resume driver is interpreted regardless of the body's compiled state;
+  JIT coverage here is the suspension-driver program.
+- **completion-values** (~311 jit / ~320 jl, the #3 row): NOT try/finally
+  machinery — the amplified fixture is 1423 iterations x 12 CONSTANT-string
+  direct evals. Each identical source is fully re-parsed per call: a
+  22-char eval ~8.9us, the row-shaped eval ~57us (vs ~0.01us inline). A
+  parsed-Program cache keyed by source would collapse the row, but eval
+  sites are distinct per invocation (the engine bumps the template parse
+  generation per eval so two identical-text evals get DISTINCT template
+  objects) — caching the parse across calls would alias template-site
+  identity and break conformance. Delicate, not sliced.
+- **Object.keys/values/entries + destructure residuals**: after Cut 82 the
+  `entries` per-key pair build and the `destructure` literal both sit on
+  the fresh-object/array creation floor (~130-300ns per box: JsObject +
+  ArraySlots/in_fields + proto + length + generation). Node-jl creates the
+  same arrays ~20-40ns. The destructure "jit-inversion" (284 jit vs 276
+  jl) is jl run-noise (256-372 across 3 samples); flat-literal rows are
+  jit-faster. These are the object-representation/allocation program.
+
+Together with head-let (characterized above), every remaining top corpus
+row is architectural: the L5 general certified-call ctx model, the
+suspension-driver JIT coverage, the eval-parse cache (with a template-
+identity constraint), and the object/array allocation floor. No bounded
+row slice is open; the next landable lever is one of these programs,
+gated on its own design probe.
+
 
 
 ## Deferred milestones

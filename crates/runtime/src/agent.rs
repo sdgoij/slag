@@ -416,6 +416,12 @@ pub struct Agent {
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
     /// Cut 27 lesson.
     pub(crate) leaf_cache: Box<[Option<(u64, crate::ir::LeafEntry)>; crate::ir::LEAF_CACHE]>,
+    /// The installed-builtin handler cache (Cut 81): function id → the
+    /// registered agent-dependent native handler, so the Cut-79 direct-call
+    /// arm skips the thread-local `BUILTIN_HANDLERS` RefCell<HashMap> get
+    /// on a hit. Boxed per the Cut 27 lesson.
+    pub(crate) builtin_handler_cells:
+        Box<[Option<(u64, crate::function::BuiltinHandler)>; crate::ir::BUILTIN_HANDLER_CELLS]>,
     /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
     /// construct fast path, and the script/eval paths take one, run, and
     /// return it — a pooled Vm is never handed to a suspended
@@ -1038,6 +1044,7 @@ impl Agent {
             spread_cells: std::array::from_fn(|_| None),
             for_in_cells: Box::new(std::array::from_fn(|_| None)),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
+            builtin_handler_cells: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             construct_maps: Box::new(std::array::from_fn(|_| None)),
             function_boilerplate_maps: [None; 2],
@@ -1276,6 +1283,30 @@ impl Agent {
             },
         ));
         slot.as_ref().map(|(_, entry)| entry)
+    }
+
+    /// The registered agent-dependent builtin handler for `id` (Cut 81): a
+    /// direct-mapped probe that fills from the thread-local `BUILTIN_HANDLERS`
+    /// on a miss. Registrations complete at realm bootstrap before any JS
+    /// runs, so a fill is final; a non-registered id (eval hosts, crux-native
+    /// builtins, EcmaScript functions) probes the empty slot every call and
+    /// returns None — never cached, so a later registration would still be
+    /// seen (none happen, but the miss path costs only the array probe).
+    pub(crate) fn builtin_handler_lookup(
+        &mut self,
+        id: u64,
+    ) -> Option<crate::function::BuiltinHandler> {
+        let index = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize
+            & (crate::ir::BUILTIN_HANDLER_CELLS - 1);
+        let slot = &mut self.builtin_handler_cells[index];
+        if let Some((cached_id, handler)) = slot
+            && *cached_id == id
+        {
+            return Some(*handler);
+        }
+        let handler = crate::function::builtin_handler(id)?;
+        *slot = Some((id, handler));
+        Some(handler)
     }
 
     /// spec 9.7.1 AgentSignifier.
