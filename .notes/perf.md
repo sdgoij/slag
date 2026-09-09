@@ -8105,7 +8105,52 @@ across jit/jitless/--gc-stress; three release test262 sweeps at baseline
 (language 23721/3 skip, built-ins 23657/155 skip with zero Date
 failures, annexB 1086/1086); corpus parity 37/37 ok, 0 mismatches.
 
+### LANDED (2026-09-09): the Date setters join the registered call handlers (Cut 88)
 
+The Cut-87 probe's unchanged residual — `d.setTime(i)` ~2100ms (the
+setter family still on the `dispatch_call` chain scan). `date::handler_for`
+now arms all 13 table setters (12 via the shared `set_components` with
+their literal local/present-mask/nan-is-zero tuples transcribed verbatim
+from `dispatch_call`, `setYear` via its own body), plus `setDate`/
+`setUTCDate` (`set_date` with the local flag) and `setTime` (the inline
+brand-check + coerce + time_clip body). The string/format methods and
+the parse/UTC statics stay on the chain (their bodies dominate).
+
+Interleaved A/B (release, scratch/date_chain_probe.js, K=300000):
+`d.setTime(i)` jit 2075-2166 -> 24-26ms (~80x) / jl 2110-2141 -> 35-39
+(~55x); `d.setFullYear(2000+i%20,0,1)` jit 51-53; `d.setUTCDate(1+i%27)`
+jit 41 / jl 52-56. The getters and control rows unchanged. Correctness:
+736 runtime release + 182 jit e2e green; clippy `-D warnings` clean;
+workspace suites green; the construct batteries still byte-identical
+across jit/jitless/--gc-stress; three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip with zero Date
+failures, annexB 1086/1086); corpus parity 37/37 ok, 0 mismatches.
+
+### PROBE: the remaining unregistered families are body-bound or cold — the chain-tax arc stops here (measured 2026-09-09)
+
+After the Date registration (Cuts 87/88) the remaining modules off the
+call-side registry are symbol, array_buffer (call = TypeError), the
+typed-array kinds (loop-shaped), the Date string/format methods +
+parse/UTC statics, and the Error subtypes (loop-shaped). Probed each
+candidate (scratch/chain_tax_probe2.js + ta_method_probe.js, K=300000):
+`new Uint8Array(64)` jit ~620-670ms (~2.1µs) is FASTER than the
+REGISTERED `new ArrayBuffer(64)` ~725-800ms (~2.5µs) — typed-array
+construct is body-bound, not chain-bound; the Date format methods are
+~8µs (`toISOString` ~2400ms, `toString` ~2600ms — format + string
+alloc bodies); `Date.UTC` ~180ms / `Date.parse` ~140ms (~470-600ns,
+body moderate but the statics are cold); `Symbol()` ~150ms (~500ns,
+cold). The typed-array METHODS looked different — `a.indexOf(i%32)`
+on a 32-element Int32Array ~11.7µs/call, `subarray` ~14.6µs, `dst.set`
+~5.1µs, jit == jl (no fast path) — but the hand-rolled equivalent
+scan (32 reads + compares, scratch/ta_method_probe.js) is ~0.9µs/call
+(compiled typed reads ~18-55ns each), so the native bodies read
+elements through the general per-element helper at ~350ns/read — a
+13x BODY gap, not dispatch. Registration would not move them; closing
+it is a typed-array body slice (fast same-type element reads inside
+the native methods). Verdict: the call/construct registration arc has
+collected its real wins (keyed, String, Object, DataView, Array,
+Date); the rest are body-bound or cold — stop here rather than add
+mechanical shims with no measured row behind them.
 
 ## Deferred milestones
 

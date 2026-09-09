@@ -1083,11 +1083,10 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 /// The Date members that need the agent, dispatched by intrinsic identity
 /// from `runtime::function::call`. `Intrinsics::define` registers a warm
 /// call for a member with an arm here (the call-side registration arc);
-/// the members without an arm (the setters, the string/format methods,
-/// parse/UTC) keep riding `dispatch_call`'s per-arm `intrinsics.get` scan,
-/// which measured ~µs/call (`d.getTime()` ~3.9µs vs ~125ns for a
-/// registered member on the same loop). Keep the arms in sync with
-/// `dispatch_call`.
+/// the members without an arm (the string/format methods, parse/UTC)
+/// keep riding `dispatch_call`'s per-arm `intrinsics.get` scan, which
+/// measured ~µs/call (`d.getTime()` ~3.9µs vs ~125ns for a registered
+/// member on the same loop). Keep the arms in sync with `dispatch_call`.
 pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
     match name {
         // The call form (spec 21.4.1.1) returns the current time as a
@@ -1159,6 +1158,157 @@ pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler>
         "%Date.prototype.getUTCSeconds%" => {
             Some(|agent, this, _args| get_component(agent, this, false, sec_f))
         }
+        // The component setters (spec 21.4.4.x): overwrite the present
+        // components and store the new time value back. setYear has its own
+        // body; the FullYear pair treats a NaN receiver as zero.
+        "%Date.prototype.setFullYear%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                true,
+                &[true, true, true, false, false, false, false],
+                true,
+            )
+        }),
+        "%Date.prototype.setHours%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                true,
+                &[false, false, false, true, true, true, true],
+                false,
+            )
+        }),
+        "%Date.prototype.setMilliseconds%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                true,
+                &[false, false, false, false, false, false, true],
+                false,
+            )
+        }),
+        "%Date.prototype.setMinutes%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                true,
+                &[false, false, false, false, true, true, true],
+                false,
+            )
+        }),
+        "%Date.prototype.setMonth%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                true,
+                &[false, true, true, false, false, false, false],
+                false,
+            )
+        }),
+        "%Date.prototype.setSeconds%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                true,
+                &[false, false, false, false, false, true, true],
+                false,
+            )
+        }),
+        "%Date.prototype.setUTCFullYear%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                false,
+                &[true, true, true, false, false, false, false],
+                true,
+            )
+        }),
+        "%Date.prototype.setUTCHours%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                false,
+                &[false, false, false, true, true, true, true],
+                false,
+            )
+        }),
+        "%Date.prototype.setUTCMilliseconds%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                false,
+                &[false, false, false, false, false, false, true],
+                false,
+            )
+        }),
+        "%Date.prototype.setUTCMinutes%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                false,
+                &[false, false, false, false, true, true, true],
+                false,
+            )
+        }),
+        "%Date.prototype.setUTCMonth%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                false,
+                &[false, true, true, false, false, false, false],
+                false,
+            )
+        }),
+        "%Date.prototype.setUTCSeconds%" => Some(|agent, this, args| {
+            set_components(
+                agent,
+                this,
+                args,
+                false,
+                &[false, false, false, false, false, true, true],
+                false,
+            )
+        }),
+        "%Date.prototype.setYear%" => Some(set_year),
+        "%Date.prototype.setDate%" => Some(|agent, this, args| set_date(agent, this, args, true)),
+        "%Date.prototype.setUTCDate%" => {
+            Some(|agent, this, args| set_date(agent, this, args, false))
+        }
+        "%Date.prototype.setTime%" => Some(|agent, this, args| {
+            // thisTimeValue first: a non-Date receiver throws before the
+            // argument is coerced (spec 21.4.4.44 step 1).
+            let ValueKind::Object(obj) = this.kind() else {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Date.prototype method called on an incompatible receiver".into(),
+                ));
+            };
+            if !agent.date_data.contains_key(&obj.id()) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Date.prototype method called on an incompatible receiver".into(),
+                ));
+            }
+            let value = match args.first() {
+                Some(v) => crate::context::to_number(agent, v)?,
+                None => f64::NAN,
+            };
+            let clipped = time_clip(value);
+            agent.date_data.insert(obj.id(), clipped);
+            Ok(Value::Number(clipped))
+        }),
         _ => None,
     }
 }
