@@ -8025,12 +8025,85 @@ jit/jitless/--gc-stress; three release test262 sweeps at baseline
 (language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
 fail/crash/hang); corpus parity 37/37 ok, 0 mismatches.
 
-Open (measured, not started): `Array()` as a call (~220ms vs `new
-Array()` ~80ms on the K=300000 harness) still pays `array_call`'s
-`intrinsics.get(ARRAY)` + a full `function::construct` round trip before
-`array_construct` runs — the call form has no step-side fast path; and
-the other registered constructors' bodies (Map/Date/etc.) each pay their
-own creation work on top of the now-O(1) dispatch.
+Open (measured, not started): the other registered constructors' bodies
+(Map/Date/etc.) each pay their own creation work on top of the now-O(1)
+dispatch.
+
+### LANDED (2026-09-09): the `Array()` call form runs `array_construct` directly (Cut 86)
+
+The Cut-85 open note's residual: `Array()` as a call registered its own
+handler in `handler_for` (Cut 79) but that handler (`array_call`)
+re-dispatched through `intrinsics.get(ARRAY)` + a full
+`function::construct`/`construct_inner` round trip — the same machinery
+the construct path had just shed. The %Object% call form never had this
+(`handler_for`'s OBJECT arm runs `object_constructor` with the Undefined
+placeholders directly), and Array is the same shape: spec 23.1.1.1 has
+no separate call behavior — an undefined NewTarget IS the active
+function. Two changes: `array_construct` now promotes an undefined
+new_target to the active case (`matches!(new_target.kind(),
+ValueKind::Undefined) || callee == new_target` — the fast-path handler
+passes Undefined placeholders for both, and the chain arm passes the
+real %Array% callee with an Undefined new_target, so the promotion
+clause is what keeps the direct dispatch correct); and both the
+registered-call handler (fast_call_core's Cut-79 arm) and
+`dispatch_call`'s ARRAY arm run `array_construct` directly. `array_call`
+is deleted.
+
+Interleaved A/B (release, scratch/cut85_ab.js, K=300000): `Array()` call
+jit 217-251 -> 72-74ms (~3x, now equal to `new Array()`'s 77-83) / jl
+~233-305 -> 82-85 (~3x); `new Array()` and the derived subclass rows
+unchanged. Correctness: 182 jit e2e + runtime release tests green (the
+Cut-83/85 e2e now also calls `Array(i)` in the compiled loop and checks
+its prototype identity); clippy `-D warnings` clean; workspace suites
+green; the construct batteries still byte-identical across
+jit/jitless/--gc-stress; three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086,
+zero fail/crash/hang); corpus parity 37/37 ok, 0 mismatches.
+
+### PROBE: the unregistered-builtin chain tax — Date members cost ~µs/call (measured 2026-09-09)
+
+After the ctor call/construct registration arc (Cuts 79-86), the
+call-side handler registry covers only nine modules (array, regexp,
+string, number, boolean, bigint, keyed, object, dataview — the
+`Intrinsics::define` chain). The constructible modules left off it —
+date, symbol, array_buffer, typed_array, error — still warm-dispatch
+through their module `dispatch_call` chains, whose per-arm
+`intrinsics.get` is a JsString alloc + HashMap probe; date.rs's chain is
+~60 arms (its getters/setters are table-driven loops). Measured warm
+member-call cost (scratch/date_chain_probe.js, K=300000): `d.getTime()`
+jit 1150ms / jl 1180ms (~3.9µs per call — BOTH engines, i.e. not a JIT
+coverage issue); `d.valueOf()` ~1220ms (~4.1µs); `d.getFullYear()`
+~390ms (~1.3µs, fewer arms); `Date.now()` ~225ms (~750ns); `d.setTime`
+~2100ms (~7µs); `Symbol()` ~150ms (~500ns) — vs the registered control
+`m.has(k)` at 37ms (~125ns) in the same harness. Node runs the whole
+probe in 0-13ms. So the unregistered members pay a 10-30x
+member-dispatch tax on top of their (often trivial) bodies — the same
+class of gap Cut 79 closed for the keyed intrinsics.
+
+### LANDED (2026-09-09): the Date module members register their call handlers (Cut 87)
+
+The probe's Date rows: `date::handler_for` now arms the call form
+(`Date()` → `date_call`), `Date.now`, the getTime/valueOf raw read
+(spec 21.4.4.10 / 21.4.4.43), getTimezoneOffset, and all 17 local/UTC
+component getters (each a one-line non-capturing closure over the
+shared `get_component` helper — same functions `dispatch_call` uses, so
+no behavior drift), and the module joins the `Intrinsics::define`
+call-side registration chain in realm.rs. The setters, string/format
+methods, parse/UTC stay on the chain (heavier bodies / rarer — a
+follow-up if a row shows them hot).
+
+Interleaved A/B (release, scratch/date_chain_probe.js, K=300000):
+`d.getTime()` jit 1138-1183 -> 19-20ms (~60x) / jl 1180-1250 -> 30-31
+(~40x); `d.valueOf()` -> 20ms jit; `d.getFullYear()` 376-417 -> 24-26
+(~15x); `Date.now()` 217-236 -> 20ms; the unregistered `d.setTime`
+UNCHANGED (~2100ms — confirms the residual is the not-yet-registered
+setter family, and the getters now run at or below the registered
+`m.has` control). Correctness: 24 date-module runtime tests + 736
+runtime release + 182 jit e2e green; clippy `-D warnings` clean;
+workspace suites green; the construct batteries still byte-identical
+across jit/jitless/--gc-stress; three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip with zero Date
+failures, annexB 1086/1086); corpus parity 37/37 ok, 0 mismatches.
 
 
 

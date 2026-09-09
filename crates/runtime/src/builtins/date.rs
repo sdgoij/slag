@@ -1080,6 +1080,89 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The Date members that need the agent, dispatched by intrinsic identity
+/// from `runtime::function::call`. `Intrinsics::define` registers a warm
+/// call for a member with an arm here (the call-side registration arc);
+/// the members without an arm (the setters, the string/format methods,
+/// parse/UTC) keep riding `dispatch_call`'s per-arm `intrinsics.get` scan,
+/// which measured ~µs/call (`d.getTime()` ~3.9µs vs ~125ns for a
+/// registered member on the same loop). Keep the arms in sync with
+/// `dispatch_call`.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        // The call form (spec 21.4.1.1) returns the current time as a
+        // string; the Date.now static reads the clock directly.
+        DATE => Some(|_agent, _this, _args| date_call()),
+        "%Date.now%" => Some(|_agent, _this, _args| date_now()),
+        // getTime and valueOf both return the [[DateValue]] (spec
+        // 21.4.4.10 / 21.4.4.43): a brand-checked raw read.
+        "%Date.prototype.getTime%" | "%Date.prototype.valueOf%" => {
+            Some(|agent, this, _args| this_date_value(agent, this).map(Value::Number))
+        }
+        "%Date.prototype.getTimezoneOffset%" => {
+            Some(|agent, this, _args| match this_date_value(agent, this) {
+                Ok(t) if t.is_nan() => Ok(Value::Number(f64::NAN)),
+                Ok(_) => Ok(Value::Number(0.0)),
+                Err(e) => Err(e),
+            })
+        }
+        // The local component getters (spec 21.4.4.x).
+        "%Date.prototype.getDate%" => {
+            Some(|agent, this, _args| get_component(agent, this, true, date_from_time))
+        }
+        "%Date.prototype.getDay%" => {
+            Some(|agent, this, _args| get_component(agent, this, true, week_day_f))
+        }
+        "%Date.prototype.getFullYear%" => {
+            Some(|agent, this, _args| get_component(agent, this, true, year_f))
+        }
+        "%Date.prototype.getHours%" => {
+            Some(|agent, this, _args| get_component(agent, this, true, hour_f))
+        }
+        "%Date.prototype.getMilliseconds%" => {
+            Some(|agent, this, _args| get_component(agent, this, true, ms_f))
+        }
+        "%Date.prototype.getMinutes%" => {
+            Some(|agent, this, _args| get_component(agent, this, true, min_f))
+        }
+        "%Date.prototype.getMonth%" => {
+            Some(|agent, this, _args| get_component(agent, this, true, month_f))
+        }
+        "%Date.prototype.getSeconds%" => {
+            Some(|agent, this, _args| get_component(agent, this, true, sec_f))
+        }
+        "%Date.prototype.getYear%" => {
+            Some(|agent, this, _args| get_component(agent, this, true, get_year_f))
+        }
+        // The UTC component getters.
+        "%Date.prototype.getUTCDate%" => {
+            Some(|agent, this, _args| get_component(agent, this, false, date_from_time))
+        }
+        "%Date.prototype.getUTCDay%" => {
+            Some(|agent, this, _args| get_component(agent, this, false, week_day_f))
+        }
+        "%Date.prototype.getUTCFullYear%" => {
+            Some(|agent, this, _args| get_component(agent, this, false, year_f))
+        }
+        "%Date.prototype.getUTCHours%" => {
+            Some(|agent, this, _args| get_component(agent, this, false, hour_f))
+        }
+        "%Date.prototype.getUTCMilliseconds%" => {
+            Some(|agent, this, _args| get_component(agent, this, false, ms_f))
+        }
+        "%Date.prototype.getUTCMinutes%" => {
+            Some(|agent, this, _args| get_component(agent, this, false, min_f))
+        }
+        "%Date.prototype.getUTCMonth%" => {
+            Some(|agent, this, _args| get_component(agent, this, false, month_f))
+        }
+        "%Date.prototype.getUTCSeconds%" => {
+            Some(|agent, this, _args| get_component(agent, this, false, sec_f))
+        }
+        _ => None,
+    }
+}
+
 /// The prototype method bodies, dispatched by intrinsic identity from
 /// `runtime::function::call`.
 pub fn dispatch_call(

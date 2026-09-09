@@ -514,14 +514,16 @@ fn array_construct(
     new_target: &Value,
 ) -> Result<Value, JsError> {
     // GetPrototypeFromConstructor reads `new_target.prototype` (spec
-    // 10.1.14). Every dispatch arm reaches `array_construct` with `callee`
-    // = %Array% (the construct/call handlers match the intrinsic by
-    // identity), so the active-function case is exactly `callee ==
-    // new_target` — and %Array%.prototype is non-writable and
+    // 10.1.14), after spec 23.1.1.1 step 1 promotes an undefined NewTarget
+    // to the active function. Every dispatch arm reaches `array_construct`
+    // with `callee` = %Array% (the construct/call handlers match the
+    // intrinsic by identity) or the call form's Undefined placeholder, so
+    // the active-function case is exactly an undefined new target or
+    // `callee == new_target` — and %Array%.prototype is non-writable and
     // non-configurable (install), so that read is always the realm's cached
     // %Array.prototype%. The member read is left only for a genuinely
     // derived new target (a subclass or Reflect.construct).
-    let proto = if callee == new_target {
+    let proto = if matches!(new_target.kind(), ValueKind::Undefined) || callee == new_target {
         agent
             .current_realm()?
             .intrinsics
@@ -553,15 +555,6 @@ fn array_construct(
         array.create_data_property_or_throw(&key(index as u64), *item)?;
     }
     Ok(Value::Object(array))
-}
-
-fn array_call(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    let ctor = agent
-        .current_realm()?
-        .intrinsics
-        .get(ARRAY)
-        .unwrap_or(Value::Undefined);
-    crate::function::construct(agent, &ctor, args, &ctor)
 }
 
 /// spec 23.1.2.2 Array.isArray.
@@ -3084,7 +3077,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 /// intrinsic name, so they stay on the chain path.
 pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
     match name {
-        ARRAY => Some(|agent, _this, args| array_call(agent, args)),
+        ARRAY => Some(|agent, _this, args| {
+            array_construct(agent, &Value::Undefined, args, &Value::Undefined)
+        }),
         IS_ARRAY => Some(array_is_array),
         OF => Some(array_of),
         FROM => Some(array_from),
@@ -3154,7 +3149,7 @@ pub fn dispatch_call(
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
     if intrinsics.get(ARRAY).as_ref() == Some(callee) {
-        return Some(array_call(agent, args));
+        return Some(array_construct(agent, callee, args, &Value::Undefined));
     }
     if intrinsics.get(IS_ARRAY).as_ref() == Some(callee) {
         return Some(array_is_array(agent, this, args));

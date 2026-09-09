@@ -1707,7 +1707,7 @@ mod tests {
         // interpreter on the churn result, and a subclassed `new` (callee =
         // the EcmaScript subclass, not the registered builtin) must still
         // construct through the ordinary path.
-        let source = "function f(n) { var s = 0; for (var i = 0; i < n; i++) { var o = new Object(); var m = new Map(); m.set('k', i); var d = new Date(i); var a = new Array(i); if (m.get('k') === i && d.getTime() === i && a.length === i && Object.getPrototypeOf(a) === Array.prototype) { s++; } } return s; }\n\
+        let source = "function f(n) { var s = 0; for (var i = 0; i < n; i++) { var o = new Object(); var m = new Map(); m.set('k', i); var d = new Date(i); var a = new Array(i); var ac = Array(i); if (m.get('k') === i && d.getTime() === i && a.length === i && ac.length === i && Object.getPrototypeOf(a) === Array.prototype && Object.getPrototypeOf(ac) === Array.prototype) { s++; } } return s; }\n\
                      function g() { class M extends Map {} var m = new M(); m.set(1, 2); return m.get(1) === 2 && m instanceof M ? 1 : 0; }\n\
                      function h() { class A extends Array {} var a = new A(3); var r = Reflect.construct(Array, [3], A); return (a instanceof A && Object.getPrototypeOf(a) === A.prototype && Array.isArray(a) && r.length === 3 && Object.getPrototypeOf(r) === A.prototype) ? 1 : 0; }\n\
                      f(20000) + g() + h();";
