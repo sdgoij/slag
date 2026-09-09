@@ -1674,6 +1674,66 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_primitive_proto_reads_match_the_interpreter() {
+        // The primitive-prototype own-data read cache (get_member_name's
+        // `primitive_proto_data_get`): a primitive method read (`s.charAt`)
+        // is served from the member-value cell keyed by %String.prototype%
+        // once warm. The cell is validated against the prototype's
+        // generation, so every mutation must be observed by the next read:
+        // an overwrite mid-loop, an accessor conversion, a redefinition of
+        // a non-writable data property, and a delete. The interpreter and
+        // the compiled path (whose primitive reads call_slow into the same
+        // machinery) must agree on all of them.
+        let source = "function churn() {\n\
+                     var s = \"abcdefghij\";\n\
+                     var acc = [];\n\
+                     for (var i = 0; i < 4; i++) {\n\
+                       acc.push(s.charAt(0));\n\
+                       if (i === 1) { String.prototype.charAt = function () { return \"X\"; }; }\n\
+                     }\n\
+                     acc.push(s.charAt(0));\n\
+                     String.prototype.charAt = function (n) { return \"Y\" + n; };\n\
+                     acc.push(s.charAt(0));\n\
+                     return acc.join(\"|\");\n\
+                   }\n\
+                   var orig = String.prototype.charAt;\n\
+                   var a = churn();\n\
+                   delete String.prototype.charAt;\n\
+                   var b = typeof \"\".charAt;\n\
+                   String.prototype.charAt = orig;\n\
+                   var c = churn();\n\
+                   Object.defineProperty(String.prototype, \"charAt\", {\n\
+                     get: function () { return function () { return \"G\"; }; },\n\
+                     configurable: true\n\
+                   });\n\
+                   var d = \"x\".charAt(0);\n\
+                   delete String.prototype.charAt;\n\
+                   var e = typeof \"x\".charAt;\n\
+                   String.prototype.charAt = orig;\n\
+                   Object.defineProperty(String.prototype, \"ro\", {\n\
+                     value: 1, writable: false, enumerable: false, configurable: true\n\
+                   });\n\
+                   var f = \"x\".ro;\n\
+                   Object.defineProperty(String.prototype, \"ro\", {\n\
+                     value: 2, writable: false, enumerable: false, configurable: true\n\
+                   });\n\
+                   var g = \"x\".ro;\n\
+                   delete String.prototype.ro;\n\
+                   [a, b, c, d, e, f, g].join(\"|\");";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled primitive-prototype reads must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_native_builtin_calls_match_the_interpreter() {
         // The crux-native fast path (Math/JSON/typed-array methods whose
         // memoized dispatch verdict is "no module chain applies"): the

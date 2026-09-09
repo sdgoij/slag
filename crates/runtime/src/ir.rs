@@ -8849,7 +8849,30 @@ impl Vm {
                     if !matches!(object.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                         Self::get_primitive_member(agent, object, &PropertyKey::String(name))?
                     } else {
-                        crate::context::get_property(agent, &object, &crux::lookup(name), object)?
+                        // A String-exotic receiver (%String.prototype% and
+                        // boxed strings) whose own-data read is the same
+                        // primitive-prototype own-data cache the primitive
+                        // receiver path uses: for a non-virtual atom the
+                        // exotic intercepts nothing, so the member-value cell
+                        // serves the direct read too (a boxed `length` or a
+                        // canonical index stays on the exact exotic path).
+                        if let ValueKind::Object(string_object) = object.kind()
+                            && matches!(string_object.kind, crux::object::ObjectKind::String(_))
+                            && let Some(value) = Self::primitive_proto_data_get(
+                                agent,
+                                &object,
+                                &PropertyKey::String(name),
+                            )
+                        {
+                            value
+                        } else {
+                            crate::context::get_property(
+                                agent,
+                                &object,
+                                &crux::lookup(name),
+                                object,
+                            )?
+                        }
                     };
                 Self::resolve_member_cell(agent, &object, name);
                 Self::resolve_chain_cell(agent, &object, name);
@@ -8865,6 +8888,73 @@ impl Vm {
         use std::sync::OnceLock;
         static LENGTH: OnceLock<crux::AtomId> = OnceLock::new();
         *LENGTH.get_or_init(|| crux::string::intern_utf8("length"))
+    }
+
+    /// The primitive-kind prototype own-data read cache: a `s.charAt`-style
+    /// read resolves to an own DATA property of the kind's %X.prototype% (a
+    /// stable per-realm object), whose value is receiver-independent. Serve
+    /// it from the member-value cell keyed by (prototype id, name) and
+    /// validated against the prototype's generation, so the primitive read
+    /// skips the full [[Get]] per call (the prototype is an exotic
+    /// `ObjectKind::String` for strings — `cell_object` declines it, so the
+    /// ordinary own-read cells never warmed). Every prototype mutation
+    /// invalidates the cell: structural writes bump the generation, and an
+    /// in-place value write either takes the warm-store path — which fronts
+    /// the same member-value cell — for Ordinary prototypes, or the full
+    /// [[Set]] (a generation bump, via `define_property_key`) for the exotic
+    /// String prototype. The String prototype's virtual own `length`/index
+    /// keys are excluded below (not own vector entries); only atom keys
+    /// reach here — a Symbol key or a property owned deeper on the chain
+    /// (Object.prototype) falls back to the exact read.
+    fn primitive_proto_data_get(
+        agent: &mut Agent,
+        proto: &Value,
+        key: &PropertyKey,
+    ) -> Option<Value> {
+        let PropertyKey::String(name) = key else {
+            return None;
+        };
+        let name = *name;
+        let proto = crate::context::as_object(proto)?;
+        if !matches!(
+            proto.kind,
+            crux::object::ObjectKind::Ordinary
+                | crux::object::ObjectKind::Array(_)
+                | crux::object::ObjectKind::String(_)
+        ) {
+            return None;
+        }
+        if matches!(proto.kind, crux::object::ObjectKind::String(_))
+            && (name == Self::length_atom()
+                || crux::object::array_index_of(&PropertyKey::String(name)).is_some())
+        {
+            return None;
+        }
+        let index = Self::member_cell_index(proto.id(), name);
+        let cell = &agent.member_value_cells[index];
+        if cell.id == proto.id() && cell.name == name && cell.generation == proto.generation() {
+            return Some(cell.value);
+        }
+        // Resolve the own data property through the vector (authoritative
+        // for the prototype's own non-virtual keys) and record the cell.
+        let key = PropertyKey::String(name);
+        let slot = proto.property_slot(&key)?;
+        let props = proto.properties.borrow();
+        let (stored, property) = props.get(slot)?;
+        if *stored != key {
+            return None;
+        }
+        let crux::object::PropertyKind::Data { value, .. } = &property.kind else {
+            return None;
+        };
+        let value = *value;
+        agent.member_value_cells[index] = MemberValueCell {
+            id: proto.id(),
+            name,
+            generation: proto.generation(),
+            value,
+        };
+        Some(value)
     }
 
     /// Serve a property read on a PRIMITIVE without building the per-read
@@ -8904,6 +8994,9 @@ impl Vm {
                 let Some(proto) = realm.intrinsics.string_prototype() else {
                     return crate::context::get_property_key(agent, &receiver, key, receiver);
                 };
+                if let Some(value) = Self::primitive_proto_data_get(agent, &proto, key) {
+                    return Ok(value);
+                }
                 crate::context::get_property_key(agent, &proto, key, receiver)
             }
             ValueKind::Number(_)
@@ -8921,6 +9014,9 @@ impl Vm {
                 let Some(proto) = realm.intrinsics.primitive_prototype(name) else {
                     return crate::context::get_property_key(agent, &receiver, key, receiver);
                 };
+                if let Some(value) = Self::primitive_proto_data_get(agent, &proto, key) {
+                    return Ok(value);
+                }
                 crate::context::get_property_key(agent, &proto, key, receiver)
             }
             _ => crate::context::get_property_key(agent, &receiver, key, receiver),
