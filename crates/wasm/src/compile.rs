@@ -2522,25 +2522,38 @@ impl<'a> Lowerer<'a> {
                     (f.height, f.after, f.results)
                 };
                 if !in_else {
-                    // No else: close the then-branch, then the empty else
-                    // (the false path) jumps straight to the continuation. An
-                    // `if` that carries parameters needs an explicit else to
-                    // consume them (the interpreter's skip would strand them
-                    // on the false path), so it stays interpreted.
-                    if self.controls[idx].nparams > 0 {
-                        return Err("an if with parameters needs an else branch".to_string());
+                    // No else: close the then-branch, then the implicit else
+                    // (the false path). An else-less `if` is identity-typed —
+                    // the validator requires its block parameters to equal its
+                    // results, and the false path leaves the parameters on the
+                    // stack as the results — so the else block restarts from
+                    // the saved parameters and forwards them to the
+                    // continuation.
+                    let nparams = self.controls[idx].nparams;
+                    if nparams > 0 && nparams != r {
+                        return Err("an else-less if must be identity-typed (params == results)"
+                            .to_string());
                     }
                     if live {
                         let payload = self.label_args(r);
                         self.controls[idx].after_used = true;
                         self.builder.ins().jump(after, &payload);
                     }
-                    let else_block = self.controls[idx].else_block.expect("if else block");
+                    let (height, else_block, saved) = {
+                        let f = &self.controls[idx];
+                        (
+                            f.height,
+                            f.else_block.expect("if else block"),
+                            f.params.clone(),
+                        )
+                    };
                     self.controls.pop();
                     self.stack.truncate(height);
+                    self.stack.extend(saved);
                     self.builder.seal_block(else_block);
                     self.builder.switch_to_block(else_block);
-                    self.builder.ins().jump(after, &[]);
+                    let payload = self.label_args(nparams);
+                    self.builder.ins().jump(after, &payload);
                     self.resume_after(after, height);
                 } else {
                     if live {
@@ -6192,6 +6205,29 @@ mod tests {
             .map(|(c, x)| vec![Value::I32(c), Value::I32(x)])
             .collect::<Vec<_>>();
         assert_equiv(&if_param, 0, &cond_cases);
+
+        // if (param i32) (result i32) WITHOUT an else: identity-typed, so the
+        // true branch must consume the parameter and the false path passes it
+        // through as the result.
+        let if_no_else = module_with_type(
+            vec![
+                Instr::I32Const(7),
+                Instr::LocalGet(0),
+                Instr::If(BlockType::Type(1)),
+                Instr::Drop,
+                Instr::I32Const(9),
+                Instr::End,
+            ],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::I32],
+            &i32_to_i32,
+        );
+        let cond_cases = [0i32, 1, -1, 7]
+            .into_iter()
+            .map(|c| vec![Value::I32(c)])
+            .collect::<Vec<_>>();
+        assert_equiv(&if_no_else, 0, &cond_cases);
 
         // loop (param i32) (result i32), single pass: the body adds 2 to the
         // parameter and falls out of the loop's end.

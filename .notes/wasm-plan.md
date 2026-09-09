@@ -2556,12 +2556,38 @@ unrelated to Wave B, not yet triaged.
 Compiled bodies can `throw`/`throw_ref` but none may contain a `try_table`
 catch.
 
-- [ ] Decide the mechanism: native unwinding of a compiled throw into a
-compiled catch, or a documented interpreter boundary for
-handling bodies (the latter keeps those bodies off the DoD).
-- [ ] If native: tag-match dispatch and `catch_ref` payload delivery, plus
-the label/frame bookkeeping `catch_branch` needs.
-- [ ] equiv over the `exceptions` suites; the coverage report rises there.
+- [x] Decide the mechanism: **a documented interpreter boundary for
+  exception-handling bodies** (the plan's option 2). A body containing any
+  `try_table` stays on the interpreter; every compiled/interpreted boundary
+  already runs a *whole* interpreter engine per interpreted subtree, so
+  `try_table` catching, `throw`/`throw_ref` unwinding, `catch_ref` payloads,
+  and the label/frame bookkeeping all live where the interpreter already
+  implements them — no native frame ever needs to take part in an unwind.
+  That is semantics-preserving today: a compiled body never sits under an
+  interpreted frame (interpreters never dispatch compiled entries), so an
+  uncaught exception from a compiled root (or an interpreted callee subtree)
+  has no wasm catch above it and correctly escapes to the driver, exactly as
+  the interpreter reports it.
+- [ ] Native unwinding (compiled catch regions; tag-match dispatch and
+  `catch_ref` payload delivery across native frames) stays a future perf
+  wave, off the DoD — the interpreter stays the one exception mechanism.
+- [x] equiv over the `exceptions` suites: green (they run in the 253-suite,
+  0-diverged core sweep). The coverage report does not rise there — the 44
+  `try_table` bodies are a by-design interpreter-kept set, folded into the
+  DoD's "exception-handling bodies stay interpreted" carve-out.
+
+#### Wave C — status (2026-09-09)
+
+The `exceptions` corpus (`tag`, `throw`, `throw_ref`, `try_table`) and the 44
+corpus-wide `try_table` bodies stay interpreter-side by decision. Native
+compilation of catch regions would need Cranelift-level unwinding: a compiled
+`throw` must deliver to the nearest matching catch across mixed native frames
+(static for same-function throws of a known tag, dynamic for `throw_ref` and
+for exceptions escaping callees), materialize `catch_ref` exception ids, and
+reproduce `catch_branch`'s label-truncation/stack bookkeeping — the same
+shape of work as a full EH lowering pass, with no corpus equivalence pressure
+behind it (the interpreter path is green). Recorded here so a later perf wave
+can pick it up without re-deriving the boundary.
 
 ### Wave D — remaining type-model gaps
 
@@ -2570,15 +2596,31 @@ the label/frame bookkeeping `catch_branch` needs.
 object writers, defaults, `struct.get`/`set`, the `array.*` family).
 - [ ] Non-carried abstract-bottom signatures: params/results/locals of
 `(ref null none)`/`nofunc`/`noextern`/`noexn` (only null rides the model).
-- [ ] Parameterized `if` without an `else` (valid wasm; the lowerer rejects
-it today) — give it an empty-else path.
+- [x] Parameterized `if` without an `else` (valid wasm; an else-less `if` is
+  identity-typed — the validator requires its block parameters to equal its
+  results, and the false path leaves the parameters on the stack as the
+  results). The lowerer's no-else path now restarts from the saved parameters
+  on the false branch instead of erroring, so those bodies compile.
 - [ ] Latent-mismatch audit: every `Instr` variant `lowerable` admits must
-lower without error — eliminate silent `lower()` fallbacks (the Gate 0
-report is the detector).
+  lower without error — eliminate silent `lower()` fallbacks (the Gate 0
+  report is the detector).
 - [ ] Oversized call sites: revisit `SCRATCH_SLOTS` (size the scratch per
-call, or document the bound as in-scope/out-of-scope for the DoD).
+  call, or document the bound as in-scope/out-of-scope for the DoD).
 - [ ] Resumable external-host imports (JS-API): decide in/out of scope for
-the DoD (no corpus presence; architectural).
+  the DoD (no corpus presence; architectural).
+
+#### Wave D — status (2026-09-09)
+
+The else-less-parameterized-`if` slice landed: `close_construct`'s no-else
+path forwards the saved parameters to the continuation on the false branch
+(identity semantics, matching the validator's `params == results` rule and
+the interpreter's skip), guarded by an identity check so a non-identity shape
+still bails to the interpreter. Corpus effect (release equiv over the whole
+core, 253 suites, 0 diverged): coverage 7865 → 7869 (95%), "lowering error"
+52 → 48 — four corpus bodies were identity else-less `if`s. Unit coverage in
+`parameterized_and_multi_value_blocks_match_the_interpreter` (an
+else-less `(param i32) (result i32)` `if` whose false path returns the
+parameter).
 
 ### Definition of done (all must hold)
 
