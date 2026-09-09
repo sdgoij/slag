@@ -512,6 +512,11 @@ pub unsafe extern "C" fn wasm_call_helper(
         }
         return rethrow_op(store, x);
     }
+    // A compiled exception dispatch (modes 19-20) tests a parked exception
+    // against a `try_table` clause tag and spills a matched payload.
+    if mode == 19 || mode == 20 {
+        return exception_dispatch_op(store, instance, mode, x, scratch);
+    }
     // A compiled `global.get` (17) / `global.set` (18) accesses the store
     // cell directly (imported and call-bearing globals never ride the `gvals`
     // snapshot; see [`global_op`]).
@@ -838,6 +843,88 @@ unsafe fn run_native_callee(
     flush_globals(store_ref, &cells, &gvals);
     refresh_descriptors(store_ref, call.caller_instance as u64, call.caller_mems);
     code
+}
+
+/// A compiled exception dispatch (runtime helper modes 19-20), the catch side
+/// of the native `try_table` wave. The store's parked pending error is either
+/// an in-flight exception (`ExecFail::Exception`) — catchable — or a trap or
+/// other error that must propagate. Mode 19 (`x` = a `try_table` clause's tag,
+/// in this instance's tag index space; `u64::MAX` for `catch_all`) writes 1 to
+/// `scratch[0]` when the parked error is an exception whose tag cell equals the
+/// clause's resolved cell — the interpreter's clause match, imported aliases
+/// included — and 0 otherwise (a parked trap never matches). Mode 20 writes the
+/// parked exception's payload to `scratch[0..]` as call slots (a v128 param
+/// takes two words) and consumes the pending error, so a matched catch cannot
+/// let the same exception escape later.
+#[cfg(feature = "compile")]
+fn exception_dispatch_op(
+    store: &mut Store,
+    instance: u64,
+    mode: u64,
+    x: u64,
+    scratch: *mut u64,
+) -> i32 {
+    match mode {
+        19 => {
+            let matched = match &store.pending_error {
+                Some(ExecFail::Exception(exn)) => store.exceptions.get(*exn).is_some_and(|exn| {
+                    if x == u64::MAX {
+                        true
+                    } else {
+                        store
+                            .instances
+                            .get(instance as usize)
+                            .and_then(|inst| inst.tags.get(x as usize))
+                            .is_some_and(|cell| exn.tag == *cell)
+                    }
+                }),
+                _ => false,
+            };
+            unsafe {
+                *scratch = u64::from(matched);
+            }
+            crate::compile::TRAP_NONE
+        }
+        _ => {
+            // Consume the parked exception and spill its payload (a matched
+            // catch must not let it escape the body later).
+            let Some(ExecFail::Exception(exn)) = store.pending_error.take() else {
+                return crate::compile::TRAP_NONE;
+            };
+            let Some(exception) = store.exceptions.get(exn) else {
+                return crate::compile::TRAP_NONE;
+            };
+            let args = exception.args.clone();
+            let params = store
+                .tags
+                .get(exception.tag)
+                .map(|tag| tag.ty.params.clone())
+                .unwrap_or_default();
+            let mut word = 0usize;
+            for (arg, ty) in args.iter().zip(&params) {
+                match ty {
+                    ValType::V128 => {
+                        let Value::V128(bits) = arg else { break };
+                        unsafe {
+                            *scratch.add(word) = *bits as u64;
+                            *scratch.add(word + 1) = (*bits >> 64) as u64;
+                        }
+                        word += 2;
+                    }
+                    _ => {
+                        let Some(slot) = value_to_call_slot(*arg) else {
+                            break;
+                        };
+                        unsafe {
+                            *scratch.add(word) = slot;
+                        }
+                        word += 1;
+                    }
+                }
+            }
+            crate::compile::TRAP_NONE
+        }
+    }
 }
 
 /// A compiled `table.get` (mode 3) or `table.set` (mode 4): resolve the

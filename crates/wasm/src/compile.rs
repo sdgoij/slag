@@ -436,7 +436,7 @@ pub fn body_compile_reason(module: &Module, defined: usize) -> String {
     {
         return "non-carried parameter/result/local type".into();
     }
-    if !eh_static_lowerable(module, body) {
+    if !eh_lowerable(module, body) {
         return "try_table exception-handling body".into();
     }
     if !lowerable(module, func_type, body) {
@@ -1066,16 +1066,17 @@ fn imported_tags(module: &Module) -> u32 {
         .count() as u32
 }
 
-/// Whether a body's exception handling lowers without runtime dispatch (Wave E
-/// slice 1): every `try_table` clause is `catch` of a module-defined tag or
-/// `catch_all` (the `catch_ref` forms and imported-tag clauses wait for the
-/// dynamic-dispatch slices), and no call or `throw_ref` executes inside any
-/// `try_table` region (a callee-escaped or re-thrown exception's tag is only
-/// known at runtime). A static throw of any tag under the remaining clause
-/// shapes is decided at compile time: an import never aliases a module-defined
-/// tag, so equal module-defined indices match and `catch_all` matches
-/// everything.
-fn eh_static_lowerable(module: &Module, body: &FuncBody) -> bool {
+/// Whether a body's exception handling lowers (Wave E slices 1-2): every
+/// `try_table` clause is `catch` of a module-defined tag or `catch_all` (the
+/// `catch_ref` forms and imported-tag clauses — which can alias across import
+/// slots — wait for the later dynamic slices), and no `throw_ref` executes
+/// inside a `try_table` region (a re-thrown exception's tag is only known at
+/// runtime). Same-function `throw`s are decided at compile time (an import
+/// never aliases a module-defined tag, so equal module-defined indices match
+/// and `catch_all` matches everything), while a callee-escaped exception at a
+/// call inside a region is dispatched at runtime against the parked
+/// exception.
+fn eh_lowerable(module: &Module, body: &FuncBody) -> bool {
     let imported = imported_tags(module);
     let mut try_depth = 0usize;
     // Whether each open construct is a `try_table` region (an `End` closes
@@ -1104,16 +1105,11 @@ fn eh_static_lowerable(module: &Module, body: &FuncBody) -> bool {
                     try_depth -= 1;
                 }
             }
-            _ if try_depth > 0 => match instr {
-                Instr::Call(_)
-                | Instr::ReturnCall(_)
-                | Instr::CallIndirect { .. }
-                | Instr::ReturnCallIndirect { .. }
-                | Instr::CallRef(_)
-                | Instr::ReturnCallRef(_)
-                | Instr::ThrowRef => return false,
-                _ => {}
-            },
+            _ if try_depth > 0 => {
+                if matches!(instr, Instr::ThrowRef) {
+                    return false;
+                }
+            }
             _ => {}
         }
     }
@@ -1141,8 +1137,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
     // A call-bearing body's globals lower through the store-cell helper (no
     // `gvals` snapshot to go stale across the callee); whether the body has
     // calls decides only the buffer contents, not the lowering subset.
-    body.body.iter().all(|instr| instr_lowerable(module, instr))
-        && eh_static_lowerable(module, body)
+    body.body.iter().all(|instr| instr_lowerable(module, instr)) && eh_lowerable(module, body)
 }
 
 /// Whether a single instruction is inside the lowering subset (the same
@@ -1168,7 +1163,7 @@ fn instr_lowerable(module: &Module, instr: &Instr) -> bool {
         Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_sig(module, bt).is_some(),
         // A `try_table` is admitted per-instruction when its block type rides
         // the value model; `lowerable` additionally requires the body's whole
-        // exception handling to be statically lowerable (`eh_static_lowerable`).
+        // exception handling to be lowerable (`eh_lowerable`).
         Instr::TryTable { blocktype, .. } => block_sig(module, blocktype).is_some(),
         Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) | Instr::BrTable { .. } => true,
         Instr::Load { memory, .. } | Instr::Store { memory, .. } => {
@@ -3141,7 +3136,22 @@ impl<'a> Lowerer<'a> {
             self.scratch,
             self.mems,
         ];
-        self.runtime_call(&args)?;
+        // A call inside a `try_table` region must be able to catch an
+        // exception that escapes the callee, so its failure branch runs a
+        // catch dispatch instead of returning the code; a `return_call*` tail
+        // call never dispatches — the interpreter replaces the frame before
+        // the callee runs, so the region cannot catch (the exception goes to
+        // this body's caller), and a call outside every region propagates.
+        let candidates = if tail {
+            Vec::new()
+        } else {
+            self.open_try_candidates()
+        };
+        if candidates.is_empty() {
+            self.runtime_call(&args)?;
+        } else {
+            self.catchable_runtime_call(&args, &candidates)?;
+        }
         let mut result_word = 0usize;
         for ty in ty.results.iter() {
             let word = result_word;
@@ -3196,6 +3206,228 @@ impl<'a> Lowerer<'a> {
         self.builder.switch_to_block(trap_block);
         self.builder.ins().return_(&[code]);
         self.builder.switch_to_block(cont);
+        Ok(())
+    }
+
+    /// Invoke the runtime helper with `args` and return its trap code without
+    /// branching (the exception-dispatch modes only report through the
+    /// scratch).
+    fn raw_helper_call(&mut self, args: &[ClifValue]) -> ClifValue {
+        let mut sig = Signature::new(self.conv);
+        for _ in 0..9 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let sig = self.builder.import_signature(sig);
+        let call = self.builder.ins().call_indirect(sig, self.call, args);
+        self.builder.inst_results(call)[0]
+    }
+
+    /// Run the exception-dispatch matcher (helper mode 19): `tag` is a clause
+    /// tag in this instance's index space, or `-1` for the any-exception
+    /// test. Returns an i32 that is nonzero when the store's parked exception
+    /// matches (the parked error is only peeked, so a no-match leaves it for
+    /// the propagate path).
+    fn mode19_flag(&mut self, tag: i64) -> ClifValue {
+        let mode = self.iconst(types::I64, 19);
+        let tag_v = self.iconst(types::I64, tag);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            tag_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        let _code = self.raw_helper_call(&args);
+        self.read_scratch(types::I32)
+    }
+
+    /// The catch candidates of every open `try_table` frame at this lowering
+    /// point, innermost frame first and each frame's clauses in order — the
+    /// interpreter's `catch_in_top_frame` scan order. Each entry pairs the
+    /// frame's controls index with a clause (the clause's label is relative
+    /// to the construct enclosing the try).
+    fn open_try_candidates(&self) -> Vec<(usize, Catch)> {
+        let mut candidates = Vec::new();
+        for (idx, frame) in self.controls.iter().enumerate().rev() {
+            if frame.kind == CtlKind::Try {
+                for clause in &frame.catches {
+                    candidates.push((idx, *clause));
+                }
+            }
+        }
+        candidates
+    }
+
+    /// The continuation block and payload arity of a catch clause's target
+    /// (the frame `label` frames above the `try_table`'s parent), marking the
+    /// continuation used so a dead path that exits only through the catch
+    /// still resumes.
+    fn catch_target(&mut self, frame_idx: usize, label: u32) -> Result<(Block, usize), String> {
+        let target_idx = frame_idx
+            .checked_sub(1 + label as usize)
+            .ok_or("catch label past the control stack")?;
+        Ok(self.frame_target(target_idx))
+    }
+
+    /// Jump to a catch clause's target for a parked exception: consume it via
+    /// the payload helper (mode 20, which spills the args as call slots) and
+    /// load each `params` slot as the target's incoming values. The builder
+    /// ends in the (dead) catch block.
+    fn emit_parked_catch(
+        &mut self,
+        frame_idx: usize,
+        label: u32,
+        params: &[ValType],
+    ) -> Result<(), String> {
+        let mode = self.iconst(types::I64, 20);
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            zero,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        let _code = self.raw_helper_call(&args);
+        let (target, _arity) = self.catch_target(frame_idx, label)?;
+        let mut payload = Vec::with_capacity(params.len());
+        let mut word = 0usize;
+        for ty in params {
+            match ty {
+                ValType::V128 => {
+                    payload.push(self.load_v128(word));
+                    word += 2;
+                }
+                _ => {
+                    let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * word as i64);
+                    let wide = self.builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        address,
+                        Offset32::new(0),
+                    );
+                    payload.push(self.value_from_slot(*ty, wide)?);
+                    word += 1;
+                }
+            }
+        }
+        let payload: Vec<BlockArg> = payload.iter().map(|value| (*value).into()).collect();
+        self.builder.ins().jump(target, &payload);
+        self.dead = true;
+        Ok(())
+    }
+
+    /// The candidate chain of a catch dispatch, entered from a runtime call's
+    /// failure branch with the helper's `code`: a parked *trap* (any nonzero
+    /// code that is not the pending-error sentinel) and a chain with no match
+    /// return `code`, so the error propagates exactly as a plain
+    /// [`Lowerer::runtime_call`] would; a parked exception whose first
+    /// matching clause is found is consumed and delivered to the clause's
+    /// target label. Every path terminates; the builder is left in the
+    /// no-match return block for the caller to abandon.
+    fn emit_catch_dispatch(
+        &mut self,
+        code: ClifValue,
+        candidates: &[(usize, Catch)],
+    ) -> Result<(), String> {
+        let pending = self.iconst(types::I32, TRAP_PENDING_ERROR as i64);
+        let is_pending = self.builder.ins().icmp(IntCC::Equal, code, pending);
+        let not_pending = self.builder.create_block();
+        let pending_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_pending, pending_block, &[], not_pending, &[]);
+        self.builder.switch_to_block(not_pending);
+        self.builder.ins().return_(&[code]);
+        // Only an *exception* is catchable: a trap parked by an interpreted
+        // callee must propagate (the interpreter never unwinds a trap through
+        // a `try_table`), so first check the parked error is an exception.
+        self.builder.switch_to_block(pending_block);
+        let is_exception = self.mode19_flag(u64::MAX as i64);
+        let zero = self.iconst(types::I32, 0);
+        let not_exception = self.builder.create_block();
+        let mut chain = self.builder.create_block();
+        let exception = self.builder.ins().icmp(IntCC::NotEqual, is_exception, zero);
+        self.builder
+            .ins()
+            .brif(exception, chain, &[], not_exception, &[]);
+        self.builder.switch_to_block(not_exception);
+        self.builder.ins().return_(&[code]);
+        // Each candidate is reached only when every earlier candidate failed
+        // to match; `catch_all` is unconditional here (only exceptions reach
+        // the chain).
+        self.builder.switch_to_block(chain);
+        for &(frame_idx, ref clause) in candidates {
+            match clause {
+                Catch::All { label } => {
+                    self.emit_parked_catch(frame_idx, *label, &[])?;
+                    // Nothing later in the chain can match (a `catch_all`
+                    // catches every exception); the builder sits in the dead
+                    // catch block.
+                    return Ok(());
+                }
+                Catch::Tag { tag, label } => {
+                    let params = tag_type_of(self.module, *tag)
+                        .map(|ty| ty.params.clone())
+                        .unwrap_or_default();
+                    let flag = self.mode19_flag(i64::from(*tag));
+                    let matched = self.builder.create_block();
+                    let next = self.builder.create_block();
+                    let is_match = self.builder.ins().icmp(IntCC::NotEqual, flag, zero);
+                    self.builder.ins().brif(is_match, matched, &[], next, &[]);
+                    self.builder.switch_to_block(matched);
+                    self.emit_parked_catch(frame_idx, *label, &params)?;
+                    self.builder.switch_to_block(next);
+                    chain = next;
+                }
+                Catch::TagRef { .. } | Catch::AllRef { .. } => {
+                    return Err("a catch_ref clause reached the catch dispatch".to_string());
+                }
+            }
+        }
+        self.builder.switch_to_block(chain);
+        self.builder.ins().return_(&[code]);
+        Ok(())
+    }
+
+    /// A [`Lowerer::runtime_call`] at a call site inside `try_table` regions
+    /// (the catchable call): a parked exception from the callee must be
+    /// catchable, while a trap keeps propagating verbatim. On failure the
+    /// code branches into a catch dispatch (see [`Lowerer::emit_catch_dispatch`]);
+    /// the success path continues in a fresh block exactly as `runtime_call`
+    /// leaves it.
+    fn catchable_runtime_call(
+        &mut self,
+        args: &[ClifValue],
+        candidates: &[(usize, Catch)],
+    ) -> Result<(), String> {
+        let mut sig = Signature::new(self.conv);
+        for _ in 0..9 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let sig = self.builder.import_signature(sig);
+        let call = self.builder.ins().call_indirect(sig, self.call, args);
+        let code = self.builder.inst_results(call)[0];
+        let zero = self.iconst(types::I32, 0);
+        let failed = self.builder.ins().icmp(IntCC::NotEqual, code, zero);
+        let dispatch = self.builder.create_block();
+        let cont = self.builder.create_block();
+        self.builder.ins().brif(failed, dispatch, &[], cont, &[]);
+        self.builder.switch_to_block(dispatch);
+        self.emit_catch_dispatch(code, candidates)?;
+        self.builder.switch_to_block(cont);
+        self.dead = false;
         Ok(())
     }
 
@@ -9586,6 +9818,128 @@ mod tests {
                 // Exception pool ids are per-store and diverge (the
                 // interpreter parks even a caught throw; a static catch never
                 // parks), so compare kinds and, for escapes, the payloads.
+                match (&via_compiled, &via_interpreter) {
+                    (Err(ExecFail::Exception(a)), Err(ExecFail::Exception(b))) => assert_eq!(
+                        compiled.exception_args(*a),
+                        interpreter.exception_args(*b),
+                        "exception payload diverges for function {function}, {args:?}"
+                    ),
+                    _ => assert_eq!(
+                        format!("{via_compiled:?}"),
+                        format!("{via_interpreter:?}"),
+                        "paths diverge for function {function}, {args:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calls_under_try_table_catch_the_escaping_exception() {
+        // Wave E slice 2: an exception that escapes a callee is parked by the
+        // call helper, so a call inside a `try_table` region runs a catch
+        // dispatch instead of returning the code: the parked exception's tag
+        // is tested against the open clauses (mode 19) and a match delivers
+        // the payload (mode 20) to the clause's target label. Mirrors
+        // try_table.wast's `catch-param-i32` (a compiled callee throws the
+        // named tag; the payload rides the catch branch out) and a `catch_all`
+        // over a callee throwing an unnamed tag; the escape cases (a direct
+        // invocation of each thrower) still surface as exceptions.
+        let module = Module {
+            types: vec![
+                // 0: (i32) -> i32 (catch-param caller).
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                // 1: (i32) -> (): the e0 thrower (also the tag payload type).
+                SubType::func(vec![ValType::I32], vec![]),
+                // 2: () -> (): the e1 thrower (also the tag type).
+                SubType::func(vec![], vec![]),
+                // 3: () -> i32 (catch-all caller).
+                SubType::func(vec![], vec![ValType::I32]),
+            ],
+            tags: vec![1, 2],
+            functions: vec![0, 3, 1, 2],
+            bodies: vec![
+                // 0: `(block $h (result i32) (try_table (result i32) (catch
+                // $e-i32 $h) (i32.const 0) (call $throw-param-i32 (local.get
+                // 0))) (return))` — the callee always throws, so the catch
+                // branch delivers the payload and the block falls off the
+                // function end with it.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::Block(BlockType::Val(ValType::I32)),
+                        Instr::TryTable {
+                            blocktype: BlockType::Val(ValType::I32),
+                            catches: vec![Catch::Tag { tag: 0, label: 0 }],
+                        },
+                        Instr::I32Const(0),
+                        Instr::LocalGet(0),
+                        Instr::Call(2),
+                        Instr::End,
+                        Instr::Return,
+                        Instr::End,
+                    ],
+                },
+                // 1: `(block $h (try_table (catch_all $h) (call $throw-e1))
+                // ) (i32.const 42)` — the unnamed e1 is caught by catch_all
+                // (which must not catch a parked *trap*).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::Block(BlockType::Empty),
+                        Instr::TryTable {
+                            blocktype: BlockType::Empty,
+                            catches: vec![Catch::All { label: 0 }],
+                        },
+                        Instr::Call(3),
+                        Instr::End,
+                        Instr::End,
+                        Instr::I32Const(42),
+                    ],
+                },
+                // 2: the e0 thrower.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Throw(0)],
+                },
+                // 3: the e1 thrower.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::Throw(1)],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "catchable-call module did not compile"
+        );
+        let mut compiled = Store::new();
+        let compiled_instance = compiled
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        let mut interpreter = Store::new();
+        interpreter.set_compile(false);
+        let interpreter_instance = interpreter
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        let cases: &[(usize, &[Vec<Value>])] = &[
+            (
+                0,
+                &[
+                    vec![Value::I32(5)],
+                    vec![Value::I32(-1)],
+                    vec![Value::I32(0)],
+                ],
+            ),
+            (1, &[vec![]]),
+            (2, &[vec![Value::I32(3)]]),
+            (3, &[vec![]]),
+        ];
+        for (function, cases) in cases {
+            for args in *cases {
+                let via_compiled = compiled.invoke(compiled_instance, *function, args);
+                let via_interpreter = interpreter.invoke(interpreter_instance, *function, args);
                 match (&via_compiled, &via_interpreter) {
                     (Err(ExecFail::Exception(a)), Err(ExecFail::Exception(b))) => assert_eq!(
                         compiled.exception_args(*a),
