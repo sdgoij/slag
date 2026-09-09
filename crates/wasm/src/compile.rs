@@ -851,15 +851,28 @@ fn array_field_of(module: &Module, ty: u32) -> Option<&FieldType> {
 }
 
 /// The value type a field/element of `storage` has on the wasm stack (packed
-/// cells are i32). V128 storage has no compiled representation yet.
+/// cells are i32). A v128 field rides the compiled value model as an `I128`
+/// spanning two u64 scratch words.
 fn storage_val_type(storage: StorageType) -> Option<ValType> {
     match storage {
         StorageType::I8 | StorageType::I16 | StorageType::I32 => Some(ValType::I32),
         StorageType::I64 => Some(ValType::I64),
         StorageType::F32 => Some(ValType::F32),
         StorageType::F64 => Some(ValType::F64),
-        StorageType::V128 => None,
+        StorageType::V128 => Some(ValType::V128),
         StorageType::Ref(reference) => Some(ValType::Ref(reference)),
+    }
+}
+
+/// The number of u64 scratch words one field/element value of `storage`
+/// occupies in the GC helpers' word-indexed layouts (a v128 spans two, every
+/// other storage type one) — the layout both the lowering and the runtime
+/// helpers derive field offsets from.
+fn storage_slot_words(storage: StorageType) -> usize {
+    if matches!(storage, StorageType::V128) {
+        2
+    } else {
+        1
     }
 }
 
@@ -885,14 +898,20 @@ fn heap_code(heap: &HeapType) -> i64 {
 }
 
 /// Whether a struct type index's field values can all ride the compiled value
-/// model and fit the scratch, and whether a single field's value can.
+/// model and fit the scratch (word-indexed: a v128 field spans two words),
+/// and whether a single field's value can.
 fn struct_values_lowerable(module: &Module, ty: u32) -> bool {
     struct_fields_of(module, ty).is_some_and(|fields| {
-        fields.len() <= SCRATCH_SLOTS
-            && fields.iter().all(|field| {
-                storage_val_type(field.ty)
-                    .is_some_and(|value_ty| carrier_type(module, value_ty).is_some())
+        let mut words = 0usize;
+        fields.iter().all(|field| {
+            storage_val_type(field.ty).is_some_and(|value_ty| {
+                if carrier_type(module, value_ty).is_none() {
+                    return false;
+                }
+                words += slot_words(value_ty);
+                words <= SCRATCH_SLOTS
             })
+        })
     })
 }
 
@@ -1196,7 +1215,12 @@ fn instr_lowerable(module: &Module, instr: &Instr) -> bool {
         Instr::ArraySet(ty) => array_value_lowerable(module, *ty),
         Instr::ArrayLen => true,
         Instr::ArrayNewFixed { ty, n } => {
-            array_value_lowerable(module, *ty) && *n as usize <= SCRATCH_SLOTS
+            array_value_lowerable(module, *ty)
+                && array_field_of(module, *ty).is_some_and(|field| {
+                    storage_val_type(field.ty).is_some_and(|value_ty| {
+                        (*n as usize).saturating_mul(slot_words(value_ty)) <= SCRATCH_SLOTS
+                    })
+                })
         }
         Instr::ArrayFill(ty) => array_value_lowerable(module, *ty),
         Instr::ArrayNewData { ty, .. } | Instr::ArrayInitData { ty, .. } => {
@@ -3616,6 +3640,23 @@ impl<'a> Lowerer<'a> {
             .store(MemFlagsData::new(), value, address, Offset32::new(0));
     }
 
+    /// Spill a value of `value_ty` at `scratch[word]` (a v128 spans two
+    /// words; every other carried value one u64 slot).
+    fn spill_value(
+        &mut self,
+        word: usize,
+        value_ty: ValType,
+        value: ClifValue,
+    ) -> Result<(), String> {
+        if matches!(value_ty, ValType::V128) {
+            self.spill_v128(word, value);
+        } else {
+            let wide = self.slot_from(value_ty, value)?;
+            self.spill_u64(word, wide);
+        }
+        Ok(())
+    }
+
     /// Pop a memory instruction's address operand (i32 for a memory32,
     /// zero-extended; i64 for a memory64) as a u64 slot.
     fn pop_addr(&mut self, memory: u32) -> Result<ClifValue, String> {
@@ -4066,9 +4107,14 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    /// Load a value of `value_ty` from the u64 at `scratch[0]` and push it
-    /// (a helper wrote the result scalar/token there).
+    /// Load a value of `value_ty` from the u64 word(s) at `scratch[0]` and
+    /// push it (a helper wrote the result there — a v128 spans two words).
     fn push_scratch_value(&mut self, value_ty: ValType) -> Result<(), String> {
+        if matches!(value_ty, ValType::V128) {
+            let value = self.load_v128(0);
+            self.stack.push(value);
+            return Ok(());
+        }
         let address = self.builder.ins().iadd_imm_s(self.scratch, 0);
         let wide =
             self.builder
@@ -4079,19 +4125,21 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    /// A `struct.new` of type `ty`: spill the field values (in field order)
-    /// to the scratch and run the GC helper (mode 30); the object's token
-    /// lands in `scratch[0]`.
+    /// A `struct.new` of type `ty`: spill the field values (in field order,
+    /// each at its word offset — a v128 field spans two words) and run the GC
+    /// helper (mode 30); the object's token lands in `scratch[0]`.
     fn do_struct_new(&mut self, ty: u32) -> Result<(), String> {
         let fields = struct_fields_of(self.module, ty).ok_or("unresolved struct type")?;
+        let mut field_word = Vec::with_capacity(fields.len());
+        let mut words = 0usize;
+        for field in fields.iter() {
+            field_word.push(words);
+            words += storage_slot_words(field.ty);
+        }
         for (i, field) in fields.iter().enumerate().rev() {
             let value = self.pop().ok_or("operand stack underflow")?;
             let value_ty = storage_val_type(field.ty).ok_or("unsupported struct field")?;
-            let wide = self.slot_from(value_ty, value)?;
-            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+            self.spill_value(field_word[i], value_ty, value)?;
         }
         let mode = self.iconst(types::I64, 30);
         let ty_v = self.iconst(types::I64, i64::from(ty));
@@ -4171,7 +4219,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// A `struct.set` of field `field`: spill the struct token and the value
-    /// and run the GC helper (mode 33).
+    /// (word 1; a v128 spans words 1-2) and run the GC helper (mode 33).
     fn do_struct_set(&mut self, ty: u32, field: u32) -> Result<(), String> {
         let value_ty = storage_val_type(
             struct_fields_of(self.module, ty)
@@ -4183,11 +4231,7 @@ impl<'a> Lowerer<'a> {
         let value = self.pop().ok_or("operand stack underflow")?;
         let object = self.pop().ok_or("operand stack underflow")?;
         self.spill_u64(0, object);
-        let wide = self.slot_from(value_ty, value)?;
-        let address = self.builder.ins().iadd_imm_s(self.scratch, 8);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+        self.spill_value(1, value_ty, value)?;
         let mode = self.iconst(types::I64, 33);
         let field_v = self.iconst(types::I64, i64::from(field));
         let zero = self.iconst(types::I64, 0);
@@ -4206,7 +4250,9 @@ impl<'a> Lowerer<'a> {
     }
 
     /// An `array.new` of element type `ty`: spill the value and length and run
-    /// the GC helper (mode 34); the array's token lands in `scratch[0]`.
+    /// the GC helper (mode 34); the array's token lands in `scratch[0]`. The
+    /// length sits after the value's words (a v128 value spans words 0-1, so
+    /// the length moves to word 2).
     fn do_array_new(&mut self, ty: u32) -> Result<(), String> {
         let value_ty = storage_val_type(
             array_field_of(self.module, ty)
@@ -4216,10 +4262,9 @@ impl<'a> Lowerer<'a> {
         .ok_or("unsupported array element type")?;
         let len = self.pop().ok_or("operand stack underflow")?;
         let value = self.pop().ok_or("operand stack underflow")?;
-        let wide = self.slot_from(value_ty, value)?;
-        self.spill_u64(0, wide);
+        self.spill_value(0, value_ty, value)?;
         let len64 = self.builder.ins().uextend(types::I64, len);
-        self.spill_u64(1, len64);
+        self.spill_u64(slot_words(value_ty), len64);
         let mode = self.iconst(types::I64, 34);
         let ty_v = self.iconst(types::I64, i64::from(ty));
         let zero = self.iconst(types::I64, 0);
@@ -4301,7 +4346,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// An `array.set` of the popped array at the popped index: spill the
-    /// object, index, and value and run the GC helper (mode 37).
+    /// object, index, and value (word 2; a v128 spans words 2-3) and run the
+    /// GC helper (mode 37).
     fn do_array_set(&mut self, ty: u32) -> Result<(), String> {
         let value_ty = storage_val_type(
             array_field_of(self.module, ty)
@@ -4315,8 +4361,7 @@ impl<'a> Lowerer<'a> {
         self.spill_u64(0, object);
         let index64 = self.builder.ins().uextend(types::I64, index);
         self.spill_u64(1, index64);
-        let wide = self.slot_from(value_ty, value)?;
-        self.spill_u64(2, wide);
+        self.spill_value(2, value_ty, value)?;
         let mode = self.iconst(types::I64, 37);
         let zero = self.iconst(types::I64, 0);
         let args = [
@@ -4367,8 +4412,9 @@ impl<'a> Lowerer<'a> {
         self.spill_u64(slot, wide);
     }
 
-    /// An `array.new_fixed` of `n` elements: spill them in element order and
-    /// run the GC helper (mode 50).
+    /// An `array.new_fixed` of `n` elements: spill them in element order
+    /// (each at its word offset — a v128 element spans two words) and run the
+    /// GC helper (mode 50).
     fn do_array_new_fixed(&mut self, ty: u32, n: u32) -> Result<(), String> {
         let value_ty = storage_val_type(
             array_field_of(self.module, ty)
@@ -4376,13 +4422,10 @@ impl<'a> Lowerer<'a> {
                 .ty,
         )
         .ok_or("unsupported array element type")?;
+        let words = slot_words(value_ty);
         for i in (0..n as usize).rev() {
             let value = self.pop().ok_or("operand stack underflow")?;
-            let wide = self.slot_from(value_ty, value)?;
-            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * i as i64);
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+            self.spill_value(i * words, value_ty, value)?;
         }
         let mode = self.iconst(types::I64, 50);
         let ty_v = self.iconst(types::I64, i64::from(ty));
@@ -4407,7 +4450,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// An `array.fill`: pop (object, start, value, length) and run the GC
-    /// helper (mode 51).
+    /// helper (mode 51). The length sits after the value's words (a v128
+    /// value spans words 2-3, so the length moves to word 4).
     fn do_array_fill(&mut self, ty: u32) -> Result<(), String> {
         let value_ty = storage_val_type(
             array_field_of(self.module, ty)
@@ -4421,9 +4465,8 @@ impl<'a> Lowerer<'a> {
         let object = self.pop().ok_or("operand stack underflow")?;
         self.spill_u64(0, object);
         self.spill_i32(1, start);
-        let wide = self.slot_from(value_ty, value)?;
-        self.spill_u64(2, wide);
-        self.spill_i32(3, len);
+        self.spill_value(2, value_ty, value)?;
+        self.spill_i32(2 + slot_words(value_ty), len);
         let mode = self.iconst(types::I64, 51);
         let zero = self.iconst(types::I64, 0);
         let args = [
@@ -10623,6 +10666,363 @@ mod tests {
             outcomes[3],
             Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess))
         ));
+    }
+
+    #[test]
+    fn gc_v128_struct_fields_match_the_interpreter() {
+        use crate::types::{CompositeType, FieldType, StorageType};
+        // Struct fields of storage type v128 ride the compiled value model as
+        // two-word I128 slots: the GC helpers (and the lowering) derive each
+        // field's word offset from the storage list, so a v128 at a nonzero
+        // offset must not shift later fields. new_default, new, get (incl.
+        // reads past a v128 field), and set-then-get round trips on the
+        // word-indexed layout.
+        let ref_struct = ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(1),
+        });
+        let struct_type = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Struct(vec![
+                FieldType {
+                    ty: StorageType::V128,
+                    mutable: true,
+                },
+                FieldType {
+                    ty: StorageType::I32,
+                    mutable: true,
+                },
+                FieldType {
+                    ty: StorageType::V128,
+                    mutable: true,
+                },
+            ]),
+        };
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![ValType::I32]),
+                struct_type,
+                SubType::func(vec![], vec![ref_struct]),
+                SubType::func(vec![], vec![ValType::V128]),
+            ],
+            functions: vec![2, 2, 3, 3, 3, 3, 0, 0],
+            bodies: vec![
+                // 0: struct.new_default.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::StructNewDefault(1)],
+                },
+                // 1: struct.new of [v128, i32, v128] (five scratch words).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::V128Const(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10),
+                        Instr::I32Const(7),
+                        Instr::V128Const(0xf1f2_f3f4_f5f6_f7f8_f9fa_fbfc_fdfe_ff00),
+                        Instr::StructNew(1),
+                    ],
+                },
+                // 2: the default v128 field is all-zero bits.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::StructNewDefault(1),
+                        Instr::StructGet { ty: 1, field: 0 },
+                    ],
+                },
+                // 3: struct.get of field 2 (a v128 three words in).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::V128Const(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00),
+                        Instr::I32Const(-9),
+                        Instr::V128Const(0xdead_beef_cafe_f00d_0123_4567_89ab_cdef),
+                        Instr::StructNew(1),
+                        Instr::StructGet { ty: 1, field: 2 },
+                    ],
+                },
+                // 4: struct.get of field 0 of the same shape.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::V128Const(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff),
+                        Instr::I32Const(-9),
+                        Instr::V128Const(0xff00_0000_0000_0000_0000_0000_0000_0000),
+                        Instr::StructNew(1),
+                        Instr::StructGet { ty: 1, field: 0 },
+                    ],
+                },
+                // 5: set field 2 (a v128 at word offset 3) and read it back.
+                FuncBody {
+                    locals: vec![ref_struct],
+                    body: vec![
+                        Instr::StructNewDefault(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::V128Const(0x8000_0000_0000_0000_0000_0000_0000_0001),
+                        Instr::StructSet { ty: 1, field: 2 },
+                        Instr::LocalGet(0),
+                        Instr::StructGet { ty: 1, field: 2 },
+                    ],
+                },
+                // 6: the default middle i32 field reads back zero.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::StructNewDefault(1),
+                        Instr::StructGet { ty: 1, field: 1 },
+                    ],
+                },
+                // 7: an i32 field that follows a v128 field keeps its value.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::V128Const(0x0000_0000_0000_0000_0000_0000_0000_0000),
+                        Instr::I32Const(12345),
+                        Instr::V128Const(0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff),
+                        Instr::StructNew(1),
+                        Instr::StructGet { ty: 1, field: 1 },
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "gc v128 struct module did not compile"
+        );
+        let outcomes = run_seq(
+            &module,
+            &[
+                (0, vec![]),
+                (1, vec![]),
+                (2, vec![]),
+                (3, vec![]),
+                (4, vec![]),
+                (5, vec![]),
+                (6, vec![]),
+                (7, vec![]),
+            ],
+        );
+        assert!(
+            matches!(&outcomes[0], Ok(v) if matches!(v.as_slice(), [Value::Ref(RefValue::Struct(_))]))
+        );
+        assert!(
+            matches!(&outcomes[1], Ok(v) if matches!(v.as_slice(), [Value::Ref(RefValue::Struct(_))]))
+        );
+        assert_eq!(outcomes[2], Ok(vec![Value::V128(0)]));
+        assert_eq!(
+            outcomes[3],
+            Ok(vec![Value::V128(0xdead_beef_cafe_f00d_0123_4567_89ab_cdef)])
+        );
+        assert_eq!(
+            outcomes[4],
+            Ok(vec![Value::V128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff)])
+        );
+        assert_eq!(
+            outcomes[5],
+            Ok(vec![Value::V128(0x8000_0000_0000_0000_0000_0000_0000_0001)])
+        );
+        assert_eq!(outcomes[6], Ok(vec![Value::I32(0)]));
+        assert_eq!(outcomes[7], Ok(vec![Value::I32(12345)]));
+    }
+
+    #[test]
+    fn gc_v128_array_elements_match_the_interpreter() {
+        use crate::types::{CompositeType, FieldType, StorageType};
+        // Array elements of storage type v128 ride the compiled value model as
+        // two-word I128 slots across the value-bearing array helpers: new (the
+        // length sits after the value's words), new_default, get/set,
+        // new_fixed, fill (the length moves behind the two-word value), and
+        // copy (value-free, but must move v128 cells verbatim).
+        let ref_array = ValType::Ref(RefType {
+            nullable: false,
+            heap: HeapType::Type(1),
+        });
+        let array_type = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Array(FieldType {
+                ty: StorageType::V128,
+                mutable: true,
+            }),
+        };
+        let module = Module {
+            types: vec![
+                SubType::func(vec![], vec![ValType::I32]),
+                array_type,
+                SubType::func(vec![], vec![ref_array]),
+                SubType::func(vec![], vec![ValType::V128]),
+            ],
+            functions: vec![2, 0, 3, 3, 3, 3, 3, 3],
+            bodies: vec![
+                // 0: array.new of a v128 value and length 4.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::V128Const(0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100),
+                        Instr::I32Const(4),
+                        Instr::ArrayNew(1),
+                    ],
+                },
+                // 1: array.new_default of length 5, then array.len.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(5),
+                        Instr::ArrayNewDefault(1),
+                        Instr::ArrayLen,
+                    ],
+                },
+                // 2: set element 2 of a 4-element array and read it back.
+                FuncBody {
+                    locals: vec![ref_array],
+                    body: vec![
+                        Instr::V128Const(0x1010_1010_1010_1010_1010_1010_1010_1010),
+                        Instr::I32Const(4),
+                        Instr::ArrayNew(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(2),
+                        Instr::V128Const(0x1234_5678_9abc_def0_0fed_cba9_8765_4321),
+                        Instr::ArraySet(1),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(2),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+                // 3: array.get past the end traps.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::V128Const(0),
+                        Instr::I32Const(1),
+                        Instr::ArrayNew(1),
+                        Instr::I32Const(9),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+                // 4: array.new_fixed of three v128s, then get element 1.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::V128Const(0xaaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa),
+                        Instr::V128Const(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb),
+                        Instr::V128Const(0xcccc_cccc_cccc_cccc_cccc_cccc_cccc_cccc),
+                        Instr::ArrayNewFixed { ty: 1, n: 3 },
+                        Instr::I32Const(1),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+                // 5: fill elements 2..6 of an 8-element array; read a filled one.
+                FuncBody {
+                    locals: vec![ref_array],
+                    body: vec![
+                        Instr::I32Const(8),
+                        Instr::ArrayNewDefault(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(2),
+                        Instr::V128Const(0x5555_5555_5555_5555_5555_5555_5555_5555),
+                        Instr::I32Const(4),
+                        Instr::ArrayFill(1),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(5),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+                // 6: the fill left an element before the range at its default.
+                FuncBody {
+                    locals: vec![ref_array],
+                    body: vec![
+                        Instr::I32Const(8),
+                        Instr::ArrayNewDefault(1),
+                        Instr::LocalSet(0),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(2),
+                        Instr::V128Const(0x5555_5555_5555_5555_5555_5555_5555_5555),
+                        Instr::I32Const(4),
+                        Instr::ArrayFill(1),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(0),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+                // 7: array.copy of a v128 range; read an element in the range.
+                FuncBody {
+                    locals: vec![ref_array, ref_array],
+                    body: vec![
+                        Instr::I32Const(6),
+                        Instr::ArrayNewDefault(1),
+                        Instr::LocalSet(0),
+                        Instr::V128Const(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                        Instr::V128Const(0x2222_2222_2222_2222_2222_2222_2222_2222),
+                        Instr::V128Const(0x3333_3333_3333_3333_3333_3333_3333_3333),
+                        Instr::ArrayNewFixed { ty: 1, n: 3 },
+                        Instr::LocalSet(1),
+                        Instr::LocalGet(0),
+                        Instr::I32Const(1),
+                        Instr::LocalGet(1),
+                        Instr::I32Const(0),
+                        Instr::I32Const(2),
+                        Instr::ArrayCopy { dst: 1, src: 1 },
+                        Instr::LocalGet(0),
+                        Instr::I32Const(2),
+                        Instr::ArrayGet(1),
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        let compiled_entries = compile_module(&module);
+        assert!(
+            compiled_entries.iter().all(|entry| entry.is_some()),
+            "gc v128 array module did not compile; failing bodies: {:?}",
+            compiled_entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entry)| entry.is_none().then_some(i))
+                .collect::<Vec<_>>()
+        );
+        let outcomes = run_seq(
+            &module,
+            &[
+                (0, vec![]),
+                (1, vec![]),
+                (2, vec![]),
+                (3, vec![]),
+                (4, vec![]),
+                (5, vec![]),
+                (6, vec![]),
+                (7, vec![]),
+            ],
+        );
+        assert!(
+            matches!(&outcomes[0], Ok(v) if matches!(v.as_slice(), [Value::Ref(RefValue::Array(_))]))
+        );
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(5)]));
+        assert_eq!(
+            outcomes[2],
+            Ok(vec![Value::V128(0x1234_5678_9abc_def0_0fed_cba9_8765_4321)])
+        );
+        assert!(matches!(
+            outcomes[3],
+            Err(ExecFail::Trap(Trap::OutOfBoundsArrayAccess))
+        ));
+        assert_eq!(
+            outcomes[4],
+            Ok(vec![Value::V128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb)])
+        );
+        assert_eq!(
+            outcomes[5],
+            Ok(vec![Value::V128(0x5555_5555_5555_5555_5555_5555_5555_5555)])
+        );
+        assert_eq!(outcomes[6], Ok(vec![Value::V128(0)]));
+        assert_eq!(
+            outcomes[7],
+            Ok(vec![Value::V128(0x2222_2222_2222_2222_2222_2222_2222_2222)])
+        );
     }
 
     #[test]

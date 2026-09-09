@@ -1346,16 +1346,19 @@ fn rethrow_op(store: &mut Store, x: u64) -> i32 {
 
 /// A compiled GC aggregate op (runtime helper modes 30-38), mirroring the
 /// interpreter's struct/array semantics exactly. Operands ride the caller-
-/// owned scratch as u64 slots (reference values as tokens); a single result
-/// value is written back to `scratch[0]`. Modes: `30` = `struct.new` (ty=`x`,
-/// field values at `scratch[0..nargs)`), `31` = `struct.new_default` (ty=`x`),
+/// owned scratch as u64 slots (reference values as tokens) word-indexed in
+/// declaration order — a v128 value spans two words, every other one — and a
+/// single result value is written back to `scratch[0]` (two words when it is
+/// a v128). Modes: `30` = `struct.new` (ty=`x`,
+/// field values at `scratch[0..words)`), `31` = `struct.new_default` (ty=`x`),
 /// `32` = `struct.get`/`_s`/`_u` (field=`x`, read mode=`y`, object token at
 /// `scratch[0]`, result to `scratch[0]`), `33` = `struct.set` (field=`x`,
 /// object at `scratch[0]`, value at `scratch[1]`), `34` = `array.new` (ty=`x`,
-/// value at `scratch[0]`, length at `scratch[1]`), `35` = `array.new_default`
-/// (ty=`x`, length at `scratch[0]`), `36` = `array.get`/`_s`/`_u` (read mode=
-/// `y`, object at `scratch[0]`, index at `scratch[1]`), `37` = `array.set`
-/// (object at `scratch[0]`, index at `scratch[1]`, value at `scratch[2]`),
+/// value at `scratch[0]`, length after the value's words), `35` =
+/// `array.new_default` (ty=`x`, length at `scratch[0]`), `36` =
+/// `array.get`/`_s`/`_u` (read mode=`y`, object at `scratch[0]`, index at
+/// `scratch[1]`), `37` = `array.set` (object at `scratch[0]`, index at
+/// `scratch[1]`, value at `scratch[2]`),
 /// `38` = `array.len` (object at `scratch[0]`, length to `scratch[0]`).
 /// Newly allocated struct/array tokens land in `scratch[0]`.
 #[cfg(feature = "compile")]
@@ -1376,7 +1379,9 @@ fn gc_op(
     let instance = instance as usize;
     match mode {
         30 | 31 => {
-            // struct.new / struct.new_default.
+            // struct.new / struct.new_default. Field values ride the scratch
+            // word-indexed in field order (a v128 field spans two words), the
+            // layout the lowering derives from the same storage list.
             let Some(storages) = gc_type_struct_fields(store, instance, x as u32) else {
                 return code_of(Trap::UnknownFunction);
             };
@@ -1384,14 +1389,15 @@ fn gc_op(
                 return gc_unsupported(store, "compiled struct.new arity");
             }
             let mut cells = Vec::with_capacity(storages.len());
-            for (i, storage) in storages.into_iter().enumerate() {
+            let mut word = 0usize;
+            for storage in storages {
                 let cell = if mode == 31 {
                     match default_storage(storage) {
                         Ok(value) => value,
                         Err(_) => return gc_unsupported(store, "non-defaultable struct field"),
                     }
                 } else {
-                    let Some(value) = storage_from_slot(storage, slot(i)) else {
+                    let Some(value) = storage_from_slot_words(storage, scratch, word) else {
                         return gc_unsupported(store, "unsupported struct.new field");
                     };
                     match wrap_cell(storage, value) {
@@ -1400,6 +1406,7 @@ fn gc_op(
                     }
                 };
                 cells.push(cell);
+                word += storage_slot_words(storage);
             }
             let id = alloc_struct(store, instance, x as u32, cells);
             match crate::values::struct_ref_token(id) {
@@ -1419,11 +1426,8 @@ fn gc_op(
                 Ok(out) => out,
                 Err(fail) => return fail,
             };
-            match value_to_call_slot(out) {
-                Some(bits) => {
-                    write(0, bits);
-                    crate::compile::TRAP_NONE
-                }
+            match write_value_slots(scratch, 0, out) {
+                Some(()) => crate::compile::TRAP_NONE,
                 None => gc_unsupported(store, "unsupported struct.get result"),
             }
         }
@@ -1438,7 +1442,7 @@ fn gc_op(
             let Some(&storage) = fields.get(x as usize) else {
                 return gc_unsupported(store, "struct field out of range");
             };
-            let Some(value) = storage_from_slot(storage, slot(1)) else {
+            let Some(value) = storage_from_slot_words(storage, scratch, 1) else {
                 return gc_unsupported(store, "unsupported struct.set value");
             };
             let cell = match wrap_cell(storage, value) {
@@ -1455,12 +1459,18 @@ fn gc_op(
         }
         34 | 35 => {
             // array.new / array.new_default: ty=`x`, value+length or length.
+            // A value rides the scratch word-indexed (a v128 spans two
+            // words), so the length sits after the value's words.
             let Some(storage) = gc_type_array_storage(store, instance, x as u32) else {
                 return code_of(Trap::UnknownFunction);
             };
-            let len_slot = if mode == 34 { slot(1) } else { slot(0) };
+            let len_slot = if mode == 34 {
+                storage_slot_words(storage)
+            } else {
+                0
+            };
             let cell = if mode == 34 {
-                let Some(value) = storage_from_slot(storage, slot(0)) else {
+                let Some(value) = storage_from_slot_words(storage, scratch, 0) else {
                     return gc_unsupported(store, "unsupported array.new value");
                 };
                 match wrap_cell(storage, value) {
@@ -1473,7 +1483,7 @@ fn gc_op(
                     Err(_) => return gc_unsupported(store, "non-defaultable array element"),
                 }
             };
-            let len = len_slot as u32 as i32;
+            let len = slot(len_slot) as u32 as i32;
             match alloc_array_filled(store, instance, x as u32, len, cell) {
                 Ok(id) => match crate::values::array_ref_token(id) {
                     Some(token) => {
@@ -1496,11 +1506,8 @@ fn gc_op(
                 Ok(out) => out,
                 Err(fail) => return fail,
             };
-            match value_to_call_slot(out) {
-                Some(bits) => {
-                    write(0, bits);
-                    crate::compile::TRAP_NONE
-                }
+            match write_value_slots(scratch, 0, out) {
+                Some(()) => crate::compile::TRAP_NONE,
                 None => gc_unsupported(store, "unsupported array.get result"),
             }
         }
@@ -1513,7 +1520,7 @@ fn gc_op(
             let Some(storage) = gc_array_storage(store, id).ok() else {
                 return gc_unsupported(store, "array object layout");
             };
-            let Some(value) = storage_from_slot(storage, slot(2)) else {
+            let Some(value) = storage_from_slot_words(storage, scratch, 2) else {
                 return gc_unsupported(store, "unsupported array.set value");
             };
             let cell = match wrap_cell(storage, value) {
@@ -1549,9 +1556,11 @@ fn gc_op(
 /// A compiled array bulk op (runtime helper modes 50-56), mirroring the
 /// interpreter's array segment/fill/copy semantics exactly. Operands ride the
 /// caller-owned scratch as u64 slots (array references as tokens, i32
-/// offsets/lengths zero-extended). Modes: `50` = `array.new_fixed` (ty=`x`,
-/// `nargs` elements at `scratch[0..nargs)`), `51` = `array.fill` (object at
-/// `scratch[0]`, start `scratch[1]`, value `scratch[2]`, length `scratch[3]`),
+/// offsets/lengths zero-extended) word-indexed in operand order — a v128
+/// value spans two words, every other one. Modes: `50` = `array.new_fixed`
+/// (ty=`x`, `nargs` elements at `scratch[0..words)`), `51` = `array.fill`
+/// (object at `scratch[0]`, start `scratch[1]`, value `scratch[2]`, length
+/// after the value's words),
 /// `52` = `array.copy` (dst object `scratch[0]`, dst offset `scratch[1]`, src
 /// object `scratch[2]`, src offset `scratch[3]`, length `scratch[4]`),
 /// `53` = `array.new_data` (ty=`x`, data index=`y`, src `scratch[0]`, length
@@ -1581,13 +1590,15 @@ fn array_bulk_op(
     let array_id = |object: u64| -> Option<usize> { array_object_of(object) };
     match mode {
         50 => {
-            // array.new_fixed: the elements arrive in slot order.
+            // array.new_fixed: the elements arrive in slot order, each at its
+            // word offset (a v128 spans two words).
             let Some(storage) = gc_type_array_storage(store, instance, x as u32) else {
                 return code_of(Trap::UnknownFunction);
             };
             let mut cells = Vec::with_capacity(nargs as usize);
-            for i in 0..nargs as usize {
-                let Some(value) = storage_from_slot(storage, slot(i)) else {
+            let mut word = 0usize;
+            for _ in 0..nargs as usize {
+                let Some(value) = storage_from_slot_words(storage, scratch, word) else {
                     return gc_unsupported(store, "unsupported array.new_fixed element");
                 };
                 let cell = match wrap_cell(storage, value) {
@@ -1595,6 +1606,7 @@ fn array_bulk_op(
                     Err(_) => return gc_unsupported(store, "packed array element write"),
                 };
                 cells.push(cell);
+                word += storage_slot_words(storage);
             }
             let id = alloc_array(store, instance, x as u32, cells);
             match crate::values::array_ref_token(id) {
@@ -1606,22 +1618,23 @@ fn array_bulk_op(
             }
         }
         51 => {
-            // array.fill: object, start, value, length.
+            // array.fill: object, start, value (word 2), length (after the
+            // value's words — word 4 for a v128).
             let Some(id) = array_id(slot(0)) else {
                 return gc_object_error(store, code_of, slot(0), Trap::NullArrayReference);
             };
             let start = slot(1) as u32 as usize;
-            let len = slot(3) as u32 as usize;
             let Some(storage) = gc_array_storage(store, id).ok() else {
                 return gc_unsupported(store, "array object layout");
             };
-            let Some(value) = storage_from_slot(storage, slot(2)) else {
+            let Some(value) = storage_from_slot_words(storage, scratch, 2) else {
                 return gc_unsupported(store, "unsupported array.fill value");
             };
             let cell = match wrap_cell(storage, value) {
                 Ok(cell) => cell,
                 Err(_) => return gc_unsupported(store, "packed array element write"),
             };
+            let len = slot(2 + storage_slot_words(storage)) as u32 as usize;
             let cells = match &mut store.objects[id].data {
                 GcData::Array(cells) => cells,
                 _ => return gc_unsupported(store, "array.fill of non-array"),
@@ -2403,8 +2416,9 @@ fn v128_mem(store: &mut Store, mode: u64, x: u64, y: u64, z: u64, scratch: *mut 
     }
 }
 
-/// Decode a value of `storage` from its u64 scratch slot (a reference decodes
-/// its token). V128 storage has no slot representation in the compiled subset.
+/// Decode a value of `storage` from its single u64 scratch slot (a reference
+/// decodes its token). A v128 has no single-slot form; callers read it with
+/// [`storage_from_slot_words`].
 #[cfg(feature = "compile")]
 fn storage_from_slot(storage: StorageType, value: u64) -> Option<Value> {
     match storage {
@@ -2417,6 +2431,53 @@ fn storage_from_slot(storage: StorageType, value: u64) -> Option<Value> {
         StorageType::Ref(reference) => value_from_call_slot(ValType::Ref(reference), value),
         StorageType::V128 => None,
     }
+}
+
+/// The number of u64 scratch words one field/element value of `storage`
+/// occupies in the GC helpers' word-indexed layouts (a v128 spans two,
+/// every other storage type one) — the layout both the compiled callers and
+/// these helpers derive offsets from.
+#[cfg(feature = "compile")]
+fn storage_slot_words(storage: StorageType) -> usize {
+    if matches!(storage, StorageType::V128) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Read a struct/array field/element value of `storage` from the u64 slot
+/// words starting at `scratch[word]` (a v128 spans two words, little-endian).
+/// Returns `None` when the value cannot be encoded from its slots.
+#[cfg(feature = "compile")]
+fn storage_from_slot_words(storage: StorageType, scratch: *mut u64, word: usize) -> Option<Value> {
+    if matches!(storage, StorageType::V128) {
+        // SAFETY: the compiled caller spilled `word + 2` slots for the value.
+        Some(Value::V128(unsafe { scratch_read_v128(scratch, word) }))
+    } else {
+        // SAFETY: the compiled caller spilled the single word slot.
+        let bits = unsafe { *scratch.add(word) };
+        storage_from_slot(storage, bits)
+    }
+}
+
+/// Write a GC read result to the u64 slot word(s) starting at `scratch[word]`
+/// (a v128 spans two words, little-endian; every other value one slot).
+/// Returns `None` when the value cannot be encoded to slots.
+#[cfg(feature = "compile")]
+fn write_value_slots(scratch: *mut u64, word: usize, value: Value) -> Option<()> {
+    match value {
+        Value::V128(bits) => {
+            // SAFETY: the caller reserves `word + 2` slots for the result.
+            unsafe { scratch_write_v128(scratch, word, bits) };
+        }
+        value => {
+            let bits = value_to_call_slot(value)?;
+            // SAFETY: the caller reserves the single result slot.
+            unsafe { *scratch.add(word) = bits };
+        }
+    }
+    Some(())
 }
 
 /// Rewrite the caller-owned memory descriptors at `mems` (one data-pointer +

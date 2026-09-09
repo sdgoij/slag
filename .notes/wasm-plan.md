@@ -2641,11 +2641,17 @@ under `--features wasm/compile`.
 
 ### Wave D — remaining type-model gaps
 
-- [ ] v128 GC storage: struct/array fields of `StorageType::V128`
-  (word-indexed field slots in the GC helpers, `storage_from_slot` and the
-  object writers, defaults, `struct.get`/`set`, the `array.*` family). No
-  runnable corpus body uses one (the coverage report would show it), so it
-  stays future work, not a DoD blocker.
+- [x] v128 GC storage: struct/array fields of `StorageType::V128` —
+  the GC helpers' field slots are word-indexed (`storage_slot_words`/
+  `storage_from_slot_words`), a v128 field/element value spans two u64 words
+  and defaults to all-zero bits; `struct.new`/`_default`/`get`/`set`, and
+  `array.new`/`_default`/`new_fixed`/`get`/`set`/`fill`/`copy` all carry it
+  on both paths (`new_data`/`init_data` already read 16-byte elements via
+  `data_element`; `array.len` and the segment ops are value-free). No
+  runnable corpus body uses one (the coverage report would show it), so the
+  unit coverage is an equivalence pair
+  (`gc_v128_struct_fields_match_the_interpreter` and
+  `gc_v128_array_elements_match_the_interpreter`), not a corpus gate.
 - [x] Non-carried abstract-bottom signatures: params/results/locals of
   `(ref null none)`/`nofunc`/`noextern`/`noexn` — `heap_is_carried` admits
   the four abstract-bottom heaps, since a bottom value has no non-null
@@ -2783,10 +2789,28 @@ catchable calls) → **8264/8264 (E3 `catch_ref`/`throw_ref`, 100%)**, with the
 fallback histogram empty at every step's 0-diverged full-corpus sweep. wasm
 lib tests 111 (compile feature) / 36 (no feature); clippy `-D warnings` clean
 in both configurations. The remaining Wave D items are scope decisions, not
-corpus blockers: v128 GC storage fields (no runnable corpus body uses one),
-the `SCRATCH_SLOTS` per-call bound (no body exceeds it; decision 6), and
+corpus blockers: the
+`SCRATCH_SLOTS` per-call bound (no body exceeds it; decision 6), and
 resumable external-host imports (kept interpreted via `host_reachable_bodies`;
 decision 7).
+
+The v128 GC storage slice closed the last unchecked Wave D item
+(2026-09-09): struct/array fields of `StorageType::V128` now compile
+natively. `storage_val_type` admits v128 (carrier `I128`), the GC helpers
+(`gc_op` modes 30/33/34/36/37, `array_bulk_op` 50/51) read and write a v128
+field/element value as two u64 scratch words at storage-derived word
+offsets, and the lowering spills/loads at the same word-indexed layout
+(`struct.set`'s value at word 1, `array.new`'s length after the value's
+words, `array.fill`'s length behind them). The value-free bulk ops needed no
+change: `array.copy` moves cells verbatim and `new_data`/`init_data` already
+read 16-byte elements through `data_element`. The interpreter handled v128
+cells all along, so the slice's gate is an equivalence pair —
+`gc_v128_struct_fields_match_the_interpreter` and
+`gc_v128_array_elements_match_the_interpreter` (defaults, mixed v128/i32
+field layouts at nonzero word offsets, set/get round trips, `new_fixed`,
+`fill` leaving the untouched default, `copy`, and the OOB trap). wasm lib
+tests 113 (compile feature) / 36 (no feature); clippy `-D warnings` clean in
+both configurations.
 
 ### Definition of done (all must hold)
 
