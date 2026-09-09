@@ -1639,6 +1639,41 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_registered_builtin_calls_match_the_interpreter() {
+        // Cut 79: a member call whose callee is an installed builtin
+        // (Map.prototype.has/get/set — registered at `Intrinsics::define`)
+        // runs the native handler directly from `fast_call_core` in both
+        // engines, skipping the per-call %eval% intrinsic lookup and the
+        // `call_inner` redispatch. The compiled loop must agree with the
+        // interpreter on the churn result, the wrong-receiver TypeError
+        // (the handler throws it), and a receiver whose own property
+        // shadows the builtin method (no fast path — the shadow runs).
+        let source = "function f(m) { var s = 0; for (var i = 0; i < 20000; i++) { var k = i & 63; if (m.has(k)) { s += m.get(k); } m.set(k, i & 255); } return s; }\n\
+                     var m = new Map();\n\
+                     for (var j = 0; j < 64; j++) { m.set(j, j); }\n\
+                     var base = f(m);\n\
+                     var threw = '';\n\
+                     try { Map.prototype.has.call({}, 'a'); } catch (e) { threw = e.name; }\n\
+                     var shadowed = '';\n\
+                     var m2 = new Map(); m2.set(1, 2);\n\
+                     m2.has = function () { return 'shadow'; };\n\
+                     shadowed = m2.has(1);\n\
+                     if (threw !== 'TypeError' || shadowed !== 'shadow') { throw 'fastpath-mismatch'; }\n\
+                     base;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled registered-builtin calls must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_shape_read_serves_cycling_same_shape_objects() {
         // Slice 1: the compiled `GetMemberName` read falls back to an
         // inline shape read when the (id, name) value cell misses — probe

@@ -11865,6 +11865,26 @@ impl Vm {
             return self.run_inline_leaf(agent, argc, this, entry, below, None);
         }
         let args = &self.stack[arg_start..n];
+        // Registered-builtin fast path: an installed builtin (Map/Set/
+        // String/Array/... method registered at `Intrinsics::define` time)
+        // is a function object whose native handler runs `(agent, this,
+        // args)` directly — skip the per-call %eval% intrinsic lookup (a
+        // JsString alloc + HashMap hit every non-EcmaScript call pays), the
+        // callable check (a registered builtin is a function), and
+        // `call_inner`'s kind redispatch. The eval hosts are never
+        // registered (they keep the identity chain), so no eval semantics
+        // are bypassed; the single-realm guard mirrors the leaf path — the
+        // general path otherwise pushes the callee's owning realm so a
+        // cross-realm handler creates its errors in the right realm.
+        if agent.realm_count.get() == 1
+            && let ValueKind::Function(function) = callee.kind()
+            && let Some(handler) = crate::function::builtin_handler(function.id())
+        {
+            let result = handler(agent, &this, args)?;
+            self.stack.truncate(arg_start - below);
+            self.stack.push(result);
+            return Ok(());
+        }
         if is_eval_function(agent, &callee)? {
             let source = args.first().cloned().unwrap_or(Value::Undefined);
             // The `eval` builtin (spec 18.2.1 step 1): a non-string argument

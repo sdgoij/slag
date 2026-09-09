@@ -7633,6 +7633,66 @@ release test262 sweeps at baseline (language 23721/3 skip, built-ins
 23657/155 skip, annexB 1086/1086, zero fail/crash/hang); corpus parity
 37/37 ok, 0 mismatches.
 
+### LANDED (2026-09-09): registered builtins call their handler directly from `fast_call_core` — the keyed-intrinsic call tax removed (Cut 79)
+
+The map/set-churn corpus rows (~210-260ms jl, jit ≈ jl — the top builtins
+mass) decomposed to ~220ns/op (jit) / ~310ns/op (jl) per Map method call
+with NO single further cost center: a pre-bound intrinsic call (X3
+`Map.prototype.has.call`) measured the SAME as the member call (X4
+`m.has(k)`), so the member read is free and the tax is the CALL path
+itself — a registered builtin callee paid, per call, the general
+`fast_call_core` tail: `is_eval_function` (a `%eval%` JsString alloc +
+HashMap get on EVERY non-EcmaScript call — a registered builtin can never
+be eval, but the check ran anyway), the callable check, and `call_inner`'s
+kind redispatch to the registered handler. A user leaf call in the same
+loop shape is ~27ns (jit) / ~80ns (jl), so the intrinsic call carried an
+~8x tax over the leaf floor.
+
+Fix: a new arm in `fast_call_core` (the SHARED core both engines route
+through — the interpreter's `do_call_fast` and the JIT's `call_slow`/
+`call_vector` helpers) after the certified-leaf path: when the callee is a
+Function whose id has a registered handler and the realm count is 1, run
+`handler(agent, this, args)` directly — skipping the %eval% lookup, the
+callable check, and the `call_inner` redispatch. Sound because
+registration (`Intrinsics::define`) excludes the eval hosts, a registered
+builtin is a function object (always callable), and the single-realm guard
+preserves the general path's cross-realm owning-realm push (a registered
+handler creates its errors in the CURRENT realm, which only matches the
+owning realm when realm_count == 1).
+
+Interleaved A/B (release, scratch/mapcall_probe.js, min-of-3): W4 `m.has`
+jit 67-69 -> 34-35ms, jl 87-91 -> 50-51 (~2x both); W1 the corpus has+get+
+set triple jit 199-207 -> 99-102, jl 221-227 -> 115-122 (~2x); bound-call
+rows unchanged (not the corpus shape). Corpus re-baseline (4-mode):
+map_churn jit 211.7 -> 94.0 / jl 206.4 -> 111.6 (~2.25x/~1.85x); set_churn
+jit 262.1 -> 124.1 / jl 282.0 -> 138.3 (~2.1x/~2.0x) — the largest single
+row-family cut since the Map/Set hash-index landing; every other row
+within single-run noise.
+
+Correctness: 180 jit e2e green (incl. a new
+`installed_jit_registered_builtin_calls_match_the_interpreter` pinning the
+compiled loop's Map churn against the interpreter plus the wrong-receiver
+TypeError and a shadowed-method receiver); a 16-case battery (wrong-receiver
+TypeError, .call/.apply/bind, subclassed Map, callback-running String/Array
+methods, shadowed eval name + the REAL %eval% identity path, shadowed
+method, delete-then-proto, iterators, a gc-stress churn loop) and a
+re-entrant battery (registered handlers whose argument coercion or
+callbacks re-enter the engine) byte-identical across jit/jitless/
+--gc-stress; clippy `-D warnings` clean; workspace 32 suites green; three
+release test262 sweeps at baseline (language 23721/3 skip, built-ins
+23657/155 skip, annexB 1086/1086, zero fail/crash/hang — the one built-ins
+run with 2 copyWithin "hangs" re-ran clean at baseline: those two ~8s
+fixtures wobble between pass and hang under batch contention, each PASSes
+standalone via `--single` in ~8.4s); corpus parity 37/37 ok, 0 mismatches.
+
+Open (measured, not started): the ~50ns/op that remains over the leaf
+floor is the `builtin_handler` thread-local RefCell<HashMap> get + the
+handler call itself — a handler pointer cached on the crux function
+object or a direct-mapped cell would close most of it, and the same
+registered-handler shortcut applies to the constructor rows (a registered
+construct path). The vector-form call sites still rebuild the fast layout
+before the core.
+
 
 
 ## Deferred milestones
