@@ -472,6 +472,8 @@ fn value_to_call_slot(value: Value) -> Option<u64> {
 /// of tag index-space entry `x` whose payload rides `scratch[0..nargs)`,
 /// parked as an in-flight exception (see [`throw_op`]); `16` = a `throw_ref`
 /// re-raising the exception whose pool id is `x` (see [`rethrow_op`]);
+/// `17`/`18` = `global.get`/`global.set` over any global index-space entry
+/// (see [`global_op`]);
 /// `40`/`41` = `extern.convert_any`/`any.convert_extern` re-tagging the
 /// token `x` (see [`gc_convert_op`]); `50`-`56` = the array bulk ops (see
 /// [`array_bulk_op`]); `60` = the `ref.test`/`ref.cast` type match check
@@ -509,6 +511,12 @@ pub unsafe extern "C" fn wasm_call_helper(
             return throw_op(store, instance, x, nargs, scratch);
         }
         return rethrow_op(store, x);
+    }
+    // A compiled `global.get` (17) / `global.set` (18) accesses the store
+    // cell directly (imported and call-bearing globals never ride the `gvals`
+    // snapshot; see [`global_op`]).
+    if mode == 17 || mode == 18 {
+        return global_op(store, instance, mode, x, scratch);
     }
     // Compiled GC aggregate ops (modes 30-38) mirror the interpreter's
     // struct/array semantics against the store's object pool.
@@ -2390,6 +2398,65 @@ fn flush_globals(store: &mut Store, cells: &[usize], words: &[u64]) {
         };
         store.globals[cell] = value;
     }
+}
+
+/// A compiled `global.get` (mode 17) / `global.set` (mode 18) over any global
+/// index-space entry — imported cells included. An imported cell can alias
+/// another import slot, and a call-bearing body's writes must be visible to
+/// (and reads fresh from) callees, so these access the store cell the way the
+/// interpreter does instead of riding the caller-owned `gvals` snapshot. A
+/// `get` writes the cell's word(s) to `scratch` (two for a v128); a `set`
+/// reads them back from `scratch`.
+#[cfg(feature = "compile")]
+fn global_op(store: &mut Store, instance: u64, mode: u64, x: u64, scratch: *mut u64) -> i32 {
+    let cell = match store
+        .instances
+        .get(instance as usize)
+        .and_then(|inst| inst.globals.get(x as usize))
+        .copied()
+    {
+        Some(cell) => cell,
+        None => {
+            store.set_pending_error(ExecFail::Unsupported(
+                "unresolved global in a compiled body",
+            ));
+            return crate::compile::TRAP_PENDING_ERROR;
+        }
+    };
+    match mode {
+        17 => {
+            let words = seed_globals(store, &[cell]);
+            // SAFETY: `scratch` is the caller-owned scratch region, sized for
+            // any call site the body can lower (two words for a v128).
+            unsafe {
+                for (i, word) in words.iter().enumerate() {
+                    *scratch.add(i) = *word;
+                }
+            }
+        }
+        _ => {
+            let width = match store.global_types.get(cell).map(|ty| ty.value) {
+                Some(ValType::V128) => 2,
+                Some(_) => 1,
+                None => {
+                    store.set_pending_error(ExecFail::Unsupported(
+                        "unresolved global in a compiled body",
+                    ));
+                    return crate::compile::TRAP_PENDING_ERROR;
+                }
+            };
+            let mut words = vec![0u64; width];
+            // SAFETY: `scratch` holds the value words the compiled `global.set`
+            // spilled before the call.
+            unsafe {
+                for (i, word) in words.iter_mut().enumerate() {
+                    *word = *scratch.add(i);
+                }
+            }
+            flush_globals(store, &[cell], &words);
+        }
+    }
+    crate::compile::TRAP_NONE
 }
 
 impl Store {

@@ -35,11 +35,14 @@
 //!   calls a runtime helper (entry params 7-9) that reallocates the store
 //!   cell's backing `Vec` and rewrites the descriptor entry, so later
 //!   accesses see the grown buffer;
-//! - `global.get`/`global.set` of module-defined numeric and v128 globals,
-//!   through a caller-owned buffer (one u64 word per numeric global, two per
-//!   v128): the compiled body reads and mutates the buffer in place, so its
-//!   writes reach the store even when it traps. Imported globals (whose
-//!   cells can alias) and GC objects are not lowered yet;
+//! - `global.get`/`global.set` of numeric and v128 globals, whether
+//!   module-defined or imported. A module-defined global of a call-free body
+//!   rides the caller-owned `gvals` buffer (one u64 word per numeric global,
+//!   two per v128), so its writes reach the store even when the body traps;
+//!   imported globals (whose cells can alias) and every global of a
+//!   call-bearing body go straight to the store cell through a runtime helper
+//!   instead, because an aliased import slot or a callee can change a shared
+//!   cell between accesses. GC objects are not lowered yet;
 //! - (nullable or not) function references ride the compiled stack as opaque
 //!   u64 tokens (0 = null; a function reference packs its address), so
 //!   `ref.func`/`ref.null func`/`ref.is_null`, `table.get`/`table.set` over
@@ -51,8 +54,9 @@
 //!   calls a store-side helper (entry params 10-11) that runs the callee
 //!   through the interpreter, so a compiled body can call anything —
 //!   interpreted or compiled, owned or host — without unbounded native
-//!   recursion. A call-bearing body that also uses globals stays interpreted
-//!   (the `gvals` snapshot would go stale across the callee).
+//!   recursion. A call-bearing body that also uses globals lowers each
+//!   `global.get`/`set` through the store-cell helper (no `gvals` snapshot to
+//!   go stale across the callee).
 //!
 //! ABI: a compiled entry is
 //! `unsafe extern "C" fn(args, nargs, mems, ncount, gvals, out, nout,
@@ -410,10 +414,9 @@ pub fn compile_module(module: &Module) -> Vec<Option<CompiledFunc>> {
 }
 
 /// A coarse reason a module-defined body is not compiled, for the coverage
-/// report: the structural gates first (non-carried types, a call-bearing
-/// body that uses globals, a `try_table` handler, an imported global), then
-/// the per-instruction subset. A body that passes the gate but still fails
-/// to lower is normally a branch to the implicit function label, a
+/// report: the structural gates first (non-carried types, a `try_table`
+/// handler), then the per-instruction subset. A body that passes the gate but
+/// still fails to lower is normally a branch to the implicit function label, a
 /// parameterized `if` without an `else`, or a latent lowerer mismatch — the
 /// message reflects that.
 pub fn body_compile_reason(module: &Module, defined: usize) -> &'static str {
@@ -433,37 +436,12 @@ pub fn body_compile_reason(module: &Module, defined: usize) -> &'static str {
     {
         return "non-carried parameter/result/local type";
     }
-    let has_call = body.body.iter().any(|instr| {
-        matches!(
-            instr,
-            Instr::Call(_)
-                | Instr::ReturnCall(_)
-                | Instr::CallIndirect { .. }
-                | Instr::ReturnCallIndirect { .. }
-        )
-    });
-    let uses_globals = body
-        .body
-        .iter()
-        .any(|instr| matches!(instr, Instr::GlobalGet(_) | Instr::GlobalSet(_)));
-    if has_call && uses_globals {
-        return "call-bearing body uses globals";
-    }
     if body
         .body
         .iter()
         .any(|instr| matches!(instr, Instr::TryTable { .. }))
     {
         return "try_table exception-handling body";
-    }
-    let imported_global = body.body.iter().any(|instr| match instr {
-        Instr::GlobalGet(index) | Instr::GlobalSet(index) => {
-            defined_global(module, *index).is_none()
-        }
-        _ => false,
-    });
-    if imported_global {
-        return "imported global";
     }
     if !lowerable(module, func_type, body) {
         return "instruction outside the lowering subset";
@@ -515,7 +493,14 @@ impl Engine {
             entry_signature(conv),
         );
         let mut fctx = FunctionBuilderContext::new();
-        let globals = body_globals(body);
+        // Only a call-free body rides the `gvals` buffer (and only for its
+        // module-defined globals); a call-bearing body's globals access the
+        // store cells through the runtime helper instead.
+        let globals = if body_has_calls(body) {
+            Vec::new()
+        } else {
+            body_globals(module, body)
+        };
         lower(
             module, body, func_type, &globals, &mut func, &mut fctx, &*self.isa,
         )
@@ -717,16 +702,39 @@ fn memory_is64(module: &Module, index: u32) -> Option<bool> {
     }
 }
 
-/// A module global's declared `(ValType, mutable)`, resolving index-space
-/// indices past the imported globals (imported globals may alias a shared
-/// cell, so compiled bodies only touch module-defined ones).
-fn defined_global(module: &Module, index: u32) -> Option<(ValType, bool)> {
-    let imported = module
+/// The number of imported globals (the head of the module global index
+/// space).
+fn imported_globals(module: &Module) -> u32 {
+    module
         .imports
         .iter()
         .filter(|import| matches!(import.desc, ImportDesc::Global(_)))
-        .count() as u32;
-    let slot = index.checked_sub(imported)?;
+        .count() as u32
+}
+
+/// A global index-space entry's declared `(value type, mutable)`, imports
+/// first then the module's own definitions.
+fn global_at(module: &Module, index: u32) -> Option<(ValType, bool)> {
+    if index < imported_globals(module) {
+        module
+            .imports
+            .iter()
+            .filter_map(|import| match import.desc {
+                ImportDesc::Global(ty) => Some((ty.value, ty.mutable)),
+                _ => None,
+            })
+            .nth(index as usize)
+    } else {
+        defined_global(module, index)
+    }
+}
+
+/// A module-defined global's declared `(ValType, mutable)` (past the imported
+/// globals). Only these ride the caller-owned `gvals` buffer: an imported
+/// cell can alias another import slot, so imported indices always access the
+/// store cell directly.
+fn defined_global(module: &Module, index: u32) -> Option<(ValType, bool)> {
+    let slot = index.checked_sub(imported_globals(module))?;
     let global = module.globals.get(slot as usize)?;
     Some((global.ty.value, global.ty.mutable))
 }
@@ -952,9 +960,29 @@ fn callable_type(module: &Module, ty: Option<FuncType>) -> bool {
             .all(|t| carrier_type(module, *t).is_some())
 }
 
-/// The module global indices (index space) a body reads or writes, sorted
-/// and deduplicated (the order the `gvals` buffer slots use).
-fn body_globals(body: &FuncBody) -> Vec<u32> {
+/// Whether the body contains any call instruction (direct, indirect, or
+/// `call_ref`, and their `return_call*` tail forms). A call-bearing body's
+/// `global.get`/`set` lower through the store-cell helper, so its `gvals`
+/// buffer stays empty.
+fn body_has_calls(body: &FuncBody) -> bool {
+    body.body.iter().any(|instr| {
+        matches!(
+            instr,
+            Instr::Call(_)
+                | Instr::ReturnCall(_)
+                | Instr::CallIndirect { .. }
+                | Instr::ReturnCallIndirect { .. }
+                | Instr::CallRef(_)
+                | Instr::ReturnCallRef(_)
+        )
+    })
+}
+
+/// The module-defined global indices (index space) a call-free body reads or
+/// writes, sorted and deduplicated (the order the `gvals` buffer slots use).
+/// Imported indices are excluded: they access the store cell directly.
+fn body_globals(module: &Module, body: &FuncBody) -> Vec<u32> {
+    let imported = imported_globals(module);
     let mut indices: Vec<u32> = body
         .body
         .iter()
@@ -962,6 +990,7 @@ fn body_globals(body: &FuncBody) -> Vec<u32> {
             Instr::GlobalGet(index) | Instr::GlobalSet(index) => Some(*index),
             _ => None,
         })
+        .filter(|index| *index >= imported)
         .collect();
     indices.sort_unstable();
     indices.dedup();
@@ -1010,25 +1039,9 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
     {
         return false;
     }
-    // A call-bearing body cannot also use globals: `global.get/set` lower
-    // through the caller-owned `gvals` buffer, which an interpreted callee
-    // (running against the store's real cells) neither sees nor refreshes.
-    let has_call = body.body.iter().any(|instr| {
-        matches!(
-            instr,
-            Instr::Call(_)
-                | Instr::ReturnCall(_)
-                | Instr::CallIndirect { .. }
-                | Instr::ReturnCallIndirect { .. }
-        )
-    });
-    let uses_globals = body
-        .body
-        .iter()
-        .any(|instr| matches!(instr, Instr::GlobalGet(_) | Instr::GlobalSet(_)));
-    if has_call && uses_globals {
-        return false;
-    }
+    // A call-bearing body's globals lower through the store-cell helper (no
+    // `gvals` snapshot to go stale across the callee); whether the body has
+    // calls decides only the buffer contents, not the lowering subset.
     body.body.iter().all(|instr| match instr {
         Instr::Nop
         | Instr::Unreachable
@@ -1060,11 +1073,11 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         }
         Instr::DataDrop(_) => true,
         Instr::GlobalGet(index) => matches!(
-            defined_global(module, *index),
+            global_at(module, *index),
             Some((ty, _)) if num_type(ty).is_some() || matches!(ty, ValType::V128)
         ),
         Instr::GlobalSet(index) => matches!(
-            defined_global(module, *index),
+            global_at(module, *index),
             Some((ty, true)) if num_type(ty).is_some() || matches!(ty, ValType::V128)
         ),
         Instr::Call(index) | Instr::ReturnCall(index) => {
@@ -1410,8 +1423,9 @@ struct Lowerer<'a> {
     /// must reload it on every use (they do).
     mems: ClifValue,
     /// The per-call global-values buffer (entry param 4): one u64 word per
-    /// used module global (a v128 global occupies two). `globals` maps a
-    /// module global index to its clif type and its buffer word offset.
+    /// used module-defined global of a call-free body (a v128 global occupies
+    /// two); imported and call-bearing bodies leave it empty. `globals` maps
+    /// a module global index to its clif type and its buffer word offset.
     globals_ptr: ClifValue,
     globals: Vec<(u32, Type, usize)>,
     out_ptr: ClifValue,
@@ -1914,99 +1928,147 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    /// `global.get`: read the module global's `gvals` buffer region, narrowed
-    /// from its u64 words (or loaded as its raw 16 bytes for a v128) to the
-    /// global's value type.
+    /// `global.get`: read a mapped module-defined global's `gvals` buffer
+    /// region (a call-free body), narrowed from its u64 words (or loaded as
+    /// its raw 16 bytes for a v128) to the global's value type. Imported
+    /// globals, and every global of a call-bearing body, instead run the
+    /// store-cell helper (mode 17): an imported cell can alias another import
+    /// slot, and a callee may have changed a shared cell since the snapshot,
+    /// so the value is read where the interpreter reads it.
     fn do_global_get(&mut self, index: u32) -> Result<(), String> {
-        let (_, ty, word) = self
-            .globals
-            .iter()
-            .find(|(i, _, _)| *i == index)
-            .copied()
-            .ok_or("unmapped global in the lowering subset")?;
-        let address = self
-            .builder
-            .ins()
-            .iadd_imm_s(self.globals_ptr, 8 * word as i64);
-        let value = match ty {
-            types::I128 => {
-                self.builder
-                    .ins()
-                    .load(types::I128, MemFlagsData::new(), address, Offset32::new(0))
-            }
-            _ => {
-                let wide = self.builder.ins().load(
-                    types::I64,
+        if let Some((_, ty, word)) = self.globals.iter().find(|(i, _, _)| *i == index).copied() {
+            let address = self
+                .builder
+                .ins()
+                .iadd_imm_s(self.globals_ptr, 8 * word as i64);
+            let value = match ty {
+                types::I128 => self.builder.ins().load(
+                    types::I128,
                     MemFlagsData::new(),
                     address,
                     Offset32::new(0),
-                );
-                match ty {
-                    types::I32 => self.builder.ins().ireduce(types::I32, wide),
-                    types::F32 => {
-                        let bits = self.builder.ins().ireduce(types::I32, wide);
-                        self.builder
-                            .ins()
-                            .bitcast(types::F32, MemFlagsData::new(), bits)
+                ),
+                _ => {
+                    let wide = self.builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        address,
+                        Offset32::new(0),
+                    );
+                    match ty {
+                        types::I32 => self.builder.ins().ireduce(types::I32, wide),
+                        types::F32 => {
+                            let bits = self.builder.ins().ireduce(types::I32, wide);
+                            self.builder
+                                .ins()
+                                .bitcast(types::F32, MemFlagsData::new(), bits)
+                        }
+                        types::I64 => wide,
+                        types::F64 => {
+                            self.builder
+                                .ins()
+                                .bitcast(types::F64, MemFlagsData::new(), wide)
+                        }
+                        _ => return Err("non-carried global reached the lowerer".to_string()),
                     }
-                    types::I64 => wide,
-                    types::F64 => self
-                        .builder
-                        .ins()
-                        .bitcast(types::F64, MemFlagsData::new(), wide),
-                    _ => return Err("non-carried global reached the lowerer".to_string()),
                 }
-            }
-        };
-        self.stack.push(value);
+            };
+            self.stack.push(value);
+            return Ok(());
+        }
+        let (value_ty, _) =
+            global_at(self.module, index).ok_or("unresolved global in the lowering subset")?;
+        let mode = self.iconst(types::I64, 17);
+        let index_v = self.iconst(types::I64, i64::from(index));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            index_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)?;
+        if matches!(value_ty, ValType::V128) {
+            let value = self.load_v128(0);
+            self.stack.push(value);
+        } else {
+            self.push_scratch_value(value_ty)?;
+        }
         Ok(())
     }
 
-    /// `global.set`: widen the value to its `gvals` buffer region (two words
-    /// for a v128). The write lands in caller-owned memory immediately, so it
-    /// is visible to the store even when a later instruction traps.
+    /// `global.set`: widen the value to a mapped module-defined global's
+    /// `gvals` buffer region (a call-free body; two words for a v128) — the
+    /// write lands in caller-owned memory immediately, so it is visible to the
+    /// store even when a later instruction traps. Imported globals, and every
+    /// global of a call-bearing body, instead run the store-cell helper (mode
+    /// 18) so an aliased import slot or a callee sees the write immediately.
     fn do_global_set(&mut self, index: u32) -> Result<(), String> {
         let value = self.pop().ok_or("operand stack underflow")?;
-        let (_, ty, word) = self
-            .globals
-            .iter()
-            .find(|(i, _, _)| *i == index)
-            .copied()
-            .ok_or("unmapped global in the lowering subset")?;
-        let address = self
-            .builder
-            .ins()
-            .iadd_imm_s(self.globals_ptr, 8 * word as i64);
-        match ty {
-            types::I128 => {
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), value, address, Offset32::new(0));
-            }
-            _ => {
-                let wide = match ty {
-                    types::I32 => self.builder.ins().uextend(types::I64, value),
-                    types::F32 => {
-                        let bits =
+        if let Some((_, ty, word)) = self.globals.iter().find(|(i, _, _)| *i == index).copied() {
+            let address = self
+                .builder
+                .ins()
+                .iadd_imm_s(self.globals_ptr, 8 * word as i64);
+            match ty {
+                types::I128 => {
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), value, address, Offset32::new(0));
+                }
+                _ => {
+                    let wide = match ty {
+                        types::I32 => self.builder.ins().uextend(types::I64, value),
+                        types::F32 => {
+                            let bits =
+                                self.builder
+                                    .ins()
+                                    .bitcast(types::I32, MemFlagsData::new(), value);
+                            self.builder.ins().uextend(types::I64, bits)
+                        }
+                        types::I64 => value,
+                        types::F64 => {
                             self.builder
                                 .ins()
-                                .bitcast(types::I32, MemFlagsData::new(), value);
-                        self.builder.ins().uextend(types::I64, bits)
-                    }
-                    types::I64 => value,
-                    types::F64 => {
-                        self.builder
-                            .ins()
-                            .bitcast(types::I64, MemFlagsData::new(), value)
-                    }
-                    _ => return Err("non-carried global reached the lowerer".to_string()),
-                };
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+                                .bitcast(types::I64, MemFlagsData::new(), value)
+                        }
+                        _ => return Err("non-carried global reached the lowerer".to_string()),
+                    };
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), wide, address, Offset32::new(0));
+                }
             }
+            return Ok(());
         }
-        Ok(())
+        let (value_ty, _) =
+            global_at(self.module, index).ok_or("unresolved global in the lowering subset")?;
+        if matches!(value_ty, ValType::V128) {
+            self.spill_v128(0, value);
+        } else {
+            let wide = self.slot_from(value_ty, value)?;
+            self.spill_u64(0, wide);
+        }
+        let mode = self.iconst(types::I64, 18);
+        let index_v = self.iconst(types::I64, i64::from(index));
+        let zero = self.iconst(types::I64, 0);
+        let args = [
+            self.store,
+            self.instance,
+            mode,
+            index_v,
+            zero,
+            zero,
+            zero,
+            self.scratch,
+            self.mems,
+        ];
+        self.runtime_call(&args)
     }
 
     /// A float constant from its IEEE bits.
@@ -4559,9 +4621,11 @@ fn lower(
         params[0], params[2], params[4], params[5], params[7], params[8], params[9], params[10],
         params[11],
     );
-    // Each used module global gets a `gvals` buffer region sized by its
-    // value type (one u64 word, or two for a v128), at the cumulative word
-    // offset the store side seeds/flushes with.
+    // Each used module-defined global of a call-free body gets a `gvals`
+    // buffer region sized by its value type (one u64 word, or two for a
+    // v128), at the cumulative word offset the store side seeds/flushes
+    // with. A call-bearing body (or an imported index) never uses the buffer:
+    // those accesses go through the store-cell helper modes.
     let mut word_offset = 0usize;
     let globals = used_globals
         .iter()
@@ -4706,9 +4770,9 @@ impl ExecutableCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::Store;
+    use crate::exec::{ExternVal, Store};
     use crate::instr::{LoadOp, StoreOp};
-    use crate::module::{FuncBody, Global, Module, Table};
+    use crate::module::{FuncBody, Global, Import, Module, Table};
     use crate::types::{
         BlockType, GlobalType, HeapType, Limits, MemType, RefType, SubType, TableType,
     };
@@ -6567,6 +6631,333 @@ mod tests {
         ));
         assert_eq!(outcomes[1], Ok(vec![Value::I32(42)]));
         assert_eq!(outcomes[3], Ok(vec![Value::I32(-3)]));
+    }
+
+    /// Run `module` (whose imports resolve through `make_imports`, called on
+    /// a fresh store) through both paths over `sequence`, requiring every
+    /// outcome to agree and returning the interpreter outcomes.
+    fn run_imported_seq(
+        make_imports: &dyn Fn(&mut Store) -> Vec<ExternVal>,
+        module: &Module,
+        sequence: &[(usize, Vec<Value>)],
+    ) -> Vec<Result<Vec<Value>, ExecFail>> {
+        assert!(
+            compile_module(module).iter().all(|entry| entry.is_some()),
+            "module did not compile; the comparison is vacuous"
+        );
+        let build = |compile: bool| -> (Store, usize) {
+            let mut store = Store::new();
+            if !compile {
+                store.set_compile(false);
+            }
+            let imports = make_imports(&mut store);
+            let mut queue = imports.into_iter();
+            let instance = store
+                .instantiate(module, &mut |_, _| queue.next())
+                .expect("module instantiates");
+            (store, instance)
+        };
+        let (mut compiled, compiled_instance) = build(true);
+        let (mut interpreter, interpreter_instance) = build(false);
+        let mut outcomes = Vec::new();
+        for (index, args) in sequence {
+            let via_compiled = compiled.invoke(compiled_instance, *index, args);
+            let via_interpreter = interpreter.invoke(interpreter_instance, *index, args);
+            let agree = match (&via_compiled, &via_interpreter) {
+                (Ok(a), Ok(b)) => a == b,
+                (Err(a), Err(b)) => format!("{a:?}") == format!("{b:?}"),
+                _ => false,
+            };
+            assert!(
+                agree,
+                "paths diverge for seq {sequence:?}: compiled={via_compiled:?} interpreter={via_interpreter:?}"
+            );
+            outcomes.push(via_interpreter);
+        }
+        outcomes
+    }
+
+    #[test]
+    fn imported_globals_access_the_shared_cell_directly() {
+        // Two import slots for one mutable i32 cell: a write through one slot
+        // must be visible through the other, in the same call and across
+        // calls. Compiled bodies read imported cells straight from the store
+        // (never a per-slot snapshot), so the aliasing matches the
+        // interpreter exactly.
+        let module = Module {
+            types: vec![
+                // 0: () -> i32 (get through slot 1).
+                SubType::func(vec![], vec![ValType::I32]),
+                // 1: (i32) -> (): set through slot 0.
+                SubType::func(vec![ValType::I32], vec![]),
+                // 2: (i32) -> i32: write slot 0, read slot 1.
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+            ],
+            imports: vec![
+                Import {
+                    module: "m".into(),
+                    name: "g".into(),
+                    desc: ImportDesc::Global(GlobalType {
+                        value: ValType::I32,
+                        mutable: true,
+                    }),
+                },
+                Import {
+                    module: "m".into(),
+                    name: "g".into(),
+                    desc: ImportDesc::Global(GlobalType {
+                        value: ValType::I32,
+                        mutable: true,
+                    }),
+                },
+            ],
+            functions: vec![0, 1, 2],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::GlobalGet(1)],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::GlobalSet(0)],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::GlobalSet(0), Instr::GlobalGet(1)],
+                },
+            ],
+            ..Module::default()
+        };
+        let make_imports = |store: &mut Store| {
+            let cell = store.global(
+                GlobalType {
+                    value: ValType::I32,
+                    mutable: true,
+                },
+                Value::I32(0),
+            );
+            vec![ExternVal::Global(cell), ExternVal::Global(cell)]
+        };
+        let outcomes = run_imported_seq(
+            &make_imports,
+            &module,
+            &[
+                (2, vec![Value::I32(5)]),
+                (0, vec![]),
+                (1, vec![Value::I32(-3)]),
+                (0, vec![]),
+                (2, vec![Value::I32(i32::MAX)]),
+                (0, vec![]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(5)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(5)]));
+        assert_eq!(outcomes[2], Ok(vec![]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(-3)]));
+        assert_eq!(outcomes[4], Ok(vec![Value::I32(i32::MAX)]));
+        assert_eq!(outcomes[5], Ok(vec![Value::I32(i32::MAX)]));
+
+        // The same aliasing through a v128 cell (two words cross the store
+        // boundary): set through slot 0, read back through slot 1.
+        let module = Module {
+            types: vec![
+                // 0: (v128) -> (): set through slot 0.
+                SubType::func(vec![ValType::V128], vec![]),
+                // 1: () -> v128: get through slot 1.
+                SubType::func(vec![], vec![ValType::V128]),
+            ],
+            imports: vec![
+                Import {
+                    module: "m".into(),
+                    name: "g".into(),
+                    desc: ImportDesc::Global(GlobalType {
+                        value: ValType::V128,
+                        mutable: true,
+                    }),
+                },
+                Import {
+                    module: "m".into(),
+                    name: "g".into(),
+                    desc: ImportDesc::Global(GlobalType {
+                        value: ValType::V128,
+                        mutable: true,
+                    }),
+                },
+            ],
+            functions: vec![0, 1],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::GlobalSet(0)],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::GlobalGet(1)],
+                },
+            ],
+            ..Module::default()
+        };
+        let make_imports = |store: &mut Store| {
+            let cell = store.global(
+                GlobalType {
+                    value: ValType::V128,
+                    mutable: true,
+                },
+                Value::V128(0),
+            );
+            vec![ExternVal::Global(cell), ExternVal::Global(cell)]
+        };
+        let patterns = [0u128, 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210, u128::MAX];
+        let mut sequence = Vec::new();
+        for pattern in patterns {
+            sequence.push((0, vec![Value::V128(pattern)]));
+            sequence.push((1, vec![]));
+        }
+        let outcomes = run_imported_seq(&make_imports, &module, &sequence);
+        for (k, pattern) in patterns.iter().enumerate() {
+            assert_eq!(outcomes[2 * k], Ok(vec![]));
+            assert_eq!(outcomes[2 * k + 1], Ok(vec![Value::V128(*pattern)]));
+        }
+    }
+
+    #[test]
+    fn call_bearing_bodies_sync_globals_across_calls() {
+        // A compiled body that writes a module-defined global, calls a callee
+        // that bumps it, then reads it back: the callee's write must be
+        // visible to the caller (and the caller's write to the callee). Both
+        // functions compile, so the call takes the native re-entry path — the
+        // old per-body `gvals` snapshot would go stale across it.
+        let module = Module {
+            types: vec![
+                // 0: () -> i32 (caller).
+                SubType::func(vec![], vec![ValType::I32]),
+                // 1: (i32) -> (): g = g + param.
+                SubType::func(vec![ValType::I32], vec![]),
+                // 2: () -> i32: read g.
+                SubType::func(vec![], vec![ValType::I32]),
+            ],
+            functions: vec![0, 1, 2],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(5),
+                        Instr::GlobalSet(0),
+                        Instr::I32Const(7),
+                        Instr::Call(1),
+                        Instr::GlobalGet(0),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::GlobalGet(0),
+                        Instr::Num(NumOp::I32Add),
+                        Instr::GlobalSet(0),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::GlobalGet(0)],
+                },
+            ],
+            globals: vec![Global {
+                ty: GlobalType {
+                    value: ValType::I32,
+                    mutable: true,
+                },
+                init: vec![Instr::I32Const(10)],
+            }],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "module did not compile; the comparison is vacuous"
+        );
+        let outcomes = run_seq(
+            &module,
+            &[
+                (0, vec![]),
+                (0, vec![]),
+                (1, vec![Value::I32(100)]),
+                (2, vec![]),
+            ],
+        );
+        // g starts 10: set 5, bump by 7 -> 12; each caller call resets g to
+        // 5 first, so the second returns 12 too. A direct bump then reads 112.
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(12)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(12)]));
+        assert_eq!(outcomes[2], Ok(vec![]));
+        assert_eq!(outcomes[3], Ok(vec![Value::I32(112)]));
+    }
+
+    #[test]
+    fn call_bearing_globals_stay_synced_through_an_interpreted_callee() {
+        // The same shape with the callee forced onto the interpreter (it
+        // reads a non-carried externref global, so it never compiles): the
+        // interpreted callee runs against the store cells, and the compiled
+        // caller's reads and writes must meet it there.
+        let module = Module {
+            types: vec![
+                // 0: () -> i32 (caller).
+                SubType::func(vec![], vec![ValType::I32]),
+                // 1: (i32) -> (): interpreted bump.
+                SubType::func(vec![ValType::I32], vec![]),
+            ],
+            functions: vec![0, 1],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(5),
+                        Instr::GlobalSet(0),
+                        Instr::I32Const(7),
+                        Instr::Call(1),
+                        Instr::GlobalGet(0),
+                    ],
+                },
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::GlobalGet(1),
+                        Instr::Drop,
+                        Instr::LocalGet(0),
+                        Instr::GlobalGet(0),
+                        Instr::Num(NumOp::I32Add),
+                        Instr::GlobalSet(0),
+                    ],
+                },
+            ],
+            globals: vec![
+                Global {
+                    ty: GlobalType {
+                        value: ValType::I32,
+                        mutable: true,
+                    },
+                    init: vec![Instr::I32Const(10)],
+                },
+                Global {
+                    ty: GlobalType {
+                        value: ValType::Ref(RefType {
+                            nullable: true,
+                            heap: HeapType::Extern,
+                        }),
+                        mutable: false,
+                    },
+                    init: vec![Instr::RefNull(HeapType::Extern)],
+                },
+            ],
+            ..Module::default()
+        };
+        let compiled = compile_module(&module);
+        assert!(compiled[0].is_some(), "the caller must compile");
+        assert!(compiled[1].is_none(), "the callee must stay interpreted");
+        // g starts 10: set 5, bump by 7 -> 12; every caller call resets g to
+        // 5 first, so both invocations return 12.
+        let outcomes = run_seq(&module, &[(0, vec![]), (0, vec![])]);
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(12)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::I32(12)]));
     }
 
     #[test]

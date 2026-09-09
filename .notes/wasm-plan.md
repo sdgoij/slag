@@ -2499,15 +2499,57 @@ coarse there — it reports no per-function `lower()` message yet.
 
 ### Wave B — globals and calls
 
-- [ ] Imported globals: `global.get`/`set` over imported cells, including
-the aliasing case (one imported global reached through two import slots) —
-decide the buffer/snapshot rule.
-- [ ] Call-bearing bodies that use globals: refresh the `gvals` buffer from
-the store after a callee runs (mirroring the descriptor refresh), then drop
-the `has_call && uses_globals` gate.
-- [ ] Unit tests: imported global read/write, an aliased import, and a
-global mutated through an interpreted callee then read natively.
-equiv over `global`, `linking`, `imports`, and `memory_grow`.
+- [x] Imported globals: `global.get`/`set` over imported cells, including
+  the aliasing case (one imported global reached through two import slots).
+  Buffer/snapshot rule: only module-defined globals of a call-free body ride
+  the caller-owned `gvals` buffer; imported indices (whose cells can alias)
+  and every global of a call-bearing body access the store cell directly
+  through a runtime helper (`wasm_call_helper` modes 17/18), which is exactly
+  the interpreter's model — an aliased import slot or a callee sees each
+  access immediately.
+- [x] Call-bearing bodies that use globals: drop the `has_call &&
+  uses_globals` gate. Their `global.get`/`set` lower through the store-cell
+  helper (modes 17/18), so the body keeps no `gvals` snapshot to go stale
+  across the callee (native re-entry and interpreted subtrees both write the
+  real cells). `CallRef`/`ReturnCallRef` count as calls for this decision too
+  (the old gate's list omitted them).
+- [x] Unit tests: imported global read/write, an aliased i32 and v128 import
+  (same call and across calls), a compiled caller whose global is bumped by
+  a native-re-entry callee, and one whose bump runs through an interpreted
+  callee — all interpreter-equivalent (`compile.rs` tests).
+- [x] equiv over `global`, `linking`, `imports`, and `memory_grow`: green.
+  Release `wasmtest equiv` over the whole `waspec/test/core` corpus (with the
+  shipped exclusions; `gc/array.wast` additionally excluded — see below) is
+  **253 suites, 0 diverged**, coverage 7865/8225 (95%), and the "imported
+global" / "call-bearing body uses globals" buckets are gone from the
+  fallback histogram. On the four Wave B suites alone coverage rose 145/166
+  (87%, HEAD) → 161/166 (96%) with both runs 0 diverged.
+
+#### Wave B — status (2026-09-09)
+
+Imported globals and call-bearing-global bodies now compile. A module-defined
+numeric/v128 global of a call-free body still rides the `gvals` buffer (fast,
+and writes reach the store even when the body traps); every other `global.get`/
+`set` — any imported index, or any index in a body that contains a call —
+spills to the scratch and runs `wasm_call_helper` mode 17 (read) / 18
+(write), which resolves the index-space entry to its store cell and moves the
+value's words with the same per-type layout `seed_globals`/`flush_globals`
+use. The decision keeps one access model for shared cells instead of a
+flush/refresh protocol at call sites, at the cost of a helper round-trip per
+global access in call-bearing bodies.
+
+`lowerable`/`body_compile_reason` dropped the "call-bearing body uses
+globals" and "imported global" buckets (`global_at` now admits any carried
+global, imports first); `body_globals` filters to defined indices and
+`body_has_calls` empties the buffer for call-bearing bodies. wasm lib tests
+101 (compile feature) / 36 (no feature), clippy clean in both
+configurations.
+
+Corpus note: `waspec/test/core/gc/array.wast` aborts the whole process with
+a 64 GiB allocation failure (`memory allocation of 68719476736 bytes failed`)
+in both debug and release, at HEAD and with Wave B — a pre-existing engine
+issue (likely a missing allocation-size trap in `array.new`-shaped fixtures)
+unrelated to Wave B, not yet triaged.
 
 ### Wave C — exception handling (`try_table`)
 
