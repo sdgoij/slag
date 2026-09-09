@@ -220,6 +220,11 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             // arguments are in the Vm's vector), popped and replaced by the
             // result — net 0.
             Step::Construct => {}
+            // A tagged template pops the tag + its `this` (2) and pushes the
+            // result (1) — net -1.
+            Step::TaggedTemplate(_) | Step::TailTaggedTemplate(_) => {
+                depth = depth.saturating_sub(1)
+            }
             // Array literals (Cut 52): `ArrayBegin` pushes the array;
             // `ArrayElement`/`ArraySpread` pop the element(s) + the array and
             // push the array back; `ArrayHole`/`ArrayEnd` keep the array on
@@ -468,6 +473,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::Call { .. } | Step::CallFast { .. } => "Call",
         Step::CallApply { .. } => "CallApply",
         Step::Construct => "Construct",
+        Step::TaggedTemplate(_) | Step::TailTaggedTemplate(_) => "TaggedTemplate",
         Step::CallFastGlobal { .. }
         | Step::CallFastSlot { .. }
         | Step::CallFastGlobalStore { .. }
@@ -4612,6 +4618,22 @@ impl<'a> Lowerer<'a> {
                 let callee = self.pop();
                 let sp = self.builder.use_var(self.sp_var);
                 let result = self.call_slow(self.sig_get_name, Helper::Construct, &[callee, sp])?;
+                self.push(result);
+                self.fall_through(index);
+            }
+            Step::TaggedTemplate(_) => {
+                // Cut 78: mirror `Construct` — the machine pushed `[this,
+                // tag]` (a plain tag's `this` is undefined, a member tag's is
+                // its base), the substitutions sit in `Vm::args` above an
+                // `ArgsBase` boundary, and the helper reads the
+                // `TemplateLiteral` payload from the step. It pops the
+                // boundary, splits the substitutions, and runs the tag via
+                // the general call machinery.
+                let tag = self.pop();
+                let this = self.pop();
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let result =
+                    self.call_slow(self.sig_rel, Helper::TaggedTemplate, &[tag, this, step_imm])?;
                 self.push(result);
                 self.fall_through(index);
             }

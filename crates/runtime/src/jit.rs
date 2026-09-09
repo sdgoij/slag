@@ -653,6 +653,11 @@ pub struct JitSlowPaths {
     /// lets an environment-free leaf body run on the caller's ctx with a
     /// frame carved from its buffer.
     pub construct: extern "C" fn(ctx: *mut c_void, callee: u64, sp: u64) -> u64,
+    /// `Step::TaggedTemplate` (Cut 78): the tag + its `this` on the JIT
+    /// buffer, the substitutions in the Vm's vector above an argument
+    /// boundary, and the step index (the `TemplateLiteral` payload lives in
+    /// the step) — mirror the interpreter handler and run the tag.
+    pub tagged_template: extern "C" fn(ctx: *mut c_void, tag: u64, this: u64, step: u64) -> u64,
     /// `Step::TailCall` (the vector form): like `tail_call`, reading the
     /// arguments from the Vm's vector instead of the JIT buffer.
     pub tail_call_vector:
@@ -983,6 +988,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     args_spread,
     call_vector,
     construct,
+    tagged_template,
     tail_call_vector,
     tail_call_self_vector,
     array_begin,
@@ -2216,6 +2222,44 @@ extern "C" fn regexp_literal(ctx: *mut c_void, step: u64) -> u64 {
         unreachable!("regexp_literal on a non-RegExpLiteral step");
     };
     match crate::expr::eval_regexp_literal(agent, pattern, flags) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn tagged_template(ctx: *mut c_void, tag: u64, this: u64, step: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let Some(crate::ir::Step::TaggedTemplate(template)) = step_at(ctx, step) else {
+        unreachable!("tagged_template on a non-TaggedTemplate step");
+    };
+    // Mirror the interpreter's `Step::TaggedTemplate` handler: pop the
+    // argument boundary and split the substitutions (built by the compiled
+    // ArgsBase/ArgsPush steps into the Vm's vector), then run the tag. The
+    // substitution Vec is unrooted while the tag invocation allocates, so
+    // `--gc-stress` is suppressed for the window (like the handler).
+    let base = match vm.args_base_stack.pop() {
+        Some(base) => base,
+        None => {
+            return slow_error(
+                ctx,
+                JsError::new(
+                    ErrorKind::SyntaxError,
+                    "TaggedTemplate without an argument boundary".into(),
+                ),
+            );
+        }
+    };
+    let _stress = crate::ir::StressSuppress::new();
+    let substitutions = vm.args.split_off(base);
+    match crate::ir::tagged_template(
+        agent,
+        Value::from_bits(this),
+        Value::from_bits(tag),
+        template,
+        substitutions,
+    ) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
     }

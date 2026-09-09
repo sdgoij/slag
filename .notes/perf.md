@@ -7587,6 +7587,52 @@ Remaining construct mass (journaled, not started): the eligibility prelude
 + `construct_this_object` + the FFI — a machine site-cache + create-this
 FFI would need the receiver allocation moved out of the core to cut further.
 
+### LANDED (2026-09-09): tagged templates certify and JIT — the compiled `TaggedTemplate` step runs the tag through a machine slow-path helper (Cut 78)
+
+The corpus #2 row (`template-literal/evaluation-order`, ~1.1-1.3s jit in the
+row history) was a JIT-coverage gap mislabeled "diffuse": `FastScopeScan`
+rejected `ExprKind::TaggedTemplate`, so a body whose hot call is a tagged
+template never certified and jit == jitless on it (~1µs+ per tagged call vs
+~60-70ns for an equivalent plain call). The fix has two halves:
+
+1. **Certification** (`FastScopeScan::expr`, ir.rs): a `TaggedTemplate`
+   certifies when its tag and every substitution expression scan — the tag
+   is an ordinary callee expression and the substitution expressions are
+   ordinary value expressions, so nothing about the step needs the env
+   machinery. A TAIL-position tagged template still bails at JIT emit
+   (`TailTaggedTemplate` has no emit arm; the compiler's catch-all returns
+   `Unsupported`, the body caches as non-compilable and runs interpreted).
+2. **JIT lowering** (compiler.rs emit arm next to `Construct`): the machine
+   pushed `[this, tag]` (a plain tag's `this` is undefined, a member tag's
+   is its base), the substitutions sit in `Vm::args` above an `ArgsBase`
+   boundary — so the compiled step pops both, passes the step index, and
+   `call_slow`s the new `tagged_template` FFI helper (jit.rs), which mirrors
+   the interpreter handler exactly: pop the boundary (SyntaxError when
+   absent), `StressSuppress` the unrooted-substitutions window, `split_off`,
+   and run `ir::tagged_template` (the general call machinery). Helper
+   registered through the four-file mirror (`Helper::TaggedTemplate`, the
+   `JitSlowPaths` entry, both test tables). `max_stack_usage` nets -1.
+
+The certification half is visible in BOTH engines (a certified body runs
+frame-slot/register-lowered even interpreted). Interleaved A/B on
+scratch/tagged_probe.js T1 (`tag`x${i}y`` per iteration, 200k): BEFORE
+jit ~322-363ms / jl ~325-344ms (no certification at all); AFTER jit
+155-164ms / jl 171-182ms — the ~2x is the certification verdict, and the
+compiled step adds another ~10% over the interpreted certified path. The
+corpus `evaluation-order` row (full-corpus bench, 37 workloads): jit
+583.6ms / jl 628.7ms vs ~1.1-1.3s in the row history — the fixture is
+closure/assert-dominated, so the row shows the certification win, not the
+~2x of a pure tagged loop.
+
+Correctness: 179 jit e2e green; a 8-edge probe (member-tag receiver
+identity, throwing tag propagation, non-callable/undefined tag TypeError,
+left-to-right substitution order, primitive tag result, template-object
+identity + frozen-ness, raw props) byte-identical across jit/jitless/
+--gc-stress; clippy `-D warnings` clean; workspace 32 suites green; three
+release test262 sweeps at baseline (language 23721/3 skip, built-ins
+23657/155 skip, annexB 1086/1086, zero fail/crash/hang); corpus parity
+37/37 ok, 0 mismatches.
+
 
 
 ## Deferred milestones

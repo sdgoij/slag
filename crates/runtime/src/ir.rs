@@ -12854,7 +12854,7 @@ pub(crate) fn object_accessor(
 }
 
 /// TaggedTemplate evaluation (spec 13.3.6.2) for the IR step.
-fn tagged_template(
+pub(crate) fn tagged_template(
     agent: &mut Agent,
     this: Value,
     tag: Value,
@@ -22790,10 +22790,17 @@ impl FastScopeScan {
                     && crux::lookup(*meta) == JsString::from_utf8("new")
                     && crux::lookup(*property) == JsString::from_utf8("target")
             }
-            ExprKind::Class(_)
-            | ExprKind::PrivateIn { .. }
-            | ExprKind::TaggedTemplate { .. }
-            | ExprKind::ImportCall { .. } => false,
+            ExprKind::Class(_) | ExprKind::PrivateIn { .. } | ExprKind::ImportCall { .. } => false,
+            ExprKind::TaggedTemplate { tag, quasi } => {
+                // Cut 78: a tagged template certifies — the tag and the
+                // substitution expressions scan like any other expression,
+                // and the compiled `TaggedTemplate` step runs the tag via
+                // the general call machinery (an FFI helper), exactly like a
+                // vector-form call. A TAIL-position tagged template still
+                // bails at JIT emit (`TailTaggedTemplate` is un-lowered),
+                // keeping the body interpreted — safe, just not compiled.
+                self.expr(tag, depth) && quasi.exprs.iter().all(|expr| self.expr(expr, depth))
+            }
             // A generator/async body's suspension points (Cut 58): the
             // argument scans like any other expression. A `yield*`
             // delegation (`delegate: true`) stays on the env path — its
