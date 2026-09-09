@@ -1388,8 +1388,13 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
 mod tests {
     use crate::embed::Context;
 
+    // raylib's process-global window state binds to the thread of the first
+    // install, and the libtest harness runs every #[test] on its own thread,
+    // so all surface checks share one test: a guarded call from a parallel
+    // second installer would throw the thread-bound TypeError instead of
+    // running its assertion.
     #[test]
-    fn installs_the_rl_namespace_with_constants_and_color_helper() {
+    fn installs_the_rl_surface_with_constants_and_argument_validation() {
         let mut context = Context::new().unwrap();
         context.install_raylib().unwrap();
 
@@ -1412,7 +1417,7 @@ mod tests {
                 .as_boolean(),
             Some(true)
         );
-        // A omitted alpha defaults to opaque.
+        // An omitted alpha defaults to opaque.
         assert_eq!(
             context.eval("rl.color(1, 2, 3)").unwrap().as_number(),
             Some(0x010203FF as f64)
@@ -1437,13 +1442,8 @@ mod tests {
                 .as_boolean(),
             Some(true)
         );
-    }
 
-    #[test]
-    fn channel_errors_name_the_offending_argument() {
-        let mut context = Context::new().unwrap();
-        context.install_raylib().unwrap();
-
+        // rl.color argument validation names the offending argument.
         let error = match context.eval("rl.color(300, 0, 0)") {
             Ok(_) => panic!("rl.color with an out-of-range channel must throw"),
             Err(error) => error.to_string(),
@@ -1451,34 +1451,32 @@ mod tests {
         assert!(error.contains("rl.color"), "{error}");
         assert!(error.contains("argument 0"), "{error}");
         assert!(error.contains("0..=255"), "{error}");
-    }
 
-    #[cfg(feature = "raygui")]
-    #[test]
-    fn installs_the_raygui_surface_when_the_feature_is_on() {
-        let mut context = Context::new().unwrap();
-        context.install_raylib().unwrap();
-
-        // Controls are installed as `rl.gui*` methods; only their shape is
-        // checked here — drawing them needs a live window.
-        assert_eq!(
-            context
-                .eval("typeof rl.guiButton === 'function' && typeof rl.guiSlider === 'function'")
-                .unwrap()
-                .as_boolean(),
-            Some(true)
-        );
-        assert_eq!(
-            context.eval("rl.GUI_STATE_DISABLED").unwrap().as_number(),
-            Some(3.0)
-        );
-        // States outside the enum are rejected instead of letting raygui
-        // index its style arrays out of bounds on a later draw.
-        let error = match context.eval("rl.guiSetState(7)") {
-            Ok(_) => panic!("rl.guiSetState with an out-of-range state must throw"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("rl.guiSetState"), "{error}");
-        assert!(error.contains("GUI_STATE"), "{error}");
+        #[cfg(feature = "raygui")]
+        {
+            // Controls are installed as `rl.gui*` methods; only their shape is
+            // checked here — drawing them needs a live window.
+            assert_eq!(
+                context
+                    .eval(
+                        "typeof rl.guiButton === 'function' && typeof rl.guiSlider === 'function'"
+                    )
+                    .unwrap()
+                    .as_boolean(),
+                Some(true)
+            );
+            assert_eq!(
+                context.eval("rl.GUI_STATE_DISABLED").unwrap().as_number(),
+                Some(3.0)
+            );
+            // States outside the enum are rejected instead of letting raygui
+            // index its style arrays out of bounds on a later draw.
+            let error = match context.eval("rl.guiSetState(7)") {
+                Ok(_) => panic!("rl.guiSetState with an out-of-range state must throw"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("rl.guiSetState"), "{error}");
+            assert!(error.contains("GUI_STATE"), "{error}");
+        }
     }
 }
