@@ -1582,7 +1582,6 @@ fn array_bulk_op(
             };
             let src = slot(0) as u32 as u64;
             let n = slot(1) as u32 as u64;
-            let mut cells = Vec::with_capacity(n as usize);
             if mode == 53 {
                 let Some(width) = storage_width(storage) else {
                     return gc_unsupported(store, "array.new_data of references");
@@ -1602,11 +1601,26 @@ fn array_bulk_op(
                 if end > bytes.len() as u64 {
                     return code_of(Trap::OutOfBoundsMemoryAccess);
                 }
+                // Reserve only after the bounds checks hold (an in-bounds but
+                // oversized request still traps instead of aborting on
+                // allocation — the `alloc_array_filled` rule).
+                let mut cells = Vec::new();
+                if cells.try_reserve_exact(n as usize).is_err() {
+                    return code_of(Trap::OutOfBoundsMemoryAccess);
+                }
                 for i in 0..n {
                     match data_element(storage, bytes, (src + i * width as u64) as usize) {
                         Some(cell) => cells.push(cell),
                         None => return gc_unsupported(store, "array.new_data element read"),
                     }
+                }
+                let id = alloc_array(store, instance, x as u32, cells);
+                match crate::values::array_ref_token(id) {
+                    Some(token) => {
+                        write(0, token);
+                        crate::compile::TRAP_NONE
+                    }
+                    None => gc_unsupported(store, "array pool id overflow"),
                 }
             } else {
                 let items = match store.instances[instance].element_segments.get(y as usize) {
@@ -1620,17 +1634,21 @@ fn array_bulk_op(
                 if end > items.len() as u64 {
                     return code_of(Trap::OutOfBoundsTableAccess);
                 }
+                let mut cells = Vec::new();
+                if cells.try_reserve_exact(n as usize).is_err() {
+                    return code_of(Trap::OutOfBoundsTableAccess);
+                }
                 for i in 0..n {
                     cells.push(Value::Ref(items[(src + i) as usize]));
                 }
-            }
-            let id = alloc_array(store, instance, x as u32, cells);
-            match crate::values::array_ref_token(id) {
-                Some(token) => {
-                    write(0, token);
-                    crate::compile::TRAP_NONE
+                let id = alloc_array(store, instance, x as u32, cells);
+                match crate::values::array_ref_token(id) {
+                    Some(token) => {
+                        write(0, token);
+                        crate::compile::TRAP_NONE
+                    }
+                    None => gc_unsupported(store, "array pool id overflow"),
                 }
-                None => gc_unsupported(store, "array pool id overflow"),
             }
         }
         55 | 56 => {
@@ -4608,7 +4626,12 @@ impl<'a> Engine<'a> {
                 if end > bytes.len() as u64 {
                     return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
                 }
-                let mut cells = Vec::with_capacity(n as usize);
+                // An in-bounds but oversized request still traps instead of
+                // aborting on allocation (the `alloc_array_filled` rule).
+                let mut cells = Vec::new();
+                if cells.try_reserve_exact(n as usize).is_err() {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
+                }
                 for i in 0..n {
                     let at = (src + i * width) as usize;
                     cells.push(
@@ -4634,9 +4657,13 @@ impl<'a> Engine<'a> {
                 if end > items.len() as u64 {
                     return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
                 }
-                let cells = (0..n)
-                    .map(|i| Value::Ref(items[(src + i) as usize]))
-                    .collect();
+                let mut cells = Vec::new();
+                if cells.try_reserve_exact(n as usize).is_err() {
+                    return Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess));
+                }
+                for i in 0..n {
+                    cells.push(Value::Ref(items[(src + i) as usize]));
+                }
                 let id = alloc_array(self.store, instance, ty, cells);
                 self.stack.push(Value::Ref(RefValue::Array(id)));
                 Ok(Ctl::Next)

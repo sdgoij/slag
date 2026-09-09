@@ -10133,6 +10133,88 @@ mod tests {
     }
 
     #[test]
+    fn oversized_array_new_from_segments_traps_not_aborts() {
+        use crate::module::{DataMode, DataSegment, ElementMode, ElementSegment};
+        use crate::types::{CompositeType, FieldType, StorageType};
+        // array.new_data / array.new_elem with a src+length past the end of
+        // the segment must trap (out of bounds memory / table) *before* any
+        // allocation: the segment-backed builders used to reserve `length`
+        // elements up front, so a 2^31-length request over a short segment
+        // aborted the process with a 64 GiB allocation instead of trapping
+        // (waspec/test/core/gc/array.wast `new-overflow`).
+        let i32_array = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Array(FieldType {
+                ty: StorageType::I32,
+                mutable: true,
+            }),
+        };
+        let func_array = SubType {
+            is_final: true,
+            supertypes: vec![],
+            composite: CompositeType::Array(FieldType {
+                ty: StorageType::Ref(RefType::FUNC),
+                mutable: true,
+            }),
+        };
+        let module = Module {
+            types: vec![SubType::func(vec![], vec![]), i32_array, func_array],
+            data: vec![DataSegment {
+                mode: DataMode::Passive,
+                bytes: vec![1, 2, 3, 4],
+            }],
+            elements: vec![ElementSegment {
+                ty: RefType::FUNC,
+                mode: ElementMode::Passive,
+                init: vec![vec![Instr::RefFunc(0)], vec![Instr::RefFunc(0)]],
+            }],
+            functions: vec![0, 0, 0],
+            bodies: vec![
+                // 0: the no-op referenced by the element segment.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![],
+                },
+                // 1: array.new_data at src 2^31, length 2^31 (over the
+                // 4-byte segment).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(i32::MIN),
+                        Instr::I32Const(i32::MIN),
+                        Instr::ArrayNewData { ty: 1, data: 0 },
+                    ],
+                },
+                // 2: array.new_elem at src 2^31, length 2^31 (over the
+                // two-item segment).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::I32Const(i32::MIN),
+                        Instr::I32Const(i32::MIN),
+                        Instr::ArrayNewElem { ty: 2, elem: 0 },
+                    ],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "segment builder module did not compile"
+        );
+        let outcomes = run_seq(&module, &[(1, vec![]), (2, vec![])]);
+        assert!(matches!(
+            outcomes[0],
+            Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))
+        ));
+        assert!(matches!(
+            outcomes[1],
+            Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
+        ));
+    }
+
+    #[test]
     fn array_elem_bulk_ops_match_the_interpreter() {
         use crate::module::{ElementMode, ElementSegment};
         use crate::types::{CompositeType, FieldType, StorageType};

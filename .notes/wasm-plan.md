@@ -2558,11 +2558,13 @@ global, imports first); `body_globals` filters to defined indices and
 101 (compile feature) / 36 (no feature), clippy clean in both
 configurations.
 
-Corpus note: `waspec/test/core/gc/array.wast` aborts the whole process with
-a 64 GiB allocation failure (`memory allocation of 68719476736 bytes failed`)
-in both debug and release, at HEAD and with Wave B — a pre-existing engine
-issue (likely a missing allocation-size trap in `array.new`-shaped fixtures)
-unrelated to Wave B, not yet triaged.
+Corpus note (fixed 2026-09-09): `waspec/test/core/gc/array.wast` used to
+abort the whole process — the compiled `array.new_data`/`new_elem` helper
+reserved `length` elements *before* its segment bounds check, so a 2^31
+request over a short segment tried to allocate 64 GiB (`memory allocation of
+68719476736 bytes failed`) and died instead of trapping. The segment-backed
+builders now bounds-check first and reserve with `try_reserve_exact`, so the
+suite runs green and the corpus needs no engine-gap exclusion.
 
 ### Wave C — exception handling (`try_table`)
 
@@ -2730,18 +2732,31 @@ The fallback histogram is now exactly the Wave C carve-out:
 ```
 
 Every other runnable, valid module-defined function in the corpus compiles
-natively at 0 diverged (253 suites). wasm lib tests 107 (compile feature) /
-36 (no feature); clippy `-D warnings` clean in both configurations plus
-`wasmtest`. The remaining Wave D items are scope decisions, not corpus
-blockers: v128 GC storage fields (no runnable corpus body uses one), the
-`SCRATCH_SLOTS` per-call bound (no body exceeds it; decision 6), and
-resumable external-host imports (kept interpreted; decision 7).
+natively at 0 diverged. wasm lib tests 107 (compile feature) / 36 (no
+feature); clippy `-D warnings` clean in both configurations plus `wasmtest`.
+The remaining Wave D items are scope decisions, not corpus blockers: v128 GC
+storage fields (no runnable corpus body uses one), the `SCRATCH_SLOTS`
+per-call bound (no body exceeds it; decision 6), and resumable external-host
+imports (kept interpreted; decision 7).
+
+The last engine-gap exclusion closed with a bug fix rather than a wave: the
+compiled segment-backed array builders reserved their length before the
+bounds check, so `gc/array.wast`'s `new-overflow` fixtures (a 2^31-length
+request over a short segment) aborted the process with a 64 GiB allocation
+instead of trapping. The reserve now follows the bounds checks and uses
+`try_reserve_exact` (the `alloc_array_filled` rule); the interpreter's two
+segment builders match. Full corpus, *no exclusions*: **254 suites, 0
+diverged; coverage 8220/8264** — `array.wast` compiles 39/39 and the totals
+return to the Gate-0 baseline's 8264-defined count. wasm lib tests 108
+(compile feature) / 36 (no feature). Unit coverage in
+`oversized_array_new_from_segments_traps_not_aborts` (data and elem overflow
+shapes trap on both paths).
 
 ### Definition of done (all must hold)
 
 - [x] Gate 0 report exists and is the tracking source of truth.
 - [x] Coverage: 100% of runnable module-defined functions in
-`waspec/test/core` compile (8181/8225; the only fallback bodies are the 44
+`waspec/test/core` compile (8220/8264; the only fallback bodies are the 44
 `try_table` functions of the Wave C carve-out) with equiv 0 diverged.
 - [x] `cargo test -p wasm --features compile --lib`, the no-feature lib
 tests, and `cargo clippy -p wasm --all-targets -- -D warnings` in both
