@@ -11885,6 +11885,26 @@ impl Vm {
             self.stack.push(result);
             return Ok(());
         }
+        // Warm crux-native builtins (Math/JSON/typed-array methods whose
+        // body is a plain `NativeFn`): the memoized dispatch verdict 0 means
+        // no agent-dependent module chain applies, so the function's own
+        // native closure is the whole call — run it directly, skipping the
+        // %eval% identity check (a JsString alloc + HashMap hit), the
+        // callable check, and `call_inner`'s redispatch. `%eval%` is never
+        // memoized (the %eval% identity check below runs before any
+        // resolution), so it cannot reach this arm.
+        if agent.realm_count.get() == 1
+            && let ValueKind::Function(function) = callee.kind()
+            && agent.builtin_dispatch_cache.get(&function.id()) == Some(&0)
+            && let crux::function::FunctionKind::Builtin {
+                call: Some(native), ..
+            } = &function.kind
+        {
+            let result = native(&this, args)?;
+            self.stack.truncate(arg_start - below);
+            self.stack.push(result);
+            return Ok(());
+        }
         if is_eval_function(agent, &callee)? {
             let source = args.first().cloned().unwrap_or(Value::Undefined);
             // The `eval` builtin (spec 18.2.1 step 1): a non-string argument

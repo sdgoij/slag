@@ -7693,6 +7693,79 @@ registered-handler shortcut applies to the constructor rows (a registered
 construct path). The vector-form call sites still rebuild the fast layout
 before the core.
 
+### LANDED (2026-09-09): warm crux-native builtins run their native closure directly from `fast_call_core` — the Math/JSON/typed-array call tax removed (Cut 80)
+
+Cut 79 covered the REGISTERED (agent-dependent) builtins; the corpus's
+`math_intrinsics` row (~311 jit / ~358 jl, the biggest remaining
+builtins mass after map/set) did not move — Math is a crux-NATIVE module
+(no agent), and `Intrinsics::define` registration excludes it. Warm calls
+still paid, per call: the %eval% intrinsic lookup (a JsString alloc +
+HashMap get on every non-registered builtin call), the callable check,
+and `call_inner`'s redispatch to the memoized dispatch verdict + the
+native closure. Probe (scratch/math_call_probe.js, min-of-3):
+`Math.floor`/`Math.abs` member calls ~220ns/call (jl) / ~160ns (jit) vs
+the now-registered `Map.has` at ~160ns (jl) / ~110ns (jit) — the
+unregistered crux-native path carried ~50-60ns/call over the Cut-79
+floor.
+
+Fix: a second arm in `fast_call_core`, next to the Cut-79 one, gated on
+`agent.builtin_dispatch_cache.get(&id) == Some(&0)` — the memoized
+verdict 0 means resolve_builtin_dispatch found no agent-dependent module
+chain, so the function's own `NativeFn` is the whole call. When warm, the
+arm runs `native(this, args)` directly, skipping the %eval% lookup, the
+callable check, and `call_inner`. Sound because %eval%/%evalScript% are
+never memoized (fast_call_core catches them by intrinsic identity BEFORE
+any dispatch resolution), a memoized-0 function is a callable
+`Builtin { call: Some(_) }`, and the single-realm guard preserves the
+cross-realm owning-realm push for the multi-realm case.
+
+Interleaved A/B (release, scratch/math_call_probe.js, min-of-3):
+`Math.floor` jit 48-52 -> 16-17ms / jl 66-71 -> 30-32 (~2-3x); the
+corpus floor+abs pair jit 147-153 -> 47-55 / jl 177-183 -> 68-69
+(~2.6-3x); Map rows unchanged. Corpus re-baseline (4-mode): math_intrinsics
+jit 311.7 -> 104.2 / jl 358.1 -> 120.7 (~3x) — now FASTER than node
+(jitGap 0.71 / jlGap 0.68, the suite's first sub-1 builtins row); every
+other row within single-run noise. Correctness: 181 jit e2e green (incl.
+a new `installed_jit_native_builtin_calls_match_the_interpreter` pinning
+compiled Math churn + a direct eval in a compiled function); a 13-case
+battery (Math basics/specials/precision, extracted + bound methods, the
+REAL %eval% identity path + shadowed eval, JSON round-trip, typed-array
+methods, Number.prototype on primitives, a native RangeError, RegExp
+methods) byte-identical across jit/jitless/--gc-stress; clippy
+`-D warnings` clean; workspace 32 suites green; three release test262
+sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip,
+annexB 1086/1086, zero fail/crash/hang); corpus parity 37/37 ok, 0
+mismatches.
+
+Open (measured, not started): the remaining ~50ns/op over the leaf floor
+on BOTH builtin paths is the per-call handler/native table lookup
+(builtin_handler's RefCell HashMap get / the dispatch-cache HashMap get)
++ the remaining general-call tail — a handler pointer cached on the crux
+function object (a type-layering change) or direct-mapped per-agent
+cells would close most of it. The dispatch-cache HashMap get could also
+be folded into a direct-mapped cell like the leaf cache.
+
+### PROBE: the head-let jit-inversion is the per-iteration-env + capturing-closure FFI serialization — no slice (measured 2026-09-09)
+
+The top corpus row (`for-in/head-let-fresh-binding-per-iteration`, ~1.2s)
+stays jit ≈ jl while every other row sees jit < jl; direct interleaved
+runs of the real fixture show jit ~8-12% SLOWER than jl (1.32-1.46 vs
+1.20-1.25s) — the suite's one jit-inverted row. A progressive bisect of
+the fixture's build core (Object.create(null) + 3 defines + for-in `let
+x` + 3 capturing closures + 3 computed stores per body) pinned the
+inversion to the CAPTURE step: N4 (non-capturing closures, everything
+else identical) is jit +10% FASTER than jl, N5 (closures capturing the
+per-iteration `let x`) is jit ≈ jl. Under jit the per-iteration machinery
+lowers to one FFI slow call per piece (`EnterPerIteration`/
+`PerIteration` env creation, `CreateFunction`, the compiled closure
+body's `LoadPerIteration`) — the FFI boundary per key erases the machine
+loop's edge over the interpreter, which does the same env/create work
+inline in its step dispatch. No slice is warranted: the per-iteration
+env (~100ns) + capturing closure create (~430-750ns) costs are at their
+architectural floors, the FFI helpers mirror the interpreter handlers
+without redundant work, and the row's real mass is general-path assert
+calls + closure/object machinery in BOTH engines (~10-20x node-jl).
+
 
 
 ## Deferred milestones

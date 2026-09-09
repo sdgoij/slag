@@ -1674,6 +1674,31 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_native_builtin_calls_match_the_interpreter() {
+        // The crux-native fast path (Math/JSON/typed-array methods whose
+        // memoized dispatch verdict is "no module chain applies"): the
+        // compiled loop's `Math.floor`/`Math.abs` calls run the native
+        // closure directly from `fast_call_core`. Must agree with the
+        // interpreter on the churn result, and a direct `eval` inside a
+        // compiled function (never memoized — the %eval% identity check
+        // catches it before any dispatch resolution) must still evaluate.
+        let source = "function f(n) { var s = 0; for (var i = 0; i < n; i++) { s += Math.floor(i * 0.5); s += Math.abs(i - 1000); } return s; }\n\
+                     function g() { return eval('1 + 2'); }\n\
+                     f(20000) + g();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled crux-native builtin calls must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_shape_read_serves_cycling_same_shape_objects() {
         // Slice 1: the compiled `GetMemberName` read falls back to an
         // inline shape read when the (id, name) value cell misses — probe
