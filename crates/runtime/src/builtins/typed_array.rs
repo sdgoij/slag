@@ -3157,6 +3157,70 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 
 /// The TypedArray members that need the agent, dispatched by intrinsic
 /// identity from `runtime::function::call`/`construct`.
+/// The TypedArray members that need the agent, dispatched by intrinsic
+/// identity from `runtime::function::call`. `Intrinsics::define` registers
+/// a warm call for a member with an arm here (the call-side registration
+/// arc); the prototype methods are shared across the twelve kinds (the
+/// element type comes from the validated receiver), so unlike the
+/// loop-shaped constructors every member is a single named handler.
+/// Keep the arms in sync with `dispatch_call`.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        TYPED_ARRAY => Some(|_, _, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "TypedArray constructor cannot be called without 'new'".into(),
+            ))
+        }),
+        FROM => Some(from),
+        OF => Some(of),
+        AT => Some(at),
+        COPY_WITHIN => Some(copy_within),
+        ENTRIES => Some(entries),
+        EVERY => Some(every),
+        FILL => Some(fill),
+        FILTER => Some(filter),
+        FIND => Some(find),
+        FIND_INDEX => Some(find_index),
+        FIND_LAST => Some(find_last),
+        FIND_LAST_INDEX => Some(find_last_index),
+        FOR_EACH => Some(for_each),
+        INCLUDES => Some(includes),
+        INDEX_OF => Some(index_of),
+        JOIN => Some(join),
+        KEYS => Some(keys),
+        LAST_INDEX_OF => Some(last_index_of),
+        MAP => Some(map),
+        REDUCE => Some(reduce),
+        REDUCE_RIGHT => Some(reduce_right),
+        REVERSE => Some(reverse),
+        SET => Some(set),
+        SLICE => Some(slice),
+        SOME => Some(some),
+        SORT => Some(sort),
+        SUBARRAY => Some(subarray),
+        TO_LOCALE_STRING => Some(to_locale_string),
+        TO_REVERSED => Some(to_reversed),
+        TO_SORTED => Some(to_sorted),
+        VALUES => Some(values),
+        WITH => Some(with),
+        ITERATOR => Some(iterator),
+        SPECIES => Some(species_getter),
+        GET_LENGTH => Some(get_length),
+        GET_BUFFER => Some(get_buffer),
+        GET_BYTE_LENGTH => Some(get_byte_length),
+        GET_BYTE_OFFSET => Some(get_byte_offset),
+        GET_TO_STRING_TAG => Some(get_to_string_tag),
+        FROM_HEX => Some(from_hex),
+        FROM_BASE64 => Some(from_base64),
+        TO_HEX => Some(to_hex),
+        TO_BASE64 => Some(to_base64),
+        SET_FROM_HEX => Some(set_from_hex),
+        SET_FROM_BASE64 => Some(set_from_base64),
+        _ => None,
+    }
+}
+
 pub fn dispatch_call(
     agent: &mut Agent,
     callee: &Value,

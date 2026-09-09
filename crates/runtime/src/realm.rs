@@ -267,6 +267,7 @@ impl Intrinsics {
                 .or_else(|| crate::builtins::object::handler_for(name))
                 .or_else(|| crate::builtins::dataview::handler_for(name))
                 .or_else(|| crate::builtins::date::handler_for(name))
+                .or_else(|| crate::builtins::typed_array::handler_for(name))
         {
             crate::function::register_builtin_handler(function.id(), handler);
         }

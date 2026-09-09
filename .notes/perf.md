@@ -8202,6 +8202,37 @@ kinds (unlike the loop-shaped constructors), so they can register
 cleanly like the Date members did, and the decode could get a
 same-type fast path.
 
+### LANDED (2026-09-09): the TypedArray members register their call handlers (Cut 90)
+
+The Cut-89 open note: every TypedArray prototype method/accessor and the
+%TypedArray% statics still rode the module `dispatch_call` chain scan.
+Unlike the loop-shaped typed-array CONSTRUCTORS (per-kind element types),
+the prototype methods are shared across the twelve kinds — the element
+type comes from the validated receiver — and every member is already a
+single named handler with the exact `BuiltinHandler` signature, so
+`typed_array::handler_for` is a plain name->fn match (at/copyWithin/
+entries/every/fill/filter/find/findIndex/findLast/findLastIndex/forEach/
+includes/indexOf/join/keys/lastIndexOf/map/reduce/reduceRight/reverse/
+set/slice/some/sort/subarray/toLocaleString/toReversed/toSorted/values/
+with/@@iterator + the species/toStringTag/length/buffer/byteLength/
+byteOffset accessors + the from/of statics + the Uint8Array hex/base64
+family + the %TypedArray% call-form throw), and the module joins the
+`Intrinsics::define` call-side registration chain in realm.rs.
+
+Interleaved A/B (release, scratch/chain_tax_probe2.js, K=300000):
+`dst.set(src)` (same-type byte copy) jit 1546-1589 -> 219-221ms (~7x —
+the dispatch was ~4.4µs of the old ~5.2µs/call) / jl ~1550 -> ~238;
+`subarray` jit 4375-4437 -> 890-938ms (~4.8x); `indexOf` over 32
+elements jit 5501-5517 -> 278-307ms (~18x) / jl ~5500 -> ~290 (now
+~1µs/call, ~31ns/read — at the compiled floor). Correctness: 737 runtime
+release + 182 jit e2e green; clippy `-D warnings` clean; workspace
+suites green; the construct batteries still byte-identical across
+jit/jitless/--gc-stress; three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086,
+zero fail/crash/hang); corpus parity 37/37 ok, 0 mismatches. This closes
+the call-side registration arc: every agent-dependent builtin module
+that can warm-dispatch now does.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
