@@ -605,8 +605,11 @@ fn heap_is_func(module: &Module, heap: &HeapType) -> bool {
 }
 
 /// Whether a heap type is one the compiled value model can carry as a token:
-/// a function reference, or the abstract `extern` heap (an externref — its
-/// payload packs into the token). Exn/GC-heap references stay interpreted.
+/// a function reference, the abstract `extern` heap (an externref — its
+/// payload packs into the token), an internal `i31`/exception/GC reference,
+/// or an abstract bottom (`none`/`nofunc`/`noextern`/`noexn`). A bottom
+/// value can only be null, so it rides the token model as the constant null
+/// token.
 fn heap_is_carried(module: &Module, heap: &HeapType) -> bool {
     match heap {
         HeapType::Func
@@ -616,7 +619,11 @@ fn heap_is_carried(module: &Module, heap: &HeapType) -> bool {
         | HeapType::Any
         | HeapType::Eq
         | HeapType::Struct
-        | HeapType::Array => true,
+        | HeapType::Array
+        | HeapType::None
+        | HeapType::NoFunc
+        | HeapType::NoExtern
+        | HeapType::NoExn => true,
         HeapType::Type(index) => {
             heap_is_func(module, heap)
                 || module.types.get(*index as usize).is_some_and(|sub| {
@@ -626,7 +633,6 @@ fn heap_is_carried(module: &Module, heap: &HeapType) -> bool {
                     )
                 })
         }
-        _ => false,
     }
 }
 
@@ -6860,6 +6866,77 @@ mod tests {
     }
 
     #[test]
+    fn bottom_refs_ride_the_null_token() {
+        // An abstract-bottom reference type (`none`/`nofunc`/`noextern`/
+        // `noexn`) has no non-null inhabitant, so it rides the compiled
+        // token model as the constant null token: params, results, globals,
+        // and table elements typed by a bottom all behave as null.
+        use crate::types::RefType;
+        let bottom = |heap: HeapType| {
+            ValType::Ref(RefType {
+                nullable: true,
+                heap,
+            })
+        };
+        // (param (ref null noextern)) -> i32: the parameter is always null.
+        let noextern_param = module_with(
+            vec![Instr::LocalGet(0), Instr::RefIsNull],
+            vec![bottom(HeapType::NoExtern)],
+            vec![],
+            vec![ValType::I32],
+        );
+        assert_equiv(&noextern_param, 0, &[vec![Value::Ref(RefValue::Null)]]);
+        // () -> (ref null none): the result is the constant null.
+        let none_result = module_with(
+            vec![Instr::RefNull(HeapType::None)],
+            vec![],
+            vec![],
+            vec![bottom(HeapType::None)],
+        );
+        assert_equiv(&none_result, 0, &[vec![]]);
+        // A bottom-typed defined global reads as null.
+        let noextern_global = Module {
+            types: vec![SubType::func(vec![], vec![ValType::I32])],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body: vec![Instr::GlobalGet(0), Instr::RefIsNull],
+            }],
+            globals: vec![Global {
+                ty: GlobalType {
+                    value: bottom(HeapType::NoExtern),
+                    mutable: false,
+                },
+                init: vec![Instr::RefNull(HeapType::NoExtern)],
+            }],
+            ..Module::default()
+        };
+        assert_equiv(&noextern_global, 0, &[vec![]]);
+        // A bottom-element table reads back null.
+        let nofunc_table = Module {
+            types: vec![SubType::func(vec![], vec![ValType::I32])],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body: vec![Instr::I32Const(0), Instr::TableGet(0), Instr::RefIsNull],
+            }],
+            tables: vec![Table {
+                ty: TableType {
+                    limits: Limits::new(1, None),
+                    element: RefType {
+                        nullable: true,
+                        heap: HeapType::NoFunc,
+                    },
+                    table64: false,
+                },
+                init: None,
+            }],
+            ..Module::default()
+        };
+        assert_equiv(&nofunc_table, 0, &[vec![]]);
+    }
+
+    #[test]
     fn memory_ops_match_the_interpreter() {
         use crate::instr::LoadOp::*;
         // i32.store then i32.load at the same address (in-bounds and OOB).
@@ -7499,10 +7576,11 @@ mod tests {
 
     #[test]
     fn call_bearing_globals_stay_synced_through_an_interpreted_callee() {
-        // The same shape with the callee forced onto the interpreter (it
-        // reads a non-carried `(ref null noextern)` global, so it never
-        // compiles): the interpreted callee runs against the store cells, and
-        // the compiled caller's reads and writes must meet it there.
+        // The same shape with the callee forced onto the interpreter (its
+        // body carries a `try_table`, which stays interpreter-side by the
+        // Wave C decision): the interpreted callee runs against the store
+        // cells, and the compiled caller's reads and writes must meet it
+        // there.
         let module = Module {
             types: vec![
                 // 0: () -> i32 (caller).
@@ -7525,34 +7603,25 @@ mod tests {
                 FuncBody {
                     locals: vec![],
                     body: vec![
-                        Instr::GlobalGet(1),
-                        Instr::Drop,
+                        Instr::TryTable {
+                            blocktype: BlockType::Empty,
+                            catches: vec![],
+                        },
                         Instr::LocalGet(0),
                         Instr::GlobalGet(0),
                         Instr::Num(NumOp::I32Add),
                         Instr::GlobalSet(0),
+                        Instr::End,
                     ],
                 },
             ],
-            globals: vec![
-                Global {
-                    ty: GlobalType {
-                        value: ValType::I32,
-                        mutable: true,
-                    },
-                    init: vec![Instr::I32Const(10)],
+            globals: vec![Global {
+                ty: GlobalType {
+                    value: ValType::I32,
+                    mutable: true,
                 },
-                Global {
-                    ty: GlobalType {
-                        value: ValType::Ref(RefType {
-                            nullable: true,
-                            heap: HeapType::NoExtern,
-                        }),
-                        mutable: false,
-                    },
-                    init: vec![Instr::RefNull(HeapType::NoExtern)],
-                },
-            ],
+                init: vec![Instr::I32Const(10)],
+            }],
             ..Module::default()
         };
         let compiled = compile_module(&module);

@@ -2594,8 +2594,10 @@ can pick it up without re-deriving the boundary.
 - [ ] v128 GC storage: struct/array fields of `StorageType::V128`
 (word-indexed field slots in the GC helpers, `storage_from_slot` and the
 object writers, defaults, `struct.get`/`set`, the `array.*` family).
-- [ ] Non-carried abstract-bottom signatures: params/results/locals of
-`(ref null none)`/`nofunc`/`noextern`/`noexn` (only null rides the model).
+- [x] Non-carried abstract-bottom signatures: params/results/locals of
+  `(ref null none)`/`nofunc`/`noextern`/`noexn` — `heap_is_carried` admits
+  the four abstract-bottom heaps, since a bottom value has no non-null
+  inhabitant and rides the token model as the constant null token.
 - [x] Parameterized `if` without an `else` (valid wasm; an else-less `if` is
   identity-typed — the validator requires its block parameters to equal its
   results, and the false path leaves the parameters on the stack as the
@@ -2666,6 +2668,17 @@ ref-table ops over non-carried tables (TableGet 8, TableSet 4), CallIndirect
 (bottom heaps). Unit coverage in `ref_globals_match_the_interpreter`
 (defined externref/funcref set-get round-trips incl. null/host/i31/function
 tokens, and the aliased-import ref cell).
+
+The abstract-bottom slice landed off the residual triage: `heap_is_carried`
+now admits `none`/`nofunc`/`noextern`/`noexn` because a bottom value has no
+non-null inhabitant and rides the token model as the constant null token.
+That compiles bottom-typed params/results/locals, `ref.null` of a bottom,
+bottom-typed globals, and bottom-element tables. Corpus effect: coverage
+8105 → 8116 (98%), the "non-carried parameter/result/local type" bucket
+drops to zero, and "outside the lowering subset" falls to 17 — the
+residuals are 64-bit-addressed ref-table shapes (`TableGet`/`TableSet` over
+`table64` and `CallIndirect` through 64-bit tables). Unit coverage in
+`bottom_refs_ride_the_null_token` (bottom param, result, global, and table).
 
 ### Definition of done (all must hold)
 
