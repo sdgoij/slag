@@ -2403,11 +2403,11 @@ tests, 97 total with the feature, clippy clean in both configurations.
 ## Cut 11 — compiled coverage: completion checklist (2026-09-07)
 
 **Definition of done: every runnable, valid module-defined function in
-`waspec/test/core` compiles natively, modulo Wave C's documented carve-out:
-`try_table` exception-handling bodies stay on the interpreter.** Coverage is
-measured — the equiv gate alone cannot detect a fallback (an uncompiled body
-is compared interpreter-vs-interpreter), so Gate 0 below is the tracking
-source of truth. The interpreter stays the correctness oracle throughout.
+`waspec/test/core` compiles natively (8264/8264 — reached when Wave E closed
+the `try_table` carve-out).** Coverage is measured — the equiv gate alone
+cannot detect a fallback (an uncompiled body is compared
+interpreter-vs-interpreter), so Gate 0 below is the tracking source of
+truth. The interpreter stays the correctness oracle throughout.
 
 ### Gate 0 — measure coverage (prerequisite for the DoD)
 
@@ -2568,41 +2568,66 @@ suite runs green and the corpus needs no engine-gap exclusion.
 
 ### Wave C — exception handling (`try_table`)
 
-Compiled bodies can `throw`/`throw_ref` but none may contain a `try_table`
-catch.
+Compiled bodies can `throw`/`throw_ref`; bodies containing a `try_table`
+catch were originally kept on the interpreter by the boundary decision below,
+then the Wave E slices replaced that boundary with native catch regions.
 
-- [x] Decide the mechanism: **a documented interpreter boundary for
-  exception-handling bodies** (the plan's option 2). A body containing any
-  `try_table` stays on the interpreter; every compiled/interpreted boundary
-  already runs a *whole* interpreter engine per interpreted subtree, so
-  `try_table` catching, `throw`/`throw_ref` unwinding, `catch_ref` payloads,
-  and the label/frame bookkeeping all live where the interpreter already
-  implements them — no native frame ever needs to take part in an unwind.
-  That is semantics-preserving today: a compiled body never sits under an
-  interpreted frame (interpreters never dispatch compiled entries), so an
-  uncaught exception from a compiled root (or an interpreted callee subtree)
-  has no wasm catch above it and correctly escapes to the driver, exactly as
-  the interpreter reports it.
-- [ ] Native unwinding (compiled catch regions; tag-match dispatch and
-  `catch_ref` payload delivery across native frames) stays a future perf
-  wave, off the DoD — the interpreter stays the one exception mechanism.
-- [x] equiv over the `exceptions` suites: green (they run in the 253-suite,
-  0-diverged core sweep). The coverage report does not rise there — the 44
-  `try_table` bodies are a by-design interpreter-kept set, folded into the
-  DoD's "exception-handling bodies stay interpreted" carve-out.
+- [x] Decide the mechanism (superseded by Wave E): **a documented
+  interpreter boundary for exception-handling bodies** (the plan's option 2).
+  A body containing any `try_table` stays on the interpreter; every
+  compiled/interpreted boundary already runs a *whole* interpreter engine
+  per interpreted subtree, so `try_table` catching, `throw`/`throw_ref`
+  unwinding, `catch_ref` payloads, and the label/frame bookkeeping all live
+  where the interpreter already implements them — no native frame ever
+  needs to take part in an unwind. That was semantics-preserving while the
+  boundary held: a compiled body never sits under an interpreted frame
+  (interpreters never dispatch compiled entries), so an uncaught exception
+  from a compiled root (or an interpreted callee subtree) has no wasm catch
+  above it and correctly escapes to the driver, exactly as the interpreter
+  reports it.
+- [x] Native catch regions (Wave E, 2026-09-09): compiled `try_table`
+  bodies now lower natively. A catch is exactly a branch to an enclosing
+  label carrying the clause payload, and an exception no native frame
+  catches keeps propagating as data through the call-helper pending-error
+  sentinel — so no Cranelift stack unwinding is ever needed. Static
+  same-function throws branch at compile time; callee-escaped exceptions,
+  `throw_ref`, `_ref` clauses, and imported-tag clauses dispatch at runtime
+  against the parked exception. The 44-body carve-out is gone.
+- [x] equiv over the `exceptions` suites: green (they run in the full
+  8264-function, 0-diverged core sweep; `try_table.wast` compiles 43/43).
 
-#### Wave C — status (2026-09-09)
+#### Wave C/E — status (2026-09-09)
 
-The `exceptions` corpus (`tag`, `throw`, `throw_ref`, `try_table`) and the 44
-corpus-wide `try_table` bodies stay interpreter-side by decision. Native
-compilation of catch regions would need Cranelift-level unwinding: a compiled
-`throw` must deliver to the nearest matching catch across mixed native frames
-(static for same-function throws of a known tag, dynamic for `throw_ref` and
-for exceptions escaping callees), materialize `catch_ref` exception ids, and
-reproduce `catch_branch`'s label-truncation/stack bookkeeping — the same
-shape of work as a full EH lowering pass, with no corpus equivalence pressure
-behind it (the interpreter path is green). Recorded here so a later perf wave
-can pick it up without re-deriving the boundary.
+The interpreter boundary held through the type-model waves, keeping the 44
+corpus `try_table` bodies interpreted (the interpreter path was and stays the
+oracle). The native-EH wave then replaced it in three slices:
+
+- E1 (`0aa74a8`): `TryTable` lowers as a block-like control frame carrying
+  its catch clauses, and a same-function `throw` whose clause statically
+  matches (`catch` of the identical module-defined tag, or `catch_all`)
+  becomes a direct branch to the clause's target label carrying the payload.
+  Coverage 8220 → 8236 (`try_table.wast` 7/43 → 23/43).
+- E2 (`1b7e92b`): a call inside a region runs a catch dispatch — when the
+  callee parks an exception, each open clause is tested innermost-first
+  against its tag cell (helper mode 19; `catch_all` first verifies the
+  parked error is an exception, so a trap from an interpreted callee still
+  propagates) and a match spills the payload (mode 20) and branches to the
+  clause's target. `return_call*` tail sites never dispatch (the interpreter
+  replaces the frame before the callee runs). Coverage 8236 → 8244.
+- E3: `catch_ref`/`catch_all_ref` deliver the tag payload plus the caught
+  exception's reference token (mode 20 appends it), `throw_ref` under a
+  region parks and dispatches (its tag is only known at runtime), and
+  `do_throw` uses the park-then-dispatch path whenever the open chain has a
+  `_ref` clause or an imported-tag aliasing ambiguity. The body-level EH
+  gate is deleted — every clause form lowers, leaving the per-instruction
+  subset as the only admission. Coverage 8244 → **8264/8264 (100%)**: the
+  fallback histogram is empty.
+
+Unit coverage across the wave: `static_try_table_catches_match_the_interpreter`,
+`calls_under_try_table_catch_the_escaping_exception`, and
+`catch_ref_clauses_and_rethrow_match_the_interpreter` (static and
+callee-escaped tag/catch_all/catch_ref catches, payload and reference
+delivery, escaping throws, and the mode-19/20 helpers).
 
 ### Wave D — remaining type-model gaps
 
@@ -2725,19 +2750,9 @@ coverage in `table64_get_set_and_call_indirect_match_the_interpreter` (an
 i64-addressed dispatcher/getter/setter over a funcref table, incl.
 out-of-range and negative-index traps).
 
-The fallback histogram is now exactly the Wave C carve-out:
-
-```
-44  try_table exception-handling body
-```
-
-Every other runnable, valid module-defined function in the corpus compiles
-natively at 0 diverged. wasm lib tests 107 (compile feature) / 36 (no
-feature); clippy `-D warnings` clean in both configurations plus `wasmtest`.
-The remaining Wave D items are scope decisions, not corpus blockers: v128 GC
-storage fields (no runnable corpus body uses one), the `SCRATCH_SLOTS`
-per-call bound (no body exceeds it; decision 6), and resumable external-host
-imports (kept interpreted; decision 7).
+The fallback histogram is now empty — the Wave E slices (see Wave C's
+status) closed the `try_table` carve-out, so every runnable, valid
+module-defined function in the corpus compiles natively.
 
 The last engine-gap exclusion closed with a bug fix rather than a wave: the
 compiled segment-backed array builders reserved their length before the
@@ -2752,12 +2767,23 @@ return to the Gate-0 baseline's 8264-defined count. wasm lib tests 108
 `oversized_array_new_from_segments_traps_not_aborts` (data and elem overflow
 shapes trap on both paths).
 
+The native-EH wave (Wave E, see Wave C's status) then cleared the last
+fallback bucket: coverage 8220 → 8236 (E1 static catches) → 8244 (E2
+catchable calls) → **8264/8264 (E3 `catch_ref`/`throw_ref`, 100%)**, with the
+fallback histogram empty at every step's 0-diverged full-corpus sweep. wasm
+lib tests 111 (compile feature) / 36 (no feature); clippy `-D warnings` clean
+in both configurations. The remaining Wave D items are scope decisions, not
+corpus blockers: v128 GC storage fields (no runnable corpus body uses one),
+the `SCRATCH_SLOTS` per-call bound (no body exceeds it; decision 6), and
+resumable external-host imports (kept interpreted via `host_reachable_bodies`;
+decision 7).
+
 ### Definition of done (all must hold)
 
 - [x] Gate 0 report exists and is the tracking source of truth.
 - [x] Coverage: 100% of runnable module-defined functions in
-`waspec/test/core` compile (8220/8264; the only fallback bodies are the 44
-`try_table` functions of the Wave C carve-out) with equiv 0 diverged.
+`waspec/test/core` compile (8264/8264 — no fallback bodies) with equiv 0
+diverged.
 - [x] `cargo test -p wasm --features compile --lib`, the no-feature lib
 tests, and `cargo clippy -p wasm --all-targets -- -D warnings` in both
 configurations are clean.

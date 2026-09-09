@@ -849,13 +849,14 @@ unsafe fn run_native_callee(
 /// of the native `try_table` wave. The store's parked pending error is either
 /// an in-flight exception (`ExecFail::Exception`) — catchable — or a trap or
 /// other error that must propagate. Mode 19 (`x` = a `try_table` clause's tag,
-/// in this instance's tag index space; `u64::MAX` for `catch_all`) writes 1 to
-/// `scratch[0]` when the parked error is an exception whose tag cell equals the
-/// clause's resolved cell — the interpreter's clause match, imported aliases
-/// included — and 0 otherwise (a parked trap never matches). Mode 20 writes the
-/// parked exception's payload to `scratch[0..]` as call slots (a v128 param
-/// takes two words) and consumes the pending error, so a matched catch cannot
-/// let the same exception escape later.
+/// in this instance's tag index space; `u64::MAX` for `catch_all`/`catch_all_ref`)
+/// writes 1 to `scratch[0]` when the parked error is an exception whose tag cell
+/// equals the clause's resolved cell — the interpreter's clause match, imported
+/// aliases included — and 0 otherwise (a parked trap never matches). Mode 20
+/// writes the parked exception's payload to `scratch[0..]` as call slots (a
+/// v128 param takes two words) and consumes the pending error, so a matched
+/// catch cannot let the same exception escape later; a `catch_ref`/`catch_all_ref`
+/// clause (`x` nonzero) appends the exception-reference token after the payload.
 #[cfg(feature = "compile")]
 fn exception_dispatch_op(
     store: &mut Store,
@@ -891,6 +892,7 @@ fn exception_dispatch_op(
             let Some(ExecFail::Exception(exn)) = store.pending_error.take() else {
                 return crate::compile::TRAP_NONE;
             };
+            let append_ref = x != 0;
             let Some(exception) = store.exceptions.get(exn) else {
                 return crate::compile::TRAP_NONE;
             };
@@ -920,6 +922,12 @@ fn exception_dispatch_op(
                         }
                         word += 1;
                     }
+                }
+            }
+            if append_ref {
+                let token = crate::values::REF_EXN_TAG | exn as u64;
+                unsafe {
+                    *scratch.add(word) = token;
                 }
             }
             crate::compile::TRAP_NONE

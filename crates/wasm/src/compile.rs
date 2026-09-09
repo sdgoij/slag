@@ -436,9 +436,6 @@ pub fn body_compile_reason(module: &Module, defined: usize) -> String {
     {
         return "non-carried parameter/result/local type".into();
     }
-    if !eh_lowerable(module, body) {
-        return "try_table exception-handling body".into();
-    }
     if !lowerable(module, func_type, body) {
         // Name the first instruction the per-instruction subset rejects, so a
         // coverage run can triage the "outside the subset" bucket without
@@ -1066,57 +1063,12 @@ fn imported_tags(module: &Module) -> u32 {
         .count() as u32
 }
 
-/// Whether a body's exception handling lowers (Wave E slices 1-2): every
-/// `try_table` clause is `catch` of a module-defined tag or `catch_all` (the
-/// `catch_ref` forms and imported-tag clauses — which can alias across import
-/// slots — wait for the later dynamic slices), and no `throw_ref` executes
-/// inside a `try_table` region (a re-thrown exception's tag is only known at
-/// runtime). Same-function `throw`s are decided at compile time (an import
-/// never aliases a module-defined tag, so equal module-defined indices match
-/// and `catch_all` matches everything), while a callee-escaped exception at a
-/// call inside a region is dispatched at runtime against the parked
-/// exception.
-fn eh_lowerable(module: &Module, body: &FuncBody) -> bool {
-    let imported = imported_tags(module);
-    let mut try_depth = 0usize;
-    // Whether each open construct is a `try_table` region (an `End` closes
-    // the innermost construct; `Else` only toggles an `if`).
-    let mut kinds: Vec<bool> = Vec::new();
-    for instr in &body.body {
-        match instr {
-            Instr::TryTable { blocktype, catches } => {
-                if block_sig(module, blocktype).is_none() {
-                    return false;
-                }
-                for clause in catches {
-                    match clause {
-                        Catch::Tag { tag, .. } if *tag < imported => return false,
-                        Catch::TagRef { .. } | Catch::AllRef { .. } => return false,
-                        _ => {}
-                    }
-                }
-                kinds.push(true);
-                try_depth += 1;
-            }
-            Instr::Block(_) | Instr::Loop(_) | Instr::If(_) => kinds.push(false),
-            Instr::Else => {}
-            Instr::End => {
-                if kinds.pop() == Some(true) {
-                    try_depth -= 1;
-                }
-            }
-            _ if try_depth > 0 => {
-                if matches!(instr, Instr::ThrowRef) {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    true
-}
-
 /// Whether `module`'s `func_type` + `body` are inside the current lowering
+/// subset. Exception handling is fully compiled (Wave E): same-function
+/// `throw`s under a statically-decidable clause branch directly, and anything
+/// dynamic — a callee-escaped exception, a `throw_ref`, a `_ref` clause, or an
+/// imported-tag clause — is dispatched at runtime against the parked
+/// exception, so no body-level gate remains beyond the per-instruction
 /// subset.
 fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
     if func_type
@@ -1137,7 +1089,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
     // A call-bearing body's globals lower through the store-cell helper (no
     // `gvals` snapshot to go stale across the callee); whether the body has
     // calls decides only the buffer contents, not the lowering subset.
-    body.body.iter().all(|instr| instr_lowerable(module, instr)) && eh_lowerable(module, body)
+    body.body.iter().all(|instr| instr_lowerable(module, instr))
 }
 
 /// Whether a single instruction is inside the lowering subset (the same
@@ -1161,9 +1113,10 @@ fn instr_lowerable(module: &Module, instr: &Instr) -> bool {
         | Instr::Return => true,
         Instr::Num(op) => supported_num(*op),
         Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_sig(module, bt).is_some(),
-        // A `try_table` is admitted per-instruction when its block type rides
-        // the value model; `lowerable` additionally requires the body's whole
-        // exception handling to be lowerable (`eh_lowerable`).
+        // A `try_table` is admitted when its block type (and the exnref a
+        // `_ref` clause delivers) rides the value model; the whole exception
+        // machinery — static branches and the runtime catch dispatch — lowers
+        // natively now, so no body-level EH gate remains.
         Instr::TryTable { blocktype, .. } => block_sig(module, blocktype).is_some(),
         Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) | Instr::BrTable { .. } => true,
         Instr::Load { memory, .. } | Instr::Store { memory, .. } => {
@@ -3276,22 +3229,26 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Jump to a catch clause's target for a parked exception: consume it via
-    /// the payload helper (mode 20, which spills the args as call slots) and
-    /// load each `params` slot as the target's incoming values. The builder
-    /// ends in the (dead) catch block.
+    /// the payload helper (mode 20, which spills the args as call slots and
+    /// appends the exception-reference token when `append` — a `catch_ref`/
+    /// `catch_all_ref` clause) and load each `params` slot (plus the token) as
+    /// the target's incoming values. The builder ends in the (dead) catch
+    /// block.
     fn emit_parked_catch(
         &mut self,
         frame_idx: usize,
         label: u32,
         params: &[ValType],
+        append: bool,
     ) -> Result<(), String> {
         let mode = self.iconst(types::I64, 20);
+        let append_v = self.iconst(types::I64, i64::from(append));
         let zero = self.iconst(types::I64, 0);
         let args = [
             self.store,
             self.instance,
             mode,
-            zero,
+            append_v,
             zero,
             zero,
             zero,
@@ -3300,7 +3257,7 @@ impl<'a> Lowerer<'a> {
         ];
         let _code = self.raw_helper_call(&args);
         let (target, _arity) = self.catch_target(frame_idx, label)?;
-        let mut payload = Vec::with_capacity(params.len());
+        let mut payload: Vec<ClifValue> = Vec::with_capacity(params.len() + usize::from(append));
         let mut word = 0usize;
         for ty in params {
             match ty {
@@ -3320,6 +3277,14 @@ impl<'a> Lowerer<'a> {
                     word += 1;
                 }
             }
+        }
+        if append {
+            let address = self.builder.ins().iadd_imm_s(self.scratch, 8 * word as i64);
+            let token =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), address, Offset32::new(0));
+            payload.push(token);
         }
         let payload: Vec<BlockArg> = payload.iter().map(|value| (*value).into()).collect();
         self.builder.ins().jump(target, &payload);
@@ -3364,19 +3329,24 @@ impl<'a> Lowerer<'a> {
         self.builder.switch_to_block(not_exception);
         self.builder.ins().return_(&[code]);
         // Each candidate is reached only when every earlier candidate failed
-        // to match; `catch_all` is unconditional here (only exceptions reach
-        // the chain).
+        // to match; `catch_all`/`catch_all_ref` are unconditional here (only
+        // exceptions reach the chain), and the `_ref` forms append the caught
+        // exception reference to the delivered payload.
         self.builder.switch_to_block(chain);
         for &(frame_idx, ref clause) in candidates {
             match clause {
                 Catch::All { label } => {
-                    self.emit_parked_catch(frame_idx, *label, &[])?;
+                    self.emit_parked_catch(frame_idx, *label, &[], false)?;
                     // Nothing later in the chain can match (a `catch_all`
                     // catches every exception); the builder sits in the dead
                     // catch block.
                     return Ok(());
                 }
-                Catch::Tag { tag, label } => {
+                Catch::AllRef { label } => {
+                    self.emit_parked_catch(frame_idx, *label, &[], true)?;
+                    return Ok(());
+                }
+                Catch::Tag { tag, label } | Catch::TagRef { tag, label } => {
                     let params = tag_type_of(self.module, *tag)
                         .map(|ty| ty.params.clone())
                         .unwrap_or_default();
@@ -3386,12 +3356,10 @@ impl<'a> Lowerer<'a> {
                     let is_match = self.builder.ins().icmp(IntCC::NotEqual, flag, zero);
                     self.builder.ins().brif(is_match, matched, &[], next, &[]);
                     self.builder.switch_to_block(matched);
-                    self.emit_parked_catch(frame_idx, *label, &params)?;
+                    let append = matches!(clause, Catch::TagRef { .. });
+                    self.emit_parked_catch(frame_idx, *label, &params, append)?;
                     self.builder.switch_to_block(next);
                     chain = next;
-                }
-                Catch::TagRef { .. } | Catch::AllRef { .. } => {
-                    return Err("a catch_ref clause reached the catch dispatch".to_string());
                 }
             }
         }
@@ -3948,19 +3916,43 @@ impl<'a> Lowerer<'a> {
         self.runtime_call(&args)
     }
 
-    /// A `throw` of tag `index`: when an open `try_table` clause can catch it,
-    /// this is a branch to the clause's target label carrying the payload
-    /// (the interpreter's `catch_branch`). The statically-lowerable subset
-    /// makes the match compile-time — clauses are `catch` of a module-defined
-    /// tag or `catch_all`, and a module-defined tag never aliases an import —
-    /// so the scan takes the first match (innermost frame, clause order) and
-    /// emits one unconditional branch. Otherwise the payload spills to the
-    /// caller-owned scratch and the throw helper (mode 15) runs, which parks
-    /// an in-flight exception on the store and returns the pending-error
-    /// sentinel so the exception propagates to this body's caller (or the
-    /// driver when this is a root). The body is dead afterwards.
+    /// A `throw` of tag `index`. When an open `try_table` clause can catch it
+    /// and the match is compile-time (the common case: `catch` of the
+    /// identical module-defined tag or `catch_all`, with no `_ref` clause and
+    /// no imported-tag aliasing in the open chain), this is a direct branch to
+    /// the clause's target label carrying the on-stack payload — the
+    /// interpreter's `catch_branch`. Otherwise (a `catch_ref`/`catch_all_ref`
+    /// clause needs the parked exception to build the delivered reference, and
+    /// an imported-tag clause can alias the thrown tag, so the interpreter
+    /// compares cells) the exception is parked and dispatched at runtime
+    /// against the open clauses. With no open matching clause the payload
+    /// spills to the caller-owned scratch and the throw helper (mode 15) runs,
+    /// parking an in-flight exception whose sentinel propagates to this
+    /// body's caller (or the driver when this is a root). The body is dead
+    /// afterwards.
     fn do_throw(&mut self, index: u32) -> Result<(), String> {
         let imported = imported_tags(self.module);
+        let has = |pred: &dyn Fn(&Catch) -> bool| {
+            self.controls
+                .iter()
+                .any(|frame| frame.kind == CtlKind::Try && frame.catches.iter().any(pred))
+        };
+        let ref_clause =
+            |clause: &Catch| matches!(clause, Catch::TagRef { .. } | Catch::AllRef { .. });
+        let imported_tag_clause =
+            |clause: &Catch| matches!(clause, Catch::Tag { tag, .. } if *tag < imported);
+        if has(&ref_clause) || (index < imported && has(&imported_tag_clause)) {
+            // The match can depend on the parked exception (a `_ref` payload
+            // or an imported alias): park it, then run the catch dispatch.
+            let code = self.park_throw(index)?;
+            let candidates = self.open_try_candidates();
+            self.emit_catch_dispatch(code, &candidates)?;
+            self.dead = true;
+            return Ok(());
+        }
+        // Compile-time scan (only `catch`/`catch_all` clauses are open here,
+        // and an import never aliases a module-defined tag): first match is a
+        // direct branch carrying the on-stack payload.
         for frame_idx in (0..self.controls.len()).rev() {
             if self.controls[frame_idx].kind != CtlKind::Try {
                 continue;
@@ -3989,6 +3981,20 @@ impl<'a> Lowerer<'a> {
                 return Ok(());
             }
         }
+        // No open clause catches: park the exception and return the helper's
+        // sentinel so it propagates.
+        let code = self.park_throw(index)?;
+        self.builder.ins().return_(&[code]);
+        self.dead = true;
+        Ok(())
+    }
+
+    /// Spill `index`'s payload (the tag's parameters, on the operand stack in
+    /// parameter order) to the caller-owned scratch and park the in-flight
+    /// exception via the throw helper (mode 15); returns its trap code (the
+    /// pending-error sentinel). The parked exception is what the runtime catch
+    /// dispatch and the entry drain act on.
+    fn park_throw(&mut self, index: u32) -> Result<ClifValue, String> {
         let ty = tag_type_of(self.module, index).ok_or("unresolved throw tag")?;
         for i in (0..ty.params.len()).rev() {
             let value = self.pop().ok_or("operand stack underflow")?;
@@ -4013,20 +4019,16 @@ impl<'a> Lowerer<'a> {
             self.scratch,
             self.mems,
         ];
-        self.runtime_call(&args)?;
-        // The helper never returns success, so the fall-through block is
-        // unreachable; terminate it so the block is valid (any later
-        // instruction is on a dead path).
-        self.emit_trap(TRAP_UNREACHABLE);
-        self.dead = true;
-        Ok(())
+        Ok(self.raw_helper_call(&args))
     }
 
     /// A `throw_ref`: pop an `exnref` token and re-raise its exception. A null
     /// token traps `NullExceptionReference`; otherwise the exception's
     /// store-pool id is passed to the throw helper (mode 16), which parks the
-    /// in-flight exception exactly like a fresh `throw`. The body is dead
-    /// afterwards.
+    /// in-flight exception exactly like a fresh `throw`. Under an open
+    /// `try_table` region the parked exception is dispatched against the
+    /// clauses (a re-thrown exception's tag is only known at runtime); without
+    /// one the sentinel propagates. The body is dead afterwards.
     fn do_throw_ref(&mut self) -> Result<(), String> {
         let token = self.pop().ok_or("operand stack underflow")?;
         let zero = self.iconst(types::I64, 0);
@@ -4050,8 +4052,16 @@ impl<'a> Lowerer<'a> {
             self.scratch,
             self.mems,
         ];
-        self.runtime_call(&args)?;
-        self.emit_trap(TRAP_UNREACHABLE);
+        let candidates = self.open_try_candidates();
+        if candidates.is_empty() {
+            // No open catch: park and let the sentinel propagate.
+            self.runtime_call(&args)?;
+            self.emit_trap(TRAP_UNREACHABLE);
+            self.dead = true;
+            return Ok(());
+        }
+        let code = self.raw_helper_call(&args);
+        self.emit_catch_dispatch(code, &candidates)?;
         self.dead = true;
         Ok(())
     }
@@ -9952,6 +9962,115 @@ mod tests {
                         "paths diverge for function {function}, {args:?}"
                     ),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn catch_ref_clauses_and_rethrow_match_the_interpreter() {
+        // Wave E slice 3: a `catch_ref` clause delivers the tag payload plus
+        // the caught exception reference, so a match under a `_ref` clause
+        // (whether the exception was thrown in this function or escaped a
+        // callee) parks and dispatches at runtime, appending the exnref token
+        // to the payload. Mirrors try_table.wast's `throw-catch_ref-param-i32`
+        // (a static throw) and a callee-escaped variant; both drop the caught
+        // reference and return the payload.
+        let exnref = ValType::Ref(RefType::EXN);
+        let module = Module {
+            types: vec![
+                // 0: (i32) -> i32.
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                // 1: (i32) -> (): the e0 thrower (also the tag payload type).
+                SubType::func(vec![ValType::I32], vec![]),
+                // 2: () -> (i32, exnref): the catch block's label arity.
+                SubType::func(vec![], vec![ValType::I32, exnref]),
+            ],
+            tags: vec![1],
+            functions: vec![0, 0, 1],
+            bodies: vec![
+                // 0: `(block $h (result i32 exnref) (try_table (result i32)
+                // (catch_ref $e-i32 $h) (throw $e-i32 (local.get 0)))
+                // (return)) (drop) (return)` — the catch branch carries the
+                // payload and the reference out of $h; the reference is
+                // dropped and the payload returned.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::Block(BlockType::Type(2)),
+                        Instr::TryTable {
+                            blocktype: BlockType::Val(ValType::I32),
+                            catches: vec![Catch::TagRef { tag: 0, label: 0 }],
+                        },
+                        Instr::LocalGet(0),
+                        Instr::Throw(0),
+                        Instr::I32Const(2),
+                        Instr::End,
+                        Instr::Return,
+                        Instr::End,
+                        Instr::Drop,
+                        Instr::Return,
+                    ],
+                },
+                // 1: the same shape with the exception escaping the e0
+                // thrower at a call inside the region.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::Block(BlockType::Type(2)),
+                        Instr::TryTable {
+                            blocktype: BlockType::Val(ValType::I32),
+                            catches: vec![Catch::TagRef { tag: 0, label: 0 }],
+                        },
+                        Instr::I32Const(0),
+                        Instr::LocalGet(0),
+                        Instr::Call(2),
+                        Instr::End,
+                        Instr::Return,
+                        Instr::End,
+                        Instr::Drop,
+                        Instr::Return,
+                    ],
+                },
+                // 2: the e0 thrower.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Throw(0)],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "catch_ref module did not compile"
+        );
+        let mut compiled = Store::new();
+        let compiled_instance = compiled
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        let mut interpreter = Store::new();
+        interpreter.set_compile(false);
+        let interpreter_instance = interpreter
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        for (function, args) in [
+            (0usize, vec![Value::I32(7)]),
+            (0, vec![Value::I32(-3)]),
+            (1, vec![Value::I32(11)]),
+            (2, vec![Value::I32(4)]),
+        ] {
+            let via_compiled = compiled.invoke(compiled_instance, function, &args);
+            let via_interpreter = interpreter.invoke(interpreter_instance, function, &args);
+            match (&via_compiled, &via_interpreter) {
+                (Err(ExecFail::Exception(a)), Err(ExecFail::Exception(b))) => assert_eq!(
+                    compiled.exception_args(*a),
+                    interpreter.exception_args(*b),
+                    "exception payload diverges for function {function}, {args:?}"
+                ),
+                _ => assert_eq!(
+                    format!("{via_compiled:?}"),
+                    format!("{via_interpreter:?}"),
+                    "paths diverge for function {function}, {args:?}"
+                ),
             }
         }
     }
