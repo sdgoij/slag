@@ -7949,6 +7949,89 @@ and the per-construct arg-copy + step dispatch; and the loop-shaped
 module dispatches (error/typed-array/Intl) could get named-shim
 registration if a row ever shows them hot.
 
+### LANDED (2026-09-09): `object_constructor` uses the cached prototype and the callee-identity shortcut (Cut 84)
+
+The Cut-83 open note's residual: `object_constructor`'s body read
+`%Object.prototype%` through the uncached `intrinsics.get` (a JsString
+alloc + HashMap hit per construct/call) and re-resolved `%Object%`
+identity for the active-constructor check the same way. Two fixes:
+(1) the prototype reads use the realm's cached `intrinsics.object_prototype()`
+accessor (the struct field the array/object creation paths already use);
+(2) the active check `intrinsics.get(OBJECT) == new_target` becomes
+`callee == new_target` — `object_constructor` is only ever reached with
+`callee` = %Object% (the dispatch arms match the intrinsic by identity
+and registration happens only for the intrinsic) or the call-form's
+Undefined placeholder (whose new_target is also Undefined, so the
+active branch is skipped either way), so "new_target is %Object%" is
+exactly the callee comparison — no per-construct lookup.
+
+Interleaved A/B (release, scratch/object_call_vs_new.js, min-of-3):
+`new Object()` jit 102-110 -> 25ms (~4x; ~85ns/construct vs the ~60ns
+literal — ~7x off the pre-Cut-83 ~590ns) / jl 113-126 -> 40-42 (~3x);
+`Object()` call jit 106-113 -> 28-29 / jl ~116 -> 40-42 (the call form
+pays the same body). `new Array()` unchanged (~145-155ms — its body's
+`get_prototype_from_constructor` member read remains). Correctness: 182
+jit e2e + 735 runtime release tests green (the existing
+`object_constructor_respects_derived_new_target` pins BOTH the derived
+`new O extends Object` / `Reflect.construct(Object, [], O)` path —
+active false via callee != new_target — and the direct `new Object(5)`
+boxing — active true); the construct batteries still byte-identical
+across jit/jitless/--gc-stress; clippy `-D warnings` clean; workspace 32
+suites green; three release test262 sweeps at baseline (language
+23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang); corpus parity 37/37 ok, 0 mismatches.
+
+Open (measured, not started): the remaining `new Array()` ~480ns vs `[]`
+~195ns is `array_construct`'s per-construct `get_prototype_from_constructor`
+member read of new_target.prototype (spec-required for subclassing; the
+active-%Array% case could shortcut to the cached `array_prototype()`
+with the same callee-identity trick); the other registered constructors'
+bodies (Map/Date/etc.) similarly pay their own creation work on top of
+the now-O(1) dispatch.
+
+### LANDED (2026-09-09): `array_construct` takes the cached prototype and the callee-identity shortcut (Cut 85)
+
+The Cut-84 open note's residual: `array_construct` read
+`new_target.prototype` through `get_prototype_from_constructor` on every
+construct — even when the active function IS %Array% (the common `new
+Array(...)`/`Array()` path), where that own property is the realm's
+immutable %Array.prototype% (non-writable, non-configurable at install),
+already cached. Same shape as Cut 84: `array_construct` gains the
+`callee` parameter and skips the member read when `callee == new_target`
+— every dispatch arm (the Cut-83 registered construct handler, the
+`dispatch_construct` chain for the Array() call form, Reflect.construct
+and derived `super`) reaches it with `callee` = %Array% by identity, so
+the active case is exactly the equality and a genuinely derived new
+target (subclass / Reflect.construct) still member-reads its prototype
+(spec 10.1.14, 23.1.1.1). The two call sites (the `construct_handler_for`
+closure became `Some(array_construct)` — the signature now matches
+`BuiltinCtor` directly — and `dispatch_construct`) pass `callee` through.
+
+Interleaved A/B (release, scratch/cut85_ab.js, K=300000, the
+object_call_vs_new.js harness): `new Array()` jit 149-186 -> 77-91ms (~2x)
+/ jl 164-230 -> 90-98 (~2x); `new Array(3)` jit 167-197 -> 76-92;
+`Array()` call jit 293-336 -> 217-251 (~1.4x — its residual is
+`array_call`'s `intrinsics.get` + the `construct_inner` round trip, not
+the proto read); derived `new (class A extends Array {})(3)` unchanged
+(616-741ms — still member-reads the derived prototype). Correctness:
+182 jit e2e + the workspace suites green (the Cut-83
+`installed_jit_registered_builtin_constructs_match_the_interpreter` now
+also churns `new Array(i)` in the compiled loop and checks the prototype
+identity, plus a subclass and `Reflect.construct(Array, [3], A)` derived
+arm; a new runtime `array_construct_respects_derived_new_target` pins
+the active vs derived prototype choice in both engines); clippy
+`-D warnings` clean; the construct batteries still byte-identical across
+jit/jitless/--gc-stress; three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero
+fail/crash/hang); corpus parity 37/37 ok, 0 mismatches.
+
+Open (measured, not started): `Array()` as a call (~220ms vs `new
+Array()` ~80ms on the K=300000 harness) still pays `array_call`'s
+`intrinsics.get(ARRAY)` + a full `function::construct` round trip before
+`array_construct` runs — the call form has no step-side fast path; and
+the other registered constructors' bodies (Map/Date/etc.) each pay their
+own creation work on top of the now-O(1) dispatch.
+
 
 
 ## Deferred milestones

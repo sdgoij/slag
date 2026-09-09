@@ -1232,7 +1232,7 @@ pub fn dispatch_construct(
 /// new target's prototype and ignores the value.
 fn object_constructor(
     agent: &mut Agent,
-    _callee: &Value,
+    callee: &Value,
     args: &[Value],
     new_target: &Value,
 ) -> Result<Value, JsError> {
@@ -1241,8 +1241,13 @@ fn object_constructor(
     // OrdinaryCreateFromConstructor(NewTarget, "%Object.prototype%"). The
     // active function is %Object% itself, so any other new target (a derived
     // constructor or Reflect.construct's target) builds an empty object with
-    // its own prototype and ignores the value argument.
-    let active = realm.intrinsics.get(OBJECT).as_ref() == Some(new_target);
+    // its own prototype and ignores the value argument. `object_constructor`
+    // is only ever reached with `callee` = %Object% (the construct/call
+    // dispatch arms match the intrinsic by identity) or the call-form
+    // placeholder, so "new_target is %Object%" is exactly `callee ==
+    // new_target` — no per-construct `intrinsics.get("%Object%")` lookup
+    // (a JsString alloc + HashMap hit).
+    let active = callee == new_target;
     if !matches!(new_target.kind(), ValueKind::Undefined) && !active {
         let proto = get_prototype_from_constructor(agent, new_target, OBJECT_PROTO)?;
         return Ok(Value::Object(JsObject::ordinary_object_create(Some(proto))));
@@ -1251,14 +1256,14 @@ fn object_constructor(
         None => {
             let proto = realm
                 .intrinsics
-                .get(OBJECT_PROTO)
+                .object_prototype()
                 .and_then(|v| as_object(&v));
             Ok(Value::Object(JsObject::ordinary_object_create(proto)))
         }
         Some(value) if value.is_undefined() || value.is_null() => {
             let proto = realm
                 .intrinsics
-                .get(OBJECT_PROTO)
+                .object_prototype()
                 .and_then(|v| as_object(&v));
             Ok(Value::Object(JsObject::ordinary_object_create(proto)))
         }

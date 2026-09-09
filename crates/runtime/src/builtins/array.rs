@@ -509,12 +509,29 @@ fn array_species_create(
 /// The Array constructor (spec 23.1.1.1), used for both call and construct.
 fn array_construct(
     agent: &mut Agent,
+    callee: &Value,
     args: &[Value],
     new_target: &Value,
 ) -> Result<Value, JsError> {
-    let proto = get_prototype_from_constructor(agent, new_target)?;
+    // GetPrototypeFromConstructor reads `new_target.prototype` (spec
+    // 10.1.14). Every dispatch arm reaches `array_construct` with `callee`
+    // = %Array% (the construct/call handlers match the intrinsic by
+    // identity), so the active-function case is exactly `callee ==
+    // new_target` — and %Array%.prototype is non-writable and
+    // non-configurable (install), so that read is always the realm's cached
+    // %Array.prototype%. The member read is left only for a genuinely
+    // derived new target (a subclass or Reflect.construct).
+    let proto = if callee == new_target {
+        agent
+            .current_realm()?
+            .intrinsics
+            .array_prototype()
+            .and_then(|value| as_object(&value))
+    } else {
+        Some(get_prototype_from_constructor(agent, new_target)?)
+    };
     if args.is_empty() {
-        return Ok(Value::Object(JsObject::array_create(Some(proto), 0.0)?));
+        return Ok(Value::Object(JsObject::array_create(proto, 0.0)?));
     }
     if args.len() == 1
         && let ValueKind::Number(number) = args[0].kind()
@@ -527,11 +544,11 @@ fn array_construct(
             ));
         }
         return Ok(Value::Object(JsObject::array_create(
-            Some(proto),
+            proto,
             int_length as f64,
         )?));
     }
-    let array = JsObject::array_create(Some(proto), args.len() as f64)?;
+    let array = JsObject::array_create(proto, args.len() as f64)?;
     for (index, item) in args.iter().enumerate() {
         array.create_data_property_or_throw(&key(index as u64), *item)?;
     }
@@ -3121,7 +3138,7 @@ pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler>
 /// dispatches O(1) from the construct fast path.
 pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
     match name {
-        ARRAY => Some(|agent, _callee, args, new_target| array_construct(agent, args, new_target)),
+        ARRAY => Some(array_construct),
         _ => None,
     }
 }
@@ -3302,7 +3319,7 @@ pub fn dispatch_construct(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     if realm.intrinsics.get(ARRAY).as_ref() == Some(callee) {
-        return Some(array_construct(agent, args, new_target));
+        return Some(array_construct(agent, callee, args, new_target));
     }
     None
 }
@@ -3386,6 +3403,31 @@ mod tests {
         assert!(run("Array(3.5)").is_err());
         assert_eq!(joined("[1, 2, 3]"), "1,2,3");
         assert_eq!(number("[1, 2, 3].length"), 3.0);
+    }
+
+    #[test]
+    fn array_construct_respects_derived_new_target() {
+        // Cut 85: the active-%Array% construct (callee == new_target) takes
+        // the realm's cached %Array.prototype% instead of the
+        // GetPrototypeFromConstructor member read. A direct `new`/call must
+        // land on %Array.prototype%; a derived new target (a subclass or
+        // Reflect.construct) must still read ITS prototype.
+        assert_eq!(
+            text(concat!(
+                "(function(){\n",
+                "  var ok1 = Object.getPrototypeOf(new Array(3)) === Array.prototype;\n",
+                "  var ok2 = Object.getPrototypeOf(Array(3)) === Array.prototype;\n",
+                "  class A extends Array {}\n",
+                "  var a = new A(3);\n",
+                "  var ok3 = a instanceof A && Object.getPrototypeOf(a) === A.prototype;\n",
+                "  var ok4 = Array.isArray(a) && a.length === 3;\n",
+                "  var r = Reflect.construct(Array, [3], A);\n",
+                "  var ok5 = Object.getPrototypeOf(r) === A.prototype && r.length === 3;\n",
+                "  return ok1 + '|' + ok2 + '|' + ok3 + '|' + ok4 + '|' + ok5;\n",
+                "})()"
+            )),
+            "true|true|true|true|true"
+        );
     }
 
     #[test]
