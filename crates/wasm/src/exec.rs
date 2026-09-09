@@ -310,6 +310,14 @@ pub struct Instance {
     /// (parallel to `Module::bodies`); `None` keeps the interpreter path.
     #[cfg(feature = "compile")]
     compiled: Vec<Option<crate::compile::CompiledFunc>>,
+    /// Cut 11 Wave 3: per module-defined body (parallel to `Module::bodies`),
+    /// whether its direct callee graph can reach an external host function (a
+    /// function import resolved to a token'd host). The compiled path cannot
+    /// suspend at an external host boundary, so such bodies run interpreted;
+    /// later instances importing a function of this one consult this when
+    /// deciding their own bodies.
+    #[cfg(feature = "compile")]
+    host_reachable: Vec<bool>,
 }
 
 /// The store: every live instance plus the shared pools they reference.
@@ -2504,6 +2512,105 @@ impl Store {
         Ok(self.tables.len() - 1)
     }
 
+    /// Which module-defined bodies of the instance being instantiated can
+    /// reach an external host function through their direct callee graph (Cut
+    /// 11 Wave 3's one-host-call-mechanism rule): a native run cannot suspend
+    /// at an external host boundary, so those bodies are not compiled and fall
+    /// back to the interpreter's parked-run protocol. `funcs` is the new
+    /// instance's full function index space (resolved imports, then its own
+    /// defined bodies).
+    #[cfg(feature = "compile")]
+    fn host_reachable_bodies(&self, module: &Module, funcs: &[FuncTarget]) -> Vec<bool> {
+        let imported = module
+            .imports
+            .iter()
+            .filter(|import| matches!(&import.desc, ImportDesc::Func(_)))
+            .count();
+        // DFS states over the module's own bodies: 0 unvisited, 1 on the
+        // current path, 2 resolved (`result[defined]` holds the answer). Only
+        // this module's bodies can cycle: every cross-instance edge points at
+        // an earlier instance, whose answers are already final.
+        let mut result = vec![false; module.bodies.len()];
+        let mut state = vec![0u8; module.bodies.len()];
+        for defined in 0..module.bodies.len() {
+            self.host_reachable_of(module, funcs, imported, defined, &mut state, &mut result);
+        }
+        result
+    }
+
+    /// Whether executing body `defined` (of the instance `host_reachable_bodies`
+    /// is analyzing) can reach an external host, following `Call`/`ReturnCall`
+    /// through the resolved function index space.
+    #[cfg(feature = "compile")]
+    fn host_reachable_of(
+        &self,
+        module: &Module,
+        funcs: &[FuncTarget],
+        imported: usize,
+        defined: usize,
+        state: &mut [u8],
+        result: &mut [bool],
+    ) -> bool {
+        if state[defined] == 2 {
+            return result[defined];
+        }
+        if state[defined] == 1 {
+            // A back edge to a body still being resolved contributes nothing:
+            // any cycle member that reaches a host reports it when it finishes.
+            return false;
+        }
+        state[defined] = 1;
+        let mut reachable = false;
+        for instr in &module.bodies[defined].body {
+            let index = match instr {
+                Instr::Call(index) | Instr::ReturnCall(index) => *index as usize,
+                _ => continue,
+            };
+            if index < imported {
+                match funcs.get(index) {
+                    // A direct call to a token'd host import (a JS-API
+                    // closure) would park the run; the compiled path cannot.
+                    Some(FuncTarget::Host(id))
+                        if self
+                            .host_funcs
+                            .get(*id)
+                            .is_some_and(|host| host.token.is_some()) =>
+                    {
+                        reachable = true;
+                    }
+                    // A direct call into an earlier instance's body: its
+                    // answers are already final.
+                    Some(FuncTarget::Owned { instance, defined })
+                        if self
+                            .instances
+                            .get(*instance)
+                            .and_then(|inst| inst.host_reachable.get(*defined))
+                            .copied()
+                            .unwrap_or(false) =>
+                    {
+                        reachable = true;
+                    }
+                    Some(_) | None => {}
+                }
+            } else if self.host_reachable_of(
+                module,
+                funcs,
+                imported,
+                index - imported,
+                state,
+                result,
+            ) {
+                reachable = true;
+            }
+            if reachable {
+                break;
+            }
+        }
+        state[defined] = 2;
+        result[defined] = reachable;
+        reachable
+    }
+
     /// Instantiate `module`, resolving each import through `resolve` (module
     /// name, field name) to an [`ExternVal`] or `None` for an unknown import.
     /// Returns the new instance's id.
@@ -2727,6 +2834,16 @@ impl Store {
             globals.push(self.globals.len() - 1);
         }
 
+        // Cut 11 Wave 3: bodies whose callee graph can reach an external host
+        // function are not compiled (they run interpreted, whose parked-run
+        // protocol is the one host-call mechanism).
+        #[cfg(feature = "compile")]
+        let host_reachable = if self.compile_off {
+            Vec::new()
+        } else {
+            self.host_reachable_bodies(module, &funcs)
+        };
+
         self.instances.push(Instance {
             module: module.clone(),
             funcs,
@@ -2743,8 +2860,16 @@ impl Store {
                 // all (the equivalence harness runs whole corpora twice).
                 Vec::new()
             } else {
-                crate::compile::compile_module(module)
+                let mut compiled = crate::compile::compile_module(module);
+                for (entry, reachable) in compiled.iter_mut().zip(&host_reachable) {
+                    if *reachable {
+                        *entry = None;
+                    }
+                }
+                compiled
             },
+            #[cfg(feature = "compile")]
+            host_reachable,
         });
 
         // Instantiate element segments in order (all elements before data),
