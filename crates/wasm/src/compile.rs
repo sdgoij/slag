@@ -84,7 +84,7 @@ use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use crate::exec::ExecFail;
-use crate::instr::{Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
+use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{FuncBody, ImportDesc, Module};
 use crate::types::{
     BlockType, CompositeType, FieldType, FuncType, HeapType, RefType, StorageType, ValType,
@@ -436,11 +436,7 @@ pub fn body_compile_reason(module: &Module, defined: usize) -> String {
     {
         return "non-carried parameter/result/local type".into();
     }
-    if body
-        .body
-        .iter()
-        .any(|instr| matches!(instr, Instr::TryTable { .. }))
-    {
+    if !eh_static_lowerable(module, body) {
         return "try_table exception-handling body".into();
     }
     if !lowerable(module, func_type, body) {
@@ -1060,6 +1056,70 @@ fn store_width(op: StoreOp) -> u64 {
     }
 }
 
+/// The number of imported tag indices (imports precede module-defined tags in
+/// the tag index space; a tag below this line can alias another import slot).
+fn imported_tags(module: &Module) -> u32 {
+    module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.desc, ImportDesc::Tag(_)))
+        .count() as u32
+}
+
+/// Whether a body's exception handling lowers without runtime dispatch (Wave E
+/// slice 1): every `try_table` clause is `catch` of a module-defined tag or
+/// `catch_all` (the `catch_ref` forms and imported-tag clauses wait for the
+/// dynamic-dispatch slices), and no call or `throw_ref` executes inside any
+/// `try_table` region (a callee-escaped or re-thrown exception's tag is only
+/// known at runtime). A static throw of any tag under the remaining clause
+/// shapes is decided at compile time: an import never aliases a module-defined
+/// tag, so equal module-defined indices match and `catch_all` matches
+/// everything.
+fn eh_static_lowerable(module: &Module, body: &FuncBody) -> bool {
+    let imported = imported_tags(module);
+    let mut try_depth = 0usize;
+    // Whether each open construct is a `try_table` region (an `End` closes
+    // the innermost construct; `Else` only toggles an `if`).
+    let mut kinds: Vec<bool> = Vec::new();
+    for instr in &body.body {
+        match instr {
+            Instr::TryTable { blocktype, catches } => {
+                if block_sig(module, blocktype).is_none() {
+                    return false;
+                }
+                for clause in catches {
+                    match clause {
+                        Catch::Tag { tag, .. } if *tag < imported => return false,
+                        Catch::TagRef { .. } | Catch::AllRef { .. } => return false,
+                        _ => {}
+                    }
+                }
+                kinds.push(true);
+                try_depth += 1;
+            }
+            Instr::Block(_) | Instr::Loop(_) | Instr::If(_) => kinds.push(false),
+            Instr::Else => {}
+            Instr::End => {
+                if kinds.pop() == Some(true) {
+                    try_depth -= 1;
+                }
+            }
+            _ if try_depth > 0 => match instr {
+                Instr::Call(_)
+                | Instr::ReturnCall(_)
+                | Instr::CallIndirect { .. }
+                | Instr::ReturnCallIndirect { .. }
+                | Instr::CallRef(_)
+                | Instr::ReturnCallRef(_)
+                | Instr::ThrowRef => return false,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Whether `module`'s `func_type` + `body` are inside the current lowering
 /// subset.
 fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
@@ -1082,6 +1142,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
     // `gvals` snapshot to go stale across the callee); whether the body has
     // calls decides only the buffer contents, not the lowering subset.
     body.body.iter().all(|instr| instr_lowerable(module, instr))
+        && eh_static_lowerable(module, body)
 }
 
 /// Whether a single instruction is inside the lowering subset (the same
@@ -1105,6 +1166,10 @@ fn instr_lowerable(module: &Module, instr: &Instr) -> bool {
         | Instr::Return => true,
         Instr::Num(op) => supported_num(*op),
         Instr::Block(bt) | Instr::Loop(bt) | Instr::If(bt) => block_sig(module, bt).is_some(),
+        // A `try_table` is admitted per-instruction when its block type rides
+        // the value model; `lowerable` additionally requires the body's whole
+        // exception handling to be statically lowerable (`eh_static_lowerable`).
+        Instr::TryTable { blocktype, .. } => block_sig(module, blocktype).is_some(),
         Instr::Else | Instr::End | Instr::Br(_) | Instr::BrIf(_) | Instr::BrTable { .. } => true,
         Instr::Load { memory, .. } | Instr::Store { memory, .. } => {
             memory_is64(module, *memory).is_some()
@@ -1204,7 +1269,6 @@ fn instr_lowerable(module: &Module, instr: &Instr) -> bool {
             memory_is64(module, *memory).is_some()
         }
         Instr::VecShuffle(_) => true,
-        _ => false,
     }
 }
 
@@ -1443,6 +1507,7 @@ enum CtlKind {
     Block,
     Loop,
     If,
+    Try,
 }
 
 /// One open structured construct (`block`/`loop`/`if`) during lowering.
@@ -1480,6 +1545,11 @@ struct CtlFrame {
     /// Whether any branch already targets `after` (so closing a dead body
     /// must still fill the continuation).
     after_used: bool,
+    /// A `try_table`'s catch clauses (empty for every other construct). A
+    /// matched clause branches to an enclosing label exactly like a `br`;
+    /// the clauses ride the frame so a `throw` inside the region can scan
+    /// them innermost-first at lowering time.
+    catches: Vec<Catch>,
 }
 
 /// A lowering context: locals, the operand stack, and the entry pointers.
@@ -2610,6 +2680,30 @@ impl<'a> Lowerer<'a> {
             in_else: false,
             has_else: false,
             after_used: false,
+            catches: Vec::new(),
+        });
+    }
+
+    fn open_try(&mut self, params: &[ValType], results: &[ValType], catches: Vec<Catch>) {
+        // A `try_table` is label-wise a block: its body produces `results` on
+        // a fall-through, and a matched catch clause branches out to an
+        // enclosing label (never through this frame's continuation).
+        let height = self.stack.len() - params.len();
+        let after = self.builder.create_block();
+        self.append_results(after, results);
+        self.controls.push(CtlFrame {
+            kind: CtlKind::Try,
+            header: None,
+            after,
+            else_block: None,
+            height,
+            nparams: params.len(),
+            params: Vec::new(),
+            results: results.len(),
+            in_else: false,
+            has_else: false,
+            after_used: false,
+            catches,
         });
     }
 
@@ -2648,6 +2742,7 @@ impl<'a> Lowerer<'a> {
             in_else: false,
             has_else: false,
             after_used: false,
+            catches: Vec::new(),
         });
     }
 
@@ -2680,6 +2775,7 @@ impl<'a> Lowerer<'a> {
             in_else: false,
             has_else: false,
             after_used: false,
+            catches: Vec::new(),
         });
         Ok(())
     }
@@ -2757,6 +2853,26 @@ impl<'a> Lowerer<'a> {
                 }
             }
             CtlKind::Block => {
+                let (height, after, r) = {
+                    let f = &self.controls[idx];
+                    (f.height, f.after, f.results)
+                };
+                if live {
+                    let payload = self.label_args(r);
+                    self.controls[idx].after_used = true;
+                    self.builder.ins().jump(after, &payload);
+                }
+                let used = self.controls[idx].after_used;
+                self.controls.pop();
+                if live || used {
+                    self.resume_after(after, height);
+                } else {
+                    self.dead = true;
+                }
+            }
+            CtlKind::Try => {
+                // A fall-through produces the results like a block; every
+                // matched catch already branched to an enclosing label.
                 let (height, after, r) = {
                     let f = &self.controls[idx];
                     (f.height, f.after, f.results)
@@ -3600,14 +3716,47 @@ impl<'a> Lowerer<'a> {
         self.runtime_call(&args)
     }
 
-    /// A `throw` of tag `index`: spill the payload (the tag's parameters,
-    /// already on the operand stack in parameter order) to the caller-owned
-    /// scratch and run the throw helper (mode 15), which parks an in-flight
-    /// exception on the store and returns the pending-error sentinel so the
-    /// entry surfaces it as [`crate::exec::ExecFail::Exception`]. The body is
-    /// dead afterwards (a throw diverges; no compiled body contains a
-    /// `try_table` catch).
+    /// A `throw` of tag `index`: when an open `try_table` clause can catch it,
+    /// this is a branch to the clause's target label carrying the payload
+    /// (the interpreter's `catch_branch`). The statically-lowerable subset
+    /// makes the match compile-time — clauses are `catch` of a module-defined
+    /// tag or `catch_all`, and a module-defined tag never aliases an import —
+    /// so the scan takes the first match (innermost frame, clause order) and
+    /// emits one unconditional branch. Otherwise the payload spills to the
+    /// caller-owned scratch and the throw helper (mode 15) runs, which parks
+    /// an in-flight exception on the store and returns the pending-error
+    /// sentinel so the exception propagates to this body's caller (or the
+    /// driver when this is a root). The body is dead afterwards.
     fn do_throw(&mut self, index: u32) -> Result<(), String> {
+        let imported = imported_tags(self.module);
+        for frame_idx in (0..self.controls.len()).rev() {
+            if self.controls[frame_idx].kind != CtlKind::Try {
+                continue;
+            }
+            let catches = self.controls[frame_idx].catches.clone();
+            for clause in catches {
+                let label = match clause {
+                    Catch::Tag { tag, label }
+                        if tag >= imported && index >= imported && tag == index =>
+                    {
+                        label
+                    }
+                    Catch::All { label } => label,
+                    Catch::Tag { .. } => continue,
+                    Catch::TagRef { .. } | Catch::AllRef { .. } => {
+                        return Err("a catch_ref clause reached the static lowering".to_string());
+                    }
+                };
+                let target_idx = frame_idx
+                    .checked_sub(1 + label as usize)
+                    .ok_or("catch label past the control stack")?;
+                let (target, arity) = self.frame_target(target_idx);
+                let payload = self.label_args(arity);
+                self.builder.ins().jump(target, &payload);
+                self.dead = true;
+                return Ok(());
+            }
+        }
         let ty = tag_type_of(self.module, index).ok_or("unresolved throw tag")?;
         for i in (0..ty.params.len()).rev() {
             let value = self.pop().ok_or("operand stack underflow")?;
@@ -4630,7 +4779,9 @@ impl<'a> Lowerer<'a> {
     fn instruction(&mut self, instr: &Instr) -> Result<(), String> {
         if self.dead {
             match instr {
-                Instr::Block(_) | Instr::Loop(_) | Instr::If(_) => self.dead_depth += 1,
+                Instr::Block(_) | Instr::Loop(_) | Instr::If(_) | Instr::TryTable { .. } => {
+                    self.dead_depth += 1
+                }
                 Instr::Else => {
                     if self.dead_depth == 0 {
                         self.open_else()?;
@@ -4815,6 +4966,11 @@ impl<'a> Lowerer<'a> {
                     block_sig(self.module, bt).ok_or("unsupported block type")?;
                 self.open_if(&params, &results)?;
             }
+            Instr::TryTable { blocktype, catches } => {
+                let (params, results) =
+                    block_sig(self.module, blocktype).ok_or("unsupported block type")?;
+                self.open_try(&params, &results, catches.clone());
+            }
             Instr::Else => self.open_else()?,
             Instr::End => self.close_construct()?,
             Instr::Br(depth) => self.do_br(*depth)?,
@@ -4838,7 +4994,6 @@ impl<'a> Lowerer<'a> {
                 self.emit_trap(TRAP_UNREACHABLE);
                 self.dead = true;
             }
-            _ => return Err("unsupported instruction reached the lowerer".to_string()),
         }
         Ok(())
     }
@@ -7656,19 +7811,36 @@ mod tests {
 
     #[test]
     fn call_bearing_globals_stay_synced_through_an_interpreted_callee() {
-        // The same shape with the callee forced onto the interpreter (its
-        // body carries a `try_table`, which stays interpreter-side by the
-        // Wave C decision): the interpreted callee runs against the store
-        // cells, and the compiled caller's reads and writes must meet it
-        // there.
+        // The same shape with the callee forced onto the interpreter: its
+        // body calls a signature wider than the per-call scratch (decision 6),
+        // so it is not lowerable now or by any later wave — the interpreted
+        // callee runs against the store cells, and the compiled caller's
+        // reads and writes must meet it there. The oversized call sits in an
+        // `if(0)` branch, so it never executes; only its presence keeps the
+        // body uncompilable.
+        let mut callee = vec![Instr::I32Const(0), Instr::If(BlockType::Empty)];
+        for _ in 0..=SCRATCH_SLOTS {
+            callee.push(Instr::I32Const(0));
+        }
+        callee.push(Instr::Call(2));
+        callee.extend([
+            Instr::Else,
+            Instr::LocalGet(0),
+            Instr::GlobalGet(0),
+            Instr::Num(NumOp::I32Add),
+            Instr::GlobalSet(0),
+            Instr::End,
+        ]);
         let module = Module {
             types: vec![
                 // 0: () -> i32 (caller).
                 SubType::func(vec![], vec![ValType::I32]),
                 // 1: (i32) -> (): interpreted bump.
                 SubType::func(vec![ValType::I32], vec![]),
+                // 2: a signature wider than the scratch bound (never called).
+                SubType::func(vec![ValType::I32; SCRATCH_SLOTS + 1], vec![]),
             ],
-            functions: vec![0, 1],
+            functions: vec![0, 1, 2],
             bodies: vec![
                 FuncBody {
                     locals: vec![],
@@ -7682,17 +7854,13 @@ mod tests {
                 },
                 FuncBody {
                     locals: vec![],
-                    body: vec![
-                        Instr::TryTable {
-                            blocktype: BlockType::Empty,
-                            catches: vec![],
-                        },
-                        Instr::LocalGet(0),
-                        Instr::GlobalGet(0),
-                        Instr::Num(NumOp::I32Add),
-                        Instr::GlobalSet(0),
-                        Instr::End,
-                    ],
+                    body: callee,
+                },
+                // The oversized target: never reached (the callee's call is
+                // behind `if(0)`), a trivial no-op.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![],
                 },
             ],
             globals: vec![Global {
@@ -9302,6 +9470,136 @@ mod tests {
         check(&module, 2, &[vec![Value::F32(5.0f32.to_bits())]]);
         check(&module, 3, &[vec![Value::I64(5)]]);
         check(&module, 4, &[vec![Value::F64(5.0f64.to_bits())]]);
+    }
+
+    #[test]
+    fn static_try_table_catches_match_the_interpreter() {
+        // Wave E slice 1: a same-function `throw` under a `try_table` whose
+        // clause list statically matches (a module-defined tag or
+        // `catch_all`) lowers to a branch to the clause's target label — the
+        // interpreter's `catch_branch`. The fixtures mirror try_table.wast's
+        // `simple-throw-catch` and `throw-catch-param-i32` shapes: catch of a
+        // no-payload tag (returns the fall-through 42 or the caught 23),
+        // catch carrying a payload to a result-typed label, and an escaping
+        // throw of a tag no clause names (an outer caller sees the
+        // exception).
+        let void_tag = SubType::func(vec![], vec![]);
+        let i32_tag = SubType::func(vec![ValType::I32], vec![]);
+        let module = Module {
+            types: vec![
+                // 0: (i32) -> i32.
+                SubType::func(vec![ValType::I32], vec![ValType::I32]),
+                void_tag,
+                i32_tag,
+                // 3: () -> () (the escaping throw).
+                SubType::func(vec![], vec![]),
+            ],
+            tags: vec![1, 2],
+            functions: vec![0, 0, 3],
+            bodies: vec![
+                // 0: simple-throw-catch: `(block $h (try_table (result i32)
+                // (catch $e0 $h) (if (i32.eqz (local.get 0)) (then (throw
+                // $e0))) (i32.const 42)) (return)) (i32.const 23)` — throw
+                // on 0 is caught at $h and returns 23; anything else
+                // falls through and returns 42.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::Block(BlockType::Empty),
+                        Instr::TryTable {
+                            blocktype: BlockType::Val(ValType::I32),
+                            catches: vec![Catch::Tag { tag: 0, label: 0 }],
+                        },
+                        Instr::LocalGet(0),
+                        Instr::Num(NumOp::I32Eqz),
+                        Instr::If(BlockType::Empty),
+                        Instr::Throw(0),
+                        Instr::Else,
+                        Instr::End,
+                        Instr::I32Const(42),
+                        Instr::End,
+                        Instr::Return,
+                        Instr::End,
+                        Instr::I32Const(23),
+                    ],
+                },
+                // 1: `(block $h (result i32) (try_table (result i32) (catch
+                // $e-i32 $h) (throw $e-i32 (local.get 0)) (i32.const 2))
+                // (return)) (return)` — the tag's payload rides the catch
+                // branch to $h and becomes the result.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::Block(BlockType::Val(ValType::I32)),
+                        Instr::TryTable {
+                            blocktype: BlockType::Val(ValType::I32),
+                            catches: vec![Catch::Tag { tag: 1, label: 0 }],
+                        },
+                        Instr::LocalGet(0),
+                        Instr::Throw(1),
+                        Instr::I32Const(2),
+                        Instr::End,
+                        Instr::Return,
+                        Instr::End,
+                        Instr::Return,
+                    ],
+                },
+                // 2: an escaping throw — tag 0 is thrown with no enclosing
+                // matching clause in this body, so it must reach the driver
+                // as an exception (a later outer catch is a dynamic slice).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::Throw(0)],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "static try_table module did not compile"
+        );
+        let mut compiled = Store::new();
+        let compiled_instance = compiled
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        let mut interpreter = Store::new();
+        interpreter.set_compile(false);
+        let interpreter_instance = interpreter
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        let cases: &[(usize, &[Vec<Value>])] = &[
+            (
+                0,
+                &[
+                    vec![Value::I32(0)],
+                    vec![Value::I32(1)],
+                    vec![Value::I32(7)],
+                ],
+            ),
+            (1, &[vec![Value::I32(-3)], vec![Value::I32(1200)]]),
+            (2, &[vec![]]),
+        ];
+        for (function, cases) in cases {
+            for args in *cases {
+                let via_compiled = compiled.invoke(compiled_instance, *function, args);
+                let via_interpreter = interpreter.invoke(interpreter_instance, *function, args);
+                // Exception pool ids are per-store and diverge (the
+                // interpreter parks even a caught throw; a static catch never
+                // parks), so compare kinds and, for escapes, the payloads.
+                match (&via_compiled, &via_interpreter) {
+                    (Err(ExecFail::Exception(a)), Err(ExecFail::Exception(b))) => assert_eq!(
+                        compiled.exception_args(*a),
+                        interpreter.exception_args(*b),
+                        "exception payload diverges for function {function}, {args:?}"
+                    ),
+                    _ => assert_eq!(
+                        format!("{via_compiled:?}"),
+                        format!("{via_interpreter:?}"),
+                        "paths diverge for function {function}, {args:?}"
+                    ),
+                }
+            }
+        }
     }
 
     #[test]
