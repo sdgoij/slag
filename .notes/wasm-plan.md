@@ -703,7 +703,7 @@ intrinsic identity like every other agent-dependent builtin.
   pages were intentionally left untouched — wasm correctness is gated by
   the `wasmtest` CLI corpora, not by the dogfood UI.
 
-### Cut 11 — Compilation: wasm-to-native via Cranelift (planned, not started)
+### Cut 11 — Compilation: wasm-to-native via Cranelift (complete 2026-09-09)
 
 Not a conformance cut: the interpreter is green against the full corpus and
 stays the correctness oracle. Cut 11 is a performance path — a wasm-to-
@@ -2628,6 +2628,16 @@ Unit coverage across the wave: `static_try_table_catches_match_the_interpreter`,
 `catch_ref_clauses_and_rethrow_match_the_interpreter` (static and
 callee-escaped tag/catch_all/catch_ref catches, payload and reference
 delivery, escaping throws, and the mode-19/20 helpers).
+
+Re-check of the `crates/runtime` JS-API surface once the wave landed on
+`main`: the four `builtins::wasm` tests that opened the 2026-09-09 session
+failing against the compiled path (`function_imports_run_js_closures`,
+`compile_and_instantiate_return_promises`,
+`multi_value_results_cross_the_js_boundary`, and
+`wasm_exceptions_surface_as_js_and_pass_through` — "external host function
+needs a resumable run" and promise-resolution mismatches) now pass. All 20
+`builtins::wasm` tests are green and the full runtime lib suite is 737/0
+under `--features wasm/compile`.
 
 ### Wave D — remaining type-model gaps
 
