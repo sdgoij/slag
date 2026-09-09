@@ -121,7 +121,17 @@ const INLINE_PROPS: usize = 2;
 /// `pub` so the runtime's constructor-boilerplate presize can cap how many
 /// keys a map may describe before their values are stored (pre-described
 /// fields only exist as in-object holes).
-pub const INLINE_FIELDS: usize = 4;
+///
+/// Sixteen slots: a descriptor below this is a single-load
+/// machine-addressable in-object field served by the compiled shape gate,
+/// and the vector-free field-only state covers ordinary records up to this
+/// many keys. Keys past the cap are Option-1 vector-pinned (the probe
+/// measured ~30% slower compiled reads at scale for a >cap ordinal — the
+/// vector is a RefCell'd sometimes-inline store, not addressable). The
+/// cost is the Cells on every `JsObject` of every kind; the field/vector
+/// boundary, the vector-free materialize threshold, and the JIT shape gate
+/// all follow this constant.
+pub const INLINE_FIELDS: usize = 16;
 
 impl Default for SmallProps {
     fn default() -> Self {
@@ -1082,29 +1092,50 @@ impl JsObject {
             return;
         }
         let value = property.value().unwrap_or(Value::Undefined);
-        let mapped = map.find(key).is_some();
-        let transitioned = !mapped
-            && property.writable() == Some(true)
-            && property.enumerable
-            && property.configurable
-            // The fresh property was pushed at the end of the vector; a
-            // transition adds it at descriptor ordinal `descriptor_count()`,
-            // which is only a sound storage address when the key now sits at
-            // exactly that position (the append was aligned). A misaligned
-            // append (a vector-only interleave or a skipped boilerplate
-            // field made the vector longer than the described prefix) leaves
-            // the key vector-only.
-            && self
-                .properties
-                .borrow()
-                .get(map.descriptor_count())
-                .is_some_and(|(name, _)| name == key)
-            && self
-                .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
-                .is_some();
-        if mapped || transitioned {
-            let _ = self.map_set(key, value);
+        let Some(ordinal) = map.find(key) else {
+            // A fresh property the map does not yet describe: transition it
+            // when the attributes allow and the append was aligned. The
+            // fresh property was pushed at the end of the vector; a
+            // transition adds it at descriptor ordinal
+            // `descriptor_count()`, which is only a sound storage address
+            // when the key now sits at exactly that position (a misaligned
+            // append — a vector-only interleave or a skipped boilerplate
+            // field made the vector longer than the described prefix —
+            // leaves the key vector-only).
+            if property.writable() == Some(true)
+                && property.enumerable
+                && property.configurable
+                && self
+                    .properties
+                    .borrow()
+                    .get(map.descriptor_count())
+                    .is_some_and(|(name, _)| name == key)
+                && self
+                    .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
+                    .is_some()
+            {
+                let _ = self.map_set(key, value);
+            }
+            return;
+        };
+        // A mapped key whose attributes a defineProperty just changed (attr
+        // drift — writable/enumerable/configurable or a data→accessor
+        // conversion) must not stay described by the SHARED map: its
+        // descriptor attrs would be a lie for this object. Drop the object
+        // to dictionary mode so a live map's descriptor attrs always equal
+        // the object's own attrs (the invariant the field-authoritative
+        // storage end-state needs). A value update with UNCHANGED attrs
+        // still mirrors into the field.
+        let attrs_match = map.descriptor_at(ordinal).is_some_and(|(_, _, attrs)| {
+            property.writable() == Some(attrs.writable())
+                && property.enumerable == attrs.enumerable()
+                && property.configurable == attrs.configurable()
+        });
+        if !attrs_match {
+            self.map.set(None);
+            return;
         }
+        let _ = self.map_set(key, value);
     }
 
     /// Part B, B5.3: a deleted own property's inline field is stale; drop
@@ -5857,22 +5888,21 @@ mod tests {
         assert!(!obj2.props_deferred.get());
         assert!(!obj2.set(&key("a"), Value::Number(9.0), false).unwrap());
         assert_eq!(obj2.get(&key("a")).unwrap(), Value::Number(1.0));
-        // A duplicate define (has-own true) updates through the full path
-        // after materializing; the value lands in vector + field mirror.
+        // The writable:false redefinition drifted the mapped key's attrs, so
+        // the object is in dictionary mode (a shared map cannot lie about
+        // them). A later duplicate define setting writable back applies to
+        // the vector and stays dictionary — no map re-acquisition — but the
+        // value and subsequent writes behave.
+        assert!(obj2.map.get().is_none());
         obj2.define_property(
             &key("a"),
             &descriptor(Some(Value::Number(2.0)), Some(true), None, None),
         )
         .unwrap();
-        assert_eq!(
-            obj2.map_get(&PropertyKey::from_utf8("a")),
-            Some(Value::Number(2.0))
-        );
+        assert!(obj2.map.get().is_none());
+        assert_eq!(obj2.get(&key("a")).unwrap(), Value::Number(2.0));
         assert!(obj2.set(&key("a"), Value::Number(3.0), false).unwrap());
-        assert_eq!(
-            obj2.map_get(&PropertyKey::from_utf8("a")),
-            Some(Value::Number(3.0))
-        );
+        assert_eq!(obj2.get(&key("a")).unwrap(), Value::Number(3.0));
     }
 
     #[test]
@@ -6012,11 +6042,11 @@ mod tests {
         // A body may write keys the pattern did not record: while the map
         // has room below INLINE_FIELDS they transition (still vector-free);
         // a fresh key on a full map materializes the written prefix
-        // (skipping the unwritten b hole) and appends through the standard
-        // path (its storage is the vector).
+        // (skipping the unwritten presize holes) and appends through the
+        // standard path (its storage is the vector).
         let map = canonical_empty_map(None);
         let mut map = map;
-        for name in ["a", "b"] {
+        for name in ["k0", "k1"] {
             map = map
                 .get_or_create_child(
                     PropertyKey::from_utf8(name),
@@ -6025,39 +6055,40 @@ mod tests {
                 .unwrap();
         }
         let obj = JsObject::ordinary_object_create_with_map(None, map);
-        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("a"), Value::Number(1.0)));
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("k0"), Value::Number(0.0)));
         // Fresh keys beyond the presize transition below the field cap.
-        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("c"), Value::Number(3.0)));
-        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("d"), Value::Number(4.0)));
+        for i in 2..INLINE_FIELDS {
+            let name = format!("k{i}");
+            assert!(obj.fresh_data_define(&PropertyKey::from_utf8(&name), Value::Number(i as f64)));
+        }
         assert!(obj.props_deferred.get());
         assert_eq!(obj.properties.borrow().len(), 0);
         assert!(
-            obj.has_own_property_key(&PropertyKey::from_utf8("c"))
+            obj.has_own_property_key(&PropertyKey::from_utf8("k2"))
                 .unwrap()
         );
         assert!(
-            !obj.has_own_property_key(&PropertyKey::from_utf8("b"))
+            !obj.has_own_property_key(&PropertyKey::from_utf8("k1"))
                 .unwrap()
         );
-        // The map is now full (a,b,c,d); a 5th fresh key materializes the
-        // written prefix and appends vector-only.
-        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("e"), Value::Number(5.0)));
+        // The map is now full (k0..k{cap-1}); a fresh key at the cap
+        // materializes the written prefix and appends vector-only.
+        let overflow = format!("k{INLINE_FIELDS}");
+        assert!(obj.fresh_data_define(&PropertyKey::from_utf8(&overflow), Value::Number(99.0)));
         assert!(!obj.props_deferred.get());
-        assert_eq!(
-            obj.own_property_keys().unwrap(),
-            vec![
-                PropertyKey::from_utf8("a"),
-                PropertyKey::from_utf8("c"),
-                PropertyKey::from_utf8("d"),
-                PropertyKey::from_utf8("e"),
-            ]
-        );
+        let mut expected = Vec::new();
+        expected.push(PropertyKey::from_utf8("k0"));
+        for i in 2..INLINE_FIELDS {
+            expected.push(PropertyKey::from_utf8(&format!("k{i}")));
+        }
+        expected.push(PropertyKey::from_utf8(&overflow));
+        assert_eq!(obj.own_property_keys().unwrap(), expected);
         assert!(
-            obj.has_own_property_key(&PropertyKey::from_utf8("e"))
+            obj.has_own_property_key(&PropertyKey::from_utf8(&format!("k{INLINE_FIELDS}")))
                 .unwrap()
         );
         assert!(
-            !obj.has_own_property_key(&PropertyKey::from_utf8("b"))
+            !obj.has_own_property_key(&PropertyKey::from_utf8("k1"))
                 .unwrap()
         );
     }
@@ -6115,37 +6146,37 @@ mod tests {
     #[test]
     fn map_store_field_pins_mapped_inline_properties() {
         let obj = JsObject::ordinary_object_create(None);
-        // Four fresh w/e/c defines transition the map to describe each key
-        // at offsets 0..3 (the in-object region).
-        let names = ["a", "b", "c", "d"];
-        for (i, name) in names.iter().enumerate() {
-            assert!(
-                obj.fresh_data_define(&PropertyKey::from_utf8(name), Value::Number(i as f64 + 1.0))
+        // INLINE_FIELDS + 1 fresh w/e/c defines transition the map: every
+        // key below the cap is an in-object field at its descriptor ordinal,
+        // and the key AT the cap is vector-pinned at the same ordinal.
+        let count = INLINE_FIELDS + 1;
+        for i in 0..count {
+            let name = format!("k{i}");
+            assert!(obj.fresh_data_define(&PropertyKey::from_utf8(&name), Value::Number(i as f64)));
+        }
+        for i in 0..count {
+            let prop_key = PropertyKey::from_utf8(&format!("k{i}"));
+            let (map_id, field) = obj.map_store_field(&prop_key).expect("mapped key");
+            assert_eq!(field, i, "k{i} offset");
+            assert!(map_id > 0);
+            assert_eq!(
+                obj.map_get(&prop_key),
+                Some(Value::Number(i as f64)),
+                "k{i} map read"
+            );
+            assert_eq!(
+                obj.get(&JsString::from_utf8(&format!("k{i}"))).unwrap(),
+                Value::Number(i as f64),
+                "k{i} vector read"
             );
         }
-        for (i, name) in names.iter().enumerate() {
-            let prop_key = PropertyKey::from_utf8(name);
-            let (map_id, field) = obj.map_store_field(&prop_key).expect("mapped key");
-            assert_eq!(field, i, "{name} offset");
-            assert!(map_id > 0);
-        }
-        // A fifth fresh key now transitions the map past the in-object
-        // capacity: it is described at ordinal 4, whose storage is the
-        // property vector at slot 4 (not an in-object mirror).
-        assert!(obj.fresh_data_define(&PropertyKey::from_utf8("e"), Value::Number(5.0)));
-        assert!(obj.map_store_field(&PropertyKey::from_utf8("a")).is_some());
-        let (map_id, field) = obj
-            .map_store_field(&PropertyKey::from_utf8("e"))
-            .expect("mapped key");
+        // The key at the cap is vector-addressed: its property-vector slot
+        // equals the descriptor ordinal.
+        let overflow = PropertyKey::from_utf8(&format!("k{INLINE_FIELDS}"));
+        let (map_id, field) = obj.map_store_field(&overflow).expect("mapped key");
         assert_eq!(field, INLINE_FIELDS);
         assert!(map_id > 0);
-        // The map read serves e through the vector slot, and the property
-        // vector agrees.
-        assert_eq!(
-            obj.map_get(&PropertyKey::from_utf8("e")),
-            Some(Value::Number(5.0))
-        );
-        assert_eq!(obj.get(&key("e")).unwrap(), Value::Number(5.0));
+        assert_eq!(obj.property_slot(&overflow), Some(INLINE_FIELDS));
     }
 
     #[test]
@@ -6365,6 +6396,60 @@ mod tests {
         // object dropped to dictionary mode and the accessor serves the read.
         assert_eq!(obj.map_get(&PropertyKey::from_utf8("x")), None);
         assert_eq!(obj.get(&key("x")).unwrap(), Value::Number(42.0));
+    }
+
+    #[test]
+    fn attr_drift_on_a_mapped_key_drops_to_dictionary() {
+        // A defineProperty that changes a mapped key's attributes makes the
+        // SHARED map's descriptor a lie for this object: the object drops to
+        // dictionary mode while a same-shape sibling keeps the map. A value
+        // update with unchanged attrs keeps the map.
+        let a = JsObject::ordinary_object_create(None);
+        let b = JsObject::ordinary_object_create(None);
+        for obj in [&a, &b] {
+            assert!(obj.fresh_data_define(&PropertyKey::from_utf8("x"), Value::Number(1.0)));
+            assert!(obj.fresh_data_define(&PropertyKey::from_utf8("y"), Value::Number(2.0)));
+        }
+        let shared = a.map.get().unwrap().id();
+        assert_eq!(b.map.get().unwrap().id(), shared);
+        // A value-only redefine (no attribute fields) keeps the attrs and
+        // the map.
+        a.define_property(
+            &key("x"),
+            &descriptor(Some(Value::Number(3.0)), None, None, None),
+        )
+        .unwrap();
+        assert_eq!(a.map.get().unwrap().id(), shared);
+        // writable:false drifts the attrs away from the descriptor's
+        // (true, true, true): dictionary mode, and the new attrs stick.
+        a.define_property(
+            &key("x"),
+            &descriptor(
+                Some(Value::Number(3.0)),
+                Some(false),
+                Some(true),
+                Some(true),
+            ),
+        )
+        .unwrap();
+        assert!(a.map.get().is_none());
+        assert_eq!(a.get(&key("x")).unwrap(), Value::Number(3.0));
+        // The sibling still shares the original map with its shape-pinned
+        // reads.
+        assert_eq!(b.map.get().unwrap().id(), shared);
+        assert_eq!(
+            b.map_get(&PropertyKey::from_utf8("x")),
+            Some(Value::Number(1.0))
+        );
+        // A later value-only redefine on the dictionary object stays
+        // dictionary and applies.
+        a.define_property(
+            &key("x"),
+            &descriptor(Some(Value::Number(4.0)), None, None, None),
+        )
+        .unwrap();
+        assert!(a.map.get().is_none());
+        assert_eq!(a.get(&key("x")).unwrap(), Value::Number(4.0));
     }
 
     #[test]

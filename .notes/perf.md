@@ -8233,6 +8233,124 @@ zero fail/crash/hang); corpus parity 37/37 ok, 0 mismatches. This closes
 the call-side registration arc: every agent-dependent builtin module
 that can warm-dispatch now does.
 
+### LANDED (2026-09-09): the attr-drift fork — a mapped key whose attrs change drops to dictionary mode (L1c gate prerequisite)
+
+The Option-3 end-state's first gate: field-authoritative storage cannot
+tolerate a shared map whose descriptor attrs lie for one object, and
+today `defineProperty` could change a mapped key's writable/enumerable/
+configurable while `sync_map_after_define` kept the map describing it
+(the drift was invisible because the property VECTOR stays authoritative
+for attrs; the map only mirrors values). `sync_map_after_define`'s
+mapped branch now compares the applied property's attrs against the
+map descriptor's recorded `MapAttrs` and drops the object to dictionary
+mode on any mismatch — establishing the invariant a live map's
+descriptor attrs equal the object's own attrs (the data→accessor
+conversion and mapped-key delete already dropped). A value-only
+redefine with unchanged attrs still mirrors into the field and keeps
+the map; fresh non-default defines never entered the map, so no drift
+is possible on append. Dropping is permanent (no map re-acquisition),
+matching the existing accessor/delete ejection and the Option-3 plan's
+"dictionary is the attr-drift home". No hot row moves (warm stores and
+fast fresh defines never route through `sync_map_after_define`; only
+descriptor redefinitions do).
+
+Crux regression test pins the mechanism: two same-shape objects share
+one map; a value-only redefine on one keeps the map, a `writable:false`
+redefine drops THAT object to dictionary while the sibling keeps the
+shared map and its shape-pinned reads, and later value updates apply on
+the vector staying dictionary. One existing test
+(`structural_ops_materialize_then_behave`) updated: its writable
+round-trip no longer re-gains the map read path (dictionary is
+permanent) — reads/sets now assert against the vector. Gate: 228 crux +
+737 runtime release + 182 jit e2e green; clippy `-D warnings` clean;
+workspace green; the construct batteries byte-identical across
+jit/jitless/--gc-stress; three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086,
+zero fail/crash/hang); corpus parity 37/37 ok.
+
+Open (measured, not started): the Option-3 storage split itself — the
+map-prefix values for ordinals >= INLINE_FIELDS move out of the vector
+into an ordinal-indexed overflow array (machine-addressable, stable
+base pointer) with enumeration/own-keys/gopd/delete re-pointed at the
+descriptors; the attr-drift fork above is the prerequisite that makes
+it safe. The l1c_current_probe residual (~30% jit read gap for ord >= 4
+at scale) is the measured justification, per the decision section's
+gate.
+
+### LANDED (2026-09-09): the in-object field region grows to eight slots — >4-key shapes become machine-addressable (Option-3 split, slice 1)
+
+The Option-3 gate probe's residual: ordinals >= 4 rode the narrow
+map-slot helper into the movable, RefCell'd, sometimes-inline property
+vector (~26-29ns/op compiled at scale vs ~22ns inline, a ~30% gap that
+grew with object count). The full Option-3 overflow array was scoped
+as indirection-bound (Slice 3), so the cheapest machine-addressable
+form of "values live in a per-object ordinal-indexed region" is a
+LARGER in-object region: `INLINE_FIELDS` 4 -> 8. Every consumer follows
+the constant — the map mirror (`map_set`/`map_field` below the cap),
+the vector-free deferred state (now field-only up to 8 keys;
+materialize defers to the 9th), the vector-slot pinning (ordinals >= 8
+keep the Option-1 pinned slot), and the compiled shape gate (a slot <
+8 is a single machine load from `in_fields[slot]`, offset_of-based so
+the layout change is safe). The l1c_current_probe 6-field objects
+(a..f) now stay fully vector-free: `{a..f}` literals adopt all six
+fields in the ObjectFast batch and never materialize. Cost: +4 `Cell`s
+(32B) on every JsObject of every kind (~528 -> ~560B) — measured
+acceptable below.
+
+Interleaved A/B (release, scratch/l1c_current_probe.js): R4-vec-read
+(ord 4, 16384 objects) jit ~9540-9997 -> ~7436-7537ms, now EQUAL to
+R0-inline-read (~7331-7749); R4 at 1024 ~530 -> ~440ms = R0; writes
+W4 ~13.7s -> ~12.4-12.8s = W0; jl equalizes likewise. `--jit-bench`
+warm rows all within drift (arithmetic 2.48 vs 2.68, bare 2.51 vs
+2.39, buildString shape 37.0 vs 37.2 — no bloat regression from the
++32B). Correctness: crux 228 green (the two 5th-key-overflow tests
+rewritten to overflow at the new 8-key boundary), 737 runtime release
++ 182 jit e2e green; clippy `-D warnings` clean; workspace green; the
+construct batteries byte-identical across jit/jitless/--gc-stress;
+three release test262 sweeps at baseline (language 23721/3 skip,
+built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang);
+corpus parity 37/37 ok.
+
+Open (measured, not started): objects past 8 keys still pin ordinals
+>= 8 to the vector (the Option-1 slot) and pay the map-slot helper on
+the compiled read — the out-of-line overflow region for keys beyond
+the in-object cap remains the next Option-3 slice if a >8-key hot
+shape shows up in a probe.
+
+### LANDED (2026-09-09): the in-object field region grows to sixteen slots (Option-3 split, slice 2)
+
+The slice-1 open note probed (scratch/l1c_overflow_probe.js, named
+member reads on a 10-key shape): ordinals >= 8 showed the same ~30%
+compiled-read gap at scale that ord >= 4 had before slice 1 (~30ns/op
+vs ~22ns inline at 16384 objects). No corpus row uses a >4-key shape
+(the object workloads are all a/b/c/d-class), so the extension is
+beyond any hot row — but the 4->8 raise measured zero bloat regression
+(+32B/JsObject), so the empirical question was whether pushing the
+boundary is also cost-free: `INLINE_FIELDS` 8 -> 16 (another +64B,
+~528B -> ~656B total vs the original). Every consumer follows the
+constant again; the probe's 10-key shape now adopts all ten fields and
+stays vector-free.
+
+A/B (release, scratch/l1c_overflow_probe.js): ord 8/9 at 16384 objects
+jit ~10.0-10.1s -> ~7.4-9.2s, into the ord 0/7 noise band (no systematic
+ord-8 penalty); n=1024 rows all ~equal. `--jit-bench` warm rows within
+drift at +128B total (+24% JsObject): arithmetic 2.45, bare 2.30,
+property read 5.34, buildString shape 34.8, full 24.4 — no bloat
+regression measured at any raise step. Correctness: crux 228 green,
+737 runtime release + 182 jit e2e green; clippy `-D warnings` clean;
+workspace green; the construct batteries byte-identical across
+jit/jitless/--gc-stress; three release test262 sweeps at baseline
+(language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086,
+zero fail/crash/hang); corpus parity 37/37 ok.
+
+Open (measured, not started): the boundary now sits at 16 keys — a
+>16-key map-pinned ordinal still rides the map-slot helper into the
+vector. The measured corpus has no shape above 4 keys, so a further
+inline raise is unbounded +64B/8-keys speculative bloat per step and
+the out-of-line overflow region is the only scaling answer; both stay
+gated behind a real >16-key (or >8-key, if 16 proves too fat) hot
+workload. STOPPING the extension arc here by the no-hot-row gate.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
