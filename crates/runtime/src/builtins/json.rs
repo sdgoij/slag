@@ -37,9 +37,46 @@ struct ParseRecord {
 }
 
 /// The recursive-descent JSON grammar (ECMA-404): JSONValue over UTF-8 bytes.
+/// ASCII grammar units: JSON grammar tokens are ASCII, and a u16 unit equals
+/// its byte value, so the UTF-16 parser's patterns reference these consts
+/// (patterns cannot apply `as` casts).
+const U_QUOTE: u16 = b'"' as u16;
+const U_LBRACE: u16 = b'{' as u16;
+const U_RBRACE: u16 = b'}' as u16;
+const U_LBRACK: u16 = b'[' as u16;
+const U_RBRACK: u16 = b']' as u16;
+const U_BSLASH: u16 = b'\\' as u16;
+const U_SLASH: u16 = b'/' as u16;
+const U_HEX_A: u16 = b'a' as u16;
+const U_HEX_F: u16 = b'f' as u16;
+const U_HEX_ACAP: u16 = b'A' as u16;
+const U_HEX_FCAP: u16 = b'F' as u16;
+const U_BELL_B: u16 = b'b' as u16;
+const U_U: u16 = b'u' as u16;
+const U_COLON: u16 = b':' as u16;
+const U_COMMA: u16 = b',' as u16;
+const U_MINUS: u16 = b'-' as u16;
+const U_PLUS: u16 = b'+' as u16;
+const U_DOT: u16 = b'.' as u16;
+const U_ZERO: u16 = b'0' as u16;
+const U_NINE: u16 = b'9' as u16;
+const U_E: u16 = b'e' as u16;
+const U_ECAP: u16 = b'E' as u16;
+const U_TRUE_T: u16 = b't' as u16;
+const U_FALSE_F: u16 = b'f' as u16;
+const U_NULL_N: u16 = b'n' as u16;
+const U_NL: u16 = b'\n' as u16;
+const U_CR: u16 = b'\r' as u16;
+const U_TAB: u16 = b'\t' as u16;
+const U_LET_R: u16 = b'r' as u16;
+
 struct JsonParser<'a> {
     agent: &'a mut Agent,
-    text: &'a [u8],
+    /// The input text as UTF-16 units: parsing natively in UTF-16 avoids the
+    /// per-call lossy UTF-8 conversion AND preserves lone surrogates verbatim
+    /// (the lossy path replaced them with U+FFFD). ASCII grammar bytes are
+    /// their own unit values, so the byte matching carries over unchanged.
+    text: &'a [u16],
     pos: usize,
     /// Whether to build the `ParseRecord` tree (sources, entry/element
     /// lists) the reviver needs. A no-reviver parse (the common case)
@@ -58,8 +95,11 @@ impl<'a> JsonParser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while let Some(&byte) = self.text.get(self.pos) {
-            if matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+        while let Some(&unit) = self.text.get(self.pos) {
+            if matches!(
+                unit,
+                0x20 | 0x09 | 0x0A | 0x0D // space, tab, LF, CR
+            ) {
                 self.pos += 1;
             } else {
                 break;
@@ -67,8 +107,8 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn eat(&mut self, byte: u8) -> bool {
-        if self.text.get(self.pos) == Some(&byte) {
+    fn eat(&mut self, unit: u16) -> bool {
+        if self.text.get(self.pos) == Some(&unit) {
             self.pos += 1;
             true
         } else {
@@ -76,9 +116,19 @@ impl<'a> JsonParser<'a> {
         }
     }
 
+    /// The ASCII keyword `word` (`true`/`false`/`null`) at the current
+    /// position. The units of an ASCII word are its byte values.
     fn eat_word(&mut self, word: &[u8]) -> bool {
-        if self.text.get(self.pos..self.pos + word.len()) == Some(word) {
-            self.pos += word.len();
+        let word_units: [u16; 5] = {
+            let mut units = [0u16; 5];
+            for (index, &byte) in word.iter().enumerate() {
+                units[index] = byte as u16;
+            }
+            units
+        };
+        let end = self.pos + word.len();
+        if end <= self.text.len() && self.text[self.pos..end] == word_units[..word.len()] {
+            self.pos = end;
             true
         } else {
             false
@@ -86,10 +136,13 @@ impl<'a> JsonParser<'a> {
     }
 
     fn object_proto(&self) -> Option<Handle<JsObject>> {
+        // The cached %Object.prototype% accessor: `intrinsics.get` builds a
+        // fresh name string + HashMap probe per container, and every JSON
+        // object/array create pays it.
         self.agent
             .current_realm()
             .ok()
-            .and_then(|realm| realm.intrinsics.get("%Object.prototype%"))
+            .and_then(|realm| realm.intrinsics.object_prototype())
             .and_then(|value| as_object(&value))
     }
 
@@ -99,22 +152,21 @@ impl<'a> JsonParser<'a> {
         self.skip_ws();
         let start = self.pos;
         let value = match self.text.get(self.pos).copied() {
-            Some(b'"') => Value::String(Handle::new(self.parse_string()?)),
-            Some(b'{') => return self.parse_object_record(),
-            Some(b'[') => return self.parse_array_record(),
-            Some(b't') if self.eat_word(b"true") => Value::Boolean(true),
-            Some(b'f') if self.eat_word(b"false") => Value::Boolean(false),
-            Some(b'n') if self.eat_word(b"null") => Value::Null,
-            Some(b'-') | Some(b'0'..=b'9') => Value::Number(self.parse_number()?),
+            Some(U_QUOTE) => Value::String(Handle::new(self.parse_string()?)),
+            Some(U_LBRACE) => return self.parse_object_record(),
+            Some(U_LBRACK) => return self.parse_array_record(),
+            Some(U_TRUE_T) if self.eat_word(b"true") => Value::Boolean(true),
+            Some(U_FALSE_F) if self.eat_word(b"false") => Value::Boolean(false),
+            Some(U_NULL_N) if self.eat_word(b"null") => Value::Null,
+            Some(U_MINUS) | Some(U_ZERO..=U_NINE) => Value::Number(self.parse_number()?),
             _ => return Err(self.syntax_error()),
         };
         let end = self.pos;
         let source = if self.records {
             match value.kind() {
                 ValueKind::Object(_) | ValueKind::Function(_) => None,
-                _ => Some(JsString::from_utf8(
-                    std::str::from_utf8(&self.text[start..end]).unwrap_or(""),
-                )),
+                // The raw token as UTF-16 units, verbatim (no lossy decode).
+                _ => Some(JsString::from_utf16(&self.text[start..end])),
             }
         } else {
             None
@@ -130,11 +182,11 @@ impl<'a> JsonParser<'a> {
     /// `{ members }`: JSONObject with the member records kept for the reviver.
     fn parse_object_record(&mut self) -> Result<ParseRecord, JsError> {
         let start = self.pos;
-        self.eat(b'{');
+        self.eat(U_LBRACE);
         let object = JsObject::ordinary_object_create(self.object_proto());
         let mut entries = Vec::new();
         self.skip_ws();
-        if self.eat(b'}') {
+        if self.eat(U_RBRACE) {
             let _ = start;
             return Ok(ParseRecord {
                 value: Value::Object(object),
@@ -145,13 +197,13 @@ impl<'a> JsonParser<'a> {
         }
         loop {
             self.skip_ws();
-            if !self.eat(b'"') {
+            if !self.eat(U_QUOTE) {
                 return Err(self.syntax_error());
             }
             self.pos -= 1;
             let key = self.parse_string()?;
             self.skip_ws();
-            if !self.eat(b':') {
+            if !self.eat(U_COLON) {
                 return Err(self.syntax_error());
             }
             let value = self.parse_value()?;
@@ -162,10 +214,10 @@ impl<'a> JsonParser<'a> {
                 let _ = value;
             }
             self.skip_ws();
-            if self.eat(b'}') {
+            if self.eat(U_RBRACE) {
                 break;
             }
-            if !self.eat(b',') {
+            if !self.eat(U_COMMA) {
                 return Err(self.syntax_error());
             }
         }
@@ -181,11 +233,11 @@ impl<'a> JsonParser<'a> {
     /// reviver. Elements are defined densely on the pre-sized array (no
     /// per-element index-string key, mirroring `array_from_values`).
     fn parse_array_record(&mut self) -> Result<ParseRecord, JsError> {
-        self.eat(b'[');
+        self.eat(U_LBRACK);
         let mut elements: Vec<ParseRecord> = Vec::new();
         let mut values: Vec<Value> = Vec::new();
         self.skip_ws();
-        if self.eat(b']') {
+        if self.eat(U_RBRACK) {
             let array = crate::builtins::array::array_create(self.agent, 0.0)?;
             return Ok(ParseRecord {
                 value: Value::Object(array),
@@ -202,10 +254,10 @@ impl<'a> JsonParser<'a> {
             }
             values.push(value);
             self.skip_ws();
-            if self.eat(b']') {
+            if self.eat(U_RBRACK) {
                 break;
             }
-            if !self.eat(b',') {
+            if !self.eat(U_COMMA) {
                 return Err(self.syntax_error());
             }
         }
@@ -223,57 +275,60 @@ impl<'a> JsonParser<'a> {
 
     fn parse_string(&mut self) -> Result<JsString, JsError> {
         self.skip_ws();
-        if !self.eat(b'"') {
+        if !self.eat(U_QUOTE) {
             return Err(self.syntax_error());
         }
-        // Fast path: a plain segment with no escape, no multi-byte UTF-8,
-        // and no control byte (all illegal unescaped in JSON strings) is the
-        // byte range verbatim — one `from_utf8`, no per-unit decode loop, no
-        // Vec<u16>. Keys and typical string values have no escapes, so this
-        // is the common shape.
+        // Fast path: a segment with no escape and no control unit (all
+        // illegal unescaped in JSON strings) is the unit range verbatim — one
+        // `from_utf16`, no per-unit loop, no Vec. Non-ASCII units are legal
+        // unescaped JSON string content (a raw astral char is already a
+        // surrogate pair; a raw lone surrogate survives), and `from_utf16`
+        // copies them verbatim, so the scan breaks only on the quote, a
+        // backslash (an escape follows), or a control unit. Keys and typical
+        // string values have no escapes, so this is the common shape.
         let start = self.pos;
         let mut scan = self.pos;
-        while let Some(&byte) = self.text.get(scan) {
-            if byte == b'"' || byte == b'\\' || byte >= 0x80 || byte <= 0x1F {
+        while let Some(&unit) = self.text.get(scan) {
+            if unit == U_QUOTE || unit == U_BSLASH || unit <= 0x1F {
                 break;
             }
             scan += 1;
         }
-        if self.text.get(scan) == Some(&b'"') {
+        if self.text.get(scan) == Some(&U_QUOTE) {
             self.pos = scan + 1;
-            return Ok(JsString::from_utf8(
-                std::str::from_utf8(&self.text[start..scan]).unwrap_or(""),
-            ));
+            return Ok(JsString::from_utf16(&self.text[start..scan]));
         }
-        // Slow path: escapes, multi-byte UTF-8, control bytes, or an
+        // Slow path: an escape, a control unit (illegal unescaped), or an
         // unterminated string.
         let mut units: Vec<u16> = Vec::new();
         loop {
-            let Some(&byte) = self.text.get(self.pos) else {
+            let Some(&unit) = self.text.get(self.pos) else {
                 return Err(self.syntax_error());
             };
             self.pos += 1;
-            match byte {
-                b'"' => break,
-                b'\\' => {
+            match unit {
+                U_QUOTE => break,
+                U_BSLASH => {
                     let Some(&escape) = self.text.get(self.pos) else {
                         return Err(self.syntax_error());
                     };
                     self.pos += 1;
                     match escape {
-                        b'"' => units.push(b'"' as u16),
-                        b'\\' => units.push(b'\\' as u16),
-                        b'/' => units.push(b'/' as u16),
-                        b'b' => units.push(0x08),
-                        b'f' => units.push(0x0C),
-                        b'n' => units.push(b'\n' as u16),
-                        b'r' => units.push(b'\r' as u16),
-                        b't' => units.push(b'\t' as u16),
-                        b'u' => {
+                        U_QUOTE => units.push(U_QUOTE),
+                        U_BSLASH => units.push(U_BSLASH),
+                        U_SLASH => units.push(U_SLASH),
+                        U_BELL_B => units.push(0x08),
+                        U_FALSE_F => units.push(0x0C),
+                        // The escape LETTERS n/r/t (0x6E/0x72/0x74); the values
+                        // pushed are the control units (0x0A/0x0D/0x09).
+                        U_NULL_N => units.push(U_NL),
+                        U_LET_R => units.push(U_CR),
+                        U_TRUE_T => units.push(U_TAB),
+                        U_U => {
                             let hi = self.parse_hex4()?;
                             units.push(hi);
                             if (0xD800..=0xDBFF).contains(&hi)
-                                && self.text.get(self.pos..self.pos + 2) == Some(b"\\u")
+                                && self.text.get(self.pos..self.pos + 2) == Some(&[U_BSLASH, U_U])
                             {
                                 let save = self.pos + 2;
                                 self.pos = save;
@@ -289,22 +344,7 @@ impl<'a> JsonParser<'a> {
                     }
                 }
                 0x00..=0x1F => return Err(self.syntax_error()),
-                _ => {
-                    // Multi-byte UTF-8: decode the code point and push its
-                    // UTF-16 encoding (a surrogate pair for astral code
-                    // points).
-                    let len = utf8_len(byte);
-                    let end = (self.pos - 1 + len).min(self.text.len());
-                    let chunk = &self.text[self.pos - 1..end];
-                    if let Ok(text) = std::str::from_utf8(chunk) {
-                        self.pos = end;
-                        for unit in text.encode_utf16() {
-                            units.push(unit);
-                        }
-                    } else {
-                        return Err(self.syntax_error());
-                    }
-                }
+                _ => units.push(unit),
             }
         }
         Ok(JsString::from_utf16(&units))
@@ -316,17 +356,17 @@ impl<'a> JsonParser<'a> {
         }
         let mut value = 0u16;
         for _ in 0..4 {
-            let Some(&byte) = self.text.get(self.pos) else {
+            let Some(&unit) = self.text.get(self.pos) else {
                 return Err(self.syntax_error());
             };
             self.pos += 1;
-            let digit = match byte {
-                b'0'..=b'9' => byte - b'0',
-                b'a'..=b'f' => byte - b'a' + 10,
-                b'A'..=b'F' => byte - b'A' + 10,
+            let digit = match unit {
+                U_ZERO..=U_NINE => unit - U_ZERO,
+                U_HEX_A..=U_HEX_F => unit - U_HEX_A + 10,
+                U_HEX_ACAP..=U_HEX_FCAP => unit - U_HEX_ACAP + 10,
                 _ => return Err(self.syntax_error()),
             };
-            value = value * 16 + digit as u16;
+            value = value * 16 + digit;
         }
         Ok(value)
     }
@@ -334,54 +374,67 @@ impl<'a> JsonParser<'a> {
     /// JSONNumber: `-? int frac? exp?` with no leading zeros and no `+`.
     fn parse_number(&mut self) -> Result<f64, JsError> {
         let start = self.pos;
-        self.eat(b'-');
+        self.eat(U_MINUS);
         match self.text.get(self.pos).copied() {
-            Some(b'0') => {
+            Some(U_ZERO) => {
                 self.pos += 1;
             }
-            Some(b'1'..=b'9') => {
-                while matches!(self.text.get(self.pos), Some(b'0'..=b'9')) {
+            Some(U_ZERO..=U_NINE) => {
+                // The first digit 1-9 (U_ZERO handled above); the range covers
+                // it, matching the JSON number grammar's no-leading-zero rule
+                // via the U_ZERO arm taking precedence.
+                while matches!(self.text.get(self.pos).copied(), Some(U_ZERO..=U_NINE)) {
                     self.pos += 1;
                 }
             }
             _ => return Err(self.syntax_error()),
         }
-        if self.eat(b'.') {
+        if self.eat(U_DOT) {
             let frac_start = self.pos;
-            while matches!(self.text.get(self.pos), Some(b'0'..=b'9')) {
+            while matches!(self.text.get(self.pos).copied(), Some(U_ZERO..=U_NINE)) {
                 self.pos += 1;
             }
             if self.pos == frac_start {
                 return Err(self.syntax_error());
             }
         }
-        if matches!(self.text.get(self.pos), Some(b'e' | b'E')) {
+        if matches!(self.text.get(self.pos).copied(), Some(U_E | U_ECAP)) {
             self.pos += 1;
-            if matches!(self.text.get(self.pos), Some(b'+' | b'-')) {
+            if matches!(self.text.get(self.pos).copied(), Some(U_PLUS | U_MINUS)) {
                 self.pos += 1;
             }
             let exp_start = self.pos;
-            while matches!(self.text.get(self.pos), Some(b'0'..=b'9')) {
+            while matches!(self.text.get(self.pos).copied(), Some(U_ZERO..=U_NINE)) {
                 self.pos += 1;
             }
             if self.pos == exp_start {
                 return Err(self.syntax_error());
             }
         }
-        let text = std::str::from_utf8(&self.text[start..self.pos]).unwrap_or("");
         // The JSON number grammar is a subset of the JS numeric-literal
-        // grammar, so the shared string→number conversion applies unchanged.
-        to_number(&Value::String(Handle::new(JsString::from_utf8(text))))
-            .map_err(|_| self.syntax_error())
-    }
-}
-
-fn utf8_len(first: u8) -> usize {
-    match first {
-        0x00..=0x7F => 1,
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        _ => 4,
+        // grammar. An integer literal (no fraction/exponent) with at most 15
+        // digits is EXACTLY representable in an f64, so parse it directly
+        // from the units — JSON number values (ids, counts, indices) skip the
+        // token-string build + box + generic string→number dispatch the
+        // shared conversion pays per value. Longer integers and any
+        // fraction/exponent form need correct rounding and fall through to
+        // the generic conversion.
+        let token = &self.text[start..self.pos];
+        let sign = usize::from(token.first() == Some(&U_MINUS));
+        if !token.contains(&U_DOT)
+            && !token.contains(&U_E)
+            && !token.contains(&U_ECAP)
+            && token.len() - sign <= 15
+        {
+            let mut value: u64 = 0;
+            for &unit in &token[sign..] {
+                value = value * 10 + (unit - U_ZERO) as u64;
+            }
+            let number = value as f64;
+            return Ok(if sign == 1 { -number } else { number });
+        }
+        let token = JsString::from_utf16(token);
+        to_number(&Value::String(Handle::new(token))).map_err(|_| self.syntax_error())
     }
 }
 
@@ -423,10 +476,10 @@ fn raw_json_source(agent: &Agent, value: &Value) -> Option<JsString> {
 /// StringToJSONPrimitive (spec 26.6.3.1): the text is exactly one JSON
 /// primitive (string, number, boolean, or null); `None` otherwise.
 fn json_primitive_value(agent: &mut Agent, text: &JsString) -> Result<Option<Value>, JsError> {
-    let bytes = text.to_string_lossy().into_bytes();
+    let units = text.as_slice();
     let mut parser = JsonParser {
         agent,
-        text: &bytes,
+        text: units,
         pos: 0,
         // A primitive-only parse; the record tree is unused beyond .value.
         records: false,
@@ -460,10 +513,10 @@ fn to_string_arg(agent: &mut Agent, value: &Value) -> Result<JsString, JsError> 
 /// must reject invalid sources at resolution time with a SyntaxError, spec
 /// 16.2.1.7.1 ParseModule for JSON modules). The parsed value is discarded.
 pub(crate) fn validate_json(agent: &mut Agent, text: &str) -> Result<(), JsError> {
-    let bytes = text.as_bytes();
+    let units: Vec<u16> = text.encode_utf16().collect();
     let mut parser = JsonParser {
         agent,
-        text: bytes,
+        text: &units,
         pos: 0,
         // Validation only; the parsed value (and its record tree) is discarded.
         records: false,
@@ -489,10 +542,10 @@ fn json_parse(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     let text_value = args.first().cloned().unwrap_or(Value::Undefined);
     let text = to_string_arg(agent, &text_value)?;
     let reviver = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let bytes = text.to_string_lossy().into_bytes();
+    let units = text.as_slice();
     let mut parser = JsonParser {
         agent,
-        text: &bytes,
+        text: units,
         pos: 0,
         records: is_callable(&reviver),
     };
@@ -1208,6 +1261,21 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
     Ok(())
+}
+
+/// The O(1) dispatch table for the JSON members that need the agent:
+/// `Intrinsics::define` registers each builtin function's id against its
+/// native handler here, so a warm call skips the intrinsic-identity probes in
+/// [`dispatch_call`] (which run `current_realm` + `intrinsics.get` with a
+/// fresh name string per call).
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        JSON_PARSE => Some(json_parse),
+        JSON_STRINGIFY => Some(json_stringify),
+        JSON_RAW_JSON => Some(raw_json),
+        JSON_IS_RAW_JSON => Some(is_raw_json_method),
+        _ => None,
+    }
 }
 
 /// The JSON members that need the agent, dispatched by intrinsic identity
