@@ -419,34 +419,45 @@ pub fn compile_module(module: &Module) -> Vec<Option<CompiledFunc>> {
 /// still fails to lower is normally a branch to the implicit function label, a
 /// parameterized `if` without an `else`, or a latent lowerer mismatch — the
 /// message reflects that.
-pub fn body_compile_reason(module: &Module, defined: usize) -> &'static str {
+pub fn body_compile_reason(module: &Module, defined: usize) -> String {
     let Some(body) = module.bodies.get(defined) else {
-        return "no body";
+        return "no body".into();
     };
     let Some(type_index) = module.functions.get(defined).copied() else {
-        return "no function type";
+        return "no function type".into();
     };
     let Some(func_type) = module.func_at(type_index) else {
-        return "no function type";
+        return "no function type".into();
     };
     let carried = |ty: ValType| carrier_type(module, ty).is_some();
     if func_type.params.iter().any(|t| !carried(*t))
         || func_type.results.iter().any(|t| !carried(*t))
         || body.locals.iter().any(|t| !carried(*t))
     {
-        return "non-carried parameter/result/local type";
+        return "non-carried parameter/result/local type".into();
     }
     if body
         .body
         .iter()
         .any(|instr| matches!(instr, Instr::TryTable { .. }))
     {
-        return "try_table exception-handling body";
+        return "try_table exception-handling body".into();
     }
     if !lowerable(module, func_type, body) {
-        return "instruction outside the lowering subset";
+        // Name the first instruction the per-instruction subset rejects, so a
+        // coverage run can triage the "outside the subset" bucket without
+        // opening each module.
+        let blocker = body
+            .body
+            .iter()
+            .find(|instr| !instr_lowerable(module, instr));
+        return match blocker {
+            Some(instr) => format!("instruction outside the lowering subset ({instr:?})"),
+            None => "instruction outside the lowering subset".into(),
+        };
     }
     "lowering error (function-label branch, parameterized if without an else, or a latent mismatch)"
+        .into()
 }
 
 /// The process-wide native `TargetIsa`, built once (an ISA construction runs
@@ -1042,7 +1053,15 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
     // A call-bearing body's globals lower through the store-cell helper (no
     // `gvals` snapshot to go stale across the callee); whether the body has
     // calls decides only the buffer contents, not the lowering subset.
-    body.body.iter().all(|instr| match instr {
+    body.body.iter().all(|instr| instr_lowerable(module, instr))
+}
+
+/// Whether a single instruction is inside the lowering subset (the same
+/// per-instruction admission `lowerable` applies across the whole body),
+/// kept separate so the coverage report can name the first blocking
+/// instruction.
+fn instr_lowerable(module: &Module, instr: &Instr) -> bool {
+    match instr {
         Instr::Nop
         | Instr::Unreachable
         | Instr::I32Const(_)
@@ -1161,7 +1180,7 @@ fn lowerable(module: &Module, func_type: &FuncType, body: &FuncBody) -> bool {
         }
         Instr::VecShuffle(_) => true,
         _ => false,
-    })
+    }
 }
 
 fn supported_num(op: NumOp) -> bool {
@@ -1231,6 +1250,20 @@ fn supported_num(op: NumOp) -> bool {
             | I64GeU
             // Conversions.
             | I32WrapI64
+            // Reinterpretations (pure bit moves between equal-width int/float
+            // types).
+            | I32ReinterpretF32
+            | I64ReinterpretF64
+            | F32ReinterpretI32
+            | F64ReinterpretI64
+            // Sign/zero extension.
+            | I32Extend8S
+            | I32Extend16S
+            | I64Extend8S
+            | I64Extend16S
+            | I64Extend32S
+            | I64ExtendI32S
+            | I64ExtendI32U
             // f32 arithmetic (the lowering canonicalizes NaN results).
             | F32Abs
             | F32Neg
@@ -1532,6 +1565,25 @@ impl<'a> Lowerer<'a> {
 
     fn lower_num(&mut self, op: NumOp) -> Result<(), String> {
         use NumOp::*;
+        // Reinterpretations and sign extensions are unary bit/extension moves
+        // whose operand type differs from the result; handle them before the
+        // int/float category dispatch below.
+        if matches!(
+            op,
+            I32ReinterpretF32
+                | I64ReinterpretF64
+                | F32ReinterpretI32
+                | F64ReinterpretI64
+                | I32Extend8S
+                | I32Extend16S
+                | I64Extend8S
+                | I64Extend16S
+                | I64Extend32S
+                | I64ExtendI32S
+                | I64ExtendI32U
+        ) {
+            return self.lower_bit_op(op);
+        }
         // Float ops take their own path (they produce typed float values and
         // canonicalize NaN results per the interpreter's policy).
         if is_f32_op(op) {
@@ -1645,6 +1697,53 @@ impl<'a> Lowerer<'a> {
         };
         self.stack.push(result);
         Ok(())
+    }
+
+    /// The reinterpretation and sign-extension `Num` ops: pure bit moves on
+    /// one operand. Reinterpretations `bitcast` the pattern between an int
+    /// and its equal-width float type; the `extend8_s/16_s/32_s` forms narrow
+    /// to the source width and sign-extend back (`i32.extend8_s` is
+    /// `a as i8 as i32`), and `i64.extend_i32_s/u` sign-/zero-extend the low
+    /// i32. None of them round or canonicalize, so they match the
+    /// interpreter's bit semantics exactly.
+    fn lower_bit_op(&mut self, op: NumOp) -> Result<(), String> {
+        use NumOp::*;
+        let a = self.pop().ok_or("operand stack underflow")?;
+        let out = match op {
+            I32ReinterpretF32 => self
+                .builder
+                .ins()
+                .bitcast(types::I32, MemFlagsData::new(), a),
+            I64ReinterpretF64 => self
+                .builder
+                .ins()
+                .bitcast(types::I64, MemFlagsData::new(), a),
+            F32ReinterpretI32 => self
+                .builder
+                .ins()
+                .bitcast(types::F32, MemFlagsData::new(), a),
+            F64ReinterpretI64 => self
+                .builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), a),
+            I32Extend8S => self.sign_extend(types::I8, types::I32, a),
+            I32Extend16S => self.sign_extend(types::I16, types::I32, a),
+            I64Extend8S => self.sign_extend(types::I8, types::I64, a),
+            I64Extend16S => self.sign_extend(types::I16, types::I64, a),
+            I64Extend32S => self.sign_extend(types::I32, types::I64, a),
+            I64ExtendI32S => self.builder.ins().sextend(types::I64, a),
+            I64ExtendI32U => self.builder.ins().uextend(types::I64, a),
+            _ => return Err("non-bit Num opcode reached the bit lowering".to_string()),
+        };
+        self.stack.push(out);
+        Ok(())
+    }
+
+    /// Truncate to `narrow` (keeping the low bits) and sign-extend back to
+    /// `wide`: the wasm `*_extendN_s` semantics.
+    fn sign_extend(&mut self, narrow: Type, wide: Type, value: ClifValue) -> ClifValue {
+        let reduced = self.builder.ins().ireduce(narrow, value);
+        self.builder.ins().sextend(wide, reduced)
     }
 
     /// Shift with the count masked to the type width (wasm semantics; never
@@ -6288,6 +6387,127 @@ mod tests {
             &i32_to_i32,
         );
         assert_equiv(&loop_carry, 0, &[vec![]]);
+    }
+
+    #[test]
+    fn reinterpret_and_extend_bits_match_the_interpreter() {
+        // Bit reinterpretations move an operand's pattern between an int and
+        // its equal-width float type; the `*_extendN_s` forms sign-extend the
+        // low bits and `i64.extend_i32_s/u` widen an i32. All are pure bit
+        // ops, so compiled and interpreter must agree on every pattern (NaN
+        // payloads and -0.0 included).
+        let i32_to_f32 = module_with(
+            vec![Instr::LocalGet(0), Instr::Num(NumOp::F32ReinterpretI32)],
+            vec![ValType::I32],
+            vec![],
+            vec![ValType::F32],
+        );
+        let i32_cases = [
+            0i32,
+            1,
+            0x3f80_0000,
+            0x3f00_0000,
+            0x7fc0_0000,
+            i32::MIN,
+            i32::MAX,
+        ]
+        .into_iter()
+        .map(|v| vec![Value::I32(v)])
+        .collect::<Vec<_>>();
+        assert_equiv(&i32_to_f32, 0, &i32_cases);
+        let f32_to_i32 = module_with(
+            vec![Instr::LocalGet(0), Instr::Num(NumOp::I32ReinterpretF32)],
+            vec![ValType::F32],
+            vec![],
+            vec![ValType::I32],
+        );
+        assert_equiv(&f32_to_i32, 0, &f32_unary());
+        let i64_to_f64 = module_with(
+            vec![Instr::LocalGet(0), Instr::Num(NumOp::F64ReinterpretI64)],
+            vec![ValType::I64],
+            vec![],
+            vec![ValType::F64],
+        );
+        let i64_cases = [
+            0i64,
+            1,
+            0x3ff0_0000_0000_0000,
+            0x7ff8_0000_0000_0000,
+            i64::MIN,
+            i64::MAX,
+        ]
+        .into_iter()
+        .map(|v| vec![Value::I64(v)])
+        .collect::<Vec<_>>();
+        assert_equiv(&i64_to_f64, 0, &i64_cases);
+        let f64_to_i64 = module_with(
+            vec![Instr::LocalGet(0), Instr::Num(NumOp::I64ReinterpretF64)],
+            vec![ValType::F64],
+            vec![],
+            vec![ValType::I64],
+        );
+        assert_equiv(&f64_to_i64, 0, &f64_unary());
+
+        let sign_extend_i32 = |op: NumOp| {
+            module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::I32],
+                vec![],
+                vec![ValType::I32],
+            )
+        };
+        let i32_patterns = [
+            0i32,
+            1,
+            0x7f,
+            0x80,
+            0xff,
+            0x7fff,
+            0x8000,
+            -1,
+            0x1234_5678,
+            i32::MIN,
+        ]
+        .into_iter()
+        .map(|v| vec![Value::I32(v)])
+        .collect::<Vec<_>>();
+        assert_equiv(&sign_extend_i32(NumOp::I32Extend8S), 0, &i32_patterns);
+        assert_equiv(&sign_extend_i32(NumOp::I32Extend16S), 0, &i32_patterns);
+        let i64_patterns = [
+            0i64,
+            1,
+            0x7f,
+            0x80,
+            0xff,
+            0x7fff_ffff,
+            -1,
+            0x1_2345_6789,
+            i64::MIN,
+        ]
+        .into_iter()
+        .map(|v| vec![Value::I64(v)])
+        .collect::<Vec<_>>();
+        for op in [NumOp::I64Extend8S, NumOp::I64Extend16S, NumOp::I64Extend32S] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::I64],
+                vec![],
+                vec![ValType::I64],
+            );
+            assert_equiv(&module, 0, &i64_patterns);
+        }
+        for (op, results) in [
+            (NumOp::I64ExtendI32S, vec![ValType::I64]),
+            (NumOp::I64ExtendI32U, vec![ValType::I64]),
+        ] {
+            let module = module_with(
+                vec![Instr::LocalGet(0), Instr::Num(op)],
+                vec![ValType::I32],
+                vec![],
+                results,
+            );
+            assert_equiv(&module, 0, &i32_patterns);
+        }
     }
 
     #[test]

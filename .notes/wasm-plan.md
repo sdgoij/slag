@@ -2622,6 +2622,25 @@ core, 253 suites, 0 diverged): coverage 7865 → 7869 (95%), "lowering error"
 else-less `(param i32) (result i32)` `if` whose false path returns the
 parameter).
 
+The coverage tooling now pinpoints stragglers: `body_compile_reason` returns
+the first blocking *instruction* for the "outside the lowering subset" bucket
+(`lowerable`'s per-instruction admission was factored into `instr_lowerable`),
+and `Store::compile_coverage`/`wasmtest equiv` report each fallback's module-
+defined body index per suite. The triage (from the 260-body bucket) shows the
+remaining composition is dominated by ref-typed globals (58), float→int
+`trunc` conversions (~47), and small families (table get/set, ref.null,
+call_indirect).
+
+The reinterpretation and sign-extension slice landed off that triage:
+`i32.reinterpret_f32`/`i64.reinterpret_f64`/`f32.reinterpret_i32`/
+`f64.reinterpret_i64` lower as pure `bitcast`s, and the `*_extendN_s` forms
+(narrow-then-sign-extend) plus `i64.extend_i32_s/u` lower natively — the
+biggest single corpus blocker. Corpus effect: coverage 7869 → 7998 (97%),
+"outside the lowering subset" 260 → 131 (the `Num` share 176 → 47, now
+entirely `trunc*`). Unit coverage in
+`reinterpret_and_extend_bits_match_the_interpreter` (bit patterns incl. NaN
+payloads and -0.0).
+
 ### Definition of done (all must hold)
 
 - [ ] Gate 0 report exists and is the tracking source of truth.

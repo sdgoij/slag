@@ -2506,9 +2506,11 @@ impl Store {
     /// Compiled-coverage totals across every live instance: how many
     /// module-defined functions compiled vs. the total, plus a coarse reason
     /// per function that did not (see [`crate::compile::body_compile_reason`]).
-    /// An interpreter-forced store reports zeros.
+    /// An interpreter-forced store reports zeros. Each fallback records its
+    /// module-defined body index alongside the coarse reason, so a run can
+    /// pinpoint which functions of which module stayed interpreted.
     #[cfg(feature = "compile")]
-    pub fn compile_coverage(&self) -> (usize, usize, Vec<&'static str>) {
+    pub fn compile_coverage(&self) -> (usize, usize, Vec<(usize, String)>) {
         let mut compiled = 0usize;
         let mut defined = 0usize;
         let mut reasons = Vec::new();
@@ -2523,7 +2525,10 @@ impl Store {
                 if entry.is_some() {
                     compiled += 1;
                 } else {
-                    reasons.push(crate::compile::body_compile_reason(&instance.module, index));
+                    reasons.push((
+                        index,
+                        crate::compile::body_compile_reason(&instance.module, index),
+                    ));
                 }
             }
         }

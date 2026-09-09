@@ -275,7 +275,8 @@ fn run(paths: &[PathBuf]) -> ExitCode {
 struct Coverage {
     compiled: usize,
     defined: usize,
-    reasons: Vec<&'static str>,
+    /// Each fallback's module-defined body index plus its reason.
+    reasons: Vec<(usize, String)>,
 }
 
 #[cfg(feature = "compile")]
@@ -283,7 +284,7 @@ impl Coverage {
     fn merge(&mut self, other: &Coverage) {
         self.compiled += other.compiled;
         self.defined += other.defined;
-        self.reasons.extend(other.reasons.iter().copied());
+        self.reasons.extend(other.reasons.iter().cloned());
     }
 }
 
@@ -389,6 +390,21 @@ fn equiv(paths: &[PathBuf]) -> ExitCode {
                 "  coverage {}/{} functions compiled ({percent}%)",
                 compiled_coverage.compiled, compiled_coverage.defined
             );
+            // Pinpoint stragglers (the Gate 0 reason list is per body index,
+            // so a wave can open the exact module): cap the listing so a
+            // many-instance suite does not drown the run.
+            let fallbacks = compiled_coverage.compiled < compiled_coverage.defined;
+            if fallbacks {
+                for (index, reason) in compiled_coverage.reasons.iter().take(40) {
+                    println!("    fallback body #{index}: {reason}");
+                }
+                if compiled_coverage.reasons.len() > 40 {
+                    println!(
+                        "    ... and {} more fallbacks",
+                        compiled_coverage.reasons.len() - 40
+                    );
+                }
+            }
         }
     }
     if total.defined > 0 {
@@ -400,8 +416,8 @@ fn equiv(paths: &[PathBuf]) -> ExitCode {
         if !total.reasons.is_empty() {
             println!("uncompiled fallback reasons:");
             let mut reasons: Vec<(&str, usize)> = Vec::new();
-            for reason in &total.reasons {
-                match reasons.iter_mut().find(|(r, _)| r == reason) {
+            for (_, reason) in &total.reasons {
+                match reasons.iter_mut().find(|(r, _)| *r == reason) {
                     Some((_, count)) => *count += 1,
                     None => reasons.push((reason, 1)),
                 }
