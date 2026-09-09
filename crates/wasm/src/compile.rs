@@ -410,16 +410,15 @@ pub fn compile_module(module: &Module) -> Vec<Option<CompiledFunc>> {
         return (0..module.bodies.len()).map(|_| None).collect();
     };
     (0..module.bodies.len())
-        .map(|defined| engine.compile(module, defined))
+        .map(|defined| engine.compile(module, defined).ok().flatten())
         .collect()
 }
 
-/// A coarse reason a module-defined body is not compiled, for the coverage
-/// report: the structural gates first (non-carried types, a `try_table`
-/// handler), then the per-instruction subset. A body that passes the gate but
-/// still fails to lower is normally a branch to the implicit function label, a
-/// parameterized `if` without an `else`, or a latent lowerer mismatch — the
-/// message reflects that.
+/// A reason a module-defined body is not compiled, for the coverage report:
+/// the structural gates first (non-carried types, a `try_table` handler),
+/// then the per-instruction subset. A body that passes the gates but is
+/// still not compiled fails inside the lowering pipeline, so the report
+/// surfaces the concrete error (the latent-mismatch audit).
 pub fn body_compile_reason(module: &Module, defined: usize) -> String {
     let Some(body) = module.bodies.get(defined) else {
         return "no body".into();
@@ -457,8 +456,17 @@ pub fn body_compile_reason(module: &Module, defined: usize) -> String {
             None => "instruction outside the lowering subset".into(),
         };
     }
-    "lowering error (function-label branch, parameterized if without an else, or a latent mismatch)"
-        .into()
+    // The gates passed, so a body reported uncompiled failed inside the
+    // lowering pipeline. Name the concrete error instead of guessing its
+    // shape. A body the pipeline accepts compiles, so it must have been
+    // held back by an embedder rule rather than a lowerer gap.
+    let Ok(engine) = Engine::new() else {
+        return "native code generation unavailable".into();
+    };
+    match engine.compile(module, defined) {
+        Err(reason) => reason,
+        Ok(_) => "compiled body held back by an embedder rule (host-reachable)".into(),
+    }
 }
 
 /// The process-wide native `TargetIsa`, built once (an ISA construction runs
@@ -490,14 +498,17 @@ impl Engine {
         Ok(Self { isa: native_isa()? })
     }
 
-    /// Compile `defined` of `module`, or `None` when the function is outside
-    /// the supported subset.
-    fn compile(&self, module: &Module, defined: usize) -> Option<CompiledFunc> {
-        let body = module.bodies.get(defined)?;
-        let type_index = *module.functions.get(defined)?;
-        let func_type = module.func_at(type_index)?;
+    /// Compile `defined` of `module`. `Ok(None)` when a structural gate keeps
+    /// the body interpreted (see [`body_compile_reason`] for the gate's
+    /// name); `Err` when the body passes the gates but the lowering pipeline
+    /// rejects it — the concrete latent-mismatch reason, surfaced so coverage
+    /// runs can triage the bucket without opening each module.
+    fn compile(&self, module: &Module, defined: usize) -> Result<Option<CompiledFunc>, String> {
+        let body = module.bodies.get(defined).ok_or("no body")?;
+        let type_index = *module.functions.get(defined).ok_or("no function type")?;
+        let func_type = module.func_at(type_index).ok_or("no function type")?;
         if !lowerable(module, func_type, body) {
-            return None;
+            return Ok(None);
         }
         let conv = platform_call_conv(&*self.isa);
         let mut func = Function::with_name_signature(
@@ -516,19 +527,22 @@ impl Engine {
         lower(
             module, body, func_type, &globals, &mut func, &mut fctx, &*self.isa,
         )
-        .ok()?;
+        .map_err(|reason| format!("lowering error: {reason}"))?;
         let mut ctx = Context::for_function(func);
-        let compiled = ctx.compile(&*self.isa, &mut ControlPlane::default()).ok()?;
-        let code = ExecutableCode::new(compiled.code_buffer()).ok()?;
+        let compiled = ctx
+            .compile(&*self.isa, &mut ControlPlane::default())
+            .map_err(|e| format!("codegen error: {e:?}"))?;
+        let code = ExecutableCode::new(compiled.code_buffer())
+            .map_err(|e| format!("executable-allocation error: {e}"))?;
         // SAFETY: `code.as_ptr()` is an executable allocation that outlives
         // the cast; a data pointer to a function pointer is a plain integer
         // cast on every supported (64-bit) target.
         let entry: CompiledEntry = unsafe { std::mem::transmute(code.as_ptr()) };
-        Some(CompiledFunc {
+        Ok(Some(CompiledFunc {
             _code: code,
             entry,
             globals,
-        })
+        }))
     }
 }
 
