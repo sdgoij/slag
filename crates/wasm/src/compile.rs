@@ -924,8 +924,8 @@ fn array_value_lowerable(module: &Module, ty: u32) -> bool {
 }
 
 /// A table index's declared `table64` flag, resolving index-space indices
-/// (imported tables first) so the call lowering can gate `call_indirect` on
-/// 32-bit-addressed tables (an i64 element index stays interpreter-side).
+/// (imported tables first) so the lowering can widen a table instruction's
+/// address operand to the referenced table's index type.
 fn table_is64(module: &Module, index: u32) -> Option<bool> {
     let imported = module
         .imports
@@ -1135,14 +1135,14 @@ fn instr_lowerable(module: &Module, instr: &Instr) -> bool {
             type_index,
             table_index,
         } => {
-            table_is64(module, *table_index) == Some(false)
+            table_is64(module, *table_index).is_some()
                 && callable_type(module, module.func_at_cloned(*type_index))
         }
         Instr::CallRef(type_index) | Instr::ReturnCallRef(type_index) => {
             callable_type(module, module.func_at_cloned(*type_index))
         }
         Instr::TableGet(table) | Instr::TableSet(table) => {
-            table_is64(module, *table) == Some(false) && table_carried_ref(module, *table)
+            table_is64(module, *table).is_some() && table_carried_ref(module, *table)
         }
         Instr::TableSize(table) | Instr::TableGrow(table) | Instr::TableFill(table) => {
             table_is64(module, *table).is_some() && table_carried_ref(module, *table)
@@ -3093,7 +3093,7 @@ impl<'a> Lowerer<'a> {
 
     /// A `call_indirect`/`return_call_indirect` through `table_index` at the
     /// element index on the operand stack, type-checked against
-    /// `type_index` (the table is 32-bit addressed in the compiled subset).
+    /// `type_index` (the element index follows the table's address type).
     fn do_call_indirect(
         &mut self,
         type_index: u32,
@@ -3104,8 +3104,7 @@ impl<'a> Lowerer<'a> {
             .module
             .func_at_cloned(type_index)
             .ok_or("unresolved call_indirect type")?;
-        let element = self.pop().ok_or("operand stack underflow")?;
-        let element64 = self.builder.ins().uextend(types::I64, element);
+        let element64 = self.pop_table_addr(table_index)?;
         let table = self.iconst(types::I64, i64::from(table_index));
         self.lower_call(1, table, element64, i64::from(type_index), &ty, tail)
     }
@@ -3241,11 +3240,11 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    /// A `table.get` over a 32-bit funcref table: pop the i32 index, read the
-    /// element through the runtime helper (mode 3), and push its token.
+    /// A `table.get`: pop the element index (sized by the table's address
+    /// type), read the element through the runtime helper (mode 3), and push
+    /// its token.
     fn do_table_get(&mut self, table: u32) -> Result<(), String> {
-        let index = self.pop().ok_or("operand stack underflow")?;
-        let index64 = self.builder.ins().uextend(types::I64, index);
+        let index64 = self.pop_table_addr(table)?;
         let table_v = self.iconst(types::I64, i64::from(table));
         let mode = self.iconst(types::I64, 3);
         let zero = self.iconst(types::I64, 0);
@@ -3270,13 +3269,12 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    /// A `table.set` over a 32-bit funcref table: pop the reference token and
-    /// the i32 index (reference on top), write through the runtime helper
-    /// (mode 4).
+    /// A `table.set`: pop the reference token and the element index (the
+    /// reference on top; the index sized by the table's address type), write
+    /// through the runtime helper (mode 4).
     fn do_table_set(&mut self, table: u32) -> Result<(), String> {
         let value = self.pop().ok_or("operand stack underflow")?;
-        let index = self.pop().ok_or("operand stack underflow")?;
-        let index64 = self.builder.ins().uextend(types::I64, index);
+        let index64 = self.pop_table_addr(table)?;
         let table_v = self.iconst(types::I64, i64::from(table));
         let mode = self.iconst(types::I64, 4);
         let zero = self.iconst(types::I64, 0);
@@ -5862,12 +5860,13 @@ mod tests {
             .instantiate(module, &mut |_, _| None)
             .expect("module instantiates");
         let mut outcomes = Vec::new();
-        for (index, args) in sequence {
+        for (step, (index, args)) in sequence.iter().enumerate() {
             let via_compiled = compiled.invoke(compiled_instance, *index, args);
             let via_interpreter = interpreter.invoke(interpreter_instance, *index, args);
             assert!(
                 via_compiled == via_interpreter,
-                "paths diverge for seq {sequence:?}: compiled={via_compiled:?} interpreter={via_interpreter:?}"
+                "paths diverge at step {step} (function {index}, {args:?}): \
+                 compiled={via_compiled:?} interpreter={via_interpreter:?}"
             );
             outcomes.push(via_interpreter);
         }
@@ -9078,6 +9077,121 @@ mod tests {
         assert_eq!(outcomes[8], Ok(vec![]));
         assert!(matches!(
             outcomes[9],
+            Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
+        ));
+    }
+
+    #[test]
+    fn table64_get_set_and_call_indirect_match_the_interpreter() {
+        // A table64 funcref table addressed by i64 element indices:
+        // `table.get`/`table.set` over the width, and a dispatcher whose
+        // `call_indirect` reads the element index at i64. The runtime helpers
+        // bounds-check the raw u64 slot, so an out-of-range or negative index
+        // (a huge unsigned slot) traps exactly like the interpreter's
+        // `pop_table_addr`.
+        let module = Module {
+            types: vec![
+                SubType::func(vec![ValType::I32, ValType::I32], vec![ValType::I32]),
+                SubType::func(
+                    vec![ValType::I32, ValType::I32, ValType::I64],
+                    vec![ValType::I32],
+                ),
+                SubType::func(vec![ValType::I64], vec![ValType::Ref(RefType::FUNC)]),
+                SubType::func(vec![ValType::I64, ValType::Ref(RefType::FUNC)], vec![]),
+            ],
+            functions: vec![0, 1, 2, 3],
+            bodies: vec![
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::Num(NumOp::I32Add),
+                    ],
+                },
+                // 1: dispatch (a, b) through slot `index`.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::CallIndirect {
+                            type_index: 0,
+                            table_index: 0,
+                        },
+                    ],
+                },
+                // 2: read slot `index`.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::TableGet(0)],
+                },
+                // 3: write `value` into slot `index` (table.set pops the
+                // reference from the top, the index below it).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::TableSet(0)],
+                },
+            ],
+            tables: vec![Table {
+                ty: TableType {
+                    element: RefType::FUNC,
+                    limits: Limits {
+                        min: 1,
+                        max: None,
+                        shared: false,
+                    },
+                    table64: true,
+                },
+                init: Some(vec![Instr::RefFunc(0)]),
+            }],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "table64 module did not compile; the comparison is vacuous"
+        );
+        let add = Value::Ref(RefValue::Func(FuncAddr {
+            instance: 0,
+            index: 0,
+        }));
+        let outcomes = run_seq(
+            &module,
+            &[
+                // Dispatch through slot 0 at an i64 index: add(2, 3).
+                (1, vec![Value::I32(2), Value::I32(3), Value::I64(0)]),
+                // An out-of-range index and a negative i64 (a huge unsigned
+                // slot) both trap as an undefined element.
+                (1, vec![Value::I32(2), Value::I32(3), Value::I64(1)]),
+                (1, vec![Value::I32(2), Value::I32(3), Value::I64(-1)]),
+                // Read the initialized `add` entry, rewrite it with a null,
+                // and confirm both ends agree at each step.
+                (2, vec![Value::I64(0)]),
+                (3, vec![Value::I64(0), add]),
+                (2, vec![Value::I64(0)]),
+                (3, vec![Value::I64(0), Value::Ref(RefValue::Null)]),
+                (2, vec![Value::I64(0)]),
+                // An out-of-range read traps on both paths.
+                (2, vec![Value::I64(7)]),
+            ],
+        );
+        assert_eq!(outcomes[0], Ok(vec![Value::I32(5)]));
+        assert!(matches!(
+            outcomes[1],
+            Err(ExecFail::Trap(Trap::UndefinedElement))
+        ));
+        assert!(matches!(
+            outcomes[2],
+            Err(ExecFail::Trap(Trap::UndefinedElement))
+        ));
+        assert_eq!(outcomes[3], Ok(vec![add]));
+        assert_eq!(outcomes[4], Ok(vec![]));
+        assert_eq!(outcomes[5], Ok(vec![add]));
+        assert_eq!(outcomes[6], Ok(vec![]));
+        assert_eq!(outcomes[7], Ok(vec![Value::Ref(RefValue::Null)]));
+        assert!(matches!(
+            outcomes[8],
             Err(ExecFail::Trap(Trap::OutOfBoundsTableAccess))
         ));
     }

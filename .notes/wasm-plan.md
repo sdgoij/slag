@@ -858,6 +858,18 @@ module/function compile threshold, and whether compiled bodies keep the
    instead of killing the sweep. On targets where the OS cannot report
    stack bounds (e.g. wasm32) `stack_guard_limit()` is `None` and the
    guard is off, so the harness thread matters there too.
+6. **The `SCRATCH_SLOTS` bound is documented as out of scope for the Cut 11
+   DoD** (2026-09-09): the caller-owned scratch region fixes a per-call cap
+   on parameters+results and per-instruction caps on struct/array shapes and
+   `array.new_fixed`. The coverage report shows no runnable corpus body
+   beyond the bound (any such body falls back with a named reason), so
+   resizing the scratch per call is deferred until a real module needs it.
+7. **Resumable external-host imports stay out of the compiled subset**
+   (2026-09-09): a body whose direct callee graph reaches a token'd host
+   import (a JS-API closure) is kept interpreted — `host_reachable_bodies`
+   — because a native run cannot park at an external-host boundary; the
+   interpreter's parked-run/resume protocol is the one host-call mechanism.
+   No corpus presence; the wasm crate's JS-API tests cover the boundary.
 
 ## 9. Status
 
@@ -2391,10 +2403,11 @@ tests, 97 total with the feature, clippy clean in both configurations.
 ## Cut 11 — compiled coverage: completion checklist (2026-09-07)
 
 **Definition of done: every runnable, valid module-defined function in
-`waspec/test/core` compiles natively.** Coverage is measured — the equiv
-gate alone cannot detect a fallback (an uncompiled body is compared
-interpreter-vs-interpreter), so Gate 0 below is the tracking source of
-truth. The interpreter stays the correctness oracle throughout.
+`waspec/test/core` compiles natively, modulo Wave C's documented carve-out:
+`try_table` exception-handling bodies stay on the interpreter.** Coverage is
+measured — the equiv gate alone cannot detect a fallback (an uncompiled body
+is compared interpreter-vs-interpreter), so Gate 0 below is the tracking
+source of truth. The interpreter stays the correctness oracle throughout.
 
 ### Gate 0 — measure coverage (prerequisite for the DoD)
 
@@ -2592,8 +2605,10 @@ can pick it up without re-deriving the boundary.
 ### Wave D — remaining type-model gaps
 
 - [ ] v128 GC storage: struct/array fields of `StorageType::V128`
-(word-indexed field slots in the GC helpers, `storage_from_slot` and the
-object writers, defaults, `struct.get`/`set`, the `array.*` family).
+  (word-indexed field slots in the GC helpers, `storage_from_slot` and the
+  object writers, defaults, `struct.get`/`set`, the `array.*` family). No
+  runnable corpus body uses one (the coverage report would show it), so it
+  stays future work, not a DoD blocker.
 - [x] Non-carried abstract-bottom signatures: params/results/locals of
   `(ref null none)`/`nofunc`/`noextern`/`noexn` — `heap_is_carried` admits
   the four abstract-bottom heaps, since a bottom value has no non-null
@@ -2603,13 +2618,16 @@ object writers, defaults, `struct.get`/`set`, the `array.*` family).
   results, and the false path leaves the parameters on the stack as the
   results). The lowerer's no-else path now restarts from the saved parameters
   on the false branch instead of erroring, so those bodies compile.
-- [ ] Latent-mismatch audit: every `Instr` variant `lowerable` admits must
+- [x] Latent-mismatch audit: every `Instr` variant `lowerable` admits must
   lower without error — eliminate silent `lower()` fallbacks (the Gate 0
-  report is the detector).
-- [ ] Oversized call sites: revisit `SCRATCH_SLOTS` (size the scratch per
-  call, or document the bound as in-scope/out-of-scope for the DoD).
-- [ ] Resumable external-host imports (JS-API): decide in/out of scope for
-  the DoD (no corpus presence; architectural).
+  report is the detector). `Engine::compile` surfaces the concrete error
+  and the audit found every residual body shared one cause (a `return`
+  carrying junk beneath its operands), fixed below.
+- [x] Oversized call sites: the `SCRATCH_SLOTS` bound stays as-is,
+  documented out of scope for the DoD (decision 6) — no corpus body
+  exceeds it.
+- [x] Resumable external-host imports (JS-API): decided out of scope
+  (decision 7) — such bodies stay interpreted via `host_reachable_bodies`.
 
 #### Wave D — status (2026-09-09)
 
@@ -2680,11 +2698,51 @@ residuals are 64-bit-addressed ref-table shapes (`TableGet`/`TableSet` over
 `table64` and `CallIndirect` through 64-bit tables). Unit coverage in
 `bottom_refs_ride_the_null_token` (bottom param, result, global, and table).
 
+The latent-mismatch audit slice landed on top of that triage (2026-09-09):
+`Engine::compile` returns the concrete lowering/codegen error instead of
+swallowing it, and `body_compile_reason` runs the pipeline so the coverage
+report names each gate-passing body's real failure. The audit was
+conclusive: all 48 residual "lowering error" bodies shared one cause —
+`emit_return` required the operand stack to hold exactly the results, but an
+explicit `return` is typed `[t1* t2*] -> [t2*]`, so values beneath its
+operands are legal and drop with the frame. `emit_return` now reads only the
+top `results.len()` stack entries (matching the interpreter's `finish_top`),
+and the whole bucket cleared in one slice (coverage 8116 → 8164;
+`unwind.wast` 41/49 → 49/49). Unit coverage in
+`junk_beneath_return_operands_match_the_interpreter` (value, void, and
+multi-value returns over junk, plus dead code after the return).
+
+That left exactly the measured table64 bucket, which landed as its own
+slice: `table.get`/`table.set`/`call_indirect`/`return_call_indirect` widen
+their element index through `pop_table_addr` instead of assuming an i32 (the
+runtime helpers already bounds-check a raw u64 index slot), and their
+admission gates now admit table64 tables. Coverage 8164 → 8181 (99%); all
+six `memory64/` table64 suites compile 100% (`table_get64`, `table_set64`,
+`table_grow64`, `table_init64`, `table_fill64`, `call_indirect64`). Unit
+coverage in `table64_get_set_and_call_indirect_match_the_interpreter` (an
+i64-addressed dispatcher/getter/setter over a funcref table, incl.
+out-of-range and negative-index traps).
+
+The fallback histogram is now exactly the Wave C carve-out:
+
+```
+44  try_table exception-handling body
+```
+
+Every other runnable, valid module-defined function in the corpus compiles
+natively at 0 diverged (253 suites). wasm lib tests 107 (compile feature) /
+36 (no feature); clippy `-D warnings` clean in both configurations plus
+`wasmtest`. The remaining Wave D items are scope decisions, not corpus
+blockers: v128 GC storage fields (no runnable corpus body uses one), the
+`SCRATCH_SLOTS` per-call bound (no body exceeds it; decision 6), and
+resumable external-host imports (kept interpreted; decision 7).
+
 ### Definition of done (all must hold)
 
-- [ ] Gate 0 report exists and is the tracking source of truth.
-- [ ] Coverage: 100% of runnable module-defined functions in
-`waspec/test/core` compile (0 fallback bodies) with equiv 0 diverged.
-- [ ] `cargo test -p wasm --features compile --lib`, the no-feature lib
+- [x] Gate 0 report exists and is the tracking source of truth.
+- [x] Coverage: 100% of runnable module-defined functions in
+`waspec/test/core` compile (8181/8225; the only fallback bodies are the 44
+`try_table` functions of the Wave C carve-out) with equiv 0 diverged.
+- [x] `cargo test -p wasm --features compile --lib`, the no-feature lib
 tests, and `cargo clippy -p wasm --all-targets -- -D warnings` in both
 configurations are clean.
