@@ -674,6 +674,11 @@ struct Lowerer<'a> {
     /// read their step's payload back out of the running body instead of
     /// marshalling it across the FFI boundary.
     sig_step: SigRef,
+    /// The `(vm, step_index, sp) -> value` signature of the compiled
+    /// `Step::ObjectFast` fused create: `object_fast` reads the names
+    /// payload back from the running body and the values from the working
+    /// region below the machine-code `sp`.
+    sig_step_sp: SigRef,
     /// Cut 55: whether the body contains try machinery (`EnterTry`). A
     /// try body's `Return` routes through `return_control`, its helpers'
     /// pending errors dispatch through `dispatch_error`, and
@@ -778,6 +783,7 @@ impl<'a> Lowerer<'a> {
         let sig_apply_args = builder.import_signature(helper_sig(&[types::I64; 3], conv));
         let sig_assign = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_step = builder.import_signature(helper_sig(&[types::I64; 2], conv));
+        let sig_step_sp = builder.import_signature(helper_sig(&[types::I64; 3], conv));
         let sig_tail = builder.import_signature(helper_sig(&[types::I64; 6], conv));
         let sig_entry = builder.import_signature(helper_sig(&[types::I64; 3], conv));
         // Cut 55: the body's try machinery and its static dispatch targets
@@ -875,6 +881,7 @@ impl<'a> Lowerer<'a> {
             sig_apply_args,
             sig_assign,
             sig_step,
+            sig_step_sp,
             sig_tail,
             sig_entry,
             has_try,
@@ -5676,30 +5683,22 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::ObjectFast { names } => {
-                // Cut 72: the interpreter's fused path adopts all fields in
-                // one map set; the JIT expands the step into the per-key
-                // helpers. The values sit on the work stack (vN on top), so
-                // pop them into locals first, then define in SOURCE order
-                // (key order is observable via enumeration). The object rides
-                // a Cranelift variable while each value defines.
+                // Cut 72: the interpreter's fused whole-literal create lowers
+                // to ONE helper call — `object_fast` reads the names payload
+                // back from the running body and the n values from the
+                // working region below the current sp, creates the object on
+                // the pre-forked shape, and adopts all fields (previously the
+                // step expanded into `ObjectBegin` + N per-key
+                // `ObjectInitName` calls, which made the JIT slower than the
+                // interpreter on literal loops). The values are dropped and
+                // the returned object replaces them on the stack.
                 let n = names.len();
-                let mut object = self.call_slow(self.sig_tdz, Helper::ObjectBegin, &[])?;
-                let mut popped: Vec<ClifValue> = Vec::with_capacity(n);
-                for _ in 0..n {
-                    popped.push(self.pop());
-                }
-                for (index, name) in names.iter().enumerate() {
-                    let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
-                    let zero = self.builder.ins().iconst(types::I64, 0);
-                    // popped[0] is the LAST value (vN); source-order value i
-                    // is popped[n - 1 - i].
-                    let value = popped[n - 1 - index];
-                    object = self.call_slow(
-                        self.sig_assign,
-                        Helper::ObjectInitName,
-                        &[object, name_imm, zero, zero, value],
-                    )?;
-                }
+                let sp = self.builder.use_var(self.sp_var);
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let object =
+                    self.call_slow(self.sig_step_sp, Helper::ObjectFast, &[step_imm, sp])?;
+                let base = self.builder.ins().iadd_imm_s(sp, -8 * (n as i64));
+                self.builder.def_var(self.sp_var, base);
                 self.push(object);
                 self.fall_through(index);
             }

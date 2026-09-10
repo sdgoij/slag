@@ -101,6 +101,10 @@ pub enum Helper {
     ArrayHole,
     ArrayEnd,
     ObjectBegin,
+    /// Cut 72: the fused `Step::ObjectFast` whole-literal create — the
+    /// compiled step lowers to ONE helper call instead of `ObjectBegin` + N
+    /// per-key `ObjectInitName` calls.
+    ObjectFast,
     ObjectInitName,
     ObjectInitComputed,
     ObjectKeyToPropertyKey,
@@ -231,6 +235,7 @@ impl Helper {
             Helper::ArrayHole => "array_hole",
             Helper::ArrayEnd => "array_end",
             Helper::ObjectBegin => "object_begin",
+            Helper::ObjectFast => "object_fast",
             Helper::ObjectInitName => "object_init_name",
             Helper::ObjectInitComputed => "object_init_computed",
             Helper::ObjectKeyToPropertyKey => "object_key_to_property_key",
@@ -602,6 +607,10 @@ pub struct JitHelpers {
     /// `ObjectKeyToPropertyKey` converts a computed key;
     /// `ObjectSpread` copies a source's own enumerable properties.
     pub object_begin: Option<extern "C" fn(vm: *mut c_void) -> u64>,
+    /// Cut 72: the fused `Step::ObjectFast` whole-literal create — reads the
+    /// names payload from the running body at `step` and the values from the
+    /// working region below `sp`.
+    pub object_fast: Option<extern "C" fn(vm: *mut c_void, step: u64, sp: u64) -> u64>,
     pub object_init_name: Option<
         extern "C" fn(
             vm: *mut c_void,
@@ -808,6 +817,7 @@ impl JitHelpers {
             array_hole: None,
             array_end: None,
             object_begin: None,
+            object_fast: None,
             object_init_name: None,
             object_init_computed: None,
             object_key_to_property_key: None,
@@ -941,6 +951,7 @@ impl JitHelpers {
             Helper::ArrayHole => self.array_hole.map(|f| f as usize as u64),
             Helper::ArrayEnd => self.array_end.map(|f| f as usize as u64),
             Helper::ObjectBegin => self.object_begin.map(|f| f as usize as u64),
+            Helper::ObjectFast => self.object_fast.map(|f| f as usize as u64),
             Helper::ObjectInitName => self.object_init_name.map(|f| f as usize as u64),
             Helper::ObjectInitComputed => self.object_init_computed.map(|f| f as usize as u64),
             Helper::ObjectKeyToPropertyKey => {
@@ -1422,6 +1433,12 @@ pub extern "C" fn test_array_end(_vm: *mut c_void, array: u64) -> u64 {
 
 /// `object_begin` double: returns 70 (the object the property steps echo).
 pub extern "C" fn test_object_begin(_vm: *mut c_void) -> u64 {
+    Value::Number(70.0).bits()
+}
+
+/// `object_fast` double: echoes the object_begin value — the scaffold tests
+/// that run a fused-literal body observe the created value the same way.
+pub extern "C" fn test_object_fast(_vm: *mut c_void, _step: u64, _sp: u64) -> u64 {
     Value::Number(70.0).bits()
 }
 

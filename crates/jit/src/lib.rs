@@ -386,6 +386,7 @@ fn runtime_helpers() -> JitHelpers {
         array_hole: Some(rt.array_hole),
         array_end: Some(rt.array_end),
         object_begin: Some(rt.object_begin),
+        object_fast: Some(rt.object_fast),
         object_init_name: Some(rt.object_init_name),
         object_init_computed: Some(rt.object_init_computed),
         object_key_to_property_key: Some(rt.object_key_to_property_key),
@@ -597,6 +598,7 @@ mod tests {
             array_hole: Some(helpers::test_array_hole),
             array_end: Some(helpers::test_array_end),
             object_begin: Some(helpers::test_object_begin),
+            object_fast: Some(helpers::test_object_fast),
             object_init_name: Some(helpers::test_object_init_name),
             object_init_computed: Some(helpers::test_object_init_computed),
             object_key_to_property_key: Some(helpers::test_object_key_to_property_key),
@@ -1187,6 +1189,29 @@ mod tests {
                 Step::ObjectInitComputed { set_name: false },
                 Step::Push(Value::Number(4.0)),
                 Step::ObjectSpread,
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(70.0).bits());
+    }
+
+    #[test]
+    fn object_fast_lowers_to_the_fused_helper() {
+        // Cut 72: a whole-simple literal lowers to ONE `ObjectFast` step —
+        // the fused helper (the double returns 70) reads the values below
+        // the working sp, the machine code drops them, and the body returns
+        // the created value. Values pushed v0 then v1; ObjectFast pops 2
+        // and pushes the object.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(1.0)),
+                Step::Push(Value::Number(2.0)),
+                Step::ObjectFast {
+                    names: Box::new([crux::intern_utf8("a"), crux::intern_utf8("b")]),
+                },
                 Step::Return,
             ],
             0,
@@ -2119,6 +2144,39 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(9.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_fused_object_literal_matches_the_interpreter() {
+        // Cut 72: a whole-simple literal lowers to ONE fused `ObjectFast`
+        // helper (not `ObjectBegin` + N per-key defines) — a compiled loop
+        // creating a 5-key and a 20-key literal every iteration (the first
+        // INLINE_FIELDS keys adopt vector-free, the tail defines) must agree
+        // with the interpreter on the field values and the grow-after
+        // shape. The key-order probes make the created objects observable.
+        let source = "function f(n) { var s = 0; \
+                      for (var i = 0; i < n; i++) { \
+                        var o = { a: i, b: i + 1, c: i + 2, d: i + 3, e: i + 4 }; \
+                        s += o.a + o.e; \
+                        var p = { a: i, b: i, c: i, d: i, e: i, f: i, g: i, h: i, i9: i, j: i, \
+                                  k: i, l: i, m: i, n9: i, o9: i, p9: i, q: i, r: i, s9: i, t: i }; \
+                        if (Object.keys(p).join(',') !== 'a,b,c,d,e,f,g,h,i9,j,k,l,m,n9,o9,p9,q,r,s9,t') { s += 1000; } \
+                        if (p.t !== i || p.q !== i || p.a !== i) { s += 2000; } \
+                        p.u = i; \
+                        if (p.u !== i || Object.keys(p).length !== 21) { s += 3000; } \
+                      } return s; } \
+                      f(2000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled fused-object-literal creates must match the interpreter"
+        );
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

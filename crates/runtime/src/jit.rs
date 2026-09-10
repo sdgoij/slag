@@ -691,6 +691,12 @@ pub struct JitSlowPaths {
     /// `Object.prototype` and return it (the machine code pushes it onto the
     /// work stack for the property steps).
     pub object_begin: extern "C" fn(ctx: *mut c_void) -> u64,
+    /// Cut 72: the compiled `Step::ObjectFast` fused whole-literal create
+    /// (`object_fast(ctx, step, sp)`) — the names payload is read back from
+    /// the running body and the n values sit below the machine-code working
+    /// `sp` in source order. Creates the object on the forked shape and
+    /// adopts all fields in one call (the interpreter's fused handler).
+    pub object_fast: extern "C" fn(ctx: *mut c_void, step: u64, sp: u64) -> u64,
     /// `Step::ObjectInitName`: define an own data property (with the
     /// `__proto__` setter special case and name inference).
     pub object_init_name: extern "C" fn(
@@ -997,6 +1003,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     array_hole,
     array_end,
     object_begin,
+    object_fast,
     object_init_name,
     object_init_computed,
     object_key_to_property_key,
@@ -2779,6 +2786,31 @@ extern "C" fn object_begin(ctx: *mut c_void) -> u64 {
         }
     };
     Value::Object(crux::object::JsObject::ordinary_object_create(Some(proto))).bits()
+}
+
+extern "C" fn object_fast(ctx: *mut c_void, step: u64, sp: u64) -> u64 {
+    // Cut 72: the compiled `Step::ObjectFast` whole-literal fused create.
+    // The names payload is read back from the running body; the n values
+    // sit below the machine-code working `sp` in source order (v0 lowest),
+    // in the rooted JIT buffer, so the shared create (which allocates the
+    // object and forks the shape chain) is safe to run under them. The
+    // machine code drops the consumed values and pushes the returned
+    // object.
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let Some(crate::ir::Step::ObjectFast { names }) = step_at(ctx, step) else {
+        unreachable!("object_fast on a non-ObjectFast step");
+    };
+    let n = names.len();
+    let base = (sp as usize).saturating_sub(n * 8);
+    // SAFETY: `sp` points into the machine-code working region (the rooted
+    // JIT buffer) with the n consumed values below it — the compiled
+    // `ObjectFast` step pushed exactly one value per name in source order.
+    let values: &[Value] = unsafe { std::slice::from_raw_parts(base as *const Value, n) };
+    match crate::ir::object_fast_create(agent, names, values) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
 }
 
 extern "C" fn object_init_name(
@@ -5179,6 +5211,7 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.array_hole as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.array_end as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_begin as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.object_fast as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_init_name as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_init_computed as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_key_to_property_key as usize, 0);
