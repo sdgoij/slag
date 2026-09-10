@@ -132,6 +132,7 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::TypedArrayLengthHoist { .. } => {}
             // LICM: the guard reads/writes frame slots only (no stack effect).
             Step::HoistMemberGuard { .. } => {}
+            Step::HoistGlobalGuard { .. } => {}
             // A store consumes the value; `UpdateLocal` pushes its result.
             Step::StoreLocal { .. } | Step::FusedStoreLocal { .. } | Step::InitLocal { .. } => {
                 depth = depth.saturating_sub(1)
@@ -573,6 +574,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::JumpIfEqImm { .. } | Step::JumpIfNeqImm { .. } => "JumpIfEqImm/NeqImm",
         Step::TypedArrayLengthHoist { .. } => "TypedArrayLengthHoist",
         Step::HoistMemberGuard { .. } => "HoistMemberGuard",
+        Step::HoistGlobalGuard { .. } => "HoistGlobalGuard",
         Step::LoadPerIteration { .. }
         | Step::StorePerIteration { .. }
         | Step::UpdatePerIteration { .. } => "Per-iteration",
@@ -605,6 +607,7 @@ fn step_targets(step: &Step) -> Vec<usize> {
         | Step::JumpIfRelLimit { target, .. } => vec![*target],
         Step::TypedArrayLengthHoist { target } => vec![*target],
         Step::HoistMemberGuard { target, .. } => vec![*target],
+        Step::HoistGlobalGuard { target, .. } => vec![*target],
         Step::FastLoopHead {
             body_start, after, ..
         } => vec![*body_start, *after],
@@ -2729,6 +2732,18 @@ impl<'a> Lowerer<'a> {
     /// current on return. Used by `LoadGlobal` and the `TailCallFastGlobal`
     /// callee read.
     fn emit_global_read(&mut self, name: crux::AtomId) -> Result<ClifValue, Unsupported> {
+        self.emit_global_read_probe(name, None)
+    }
+
+    /// As `emit_global_read`, but a cell miss branches to `miss` (caller-owned,
+    /// left unsealed) instead of emitting the `get_global` fallback — the LICM
+    /// global guard takes the general loop on a miss. The merge block is sealed
+    /// and current on return.
+    fn emit_global_read_probe(
+        &mut self,
+        name: crux::AtomId,
+        miss: Option<Block>,
+    ) -> Result<ClifValue, Unsupported> {
         let ctx = self.vm();
         let global = self.builder.ins().load(
             types::I64,
@@ -2744,7 +2759,10 @@ impl<'a> Lowerer<'a> {
         );
         let name_imm = self.builder.ins().iconst(types::I64, name as i64);
         let value_var = self.builder.declare_var(types::I64);
-        let slow = self.builder.create_block();
+        let slow = match miss {
+            Some(block) => block,
+            None => self.builder.create_block(),
+        };
         let merge = self.builder.create_block();
         let has_global = self.builder.ins().icmp_imm_u(IntCC::NotEqual, global, 0);
         let has_global_64 = self.bint(has_global);
@@ -2809,12 +2827,15 @@ impl<'a> Lowerer<'a> {
         let ok = self.builder.ins().band(name_id_ok, gen_ok_64);
         self.builder.def_var(value_var, cell_value);
         self.builder.ins().brif(ok, merge, &[], slow, &[]);
-        // The slow path: re-resolve through the runtime (which also
-        // repopulates the cell for the next read).
-        self.builder.switch_to_block(slow);
-        let res = self.call_slow(self.sig_bool, Helper::GetGlobal, &[name_imm])?;
-        self.builder.def_var(value_var, res);
-        self.builder.ins().jump(merge, &[]);
+        // The slow path (only when no external miss block was given):
+        // re-resolve through the runtime (which also repopulates the cell for
+        // the next read).
+        if miss.is_none() {
+            self.builder.switch_to_block(slow);
+            let res = self.call_slow(self.sig_bool, Helper::GetGlobal, &[name_imm])?;
+            self.builder.def_var(value_var, res);
+            self.builder.ins().jump(merge, &[]);
+        }
         self.builder.seal_block(merge);
         self.builder.switch_to_block(merge);
         Ok(self.builder.use_var(value_var))
@@ -3985,6 +4006,39 @@ impl<'a> Lowerer<'a> {
                     let object = self.load_slot(*recv_slot);
                     let value = self.emit_member_cell_probe(object, *name, Some(miss))?;
                     let danger = self.emit_value_dangerous(value, *strict);
+                    let cont = self.builder.create_block();
+                    self.builder.ins().brif(danger, miss, &[], cont, &[]);
+                    self.builder.switch_to_block(cont);
+                    self.store_slot(*hoist_slot, value);
+                    self.builder.seal_block(cont);
+                }
+                self.fall_through(index);
+            }
+            Step::HoistGlobalGuard { reads, env, target } => {
+                // LICM: probe each invariant global's data cell; a hit with a
+                // non-object value stores it in the hidden slot, any miss
+                // jumps to the general per-iteration loop. An `env` read is
+                // only a global read when the body's env chain is exactly the
+                // global env (the `LoadIdent` fast-path gate), so gate the
+                // whole probe on the ctx's `clean_chain`.
+                let miss = self.ensure_block(*target);
+                if *env {
+                    let ctx = self.vm();
+                    let clean = self.builder.ins().load(
+                        types::I8,
+                        MemFlagsData::new(),
+                        ctx,
+                        Offset32::new(std::mem::offset_of!(JitCallContext, clean_chain) as i32),
+                    );
+                    let clean_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, clean, 0);
+                    let cont = self.builder.create_block();
+                    self.builder.ins().brif(clean_ok, cont, &[], miss, &[]);
+                    self.builder.switch_to_block(cont);
+                    self.builder.seal_block(cont);
+                }
+                for (name, hoist_slot) in reads {
+                    let value = self.emit_global_read_probe(*name, Some(miss))?;
+                    let danger = self.emit_value_dangerous(value, false);
                     let cont = self.builder.create_block();
                     self.builder.ins().brif(danger, miss, &[], cont, &[]);
                     self.builder.switch_to_block(cont);

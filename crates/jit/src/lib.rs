@@ -1842,6 +1842,52 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_hoists_invariant_global_reads_without_changing_semantics() {
+        // LICM globals: a loop reading a name that resolves at the global env
+        // is hoisted to a hidden slot when the cell's data value is a
+        // primitive and the body cannot write it. Every soundness edge must
+        // keep per-iteration semantics: a SHADOWING env (a closure created
+        // inside a `with`, whose chain is not the global env — the
+        // `clean_chain` gate must miss so the shadowed value is read), an
+        // object-valued global (per-iteration ToPrimitive), a global written
+        // in the loop, an accessor global (the cell never warms), and a
+        // counter-dependent RHS (only the read hoists).
+        //
+        // Order matters: any global write bumps the global object's
+        // generation and invalidates every value cell, so `mut`/`getter`
+        // (which write globals) come last — before them the `gNum` cell is
+        // warm, which is exactly what makes the shadowed read discriminating
+        // (a hoist that ignored `clean_chain` would read the global's 5).
+        let source = "var gNum = 5; var gStr = 'x'; var gObj = { valueOf: function () { return 2; } }; var gMut = 1; var gAcc = 0;\n\
+                      Object.defineProperty(globalThis, 'gGetter', { get: function () { return ++gAcc; }, configurable: true });\n\
+                      function warm(n) { var s = 0; for (var i = 0; i < n; i++) { s += gNum; } return s; }\n\
+                      function num() { var s = 0; for (var i = 0; i < 5; i++) { s += gNum; } return s; }\n\
+                      function str() { var r = ''; for (var i = 0; i < 4; i++) { r += gStr; } return r; }\n\
+                      function obj() { var s = 0; for (var i = 0; i < 3; i++) { s += gObj; } return s; }\n\
+                      function mut() { var s = 0; for (var i = 0; i < 3; i++) { s += gMut; gMut = gMut + 1; } return s * 100 + gMut; }\n\
+                      function getter() { var s = 0; for (var i = 0; i < 4; i++) { s += gGetter; } return s * 10 + gAcc; }\n\
+                      function counter() { var s = 0; for (var i = 0; i < 4; i++) { s += gNum + i; } return s; }\n\
+                      var shadowed;\n\
+                      with ({ gNum: 100 }) { shadowed = function (n) { var s = 0; for (var i = 0; i < n; i++) { s += gNum; } return s; }; }\n\
+                      warm(1);\n\
+                      var ok = num() === 25 && str() === 'xxxx' && obj() === 6 && shadowed(3) === 300\n\
+                        && counter() === 26 && mut() === 604 && getter() === 104;\n\
+                      ok ? 1 : 0;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the global-read hoist must match the interpreter"
+        );
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_registered_builtin_calls_match_the_interpreter() {
         // Cut 79: a member call whose callee is an installed builtin
         // (Map.prototype.has/get/set — registered at `Intrinsics::define`)

@@ -834,6 +834,20 @@ pub enum Step {
         numbers: bool,
         target: usize,
     },
+    /// LICM: the invariant-global read guard. Probes each global's data cell;
+    /// on a hit with a non-object value stores it in the hidden slot and falls
+    /// through, else jumps to `target` (the general loop). A loop with no
+    /// calls and no writes to the global cannot change it, so a data hit is
+    /// loop-invariant; the non-object check keeps any later per-iteration
+    /// coercion from re-entering user code. `env` reads are `BindingLoc::Env`
+    /// names (resolved through the env chain) and additionally require the
+    /// body's chain to be exactly the global env (the ctx's `clean_chain`),
+    /// mirroring the `LoadIdent` fast path.
+    HoistGlobalGuard {
+        reads: Vec<(crux::AtomId, usize)>,
+        env: bool,
+        target: usize,
+    },
     // ----- top-level fast path (script-level bindings) -----
     /// Read a declared top-level `var`/function directly off the global
     /// object — the binding is guaranteed to exist (script instantiation
@@ -7893,6 +7907,29 @@ impl Vm {
                         self.ip = *target;
                     }
                 }
+                Step::HoistGlobalGuard { reads, env, target } => {
+                    // LICM: a once-per-loop global read guard — a data-cell hit
+                    // with a non-object value is loop-invariant. An `Env` read
+                    // also needs the clean chain (the global env), exactly the
+                    // `LoadIdent` fast-path gate.
+                    let mut ok = !(*env) || self.clean_chain;
+                    if ok {
+                        for (name, hoist_slot) in reads {
+                            match self.try_global_cell_read(agent, *name) {
+                                Some(value) if !value.is_object() && !value.is_function() => {
+                                    *self.frame_get_mut(*hoist_slot) = value;
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        self.ip = *target;
+                    }
+                }
                 Step::FastLoopHead {
                     var,
                     op,
@@ -13805,6 +13842,12 @@ enum Fixup {
         index: usize,
         label: usize,
     },
+    /// The global-read hoist guard (`Step::HoistGlobalGuard`): `target`
+    /// resolves at compile end.
+    HoistGlobalGuard {
+        index: usize,
+        label: usize,
+    },
     Break(usize, usize),
     Continue(usize, usize),
     JumpIfChainShort(usize, usize),
@@ -14022,6 +14065,11 @@ struct Compiler {
     /// the preheader). `None` elsewhere, so the preheader's own computation and
     /// the general copy compile the expression normally.
     hoisted_exprs: Option<std::collections::HashMap<(u32, u32), usize>>,
+    /// LICM: while the FAST (or read-hoisted) copy of a loop with hoisted
+    /// invariant globals is being compiled — `(name, hoist_slot)` — an
+    /// identifier read resolving to that global lowers to
+    /// `LoadLocal(hoist_slot)`.
+    hoisted_globals: Option<Vec<(crux::AtomId, usize)>>,
     /// LICM: frame slots the compiler has proven hold a Number throughout the
     /// fast copy being compiled (the guard-verified hoisted RHS slots). The
     /// num-slot plan accepts them as a raw-f64 RHS ([`NumRhs::Slot`]). Scoped
@@ -15111,6 +15159,11 @@ impl Compiler {
                         *target = self.labels[&label];
                     }
                 }
+                Fixup::HoistGlobalGuard { index, label } => {
+                    if let Step::HoistGlobalGuard { target, .. } = &mut self.steps[index] {
+                        *target = self.labels[&label];
+                    }
+                }
                 Fixup::FastLoopHead(index, body_label, after_label) => {
                     if let Step::FastLoopHead {
                         body_start, after, ..
@@ -15891,6 +15944,7 @@ impl Compiler {
             Fixup::FastLoopHead(index, _, _) => index,
             Fixup::TypedArrayLengthHoist { index, .. } => index,
             Fixup::HoistMemberGuard { index, .. } => index,
+            Fixup::HoistGlobalGuard { index, .. } => index,
             Fixup::Break(index, _) => index,
             Fixup::Continue(index, _) => index,
             Fixup::JumpIfChainShort(index, _) => index,
@@ -16294,7 +16348,7 @@ impl Compiler {
                 reads.push(entry);
             }
         }
-        if reads.is_empty() || reads.len() > 8 {
+        if reads.len() > 8 {
             return None;
         }
         // A lexical declaration in the body could shadow a scanned name (two
@@ -16305,17 +16359,38 @@ impl Compiler {
         if stmt_contains_lexical_decl(body) {
             return None;
         }
-        // Every value read must resolve to a frame slot the guard can check.
+        // Every value read resolves either to a frame slot the guard checks or
+        // to an invariant global the global guard hoists (a top-level `var` the
+        // loop never writes; a call could write it, but the purity scan forbids
+        // calls). A `BindingLoc::Env` name is a dynamic resolve — hoistable only
+        // when no env-changing step precedes the loop (`!env_changing`, checked
+        // as of this point in the body), so the entry-time `clean_chain` is
+        // still accurate when the guard runs.
         let mut prim_slots: Vec<usize> = Vec::new();
+        let mut globals: Vec<(crux::AtomId, bool)> = Vec::new();
         for name in &scan.value_names {
-            let BindingLoc::Slot(slot) = self.binding(*name) else {
-                return None;
+            let mut hoist = |name: crux::AtomId, env: bool| {
+                if !globals.contains(&(name, env)) {
+                    globals.push((name, env));
+                }
             };
-            if !prim_slots.contains(&slot) {
-                prim_slots.push(slot);
+            match self.binding(*name) {
+                BindingLoc::Slot(slot) => {
+                    if !prim_slots.contains(&slot) {
+                        prim_slots.push(slot);
+                    }
+                }
+                BindingLoc::Global if !assigned.contains(name) => hoist(*name, false),
+                BindingLoc::Env if !self.env_changing && !assigned.contains(name) => {
+                    hoist(*name, true)
+                }
+                _ => return None,
             }
         }
-        if prim_slots.len() > 16 {
+        if prim_slots.len() > 16 || globals.len() > 8 {
+            return None;
+        }
+        if reads.is_empty() && globals.is_empty() {
             return None;
         }
         // The invariant-RHS hoist: an assignment RHS built only from the
@@ -16355,6 +16430,7 @@ impl Compiler {
             reads,
             prim_slots,
             exprs,
+            globals,
         })
     }
 
@@ -16380,34 +16456,55 @@ impl Compiler {
             let hoist_slot = self.alloc_hoist_slot();
             guards.push((*recv_slot, *name, hoist_slot, *strict));
         }
+        let mut globals: Vec<(crux::AtomId, usize)> = Vec::new();
+        let mut globals_env = false;
+        for (name, env) in &plan.globals {
+            let hoist_slot = self.alloc_hoist_slot();
+            globals.push((*name, hoist_slot));
+            globals_env |= *env;
+        }
         let general_label = self.new_label();
-        let guard_index = self.steps.len();
-        self.emit(Step::HoistMemberGuard {
-            reads: guards.clone(),
-            prim_slots: plan.prim_slots,
-            numbers: false,
-            target: 0,
-        });
-        self.fixups.push(Fixup::HoistMemberGuard {
-            index: guard_index,
-            label: general_label,
-        });
+        if !guards.is_empty() {
+            let guard_index = self.steps.len();
+            self.emit(Step::HoistMemberGuard {
+                reads: guards.clone(),
+                prim_slots: plan.prim_slots,
+                numbers: false,
+                target: 0,
+            });
+            self.fixups.push(Fixup::HoistMemberGuard {
+                index: guard_index,
+                label: general_label,
+            });
+        }
+        if !globals.is_empty() {
+            let guard_index = self.steps.len();
+            self.emit(Step::HoistGlobalGuard {
+                reads: globals.clone(),
+                env: globals_env,
+                target: 0,
+            });
+            self.fixups.push(Fixup::HoistGlobalGuard {
+                index: guard_index,
+                label: general_label,
+            });
+        }
         let done_label = self.new_label();
         let readonly_label = self.new_label();
         let saved_suppressed = self.hoist_suppressed;
         let saved_members = self.hoisted_members.take();
         let saved_exprs = self.hoisted_exprs.take();
+        let saved_globals = self.hoisted_globals.take();
         let saved_proven = std::mem::take(&mut self.proven_num_slots);
         // Precompute the invariant RHS expressions into fresh hidden slots. The
-        // read redirect is active (their member reads load the guard's slots);
-        // the expression redirect is not, so they compile normally. A second
-        // guard then requires those results to be Numbers — the raw-f64
-        // num-slot reduction reads them without a tag check — falling back to
-        // the read-hoisted copy when they are not.
+        // member and global read redirects are active (their reads load the
+        // guard's slots); the expression redirect is not, so they compile
+        // normally.
         let mut expr_slots: Vec<usize> = Vec::new();
         let mut expr_map = std::collections::HashMap::new();
         if !plan.exprs.is_empty() {
             self.hoisted_members = Some(guards.clone());
+            self.hoisted_globals = Some(globals.clone());
             for expr in &plan.exprs {
                 let slot = self.alloc_hoist_slot();
                 self.compile_expr(expr)?;
@@ -16415,10 +16512,17 @@ impl Compiler {
                 expr_map.insert((expr.span.start, expr.span.end), slot);
                 expr_slots.push(slot);
             }
+        }
+        // A second guard requires the raw-f64 reduction's operands (the hoisted
+        // RHS results and the hoisted globals) to be Numbers; a miss keeps the
+        // reads hoisted but drops the reduction.
+        let mut number_slots = expr_slots.clone();
+        number_slots.extend(globals.iter().map(|(_, slot)| *slot));
+        if !number_slots.is_empty() {
             let number_index = self.steps.len();
             self.emit(Step::HoistMemberGuard {
                 reads: Vec::new(),
-                prim_slots: expr_slots.clone(),
+                prim_slots: number_slots.clone(),
                 numbers: true,
                 target: 0,
             });
@@ -16427,31 +16531,37 @@ impl Compiler {
                 label: readonly_label,
             });
         }
-        // Fast copy: reads (and the invariant RHS expressions) lower to the
-        // hidden slots, and the RHS slots are the num-slot reduction's raw-f64
-        // RHS. `hoist_suppressed` stops this same loop re-hoisting itself (and
-        // any nested loop in the copy — merely conservative).
+        // Fast copy: the reads (and the invariant RHS) lower to the hidden
+        // slots, and the Number-proven slots are the num-slot reduction's
+        // raw-f64 RHS. `hoist_suppressed` stops this same loop re-hoisting
+        // itself (and any nested loop in the copy — merely conservative).
         self.hoist_suppressed = true;
         self.hoisted_members = Some(guards.clone());
+        self.hoisted_globals = Some(globals.clone());
         self.hoisted_exprs = if expr_map.is_empty() {
             None
         } else {
             Some(expr_map)
         };
-        self.proven_num_slots = expr_slots.iter().copied().collect();
+        self.proven_num_slots = number_slots.iter().copied().collect();
         self.compile_for(init, test, update, body)?;
         self.hoisted_exprs = saved_exprs;
         self.hoisted_members = saved_members.clone();
+        self.hoisted_globals = saved_globals.clone();
         self.proven_num_slots = saved_proven;
         self.hoist_suppressed = saved_suppressed;
         self.jump(done_label);
-        if !expr_slots.is_empty() {
-            // Read-hoisted copy: the RHS was computed but was not a Number.
+        if !expr_slots.is_empty() || !globals.is_empty() {
+            // Read-hoisted copy: the RHS was computed but was not a Number (or
+            // the hoisted globals were not Numbers), so the reduction is
+            // dropped.
             self.place(readonly_label);
             self.hoist_suppressed = true;
-            self.hoisted_members = Some(guards);
+            self.hoisted_members = Some(guards.clone());
+            self.hoisted_globals = Some(globals);
             self.compile_for(init, test, update, body)?;
             self.hoisted_members = saved_members.clone();
+            self.hoisted_globals = saved_globals;
             self.hoist_suppressed = saved_suppressed;
             self.jump(done_label);
         }
@@ -17773,6 +17883,23 @@ impl Compiler {
         {
             self.emit(Step::LoadLocal { slot: *slot });
             return Ok(());
+        }
+        // LICM: a hoisted invariant global read loads its hidden slot (matched
+        // by name AND a Global resolution, so a shadowing local keeps its own
+        // binding).
+        if let ExprKind::Ident(name) = &expr.kind {
+            let slot = self.hoisted_globals.as_ref().and_then(|globals| {
+                globals
+                    .iter()
+                    .find(|(read, _)| read == name)
+                    .map(|(_, slot)| *slot)
+            });
+            if let Some(slot) = slot
+                && matches!(self.binding(*name), BindingLoc::Global | BindingLoc::Env)
+            {
+                self.emit(Step::LoadLocal { slot });
+                return Ok(());
+            }
         }
         match &expr.kind {
             ExprKind::Paren(inner) => self.compile_expr(inner),
@@ -20309,13 +20436,17 @@ fn step_writes_slot(step: &Step, slot: usize) -> bool {
 /// Route B: whether the already-emitted prefix is straight-line — no control
 /// exit and no jump that could re-enter or skip the loop's bind. That is what
 /// makes "the entry init executes exactly once, unconditionally" true without
-/// needing to resolve the (still unpatched) label targets. A
-/// `HoistMemberGuard` is allowed: its target is a forward fixup to the LICM
-/// general copy, which is emitted after this loop, so it cannot re-enter or
-/// skip the bind.
+/// needing to resolve the (still unpatched) label targets. A hoist guard
+/// (`HoistMemberGuard`/`HoistGlobalGuard`) is allowed: its target is a forward
+/// fixup to the LICM general copy, which is emitted after this loop, so it
+/// cannot re-enter or skip the bind.
 fn prefix_is_straight_line(steps: &[Step]) -> bool {
     steps.iter().all(|step| {
-        (step_targets(step).is_empty() || matches!(step, Step::HoistMemberGuard { .. }))
+        (step_targets(step).is_empty()
+            || matches!(
+                step,
+                Step::HoistMemberGuard { .. } | Step::HoistGlobalGuard { .. }
+            ))
             && !matches!(
                 step,
                 Step::Return
@@ -24148,6 +24279,9 @@ struct MemberHoistPlan<'a> {
     reads: Vec<(usize, crux::AtomId, bool)>,
     prim_slots: Vec<usize>,
     exprs: Vec<&'a Expr>,
+    /// Invariant global reads to hoist: `(name, env)` — `env` marks a
+    /// `BindingLoc::Env` name (a dynamic resolve, gated on `clean_chain`).
+    globals: Vec<(crux::AtomId, bool)>,
 }
 
 /// LICM slice: the invariant member reads a loop body exposes and the

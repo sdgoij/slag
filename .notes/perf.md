@@ -8902,6 +8902,69 @@ Fix (`crates/runtime/src/ir.rs`): emit nothing for a test-less head. `test_label
 
 Verification: `scratch/for_no_test_battery.js` (bare `for(;;)`, with update, with init, `continue`, nested, `while(true)`, `do/while`) all agree with node across jit / `--jitless` / `--gc-stress`. Regression tests: `eval::tests::testless_for_head_emits_no_dummy_test_push` (structural) and `jit::tests::installed_jit_runs_a_testless_for_head` (e2e, 100k iterations). Gates: clippy `--workspace --all-targets -D warnings` clean; `cargo test --workspace` 4774 passed / 0 failed; three release test262 sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang).
 
+### LANDED (2026-09-10): invariant GLOBAL reads hoist out of certified loops — `global read` jit 3.13 -> 1.40ms
+
+The `global read` row's read half: the member-read LICM above, extended from
+member reads to bare global identifiers. The row's `g` lives in a function
+body, so it resolves as `BindingLoc::Env` (a dynamic env-chain lookup), not
+`BindingLoc::Global` — an earlier cut that admitted only `Global` moved nothing
+(2.94ms), because the name it had to reach is the `Env` one.
+
+`Step::HoistGlobalGuard { reads: Vec<(AtomId, hoist_slot)>, env, target }` — a
+once-per-loop guard that probes each global's warmed data cell
+(`Vm::try_global_cell_read`: data-only, so an accessor or absent name misses)
+and requires a non-object value (no later per-iteration coercion can re-enter
+user code), storing hits in hidden frame slots; any miss jumps to the general
+copy. `env` marks a `BindingLoc::Env` read, which additionally requires the
+running env chain to be exactly the global env (`Vm::clean_chain` /
+`JitCallContext::clean_chain`) — the same gate `Step::LoadIdent` uses, because a
+name resolved through an intermediate env (a closure capture, a `with` object)
+is not the global's binding. `hoistable_member_loop` admits an `Env` name only
+when the body cannot add envs mid-run (`!env_changing`, matching
+`CompiledBody::env_constant`), and the guard re-checks at runtime; the JIT arm
+branches to the general loop when `clean_chain` is clear. A `Global`-resolved
+read needs no chain gate (its binding is statically the global).
+
+The read redirect (`Compiler.hoisted_globals`) lowers a matching `Ident` to
+`LoadLocal(hoist_slot)` in the fast/read-hoisted copies, and the hoist slots
+join `proven_num_slots`, so the num-slot reduction takes them as a raw-f64 RHS
+(`NumRhs::Slot`) — `s += g` becomes one `BinStoreNum` with no tag check, exactly
+like the member-read case. `prefix_is_straight_line` admits the new guard.
+
+Measured (`--jit-bench`, release): `global read` jit 3.0-3.13 -> **1.38-1.40ms**
+(~2.25x). `property read` unchanged (0.76-0.78ms). The interp column is flat
+within run-to-run noise (10.1-10.6ms both sides — the interpreter's `LoadIdent`
+cell probe was already near a `LoadLocal`). Node's `global read` is 0.317ms, so
+the row's gap goes ~9.9x -> ~4.3x.
+
+A/B on the row's own shape (a throwaway `--corpus` dir, 1M iters):
+`g_imm` (literal bound) **0.705ms** jit / 9.22ms jitless vs `l_imm` (local read,
+cannot hoist) 2.309ms jit / 12.87ms jitless — the hoist is 3.3x jit / 1.4x
+jitless on the same loop with the global read swapped for a local.
+
+PROBE (same day, no code): the row's residual is NOT the read. `g_imm` 0.705ms
+matches `property read`'s 0.76ms and the arithmetic floor, while the row's
+parameter-bounded `g_param` is 1.383ms. The ~0.67ms/1M difference is the loop
+TEST shape: a literal bound folds to `JumpIfLtImm`/`limit: Imm`, while
+`for (i = 0; i < n; i++)` compiles `JumpIfRelLimit { limit: Slot(0) }` — a
+per-iteration slot load plus a tagged relational compare. Queued lever: the
+loop-limit analogue of `NumRhs::Slot` (prove the limit slot is a Number at
+entry and never written in the loop, then keep it — and the counter — as raw
+f64). Also recorded: ANY global write bumps the global object's generation and
+invalidates every value cell, so the guard misses until a read re-warms the
+cell (the first call of a fresh row always takes the general copy).
+
+Verification: clippy `--workspace --all-targets -D warnings` clean;
+`cargo test --workspace` 4780 pass / 0 fail (incl.
+`jit::tests::installed_jit_hoists_invariant_global_reads_without_changing_semantics`,
+whose `with`-shadow case reads the wrong value if the `clean_chain` gate is
+dropped — verified by disabling it); six test262 sweeps at baseline (language
+23721/0/3, annexB 1086/0/0, built-ins 23657/0/155, with the JIT and with
+`--jitless`, zero fail/crash/hang); the 45-case differential battery
+(`scratch/hoist_battery.js` cases 40-45: invariant Number/String globals,
+object-valued global, global written in-loop, accessor global, global+counter)
+byte-identical across jit / `--jitless` / node and again under `--gc-stress`.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
