@@ -1613,10 +1613,12 @@ impl<'a> Lowerer<'a> {
         Ok(self.builder.use_var(value_var))
     }
 
-    /// LICM: whether a value can re-enter user code when coerced — an object
-    /// or a function (their ToPrimitive runs user `valueOf`/`toString`).
-    /// Strings/bigints/symbols and the non-heap primitives are safe.
-    fn emit_value_dangerous(&mut self, value: ClifValue) -> ClifValue {
+    /// LICM: whether a value can re-enter user code or throw when coerced. An
+    /// object or a function always can (`valueOf`/`toString`). When `strict`,
+    /// BigInt and Symbol also count — they are the primitives whose arithmetic
+    /// coercion can throw, which matters for a value feeding a hoisted RHS
+    /// computed before the loop's test.
+    fn emit_value_dangerous(&mut self, value: ClifValue, strict: bool) -> ClifValue {
         let heap = self.builder.ins().band_imm_u(value, crux::TAG_MASK as i64);
         let is_heap = self
             .builder
@@ -1632,8 +1634,20 @@ impl<'a> Lowerer<'a> {
             .builder
             .ins()
             .icmp_imm_u(IntCC::Equal, tag, crux::TAG_FUNCTION as i64);
-        let obj_or_fn = self.builder.ins().bor(tag_obj, tag_fun);
-        self.builder.ins().band(is_heap, obj_or_fn)
+        let mut bad = self.builder.ins().bor(tag_obj, tag_fun);
+        if strict {
+            let tag_big = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, tag, crux::TAG_BIGINT as i64);
+            let tag_sym = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, tag, crux::TAG_SYMBOL as i64);
+            let big_or_sym = self.builder.ins().bor(tag_big, tag_sym);
+            bad = self.builder.ins().bor(bad, big_or_sym);
+        }
+        self.builder.ins().band(is_heap, bad)
     }
 
     /// The member-store shape gate (Slice 2), shared by the compiled member-
@@ -3935,6 +3949,7 @@ impl<'a> Lowerer<'a> {
             Step::HoistMemberGuard {
                 reads,
                 prim_slots,
+                numbers,
                 target,
             } => {
                 // LICM: verify every value-operand slot holds a non-object
@@ -3946,10 +3961,18 @@ impl<'a> Lowerer<'a> {
                 let mut bad: Option<ClifValue> = None;
                 for slot in prim_slots {
                     let value = self.load_slot(*slot);
-                    let danger = self.emit_value_dangerous(value);
+                    let bad_slot = if *numbers {
+                        // The RHS result must be a Number for the raw-f64
+                        // num-slot reduction.
+                        let is_num = self.is_double(value);
+                        let is_num = self.bint(is_num);
+                        self.builder.ins().icmp_imm_u(IntCC::Equal, is_num, 0)
+                    } else {
+                        self.emit_value_dangerous(value, false)
+                    };
                     bad = Some(match bad {
-                        Some(prev) => self.builder.ins().bor(prev, danger),
-                        None => danger,
+                        Some(prev) => self.builder.ins().bor(prev, bad_slot),
+                        None => bad_slot,
                     });
                 }
                 if let Some(bad) = bad {
@@ -3958,10 +3981,10 @@ impl<'a> Lowerer<'a> {
                     self.builder.switch_to_block(ok);
                     self.builder.seal_block(ok);
                 }
-                for (recv_slot, name, hoist_slot) in reads {
+                for (recv_slot, name, hoist_slot, strict) in reads {
                     let object = self.load_slot(*recv_slot);
                     let value = self.emit_member_cell_probe(object, *name, Some(miss))?;
-                    let danger = self.emit_value_dangerous(value);
+                    let danger = self.emit_value_dangerous(value, *strict);
                     let cont = self.builder.create_block();
                     self.builder.ins().brif(danger, miss, &[], cont, &[]);
                     self.builder.switch_to_block(cont);
@@ -6922,6 +6945,14 @@ impl<'a> Lowerer<'a> {
                 let mid = self.emit_arith(op1, counter, first)?;
                 let second = self.builder.ins().f64const(imm2);
                 self.emit_arith(op2, mid, second)?
+            }
+            NumRhs::Slot(slot) => {
+                // A guard-proven Number slot (the LICM RHS hoist): its frame
+                // word IS an f64 — no tag check, no canonicalization.
+                let bits = self.load_slot(slot);
+                self.builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), bits)
             }
         };
         let res = self.emit_arith(op, left, right)?;

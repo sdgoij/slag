@@ -821,10 +821,17 @@ pub enum Step {
     /// per-iteration loop, unchanged semantics). Every receiver is a frame
     /// slot the loop never writes and the body has no calls/member stores, so
     /// a data hit is loop-invariant; an accessor, a cold shape, or an object
-    /// value misses.
+    /// value misses. A read whose value feeds a hoisted invariant RHS carries
+    /// the `strict` flag: its value must also not be a BigInt/Symbol, the two
+    /// primitives whose coercion can throw, since that RHS is computed once in
+    /// the preheader.
     HoistMemberGuard {
-        reads: Vec<(usize, crux::AtomId, usize)>,
+        reads: Vec<(usize, crux::AtomId, usize, bool)>,
         prim_slots: Vec<usize>,
+        /// When true, `prim_slots` (and no reads) are checked to hold Numbers
+        /// rather than merely non-object primitives — the RHS-hoist result
+        /// guard that gates the raw-f64 num-slot reduction.
+        numbers: bool,
         target: usize,
     },
     // ----- top-level fast path (script-level bindings) -----
@@ -1153,6 +1160,9 @@ pub enum NumRhs {
         op2: BinaryOp,
         imm2: f64,
     },
+    /// A guard-verified loop-invariant Number frame slot (the LICM RHS hoist,
+    /// `s += HOISTED`): read as raw f64.
+    Slot(usize),
 }
 
 /// A register instruction for a *leaf* body (Cut 35 slice 1). The step path
@@ -7831,6 +7841,7 @@ impl Vm {
                 Step::HoistMemberGuard {
                     reads,
                     prim_slots,
+                    numbers,
                     target,
                 } => {
                     // LICM: a once-per-loop guard. Every VALUE-operand slot
@@ -7842,10 +7853,14 @@ impl Vm {
                     // jumps to the general per-iteration loop.
                     let mut ok = prim_slots.iter().all(|slot| {
                         let value = *self.frame_get(*slot);
-                        !value.is_object() && !value.is_function()
+                        if *numbers {
+                            value.as_number().is_some()
+                        } else {
+                            !value.is_object() && !value.is_function()
+                        }
                     });
                     if ok {
-                        for (recv_slot, name, hoist_slot) in reads {
+                        for (recv_slot, name, hoist_slot, strict) in reads {
                             let object = *self.frame_get(*recv_slot);
                             // The TDZ marker is a reserved tag that must never
                             // reach `cell_object`/`Value::kind`; a TDZ receiver
@@ -7858,7 +7873,12 @@ impl Vm {
                                     .and_then(|cell| {
                                         Self::member_cell_warm_probe(agent, &cell, *name)
                                     })
-                                    .filter(|value| !value.is_object() && !value.is_function())
+                                    .filter(|value| {
+                                        !value.is_object()
+                                            && !value.is_function()
+                                            && !(*strict
+                                                && (value.is_bigint() || value.is_symbol()))
+                                    })
                             };
                             match hit {
                                 Some(value) => *self.frame_get_mut(*hoist_slot) = value,
@@ -10366,6 +10386,15 @@ impl Vm {
                         } => {
                             let mid = num_arith(*op1, self.loop_counter, *imm1);
                             let right = num_arith(*op2, mid, *imm2);
+                            self.loop_num = num_arith(*op, self.loop_num, right);
+                            self.acc = Value::Number(self.loop_num);
+                        }
+                        NumRhs::Slot(slot) => {
+                            // The plan proved this loop-invariant slot holds a
+                            // Number (the hoist guard); a non-Number here is a
+                            // compiler bug, so surface it as NaN, not 0.
+                            let value = *self.frame_get(*slot);
+                            let right = value.as_number().unwrap_or(f64::NAN);
                             self.loop_num = num_arith(*op, self.loop_num, right);
                             self.acc = Value::Number(self.loop_num);
                         }
@@ -13986,7 +14015,18 @@ struct Compiler {
     /// read — a matching `RECV.name` read lowers to `LoadLocal(hoist_slot)`.
     /// Save/restored around nested hoists; the guard-miss fallback copy
     /// compiles with the outer value, so its reads re-resolve exactly.
-    hoisted_members: Option<Vec<(usize, crux::AtomId, usize)>>,
+    hoisted_members: Option<Vec<(usize, crux::AtomId, usize, bool)>>,
+    /// LICM slice: while the FAST copy of a loop with hoisted invariant RHS
+    /// expressions is being compiled — the RHS source span → its hidden slot —
+    /// a matching expression loads the hidden slot (it was computed once in
+    /// the preheader). `None` elsewhere, so the preheader's own computation and
+    /// the general copy compile the expression normally.
+    hoisted_exprs: Option<std::collections::HashMap<(u32, u32), usize>>,
+    /// LICM: frame slots the compiler has proven hold a Number throughout the
+    /// fast copy being compiled (the guard-verified hoisted RHS slots). The
+    /// num-slot plan accepts them as a raw-f64 RHS ([`NumRhs::Slot`]). Scoped
+    /// like `hoisted_members`; empty elsewhere.
+    proven_num_slots: std::collections::HashSet<usize>,
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -16156,15 +16196,16 @@ impl Compiler {
     }
 
     /// LICM slice: whether the loop qualifies for the general invariant
-    /// member-read hoist. Returns the `(receiver slot, name)` reads to hoist
-    /// and the VALUE-operand slots the guard must check, or `None`.
-    fn hoistable_member_loop(
+    /// member-read hoist. Returns the reads to hoist (with whether each value
+    /// must also exclude BigInt/Symbol), the VALUE-operand slots the guard
+    /// checks, and the invariant RHS expressions to precompute — or `None`.
+    fn hoistable_member_loop<'a>(
         &self,
-        init: Option<&ForInit>,
-        test: Option<&Expr>,
-        update: Option<&Expr>,
-        body: &Stmt,
-    ) -> Option<MemberHoistPlan> {
+        init: Option<&'a ForInit>,
+        test: Option<&'a Expr>,
+        update: Option<&'a Expr>,
+        body: &'a Stmt,
+    ) -> Option<MemberHoistPlan<'a>> {
         if self.scope.is_none() || self.acc_binding.is_some() {
             return None;
         }
@@ -16277,55 +16318,145 @@ impl Compiler {
         if prim_slots.len() > 16 {
             return None;
         }
-        Some((reads, prim_slots))
+        // The invariant-RHS hoist: an assignment RHS built only from the
+        // hoisted reads and non-BigInt literals, with at least one operator,
+        // is computed once in the preheader. The reads that feed it must
+        // additionally exclude BigInt/Symbol — the coercions that can throw —
+        // because the preheader runs before the loop's test, so a throw must
+        // not move across a zero-trip loop.
+        let receivers: HashSet<crux::AtomId> = scan.reads.iter().map(|(recv, _)| *recv).collect();
+        let hoisted: HashSet<(crux::AtomId, crux::AtomId)> = scan.reads.iter().copied().collect();
+        let mut exprs: Vec<&'a Expr> = Vec::new();
+        let mut strict_names: Vec<(crux::AtomId, crux::AtomId)> = Vec::new();
+        for &value in &scan.assign_values {
+            let mut used = Vec::new();
+            let mut has_op = false;
+            if expr_invariant_rhs(value, &receivers, &hoisted, &mut used, &mut has_op)
+                && has_op
+                && !used.is_empty()
+            {
+                exprs.push(value);
+                strict_names.extend(used);
+            }
+        }
+        if exprs.len() > 4 {
+            return None;
+        }
+        let reads = reads
+            .into_iter()
+            .map(|(slot, prop)| {
+                let strict = strict_names.iter().any(|(recv, name)| {
+                    *name == prop && matches!(self.binding(*recv), BindingLoc::Slot(s) if s == slot)
+                });
+                (slot, prop, strict)
+            })
+            .collect();
+        Some(MemberHoistPlan {
+            reads,
+            prim_slots,
+            exprs,
+        })
     }
 
     /// Emit the hoisted member-read loop: a once-per-loop guard verifies the
     /// primitive operand slots and probes every invariant read; on a hit the
     /// values land in hidden frame slots and the SAME loop re-compiles with
-    /// its reads lowered to those slots, on a miss it re-compiles unchanged as
-    /// the general per-iteration loop (only one copy runs). Both copies
-    /// re-emit the head init, so each starts its counter fresh.
-    fn compile_hoisted_member_for(
+    /// its reads (and any invariant RHS) lowered to those slots, on a miss it
+    /// re-compiles unchanged as the general per-iteration loop. When an
+    /// invariant RHS was hoisted, a second guard requires its result to be a
+    /// Number; a miss there keeps the reads hoisted but drops the RHS (the
+    /// read-hoisted copy). Only one copy runs.
+    fn compile_hoisted_member_for<'a>(
         &mut self,
-        init: Option<&ForInit>,
-        test: Option<&Expr>,
-        update: Option<&Expr>,
-        body: &Stmt,
-        reads: Vec<(usize, crux::AtomId)>,
-        prim_slots: Vec<usize>,
+        init: Option<&'a ForInit>,
+        test: Option<&'a Expr>,
+        update: Option<&'a Expr>,
+        body: &'a Stmt,
+        plan: MemberHoistPlan<'a>,
     ) -> Result<(), JsError> {
         self.emit(Step::ResetCompletion);
-        let mut guards: Vec<(usize, crux::AtomId, usize)> = Vec::new();
-        for (recv_slot, name) in reads {
+        let mut guards: Vec<(usize, crux::AtomId, usize, bool)> = Vec::new();
+        for (recv_slot, name, strict) in &plan.reads {
             let hoist_slot = self.alloc_hoist_slot();
-            guards.push((recv_slot, name, hoist_slot));
+            guards.push((*recv_slot, *name, hoist_slot, *strict));
         }
-        let miss_label = self.new_label();
+        let general_label = self.new_label();
         let guard_index = self.steps.len();
         self.emit(Step::HoistMemberGuard {
             reads: guards.clone(),
-            prim_slots,
+            prim_slots: plan.prim_slots,
+            numbers: false,
             target: 0,
         });
         self.fixups.push(Fixup::HoistMemberGuard {
             index: guard_index,
-            label: miss_label,
+            label: general_label,
         });
         let done_label = self.new_label();
-        // Fast copy: reads lower to the hidden slots. `hoist_suppressed` stops
-        // this same loop re-hoisting itself (and any nested loop in the copy —
-        // merely conservative).
+        let readonly_label = self.new_label();
         let saved_suppressed = self.hoist_suppressed;
+        let saved_members = self.hoisted_members.take();
+        let saved_exprs = self.hoisted_exprs.take();
+        let saved_proven = std::mem::take(&mut self.proven_num_slots);
+        // Precompute the invariant RHS expressions into fresh hidden slots. The
+        // read redirect is active (their member reads load the guard's slots);
+        // the expression redirect is not, so they compile normally. A second
+        // guard then requires those results to be Numbers — the raw-f64
+        // num-slot reduction reads them without a tag check — falling back to
+        // the read-hoisted copy when they are not.
+        let mut expr_slots: Vec<usize> = Vec::new();
+        let mut expr_map = std::collections::HashMap::new();
+        if !plan.exprs.is_empty() {
+            self.hoisted_members = Some(guards.clone());
+            for expr in &plan.exprs {
+                let slot = self.alloc_hoist_slot();
+                self.compile_expr(expr)?;
+                self.emit(Step::InitLocal { slot });
+                expr_map.insert((expr.span.start, expr.span.end), slot);
+                expr_slots.push(slot);
+            }
+            let number_index = self.steps.len();
+            self.emit(Step::HoistMemberGuard {
+                reads: Vec::new(),
+                prim_slots: expr_slots.clone(),
+                numbers: true,
+                target: 0,
+            });
+            self.fixups.push(Fixup::HoistMemberGuard {
+                index: number_index,
+                label: readonly_label,
+            });
+        }
+        // Fast copy: reads (and the invariant RHS expressions) lower to the
+        // hidden slots, and the RHS slots are the num-slot reduction's raw-f64
+        // RHS. `hoist_suppressed` stops this same loop re-hoisting itself (and
+        // any nested loop in the copy — merely conservative).
         self.hoist_suppressed = true;
-        let saved_members = self.hoisted_members.replace(guards);
+        self.hoisted_members = Some(guards.clone());
+        self.hoisted_exprs = if expr_map.is_empty() {
+            None
+        } else {
+            Some(expr_map)
+        };
+        self.proven_num_slots = expr_slots.iter().copied().collect();
         self.compile_for(init, test, update, body)?;
-        self.hoisted_members = saved_members;
+        self.hoisted_exprs = saved_exprs;
+        self.hoisted_members = saved_members.clone();
+        self.proven_num_slots = saved_proven;
         self.hoist_suppressed = saved_suppressed;
         self.jump(done_label);
-        // Fallback copy: the original per-iteration reads.
-        self.place(miss_label);
-        let saved_suppressed = self.hoist_suppressed;
+        if !expr_slots.is_empty() {
+            // Read-hoisted copy: the RHS was computed but was not a Number.
+            self.place(readonly_label);
+            self.hoist_suppressed = true;
+            self.hoisted_members = Some(guards);
+            self.compile_for(init, test, update, body)?;
+            self.hoisted_members = saved_members.clone();
+            self.hoist_suppressed = saved_suppressed;
+            self.jump(done_label);
+        }
+        // General copy: the original per-iteration reads.
+        self.place(general_label);
         self.hoist_suppressed = true;
         self.compile_for(init, test, update, body)?;
         self.hoist_suppressed = saved_suppressed;
@@ -16417,29 +16548,33 @@ impl Compiler {
             {
                 return;
             }
-            if !run_acc_is_number(ops, rmw_index) {
+            if !run_acc_is_number(ops, rmw_index, &self.proven_num_slots) {
                 return;
             }
             (rmw_index, slot)
         };
         // Entry proof: the slot's last write before the loop is a straight-line
         // `Push(Number(_))` + store, and the prefix cannot skip or re-enter it.
-        let Some(write) = (0..bind)
-            .rev()
-            .find(|&i| step_writes_slot(&self.steps[i], slot))
-        else {
-            return;
-        };
-        if write == 0
-            || !matches!(&self.steps[write - 1], Step::Push(value) if value.is_number())
-            || !matches!(
-                &self.steps[write],
-                Step::InitLocal { slot: s }
-                    | Step::StoreLocal { slot: s }
-                    | Step::FusedStoreLocal { slot: s } if *s == slot
-            )
-        {
-            return;
+        // A guard-proven Number slot (a hoisted invariant RHS) needs no proof —
+        // the guard verified it at the loop's entry.
+        if !self.proven_num_slots.contains(&slot) {
+            let Some(write) = (0..bind)
+                .rev()
+                .find(|&i| step_writes_slot(&self.steps[i], slot))
+            else {
+                return;
+            };
+            if write == 0
+                || !matches!(&self.steps[write - 1], Step::Push(value) if value.is_number())
+                || !matches!(
+                    &self.steps[write],
+                    Step::InitLocal { slot: s }
+                        | Step::StoreLocal { slot: s }
+                        | Step::FusedStoreLocal { slot: s } if *s == slot
+                )
+            {
+                return;
+            }
         }
         if !prefix_is_straight_line(&self.steps[..bind]) {
             return;
@@ -16465,7 +16600,7 @@ impl Compiler {
             return;
         };
         let rhs = if rmw_index + 1 == ops.len() {
-            rhs_recipe(&ops[..rmw_index]).unwrap_or(NumRhs::Acc)
+            rhs_recipe(&ops[..rmw_index], &self.proven_num_slots).unwrap_or(NumRhs::Acc)
         } else {
             NumRhs::Acc
         };
@@ -16492,10 +16627,8 @@ impl Compiler {
             if let Some(recv_slot) = self.hoistable_length_loop(init, test, update, body) {
                 return self.compile_hoisted_length_for(init, test, update, body, recv_slot);
             }
-            if let Some((reads, prim_slots)) = self.hoistable_member_loop(init, test, update, body)
-            {
-                return self
-                    .compile_hoisted_member_for(init, test, update, body, reads, prim_slots);
+            if let Some(plan) = self.hoistable_member_loop(init, test, update, body) {
+                return self.compile_hoisted_member_for(init, test, update, body, plan);
             }
         }
         self.emit(Step::ResetCompletion);
@@ -17633,6 +17766,14 @@ impl Compiler {
     }
 
     fn compile_expr_inner(&mut self, expr: &Expr) -> Result<(), JsError> {
+        // LICM: an invariant RHS already computed once in the fast copy's
+        // preheader loads its hidden slot.
+        if let Some(slots) = &self.hoisted_exprs
+            && let Some(slot) = slots.get(&(expr.span.start, expr.span.end))
+        {
+            self.emit(Step::LoadLocal { slot: *slot });
+            return Ok(());
+        }
         match &expr.kind {
             ExprKind::Paren(inner) => self.compile_expr(inner),
             ExprKind::Sequence(exprs) => {
@@ -19163,8 +19304,8 @@ impl Compiler {
         let Some(hoist_slot) = self.hoisted_members.as_ref().and_then(|guards| {
             guards
                 .iter()
-                .find(|(recv_slot, read_name, _)| *recv_slot == slot && read_name == prop)
-                .map(|(_, _, hoist_slot)| *hoist_slot)
+                .find(|(recv_slot, read_name, _, _)| *recv_slot == slot && read_name == prop)
+                .map(|(_, _, hoist_slot, _)| *hoist_slot)
         }) else {
             return false;
         };
@@ -20080,10 +20221,13 @@ fn num_arith(op: BinaryOp, lhs: f64, rhs: f64) -> f64 {
 /// leading op (`LoadCounter`/`LoadConst(Number)`) or a counter-plus-immediate
 /// pair (`LoadCounter` + `BinImm`) collapses into the store, dropping the
 /// accumulator round-trip; anything else keeps `NumRhs::Acc`.
-fn rhs_recipe(prefix: &[LeafOp]) -> Option<NumRhs> {
+fn rhs_recipe(prefix: &[LeafOp], proven: &HashSet<usize>) -> Option<NumRhs> {
     match prefix {
         [LeafOp::LoadCounter] => Some(NumRhs::Counter),
         [LeafOp::LoadConst(value)] => value.as_number().map(NumRhs::Imm),
+        [LeafOp::LoadReg { slot, tdz: false }] if proven.contains(slot) => {
+            Some(NumRhs::Slot(*slot))
+        }
         [LeafOp::LoadCounter, LeafOp::BinImm { op, imm }] if is_inline_arith(*op) => {
             Some(NumRhs::CounterImm { op: *op, imm: *imm })
         }
@@ -20162,14 +20306,16 @@ fn step_writes_slot(step: &Step, slot: usize) -> bool {
     }
 }
 
-/// Route B: whether the already-emitted prefix is straight-line — no step with
-/// a jump target and no control exit. That is what makes "the entry init
-/// executes exactly once, unconditionally" true without needing to resolve the
-/// (still unpatched) label targets. The loop's own initial test lives after
-/// `bind`, so it is outside the range checked.
+/// Route B: whether the already-emitted prefix is straight-line — no control
+/// exit and no jump that could re-enter or skip the loop's bind. That is what
+/// makes "the entry init executes exactly once, unconditionally" true without
+/// needing to resolve the (still unpatched) label targets. A
+/// `HoistMemberGuard` is allowed: its target is a forward fixup to the LICM
+/// general copy, which is emitted after this loop, so it cannot re-enter or
+/// skip the bind.
 fn prefix_is_straight_line(steps: &[Step]) -> bool {
     steps.iter().all(|step| {
-        step_targets(step).is_empty()
+        (step_targets(step).is_empty() || matches!(step, Step::HoistMemberGuard { .. }))
             && !matches!(
                 step,
                 Step::Return
@@ -20188,12 +20334,14 @@ fn prefix_is_straight_line(steps: &[Step]) -> bool {
 /// `ops[upto]`, mirroring the register executor's own value semantics (the
 /// JIT's slice-A `acc_is_number`). Conservative: an op it cannot account for
 /// loses the proof.
-fn run_acc_is_number(ops: &[LeafOp], upto: usize) -> bool {
+fn run_acc_is_number(ops: &[LeafOp], upto: usize, proven: &HashSet<usize>) -> bool {
     let mut known = false;
     for op in &ops[..upto] {
         known = match op {
             LeafOp::LoadCounter => true,
             LeafOp::LoadConst(value) => value.is_number(),
+            // A guard-proven Number slot (a hoisted invariant RHS) is known.
+            LeafOp::LoadReg { slot, tdz: false } if proven.contains(slot) => true,
             LeafOp::BinImm { op, .. } => known && is_inline_arith(*op),
             LeafOp::BinConst { op, value } => known && value.is_number() && is_inline_arith(*op),
             LeafOp::UpdateAcc { .. } => known,
@@ -23992,18 +24140,103 @@ fn collect_assigned_expr(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) {
 // the accessor-served length; other receivers could alias RECV through a
 // global, so they are excluded entirely).
 
-/// LICM: a member-read hoist plan — the `(receiver slot, name)` reads to
-/// hoist and the VALUE-operand slots the guard must check.
-type MemberHoistPlan = (Vec<(usize, crux::AtomId)>, Vec<usize>);
+/// LICM: a member-read hoist plan — the reads to hoist (with whether the value
+/// must also exclude BigInt/Symbol, because it feeds a hoisted invariant RHS),
+/// the VALUE-operand slots the guard checks, and the invariant RHS expressions
+/// to precompute into hidden slots.
+struct MemberHoistPlan<'a> {
+    reads: Vec<(usize, crux::AtomId, bool)>,
+    prim_slots: Vec<usize>,
+    exprs: Vec<&'a Expr>,
+}
 
 /// LICM slice: the invariant member reads a loop body exposes and the
 /// identifiers it reads as VALUES. The guard checks those slots hold
 /// non-object primitives, so no operand coercion can re-enter user code and
 /// mutate a hoisted receiver, and the read values are own data properties.
 #[derive(Default)]
-struct MemberHoistScan {
+struct MemberHoistScan<'a> {
     reads: Vec<(crux::AtomId, crux::AtomId)>,
     value_names: HashSet<crux::AtomId>,
+    /// The RHS of every assignment seen, as invariant-RHS hoist candidates.
+    assign_values: Vec<&'a Expr>,
+}
+
+/// LICM: whether `expr` is invariant across the loop — built only from literals
+/// (never BigInt/RegExp) and the already-hoisted data reads, with no
+/// value-operand identifier. Collects the reads it uses and whether it applies
+/// any operator (a bare read needs no expression hoist).
+fn expr_invariant_rhs(
+    expr: &Expr,
+    receivers: &HashSet<crux::AtomId>,
+    hoisted: &HashSet<(crux::AtomId, crux::AtomId)>,
+    used: &mut Vec<(crux::AtomId, crux::AtomId)>,
+    has_op: &mut bool,
+) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(lit) => !matches!(
+            lit,
+            syntax::ast::Literal::RegExp { .. } | syntax::ast::Literal::BigInt(_)
+        ),
+        ExprKind::Paren(inner) => expr_invariant_rhs(inner, receivers, hoisted, used, has_op),
+        ExprKind::Unary { op, operand } => {
+            if matches!(op, UnaryOp::Delete) {
+                return false;
+            }
+            *has_op = true;
+            expr_invariant_rhs(operand, receivers, hoisted, used, has_op)
+        }
+        ExprKind::Binary { op, left, right } => {
+            if matches!(op, BinaryOp::In | BinaryOp::Instanceof) {
+                return false;
+            }
+            *has_op = true;
+            expr_invariant_rhs(left, receivers, hoisted, used, has_op)
+                && expr_invariant_rhs(right, receivers, hoisted, used, has_op)
+        }
+        ExprKind::Logical { left, right, .. } => {
+            *has_op = true;
+            expr_invariant_rhs(left, receivers, hoisted, used, has_op)
+                && expr_invariant_rhs(right, receivers, hoisted, used, has_op)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            *has_op = true;
+            expr_invariant_rhs(test, receivers, hoisted, used, has_op)
+                && expr_invariant_rhs(consequent, receivers, hoisted, used, has_op)
+                && expr_invariant_rhs(alternate, receivers, hoisted, used, has_op)
+        }
+        ExprKind::Sequence(exprs) => {
+            *has_op = true;
+            exprs
+                .iter()
+                .all(|e| expr_invariant_rhs(e, receivers, hoisted, used, has_op))
+        }
+        ExprKind::Member(MemberExpr {
+            object,
+            property: MemberProperty::Name(prop),
+            optional: false,
+            ..
+        }) => {
+            let mut receiver = object;
+            while let ExprKind::Paren(inner) = &receiver.kind {
+                receiver = inner;
+            }
+            let ExprKind::Ident(name) = &receiver.kind else {
+                return false;
+            };
+            if receivers.contains(name) && hoisted.contains(&(*name, *prop)) {
+                used.push((*name, *prop));
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Whether `stmt` declares a lexical (`let`/`const`) binding anywhere in its
@@ -24040,7 +24273,7 @@ fn stmt_contains_lexical_decl(stmt: &Stmt) -> bool {
 /// Whether `expr` is safe to run per iteration across the hoisted loop's two
 /// copies without user code (see `MemberHoistScan`). Records every value
 /// identifier and every identifier-receiver named member read.
-fn expr_member_hoist_scan(expr: &Expr, scan: &mut MemberHoistScan) -> bool {
+fn expr_member_hoist_scan<'a>(expr: &'a Expr, scan: &mut MemberHoistScan<'a>) -> bool {
     match &expr.kind {
         ExprKind::Literal(lit) => !matches!(lit, syntax::ast::Literal::RegExp { .. }),
         ExprKind::Ident(name) => {
@@ -24083,6 +24316,7 @@ fn expr_member_hoist_scan(expr: &Expr, scan: &mut MemberHoistScan) -> bool {
             // a hoisted receiver or run a setter.
             if let ExprKind::Ident(name) = &target.kind {
                 scan.value_names.insert(*name);
+                scan.assign_values.push(value);
                 expr_member_hoist_scan(value, scan)
             } else {
                 false
@@ -24112,7 +24346,7 @@ fn expr_member_hoist_scan(expr: &Expr, scan: &mut MemberHoistScan) -> bool {
 /// Whether `stmt` may appear in a hoisted member-read loop's body (see
 /// `MemberHoistScan`). Control transfers are excluded like the length hoist:
 /// the fused loop copies must keep their flow inside.
-fn stmt_member_hoist_scan(stmt: &Stmt, scan: &mut MemberHoistScan) -> bool {
+fn stmt_member_hoist_scan<'a>(stmt: &'a Stmt, scan: &mut MemberHoistScan<'a>) -> bool {
     match &stmt.kind {
         StmtKind::Empty | StmtKind::Debugger => true,
         StmtKind::Block(block) => block.stmts.iter().all(|s| stmt_member_hoist_scan(s, scan)),

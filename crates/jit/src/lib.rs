@@ -1824,7 +1824,9 @@ mod tests {
 \t                      function accessor() { var o = { b: 2 }; var c = 0; Object.defineProperty(o, 'a', { get: function () { return ++c; } }); var n = 0; for (var i = 0; i < 4; i++) { n += o.a + o.b; } return n * 100 + c; }\n\
 \t                      function objectOperand() { var o = { a: 1 }; var n = { valueOf: function () { return 1; } }; for (var i = 0; i < 3; i++) { n = n + o.a; } return n; }\n\
 \t                      function mutated() { var o = { a: 1 }; var n = 0; for (var i = 0; i < 3; i++) { n += o.a; o.a = o.a + 1; } return n; }\n\
-\t                      (data() === 1500 && accessor() === 1804 && objectOperand() === 4 && mutated() === 6) ? 1 : 0;";
+\t                      function boolRhs() { var o = { a: 1, b: 2 }; var n = 0; for (var i = 0; i < 3; i++) { n += (o.a < o.b); } return n; }\n\
+\t                      function strRhs() { var o = { s: 'x', t: 'y' }; var r = ''; for (var i = 0; i < 4; i++) { r += o.s + o.t; } return r; }\n\
+\t                      (data() === 1500 && accessor() === 1804 && objectOperand() === 4 && mutated() === 6 && boolRhs() === 3 && strRhs() === 'xyxyxyxy') ? 1 : 0;";
         let interp = {
             let mut agent = runtime::Agent::new();
             agent.initialize_host_defined_realm().expect("realm");

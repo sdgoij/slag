@@ -33,5 +33,6 @@ pub use span::{SourceLocation, Span};
 pub use string::{AtomId, JsString, intern, intern_utf8, lookup, proto_atom};
 pub use symbol::{Symbol, descriptive_string};
 pub use value::{
-    PAYLOAD_MASK, TAG_FUNCTION, TAG_MASK, TAG_OBJECT, TAG_PREFIX, TAG_STRING, Value, type_of,
+    PAYLOAD_MASK, TAG_BIGINT, TAG_FUNCTION, TAG_MASK, TAG_OBJECT, TAG_PREFIX, TAG_STRING,
+    TAG_SYMBOL, Value, type_of,
 };
