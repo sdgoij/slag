@@ -38,7 +38,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
     ApplyKind, CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberMapCell,
-    MemberValueCell, RegOperand, RelLimit, ScopeInfo, Step, is_compound_assign,
+    MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JIT_APPLY_MAX_ARGS, JIT_GC_PROBE_INTERVAL,
@@ -6811,9 +6811,35 @@ impl<'a> Lowerer<'a> {
     /// Slice B (Route A): `var = var fop acc`, the result re-canonicalized into
     /// the accumulator. Both operands are proven Numbers, so no tag check and
     /// no slow path are emitted.
-    fn emit_num_slot_rmw(&mut self, op: BinaryOp, var: Variable) -> Result<(), Unsupported> {
+    fn emit_num_slot_rmw(
+        &mut self,
+        op: BinaryOp,
+        var: Variable,
+        rhs: NumRhs,
+    ) -> Result<(), Unsupported> {
         let left = self.builder.use_var(var);
-        let right = self.acc_f64();
+        let right = match rhs {
+            NumRhs::Acc => self.acc_f64(),
+            NumRhs::Imm(imm) => self.builder.ins().f64const(imm),
+            NumRhs::Counter => self.builder.use_var(self.counter_var),
+            NumRhs::CounterImm { op, imm } => {
+                let counter = self.builder.use_var(self.counter_var);
+                let imm = self.builder.ins().f64const(imm);
+                self.emit_arith(op, counter, imm)?
+            }
+            NumRhs::CounterImm2 {
+                op1,
+                imm1,
+                op2,
+                imm2,
+            } => {
+                let counter = self.builder.use_var(self.counter_var);
+                let first = self.builder.ins().f64const(imm1);
+                let mid = self.emit_arith(op1, counter, first)?;
+                let second = self.builder.ins().f64const(imm2);
+                self.emit_arith(op2, mid, second)?
+            }
+        };
         let res = self.emit_arith(op, left, right)?;
         self.builder.def_var(var, res);
         self.set_acc_num(res);
@@ -7045,29 +7071,23 @@ impl<'a> Lowerer<'a> {
                 self.emit_acc_binary(*op, BinForm::Bits(left), right, false, right_known)?;
             }
             LeafOp::BinStoreReg { op, slot } => {
-                if let Some(var) = self.num_slot_var(*slot) {
-                    // Slice B (Route A): the loop-carried Number slot lives in
-                    // an f64 register; the planner proved both operands Number.
-                    self.emit_num_slot_rmw(*op, var)?;
-                } else {
-                    // The fused tail of a slot-left binary stored back into the
-                    // SAME slot (`[BinLeftReg, StoreReg]`): combine the slot
-                    // with the accumulator and write the result back, one op.
-                    let left = self.load_slot(*slot);
-                    let right_known = self.acc_is_number;
-                    let right = self.acc_form();
-                    let l = self.bin_form_bits(BinForm::Bits(left));
-                    let r = self.bin_form_bits(right);
-                    let res = self.emit_binary_known(*op, l, r, false, right_known)?;
-                    self.store_slot(*slot, res);
-                    self.set_acc_bits(res);
-                }
+                // The fused tail of a slot-left binary stored back into the
+                // SAME slot (`[BinLeftReg, StoreReg]`): combine the slot with
+                // the accumulator and write the result back, one op.
+                let left = self.load_slot(*slot);
+                let right_known = self.acc_is_number;
+                let right = self.acc_form();
+                let l = self.bin_form_bits(BinForm::Bits(left));
+                let r = self.bin_form_bits(right);
+                let res = self.emit_binary_known(*op, l, r, false, right_known)?;
+                self.store_slot(*slot, res);
+                self.set_acc_bits(res);
             }
-            LeafOp::BinStoreNum { op, slot } => {
+            LeafOp::BinStoreNum { op, rhs, slot } => {
                 // Route B: the loop-carried Number slot lives in an f64
                 // register; the compiler proved both operands Number.
                 if let Some(var) = self.num_slot_var(*slot) {
-                    self.emit_num_slot_rmw(*op, var)?;
+                    self.emit_num_slot_rmw(*op, var, *rhs)?;
                 } else {
                     return Err(Unsupported::Step("BinStoreNum without a plan"));
                 }

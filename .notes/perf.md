@@ -8725,6 +8725,104 @@ Verification after the revert: clippy `--workspace --all-targets -D warnings`
 clean; `cargo test --workspace` 4777 pass / 0 fail; `--jit-bench` back at
 `arithmetic` ~0.61ms, `bare loop` ~0.60ms. Uncommitted.
 
+### LANDED (2026-09-10): the RHS chain folds into the loop-slot RMW — and the register-op DISPATCH is not the cost
+
+Follow-up to Route B, prompted by the guess that the interpreter's register-op
+dispatch was the remaining `--jitless` hot spot. A corpus probe (`--jitless
+--corpus`, 1M iterations, ops in the run) settled it:
+
+| shape | ms | delta vs empty |
+|---|---|---|
+| empty loop | 5.0-5.4 | — |
+| `n += 1` (`[LoadConst, BinStoreNum]`) | 9.4-9.5 | +4.1 |
+| `n += i` (`[LoadCounter, BinStoreNum]`) | 9.9-10.3 | +4.9 |
+| `n += i * 2` (`[LoadCounter, BinImm, BinStoreNum]`) | 11.9-12.5 | +7.1 |
+| `n += i * 2 + 3` (4 ops, `Acc` path) | 15.3-16.4 | +9.9 |
+
+Two corrections to the hypothesis:
+
+1. **The register-op dispatch is cheap** (~0.15-0.9ns/op): collapsing
+   `n += i * 2` from 3 ops to 1 changed the row by only ~0.6ms.
+2. **The `binary_inline` `Value` round-trip is the cost** (~1.5-2ns per call):
+   the same op computing `counter * 2` through `binary_inline` (two
+   `Value::Number` constructions + two `as_number` checks + the op match)
+   versus raw f64 differs by ~2ns. The per-iteration floor
+   (`FastLoopHead` + the `allocation_budget_exceeded` TLS read + the
+   `RunRegBody` dispatch) is ~5ms of the ~12ms; skipping the GC budget check
+   measured ~0.9-2.0ns/iter (a throwaway probe, reverted — the check stays).
+
+Landing: `LeafOp::BinStoreNum` carries a `NumRhs` recipe
+(`Acc`/`Imm`/`Counter`/`CounterImm`). `Compiler::plan_loop_num` collapses a
+recognized RHS chain into the store (`rhs_recipe`; the leading ops are dropped)
+and the interpreter's recipe arms run **raw f64** via `num_arith` — no `Value`
+boxing, no `binary_inline`. `Acc` (the general form, e.g. a frame-slot RHS)
+keeps the shared path.
+
+`--jit-bench` (release), `--jitless` (`interp` column):
+
+| row | pre-Route-B | Route B | + recipe |
+|---|---|---|---|
+| `arithmetic` | ~14.2ms | ~12.6ms | **7.51ms** |
+| `bare loop` | ~11.8ms | ~9.9ms | **6.71ms** |
+
+~-47% / ~-43% from the pre-Route-B interpreter. The JIT is unchanged
+(0.60/0.67ms — it already computed the RHS in f64).
+
+Follow-up (same day): the 2-inner-op recipe landed — `NumRhs::CounterImm2`
+(`(counter op1 imm1) op2 imm2`) folds `n += i * 2 + 3` from 4 ops to 1
+(`[BinStoreNum { Add, rhs: CounterImm2 { Mul, 2.0, Add, 3.0 } }]`): ~15.9 ->
+**8.47ms** (`--jitless`). A 3-inner-op chain (`n += i * 2 + 3 + 4`, ~20.8ms)
+still takes `Acc`; the recipes stop at two inner ops (a `Vec`-based
+`CounterChain` would generalize, but 3+ ops on the counter is synthetic).
+
+Verification: clippy `--workspace --all-targets -D warnings` clean; `cargo test
+--workspace` 4777 pass / 0 fail; six test262 sweeps at baseline (language
+23721/0/3, annexB 1086/0/0, built-ins 23657/0/155, with the JIT and with
+`--jitless`). Three structural eval tests updated (the collapse changes the
+documented op shapes). Uncommitted.
+
+### NEGATIVE PROBE (2026-09-10): the pure-loop safepoint skip is a code-PLACEMENT artifact, not a probe cost (reverted)
+
+Motivation: the FLOOR probe and the register-tick probe both point at the per-iteration GC
+safepoint as a candidate for the head floor. A loop whose body is one register run of
+provably pure ops (`LoadCounter`, a `Value::Number` `LoadConst`, an arith `BinImm`, a
+`BinStoreNum`) can neither allocate nor re-enter user code, so its allocation budget cannot
+change inside it and it provably needs no per-iteration poll — a `FastLoopHead` whose
+`body_start` is such a `RunRegBody` was marked `pure_loop_heads` and skipped the probe.
+The proposal was bounded and the classification is sound. The gate was whether removing the
+probe actually moves the compiled loop.
+
+Method — A/B by PROBE COUNT on the emitted loop, holding everything else fixed (release,
+`--jit-bench`, 4 runs each):
+
+| probes/iter | how | `arithmetic` jit | `bare loop` jit |
+|---|---|---|---|
+| 1 (clean) | committed shape | 595-629µs (≈614) | 666-681µs (≈673) |
+| 2 | a duplicate `emit_gc_probe()` on the head | 744-748µs (≈747) | 693-698µs (≈696) |
+| 0 | the pure-loop skip enabled | 758-798µs (≈769) | 654-696µs (≈668) |
+
+The `arithmetic` column is **non-monotonic**: relative to the single-probe shape, *adding* a
+probe costs ~+133µs and *removing* the probe costs ~+155µs. A real per-iteration cost cannot
+be more expensive when the work is deleted, so the probe is not the lever — the loop is
+sensitive to where its instructions land (the head is a ~5-µop latency-bound loop with idle
+issue slots; a size change shifts the hot `jnbe`/`vaddsd` alignment across a fetch/uop-cache
+boundary). `bare loop` moves ≤~25µs and nearly monotonic, i.e. within/below noise across the
+three shapes. The skip was deterministic per binary (toggling the guard reproduced ≈614µs vs
+≈769µs on rebuild), so this is a codegen-placement effect, not run-to-run variance — and not
+a control we have (Cranelift exposes no loop-header alignment knob, and the earlier
+address-shift test found the same non-responsiveness).
+
+This is the same wall as the register-held GC tick above: the head floor is not reachable by
+moving the *safepoint*, by removing it, or by adding to it. Verdict: no clean win; the
+`pure_loop_heads` machinery, `leaf_op_is_safepoint_pure`, the duplicate probe, and the
+`&& false` guard were all reverted — the tree is byte-identical to HEAD `e943872`. Recorded so
+the next attempt at the head floor starts from a probe count A/B rather than the plausible-
+but-false "the probe is pure dead weight" premise.
+
+Verification: clippy `--workspace --all-targets -D warnings` clean on the reverted tree;
+`git status` clean (no source delta). The scratch probes (`scratch/pureprobe.js`,
+`scratch/arithprobe.js`, `scratch/layout/`) were deleted.
+
 ### FIXED (2026-09-10): the empty-body certified `for`-loop hang
 
 Root cause: in the two `FastLoopHead` loop paths, `compiler.compile_for` places `body_start`, compiles the body, then places `continue_label`. With no body statements those two labels collapse onto the same step — the head's own index. `emit_fast_loop_head` then resolves the backward-edge target via `ensure_block(body_start)`, which returns the head's own block, and the compiled self-loop re-enters the head without carrying the incremented counter variable, so the loop test never fails.

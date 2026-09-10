@@ -3287,10 +3287,14 @@ mod tests {
         );
         assert_eq!(var_chain.len(), 1, "the s += i body must lower");
         assert!(
-            var_chain[0]
-                .iter()
-                .any(|op| matches!(op, crate::ir::LeafOp::LoadCounter)),
-            "the run must load the counter operand"
+            var_chain[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::BinStoreNum {
+                    rhs: crate::ir::NumRhs::Counter,
+                    ..
+                }
+            )),
+            "the run must read the counter as the RMW's RHS (Route B collapse)"
         );
         assert!(
             var_chain[0].iter().any(|op| {
@@ -3454,7 +3458,10 @@ mod tests {
             )),
             "s += 1 must fuse its store into one bin+store op"
         );
-        assert_eq!(slot[0].len(), constant[0].len());
+        // Route B's RHS collapse folds the literal into the RMW (one op),
+        // while a frame-slot RHS keeps the pair.
+        assert_eq!(constant[0].len(), 1);
+        assert_eq!(slot[0].len(), 2);
     }
 
     #[test]
@@ -4452,10 +4459,19 @@ mod tests {
             "seg",
         );
         assert_eq!(segmented.len(), 2, "both fused-store statements must lower");
+        // The pre-`if` statement lowers to the plain two-op fused run — compare
+        // against a flat body that does NOT take the Route B specialization (a
+        // String-initialized slot fails the Number entry proof), since the `if`
+        // keeps `segmented`'s loop on the unspecialized path too.
+        let unspecialized = register_runs(
+            &mut agent,
+            "function flat2() { var n = ''; for (var i = 0; i < 10; i++) n += 1; return n; }",
+            "flat2",
+        );
         assert_eq!(
             segmented[0].len(),
-            unbraced[0].len(),
-            "the pre-`if` statement lowers to the same run as the flat body"
+            unspecialized[0].len(),
+            "the pre-`if` statement lowers to the same run as the plain flat body"
         );
     }
 

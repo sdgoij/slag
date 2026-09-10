@@ -1115,6 +1115,30 @@ fn trace_leaf_op_heaps(op: &LeafOp, visit: &mut dyn FnMut(GcAny)) {
     }
 }
 
+/// The right operand of a loop-carried Number slot's RMW
+/// ([`LeafOp::BinStoreNum`]): the compiler collapses a recognized RHS chain
+/// into the store op so the common reduction is ONE register op — the
+/// interpreter's per-op dispatch is its dominant per-iteration cost.
+#[derive(Debug, Clone, Copy)]
+pub enum NumRhs {
+    /// The accumulator — the general form, when the RHS was computed by the
+    /// run's preceding ops.
+    Acc,
+    /// A Number literal (`s += 1`).
+    Imm(f64),
+    /// The fused loop counter, `Vm::loop_counter` (`s += i`).
+    Counter,
+    /// `counter op imm` (`s += i * 2`).
+    CounterImm { op: BinaryOp, imm: f64 },
+    /// `(counter op1 imm1) op2 imm2` (`s += i * 2 + 3`).
+    CounterImm2 {
+        op1: BinaryOp,
+        imm1: f64,
+        op2: BinaryOp,
+        imm2: f64,
+    },
+}
+
 /// A register instruction for a *leaf* body (Cut 35 slice 1). The step path
 /// round-trips the value stack for every expression; these ops target a
 /// single accumulator (`Vm.acc`) plus the leaf's frame segment, capture
@@ -1311,14 +1335,18 @@ pub enum LeafOp {
     /// and the write-back skips the `tdz` check (the lowering only fuses
     /// the `tdz=false` slot shape, where the pair's `StoreReg` had none).
     BinStoreReg { op: BinaryOp, slot: usize },
-    /// Route B: `loop_num = loop_num op acc; acc = Number(loop_num)` — the
+    /// Route B: `loop_num = loop_num op <rhs>; acc = Number(loop_num)` — the
     /// loop-carried Number slot's RMW, kept in `Vm::loop_num` (f64) for the
     /// loop's duration instead of the frame. The compile-time plan proved both
     /// operands are Numbers, so no coercion or tag check is needed; the frame
     /// slot is written back by the loop's `Step::FastLoopStore`. `slot` names
     /// the binding (the JIT maps it to its register; the interpreter uses the
     /// single `Vm::loop_num`).
-    BinStoreNum { op: BinaryOp, slot: usize },
+    BinStoreNum {
+        op: BinaryOp,
+        slot: usize,
+        rhs: NumRhs,
+    },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
 }
@@ -10242,16 +10270,45 @@ impl Vm {
                     self.acc = result;
                     *self.frame_get_mut(*slot) = result;
                 }
-                LeafOp::BinStoreNum { op, .. } => {
+                LeafOp::BinStoreNum { op, rhs, .. } => {
                     // Route B: the loop-carried Number slot lives in
                     // `Vm::loop_num` (f64) for the loop's duration; the frame
                     // slot is written back by the loop's `FastLoopStore`. The
                     // compile-time plan proves both operands are Numbers, so
-                    // the arithmetic result is a Number too.
-                    let left = Value::Number(self.loop_num);
-                    let result = Self::binary_inline(agent, *op, &left, &self.acc)?;
-                    self.acc = result;
-                    self.loop_num = result.as_number().unwrap_or(self.loop_num);
+                    // the recipe forms run in raw f64 (no `Value` round-trip);
+                    // the general `Acc` form takes the shared `binary_inline`.
+                    match rhs {
+                        NumRhs::Acc => {
+                            let left = Value::Number(self.loop_num);
+                            let result = Self::binary_inline(agent, *op, &left, &self.acc)?;
+                            self.acc = result;
+                            self.loop_num = result.as_number().unwrap_or(self.loop_num);
+                        }
+                        NumRhs::Imm(imm) => {
+                            self.loop_num = num_arith(*op, self.loop_num, *imm);
+                            self.acc = Value::Number(self.loop_num);
+                        }
+                        NumRhs::Counter => {
+                            self.loop_num = num_arith(*op, self.loop_num, self.loop_counter);
+                            self.acc = Value::Number(self.loop_num);
+                        }
+                        NumRhs::CounterImm { op: inner, imm } => {
+                            let right = num_arith(*inner, self.loop_counter, *imm);
+                            self.loop_num = num_arith(*op, self.loop_num, right);
+                            self.acc = Value::Number(self.loop_num);
+                        }
+                        NumRhs::CounterImm2 {
+                            op1,
+                            imm1,
+                            op2,
+                            imm2,
+                        } => {
+                            let mid = num_arith(*op1, self.loop_counter, *imm1);
+                            let right = num_arith(*op2, mid, *imm2);
+                            self.loop_num = num_arith(*op, self.loop_num, right);
+                            self.acc = Value::Number(self.loop_num);
+                        }
+                    }
                 }
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc));
@@ -16130,7 +16187,10 @@ impl Compiler {
         if !prefix_is_straight_line(&self.steps[..bind]) {
             return;
         }
-        // Commit.
+        // Commit: mark the loop and rewrite the RMW op. When the run is exactly
+        // a recognized RHS chain followed by the RMW, collapse the chain into
+        // the one op (the interpreter's per-op dispatch dominates its
+        // per-iteration cost); otherwise the RHS stays in the accumulator.
         if let Step::FastLoopBind { num, .. } = &mut self.steps[bind] {
             *num = Some(slot);
         } else {
@@ -16141,10 +16201,21 @@ impl Compiler {
         } else {
             return;
         }
-        if let Step::RunRegBody { ops } = &mut self.steps[body_start]
-            && let LeafOp::BinStoreReg { op, .. } = ops[rmw_index]
-        {
-            ops[rmw_index] = LeafOp::BinStoreNum { op, slot };
+        let Step::RunRegBody { ops } = &mut self.steps[body_start] else {
+            return;
+        };
+        let LeafOp::BinStoreReg { op, .. } = ops[rmw_index] else {
+            return;
+        };
+        let rhs = if rmw_index + 1 == ops.len() {
+            rhs_recipe(&ops[..rmw_index]).unwrap_or(NumRhs::Acc)
+        } else {
+            NumRhs::Acc
+        };
+        if matches!(rhs, NumRhs::Acc) {
+            ops[rmw_index] = LeafOp::BinStoreNum { op, slot, rhs };
+        } else {
+            *ops = vec![LeafOp::BinStoreNum { op, slot, rhs }].into_boxed_slice();
         }
     }
 
@@ -19686,6 +19757,47 @@ fn is_inline_arith(op: BinaryOp) -> bool {
         op,
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
     )
+}
+
+/// The four inline arithmetic shapes (`is_inline_arith`) on two f64s — the
+/// register ops' fast path without the `Value` round-trip. The compile gate
+/// admits only these ops here.
+fn num_arith(op: BinaryOp, lhs: f64, rhs: f64) -> f64 {
+    match op {
+        BinaryOp::Add => lhs + rhs,
+        BinaryOp::Sub => lhs - rhs,
+        BinaryOp::Mul => lhs * rhs,
+        BinaryOp::Div => lhs / rhs,
+        _ => {
+            debug_assert!(false, "non-arith op in num_arith");
+            lhs
+        }
+    }
+}
+
+/// Route B: the RHS chains [`LeafOp::BinStoreNum`] can compute inline. A single
+/// leading op (`LoadCounter`/`LoadConst(Number)`) or a counter-plus-immediate
+/// pair (`LoadCounter` + `BinImm`) collapses into the store, dropping the
+/// accumulator round-trip; anything else keeps `NumRhs::Acc`.
+fn rhs_recipe(prefix: &[LeafOp]) -> Option<NumRhs> {
+    match prefix {
+        [LeafOp::LoadCounter] => Some(NumRhs::Counter),
+        [LeafOp::LoadConst(value)] => value.as_number().map(NumRhs::Imm),
+        [LeafOp::LoadCounter, LeafOp::BinImm { op, imm }] if is_inline_arith(*op) => {
+            Some(NumRhs::CounterImm { op: *op, imm: *imm })
+        }
+        [
+            LeafOp::LoadCounter,
+            LeafOp::BinImm { op: op1, imm: imm1 },
+            LeafOp::BinImm { op: op2, imm: imm2 },
+        ] if is_inline_arith(*op1) && is_inline_arith(*op2) => Some(NumRhs::CounterImm2 {
+            op1: *op1,
+            imm1: *imm1,
+            op2: *op2,
+            imm2: *imm2,
+        }),
+        _ => None,
+    }
 }
 
 /// Route B: whether a register op reads or writes the frame slot.
