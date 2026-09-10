@@ -8497,6 +8497,215 @@ Verdict: NOT an architectural redesign. The NaN-boxed `Value` representation is 
 
 Side finding (unrelated to this row; the loop-lowering code is untouched by the recent landings): a certified function with an EMPTY loop body HANGS the JIT — `function bare(n) { for (var i = 0; i < n; i++) {} } bare(1000000)` never returns, while `--jitless` and any non-empty body work. The CLIF shows the empty body's `body_start` collapses onto the `FastLoopHead`'s own step/block, so its back edge re-enters the head with the pre-increment counter (the increment is never written back) and the test never fails. A fixture-free latent hang, fixed the same day (see the FIXED entry below).
 
+### LANDED (2026-09-10): known-Number register operands drop their tag checks — slice A of the type-specialized loop lowering
+
+The first cut of the arithmetic-loop floor work. The register executor
+(`crates/jit/src/compiler.rs`) now tracks whether its accumulator holds a
+canonical `Value::Number` by construction (`Lowerer::acc_is_number`), and
+`emit_binary` takes an operand-knownness pair (`emit_binary_known`). A known
+operand's `is_double` check is dropped; when BOTH operands are known the
+arithmetic fast result is returned with no slow block and no `brif` at all.
+The `i * 2` of `n += i * 2` (accumulator from `LoadCounter`, right a
+`Value::Number` constant) therefore lowers to a bare `fmul` + canonicalization.
+
+Provenance is per-`RunRegBody`: reset at the step boundary and at the
+register-body entry (which seeds the accumulator with `undef`), set by
+`LoadCounter`/`LoadConst(Number)`/arithmetic results, cleared by `LoadReg`,
+member reads, and comparisons — `binary_yields_number` only yields Number for
+the `InlineBin::Arith` shapes on two Numbers. The string boundary needs no
+special case: `i + '!'` has a non-Number right operand and still takes the
+concat slow path. JIT-only — the interpreter's `run_leaf_ops` and the step path
+are untouched.
+
+Measured on `--jit-bench`'s `arithmetic` row (release, min-of-batched-samples,
+4 runs each side): baseline 2.489 / 2.459 / 2.450 / 2.479ms, slice A
+2.368 / 2.359 / 2.351 / 2.326ms — ~2.47 -> ~2.35ms (~4.5%). As the FLOOR probe
+predicted, one of the two bin ops losing its branch moves the floor only a
+little: `n += ...`'s `BinStoreReg` still checks its slot-left operand.
+
+Verification: `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 4775 pass / 0 fail (incl.
+`installed_jit_known_number_operands_match_the_interpreter`). Uncommitted.
+
+### LANDED (2026-09-10): the JIT-only loop-carried Number slot — slice B Route A of the type-specialized loop lowering
+
+Slice A removed the tag checks for operands the compiler already knows are
+Numbers. The remaining body cost in `arithmetic`/`bare loop` was the slot-left
+operand of the reduction: `n += i * 2` lowered to `BinLeftReg`/`BinStoreReg` on
+an untyped frame slot `n`, re-checked every iteration. Slice B is the
+loop-carried half of the plan — keep `n` in a raw f64 register for the loop's
+duration and sync it to the frame only at the loop edges, the existing
+`loop_counter` / `FastLoopBind` / `FastLoopStore` template generalized.
+
+Target shape (probe of `--print-bytecode` on `var n = 0; for (var i = 0; i < 3;
+i++) { n += i * 2; }`): the loop body is exactly one run,
+`RunRegBody { ops: [LoadCounter, BinImm { op: Mul, imm: 2.0 }, BinStoreReg { op:
+Add, slot: 0 }] }`, with `n` = slot 0 and `i` = slot 1, and the only reference
+to slot 0 in the body IS that RMW. The Number init (`var n = 0`) is visible in
+the step stream as `Push(Number(0.0))` + `InitLocal { slot: 0 }` just before
+`FastLoopBind`. Both hot rows (`arithmetic`, `bare loop`) have this shape.
+
+Two routes were identified. v1 landed **Route A** (JIT-only); **Route B** (the
+step/`LeafOp` IR route) stays deferred and is documented below for later review.
+
+Common v1 restriction (both routes). A slot `s` is specialized only when:
+
+- every reference to `s` in the loop body is the statement-position RMW
+  `s op= <number-provable>` — no other read or write (a read or a step-path
+  access would observe the stale frame slot mid-loop);
+- the RMW's op is arithmetic and its right operand (the accumulator) is
+  Number-provable, so the f64 result is exact; and
+- `s` is a Number at loop entry (the route-specific proof below).
+
+Neither route builds a runtime entry guard or a versioned (specialized +
+generic) body — the entry value is proven at compile time.
+
+#### Route A (LANDED) — JIT-only, no IR change
+
+The JIT already sees the whole `CompiledBody`, so it does the candidate scan
+and the entry proof itself and specializes purely in machine code
+(`plan_num_slot` + `Lowerer::num_slots` in `crates/jit/src/compiler.rs`):
+
+- Candidate: a `FastLoopHead { var: Counter }` whose body is exactly one
+  `RunRegBody` step (`head == body_start + 1`), containing exactly one
+  arithmetic `BinStoreReg { op, slot }` and no other op referencing that slot;
+  `!has_try && !has_suspension` (a throw or suspension escaping the loop would
+  skip the flush, and a suspension would not carry the register).
+- Entry proof: let `w` be the last step index `< body_start` that writes the
+  slot; require `steps[w - 1]` is `Push(Number(_))` and `steps[w]` writes the
+  slot (`InitLocal`/`StoreLocal`/`FusedStoreLocal`); and require that no step
+  in `[0, body_start)` targets an index `< body_start`, no unconditional
+  `Jump`, and no `Return`/`Throw`/`Break`/`Continue` — so the prefix to `w` is
+  straight-line and `w` executes exactly once with the Number just pushed.
+- Codegen: one `declare_var(types::F64)` per candidate, seeded at its
+  `FastLoopBind` from the frame slot, lowered as `var = fop(var, bitcast(acc))`
+  with `acc` re-canonicalized, and flushed (`store_slot(slot,
+  canon(bitcast(var)))`) at the top of the `FastLoopHead::after` block — the
+  single merge of the normal exit, the zero-iteration initial test, and every
+  `break`.
+
+The interpreter keeps running the generic `BinStoreReg`, so `--jitless` (and
+any un-specialized run) is unaffected by construction. Blast radius:
+`crates/jit/src/compiler.rs` only.
+
+Measured on `--jit-bench` (release, two runs):
+
+| row | before (slice A) | after (slice B) | ratio |
+|---|---|---|---|
+| `arithmetic` | 2.33-2.37ms | **1.17ms** | 0.18 -> 0.08 |
+| `bare loop` | 2.30-2.34ms | **0.75-0.78ms** | 0.20 -> 0.06 |
+
+That is the body's last branch gone: both rows now run as raw f64 register ops
+with no body tag check, no body slow block, and no body branch; the remaining
+cost is the loop head (slice C). The win is far larger than the FLOOR probe's
+"the ops are nearly free" estimate because what was removed was the branchy
+block structure, not the ALU ops. Node's `arithmetic` is ~0.50ms, so the row is
+now ~2.3x node (from ~5x).
+
+Verification: `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 4776 pass / 0 fail (incl.
+`installed_jit_loop_carried_number_slots_match_the_interpreter`, which also
+guards the shapes that must NOT specialize: a conditional entry write and a
+String-init slot); test262 sweeps at baseline — language 23721/0/3, annexB
+1086/0/0, built-ins 23657/0/155, zero fail/crash/hang. Uncommitted.
+
+#### Route B (deferred, not started) — the step/`LeafOp` IR route
+
+Kept as the reviewed-plan artifact for a later cut. It would also speed up
+`--jitless` (and any un-specialized run), at the cost of new IR that both
+engines must implement. Route A's compile-time proof and candidate scan can be
+reused by the compiler side if this is picked up, but the entry proof would move
+into `ir.rs` (the current one scans the JIT-visible step stream).
+
+- `Step::FastLoopBind`/`FastLoopStore` carry the candidate list (or two sibling
+  steps), one new `LeafOp::BinStoreNum { op, index }`, and a `Vm` f64 scratch
+  (`loop_nums`).
+- Interpreter arms: `run_leaf_ops` for the new op, plus the
+  `FastLoopBind`/`FastLoopStore` dispatch that seeds/flushes the scratch.
+- Compiler side (`ir.rs`): a `number_slots` map set by `var s = <Number>`,
+  cleared by any assignment / declaration without a Number init / any
+  control-flow statement that assigns `s`, consulted when `compile_for` emits
+  the acc-path loop; the candidate list rides on the loop steps.
+- JIT side: f64 `num_vars` + the `emit_leaf_op` arm + `step_name`
+  /`step_targets`/`max_stack_usage`; `lower_step`/
+  `lower_leaf_ops_segmented` need the slot→index map so the run emits
+  `BinStoreNum` instead of `BinStoreReg`.
+- Hard requirement: the register-run segmentation must never leave a
+  specialized slot referenced by a step, and `--jitless` must agree — this is
+  the extra correctness surface Route A avoids.
+
+A drop-in would also need the same confinement Route A enforces (the single-RMW
+body, the Number entry proof) so the specialized slot is never observed via the
+stale frame mid-loop.
+
+### LANDED (2026-09-10): the loop head — slice C of the type-specialized loop lowering
+
+With slice B the body was nearly free, so the head dominated. `JIT_DUMP_CLIF`
+on `function f() { var n = 0; for (var i = 0; i < 5; i++) { n += i * 2; } }`
+showed **two GC safepoint probes per iteration** (the `FastLoopHead` block and
+its own `body_start` block, which `back_targets` also probes) and **three
+`band`/`icmp`/`select` canonicalizations** — the `LoadCounter` value, the `i *
+2` product, and the `n +=` result were each round-tripped through a NaN-boxed
+`Value` even though nothing consumed them as a `Value`. Three changes
+(`crates/jit/src/compiler.rs`):
+
+1. **Duplicate probe removed.** `emit_all` now records each `FastLoopHead`'s
+   `body_start` whose SOLE back edge is that head (`probe_suppressed`); the
+   head's own block polls every iteration, so the body's second probe is
+   skipped. (Measured `arithmetic` 1.17 -> ~1.00ms, `bare loop` 0.75 -> ~0.60ms.)
+2. **Deferred `Value`-bits for a Number accumulator.** A second register
+   (`acc_num_var: F64`) holds the accumulator's live numeric form when it is a
+   known Number; `acc_bits()` materializes the canonical `Value` only when a
+   consumer needs it (a member op, `StoreReg`, `PushAcc`, `ReturnAcc`). The
+   arithmetic chain stays in f64 end to end (`BinForm::Num` operands, no
+   per-op canon). (Measured `arithmetic` ~1.00 -> **0.607ms**, `bare loop`
+   ~0.60 -> 0.607ms.)
+3. `cond_jump_i8` — the fused head test passes its `fcmp` I8 straight to the
+   branch instead of `uextend`+`icmp`; measured neutral, kept as a
+   simplification.
+
+The hot loop is now ~2 flops (`fmul`/`fadd`) plus one safepoint probe and the
+counter inc/test, per iteration.
+
+| row | probe (2026-09-10) | slice A | slice B | slice C |
+|---|---|---|---|---|
+| `arithmetic` | 2.50ms | 2.35 | 1.17 | **0.607ms** |
+| `bare loop` | 2.30 | 2.32 | 0.75-0.78 | **0.607ms** |
+
+Node's `arithmetic` is ~0.50ms, so the row went from ~5x node to **~1.2x** (a
+~4.1x cut from the probe). The remaining gap is the per-iteration GC safepoint
+poll (load/dec/store/cmp/branch); a register-held tick was tried next and lost
+(see the NEGATIVE PROBE below).
+
+Verification: `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 4777 pass / 0 fail (incl.
+`installed_jit_deferred_number_accumulator_matches_the_interpreter`); test262
+sweeps at baseline — language 23721/0/3, annexB 1086/0/0, built-ins
+23657/0/155, zero fail/crash/hang. Uncommitted.
+
+### NEGATIVE PROBE (2026-09-10): the register-held GC tick is SLOWER — the safepoint stays memory-based (reverted)
+
+The slice C "next micro-lever": hold the loop's GC tick in a Cranelift register
+for the specialized reduction loop (`plan_num_slot`'s candidate), decrement it
+per head iteration, and touch `ctx.gc_ticks` only on underflow — seeded at the
+loop's `FastLoopBind` and written back at the loop exit. The correctness story
+held (the body is one register run, so the loop's own poll keeps collections
+paced while the ctx field is stale; the exit flush re-syncs it), and the change
+compiled and ran.
+
+Measured (release, two runs): `arithmetic` 0.607 -> 0.756 / 0.771ms,
+`bare loop` 0.60 -> 0.678 / 0.684ms — ~20-25% SLOWER. The memory probe's
+load/dec/store ride a pipe off the branch's critical path, while the register
+tick adds a loop-carried `Variable` chain (the underflow block's `def` forces a
+phi at the head, and the loop-carried def/use lengthens the recurrence) plus an
+extra `icmp` + `brif`. Reverted; the per-iteration `ctx.gc_ticks` probe remains.
+Recorded so a later attempt at the head floor starts from this measurement
+rather than re-tripping on it.
+
+Verification after the revert: clippy `--workspace --all-targets -D warnings`
+clean; `cargo test --workspace` 4777 pass / 0 fail; `--jit-bench` back at
+`arithmetic` ~0.61ms, `bare loop` ~0.60ms. Uncommitted.
+
 ### FIXED (2026-09-10): the empty-body certified `for`-loop hang
 
 Root cause: in the two `FastLoopHead` loop paths, `compiler.compile_for` places `body_start`, compiles the body, then places `continue_label`. With no body statements those two labels collapse onto the same step — the head's own index. `emit_fast_loop_head` then resolves the backward-edge target via `ensure_block(body_start)`, which returns the head's own block, and the compiled self-loop re-enters the head without carrying the incremented counter variable, so the loop test never fails.

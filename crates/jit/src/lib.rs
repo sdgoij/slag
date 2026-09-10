@@ -1664,6 +1664,124 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_known_number_operands_match_the_interpreter() {
+        // Slice A of the type-specialized loop lowering: the register
+        // executor's accumulator provenance lets an op whose operands are
+        // already canonical Numbers skip its tag checks (and its slow
+        // block entirely when BOTH are known) — the `i * 2` of a numeric
+        // reduction lowers to a bare `fmul`. The string-concat arm guards
+        // the boundary: a Number accumulator combined with a String constant
+        // must still take the slow path (right operand not known-Number), so
+        // `i + '!'` concatenates rather than adding.
+        let source = "function bench() {\n\
+                        var n = 0;\n\
+                        for (var i = 0; i < 100000; i++) { n += i * 2; }\n\
+                        return n;\n\
+                      }\n\
+                      function cat() {\n\
+                        var out = '';\n\
+                        for (var i = 0; i < 3; i++) { out = i + '!'; }\n\
+                        return out;\n\
+                      }\n\
+                      var a = bench();\n\
+                      var b = cat();\n\
+                      (a === 9999900000 && b === '2!') ? 1 : 0;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "known-Number operand lowering must match the interpreter"
+        );
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_loop_carried_number_slots_match_the_interpreter() {
+        // Slice B (Route A): a frame slot whose only in-loop reference is one
+        // arithmetic RMW (`n += i * 2`, `n -= 1`) is kept in an f64 register
+        // across its canonical loop and flushed to the frame at the loop exit.
+        // The guarded shapes must stay generic and still agree: a slot whose
+        // entry write is conditional (`if (true) { n = 1; }` — a branch in the
+        // prefix) and a non-Number init (`n = 'x'`, whose `+=` concatenates).
+        let source = "function reduce() {\n\
+                        var n = 0;\n\
+                        for (var i = 0; i < 100000; i++) { n += i * 2; }\n\
+                        return n;\n\
+                      }\n\
+                      function dec() {\n\
+                        var n = 5;\n\
+                        for (var i = 0; i < 10; i++) { n -= 1; }\n\
+                        return n;\n\
+                      }\n\
+                      function conditional() {\n\
+                        var n = 0;\n\
+                        if (true) { n = 1; }\n\
+                        for (var i = 0; i < 3; i++) { n += i; }\n\
+                        return n;\n\
+                      }\n\
+                      function concat() {\n\
+                        var n = 'x';\n\
+                        for (var i = 0; i < 3; i++) { n += i; }\n\
+                        return n;\n\
+                      }\n\
+                      [reduce(), dec()];\n\
+                      (reduce() === 9999900000 && dec() === -5 &&\n\
+                       conditional() === 4 && concat() === 'x012') ? 1 : 0;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "loop-carried Number slot lowering must match the interpreter"
+        );
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_deferred_number_accumulator_matches_the_interpreter() {
+        // Slice C: the register executor keeps a known Number accumulator in an
+        // f64 and materializes the `Value`-bits form only when a consumer needs
+        // it. Exercise the consumers — a leaf body's `ReturnAcc`, a computed
+        // member store (the accumulator as the stored value), and arithmetic
+        // across several ops — against the interpreter.
+        let source = "function callLeaf(fn) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < 2000; i++) { s += fn(i); }\n\
+                        return s;\n\
+                      }\n\
+                      function store(o, k) {\n\
+                        var n = 0;\n\
+                        for (var i = 0; i < 100; i++) { n += i * 3; o[k] = n; }\n\
+                        return o[k];\n\
+                      }\n\
+                      var a = callLeaf(function (x) { return x * 2 + 1; });\n\
+                      var o = {};\n\
+                      var b = store(o, 'v');\n\
+                      (a === 4000000 && b === 14850) ? 1 : 0;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "deferred accumulator materialization must match the interpreter"
+        );
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_registered_builtin_calls_match_the_interpreter() {
         // Cut 79: a member call whose callee is an installed builtin
         // (Map.prototype.has/get/set — registered at `Intrinsics::define`)

@@ -437,6 +437,15 @@ enum InlineBin {
     Cmp(FloatCC),
 }
 
+/// A binary operand (slice C): `Bits` is a ready `Value`, `Num` is an f64 whose
+/// `Value`-bits form is materialized only if the slow path needs it — the
+/// accumulator's deferred representation when it is a known Number.
+#[derive(Clone, Copy)]
+enum BinForm {
+    Bits(ClifValue),
+    Num(ClifValue),
+}
+
 /// The number-number shapes `binary_inline` inlines in the interpreter
 /// (`apply_binary` for two numbers). `Equal`/`StrictEqual` on two numbers are
 /// the same f64 compare (NaN != NaN, -0 == 0, matching JS).
@@ -613,6 +622,236 @@ fn step_targets(step: &Step) -> Vec<usize> {
     }
 }
 
+/// Slice B (Route A): a frame slot proven Number at loop entry whose only
+/// in-loop reference is a single arithmetic `BinStoreReg`. The JIT keeps it in
+/// an f64 register across the loop and flushes it to the frame at the loop
+/// exit. See `.notes/perf.md` ("loop-carried Number slots").
+struct NumSlotPlan {
+    slot: usize,
+    /// The `FastLoopBind` that seeds the register from the frame.
+    bind_step: usize,
+    /// The loop's exit step (`FastLoopHead::after`) — the merge of the normal
+    /// exit, the zero-iteration initial test, and every `break`.
+    flush_step: usize,
+}
+
+/// Plan the JIT-only loop-carried Number specialization (slice B, Route A).
+/// `None` when no canonical accumulator loop qualifies; the body then compiles
+/// exactly as before.
+fn plan_num_slot(body: &CompiledBody, has_try: bool, has_suspension: bool) -> Option<NumSlotPlan> {
+    // A throw or suspension escaping the loop would skip the flush, and a
+    // suspension would not carry the register across the resume.
+    if has_try || has_suspension {
+        return None;
+    }
+    let steps = &body.steps;
+    for (head, step) in steps.iter().enumerate() {
+        let Step::FastLoopHead {
+            var: FastLoopVar::Counter,
+            body_start,
+            after,
+            ..
+        } = step
+        else {
+            continue;
+        };
+        // v1: the loop body is exactly one register run.
+        if head != body_start + 1 {
+            continue;
+        }
+        let Step::RunRegBody { ops } = &steps[*body_start] else {
+            continue;
+        };
+        // Exactly one arithmetic slot RMW, and no other op touching that slot
+        // (the frame slot is stale while the loop runs).
+        let mut candidate: Option<(usize, usize)> = None;
+        for (op_index, op) in ops.iter().enumerate() {
+            if let LeafOp::BinStoreReg { op, slot } = op
+                && matches!(inline_binary(*op), Some(InlineBin::Arith(_)))
+            {
+                if candidate.is_some() {
+                    candidate = None;
+                    break;
+                }
+                candidate = Some((op_index, *slot));
+            }
+        }
+        let Some((rmw_index, slot)) = candidate else {
+            continue;
+        };
+        if ops
+            .iter()
+            .enumerate()
+            .any(|(op_index, op)| op_index != rmw_index && leaf_op_touches_slot(op, slot))
+        {
+            continue;
+        }
+        // The RMW's incoming accumulator must be a Number: the lowering
+        // bitcasts it to f64 without a check.
+        if !run_acc_is_number(ops, rmw_index) {
+            continue;
+        }
+        // Entry proof: the slot's last write before the loop is a straight-line
+        // `Push(Number(_))` + store, and the prefix cannot skip or re-enter it.
+        let Some(write) = (0..*body_start)
+            .rev()
+            .find(|&i| step_writes_slot(&steps[i], slot))
+        else {
+            continue;
+        };
+        if write == 0
+            || !matches!(&steps[write - 1], Step::Push(value) if value.is_number())
+            || !matches!(
+                &steps[write],
+                Step::InitLocal { slot: s }
+                    | Step::StoreLocal { slot: s }
+                    | Step::FusedStoreLocal { slot: s } if *s == slot
+            )
+        {
+            continue;
+        }
+        if (0..*body_start).any(|i| prefix_escapes(steps, i, *body_start)) {
+            continue;
+        }
+        let Some(bind_step) = (0..*body_start)
+            .rev()
+            .find(|&i| matches!(&steps[i], Step::FastLoopBind { .. }))
+        else {
+            continue;
+        };
+        return Some(NumSlotPlan {
+            slot,
+            bind_step,
+            flush_step: *after,
+        });
+    }
+    None
+}
+
+/// Whether a step can leave the straight-line prefix before the loop (a jump
+/// backward or into the prefix, an unconditional `Jump`, or a control exit) —
+/// any of these would invalidate "the entry init executes exactly once".
+fn prefix_escapes(steps: &[Step], index: usize, body_start: usize) -> bool {
+    let step = &steps[index];
+    if step_targets(step).iter().any(|target| *target < body_start) {
+        return true;
+    }
+    matches!(
+        step,
+        Step::Jump(_)
+            | Step::Return
+            | Step::Throw
+            | Step::Break { .. }
+            | Step::Continue { .. }
+            | Step::FastLoopHead { .. }
+            | Step::TailCallSelf { .. }
+            | Step::TailCallSelfCheck { .. }
+            | Step::TailCallSelfVector
+            | Step::TailCallSelfCheckVector
+    )
+}
+
+/// Whether the step writes the frame slot (conservatively: the wholesale
+/// destructuring binds can write any slot).
+fn step_writes_slot(step: &Step, slot: usize) -> bool {
+    match step {
+        Step::InitLocal { slot: s }
+        | Step::StoreLocal { slot: s }
+        | Step::FusedStoreLocal { slot: s }
+        | Step::UpdateLocal { slot: s, .. }
+        | Step::Inc { slot: s }
+        | Step::Dec { slot: s }
+        | Step::CreateArguments { slot: s, .. }
+        | Step::ForOfNextBindLocal { slot: s, .. }
+        | Step::ForOfBindLocal { slot: s } => *s == slot,
+        Step::Destructure { .. } | Step::DeclInit { .. } => true,
+        _ => false,
+    }
+}
+
+/// Whether a register op reads or writes the frame slot.
+fn leaf_op_touches_slot(op: &LeafOp, slot: usize) -> bool {
+    let operand = |operand: &RegOperand| match operand {
+        RegOperand::Reg { slot: s, .. } | RegOperand::PostInc { slot: s, .. } => *s == slot,
+        _ => false,
+    };
+    match op {
+        LeafOp::LoadReg { slot: s, .. }
+        | LeafOp::BinReg { slot: s, .. }
+        | LeafOp::StoreReg { slot: s, .. }
+        | LeafOp::BinLeftReg { slot: s, .. }
+        | LeafOp::BinStoreReg { slot: s, .. }
+        | LeafOp::UpdateReg { slot: s, .. }
+        | LeafOp::BinImmLocal { slot: s, .. }
+        | LeafOp::BinCtxReg { slot: s, .. }
+        | LeafOp::StoreMemberNameLocal { object_slot: s, .. }
+        | LeafOp::GetMemberNameLocal { object_slot: s, .. } => *s == slot,
+        LeafOp::StoreMemberComputedLocal { object_slot, key } => {
+            *object_slot == slot || operand(key)
+        }
+        LeafOp::CompoundMemberComputedLocal {
+            object_slot,
+            key,
+            rhs,
+            ..
+        } => *object_slot == slot || operand(key) || operand(rhs),
+        LeafOp::UpdateMemberComputedLocal {
+            object_slot, key, ..
+        } => *object_slot == slot || operand(key),
+        LeafOp::GetMemberComputedLocal {
+            object_slot, key, ..
+        } => *object_slot == slot || operand(key),
+        LeafOp::StoreMemberName { value, .. } => operand(value),
+        LeafOp::StoreMemberComputed { key, value } => operand(key) || operand(value),
+        LeafOp::GetMemberComputed { key } => operand(key),
+        _ => false,
+    }
+}
+
+/// Whether the accumulator provably holds a Number just before `ops[upto]`,
+/// mirroring the register executor's own value semantics (slice A's
+/// `acc_is_number`). Conservative: an op it cannot account for loses the proof.
+fn run_acc_is_number(ops: &[LeafOp], upto: usize) -> bool {
+    let mut known = false;
+    for op in &ops[..upto] {
+        known = match op {
+            LeafOp::LoadCounter => true,
+            LeafOp::LoadConst(value) => value.is_number(),
+            LeafOp::BinImm { op, .. } => {
+                known && matches!(inline_binary(*op), Some(InlineBin::Arith(_)))
+            }
+            LeafOp::BinConst { op, value } => {
+                known
+                    && value.is_number()
+                    && matches!(inline_binary(*op), Some(InlineBin::Arith(_)))
+            }
+            LeafOp::UpdateAcc { .. } => known,
+            LeafOp::LoadReg { .. }
+            | LeafOp::LoadContext { .. }
+            | LeafOp::LoadPerIter { .. }
+            | LeafOp::BinReg { .. }
+            | LeafOp::BinContext { .. }
+            | LeafOp::BinPerIter { .. }
+            | LeafOp::BinCtxReg { .. }
+            | LeafOp::BinImmLocal { .. }
+            | LeafOp::BinAccPop { .. }
+            | LeafOp::BinLeftReg { .. }
+            | LeafOp::BinStoreReg { .. }
+            | LeafOp::GetMemberName { .. }
+            | LeafOp::GetMemberComputed { .. }
+            | LeafOp::GetMemberNameLocal { .. }
+            | LeafOp::GetMemberComputedLocal { .. } => false,
+            _ => known,
+        };
+    }
+    known
+}
+
+struct NumSlot {
+    slot: usize,
+    var: Variable,
+}
+
 struct Lowerer<'a> {
     builder: FunctionBuilder<'a>,
     helpers: &'a JitHelpers,
@@ -622,6 +861,10 @@ struct Lowerer<'a> {
     /// Blocks that receive a jump from a LATER step (back edges) — sealed at
     /// the end by `seal_all_blocks`, not at visit time.
     back_targets: HashSet<usize>,
+    /// Cut 91 (slice C): loop-body blocks whose only back edge is a
+    /// `FastLoopHead` — the head's own block polls the safepoint every
+    /// iteration, so these skip the duplicate probe.
+    probe_suppressed: HashSet<usize>,
     frame_var: Variable,
     sp_var: Variable,
     /// Cut 70: one variable per handler, holding the working-sp at the
@@ -723,6 +966,25 @@ struct Lowerer<'a> {
     /// (the interpreter truncates before propagating; a catch block reads
     /// the sp at the `RunRegBody` step).
     error_sp: Option<ClifValue>,
+    /// Slice A of the type-specialized loop lowering: whether `acc_var` holds
+    /// a canonical `Value::Number` by construction. Tracked across a
+    /// `RunRegBody`'s straight-line op stream (reset at its entry, updated by
+    /// every accumulator write) so a numeric register op can drop the operand
+    /// tag checks whose outcome the compiler already knows (the `i * 2` of a
+    /// numeric reduction). Only meaningful inside a register run — `emit_step`
+    /// resets it per step.
+    acc_is_number: bool,
+    /// Slice C: the accumulator's live numeric form when `acc_is_number` — the
+    /// `Value`-bits form in `acc_var` is then stale until `acc_bits()`
+    /// materializes it. When `!acc_is_number`, `acc_var` is authoritative.
+    acc_num_var: Variable,
+    acc_bits_valid: bool,
+    /// Slice B (Route A): the loop-carried Number slots kept in f64 registers
+    /// (at most one under v1), seeded at `num_slot_bind` from the frame and
+    /// flushed to the frame at `num_slot_flush`.
+    num_slots: Vec<NumSlot>,
+    num_slot_bind: Option<usize>,
+    num_slot_flush: Option<usize>,
     // NaN-boxing bit patterns (see `crux::value`).
     /// The `(vm, callee, this, argc, args, direct_eval) -> value` signature
     /// of the tail-call helper (Cut 45).
@@ -767,6 +1029,7 @@ impl<'a> Lowerer<'a> {
         let vm_var = builder.declare_var(types::I64);
         let counter_var = builder.declare_var(types::F64);
         let acc_var = builder.declare_var(types::I64);
+        let acc_num_var = builder.declare_var(types::F64);
         let sig_binary = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_rel = builder.import_signature(helper_sig(&[types::I64; 4], conv));
         let sig_update = builder.import_signature(helper_sig(&[types::I64; 3], conv));
@@ -822,6 +1085,17 @@ impl<'a> Lowerer<'a> {
             .steps
             .iter()
             .any(|step| matches!(step, Step::Yield { .. } | Step::Await));
+        // Slice B (Route A): the JIT-only loop-carried Number slot.
+        let num_slot_plan = plan_num_slot(body, has_try, has_suspension);
+        let num_slots: Vec<NumSlot> = num_slot_plan
+            .iter()
+            .map(|plan| NumSlot {
+                slot: plan.slot,
+                var: builder.declare_var(types::F64),
+            })
+            .collect();
+        let num_slot_bind = num_slot_plan.as_ref().map(|plan| plan.bind_step);
+        let num_slot_flush = num_slot_plan.as_ref().map(|plan| plan.flush_step);
         let mut suspension_targets = Vec::new();
         for (index, step) in body.steps.iter().enumerate() {
             if matches!(step, Step::Yield { .. } | Step::Await) {
@@ -856,6 +1130,7 @@ impl<'a> Lowerer<'a> {
             scope: body.scope.as_ref(),
             blocks: Vec::new(),
             back_targets: HashSet::new(),
+            probe_suppressed: HashSet::new(),
             reentry_block: None,
             frame_var,
             sp_var,
@@ -865,6 +1140,7 @@ impl<'a> Lowerer<'a> {
             vm_var,
             counter_var,
             acc_var,
+            acc_num_var,
             sig_binary,
             sig_rel,
             sig_update,
@@ -892,6 +1168,11 @@ impl<'a> Lowerer<'a> {
             dispatch_targets,
             current_step: 0,
             error_sp: None,
+            acc_is_number: false,
+            acc_bits_valid: true,
+            num_slots,
+            num_slot_bind,
+            num_slot_flush,
             undef_bits: Value::Undefined.bits() as i64,
             null_bits: Value::Null.bits() as i64,
             false_bits: Value::Boolean(false).bits() as i64,
@@ -963,15 +1244,47 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// `cond_jump` for an already-I8 condition (an `fcmp`/`icmp` result) — no
+    /// normalization needed, unlike the wide 0/1 forms `cond_jump` accepts.
+    fn cond_jump_i8(&mut self, cond: ClifValue, jump_when: bool, target_block: Block, next: usize) {
+        let next_block = self.ensure_block(next);
+        if jump_when {
+            self.builder
+                .ins()
+                .brif(cond, target_block, &[], next_block, &[]);
+        } else {
+            self.builder
+                .ins()
+                .brif(cond, next_block, &[], target_block, &[]);
+        }
+    }
+
     fn emit_all(&mut self, body: &CompiledBody) -> Result<(), Unsupported> {
         let n = body.steps.len();
         self.blocks = vec![None; n + 1];
         self.back_targets.clear();
+        self.probe_suppressed.clear();
+        let mut head_body_starts = HashSet::new();
+        let mut back_edge_count: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for (index, step) in body.steps.iter().enumerate() {
+            if let Step::FastLoopHead { body_start, .. } = step {
+                head_body_starts.insert(*body_start);
+            }
             for target in step_targets(step) {
                 if target < index {
+                    *back_edge_count.entry(target).or_default() += 1;
                     self.back_targets.insert(target);
                 }
+            }
+        }
+        // Slice C: a `FastLoopHead`'s own block polls the safepoint every
+        // iteration, so its body-start block (when the head is its SOLE back
+        // edge) does not need a second poll — the certified accumulator loop
+        // would otherwise carry two probes per iteration.
+        for body_start in head_body_starts {
+            if back_edge_count.get(&body_start) == Some(&1) {
+                self.probe_suppressed.insert(body_start);
             }
         }
         // Cut 55: the control-transfer dispatch can jump to ANY dispatch
@@ -3535,6 +3848,14 @@ impl<'a> Lowerer<'a> {
         // interpreter's ip for this step (the loop-top increment means a
         // step's error/transfer is attributed to `index + 1`).
         self.current_step = index;
+        // A step boundary drops the register-op accumulator provenance; only a
+        // `RunRegBody` (which re-seeds the accumulator) re-establishes it.
+        self.acc_is_number = false;
+        // Slice B (Route A): the loop's exit block flushes the loop-carried
+        // Number registers to the frame before any later step reads the slot.
+        if self.num_slot_flush == Some(index) {
+            self.flush_num_slots();
+        }
         // Cut 70: a catch/finally entry step resumes at the handler's
         // try-entry sp (saved at `EnterTry`). A helper error inside the try
         // leaves the erroring step's operands on the working stack — the
@@ -3558,7 +3879,9 @@ impl<'a> Lowerer<'a> {
         // `JIT_GC_PROBE_INTERVAL` iterations (the interpreter checks the
         // same budget at every loop back edge; compiled code cannot read the
         // crux TLS counter from machine code, so it polls instead).
-        if matches!(step, Step::FastLoopHead { .. }) || self.back_targets.contains(&index) {
+        if (matches!(step, Step::FastLoopHead { .. }) || self.back_targets.contains(&index))
+            && !self.probe_suppressed.contains(&index)
+        {
             self.emit_gc_probe()?;
         }
         match step {
@@ -3883,6 +4206,9 @@ impl<'a> Lowerer<'a> {
             }
             Step::FastLoopBind { var } => {
                 self.emit_fast_loop_bind(*var)?;
+                if self.num_slot_bind == Some(index) {
+                    self.seed_num_slots();
+                }
                 self.fall_through(index);
             }
             Step::FastLoopStore { var } => {
@@ -3899,8 +4225,7 @@ impl<'a> Lowerer<'a> {
             } => self.emit_fast_loop_head(*var, *op, *limit, *inc, *body_start, *after)?,
             Step::RunRegBody { ops } => {
                 let entry_sp = self.builder.use_var(self.sp_var);
-                let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
-                self.builder.def_var(self.acc_var, undef);
+                self.seed_acc_undefined();
                 let returns = matches!(ops.last(), Some(LeafOp::ReturnAcc));
                 // Cut 55: a helper error inside the run must truncate the
                 // transient stack use to the entry depth before the pending
@@ -6111,8 +6436,7 @@ impl<'a> Lowerer<'a> {
                         let cc = rel_cc(op)?;
                         let imm_num = self.builder.ins().f64const(imm);
                         let cmp = self.builder.ins().fcmp(cc, cur, imm_num);
-                        let test = self.bint(cmp);
-                        self.cond_jump(test, true, body_block, after);
+                        self.cond_jump_i8(cmp, true, body_block, after);
                         Ok(())
                     }
                     _ => {
@@ -6414,6 +6738,24 @@ impl<'a> Lowerer<'a> {
         lhs: ClifValue,
         rhs: ClifValue,
     ) -> Result<ClifValue, Unsupported> {
+        self.emit_binary_known(op, lhs, rhs, false, false)
+    }
+
+    /// `emit_binary` with compile-time knowledge that an operand is already a
+    /// canonical `Value::Number` (the register executor's accumulator
+    /// provenance, or a Number constant). A known operand's tag check is
+    /// dropped, and when BOTH operands are known the fast result is returned
+    /// with no slow block and no branch — the `i * 2` of a numeric reduction
+    /// lowers to a bare `fmul`. Sound because a canonical Number bit-casts to
+    /// its f64 and can never take the slow path.
+    fn emit_binary_known(
+        &mut self,
+        op: BinaryOp,
+        lhs: ClifValue,
+        rhs: ClifValue,
+        lhs_known: bool,
+        rhs_known: bool,
+    ) -> Result<ClifValue, Unsupported> {
         let Some(inline) = inline_binary(op) else {
             let op_imm = self.builder.ins().iconst(types::I64, op as i64);
             return self.call_slow(self.sig_binary, Helper::BinarySlow, &[op_imm, lhs, rhs]);
@@ -6447,8 +6789,19 @@ impl<'a> Lowerer<'a> {
                 self.builder.ins().select(c, t, f)
             }
         };
-        let lhs_dbl = self.is_double(lhs);
-        let rhs_dbl = self.is_double(rhs);
+        if lhs_known && rhs_known {
+            return Ok(fast);
+        }
+        let lhs_dbl = if lhs_known {
+            self.builder.ins().iconst(types::I8, 1)
+        } else {
+            self.is_double(lhs)
+        };
+        let rhs_dbl = if rhs_known {
+            self.builder.ins().iconst(types::I8, 1)
+        } else {
+            self.is_double(rhs)
+        };
         let both = self.builder.ins().band(lhs_dbl, rhs_dbl);
         let res_var = self.builder.declare_var(types::I64);
         self.builder.def_var(res_var, fast);
@@ -6485,7 +6838,220 @@ impl<'a> Lowerer<'a> {
         Ok(self.builder.use_var(res_var))
     }
 
+    /// Seed the accumulator's scratch state at a run/body entry: `undefined`
+    /// bits, the deferred numeric register, and the provenance flags.
+    fn seed_acc_undefined(&mut self) {
+        let undef = self.builder.ins().iconst(types::I64, self.undef_bits);
+        self.builder.def_var(self.acc_var, undef);
+        let zero = self.builder.ins().f64const(0.0);
+        self.builder.def_var(self.acc_num_var, zero);
+        self.acc_is_number = false;
+        self.acc_bits_valid = true;
+    }
+
+    /// Record that the accumulator now holds the f64 `num` (a known Number).
+    /// The `Value`-bits form is deferred until a consumer needs it.
+    fn set_acc_num(&mut self, num: ClifValue) {
+        self.builder.def_var(self.acc_num_var, num);
+        self.acc_is_number = true;
+        self.acc_bits_valid = false;
+    }
+
+    /// Record that the accumulator now holds the arbitrary `Value` `bits`.
+    fn set_acc_bits(&mut self, bits: ClifValue) {
+        self.builder.def_var(self.acc_var, bits);
+        self.acc_is_number = false;
+        self.acc_bits_valid = true;
+    }
+
+    /// The accumulator as `Value` bits, materializing the canonical form when
+    /// the numeric representation is the live one (slice C).
+    fn acc_bits(&mut self) -> ClifValue {
+        if self.acc_is_number && !self.acc_bits_valid {
+            let num = self.builder.use_var(self.acc_num_var);
+            let bits = self
+                .builder
+                .ins()
+                .bitcast(types::I64, MemFlagsData::new(), num);
+            let value = self.canon(bits);
+            self.builder.def_var(self.acc_var, value);
+            self.acc_bits_valid = true;
+        }
+        self.builder.use_var(self.acc_var)
+    }
+
+    /// The accumulator as an f64: the live numeric register when it is a known
+    /// Number, else the bitcast of the `Value` bits (already canonical).
+    fn acc_f64(&mut self) -> ClifValue {
+        if self.acc_is_number {
+            self.builder.use_var(self.acc_num_var)
+        } else {
+            let bits = self.builder.use_var(self.acc_var);
+            self.builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), bits)
+        }
+    }
+
+    /// The accumulator's binary-operand form: the live numeric register when
+    /// it is a known Number (bits deferred), else the ready `Value` bits.
+    fn acc_form(&mut self) -> BinForm {
+        if self.acc_is_number {
+            BinForm::Num(self.builder.use_var(self.acc_num_var))
+        } else {
+            BinForm::Bits(self.builder.use_var(self.acc_var))
+        }
+    }
+
+    fn bin_form_bits(&mut self, form: BinForm) -> ClifValue {
+        match form {
+            BinForm::Bits(bits) => bits,
+            BinForm::Num(num) => {
+                let bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), num);
+                self.canon(bits)
+            }
+        }
+    }
+
+    fn bin_form_num(&mut self, form: BinForm) -> ClifValue {
+        match form {
+            BinForm::Bits(bits) => {
+                self.builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), bits)
+            }
+            BinForm::Num(num) => num,
+        }
+    }
+
+    /// The bare float op for the `InlineBin::Arith` shapes.
+    fn emit_arith(
+        &mut self,
+        op: BinaryOp,
+        lhs: ClifValue,
+        rhs: ClifValue,
+    ) -> Result<ClifValue, Unsupported> {
+        let res = match inline_binary(op) {
+            Some(InlineBin::Arith(ArithOp::Add)) => self.builder.ins().fadd(lhs, rhs),
+            Some(InlineBin::Arith(ArithOp::Sub)) => self.builder.ins().fsub(lhs, rhs),
+            Some(InlineBin::Arith(ArithOp::Mul)) => self.builder.ins().fmul(lhs, rhs),
+            Some(InlineBin::Arith(ArithOp::Div)) => self.builder.ins().fdiv(lhs, rhs),
+            _ => return Err(Unsupported::Step("non-arith binary")),
+        };
+        Ok(res)
+    }
+
+    /// A binary update of the accumulator where the operand knownness is known
+    /// at compile time (slice C). With BOTH operands known and an arithmetic
+    /// op the whole thing stays in the f64 domain — the `Value`-bits form is
+    /// deferred and no tag check, canonicalization, or branch is emitted. A
+    /// comparison of two known Numbers yields a Boolean; anything else falls
+    /// back to `emit_binary_known` (materializing the deferred operand first).
+    fn emit_acc_binary(
+        &mut self,
+        op: BinaryOp,
+        lhs: BinForm,
+        rhs: BinForm,
+        lhs_known: bool,
+        rhs_known: bool,
+    ) -> Result<(), Unsupported> {
+        if lhs_known && rhs_known {
+            match inline_binary(op) {
+                Some(InlineBin::Arith(_)) => {
+                    let l = self.bin_form_num(lhs);
+                    let r = self.bin_form_num(rhs);
+                    let res = self.emit_arith(op, l, r)?;
+                    self.set_acc_num(res);
+                }
+                Some(InlineBin::Cmp(cc)) => {
+                    let l = self.bin_form_num(lhs);
+                    let r = self.bin_form_num(rhs);
+                    let c = self.builder.ins().fcmp(cc, l, r);
+                    let t = self.builder.ins().iconst(types::I64, self.true_bits);
+                    let f = self.builder.ins().iconst(types::I64, self.false_bits);
+                    let value = self.builder.ins().select(c, t, f);
+                    self.set_acc_bits(value);
+                }
+                None => {
+                    let l = self.bin_form_bits(lhs);
+                    let r = self.bin_form_bits(rhs);
+                    let op_imm = self.builder.ins().iconst(types::I64, op as i64);
+                    let res =
+                        self.call_slow(self.sig_binary, Helper::BinarySlow, &[op_imm, l, r])?;
+                    self.set_acc_bits(res);
+                }
+            }
+            return Ok(());
+        }
+        let l = self.bin_form_bits(lhs);
+        let r = self.bin_form_bits(rhs);
+        let res = self.emit_binary_known(op, l, r, lhs_known, rhs_known)?;
+        // At least one operand was unknown, so an arithmetic result is not
+        // provably a Number.
+        self.set_acc_bits(res);
+        Ok(())
+    }
+
     // ----- register body (LeafOp) lowering -----
+
+    fn num_slot_var(&self, slot: usize) -> Option<Variable> {
+        self.num_slots
+            .iter()
+            .find(|num| num.slot == slot)
+            .map(|num| num.var)
+    }
+
+    /// Seed the loop-carried Number registers from the frame (the planner
+    /// proved the slots hold canonical Numbers here, so the bitcast is exact).
+    fn seed_num_slots(&mut self) {
+        let slots: Vec<(Variable, usize)> = self
+            .num_slots
+            .iter()
+            .map(|num| (num.var, num.slot))
+            .collect();
+        for (var, slot) in slots {
+            let bits = self.load_slot(slot);
+            let num = self
+                .builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), bits);
+            self.builder.def_var(var, num);
+        }
+    }
+
+    /// Flush the loop-carried Number registers back to the frame as canonical
+    /// `Value::Number`s.
+    fn flush_num_slots(&mut self) {
+        let slots: Vec<(Variable, usize)> = self
+            .num_slots
+            .iter()
+            .map(|num| (num.var, num.slot))
+            .collect();
+        for (var, slot) in slots {
+            let num = self.builder.use_var(var);
+            let bits = self
+                .builder
+                .ins()
+                .bitcast(types::I64, MemFlagsData::new(), num);
+            let value = self.canon(bits);
+            self.store_slot(slot, value);
+        }
+    }
+
+    /// Slice B (Route A): `var = var fop acc`, the result re-canonicalized into
+    /// the accumulator. Both operands are proven Numbers, so no tag check and
+    /// no slow path are emitted.
+    fn emit_num_slot_rmw(&mut self, op: BinaryOp, var: Variable) -> Result<(), Unsupported> {
+        let left = self.builder.use_var(var);
+        let right = self.acc_f64();
+        let res = self.emit_arith(op, left, right)?;
+        self.builder.def_var(var, res);
+        self.set_acc_num(res);
+        Ok(())
+    }
 
     fn emit_leaf_op(
         &mut self,
@@ -6499,7 +7065,7 @@ impl<'a> Lowerer<'a> {
                 if *tdz {
                     self.emit_tdz_check(bits)?;
                 }
-                self.builder.def_var(self.acc_var, bits);
+                self.set_acc_bits(bits);
             }
             LeafOp::LoadContext { index } => {
                 // Depth-0 capture-context read through the slow path.
@@ -6507,7 +7073,7 @@ impl<'a> Lowerer<'a> {
                 let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
                 let res =
                     self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])?;
-                self.builder.def_var(self.acc_var, res);
+                self.set_acc_bits(res);
             }
             LeafOp::LoadPerIter { index } => {
                 // Depth-0 per-iteration read through the slow path (the
@@ -6516,24 +7082,33 @@ impl<'a> Lowerer<'a> {
                 let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
                 let res =
                     self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])?;
-                self.builder.def_var(self.acc_var, res);
+                self.set_acc_bits(res);
             }
             LeafOp::LoadCounter => {
-                let bits = self.counter_bits();
-                self.builder.def_var(self.acc_var, bits);
+                // Slice C: the counter already IS an f64 — no `Value`
+                // canonicalization until a consumer needs the bits.
+                let num = self.builder.use_var(self.counter_var);
+                self.set_acc_num(num);
             }
             LeafOp::LoadConst(value) => {
-                let bits = self.const_bits(value, step, op_index, 0)?;
-                self.builder.def_var(self.acc_var, bits);
+                if let Some(n) = value.as_number() {
+                    let num = self.builder.ins().f64const(n);
+                    self.set_acc_num(num);
+                } else {
+                    let bits = self.const_bits(value, step, op_index, 0)?;
+                    self.set_acc_bits(bits);
+                }
             }
             LeafOp::BinReg { op, slot, tdz } => {
                 let right = self.load_slot(*slot);
                 if *tdz {
                     self.emit_tdz_check(right)?;
                 }
-                let left = self.builder.use_var(self.acc_var);
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
+                let left_known = self.acc_is_number;
+                let left = self.acc_form();
+                // The right operand is a frame slot, whose type is unknown
+                // until the loop-carried analysis (slice B).
+                self.emit_acc_binary(*op, left, BinForm::Bits(right), left_known, false)?;
             }
             LeafOp::BinContext { op, index } => {
                 // `acc = acc op context[index]` (the fused `LoadContext` +
@@ -6542,9 +7117,9 @@ impl<'a> Lowerer<'a> {
                 let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
                 let right =
                     self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])?;
-                let left = self.builder.use_var(self.acc_var);
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
+                let left_known = self.acc_is_number;
+                let left = self.acc_form();
+                self.emit_acc_binary(*op, left, BinForm::Bits(right), left_known, false)?;
             }
             LeafOp::BinPerIter { op, index } => {
                 // `acc = acc op per-iteration[index]` (depth 0).
@@ -6552,9 +7127,9 @@ impl<'a> Lowerer<'a> {
                 let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
                 let right =
                     self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])?;
-                let left = self.builder.use_var(self.acc_var);
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
+                let left_known = self.acc_is_number;
+                let left = self.acc_form();
+                self.emit_acc_binary(*op, left, BinForm::Bits(right), left_known, false)?;
             }
             LeafOp::BinCtxReg {
                 op,
@@ -6572,73 +7147,86 @@ impl<'a> Lowerer<'a> {
                 if *tdz {
                     self.emit_tdz_check(right)?;
                 }
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
+                self.emit_acc_binary(*op, BinForm::Bits(left), BinForm::Bits(right), false, false)?;
             }
             LeafOp::BinImm { op, imm } => {
-                let left = self.builder.use_var(self.acc_var);
-                let right = self.const_value(&Value::Number(*imm))?;
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
+                let left_known = self.acc_is_number;
+                let left = self.acc_form();
+                let right = BinForm::Num(self.builder.ins().f64const(*imm));
+                self.emit_acc_binary(*op, left, right, left_known, true)?;
             }
             LeafOp::BinConst { op, value } => {
-                let left = self.builder.use_var(self.acc_var);
-                let right = self.const_bits(value, step, op_index, 0)?;
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
+                let left_known = self.acc_is_number;
+                let left = self.acc_form();
+                let (right, right_known) = if let Some(n) = value.as_number() {
+                    (BinForm::Num(self.builder.ins().f64const(n)), true)
+                } else {
+                    (
+                        BinForm::Bits(self.const_bits(value, step, op_index, 0)?),
+                        false,
+                    )
+                };
+                self.emit_acc_binary(*op, left, right, left_known, right_known)?;
             }
             LeafOp::BinImmLocal { op, slot, tdz, imm } => {
                 let left = self.load_slot(*slot);
                 if *tdz {
                     self.emit_tdz_check(left)?;
                 }
-                let right = self.const_value(&Value::Number(*imm))?;
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
+                let right = BinForm::Num(self.builder.ins().f64const(*imm));
+                self.emit_acc_binary(*op, BinForm::Bits(left), right, false, true)?;
             }
             LeafOp::BinAccPop { op } => {
                 let left = self.pop();
-                let right = self.builder.use_var(self.acc_var);
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
+                let right_known = self.acc_is_number;
+                let right = self.acc_form();
+                self.emit_acc_binary(*op, BinForm::Bits(left), right, false, right_known)?;
             }
             LeafOp::UpdateAcc { op } => {
                 // acc = ToNumeric(acc) ± 1 (`o.x++`'s update half): the
                 // number case is the inline f64 add (mirrors `emit_update`),
-                // anything else falls to the general `UpdateValueSlow`.
-                let old = self.builder.use_var(self.acc_var);
-                let is_num = self.is_double(old);
-                let num = self
-                    .builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), old);
+                // anything else falls to the general `UpdateValueSlow`. A
+                // Number input always yields a Number.
                 let delta = if matches!(op, syntax::ast::UpdateOp::Increment) {
                     1.0
                 } else {
                     -1.0
                 };
-                let delta_c = self.builder.ins().f64const(delta);
-                let new_num = self.builder.ins().fadd(num, delta_c);
-                let new_bits = self
-                    .builder
-                    .ins()
-                    .bitcast(types::I64, MemFlagsData::new(), new_num);
-                let new_fast = self.canon(new_bits);
-                let new_var = self.builder.declare_var(types::I64);
-                self.builder.def_var(new_var, new_fast);
-                let merge = self.builder.create_block();
-                let slow = self.builder.create_block();
-                self.builder.ins().brif(is_num, merge, &[], slow, &[]);
-                self.builder.switch_to_block(slow);
-                let inc_imm = self.builder.ins().iconst(types::I64, *op as i64);
-                let new_slow =
-                    self.call_slow(self.sig_update, Helper::UpdateValueSlow, &[inc_imm, old])?;
-                self.builder.def_var(new_var, new_slow);
-                self.builder.ins().jump(merge, &[]);
-                self.builder.seal_block(merge);
-                self.builder.switch_to_block(merge);
-                let new_value = self.builder.use_var(new_var);
-                self.builder.def_var(self.acc_var, new_value);
+                if self.acc_is_number {
+                    let num = self.acc_f64();
+                    let delta_c = self.builder.ins().f64const(delta);
+                    let new_num = self.builder.ins().fadd(num, delta_c);
+                    self.set_acc_num(new_num);
+                } else {
+                    let old = self.builder.use_var(self.acc_var);
+                    let is_num = self.is_double(old);
+                    let num = self
+                        .builder
+                        .ins()
+                        .bitcast(types::F64, MemFlagsData::new(), old);
+                    let delta_c = self.builder.ins().f64const(delta);
+                    let new_num = self.builder.ins().fadd(num, delta_c);
+                    let new_bits =
+                        self.builder
+                            .ins()
+                            .bitcast(types::I64, MemFlagsData::new(), new_num);
+                    let new_fast = self.canon(new_bits);
+                    let new_var = self.builder.declare_var(types::I64);
+                    self.builder.def_var(new_var, new_fast);
+                    let merge = self.builder.create_block();
+                    let slow = self.builder.create_block();
+                    self.builder.ins().brif(is_num, merge, &[], slow, &[]);
+                    self.builder.switch_to_block(slow);
+                    let inc_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                    let new_slow =
+                        self.call_slow(self.sig_update, Helper::UpdateValueSlow, &[inc_imm, old])?;
+                    self.builder.def_var(new_var, new_slow);
+                    self.builder.ins().jump(merge, &[]);
+                    self.builder.seal_block(merge);
+                    self.builder.switch_to_block(merge);
+                    let new_value = self.builder.use_var(new_var);
+                    self.set_acc_bits(new_value);
+                }
             }
             LeafOp::UpdateReg { slot, tdz, op } => {
                 // frame[slot] = ToNumeric(frame[slot]) ± 1 (a
@@ -6685,33 +7273,42 @@ impl<'a> Lowerer<'a> {
             }
             LeafOp::BinLeftReg { op, slot } => {
                 let left = self.load_slot(*slot);
-                let right = self.builder.use_var(self.acc_var);
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
+                let right_known = self.acc_is_number;
+                let right = self.acc_form();
+                self.emit_acc_binary(*op, BinForm::Bits(left), right, false, right_known)?;
             }
             LeafOp::BinStoreReg { op, slot } => {
-                // The fused tail of a slot-left binary stored back into the
-                // SAME slot (`[BinLeftReg, StoreReg]`): combine the slot
-                // with the accumulator and write the result back, one op.
-                let left = self.load_slot(*slot);
-                let right = self.builder.use_var(self.acc_var);
-                let res = self.emit_binary(*op, left, right)?;
-                self.builder.def_var(self.acc_var, res);
-                self.store_slot(*slot, res);
+                if let Some(var) = self.num_slot_var(*slot) {
+                    // Slice B (Route A): the loop-carried Number slot lives in
+                    // an f64 register; the planner proved both operands Number.
+                    self.emit_num_slot_rmw(*op, var)?;
+                } else {
+                    // The fused tail of a slot-left binary stored back into the
+                    // SAME slot (`[BinLeftReg, StoreReg]`): combine the slot
+                    // with the accumulator and write the result back, one op.
+                    let left = self.load_slot(*slot);
+                    let right_known = self.acc_is_number;
+                    let right = self.acc_form();
+                    let l = self.bin_form_bits(BinForm::Bits(left));
+                    let r = self.bin_form_bits(right);
+                    let res = self.emit_binary_known(*op, l, r, false, right_known)?;
+                    self.store_slot(*slot, res);
+                    self.set_acc_bits(res);
+                }
             }
             LeafOp::StoreReg { slot, tdz } => {
                 if *tdz {
                     let current = self.load_slot(*slot);
                     self.emit_tdz_check(current)?;
                 }
-                let value = self.builder.use_var(self.acc_var);
+                let value = self.acc_bits();
                 self.store_slot(*slot, value);
             }
             LeafOp::StoreMemberName { name, value } => {
                 // The object is the accumulator, the value a register/const
                 // operand: the shared inline validated store (see
                 // `emit_validated_member_store`).
-                let object = self.builder.use_var(self.acc_var);
+                let object = self.acc_bits();
                 let value = self.leaf_operand(step, op_index, 1, value)?;
                 self.emit_validated_member_store(object, value, *name)?;
             }
@@ -6720,11 +7317,11 @@ impl<'a> Lowerer<'a> {
                 // value the accumulator: the shared inline validated store
                 // (see `emit_validated_member_store`).
                 let object = self.load_slot(*object_slot);
-                let value = self.builder.use_var(self.acc_var);
+                let value = self.acc_bits();
                 self.emit_validated_member_store(object, value, *name)?;
             }
             LeafOp::StoreMemberComputed { key, value } => {
-                let object = self.builder.use_var(self.acc_var);
+                let object = self.acc_bits();
                 let key = self.leaf_operand(step, op_index, 3, key)?;
                 let value = self.leaf_operand(step, op_index, 4, value)?;
                 self.emit_computed_store(object, key, value)?;
@@ -6735,7 +7332,7 @@ impl<'a> Lowerer<'a> {
                 // value the accumulator. Same gates as `StoreMemberComputed`.
                 let object = self.load_slot(*object_slot);
                 let key = self.leaf_operand(step, op_index, 5, key)?;
-                let value = self.builder.use_var(self.acc_var);
+                let value = self.acc_bits();
                 self.emit_computed_store(object, key, value)?;
             }
             LeafOp::CompoundMemberComputedLocal {
@@ -6775,16 +7372,16 @@ impl<'a> Lowerer<'a> {
                 )?;
             }
             LeafOp::GetMemberName { name } => {
-                let object = self.builder.use_var(self.acc_var);
+                let object = self.acc_bits();
                 let value = self.emit_member_cell_read(object, *name)?;
-                self.builder.def_var(self.acc_var, value);
+                self.set_acc_bits(value);
             }
             LeafOp::GetMemberComputed { key } => {
-                let object = self.builder.use_var(self.acc_var);
+                let object = self.acc_bits();
                 let key = self.leaf_operand(step, op_index, 2, key)?;
                 let res =
                     self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
-                self.builder.def_var(self.acc_var, res);
+                self.set_acc_bits(res);
             }
             LeafOp::GetMemberNameLocal {
                 object_slot,
@@ -6796,7 +7393,7 @@ impl<'a> Lowerer<'a> {
                     self.emit_tdz_check(object)?;
                 }
                 let value = self.emit_member_cell_read(object, *name)?;
-                self.builder.def_var(self.acc_var, value);
+                self.set_acc_bits(value);
             }
             LeafOp::GetMemberComputedLocal {
                 object_slot,
@@ -6810,17 +7407,17 @@ impl<'a> Lowerer<'a> {
                 let key = self.leaf_operand(step, op_index, 2, key)?;
                 let res =
                     self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
-                self.builder.def_var(self.acc_var, res);
+                self.set_acc_bits(res);
             }
             LeafOp::PushAcc => {
                 // The register executor pushes the accumulator (Cut 35 slice
                 // 10 spill) — NOT the loop counter (that is `Step::PushAcc`,
                 // which lowers to `LoadCounter` instead).
-                let bits = self.builder.use_var(self.acc_var);
+                let bits = self.acc_bits();
                 self.push(bits);
             }
             LeafOp::ReturnAcc => {
-                let value = self.builder.use_var(self.acc_var);
+                let value = self.acc_bits();
                 self.builder.ins().return_(&[value]);
             }
         }
