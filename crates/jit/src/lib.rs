@@ -2181,6 +2181,26 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_runs_an_empty_loop_body() {
+        // Cut 72 follow-up: an empty certified for-body must terminate in
+        // compiled code. The head's backward edge has to re-enter a DISTINCT
+        // body block; if `body_start` collapses onto the head's own step the
+        // compiled induction variable never advances and the body spins
+        // forever (the empty-block and empty-statement forms both).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) { for (var i = 0; i < n; i++) {} return 1; } \
+                     function g(n) { for (var i = 0; i < n; i++); return 2; } \
+                     f(100000) + g(100000);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(3.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_runs_a_string_literal_body() {
         // Cut 54: a body with string literals compiles — `s += 'x'` in a
         // loop (the concat rides the binary Add's `concat_strings` helper).

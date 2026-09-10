@@ -4303,6 +4303,44 @@ mod tests {
     }
 
     #[test]
+    fn empty_for_body_keeps_a_distinct_body_block() {
+        // An empty loop body must still leave the `FastLoopHead` a DISTINCT
+        // `body_start` step. If it collapses onto the head's own step, the
+        // head's backward edge targets its own block and the compiled
+        // self-loop never carries the induction variable's increment — the
+        // compiled body spins forever (the empty-body JIT hang). The
+        // compiler emits an explicit forward `Jump` to the continue label so
+        // the body is a real block; this structural assert fails fast where
+        // the behavioral one would hang on a regression.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f(n) { for (var i = 0; i < n; i++) {} return 1; }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        let head = ir
+            .steps
+            .iter()
+            .position(|step| matches!(step, crate::ir::Step::FastLoopHead { .. }))
+            .expect("the loop must fuse into a FastLoopHead");
+        let crate::ir::Step::FastLoopHead { body_start, .. } = &ir.steps[head] else {
+            unreachable!()
+        };
+        assert_ne!(
+            *body_start, head,
+            "an empty body must not collapse body_start onto the head"
+        );
+        assert!(
+            matches!(ir.steps.get(*body_start), Some(crate::ir::Step::Jump(_))),
+            "the empty body must be an explicit forward jump, got {:?}",
+            ir.steps.get(*body_start)
+        );
+        // The emitted body still terminates (interpreted here; the JIT e2e
+        // covers the compiled path).
+        assert_eq!(agent.run_script("f(100000)").unwrap(), Value::Number(1.0));
+    }
+
+    #[test]
     fn braced_fused_store_bodies_lower_to_register_runs() {
         // M7 slice 1a: a braced loop body whose last statement is a
         // self-balancing fused store (`{ n += 1; }` — the store pops its

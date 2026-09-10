@@ -15988,6 +15988,27 @@ impl Compiler {
         }
     }
 
+    /// Emit a `FastLoopHead` loop body, guaranteeing at least one step. An
+    /// EMPTY body would otherwise collapse the `body_start` label onto the
+    /// head's own step: the head branches to `body_start`, so the backward
+    /// edge would target the head's own block and the compiled self-loop
+    /// never carries the induction variable's increment back — it spins
+    /// forever (the empty-body JIT hang). A forward `Jump` to the continue
+    /// label keeps the body a distinct block; it costs the interpreter one
+    /// dispatch on a body that does nothing anyway.
+    fn compile_fast_loop_body(
+        &mut self,
+        body: &Stmt,
+        continue_label: usize,
+    ) -> Result<(), JsError> {
+        let before = self.steps.len();
+        self.compile_for_body(body)?;
+        if self.steps.len() == before {
+            self.jump(continue_label);
+        }
+        Ok(())
+    }
+
     fn compile_for(
         &mut self,
         init: Option<&ForInit>,
@@ -16284,7 +16305,7 @@ impl Compiler {
                         let saved = self.acc_binding.replace(name);
                         let body_steps = self.steps.len();
                         let body_fixups = self.fixups.len();
-                        self.compile_for_body(body)?;
+                        self.compile_fast_loop_body(body, continue_label)?;
                         // Cut 35 slice 9: a body that lowers to register ops
                         // runs on the register executor in one dispatch
                         // (`RunRegBody` saves/restores the accumulator
@@ -16326,7 +16347,7 @@ impl Compiler {
                     self.emit_fused_rel_test(op, loc, name, limit, end_label);
                     let body_start = self.new_label();
                     self.place(body_start);
-                    self.compile_for_body(body)?;
+                    self.compile_fast_loop_body(body, continue_label)?;
                     self.place(continue_label);
                     let index = self.steps.len();
                     self.emit(Step::FastLoopHead {
