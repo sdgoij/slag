@@ -1786,6 +1786,35 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_indirect_call_into_an_object_literal_body() {
+        // Cut 72: the compiled `ObjectFast` helper reads its `names` payload
+        // back from the RUNNING body (`string_literal_step_reads_body`), so a
+        // body containing one must not leaf-inline — an inlined `object_fast`
+        // read the CALLER's body and tripped its unreachable!. The indirect
+        // `f()` call site resolves to the one literal-plus-loop callee.
+        let source = "function make() {\n\
+\t                        var o = { a: 1, b: 2 };\n\
+\t                        var n = 0;\n\
+\t                        for (var i = 0; i < 2000; i++) { n += o.a + o.b; }\n\
+\t                        return n;\n\
+\t                      }\n\
+\t                      function via(f) { var r = 0; for (var k = 0; k < 3; k++) { r = f(); } return r; }\n\
+\t                      via(make);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "an indirect call into an object-literal body must match the interpreter"
+        );
+        assert_eq!(value.as_number(), Some(6000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_registered_builtin_calls_match_the_interpreter() {
         // Cut 79: a member call whose callee is an installed builtin
         // (Map.prototype.has/get/set — registered at `Intrinsics::define`)

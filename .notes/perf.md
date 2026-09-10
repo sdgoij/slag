@@ -8823,6 +8823,37 @@ Verification: clippy `--workspace --all-targets -D warnings` clean on the revert
 `git status` clean (no source delta). The scratch probes (`scratch/pureprobe.js`,
 `scratch/arithprobe.js`, `scratch/layout/`) were deleted.
 
+### PROBE (2026-09-10): `property read` is a LICM gap — node hoists the invariant `o.a`/`o.b`, we re-read them per iteration (~3.5ns each)
+
+Follow-up to the pure-loop probe, moving to the next row. Measured on the canonical harnesses (release, node v24.12.0):
+
+| engine | mode | `property read` |
+|---|---|---|
+| node | jit | 0.31ms |
+| slag | jit | 5.2ms (~17x) |
+| node | --jitless | 12.9ms |
+| slag | --jitless | 25-26ms (~2x) |
+
+The jitless gap is ~2x; the JIT gap is ~17x, so this is a JIT-codegen gap, not a read-path-machinery gap. Decomposition (`scratch/prop_decomp.js`, 1M iters, jit, indirect-call harness): `n += o.a + o.b` 7.6ms; `n += 3` 0.75ms; `n += a + b` with `a`/`b` source-hoisted to locals 2.5ms; `n += o.a` 4.1ms. So each member read costs ~3.5ns over a ~0.9ns local read, and the two reads are essentially the whole suite row. Node's 0.31ms is the same loop fully hoisted AND const-folded (`o.a + o.b` = 3 → `n += 3`) by Turbofan's LICM; our own const-add floor is 0.75ms (~2x node, the same relationship as the `arithmetic` row). Ceiling: hoisting the reads to hidden slots gives ~2.5ms (~2x); hoisting the invariant sum too gives ~0.75ms (~7x, at our arithmetic floor). The `JIT_DUMP_CLIF` dump confirms the per-iteration work is two ~33-instruction value-cell probes (receiver tag check + `(id^name)&15` cell probe + id/name/generation validation) over ~17 cycles/iter (~6.8 IPC — throughput-bound, so op-count micro-slices will not move it).
+
+DISPOSITION: this is the "general LICM of `o.a`/`g` reads" item the 2026-09-04 task list closed as "not worth; no bench row exercises most" — the `property read` and `global read` rows exercise exactly it, so that closure is wrong for these rows. Design (generalizes the landed M6 slice 2/3 typed-array-length hoist): a runtime-guarded once-per-loop hoist of invariant member reads in a pure `RunRegBody` — receiver is a frame-slot binding never written in the loop, the body has no calls and no member stores (no alias/grow), and the guard's single read must HIT the value-cell probe (an own/map-served data value; an accessor or a cold read misses and takes the general loop). The fast body's `GetMemberNameLocal` then loads the hidden slot. Not started (a bounded but multi-file IR slice: guard step + hidden hoist slot + fast/general loop copies + member-read redirect + the interpreter-shared step arm), pending direction.
+
+### FIXED (2026-09-10): the compiled `ObjectFast` misread the running body when leaf-inlined (unreachable panic)
+
+Found while probing `property read`. A certified function containing a whole-simple object literal reached through an INDIRECT call (`f()` to a frame-slot callee) aborted the process:
+
+```js
+function make() { var o = { a: 1, b: 2 }; var n = 0; for (var i = 0; i < 2000; i++) { n += o.a + o.b; } return n; }
+function via(f) { var r = 0; for (var k = 0; k < 3; k++) { r = f(); } return r; }
+via(make);   // panics: "object_fast on a non-ObjectFast step" (crates/runtime/src/jit.rs)
+```
+
+The shape also need not loop: a literal-plus-loop callee is what makes it leaf-eligible and hot enough to be reached indirectly; a direct call to the same function is fine (`scratch/pd5.js` is the minimal repro).
+
+Root cause: Cut 72's compiled `ObjectFast` helper reads its `names` payload back from the RUNNING body via `step_at(ctx, step)` (`JitCallContext::body`). `make` is leaf-eligible (`steps_are_leaf` allows fast-loop/register/member steps), so `via`'s `f()` site leaf-inlines it onto the CALLER's ctx — the inlined `object_fast` then reads `via`'s body at `make`'s step index and hits the `unreachable!`. `Step::ObjectFast` was missing from `string_literal_step_reads_body` (the Cut 54 predicate that keeps body-reading steps out of leaves, where `PushStr`/`ConcatStrConst` live); the Cut 72 note's "the helper defaults to disturbing leaf eligibility" referred to the unrelated epoch-bump mechanism, not `steps_are_leaf`. Fix: `Step::ObjectFast { .. } => true` in that predicate — a body with a literal now runs the general path with its own body/ctx.
+
+Verification: `scratch/pd5.js` panics before / returns 6000 after; a new regression test `jit::tests::installed_jit_indirect_call_into_an_object_literal_body` panics with the fix disabled (`Step::ObjectFast => false`) and passes with it; clippy `--workspace --all-targets -D warnings` clean; `cargo test --workspace` 4778 pass / 0 fail; six test262 sweeps at baseline (language 23721/0/3, annexB 1086/0/0, built-ins 23657/0/155, with the JIT and with `--jitless`, zero fail/crash/hang); `--jit-bench` all rows result-ok with `property read` ~5.2ms unchanged (no leaf-inline regression).
+
 ### FIXED (2026-09-10): the empty-body certified `for`-loop hang
 
 Root cause: in the two `FastLoopHead` loop paths, `compiler.compile_for` places `body_start`, compiles the body, then places `continue_label`. With no body statements those two labels collapse onto the same step — the head's own index. `emit_fast_loop_head` then resolves the backward-edge target via `ensure_block(body_start)`, which returns the head's own block, and the compiled self-loop re-enters the head without carrying the incremented counter variable, so the loop test never fails.

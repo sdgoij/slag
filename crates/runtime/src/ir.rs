@@ -20121,6 +20121,10 @@ fn string_literal_step_reads_body(step: &Step) -> bool {
     match step {
         Step::PushStr(_) | Step::ConcatStrConst(_) => true,
         Step::Push(value) => value_is_heap(value),
+        // Cut 72's fused literal create reads its `names` payload back from
+        // the running body. An inlined leaf's helper would see the caller's
+        // body and misread an unrelated step (unreachable panic).
+        Step::ObjectFast { .. } => true,
         Step::RunRegBody { ops } => ops.iter().any(leaf_op_has_heap_const),
         _ => false,
     }
