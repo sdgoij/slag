@@ -760,6 +760,7 @@ mod tests {
                 Step::InitLocal { slot: 1 },
                 Step::FastLoopBind {
                     var: runtime::ir::FastLoopVar::Slot(0),
+                    num: None,
                 },
                 Step::JumpIfLtImm {
                     slot: 0,
@@ -780,6 +781,7 @@ mod tests {
                 },
                 Step::FastLoopStore {
                     var: runtime::ir::FastLoopVar::Slot(0),
+                    num: None,
                 },
                 Step::NormalizeCompletion,
                 Step::LoadLocal { slot: 1 },
@@ -833,6 +835,7 @@ mod tests {
                 Step::InitLocal { slot: 0 },
                 Step::FastLoopBind {
                     var: runtime::ir::FastLoopVar::Slot(0),
+                    num: None,
                 },
                 Step::JumpIfLtImm {
                     slot: 0,
@@ -868,6 +871,7 @@ mod tests {
                 },
                 Step::FastLoopStore {
                     var: runtime::ir::FastLoopVar::Slot(0),
+                    num: None,
                 },
                 Step::NormalizeCompletion,
                 Step::LoadLocal { slot: 1 },

@@ -622,231 +622,6 @@ fn step_targets(step: &Step) -> Vec<usize> {
     }
 }
 
-/// Slice B (Route A): a frame slot proven Number at loop entry whose only
-/// in-loop reference is a single arithmetic `BinStoreReg`. The JIT keeps it in
-/// an f64 register across the loop and flushes it to the frame at the loop
-/// exit. See `.notes/perf.md` ("loop-carried Number slots").
-struct NumSlotPlan {
-    slot: usize,
-    /// The `FastLoopBind` that seeds the register from the frame.
-    bind_step: usize,
-    /// The loop's exit step (`FastLoopHead::after`) — the merge of the normal
-    /// exit, the zero-iteration initial test, and every `break`.
-    flush_step: usize,
-}
-
-/// Plan the JIT-only loop-carried Number specialization (slice B, Route A).
-/// `None` when no canonical accumulator loop qualifies; the body then compiles
-/// exactly as before.
-fn plan_num_slot(body: &CompiledBody, has_try: bool, has_suspension: bool) -> Option<NumSlotPlan> {
-    // A throw or suspension escaping the loop would skip the flush, and a
-    // suspension would not carry the register across the resume.
-    if has_try || has_suspension {
-        return None;
-    }
-    let steps = &body.steps;
-    for (head, step) in steps.iter().enumerate() {
-        let Step::FastLoopHead {
-            var: FastLoopVar::Counter,
-            body_start,
-            after,
-            ..
-        } = step
-        else {
-            continue;
-        };
-        // v1: the loop body is exactly one register run.
-        if head != body_start + 1 {
-            continue;
-        }
-        let Step::RunRegBody { ops } = &steps[*body_start] else {
-            continue;
-        };
-        // Exactly one arithmetic slot RMW, and no other op touching that slot
-        // (the frame slot is stale while the loop runs).
-        let mut candidate: Option<(usize, usize)> = None;
-        for (op_index, op) in ops.iter().enumerate() {
-            if let LeafOp::BinStoreReg { op, slot } = op
-                && matches!(inline_binary(*op), Some(InlineBin::Arith(_)))
-            {
-                if candidate.is_some() {
-                    candidate = None;
-                    break;
-                }
-                candidate = Some((op_index, *slot));
-            }
-        }
-        let Some((rmw_index, slot)) = candidate else {
-            continue;
-        };
-        if ops
-            .iter()
-            .enumerate()
-            .any(|(op_index, op)| op_index != rmw_index && leaf_op_touches_slot(op, slot))
-        {
-            continue;
-        }
-        // The RMW's incoming accumulator must be a Number: the lowering
-        // bitcasts it to f64 without a check.
-        if !run_acc_is_number(ops, rmw_index) {
-            continue;
-        }
-        // Entry proof: the slot's last write before the loop is a straight-line
-        // `Push(Number(_))` + store, and the prefix cannot skip or re-enter it.
-        let Some(write) = (0..*body_start)
-            .rev()
-            .find(|&i| step_writes_slot(&steps[i], slot))
-        else {
-            continue;
-        };
-        if write == 0
-            || !matches!(&steps[write - 1], Step::Push(value) if value.is_number())
-            || !matches!(
-                &steps[write],
-                Step::InitLocal { slot: s }
-                    | Step::StoreLocal { slot: s }
-                    | Step::FusedStoreLocal { slot: s } if *s == slot
-            )
-        {
-            continue;
-        }
-        if (0..*body_start).any(|i| prefix_escapes(steps, i, *body_start)) {
-            continue;
-        }
-        let Some(bind_step) = (0..*body_start)
-            .rev()
-            .find(|&i| matches!(&steps[i], Step::FastLoopBind { .. }))
-        else {
-            continue;
-        };
-        return Some(NumSlotPlan {
-            slot,
-            bind_step,
-            flush_step: *after,
-        });
-    }
-    None
-}
-
-/// Whether a step can leave the straight-line prefix before the loop (a jump
-/// backward or into the prefix, an unconditional `Jump`, or a control exit) —
-/// any of these would invalidate "the entry init executes exactly once".
-fn prefix_escapes(steps: &[Step], index: usize, body_start: usize) -> bool {
-    let step = &steps[index];
-    if step_targets(step).iter().any(|target| *target < body_start) {
-        return true;
-    }
-    matches!(
-        step,
-        Step::Jump(_)
-            | Step::Return
-            | Step::Throw
-            | Step::Break { .. }
-            | Step::Continue { .. }
-            | Step::FastLoopHead { .. }
-            | Step::TailCallSelf { .. }
-            | Step::TailCallSelfCheck { .. }
-            | Step::TailCallSelfVector
-            | Step::TailCallSelfCheckVector
-    )
-}
-
-/// Whether the step writes the frame slot (conservatively: the wholesale
-/// destructuring binds can write any slot).
-fn step_writes_slot(step: &Step, slot: usize) -> bool {
-    match step {
-        Step::InitLocal { slot: s }
-        | Step::StoreLocal { slot: s }
-        | Step::FusedStoreLocal { slot: s }
-        | Step::UpdateLocal { slot: s, .. }
-        | Step::Inc { slot: s }
-        | Step::Dec { slot: s }
-        | Step::CreateArguments { slot: s, .. }
-        | Step::ForOfNextBindLocal { slot: s, .. }
-        | Step::ForOfBindLocal { slot: s } => *s == slot,
-        Step::Destructure { .. } | Step::DeclInit { .. } => true,
-        _ => false,
-    }
-}
-
-/// Whether a register op reads or writes the frame slot.
-fn leaf_op_touches_slot(op: &LeafOp, slot: usize) -> bool {
-    let operand = |operand: &RegOperand| match operand {
-        RegOperand::Reg { slot: s, .. } | RegOperand::PostInc { slot: s, .. } => *s == slot,
-        _ => false,
-    };
-    match op {
-        LeafOp::LoadReg { slot: s, .. }
-        | LeafOp::BinReg { slot: s, .. }
-        | LeafOp::StoreReg { slot: s, .. }
-        | LeafOp::BinLeftReg { slot: s, .. }
-        | LeafOp::BinStoreReg { slot: s, .. }
-        | LeafOp::UpdateReg { slot: s, .. }
-        | LeafOp::BinImmLocal { slot: s, .. }
-        | LeafOp::BinCtxReg { slot: s, .. }
-        | LeafOp::StoreMemberNameLocal { object_slot: s, .. }
-        | LeafOp::GetMemberNameLocal { object_slot: s, .. } => *s == slot,
-        LeafOp::StoreMemberComputedLocal { object_slot, key } => {
-            *object_slot == slot || operand(key)
-        }
-        LeafOp::CompoundMemberComputedLocal {
-            object_slot,
-            key,
-            rhs,
-            ..
-        } => *object_slot == slot || operand(key) || operand(rhs),
-        LeafOp::UpdateMemberComputedLocal {
-            object_slot, key, ..
-        } => *object_slot == slot || operand(key),
-        LeafOp::GetMemberComputedLocal {
-            object_slot, key, ..
-        } => *object_slot == slot || operand(key),
-        LeafOp::StoreMemberName { value, .. } => operand(value),
-        LeafOp::StoreMemberComputed { key, value } => operand(key) || operand(value),
-        LeafOp::GetMemberComputed { key } => operand(key),
-        _ => false,
-    }
-}
-
-/// Whether the accumulator provably holds a Number just before `ops[upto]`,
-/// mirroring the register executor's own value semantics (slice A's
-/// `acc_is_number`). Conservative: an op it cannot account for loses the proof.
-fn run_acc_is_number(ops: &[LeafOp], upto: usize) -> bool {
-    let mut known = false;
-    for op in &ops[..upto] {
-        known = match op {
-            LeafOp::LoadCounter => true,
-            LeafOp::LoadConst(value) => value.is_number(),
-            LeafOp::BinImm { op, .. } => {
-                known && matches!(inline_binary(*op), Some(InlineBin::Arith(_)))
-            }
-            LeafOp::BinConst { op, value } => {
-                known
-                    && value.is_number()
-                    && matches!(inline_binary(*op), Some(InlineBin::Arith(_)))
-            }
-            LeafOp::UpdateAcc { .. } => known,
-            LeafOp::LoadReg { .. }
-            | LeafOp::LoadContext { .. }
-            | LeafOp::LoadPerIter { .. }
-            | LeafOp::BinReg { .. }
-            | LeafOp::BinContext { .. }
-            | LeafOp::BinPerIter { .. }
-            | LeafOp::BinCtxReg { .. }
-            | LeafOp::BinImmLocal { .. }
-            | LeafOp::BinAccPop { .. }
-            | LeafOp::BinLeftReg { .. }
-            | LeafOp::BinStoreReg { .. }
-            | LeafOp::GetMemberName { .. }
-            | LeafOp::GetMemberComputed { .. }
-            | LeafOp::GetMemberNameLocal { .. }
-            | LeafOp::GetMemberComputedLocal { .. } => false,
-            _ => known,
-        };
-    }
-    known
-}
-
 struct NumSlot {
     slot: usize,
     var: Variable,
@@ -980,11 +755,9 @@ struct Lowerer<'a> {
     acc_num_var: Variable,
     acc_bits_valid: bool,
     /// Slice B (Route A): the loop-carried Number slots kept in f64 registers
-    /// (at most one under v1), seeded at `num_slot_bind` from the frame and
-    /// flushed to the frame at `num_slot_flush`.
+    /// (at most one under v1), seeded at the loop's `FastLoopBind` and flushed
+    /// at its `FastLoopStore`.
     num_slots: Vec<NumSlot>,
-    num_slot_bind: Option<usize>,
-    num_slot_flush: Option<usize>,
     // NaN-boxing bit patterns (see `crux::value`).
     /// The `(vm, callee, this, argc, args, direct_eval) -> value` signature
     /// of the tail-call helper (Cut 45).
@@ -1085,17 +858,23 @@ impl<'a> Lowerer<'a> {
             .steps
             .iter()
             .any(|step| matches!(step, Step::Yield { .. } | Step::Await));
-        // Slice B (Route A): the JIT-only loop-carried Number slot.
-        let num_slot_plan = plan_num_slot(body, has_try, has_suspension);
-        let num_slots: Vec<NumSlot> = num_slot_plan
+        // Route B: the compiler marks a loop-carried Number slot on the loop's
+        // `FastLoopBind`/`FastLoopStore`; the JIT keeps it in an f64 register
+        // for the loop's duration (seeded at the bind, flushed at the store).
+        let num_slots: Vec<NumSlot> = body
+            .steps
             .iter()
-            .map(|plan| NumSlot {
-                slot: plan.slot,
+            .filter_map(|step| match step {
+                Step::FastLoopBind {
+                    num: Some(slot), ..
+                } => Some(*slot),
+                _ => None,
+            })
+            .map(|slot| NumSlot {
+                slot,
                 var: builder.declare_var(types::F64),
             })
             .collect();
-        let num_slot_bind = num_slot_plan.as_ref().map(|plan| plan.bind_step);
-        let num_slot_flush = num_slot_plan.as_ref().map(|plan| plan.flush_step);
         let mut suspension_targets = Vec::new();
         for (index, step) in body.steps.iter().enumerate() {
             if matches!(step, Step::Yield { .. } | Step::Await) {
@@ -1171,8 +950,6 @@ impl<'a> Lowerer<'a> {
             acc_is_number: false,
             acc_bits_valid: true,
             num_slots,
-            num_slot_bind,
-            num_slot_flush,
             undef_bits: Value::Undefined.bits() as i64,
             null_bits: Value::Null.bits() as i64,
             false_bits: Value::Boolean(false).bits() as i64,
@@ -3851,11 +3628,6 @@ impl<'a> Lowerer<'a> {
         // A step boundary drops the register-op accumulator provenance; only a
         // `RunRegBody` (which re-seeds the accumulator) re-establishes it.
         self.acc_is_number = false;
-        // Slice B (Route A): the loop's exit block flushes the loop-carried
-        // Number registers to the frame before any later step reads the slot.
-        if self.num_slot_flush == Some(index) {
-            self.flush_num_slots();
-        }
         // Cut 70: a catch/finally entry step resumes at the handler's
         // try-entry sp (saved at `EnterTry`). A helper error inside the try
         // leaves the erroring step's operands on the working stack — the
@@ -4204,15 +3976,18 @@ impl<'a> Lowerer<'a> {
                 let block = self.ensure_block(*target);
                 self.cond_jump(test, false, block, index + 1);
             }
-            Step::FastLoopBind { var } => {
+            Step::FastLoopBind { var, num } => {
                 self.emit_fast_loop_bind(*var)?;
-                if self.num_slot_bind == Some(index) {
-                    self.seed_num_slots();
+                if let Some(slot) = num {
+                    self.seed_num_slot(*slot);
                 }
                 self.fall_through(index);
             }
-            Step::FastLoopStore { var } => {
+            Step::FastLoopStore { var, num } => {
                 self.emit_fast_loop_store(*var)?;
+                if let Some(slot) = num {
+                    self.flush_num_slot(*slot);
+                }
                 self.fall_through(index);
             }
             Step::FastLoopHead {
@@ -7004,41 +6779,33 @@ impl<'a> Lowerer<'a> {
             .map(|num| num.var)
     }
 
-    /// Seed the loop-carried Number registers from the frame (the planner
-    /// proved the slots hold canonical Numbers here, so the bitcast is exact).
-    fn seed_num_slots(&mut self) {
-        let slots: Vec<(Variable, usize)> = self
-            .num_slots
-            .iter()
-            .map(|num| (num.var, num.slot))
-            .collect();
-        for (var, slot) in slots {
-            let bits = self.load_slot(slot);
-            let num = self
-                .builder
-                .ins()
-                .bitcast(types::F64, MemFlagsData::new(), bits);
-            self.builder.def_var(var, num);
-        }
+    /// Route B: seed the loop-carried Number register for `slot` from the frame
+    /// (the compiler proved the slot holds a canonical Number here).
+    fn seed_num_slot(&mut self, slot: usize) {
+        let Some(var) = self.num_slot_var(slot) else {
+            return;
+        };
+        let bits = self.load_slot(slot);
+        let num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), bits);
+        self.builder.def_var(var, num);
     }
 
-    /// Flush the loop-carried Number registers back to the frame as canonical
-    /// `Value::Number`s.
-    fn flush_num_slots(&mut self) {
-        let slots: Vec<(Variable, usize)> = self
-            .num_slots
-            .iter()
-            .map(|num| (num.var, num.slot))
-            .collect();
-        for (var, slot) in slots {
-            let num = self.builder.use_var(var);
-            let bits = self
-                .builder
-                .ins()
-                .bitcast(types::I64, MemFlagsData::new(), num);
-            let value = self.canon(bits);
-            self.store_slot(slot, value);
-        }
+    /// Route B: flush the loop-carried Number register for `slot` back to the
+    /// frame as a canonical `Value::Number`.
+    fn flush_num_slot(&mut self, slot: usize) {
+        let Some(var) = self.num_slot_var(slot) else {
+            return;
+        };
+        let num = self.builder.use_var(var);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), num);
+        let value = self.canon(bits);
+        self.store_slot(slot, value);
     }
 
     /// Slice B (Route A): `var = var fop acc`, the result re-canonicalized into
@@ -7294,6 +7061,15 @@ impl<'a> Lowerer<'a> {
                     let res = self.emit_binary_known(*op, l, r, false, right_known)?;
                     self.store_slot(*slot, res);
                     self.set_acc_bits(res);
+                }
+            }
+            LeafOp::BinStoreNum { op, slot } => {
+                // Route B: the loop-carried Number slot lives in an f64
+                // register; the compiler proved both operands Number.
+                if let Some(var) = self.num_slot_var(*slot) {
+                    self.emit_num_slot_rmw(*op, var)?;
+                } else {
+                    return Err(Unsupported::Step("BinStoreNum without a plan"));
                 }
             }
             LeafOp::StoreReg { slot, tdz } => {

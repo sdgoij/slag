@@ -3299,6 +3299,9 @@ mod tests {
                     crate::ir::LeafOp::BinStoreReg {
                         op: syntax::ast::BinaryOp::Add,
                         ..
+                    } | crate::ir::LeafOp::BinStoreNum {
+                        op: syntax::ast::BinaryOp::Add,
+                        ..
                     }
                 )
             }),
@@ -3364,9 +3367,10 @@ mod tests {
         );
         assert_eq!(self_assign.len(), 1, "the s = s + i body must lower");
         assert!(
-            self_assign[0]
-                .iter()
-                .any(|op| matches!(op, crate::ir::LeafOp::BinStoreReg { .. })),
+            self_assign[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::BinStoreReg { .. } | crate::ir::LeafOp::BinStoreNum { .. }
+            )),
             "the same-slot self assign must fuse into one bin+store op"
         );
         assert!(
@@ -3444,10 +3448,11 @@ mod tests {
             "h",
         );
         assert!(
-            constant[0]
-                .iter()
-                .any(|op| matches!(op, crate::ir::LeafOp::BinStoreReg { .. })),
-            "s += 1 must fuse its store into BinStoreReg"
+            constant[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::BinStoreReg { .. } | crate::ir::LeafOp::BinStoreNum { .. }
+            )),
+            "s += 1 must fuse its store into one bin+store op"
         );
         assert_eq!(slot[0].len(), constant[0].len());
     }
@@ -4406,9 +4411,10 @@ mod tests {
         );
         assert_eq!(braced.len(), 1, "the braced fused-store body must lower");
         assert!(
-            braced[0]
-                .iter()
-                .any(|op| matches!(op, crate::ir::LeafOp::BinStoreReg { .. })),
+            braced[0].iter().any(|op| matches!(
+                op,
+                crate::ir::LeafOp::BinStoreReg { .. } | crate::ir::LeafOp::BinStoreNum { .. }
+            )),
             "the run must end in the fused accumulator store"
         );
         // The unbraced equivalent lowers to the same run.

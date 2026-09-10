@@ -8545,10 +8545,12 @@ to slot 0 in the body IS that RMW. The Number init (`var n = 0`) is visible in
 the step stream as `Push(Number(0.0))` + `InitLocal { slot: 0 }` just before
 `FastLoopBind`. Both hot rows (`arithmetic`, `bare loop`) have this shape.
 
-Two routes were identified. v1 landed **Route A** (JIT-only); **Route B** (the
-step/`LeafOp` IR route) stays deferred and is documented below for later review.
+The loop-carried Number slot landed in two cuts. The first was JIT-only; the
+second moved the proof into the compiler and added the interpreter op, so
+`--jitless` runs the same specialization. The JIT-only planner was deleted
+when the compiler took over.
 
-Common v1 restriction (both routes). A slot `s` is specialized only when:
+Common restriction (both cuts). A slot `s` is specialized only when:
 
 - every reference to `s` in the loop body is the statement-position RMW
   `s op= <number-provable>` — no other read or write (a read or a step-path
@@ -8560,11 +8562,12 @@ Common v1 restriction (both routes). A slot `s` is specialized only when:
 Neither route builds a runtime entry guard or a versioned (specialized +
 generic) body — the entry value is proven at compile time.
 
-#### Route A (LANDED) — JIT-only, no IR change
+#### Cut 1 (LANDED 2026-09-10, JIT-only — planner since superseded)
 
-The JIT already sees the whole `CompiledBody`, so it does the candidate scan
-and the entry proof itself and specializes purely in machine code
-(`plan_num_slot` + `Lowerer::num_slots` in `crates/jit/src/compiler.rs`):
+The first cut did the candidate scan and the entry proof inside the JIT
+(`plan_num_slot` + `Lowerer::num_slots` in `crates/jit/src/compiler.rs`), so the
+interpreter kept the generic `BinStoreReg` and `--jitless` was untouched. Cut 2
+(below) moved the proof into the compiler and deleted the JIT planner.
 
 - Candidate: a `FastLoopHead { var: Counter }` whose body is exactly one
   `RunRegBody` step (`head == body_start + 1`), containing exactly one
@@ -8584,9 +8587,9 @@ and the entry proof itself and specializes purely in machine code
   single merge of the normal exit, the zero-iteration initial test, and every
   `break`.
 
-The interpreter keeps running the generic `BinStoreReg`, so `--jitless` (and
-any un-specialized run) is unaffected by construction. Blast radius:
-`crates/jit/src/compiler.rs` only.
+At this cut the interpreter kept running the generic `BinStoreReg`, so
+`--jitless` (and any un-specialized run) was unaffected; the whole change was
+`crates/jit/src/compiler.rs`.
 
 Measured on `--jit-bench` (release, two runs):
 
@@ -8609,34 +8612,50 @@ guards the shapes that must NOT specialize: a conditional entry write and a
 String-init slot); test262 sweeps at baseline — language 23721/0/3, annexB
 1086/0/0, built-ins 23657/0/155, zero fail/crash/hang. Uncommitted.
 
-#### Route B (deferred, not started) — the step/`LeafOp` IR route
+#### Cut 2 (LANDED 2026-09-10) — the compiler plan + the interpreter op (Route B)
 
-Kept as the reviewed-plan artifact for a later cut. It would also speed up
-`--jitless` (and any un-specialized run), at the cost of new IR that both
-engines must implement. Route A's compile-time proof and candidate scan can be
-reused by the compiler side if this is picked up, but the entry proof would move
-into `ir.rs` (the current one scans the JIT-visible step stream).
+`Compiler::plan_loop_num` (`crates/runtime/src/ir.rs`) runs once, right after an
+acc-path loop is fully emitted, doing the candidate scan and entry proof (the
+JIT's former planner, moved) on the step stream. On success it marks the loop
+(`Step::FastLoopBind`/`Step::FastLoopStore` gain `num: Some(slot)`) and rewrites
+the RMW op to `LeafOp::BinStoreNum { op, slot }`.
 
-- `Step::FastLoopBind`/`FastLoopStore` carry the candidate list (or two sibling
-  steps), one new `LeafOp::BinStoreNum { op, index }`, and a `Vm` f64 scratch
-  (`loop_nums`).
-- Interpreter arms: `run_leaf_ops` for the new op, plus the
-  `FastLoopBind`/`FastLoopStore` dispatch that seeds/flushes the scratch.
-- Compiler side (`ir.rs`): a `number_slots` map set by `var s = <Number>`,
-  cleared by any assignment / declaration without a Number init / any
-  control-flow statement that assigns `s`, consulted when `compile_for` emits
-  the acc-path loop; the candidate list rides on the loop steps.
-- JIT side: f64 `num_vars` + the `emit_leaf_op` arm + `step_name`
-  /`step_targets`/`max_stack_usage`; `lower_step`/
-  `lower_leaf_ops_segmented` need the slot→index map so the run emits
-  `BinStoreNum` instead of `BinStoreReg`.
-- Hard requirement: the register-run segmentation must never leave a
-  specialized slot referenced by a step, and `--jitless` must agree — this is
-  the extra correctness surface Route A avoids.
+- **IR**: `Vm::loop_num` (f64, the `loop_counter` sibling); the two new step
+  fields and the one new op.
+- **Interpreter**: `fast_loop_bind`/`fast_loop_store` seed/flush `loop_num`, and
+  the `run_leaf_ops` arm does `loop_num = loop_num op acc; acc = result`.
+- **JIT**: discovers the marked slot from the steps, keeps it in an f64 register
+  (seeded at the bind, flushed at the store) and lowers `BinStoreNum` to the
+  same `fadd`/`fmul` (+ canon) code it emitted before.
+- **The entry proof changed shape**: it no longer resolves jump targets (at this
+  point they are still unpatched label ids, and the initial test's target is a
+  fixup placeholder) — it requires the already-emitted prefix to be
+  straight-line (`prefix_is_straight_line`: no step with a jump target, no
+  control exit), which is the property that makes the entry init execute
+  exactly once unconditionally. The loop's own initial test sits after the
+  bind, so it is outside the checked range.
+- **Confinement unchanged**: the register run must reference the slot only in
+  the RMW, so the stale frame slot is never observed mid-loop.
 
-A drop-in would also need the same confinement Route A enforces (the single-RMW
-body, the Number entry proof) so the specialized slot is never observed via the
-stale frame mid-loop.
+Measured on `--jit-bench` (release; plan-on vs plan-off, since the plan now
+drives BOTH engines and "off" is the pre-Route-B lowering):
+
+| row | `--jitless` off-plan | `--jitless` on-plan | JIT (either) |
+|---|---|---|---|
+| `arithmetic` | ~14.2ms | **~12.6ms** | 0.60-0.64ms |
+| `bare loop` | ~11.8ms | **~9.9ms** | 0.67-0.69ms |
+
+So `--jitless` gains ~11% / ~16% on the two rows, and the JIT keeps its
+loop-carried-slot win (0.6ms vs 2.34ms with the plan disabled). The JIT's
+`bare loop` reads ~0.07ms above the pre-Route-B build; the generated loop is the
+same shape (one `fadd` + the safepoint probe + the counter head), so the delta
+is build/code-layout variation, not a code-shape regression.
+
+Verification: clippy `--workspace --all-targets -D warnings` clean; `cargo test
+--workspace` 4777 pass / 0 fail; six test262 sweeps at baseline — language
+23721/0/3, annexB 1086/0/0, built-ins 23657/0/155 with the JIT AND with
+`--jitless`, zero fail/crash/hang. The four structural eval tests that pinned
+`BinStoreReg` now accept `BinStoreNum` too. Uncommitted.
 
 ### LANDED (2026-09-10): the loop head — slice C of the type-specialized loop lowering
 

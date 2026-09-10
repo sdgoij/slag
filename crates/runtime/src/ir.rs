@@ -883,6 +883,11 @@ pub enum Step {
     /// the loop init.
     FastLoopBind {
         var: FastLoopVar,
+        /// Route B: the frame slot this loop keeps in `Vm::loop_num` (its f64
+        /// form) for the loop's duration — `Some` only when the compile-time
+        /// plan proved the slot Number at loop entry and its only in-loop
+        /// reference is one arithmetic RMW ([`LeafOp::BinStoreNum`]).
+        num: Option<usize>,
     },
     /// The fused canonical loop's counter epilogue (Cut 17): write the
     /// accumulator back to the binding. Emitted once at the loop exit — on
@@ -891,6 +896,9 @@ pub enum Step {
     /// dead, so the stale binding is unobservable).
     FastLoopStore {
         var: FastLoopVar,
+        /// Route B: write the loop-carried `Vm::loop_num` back to this frame
+        /// slot (the counterpart of `FastLoopBind`'s `num`).
+        num: Option<usize>,
     },
     /// Run a register-lowered loop body (Cut 35 slice 9): the ops address
     /// the current frame — the script's inline frame here (the leaf path
@@ -1303,6 +1311,14 @@ pub enum LeafOp {
     /// and the write-back skips the `tdz` check (the lowering only fuses
     /// the `tdz=false` slot shape, where the pair's `StoreReg` had none).
     BinStoreReg { op: BinaryOp, slot: usize },
+    /// Route B: `loop_num = loop_num op acc; acc = Number(loop_num)` — the
+    /// loop-carried Number slot's RMW, kept in `Vm::loop_num` (f64) for the
+    /// loop's duration instead of the frame. The compile-time plan proved both
+    /// operands are Numbers, so no coercion or tag check is needed; the frame
+    /// slot is written back by the loop's `Step::FastLoopStore`. `slot` names
+    /// the binding (the JIT maps it to its register; the interpreter uses the
+    /// single `Vm::loop_num`).
+    BinStoreNum { op: BinaryOp, slot: usize },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
 }
@@ -2826,6 +2842,12 @@ pub struct Vm {
     /// be provably Number — so the head's test and increment are plain
     /// float ops, never the Value round-trip.
     loop_counter: f64,
+    /// Route B: the loop-carried Number slot (see `LeafOp::BinStoreNum`): a
+    /// single f64 scratch, seeded by `Step::FastLoopBind` and written back by
+    /// `Step::FastLoopStore`. Raw f64 is sound for the same reason
+    /// `loop_counter` is — the compile-time plan admits only proven-Number
+    /// slots with proven-Number RMWs.
+    loop_num: f64,
     /// Completion-register saves for the `finally` blocks currently running
     /// (nested finallys push in order).
     completion_stack: Vec<(Value, bool)>,
@@ -3039,6 +3061,7 @@ impl Vm {
             completion_is_empty: true,
             acc: Value::Undefined,
             loop_counter: 0.0,
+            loop_num: 0.0,
             completion_stack: Vec::new(),
             list_stack: Vec::new(),
             var_ref_stack: Vec::new(),
@@ -5047,7 +5070,12 @@ impl Vm {
     /// binding's current value into the `loop_counter` field
     /// (`Step::FastLoopBind`). The acc-path gate requires the init to be a
     /// Number, so the field takes the value's numeric form.
-    fn fast_loop_bind(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
+    fn fast_loop_bind(
+        &mut self,
+        agent: &mut Agent,
+        var: FastLoopVar,
+        num: Option<usize>,
+    ) -> Result<(), JsError> {
         let value = match var {
             FastLoopVar::Slot(slot) => *self.frame_get(slot),
             FastLoopVar::Global(name) => self.load_global_value(agent, name)?,
@@ -5058,12 +5086,25 @@ impl Vm {
             "the acc-path loop init is gated to a Number"
         );
         self.loop_counter = value.as_number().unwrap_or(0.0);
+        if let Some(slot) = num {
+            let value = *self.frame_get(slot);
+            debug_assert!(value.is_number(), "the num-slot plan proves a Number");
+            self.loop_num = value.as_number().unwrap_or(0.0);
+        }
         Ok(())
     }
 
     /// The fused canonical loop's counter epilogue (Cut 17): write the
     /// `loop_counter` field back to the binding (`Step::FastLoopStore`).
-    fn fast_loop_store(&mut self, agent: &mut Agent, var: FastLoopVar) -> Result<(), JsError> {
+    fn fast_loop_store(
+        &mut self,
+        agent: &mut Agent,
+        var: FastLoopVar,
+        num: Option<usize>,
+    ) -> Result<(), JsError> {
+        if let Some(slot) = num {
+            *self.frame_get_mut(slot) = Value::Number(self.loop_num);
+        }
         let value = Value::Number(self.loop_counter);
         match var {
             FastLoopVar::Slot(slot) => *self.frame_get_mut(slot) = value,
@@ -7767,11 +7808,11 @@ impl Vm {
                         self.ip = *body_start;
                     }
                 }
-                Step::FastLoopBind { var } => {
-                    self.fast_loop_bind(agent, *var)?;
+                Step::FastLoopBind { var, num } => {
+                    self.fast_loop_bind(agent, *var, *num)?;
                 }
-                Step::FastLoopStore { var } => {
-                    self.fast_loop_store(agent, *var)?;
+                Step::FastLoopStore { var, num } => {
+                    self.fast_loop_store(agent, *var, *num)?;
                 }
                 Step::RunRegBody { ops } => {
                     // The register body addresses the current frame (the
@@ -10200,6 +10241,17 @@ impl Vm {
                     let result = Self::binary_inline(agent, *op, &left, &self.acc)?;
                     self.acc = result;
                     *self.frame_get_mut(*slot) = result;
+                }
+                LeafOp::BinStoreNum { op, .. } => {
+                    // Route B: the loop-carried Number slot lives in
+                    // `Vm::loop_num` (f64) for the loop's duration; the frame
+                    // slot is written back by the loop's `FastLoopStore`. The
+                    // compile-time plan proves both operands are Numbers, so
+                    // the arithmetic result is a Number too.
+                    let left = Value::Number(self.loop_num);
+                    let result = Self::binary_inline(agent, *op, &left, &self.acc)?;
+                    self.acc = result;
+                    self.loop_num = result.as_number().unwrap_or(self.loop_num);
                 }
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc));
@@ -16009,6 +16061,93 @@ impl Compiler {
         Ok(())
     }
 
+    /// Route B: after an acc-path loop is fully emitted, prove that one frame
+    /// slot can live in `Vm::loop_num` (f64) for the loop's duration and mark
+    /// the loop with it — the RMW op becomes `LeafOp::BinStoreNum`, and both
+    /// engines read/write `Vm::loop_num` instead of the frame. The proof is a
+    /// step-stream scan (the same conditions the JIT's slice-B planner used,
+    /// now done once at compile time so `--jitless` benefits too). A slot is
+    /// specialized only when the loop body is exactly one register run with a
+    /// single arithmetic `BinStoreReg` RMW and no other reference to the slot,
+    /// the RMW's accumulator is a proven Number, and the slot is a proven
+    /// Number at loop entry from the straight-line prefix (`Push(Number)` +
+    /// store, no backward/escaping jump).
+    fn plan_loop_num(&mut self, bind: usize, body_start: usize, head: usize, store: usize) {
+        if head != body_start + 1 {
+            return;
+        }
+        let (rmw_index, slot) = {
+            let Step::RunRegBody { ops } = &self.steps[body_start] else {
+                return;
+            };
+            // Exactly one arithmetic slot RMW, and no other op touching that
+            // slot (the frame slot is stale while the loop runs).
+            let mut candidate: Option<(usize, usize)> = None;
+            for (op_index, op) in ops.iter().enumerate() {
+                if let LeafOp::BinStoreReg { op, slot } = op
+                    && is_inline_arith(*op)
+                {
+                    if candidate.is_some() {
+                        return;
+                    }
+                    candidate = Some((op_index, *slot));
+                }
+            }
+            let Some((rmw_index, slot)) = candidate else {
+                return;
+            };
+            if ops
+                .iter()
+                .enumerate()
+                .any(|(op_index, op)| op_index != rmw_index && leaf_op_touches_slot(op, slot))
+            {
+                return;
+            }
+            if !run_acc_is_number(ops, rmw_index) {
+                return;
+            }
+            (rmw_index, slot)
+        };
+        // Entry proof: the slot's last write before the loop is a straight-line
+        // `Push(Number(_))` + store, and the prefix cannot skip or re-enter it.
+        let Some(write) = (0..bind)
+            .rev()
+            .find(|&i| step_writes_slot(&self.steps[i], slot))
+        else {
+            return;
+        };
+        if write == 0
+            || !matches!(&self.steps[write - 1], Step::Push(value) if value.is_number())
+            || !matches!(
+                &self.steps[write],
+                Step::InitLocal { slot: s }
+                    | Step::StoreLocal { slot: s }
+                    | Step::FusedStoreLocal { slot: s } if *s == slot
+            )
+        {
+            return;
+        }
+        if !prefix_is_straight_line(&self.steps[..bind]) {
+            return;
+        }
+        // Commit.
+        if let Step::FastLoopBind { num, .. } = &mut self.steps[bind] {
+            *num = Some(slot);
+        } else {
+            return;
+        }
+        if let Step::FastLoopStore { num, .. } = &mut self.steps[store] {
+            *num = Some(slot);
+        } else {
+            return;
+        }
+        if let Step::RunRegBody { ops } = &mut self.steps[body_start]
+            && let LeafOp::BinStoreReg { op, .. } = ops[rmw_index]
+        {
+            ops[rmw_index] = LeafOp::BinStoreNum { op, slot };
+        }
+    }
+
     fn compile_for(
         &mut self,
         init: Option<&ForInit>,
@@ -16298,10 +16437,12 @@ impl Compiler {
                         // written by the loop init) into the accumulator
                         // before the initial test, so a zero-iteration loop
                         // still stores the init value back.
-                        self.emit(Step::FastLoopBind { var });
+                        let bind_index = self.steps.len();
+                        self.emit(Step::FastLoopBind { var, num: None });
                         self.emit_fused_rel_test(op, loc, name, limit, end_label);
                         let body_start = self.new_label();
                         self.place(body_start);
+                        let body_start_index = self.steps.len();
                         let saved = self.acc_binding.replace(name);
                         let body_steps = self.steps.len();
                         let body_fixups = self.fixups.len();
@@ -16334,8 +16475,10 @@ impl Compiler {
                         // `break` writes the counter back too (a `continue`
                         // skips it via the head's back-jump).
                         self.place(end_label);
-                        self.emit(Step::FastLoopStore { var });
+                        let store_index = self.steps.len();
+                        self.emit(Step::FastLoopStore { var, num: None });
                         self.emit(Step::NormalizeCompletion);
+                        self.plan_loop_num(bind_index, body_start_index, index, store_index);
                         self.scope_stack.pop();
                         return Ok(());
                     }
@@ -19533,6 +19676,134 @@ pub(crate) fn body_has_loop(steps: &[Step]) -> bool {
         }
     }
     false
+}
+
+/// Route B: whether `op` is one of the arithmetic shapes the register
+/// executor inlines on two Numbers (the `BinaryOp` subset the JIT's
+/// `inline_binary` treats as `Arith`).
+fn is_inline_arith(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+    )
+}
+
+/// Route B: whether a register op reads or writes the frame slot.
+fn leaf_op_touches_slot(op: &LeafOp, slot: usize) -> bool {
+    let operand = |operand: &RegOperand| match operand {
+        RegOperand::Reg { slot: s, .. } | RegOperand::PostInc { slot: s, .. } => *s == slot,
+        _ => false,
+    };
+    match op {
+        LeafOp::LoadReg { slot: s, .. }
+        | LeafOp::BinReg { slot: s, .. }
+        | LeafOp::StoreReg { slot: s, .. }
+        | LeafOp::BinLeftReg { slot: s, .. }
+        | LeafOp::BinStoreReg { slot: s, .. }
+        | LeafOp::BinStoreNum { slot: s, .. }
+        | LeafOp::UpdateReg { slot: s, .. }
+        | LeafOp::BinImmLocal { slot: s, .. }
+        | LeafOp::BinCtxReg { slot: s, .. }
+        | LeafOp::StoreMemberNameLocal { object_slot: s, .. }
+        | LeafOp::GetMemberNameLocal { object_slot: s, .. } => *s == slot,
+        LeafOp::StoreMemberComputedLocal { object_slot, key } => {
+            *object_slot == slot || operand(key)
+        }
+        LeafOp::CompoundMemberComputedLocal {
+            object_slot,
+            key,
+            rhs,
+            ..
+        } => *object_slot == slot || operand(key) || operand(rhs),
+        LeafOp::UpdateMemberComputedLocal {
+            object_slot, key, ..
+        } => *object_slot == slot || operand(key),
+        LeafOp::GetMemberComputedLocal {
+            object_slot, key, ..
+        } => *object_slot == slot || operand(key),
+        LeafOp::StoreMemberName { value, .. } => operand(value),
+        LeafOp::StoreMemberComputed { key, value } => operand(key) || operand(value),
+        LeafOp::GetMemberComputed { key } => operand(key),
+        _ => false,
+    }
+}
+
+/// Route B: whether the step writes the frame slot (conservatively for the
+/// wholesale destructuring binds, which can write any slot).
+fn step_writes_slot(step: &Step, slot: usize) -> bool {
+    match step {
+        Step::InitLocal { slot: s }
+        | Step::StoreLocal { slot: s }
+        | Step::FusedStoreLocal { slot: s }
+        | Step::UpdateLocal { slot: s, .. }
+        | Step::Inc { slot: s }
+        | Step::Dec { slot: s }
+        | Step::CreateArguments { slot: s, .. }
+        | Step::ForOfNextBindLocal { slot: s, .. }
+        | Step::ForOfBindLocal { slot: s } => *s == slot,
+        Step::FastLoopStore { var, num } => {
+            matches!(var, FastLoopVar::Slot(s) if *s == slot) || *num == Some(slot)
+        }
+        Step::Destructure { .. } | Step::DeclInit { .. } => true,
+        _ => false,
+    }
+}
+
+/// Route B: whether the already-emitted prefix is straight-line — no step with
+/// a jump target and no control exit. That is what makes "the entry init
+/// executes exactly once, unconditionally" true without needing to resolve the
+/// (still unpatched) label targets. The loop's own initial test lives after
+/// `bind`, so it is outside the range checked.
+fn prefix_is_straight_line(steps: &[Step]) -> bool {
+    steps.iter().all(|step| {
+        step_targets(step).is_empty()
+            && !matches!(
+                step,
+                Step::Return
+                    | Step::Throw
+                    | Step::Break { .. }
+                    | Step::Continue { .. }
+                    | Step::TailCallSelf { .. }
+                    | Step::TailCallSelfCheck { .. }
+                    | Step::TailCallSelfVector
+                    | Step::TailCallSelfCheckVector
+            )
+    })
+}
+
+/// Route B: whether the accumulator provably holds a Number just before
+/// `ops[upto]`, mirroring the register executor's own value semantics (the
+/// JIT's slice-A `acc_is_number`). Conservative: an op it cannot account for
+/// loses the proof.
+fn run_acc_is_number(ops: &[LeafOp], upto: usize) -> bool {
+    let mut known = false;
+    for op in &ops[..upto] {
+        known = match op {
+            LeafOp::LoadCounter => true,
+            LeafOp::LoadConst(value) => value.is_number(),
+            LeafOp::BinImm { op, .. } => known && is_inline_arith(*op),
+            LeafOp::BinConst { op, value } => known && value.is_number() && is_inline_arith(*op),
+            LeafOp::UpdateAcc { .. } => known,
+            LeafOp::LoadReg { .. }
+            | LeafOp::LoadContext { .. }
+            | LeafOp::LoadPerIter { .. }
+            | LeafOp::BinReg { .. }
+            | LeafOp::BinContext { .. }
+            | LeafOp::BinPerIter { .. }
+            | LeafOp::BinCtxReg { .. }
+            | LeafOp::BinImmLocal { .. }
+            | LeafOp::BinAccPop { .. }
+            | LeafOp::BinLeftReg { .. }
+            | LeafOp::BinStoreReg { .. }
+            | LeafOp::BinStoreNum { .. }
+            | LeafOp::GetMemberName { .. }
+            | LeafOp::GetMemberComputed { .. }
+            | LeafOp::GetMemberNameLocal { .. }
+            | LeafOp::GetMemberComputedLocal { .. } => false,
+            _ => known,
+        };
+    }
+    known
 }
 
 /// Whether the body contains a `Step::CallApply` site (M10): the JIT's
