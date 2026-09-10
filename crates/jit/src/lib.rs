@@ -1815,6 +1815,31 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_hoists_invariant_member_reads_without_changing_semantics() {
+        // LICM: a data-property read on a loop-invariant frame-slot receiver
+        // is hoisted to a hidden slot; an accessor, an object-valued operand,
+        // and a member write in the body must all keep per-iteration
+        // semantics (the guard misses or the loop is not hoisted).
+        let source = "function data() { var o = { a: 1, b: 2 }; var n = 0; for (var i = 0; i < 500; i++) { n += o.a + o.b; } return n; }\n\
+\t                      function accessor() { var o = { b: 2 }; var c = 0; Object.defineProperty(o, 'a', { get: function () { return ++c; } }); var n = 0; for (var i = 0; i < 4; i++) { n += o.a + o.b; } return n * 100 + c; }\n\
+\t                      function objectOperand() { var o = { a: 1 }; var n = { valueOf: function () { return 1; } }; for (var i = 0; i < 3; i++) { n = n + o.a; } return n; }\n\
+\t                      function mutated() { var o = { a: 1 }; var n = 0; for (var i = 0; i < 3; i++) { n += o.a; o.a = o.a + 1; } return n; }\n\
+\t                      (data() === 1500 && accessor() === 1804 && objectOperand() === 4 && mutated() === 6) ? 1 : 0;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the member-read hoist must match the interpreter"
+        );
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_registered_builtin_calls_match_the_interpreter() {
         // Cut 79: a member call whose callee is an installed builtin
         // (Map.prototype.has/get/set — registered at `Intrinsics::define`)

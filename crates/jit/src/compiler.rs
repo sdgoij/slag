@@ -130,6 +130,8 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             // The hoist guard pops the receiver and pushes the length back on
             // a probe hit (net 0); the miss jumps to a fresh evaluation.
             Step::TypedArrayLengthHoist { .. } => {}
+            // LICM: the guard reads/writes frame slots only (no stack effect).
+            Step::HoistMemberGuard { .. } => {}
             // A store consumes the value; `UpdateLocal` pushes its result.
             Step::StoreLocal { .. } | Step::FusedStoreLocal { .. } | Step::InitLocal { .. } => {
                 depth = depth.saturating_sub(1)
@@ -570,6 +572,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::JumpIfRelLimit { .. } => "JumpIfRelLimit",
         Step::JumpIfEqImm { .. } | Step::JumpIfNeqImm { .. } => "JumpIfEqImm/NeqImm",
         Step::TypedArrayLengthHoist { .. } => "TypedArrayLengthHoist",
+        Step::HoistMemberGuard { .. } => "HoistMemberGuard",
         Step::LoadPerIteration { .. }
         | Step::StorePerIteration { .. }
         | Step::UpdatePerIteration { .. } => "Per-iteration",
@@ -601,6 +604,7 @@ fn step_targets(step: &Step) -> Vec<usize> {
         | Step::JumpIfGeGlobalImm { target, .. }
         | Step::JumpIfRelLimit { target, .. } => vec![*target],
         Step::TypedArrayLengthHoist { target } => vec![*target],
+        Step::HoistMemberGuard { target, .. } => vec![*target],
         Step::FastLoopHead {
             body_start, after, ..
         } => vec![*body_start, *after],
@@ -1307,6 +1311,19 @@ impl<'a> Lowerer<'a> {
         object: ClifValue,
         name: crux::AtomId,
     ) -> Result<ClifValue, Unsupported> {
+        self.emit_member_cell_probe(object, name, None)
+    }
+
+    /// As `emit_member_cell_read`, but a probe miss branches to `miss`
+    /// (caller-owned, left unsealed) instead of emitting the full
+    /// `get_member_name` fallback — the LICM guard takes the general loop on a
+    /// miss. The probe's own merge block is sealed and current on return.
+    fn emit_member_cell_probe(
+        &mut self,
+        object: ClifValue,
+        name: crux::AtomId,
+        miss: Option<Block>,
+    ) -> Result<ClifValue, Unsupported> {
         let name_imm = self.builder.ins().iconst(types::I64, name as i64);
         let ctx = self.vm();
         let cells = self.builder.ins().load(
@@ -1317,7 +1334,10 @@ impl<'a> Lowerer<'a> {
         );
         let value_var = self.builder.declare_var(types::I64);
         let probe = self.builder.create_block();
-        let slow = self.builder.create_block();
+        let slow = match miss {
+            Some(block) => block,
+            None => self.builder.create_block(),
+        };
         let merge = self.builder.create_block();
         let shape = self.builder.create_block();
         let map_present = self.builder.create_block();
@@ -1575,19 +1595,45 @@ impl<'a> Lowerer<'a> {
         self.builder.switch_to_block(field_hit);
         self.builder.def_var(value_var, value_bits);
         self.builder.ins().jump(merge, &[]);
-        // The slow path: the full Get (which also re-resolves and
-        // repopulates the cell for the next read).
-        self.builder.switch_to_block(slow);
-        let res = self.call_slow(
-            self.sig_get_name,
-            Helper::GetMemberName,
-            &[object, name_imm],
-        )?;
-        self.builder.def_var(value_var, res);
-        self.builder.ins().jump(merge, &[]);
+        // The slow path (only when no external miss block was given): the
+        // full Get, which also re-resolves and repopulates the cell for the
+        // next read.
+        if miss.is_none() {
+            self.builder.switch_to_block(slow);
+            let res = self.call_slow(
+                self.sig_get_name,
+                Helper::GetMemberName,
+                &[object, name_imm],
+            )?;
+            self.builder.def_var(value_var, res);
+            self.builder.ins().jump(merge, &[]);
+        }
         self.builder.seal_block(merge);
         self.builder.switch_to_block(merge);
         Ok(self.builder.use_var(value_var))
+    }
+
+    /// LICM: whether a value can re-enter user code when coerced — an object
+    /// or a function (their ToPrimitive runs user `valueOf`/`toString`).
+    /// Strings/bigints/symbols and the non-heap primitives are safe.
+    fn emit_value_dangerous(&mut self, value: ClifValue) -> ClifValue {
+        let heap = self.builder.ins().band_imm_u(value, crux::TAG_MASK as i64);
+        let is_heap = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, heap, crux::TAG_PREFIX as i64);
+        let tag = self.builder.ins().ushr_imm_u(value, 44);
+        let tag = self.builder.ins().band_imm_u(tag, 0xF);
+        let tag_obj = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
+        let tag_fun = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_FUNCTION as i64);
+        let obj_or_fn = self.builder.ins().bor(tag_obj, tag_fun);
+        self.builder.ins().band(is_heap, obj_or_fn)
     }
 
     /// The member-store shape gate (Slice 2), shared by the compiled member-
@@ -3885,6 +3931,44 @@ impl<'a> Lowerer<'a> {
                 self.push(len);
                 self.fall_through(index);
                 self.builder.seal_block(hit_block);
+            }
+            Step::HoistMemberGuard {
+                reads,
+                prim_slots,
+                target,
+            } => {
+                // LICM: verify every value-operand slot holds a non-object
+                // primitive, then probe each invariant read. A full hit stores
+                // the values in the hidden frame slots and falls through; any
+                // miss jumps to the general per-iteration loop (nothing
+                // stored there matters).
+                let miss = self.ensure_block(*target);
+                let mut bad: Option<ClifValue> = None;
+                for slot in prim_slots {
+                    let value = self.load_slot(*slot);
+                    let danger = self.emit_value_dangerous(value);
+                    bad = Some(match bad {
+                        Some(prev) => self.builder.ins().bor(prev, danger),
+                        None => danger,
+                    });
+                }
+                if let Some(bad) = bad {
+                    let ok = self.builder.create_block();
+                    self.builder.ins().brif(bad, miss, &[], ok, &[]);
+                    self.builder.switch_to_block(ok);
+                    self.builder.seal_block(ok);
+                }
+                for (recv_slot, name, hoist_slot) in reads {
+                    let object = self.load_slot(*recv_slot);
+                    let value = self.emit_member_cell_probe(object, *name, Some(miss))?;
+                    let danger = self.emit_value_dangerous(value);
+                    let cont = self.builder.create_block();
+                    self.builder.ins().brif(danger, miss, &[], cont, &[]);
+                    self.builder.switch_to_block(cont);
+                    self.store_slot(*hoist_slot, value);
+                    self.builder.seal_block(cont);
+                }
+                self.fall_through(index);
             }
             Step::JumpIfFalse(target) => {
                 let bits = self.pop();

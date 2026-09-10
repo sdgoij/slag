@@ -811,6 +811,22 @@ pub enum Step {
     TypedArrayLengthHoist {
         target: usize,
     },
+    /// LICM: the general loop-invariant member-read guard. Verifies every
+    /// VALUE-operand slot holds a non-object primitive (objects/functions are
+    /// the only operands whose coercion can re-enter user code, which could
+    /// mutate a hoisted receiver) and probes each `reads` entry's
+    /// `frame[recv_slot].name` through the data-only member-cell probe; on a
+    /// full hit it stores the values in the hidden `hoist_slot`s and falls
+    /// through, otherwise jumps to `target` (the compiler's general
+    /// per-iteration loop, unchanged semantics). Every receiver is a frame
+    /// slot the loop never writes and the body has no calls/member stores, so
+    /// a data hit is loop-invariant; an accessor, a cold shape, or an object
+    /// value misses.
+    HoistMemberGuard {
+        reads: Vec<(usize, crux::AtomId, usize)>,
+        prim_slots: Vec<usize>,
+        target: usize,
+    },
     // ----- top-level fast path (script-level bindings) -----
     /// Read a declared top-level `var`/function directly off the global
     /// object — the binding is guaranteed to exist (script instantiation
@@ -7812,6 +7828,51 @@ impl Vm {
                         self.ip = *target;
                     }
                 }
+                Step::HoistMemberGuard {
+                    reads,
+                    prim_slots,
+                    target,
+                } => {
+                    // LICM: a once-per-loop guard. Every VALUE-operand slot
+                    // must hold a non-object primitive (an object/function
+                    // operand's coercion can run user code, which could mutate
+                    // a hoisted receiver), and every read must be a data-cell
+                    // hit with a non-object value. On success the values land
+                    // in the hidden hoist slots for the fast copy; any miss
+                    // jumps to the general per-iteration loop.
+                    let mut ok = prim_slots.iter().all(|slot| {
+                        let value = *self.frame_get(*slot);
+                        !value.is_object() && !value.is_function()
+                    });
+                    if ok {
+                        for (recv_slot, name, hoist_slot) in reads {
+                            let object = *self.frame_get(*recv_slot);
+                            // The TDZ marker is a reserved tag that must never
+                            // reach `cell_object`/`Value::kind`; a TDZ receiver
+                            // means the body would throw, so take the general
+                            // loop (which raises it on the body's own read).
+                            let hit = if object.is_uninitialized() {
+                                None
+                            } else {
+                                Self::cell_object(&object)
+                                    .and_then(|cell| {
+                                        Self::member_cell_warm_probe(agent, &cell, *name)
+                                    })
+                                    .filter(|value| !value.is_object() && !value.is_function())
+                            };
+                            match hit {
+                                Some(value) => *self.frame_get_mut(*hoist_slot) = value,
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        self.ip = *target;
+                    }
+                }
                 Step::FastLoopHead {
                     var,
                     op,
@@ -13709,6 +13770,12 @@ enum Fixup {
         index: usize,
         label: usize,
     },
+    /// The member-read hoist guard (`Step::HoistMemberGuard`): the step's
+    /// `target` resolves at compile end (the general per-iteration loop).
+    HoistMemberGuard {
+        index: usize,
+        label: usize,
+    },
     Break(usize, usize),
     Continue(usize, usize),
     JumpIfChainShort(usize, usize),
@@ -13914,6 +13981,12 @@ struct Compiler {
     /// purity make the length loop-invariant). `None` on the guard-miss
     /// fallback copy, whose hidden slot was never initialized.
     hoisted_length: Option<(usize, usize)>,
+    /// LICM slice: while the FAST copy of a hoisted member-read loop is being
+    /// compiled — `(recv_slot, name, hoist_slot)` for every guard-verified
+    /// read — a matching `RECV.name` read lowers to `LoadLocal(hoist_slot)`.
+    /// Save/restored around nested hoists; the guard-miss fallback copy
+    /// compiles with the outer value, so its reads re-resolve exactly.
+    hoisted_members: Option<Vec<(usize, crux::AtomId, usize)>>,
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -14993,6 +15066,11 @@ impl Compiler {
                         *target = self.labels[&label];
                     }
                 }
+                Fixup::HoistMemberGuard { index, label } => {
+                    if let Step::HoistMemberGuard { target, .. } = &mut self.steps[index] {
+                        *target = self.labels[&label];
+                    }
+                }
                 Fixup::FastLoopHead(index, body_label, after_label) => {
                     if let Step::FastLoopHead {
                         body_start, after, ..
@@ -15772,6 +15850,7 @@ impl Compiler {
             Fixup::JumpIfStrictEqImm { index, .. } => index,
             Fixup::FastLoopHead(index, _, _) => index,
             Fixup::TypedArrayLengthHoist { index, .. } => index,
+            Fixup::HoistMemberGuard { index, .. } => index,
             Fixup::Break(index, _) => index,
             Fixup::Continue(index, _) => index,
             Fixup::JumpIfChainShort(index, _) => index,
@@ -16076,6 +16155,184 @@ impl Compiler {
         Ok(())
     }
 
+    /// LICM slice: whether the loop qualifies for the general invariant
+    /// member-read hoist. Returns the `(receiver slot, name)` reads to hoist
+    /// and the VALUE-operand slots the guard must check, or `None`.
+    fn hoistable_member_loop(
+        &self,
+        init: Option<&ForInit>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+    ) -> Option<MemberHoistPlan> {
+        if self.scope.is_none() || self.acc_binding.is_some() {
+            return None;
+        }
+        let length_atom = Self::length_atom();
+        // A `var` head of identifiers (a lexical head's per-iteration env
+        // machinery would need duplicating across the two loop copies).
+        let head_names: Vec<crux::AtomId> = match init {
+            Some(ForInit::VarDecl {
+                kind: VarDeclKind::Var,
+                decls,
+            }) if decls
+                .iter()
+                .all(|decl| matches!(&decl.pattern, BindingPattern::Ident(_))) =>
+            {
+                decls
+                    .iter()
+                    .filter_map(|decl| match &decl.pattern {
+                        BindingPattern::Ident(name) => Some(*name),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            _ => return None,
+        };
+        if head_names.is_empty() {
+            return None;
+        }
+        // Every value-producing construct must be user-code-free once the
+        // guard has verified the primitive slots and data reads: no calls,
+        // object/array/function/regexp literals, computed/optional member
+        // access, `in`/`instanceof`/`delete`, or suspension, and every named
+        // member READ on a plain-identifier receiver (nothing else can run an
+        // accessor).
+        let mut scan = MemberHoistScan::default();
+        if !stmt_member_hoist_scan(body, &mut scan) {
+            return None;
+        }
+        if let Some(update) = update
+            && !expr_member_hoist_scan(update, &mut scan)
+        {
+            return None;
+        }
+        if let Some(test) = test
+            && !expr_member_hoist_scan(test, &mut scan)
+        {
+            return None;
+        }
+        if let Some(ForInit::VarDecl { decls, .. }) = init {
+            for decl in decls {
+                if let Some(init) = &decl.init
+                    && !expr_member_hoist_scan(init, &mut scan)
+                {
+                    return None;
+                }
+            }
+        }
+        // The receivers must be loop-invariant frame slots.
+        let mut assigned = HashSet::new();
+        collect_assigned_stmt(body, &mut assigned);
+        if let Some(update) = update {
+            collect_assigned_expr(update, &mut assigned);
+        }
+        if let Some(ForInit::VarDecl { decls, .. }) = init {
+            for decl in decls {
+                if let Some(init) = &decl.init {
+                    collect_assigned_expr(init, &mut assigned);
+                }
+            }
+        }
+        let mut reads: Vec<(usize, crux::AtomId)> = Vec::new();
+        for (recv_name, prop) in &scan.reads {
+            // `length` stays on the typed-array length hoist (its JIT probe is
+            // a different receiver class); a loop reading it is not hoisted
+            // here.
+            if *prop == length_atom {
+                return None;
+            }
+            if head_names.contains(recv_name) || assigned.contains(recv_name) {
+                return None;
+            }
+            let BindingLoc::Slot(slot) = self.binding(*recv_name) else {
+                return None;
+            };
+            let entry = (slot, *prop);
+            if !reads.contains(&entry) {
+                reads.push(entry);
+            }
+        }
+        if reads.is_empty() || reads.len() > 8 {
+            return None;
+        }
+        // A lexical declaration in the body could shadow a scanned name (two
+        // slots under one name); the guard resolves names at the enclosing
+        // scope, so reject rather than risk probing a different binding than
+        // the body reads. (`var` is function-scoped — same slot — and nested
+        // function/class/catch declarations are already rejected above.)
+        if stmt_contains_lexical_decl(body) {
+            return None;
+        }
+        // Every value read must resolve to a frame slot the guard can check.
+        let mut prim_slots: Vec<usize> = Vec::new();
+        for name in &scan.value_names {
+            let BindingLoc::Slot(slot) = self.binding(*name) else {
+                return None;
+            };
+            if !prim_slots.contains(&slot) {
+                prim_slots.push(slot);
+            }
+        }
+        if prim_slots.len() > 16 {
+            return None;
+        }
+        Some((reads, prim_slots))
+    }
+
+    /// Emit the hoisted member-read loop: a once-per-loop guard verifies the
+    /// primitive operand slots and probes every invariant read; on a hit the
+    /// values land in hidden frame slots and the SAME loop re-compiles with
+    /// its reads lowered to those slots, on a miss it re-compiles unchanged as
+    /// the general per-iteration loop (only one copy runs). Both copies
+    /// re-emit the head init, so each starts its counter fresh.
+    fn compile_hoisted_member_for(
+        &mut self,
+        init: Option<&ForInit>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+        reads: Vec<(usize, crux::AtomId)>,
+        prim_slots: Vec<usize>,
+    ) -> Result<(), JsError> {
+        self.emit(Step::ResetCompletion);
+        let mut guards: Vec<(usize, crux::AtomId, usize)> = Vec::new();
+        for (recv_slot, name) in reads {
+            let hoist_slot = self.alloc_hoist_slot();
+            guards.push((recv_slot, name, hoist_slot));
+        }
+        let miss_label = self.new_label();
+        let guard_index = self.steps.len();
+        self.emit(Step::HoistMemberGuard {
+            reads: guards.clone(),
+            prim_slots,
+            target: 0,
+        });
+        self.fixups.push(Fixup::HoistMemberGuard {
+            index: guard_index,
+            label: miss_label,
+        });
+        let done_label = self.new_label();
+        // Fast copy: reads lower to the hidden slots. `hoist_suppressed` stops
+        // this same loop re-hoisting itself (and any nested loop in the copy —
+        // merely conservative).
+        let saved_suppressed = self.hoist_suppressed;
+        self.hoist_suppressed = true;
+        let saved_members = self.hoisted_members.replace(guards);
+        self.compile_for(init, test, update, body)?;
+        self.hoisted_members = saved_members;
+        self.hoist_suppressed = saved_suppressed;
+        self.jump(done_label);
+        // Fallback copy: the original per-iteration reads.
+        self.place(miss_label);
+        let saved_suppressed = self.hoist_suppressed;
+        self.hoist_suppressed = true;
+        self.compile_for(init, test, update, body)?;
+        self.hoist_suppressed = saved_suppressed;
+        self.place(done_label);
+        Ok(())
+    }
+
     /// Compile a `for` body. A braced block whose statements never transfer
     /// control out of it compiles without the statement-list wrapper: its
     /// per-iteration `ListBegin`/`ListEnd` would only save/restore the
@@ -16231,10 +16488,15 @@ impl Compiler {
         // two loop copies), so the eligible shape returns before the normal
         // path. `hoist_suppressed` stops the fallback loop's own re-hoist
         // (its test is the original member shape).
-        if !self.hoist_suppressed
-            && let Some(recv_slot) = self.hoistable_length_loop(init, test, update, body)
-        {
-            return self.compile_hoisted_length_for(init, test, update, body, recv_slot);
+        if !self.hoist_suppressed {
+            if let Some(recv_slot) = self.hoistable_length_loop(init, test, update, body) {
+                return self.compile_hoisted_length_for(init, test, update, body, recv_slot);
+            }
+            if let Some((reads, prim_slots)) = self.hoistable_member_loop(init, test, update, body)
+            {
+                return self
+                    .compile_hoisted_member_for(init, test, update, body, reads, prim_slots);
+            }
         }
         self.emit(Step::ResetCompletion);
         let mut has_loop_env = false;
@@ -18874,8 +19136,47 @@ impl Compiler {
         true
     }
 
+    /// LICM slice: whether a member read compiles to a hoisted hidden slot.
+    /// Inside the fast copy of a hoisted member-read loop, a `RECV.name` read
+    /// whose receiver resolves to the exact slot the guard probed, for the
+    /// exact name, lowers to a plain `LoadLocal` of the hidden slot — the
+    /// guard verified the receiver's own data property and the loop's operand
+    /// purity, so the value is loop-invariant. Matching by RESOLVED slot (not
+    /// name) keeps a shadowing declaration on the member path.
+    fn try_hoisted_member_read(&mut self, member: &syntax::ast::MemberExpr) -> bool {
+        if member.optional || matches!(member.object.kind, ExprKind::Super) {
+            return false;
+        }
+        let syntax::ast::MemberProperty::Name(prop) = &member.property else {
+            return false;
+        };
+        let mut object = &member.object;
+        while let ExprKind::Paren(inner) = &object.kind {
+            object = inner;
+        }
+        let ExprKind::Ident(name) = &object.kind else {
+            return false;
+        };
+        let BindingLoc::Slot(slot) = self.binding(*name) else {
+            return false;
+        };
+        let Some(hoist_slot) = self.hoisted_members.as_ref().and_then(|guards| {
+            guards
+                .iter()
+                .find(|(recv_slot, read_name, _)| *recv_slot == slot && read_name == prop)
+                .map(|(_, _, hoist_slot)| *hoist_slot)
+        }) else {
+            return false;
+        };
+        self.emit(Step::LoadLocal { slot: hoist_slot });
+        true
+    }
+
     fn compile_member(&mut self, member: &syntax::ast::MemberExpr) -> Result<(), JsError> {
         if self.try_hoisted_length_read(member) {
+            return Ok(());
+        }
+        if self.try_hoisted_member_read(member) {
             return Ok(());
         }
         if matches!(member.object.kind, ExprKind::Super) {
@@ -23690,6 +23991,194 @@ fn collect_assigned_expr(expr: &Expr, assigned: &mut HashSet<crux::AtomId>) {
 // `RECV[expr] = v` STORE (element writes and own-prop defines cannot change
 // the accessor-served length; other receivers could alias RECV through a
 // global, so they are excluded entirely).
+
+/// LICM: a member-read hoist plan — the `(receiver slot, name)` reads to
+/// hoist and the VALUE-operand slots the guard must check.
+type MemberHoistPlan = (Vec<(usize, crux::AtomId)>, Vec<usize>);
+
+/// LICM slice: the invariant member reads a loop body exposes and the
+/// identifiers it reads as VALUES. The guard checks those slots hold
+/// non-object primitives, so no operand coercion can re-enter user code and
+/// mutate a hoisted receiver, and the read values are own data properties.
+#[derive(Default)]
+struct MemberHoistScan {
+    reads: Vec<(crux::AtomId, crux::AtomId)>,
+    value_names: HashSet<crux::AtomId>,
+}
+
+/// Whether `stmt` declares a lexical (`let`/`const`) binding anywhere in its
+/// statement subtree. Only the statement kinds the purity scan admits need
+/// walking.
+fn stmt_contains_lexical_decl(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::VarDecl { kind, .. } => *kind != VarDeclKind::Var,
+        StmtKind::Block(block) => block.stmts.iter().any(stmt_contains_lexical_decl),
+        StmtKind::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            stmt_contains_lexical_decl(consequent)
+                || alternate
+                    .as_ref()
+                    .is_some_and(|a| stmt_contains_lexical_decl(a))
+        }
+        StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => {
+            stmt_contains_lexical_decl(body)
+        }
+        StmtKind::For { init, body, .. } => {
+            let head_lexical = matches!(
+                init,
+                Some(ForInit::VarDecl { kind, .. }) if *kind != VarDeclKind::Var
+            );
+            head_lexical || stmt_contains_lexical_decl(body)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `expr` is safe to run per iteration across the hoisted loop's two
+/// copies without user code (see `MemberHoistScan`). Records every value
+/// identifier and every identifier-receiver named member read.
+fn expr_member_hoist_scan(expr: &Expr, scan: &mut MemberHoistScan) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(lit) => !matches!(lit, syntax::ast::Literal::RegExp { .. }),
+        ExprKind::Ident(name) => {
+            scan.value_names.insert(*name);
+            true
+        }
+        ExprKind::Paren(inner) => expr_member_hoist_scan(inner, scan),
+        ExprKind::Unary { op, operand } => {
+            !matches!(op, UnaryOp::Delete) && expr_member_hoist_scan(operand, scan)
+        }
+        ExprKind::Update { target, .. } => {
+            // A bare `++`/`--` on a binding; a member update is a write.
+            if let ExprKind::Ident(name) = &target.kind {
+                scan.value_names.insert(*name);
+                true
+            } else {
+                false
+            }
+        }
+        ExprKind::Binary { op, left, right } => {
+            !matches!(op, BinaryOp::In | BinaryOp::Instanceof)
+                && expr_member_hoist_scan(left, scan)
+                && expr_member_hoist_scan(right, scan)
+        }
+        ExprKind::Logical { left, right, .. } => {
+            expr_member_hoist_scan(left, scan) && expr_member_hoist_scan(right, scan)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_member_hoist_scan(test, scan)
+                && expr_member_hoist_scan(consequent, scan)
+                && expr_member_hoist_scan(alternate, scan)
+        }
+        ExprKind::Sequence(exprs) => exprs.iter().all(|e| expr_member_hoist_scan(e, scan)),
+        ExprKind::Assign { target, value, .. } => {
+            // Only a plain binding target; a member/element write could alias
+            // a hoisted receiver or run a setter.
+            if let ExprKind::Ident(name) = &target.kind {
+                scan.value_names.insert(*name);
+                expr_member_hoist_scan(value, scan)
+            } else {
+                false
+            }
+        }
+        ExprKind::Member(MemberExpr {
+            object,
+            property: MemberProperty::Name(prop),
+            optional: false,
+            ..
+        }) => {
+            let mut receiver = object;
+            while let ExprKind::Paren(inner) = &receiver.kind {
+                receiver = inner;
+            }
+            if let ExprKind::Ident(name) = &receiver.kind {
+                scan.reads.push((*name, *prop));
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether `stmt` may appear in a hoisted member-read loop's body (see
+/// `MemberHoistScan`). Control transfers are excluded like the length hoist:
+/// the fused loop copies must keep their flow inside.
+fn stmt_member_hoist_scan(stmt: &Stmt, scan: &mut MemberHoistScan) -> bool {
+    match &stmt.kind {
+        StmtKind::Empty | StmtKind::Debugger => true,
+        StmtKind::Block(block) => block.stmts.iter().all(|s| stmt_member_hoist_scan(s, scan)),
+        StmtKind::Expr(expr) => expr_member_hoist_scan(expr, scan),
+        StmtKind::VarDecl { decls, .. } => decls.iter().all(|decl| {
+            matches!(&decl.pattern, BindingPattern::Ident(_))
+                && decl
+                    .init
+                    .as_ref()
+                    .is_none_or(|init| expr_member_hoist_scan(init, scan))
+        }),
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_member_hoist_scan(test, scan)
+                && stmt_member_hoist_scan(consequent, scan)
+                && alternate
+                    .as_ref()
+                    .is_none_or(|a| stmt_member_hoist_scan(a, scan))
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            expr_member_hoist_scan(test, scan) && stmt_member_hoist_scan(body, scan)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let init_ok = match init {
+                None => true,
+                Some(ForInit::Expr(expr)) => expr_member_hoist_scan(expr, scan),
+                Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
+                    matches!(&decl.pattern, BindingPattern::Ident(_))
+                        && decl
+                            .init
+                            .as_ref()
+                            .is_none_or(|init| expr_member_hoist_scan(init, scan))
+                }),
+            };
+            init_ok
+                && test
+                    .as_ref()
+                    .is_none_or(|t| expr_member_hoist_scan(t, scan))
+                && update
+                    .as_ref()
+                    .is_none_or(|u| expr_member_hoist_scan(u, scan))
+                && stmt_member_hoist_scan(body, scan)
+        }
+        StmtKind::Labeled { .. }
+        | StmtKind::Break(_)
+        | StmtKind::Continue(_)
+        | StmtKind::Return(_)
+        | StmtKind::Throw(_)
+        | StmtKind::FunctionDecl(_)
+        | StmtKind::ClassDecl(_)
+        | StmtKind::UsingDecl { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::With { .. }
+        | StmtKind::ForIn { .. }
+        | StmtKind::ForOf { .. } => false,
+    }
+}
 
 /// Whether `expr` may appear in a hoisted loop's body (see the module note).
 fn expr_is_hoist_pure(expr: &Expr, recv: crux::AtomId, length_atom: crux::AtomId) -> bool {
