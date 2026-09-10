@@ -456,15 +456,38 @@ pub(crate) struct FxHasher(u64);
 impl std::hash::Hasher for FxHasher {
     fn write(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            self.0 =
-                (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+            self.mix(u64::from(byte));
         }
     }
+    fn write_u8(&mut self, n: u8) {
+        self.mix(u64::from(n));
+    }
+    fn write_u16(&mut self, n: u16) {
+        self.mix(u64::from(n));
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.mix(u64::from(n));
+    }
     fn write_u64(&mut self, n: u64) {
-        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        self.mix(n);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.mix(n as u64);
     }
     fn finish(&self) -> u64 {
         self.0
+    }
+}
+
+impl FxHasher {
+    /// The FxHash round for one whole word. The `Hasher` trait's primitive
+    /// methods default to `self.write(&n.to_ne_bytes())` (a byte-at-a-time
+    /// loop), which made every derived integer hash — an atom-keyed
+    /// `Map::transitions` lookup, a GC address — pay 4-8 rounds for one
+    /// integer; the whole-word round is one.
+    #[inline]
+    fn mix(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
     }
 }
 
