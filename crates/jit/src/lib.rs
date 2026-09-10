@@ -2201,6 +2201,24 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_runs_a_testless_for_head() {
+        // A `for (;;)` head has no test value to push: the old dummy test
+        // push leaked one working-stack slot per iteration, and the compiled
+        // loop ran past its fixed buffer (a segfault after ~`INLINE_JIT_BUF`
+        // iterations). This must complete 100k iterations in compiled code.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f() { var c = 0; for (;;) { c++; if (c === 100000) break; } return c; } \
+                     f();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(100000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_runs_a_string_literal_body() {
         // Cut 54: a body with string literals compiles — `s += 'x'` in a
         // loop (the concat rides the binary Add's `concat_strings` helper).

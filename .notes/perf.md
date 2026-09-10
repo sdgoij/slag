@@ -8505,7 +8505,17 @@ Fix (`crates/runtime/src/ir.rs`): a `compile_fast_loop_body(body, continue_label
 
 Verification: the empty-block, empty-statement (`;`), lexical-head, `while`, `do`, and bare-`for` shapes all terminate and agree across node / jit / `--jitless` / `--gc-stress` (`scratch/empty_loop_battery.js`). Regression tests: `eval::tests::empty_for_body_keeps_a_distinct_body_block` (structural — fails fast where a behavioral test would hang) and `jit::tests::installed_jit_runs_an_empty_loop_body` (e2e). Gates: clippy `--workspace --all-targets -D warnings` clean; `cargo test --workspace` 4772 passed / 0 failed; three release test262 sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang).
 
-Side finding (SEPARATE, NOT fixed — pre-existing and unrelated to the empty-body shape): `function e6(n) { var c = 0; for (;;) { c++; if (c === n) break; } return c; } e6(100000)` SEGFAULTS under the JIT at large iteration counts (6 iterations are fine; `--jitless` is fine; reproduced on the committed pre-fix binary). A `for(;;)` with a non-empty body takes the general (non-`FastLoopHead`) loop path, so this fix neither causes nor addresses it; it needs its own investigation (likely the general compiled loop's back-edge / safepoint interaction).
+Side finding (SEPARATE, fixed the same day — see the next FIXED entry): `function e6(n) { var c = 0; for (;;) { c++; if (c === n) break; } return c; } e6(100000)` SEGFAULTED under the JIT at large iteration counts (6 iterations were fine; `--jitless` was fine; reproduced on the committed pre-fix binary). A `for(;;)` with a non-empty body takes the general (non-`FastLoopHead`) loop path, so the empty-body fix neither caused nor addressed it.
+
+### FIXED (2026-09-10): the test-less `for(;;)` head leaked a stack slot per iteration (the compiled segfault)
+
+Same-day follow-up to the side finding above: `function f() { var c = 0; for (;;) { c++; if (c === 100000) break; } return c; } f()` segfaulted under the JIT, while `--jitless` and short loops were fine. Bisect: n=50 completed, n=100 segfaulted — the `INLINE_JIT_BUF` (64 slots) threshold.
+
+Root cause: in `compile_for`, the test-less head arm (`test == None` — `for (;;)` / `for (init;; update)`) emitted `Step::Push(Value::Boolean(true))` at the `test_label`. Nothing consumes that dummy test value: no `jump_if_false` is emitted for the test-less form, and the loop's backward `Jump(test_label)` re-enters the push every iteration — so the value stack grew by one slot PER ITERATION. The interpreter's stack is a heap `Vec`, so it merely grew; the JIT's working buffer is sized from the static step depth (`max_stack_usage`), so the leak ran the machine code past `buf_end` and segfaulted once the loop exceeded the inline buffer.
+
+Fix (`crates/runtime/src/ir.rs`): emit nothing for a test-less head. `test_label` is only the backward-jump target (the `continue` target is `continue_label`), so with no test the back-jump lands on the body start — an unconditional loop with no per-iteration stack growth. It also drops one wasted dispatch per iteration in the interpreter.
+
+Verification: `scratch/for_no_test_battery.js` (bare `for(;;)`, with update, with init, `continue`, nested, `while(true)`, `do/while`) all agree with node across jit / `--jitless` / `--gc-stress`. Regression tests: `eval::tests::testless_for_head_emits_no_dummy_test_push` (structural) and `jit::tests::installed_jit_runs_a_testless_for_head` (e2e, 100k iterations). Gates: clippy `--workspace --all-targets -D warnings` clean; `cargo test --workspace` 4774 passed / 0 failed; three release test262 sweeps at baseline (language 23721/3 skip, built-ins 23657/155 skip, annexB 1086/1086, zero fail/crash/hang).
 
 ## Deferred milestones
 

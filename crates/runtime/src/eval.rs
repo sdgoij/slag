@@ -4341,6 +4341,39 @@ mod tests {
     }
 
     #[test]
+    fn testless_for_head_emits_no_dummy_test_push() {
+        // A `for (;;)` / `for (init;; update)` head has no test, so the
+        // compiler must emit nothing for it. It used to emit a dummy
+        // `Push(true)` at the test label that nothing consumed (the
+        // backward jump re-entered it and no `jump_if_false` popped it),
+        // leaking one value-stack slot PER ITERATION. The interpreter only
+        // grew its heap stack, but the JIT writes into a fixed working
+        // buffer sized from the static step depth, so a long loop ran past
+        // `buf_end` and segfaulted (~`INLINE_JIT_BUF` iterations).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "function f() { var c = 0; for (;;) { c++; if (c === 100000) break; } return c; }",
+            )
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            !ir.steps.iter().any(
+                |s| matches!(s, crate::ir::Step::Push(value) if *value == Value::Boolean(true))
+            ),
+            "a test-less for head must not push a dummy test value"
+        );
+        assert!(
+            ir.steps
+                .iter()
+                .any(|s| matches!(s, crate::ir::Step::Jump(_))),
+            "the test-less head still needs its backward jump"
+        );
+        assert_eq!(agent.run_script("f()").unwrap(), Value::Number(100000.0));
+    }
+
+    #[test]
     fn braced_fused_store_bodies_lower_to_register_runs() {
         // M7 slice 1a: a braced loop body whose last statement is a
         // self-balancing fused store (`{ n += 1; }` — the store pops its

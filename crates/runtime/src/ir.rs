@@ -16375,7 +16375,16 @@ impl Compiler {
                     self.jump_if_false(end_label);
                 }
             }
-            None => self.emit(Step::Push(Value::Boolean(true))),
+            None => {
+                // A test-less head (`for (;;)` / `for (init;; update)`) is an
+                // unconditional loop: emit no test. A dummy `Push(true)` here
+                // is never consumed (the back-jump re-enters it, and no
+                // `jump_if_false` pops it), so it leaked one stack slot PER
+                // ITERATION — the interpreter merely grew its heap stack,
+                // but the JIT writes into a fixed working buffer sized from
+                // the static step depth, so a long loop ran past `buf_end`
+                // and segfaulted (~64 iterations, `INLINE_JIT_BUF`).
+            }
         }
         self.compile_for_body(body)?;
         self.place(continue_label);
