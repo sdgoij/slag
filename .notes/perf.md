@@ -8965,6 +8965,75 @@ dropped — verified by disabling it); six test262 sweeps at baseline (language
 object-valued global, global written in-loop, accessor global, global+counter)
 byte-identical across jit / `--jitless` / node and again under `--gc-stress`.
 
+### PROBE (2026-09-10): the `string concat` append row is allocation-REGISTRATION-bound — the node size is not the lever, `register` is ~5ns/iter
+
+The row (`scratch/sconcat/pin.js`, the pinned fixed-reps protocol —
+`--jit-bench`/`--corpus` are bimodal on it): `append_acc` =
+`var s = x; for (i = 0; i < 100000; i++) s += x; return s.length` measures
+jit **26.6-27.0ns/iter** vs node 3.10 (8.7x). The loop is one lean
+`ConsString` box per iteration and all 100k stay live (the chain IS the
+accumulator), so this is an allocation benchmark, not a concat benchmark.
+An in-process `JsString::concat` chain simulation in `crux` reproduces (and
+exceeds, page-fault-inflated at 29ns) the same per-append cost, so neither
+the JIT lowering nor the `binary_inline`/`concat_strings` FFI layer is the
+target — the cost is the concat+alloc machinery itself.
+
+FALSIFIED — "node's node is 64B, so shrink ours". The two premises were both
+wrong. (1) The suggested cache swap is byte-free: `OnceLock<Arc<[u16]>>` is
+24B and `GcCell<Option<Arc<[u16]>>>` is ALSO 24B (a fat `Arc` pointer, not
+the 8B assumed). (2) Even the safe 16B `OnceCell<Arc<[u16]>>` — which does
+shrink `JsString` 56 -> 48 — changes nothing at runtime, because
+`GcBox<JsString>` = 8 + 48 = 56 rounds up to **64** under the 16B arena
+granularity: the allocation size class is unchanged. The row confirms it
+(27.0 -> 26.6, within noise). A direct +16B pad on the node (GcBox 64 -> 80)
+cost only **+1.3ns**, so the marginal per-byte cost is ~0.08ns/B — the
+`JsString` footprint is not the lever.
+
+Dead code found: `ConsString`/`Rope`'s `depth` field. The over-deep fold it
+guarded was dropped when `ConsString` replaced the rope-append (commit
+2a6d838); `depth()` is now written on every append (`1 + left.depth()`) and
+read only to compute the next `depth`, with no consumer. Removed, along with
+the stale "fold" doc comments and the `OnceLock` mentions in `parser`/`crux`.
+
+MEASURED LEVER — `Heap::register`. The per-box fat-pointer push into
+`live: Vec<*mut GcBox<dyn Trace>>` (plus the `live_min`/`live_max` branches)
+costs **5.1ns/iter**: an A/B with `register` early-returning (throwaway
+build; the boxes leak, which is safe because the sweep iterates `live`)
+drops the row **26.6 -> 21.5**. Pre-reserving the `live` Vec (eliminating its
+doubling copies) changed nothing, so the cost is the per-entry store and
+branches, not growth. This is the architectural difference from V8: V8 has
+NO per-object registration — the young-gen collector recovers object bounds
+from the allocation range/page bitmaps — while Slag's collector needs the
+registry for sweep enumeration, the conservative stack scan's sorted address
+list, the abort-path mark reset, and `live_count`.
+
+Design it implies (documented, NOT attempted — a GC-internals slice): walk
+the arena (every `GcBox` already stores its rounded `size`) with a per-slot
+live bit, and recover type info from a vtable (trace fn + drop fn) in the
+box header; the 8B pointer fits the existing header padding, so the hot
+types are byte-neutral (`GcBox<JsString>` 16 + 48 = 64, `GcBox<JsObject>`
+16 + 528 = 544) and the `live` registry disappears entirely. Not landed
+because it rewrites the collector's enumeration and stack-scan list and needs
+the full GC-stress/test262 battery behind it.
+
+LANDED from the probe: the dead-`depth` removal + the `OnceLock` ->
+`OnceCell` cache (single-threaded, so no atomicity is needed, and the type is
+smaller) + the stale comment fixes. Perf ~neutral (26.6 vs 27.0, within
+noise), but it removes real per-append work and a field.
+
+Also measured on the same protocol (`scratch/sconcat/pin4.js`, no code): the
+expression-position shape `t = s0 + x` runs ~37ns vs the `+=` row's ~31ns at
+the same 100k, and merely using a GLOBAL loop bound adds ~5ns/iter — both are
+read/dispatch machinery, not concat.
+
+Gates: clippy `--workspace --all-targets -D warnings` clean;
+`cargo test --workspace` 4780 pass / 0 fail; `pin.js` baseline numbers
+unchanged (base_100k 26.5, acc_num/loop floor 2.3-2.4ns). The throwaway
+`probe_alloc_cost` test (written for this probe) was deleted — its
+"payload-size cost" term conflated the measured payload write with a
+`JsString::from_utf8` call in the write closure, which is what produced the
+misleading 0.37ns/B figure the padding A/B above corrects.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

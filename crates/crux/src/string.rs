@@ -1,6 +1,7 @@
 //! JavaScript strings: UTF-16 code-unit sequences (spec 6.1.4) and the string
 //! interner backing `AtomId`.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,9 +22,10 @@ use crate::heap::{GcAny, Trace};
 /// (Rc bumps, no copies). That makes ropes `!Send`, which is fine: the one
 /// `Send` consumer — the well-known-symbol table — keeps its symbols
 /// thread-locally instead. Flat buffers are `Arc`-shared, so flat clones are
-/// O(1). The rope tracks a tree depth and folds an over-deep left side into a
-/// single shared flat; both the fold and the final drop are amortized across
-/// the cap appends, so arbitrarily long append chains stay linear.
+/// O(1). The final drop is amortized: a leaf-leaning chain's boxes are
+/// reclaimed one at a time by the collector, never recursively. (A
+/// left-leaning append chain is walked iteratively, both when flattening and
+/// when dropping.)
 pub enum JsString {
     Flat(Arc<[u16]>),
     /// Cut 67: a string of at most [`SMALL_STRING_CAP`] code units stored
@@ -39,33 +41,27 @@ pub enum JsString {
     },
     /// Lean append-node for `s += char` patterns. Each node stores a left
     /// and right pointer — like V8's ConsString — but no buffer. This
-    /// makes each append a lean Gc allocation (~48 bytes). The accumulated
-    /// string is materialized lazily on first `as_slice()` access via
-    /// iterative traversal of the ConsString chain.
+    /// makes each append a single Gc allocation carrying no copied content.
+    /// The accumulated string is materialized lazily on first `as_slice()`
+    /// access via iterative traversal of the ConsString chain.
     ConsString {
         left: Handle<JsString>,
         right: Handle<JsString>,
         len: usize,
-        depth: u32,
-        flat: OnceLock<Arc<[u16]>>,
+        flat: OnceCell<Arc<[u16]>>,
     },
     /// Full binary rope for non-trivial concatenations (both sides large, or
-    /// when `ConsString` isn't the better fit). The binary-tree structure
-    /// keeps depth logarithmic for balanced trees.
+    /// when `ConsString` isn't the better fit): a balanced tree over two
+    /// operand handles, so neither side dominates the flatten walk.
     Rope {
         left: Option<Handle<JsString>>,
         right: Option<Handle<JsString>>,
         len: usize,
-        /// The rope's tree depth (0 for a flat leaf): concat folds the left
-        /// side into one shared flat once it would exceed `ROPE_MAX_DEPTH`.
-        /// Bounding the depth keeps the final drop (and any single flatten) at
-        /// O(cap) nodes. u32 is far beyond any real append chain.
-        depth: u32,
         /// The materialized contiguous form, computed on first access; immutable
         /// once set (strings are immutable), which is what makes `as_slice`
         /// return a stable reference. (Rope clones get a fresh cache — a rope
         /// flattened through two handles flattens twice.)
-        flat: OnceLock<Arc<[u16]>>,
+        flat: OnceCell<Arc<[u16]>>,
     },
     /// An O(1) substring view (V8's SlicedString): the code units of `parent`
     /// at `[offset, offset + len)`. `substring`/`slice` return this instead of
@@ -78,7 +74,7 @@ pub enum JsString {
         parent: Handle<JsString>,
         offset: usize,
         len: usize,
-        flat: OnceLock<Arc<[u16]>>,
+        flat: OnceCell<Arc<[u16]>>,
     },
 }
 
@@ -88,7 +84,7 @@ enum FlattenLeaf<'a> {
 }
 
 /// The flatten cache of a rope node, if `s` is one.
-fn rope_cache(s: &JsString) -> Option<&OnceLock<Arc<[u16]>>> {
+fn rope_cache(s: &JsString) -> Option<&OnceCell<Arc<[u16]>>> {
     match s {
         JsString::ConsString { flat, .. }
         | JsString::Rope { flat, .. }
@@ -223,8 +219,7 @@ impl JsString {
                         left: Some(*left),
                         right: Some(*right),
                         len,
-                        depth: 1,
-                        flat: OnceLock::new(),
+                        flat: OnceCell::new(),
                     });
                 }
             });
@@ -232,7 +227,6 @@ impl JsString {
         // Default: create a lean ConsString append-node (like V8).
         // Each append = one Gc allocation, written in place. No buffer, no
         // Arc, no Vec clone.
-        let depth = 1 + left.depth();
         Handle::new_in_place(|ptr: *mut JsString| {
             // SAFETY: `new_in_place` hands back the fresh slot; this
             // closure writes every field before returning.
@@ -241,8 +235,7 @@ impl JsString {
                     left: *left,
                     right: *right,
                     len,
-                    depth,
-                    flat: OnceLock::new(),
+                    flat: OnceCell::new(),
                 });
             }
         })
@@ -270,7 +263,7 @@ impl JsString {
                     parent: *parent,
                     offset: from,
                     len: to - from,
-                    flat: OnceLock::new(),
+                    flat: OnceCell::new(),
                 });
             }
         })
@@ -280,14 +273,6 @@ impl JsString {
     /// the units directly with no flatten cost.
     fn is_leaf(&self) -> bool {
         matches!(self, JsString::Flat(_) | JsString::Small { .. })
-    }
-
-    /// The tree depth: 0 for a flat string, else the node's cached depth.
-    fn depth(&self) -> u32 {
-        match self {
-            JsString::Flat(_) | JsString::Small { .. } | JsString::Sliced { .. } => 0,
-            JsString::ConsString { depth, .. } | JsString::Rope { depth, .. } => *depth,
-        }
     }
 
     /// The number of code units (spec 6.1.4.1 StringLength).
@@ -339,8 +324,8 @@ impl JsString {
     /// box's flatten cache is materialized HERE and seeded into the copy —
     /// the value `to_string` hands a string builtin for a rope `this` would
     /// otherwise re-flatten the rope on every use (each owned clone carries a
-    /// fresh `OnceLock`). Content is immutable, so seeding the copy with the
-    /// box's buffer is exact, and the box flattens only once for its lifetime.
+    /// fresh cache). Content is immutable, so seeding the copy with the box's
+    /// buffer is exact, and the box flattens only once for its lifetime.
     pub fn owned_of(handle: &Handle<JsString>) -> JsString {
         match &**handle {
             JsString::Flat(units) => JsString::Flat(units.clone()),
@@ -354,12 +339,16 @@ impl JsString {
             // don't re-flatten. For a `Sliced` the boxed buffer is the whole
             // parent materialization; the copy windows it the same way.
             JsString::ConsString { .. } | JsString::Rope { .. } | JsString::Sliced { .. } => {
-                let _ = handle.as_slice();
+                handle.as_slice();
                 let copy = (**handle).clone();
                 if let Some(boxed) = rope_cache(handle).and_then(|cache| cache.get())
                     && let Some(fresh) = rope_cache(&copy)
                 {
-                    let _ = fresh.set(boxed.clone());
+                    // `copy` is a fresh clone, so its cache is empty; give it
+                    // the box's already-materialized buffer so owned reads
+                    // don't re-flatten it. Content is immutable, so sharing
+                    // the buffer is exact.
+                    fresh.get_or_init(|| boxed.clone());
                 }
                 copy
             }
@@ -460,30 +449,20 @@ impl Clone for JsString {
                 units: *units,
             },
             JsString::ConsString {
-                left,
-                right,
-                len,
-                depth,
-                ..
+                left, right, len, ..
             } => JsString::ConsString {
                 left: *left,
                 right: *right,
                 len: *len,
-                depth: *depth,
-                flat: OnceLock::new(),
+                flat: OnceCell::new(),
             },
             JsString::Rope {
-                left,
-                right,
-                len,
-                depth,
-                ..
+                left, right, len, ..
             } => JsString::Rope {
                 left: *left,
                 right: *right,
                 len: *len,
-                depth: *depth,
-                flat: OnceLock::new(),
+                flat: OnceCell::new(),
             },
             JsString::Sliced {
                 parent,
@@ -494,7 +473,7 @@ impl Clone for JsString {
                 parent: *parent,
                 offset: *offset,
                 len: *len,
-                flat: OnceLock::new(),
+                flat: OnceCell::new(),
             },
         }
     }
@@ -952,6 +931,10 @@ mod tests {
 
     #[test]
     fn owned_of_seeds_the_owned_copy_from_the_box_flatten_cache() {
+        // Must also pass under `cargo test -p crux --release`: a seed guarded
+        // by `debug_assert!` would pass here (debug) and fail there, because
+        // the assert — and the `set` inside it — compiles out in release.
+        //
         // `to_string` on a String primitive hands a string builtin an OWNED
         // copy of the rope box (`JsString::owned_of`). The copy must not
         // re-flatten the rope on every use: owned_of materializes the box once
@@ -969,6 +952,14 @@ mod tests {
         assert!(rope_cache(&s).is_some_and(|c| c.get().is_none()));
         // The owned copy a builtin would receive for `this`.
         let owned = JsString::owned_of(&s);
+        // `owned_of` must have seeded the copy itself. Assert BEFORE any
+        // content read on `owned`: `len`/`code_unit`/`as_slice` seed the cache
+        // lazily, which would mask a missing seed. This is the release-mode
+        // regression guard — a seed gated by `debug_assert!` fails only here.
+        assert!(
+            rope_cache(&owned).is_some_and(|c| c.get().is_some()),
+            "owned_of must seed the owned copy's flatten cache"
+        );
         assert_eq!(owned.len(), 200);
         assert_eq!(owned.code_unit(0), Some(b'x' as u16));
         // The materialization happened in the box's cache (once), not per copy.
@@ -993,9 +984,8 @@ mod tests {
 
     #[test]
     fn deep_append_chain_drops_and_flattens_iteratively() {
-        // Left-leaning appends: the depth cap folds the tree every
-        // ROPE_MAX_DEPTH appends, so it stays shallow — the fold's
-        // materialization and the final drop exercise the iterative paths.
+        // Left-leaning appends: a 200k-deep chain — flatten and drop must
+        // both stay iterative (the chain is never folded).
         let mut s = Handle::new(JsString::from_utf8(""));
         let leaf = Handle::new(JsString::from_utf8("x"));
         for i in 0..200_000 {
@@ -1010,8 +1000,8 @@ mod tests {
         let units = s.as_slice();
         assert!(units.iter().all(|&u| u == b'x' as u16));
 
-        // Right-leaning prepends: the cap only inspects the left side, so the
-        // depth grows unbounded — drop and flatten must still be iterative.
+        // Right-leaning prepends: the chain grows unbounded to the right —
+        // drop and flatten must still be iterative.
         let mut p = Handle::new(JsString::from_utf8(""));
         for _ in 0..200_000 {
             p = JsString::concat(&leaf, &p);
@@ -1114,10 +1104,17 @@ mod tests {
 
     #[test]
     fn owned_of_a_view_seeds_the_copy_cache() {
+        // Must also pass under `cargo test -p crux --release` (see the note on
+        // `owned_of_seeds_the_owned_copy_from_the_box_flatten_cache`).
         let units: Vec<u16> = (0..100).map(|i| b'a' as u16 + (i % 26) as u16).collect();
         let parent = Handle::new(JsString::from_utf16(&units));
         let view = JsString::slice_view(&parent, 10, 90);
         let owned = JsString::owned_of(&view);
+        // Assert before the content read below (which would seed lazily).
+        assert!(
+            rope_cache(&owned).is_some_and(|c| c.get().is_some()),
+            "owned_of must seed the owned copy's cache"
+        );
         assert_eq!(owned.len(), 80);
         assert_eq!(owned.as_slice(), &units[10..90]);
         // The box materialized once and the copy's cache carries the buffer.

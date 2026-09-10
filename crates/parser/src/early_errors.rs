@@ -13,8 +13,8 @@
 //! continue/break a label declared outside.
 
 // The declaration-name sets below are keyed by JsString. A JsString hash is
-// content-stable: a rope's first hash materializes its flat cache (OnceLock),
-// but the cached form never changes the hash output, so these sets are sound.
+// content-stable: a rope's first hash materializes its flat cache, but the
+// cached form never changes the hash output, so these sets are sound.
 #![allow(clippy::mutable_key_type)]
 //! be seen by labels in the enclosing statement list.
 
