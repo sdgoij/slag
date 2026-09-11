@@ -27,8 +27,8 @@ use crux::object::JsObject as CruxObject;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 use raylib_sys::{
-    BoundingBox, Camera3D, Color, Image, Matrix, Model, ModelAnimation, Rectangle, RenderTexture2D,
-    Shader, Sound, Texture2D, Transform, Vector2, Vector3,
+    BoundingBox, Camera3D, Color, Image, Matrix, Model, ModelAnimation, Music, Rectangle,
+    RenderTexture2D, Shader, Sound, Texture2D, Transform, Vector2, Vector3,
 };
 
 use crate::agent::Agent;
@@ -49,6 +49,19 @@ static SOUNDS: Mutex<Vec<SoundSlot>> = Mutex::new(Vec::new());
 struct SoundSlot(Sound);
 unsafe impl Send for SoundSlot {}
 unsafe impl Sync for SoundSlot {}
+
+/// Music streams created by `loadMusic`, indexed by handle.
+static MUSIC: Mutex<Vec<MusicSlot>> = Mutex::new(Vec::new());
+
+/// A music stream plus its loaded flag. `Music` carries raw stream pointers, so
+/// the slot needs the manual `Send`/`Sync` impls (it is still only ever touched
+/// from the window thread).
+struct MusicSlot {
+    music: Music,
+    loaded: bool,
+}
+unsafe impl Send for MusicSlot {}
+unsafe impl Sync for MusicSlot {}
 
 /// Models created by `loadModel`, indexed by handle. raylib keeps a model's
 /// animations in a separate array (loaded by `LoadModelAnimations`), so a slot
@@ -547,37 +560,42 @@ fn draw_billboard_rec(args: &[Value]) -> Result<Value, JsError> {
 
 // ---- models (needs the rmodels C module) ----
 
-/// A model file raylib can open. An embedded asset is materialised to a temp
-/// file for the duration of the load and removed afterwards: raylib's model
-/// loaders take a *path*, and both the model and its animations are read
-/// eagerly during the two load calls.
-struct ModelFile {
+/// A file raylib can open from a path. An embedded asset is materialised to a
+/// temp file for the duration of the load and removed afterwards: raylib's
+/// model, sound and music loaders all take a *path*, and pick a decoder from its
+/// extension, so the original extension is kept.
+struct AssetFile {
     path: CString,
     temp: Option<std::path::PathBuf>,
 }
 
-impl ModelFile {
-    fn open(name: &str) -> Result<ModelFile, JsError> {
+impl AssetFile {
+    fn open(name: &str, what: &str) -> Result<AssetFile, JsError> {
         if let Some((_, data)) = embedded_asset(name) {
+            let extension = std::path::Path::new(name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| format!(".{extension}"))
+                .unwrap_or_default();
             let mut temp = std::env::temp_dir();
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_nanos())
                 .unwrap_or(0);
-            temp.push(format!("slag-raylib-{stamp}.glb"));
+            temp.push(format!("slag-raylib-{stamp}{extension}"));
             std::fs::write(&temp, data).map_err(|error| {
                 JsError::new(
                     ErrorKind::TypeError,
-                    format!("rl.loadModel: cannot materialise embedded asset {name}: {error}"),
+                    format!("rl.{what}: cannot materialise embedded asset {name}: {error}"),
                 )
             })?;
             let path = CString::new(temp.to_string_lossy().as_bytes()).map_err(|_| {
                 JsError::new(
                     ErrorKind::TypeError,
-                    "rl.loadModel: temp path contains a NUL byte".into(),
+                    format!("rl.{what}: temp path contains a NUL byte"),
                 )
             })?;
-            Ok(ModelFile {
+            Ok(AssetFile {
                 path,
                 temp: Some(temp),
             })
@@ -585,15 +603,15 @@ impl ModelFile {
             let path = CString::new(name).map_err(|_| {
                 JsError::new(
                     ErrorKind::TypeError,
-                    "rl.loadModel: path contains a NUL byte".into(),
+                    format!("rl.{what}: path contains a NUL byte"),
                 )
             })?;
-            Ok(ModelFile { path, temp: None })
+            Ok(AssetFile { path, temp: None })
         }
     }
 }
 
-impl Drop for ModelFile {
+impl Drop for AssetFile {
     fn drop(&mut self) {
         if let Some(path) = self.temp.take() {
             let _ = std::fs::remove_file(path);
@@ -654,7 +672,7 @@ fn animation_arg(handle: i32, index: i32, name: &str) -> Result<ModelAnimation, 
 fn load_model(args: &[Value]) -> Result<Value, JsError> {
     let name = text_arg(args, 0, "loadModel")?;
     let name_str = name.to_string_lossy();
-    let file = ModelFile::open(&name_str)?;
+    let file = AssetFile::open(&name_str, "loadModel")?;
     // SAFETY: window-thread guard; raylib reads the file during this call.
     let model = unsafe { raylib_sys::LoadModel(file.path.as_ptr()) };
     // Gate on the loaded mesh data rather than raylib's own `IsModelValid`:
@@ -1616,24 +1634,14 @@ fn load_texture_from_file(args: &[Value]) -> Result<Value, JsError> {
 }
 
 fn load_sound_from_file(args: &[Value]) -> Result<Value, JsError> {
-    let path = text_arg(args, 0, "loadSound")?;
-    let path_str = path.to_string_lossy();
-    let sound = if let Some((_, data)) = embedded_asset(&path_str) {
-        let format = CString::new(".wav").unwrap();
-        // SAFETY: window-thread guard; raylib decodes from our static bytes.
-        let wave = unsafe {
-            raylib_sys::LoadWaveFromMemory(format.as_ptr(), data.as_ptr(), data.len() as i32)
-        };
-        if wave.frameCount == 0 {
-            return Ok(Value::Number(-1.0));
-        }
-        let sound = unsafe { raylib_sys::LoadSoundFromWave(wave) };
-        unsafe { raylib_sys::UnloadWave(wave) };
-        sound
-    } else {
-        // SAFETY: as above; the returned handle keeps the decoded samples alive.
-        unsafe { raylib_sys::LoadSound(path.as_ptr()) }
-    };
+    let name = text_arg(args, 0, "loadSound")?;
+    let name_str = name.to_string_lossy();
+    // Embedded assets are materialised to a temp file so raylib can pick its
+    // decoder from the extension (wav/mp3/ogg); otherwise the path is used as is.
+    let file = AssetFile::open(&name_str, "loadSound")?;
+    // SAFETY: window-thread guard; raylib reads the file during this call.
+    let sound = unsafe { raylib_sys::LoadSound(file.path.as_ptr()) };
+    drop(file);
     if sound.frameCount == 0 {
         return Ok(Value::Number(-1.0));
     }
@@ -1677,6 +1685,154 @@ fn set_sound_volume(args: &[Value]) -> Result<Value, JsError> {
     // SAFETY: as above.
     unsafe { raylib_sys::SetSoundVolume(sound, volume) };
     Ok(Value::Undefined)
+}
+
+fn set_sound_pitch(args: &[Value]) -> Result<Value, JsError> {
+    let sound = sound_handle(args, "setSoundPitch")?;
+    let pitch = num_arg(args, 1, "setSoundPitch")?;
+    if !pitch.is_finite() || pitch <= 0.0 {
+        return Err(expected("setSoundPitch", 1, "a positive pitch"));
+    }
+    // SAFETY: as above.
+    unsafe { raylib_sys::SetSoundPitch(sound, pitch as f32) };
+    Ok(Value::Undefined)
+}
+
+fn is_sound_playing(args: &[Value]) -> Result<Value, JsError> {
+    let sound = sound_handle(args, "isSoundPlaying")?;
+    // SAFETY: as above.
+    let playing = unsafe { raylib_sys::IsSoundPlaying(sound) };
+    Ok(Value::Boolean(playing))
+}
+
+// ---- music streams ----
+//
+// Music is streamed from disk rather than decoded into memory, which is what the
+// long looping beds (background track, wind and rain) want. Music loops by
+// default; `updateMusic` must be called every frame to keep feeding the stream.
+
+fn music_handle(args: &[Value], name: &str) -> Result<Music, JsError> {
+    let handle = int_arg(args, 0, name)?;
+    let registry = MUSIC.lock().unwrap();
+    match registry.get(handle as usize) {
+        Some(slot) if slot.loaded => Ok(slot.music),
+        Some(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: music {handle} was unloaded"),
+        )),
+        None => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: unknown music {handle}"),
+        )),
+    }
+}
+
+fn load_music_from_file(args: &[Value]) -> Result<Value, JsError> {
+    let name = text_arg(args, 0, "loadMusic")?;
+    let name_str = name.to_string_lossy();
+    let file = AssetFile::open(&name_str, "loadMusic")?;
+    // SAFETY: window-thread guard; the stream holds the file open and reads it
+    // during `updateMusicStream`.
+    let music = unsafe { raylib_sys::LoadMusicStream(file.path.as_ptr()) };
+    drop(file);
+    if music.ctxData.is_null() || music.frameCount == 0 {
+        return Ok(Value::Number(-1.0));
+    }
+    let mut registry = MUSIC.lock().unwrap();
+    registry.push(MusicSlot {
+        music,
+        loaded: true,
+    });
+    Ok(Value::Number((registry.len() - 1) as f64))
+}
+
+fn unload_music(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "unloadMusic")?;
+    let mut registry = MUSIC.lock().unwrap();
+    if let Some(slot) = registry.get_mut(handle as usize) {
+        if slot.loaded {
+            // SAFETY: window-thread guard; the stream came from raylib and is
+            // freed exactly once (the slot is then marked unloaded).
+            unsafe { raylib_sys::UnloadMusicStream(slot.music) };
+            slot.loaded = false;
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn play_music(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "playMusic")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::PlayMusicStream(music) };
+    Ok(Value::Undefined)
+}
+
+fn update_music(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "updateMusic")?;
+    // SAFETY: as above. Must be called every frame to refill the stream.
+    unsafe { raylib_sys::UpdateMusicStream(music) };
+    Ok(Value::Undefined)
+}
+
+fn stop_music(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "stopMusic")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::StopMusicStream(music) };
+    Ok(Value::Undefined)
+}
+
+fn pause_music(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "pauseMusic")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::PauseMusicStream(music) };
+    Ok(Value::Undefined)
+}
+
+fn resume_music(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "resumeMusic")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::ResumeMusicStream(music) };
+    Ok(Value::Undefined)
+}
+
+fn set_music_volume(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "setMusicVolume")?;
+    let volume = num_arg(args, 1, "setMusicVolume")?.clamp(0.0, 1.0) as f32;
+    // SAFETY: as above.
+    unsafe { raylib_sys::SetMusicVolume(music, volume) };
+    Ok(Value::Undefined)
+}
+
+fn set_music_pitch(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "setMusicPitch")?;
+    let pitch = num_arg(args, 1, "setMusicPitch")?;
+    if !pitch.is_finite() || pitch <= 0.0 {
+        return Err(expected("setMusicPitch", 1, "a positive pitch"));
+    }
+    // SAFETY: as above.
+    unsafe { raylib_sys::SetMusicPitch(music, pitch as f32) };
+    Ok(Value::Undefined)
+}
+
+fn is_music_playing(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "isMusicPlaying")?;
+    // SAFETY: as above.
+    let playing = unsafe { raylib_sys::IsMusicStreamPlaying(music) };
+    Ok(Value::Boolean(playing))
+}
+
+fn music_time_length(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "musicTimeLength")?;
+    // SAFETY: as above.
+    let length = unsafe { raylib_sys::GetMusicTimeLength(music) };
+    Ok(Value::Number(length as f64))
+}
+
+fn music_time_played(args: &[Value]) -> Result<Value, JsError> {
+    let music = music_handle(args, "musicTimePlayed")?;
+    // SAFETY: as above.
+    let played = unsafe { raylib_sys::GetMusicTimePlayed(music) };
+    Ok(Value::Number(played as f64))
 }
 
 // ---- window ----
@@ -2534,6 +2690,20 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("playSound", 1, play_sound),
         ("stopSound", 1, stop_sound),
         ("setSoundVolume", 2, set_sound_volume),
+        ("isSoundPlaying", 1, is_sound_playing),
+        ("setSoundPitch", 2, set_sound_pitch),
+        ("loadMusic", 1, load_music_from_file),
+        ("unloadMusic", 1, unload_music),
+        ("playMusic", 1, play_music),
+        ("updateMusic", 1, update_music),
+        ("stopMusic", 1, stop_music),
+        ("pauseMusic", 1, pause_music),
+        ("resumeMusic", 1, resume_music),
+        ("setMusicVolume", 2, set_music_volume),
+        ("setMusicPitch", 2, set_music_pitch),
+        ("isMusicPlaying", 1, is_music_playing),
+        ("musicTimeLength", 1, music_time_length),
+        ("musicTimePlayed", 1, music_time_played),
         ("isKeyDown", 1, is_key_down),
         ("isKeyPressed", 1, is_key_pressed),
         ("isKeyReleased", 1, is_key_released),
@@ -2808,6 +2978,45 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("rl.updateModelAnimation"), "{error}");
+
+        // Audio and music bindings are installed; loading needs a live audio
+        // device, so only their shape is checked.
+        for name in [
+            "loadSound",
+            "playSound",
+            "stopSound",
+            "setSoundVolume",
+            "isSoundPlaying",
+            "setSoundPitch",
+            "loadMusic",
+            "unloadMusic",
+            "playMusic",
+            "updateMusic",
+            "stopMusic",
+            "pauseMusic",
+            "resumeMusic",
+            "setMusicVolume",
+            "setMusicPitch",
+            "isMusicPlaying",
+            "musicTimeLength",
+            "musicTimePlayed",
+        ] {
+            assert_eq!(
+                context
+                    .eval(&format!("typeof rl.{name}"))
+                    .unwrap()
+                    .as_string()
+                    .as_deref(),
+                Some("function"),
+                "rl.{name}"
+            );
+        }
+        // A non-positive pitch is rejected instead of silencing the handle.
+        let error = match context.eval("rl.setSoundPitch(-1, 0)") {
+            Ok(_) => panic!("rl.setSoundPitch with a zero pitch must throw"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rl.setSoundPitch"), "{error}");
 
         // rl.color argument validation names the offending argument.
         let error = match context.eval("rl.color(300, 0, 0)") {
