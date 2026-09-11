@@ -1378,7 +1378,70 @@ impl<'a> Lowerer<'a> {
             let len_miss = self.builder.create_block();
             self.builder.ins().brif(hit, merge, &[], len_miss, &[]);
             self.builder.seal_block(ffi);
+            // A dense Array's `length` is the slots cell, read straight from
+            // the box: the member-value cell cannot serve it because the
+            // compiled dense append bumps the generation on every store, so
+            // the cell misses each read. Any other receiver falls through to
+            // the shared tag check / member-cell probe below.
+            let after = self.builder.create_block();
+            let array_probe = self.builder.create_block();
+            let array_hit = self.builder.create_block();
             self.builder.switch_to_block(len_miss);
+            let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
+            let is_obj =
+                self.builder
+                    .ins()
+                    .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+            let tag = self.builder.ins().ushr_imm_u(object, 44);
+            let tag = self.builder.ins().band_imm_u(tag, 0xF);
+            let tag_obj = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
+            let plain = self.builder.ins().band(is_obj, tag_obj);
+            self.builder.ins().brif(plain, array_probe, &[], after, &[]);
+            self.builder.seal_block(len_miss);
+            self.builder.switch_to_block(array_probe);
+            let obj_ptr = self
+                .builder
+                .ins()
+                .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+            let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+            let obj_ptr = self
+                .builder
+                .ins()
+                .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+            let slots = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                obj_ptr,
+                Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+            );
+            let is_array = self.builder.ins().icmp_imm_u(IntCC::NotEqual, slots, 0);
+            self.builder
+                .ins()
+                .brif(is_array, array_hit, &[], after, &[]);
+            self.builder.seal_block(array_probe);
+            self.builder.switch_to_block(array_hit);
+            let slots_ptr = self
+                .builder
+                .ins()
+                .iadd_imm_s(slots, crux::heap::GCBOX_DATA_OFFSET as i64);
+            let length = self.builder.ins().load(
+                types::F64,
+                MemFlagsData::new(),
+                slots_ptr,
+                Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+            );
+            let length_bits = self
+                .builder
+                .ins()
+                .bitcast(types::I64, MemFlagsData::new(), length);
+            self.builder.def_var(value_var, length_bits);
+            self.builder.ins().jump(merge, &[]);
+            self.builder.seal_block(array_hit);
+            self.builder.switch_to_block(after);
+            self.builder.seal_block(after);
         }
         let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
         let is_obj = self
@@ -2362,7 +2425,6 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), Unsupported> {
         let inline = self.builder.create_block();
         let probe = self.builder.create_block();
-        let key_check = self.builder.create_block();
         let key_ok_check = self.builder.create_block();
         let len_check = self.builder.create_block();
         let append = self.builder.create_block();
@@ -2375,20 +2437,17 @@ impl<'a> Lowerer<'a> {
         let helper = self.builder.create_block();
         let idx_var = self.builder.declare_var(types::I64);
         self.builder.ins().jump(inline, &[]);
-        // Object tag: heap prefix + Object tag.
+        // Object tag: a tagged value is `TAG_PREFIX | (tag << 44) | payload`,
+        // so shifting the top 20 bits down and comparing against the packed
+        // prefix+Object-tag pattern checks the heap prefix AND the Object tag
+        // in one compare.
         self.builder.switch_to_block(inline);
-        let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
-        let is_obj = self
+        let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+        let tag_bits = self.builder.ins().ushr_imm_u(object, 44);
+        let obj_ok = self
             .builder
             .ins()
-            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
-        let tag = self.builder.ins().ushr_imm_u(object, 44);
-        let tag = self.builder.ins().band_imm_u(tag, 0xF);
-        let tag_obj = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
-        let obj_ok = self.builder.ins().band(is_obj, tag_obj);
+            .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
         self.builder.ins().brif(obj_ok, probe, &[], legacy, &[]);
         self.builder.seal_block(inline);
         // The dense gate: the object's `array_dense` cell (the ArraySlots
@@ -2415,44 +2474,27 @@ impl<'a> Lowerer<'a> {
             .icmp_imm_u(IntCC::NotEqual, slots_base, 0);
         self.builder
             .ins()
-            .brif(slots_ok, key_check, &[], legacy, &[]);
+            .brif(slots_ok, key_ok_check, &[], legacy, &[]);
         self.builder.seal_block(probe);
-        // The key must be a double BEFORE the float math — `fcvt_to_uint`
-        // on a NaN-boxed heap value's bits (a string key) can trap in the
-        // lowering, so the is-double gate is its own block.
-        self.builder.switch_to_block(key_check);
-        let is_double = self.is_double(key);
-        self.builder
-            .ins()
-            .brif(is_double, key_ok_check, &[], legacy, &[]);
-        self.builder.seal_block(key_check);
-        // The canonical-index checks: no fraction, 0 <= n < 2^32-1. The
-        // conversion is SATURATING: the non-saturating `fcvt_to_uint`
-        // lowers to a trap on a real double that is NaN, an infinity,
-        // negative, or >= 2^63 (the is-double gate only excludes heap
-        // values), and this block runs the conversion before the range
-        // branches below can route such a key to `legacy`. The saturating
-        // form converts every double; the round-trip integrality and range
-        // gates below then send every non-canonical value to `legacy`
-        // (a canonical index < 2^32 is never saturated, so the fast path
-        // is unchanged).
+        // The canonical-index gate: `idx = ToUint64Sat(num)` round-trips
+        // exactly when `num` is an integral double in range, so one
+        // f64 -> u64 -> f64 round trip plus the `< 2^32-1` bound rejects
+        // fractional, negative, huge, and non-double keys (a NaN-boxed
+        // heap/undefined value bitcasts to a NaN, whose compare fails). The
+        // saturating conversion never traps, so no separate is-double block
+        // is needed; `-0.0` round-trips to index 0, which is the correct
+        // canonicalization.
         self.builder.switch_to_block(key_ok_check);
         let num = self
             .builder
             .ins()
             .bitcast(types::F64, MemFlagsData::new(), key);
-        let zero = self.builder.ins().f64const(0.0);
         let max = self.builder.ins().f64const(4294967295.0);
-        let ge0 = self
-            .builder
-            .ins()
-            .fcmp(FloatCC::GreaterThanOrEqual, num, zero);
         let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
         let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
         let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
         let integral = self.builder.ins().fcmp(FloatCC::Equal, back, num);
-        let in_range = self.builder.ins().band(ge0, lt_max);
-        let key_ok = self.builder.ins().band(in_range, integral);
+        let key_ok = self.builder.ins().band(integral, lt_max);
         self.builder.def_var(idx_var, idx);
         self.builder.ins().brif(key_ok, len_check, &[], legacy, &[]);
         self.builder.seal_block(key_ok_check);
@@ -2471,8 +2513,9 @@ impl<'a> Lowerer<'a> {
             Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
         );
         let idx = self.builder.use_var(idx_var);
-        let idx_f = self.builder.ins().fcvt_from_uint(types::F64, idx);
-        let append_ok = self.builder.ins().fcmp(FloatCC::Equal, idx_f, length);
+        // `back` is `fcvt_from_uint(idx)` from the gate — reuse it instead of
+        // re-converting the same index.
+        let append_ok = self.builder.ins().fcmp(FloatCC::Equal, back, length);
         self.builder.ins().brif(append_ok, append, &[], legacy, &[]);
         self.builder.seal_block(len_check);
         // The inline append (Phase C). The gate has proved a dense Array with
@@ -2495,7 +2538,6 @@ impl<'a> Lowerer<'a> {
             .ins()
             .icmp_imm_u(IntCC::NotEqual, extensible, 0);
         self.builder.ins().brif(ext_ok, verdict, &[], helper, &[]);
-        self.builder.seal_block(append);
         // The verdict: a first link is recorded, present, and unchanged. A
         // chain mutation on either link bumps its generation, so a mismatch
         // falls to the helper (which re-walks and re-records).
@@ -2639,7 +2681,7 @@ impl<'a> Lowerer<'a> {
             Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
         );
         let one_f = self.builder.ins().f64const(1.0);
-        let new_length = self.builder.ins().fadd(idx_f, one_f);
+        let new_length = self.builder.ins().fadd(back, one_f);
         self.builder.ins().store(
             MemFlagsData::new(),
             new_length,

@@ -9219,6 +9219,39 @@ spill sync), `crates/runtime/src/{ir,jit}.rs`,
 `crates/jit/src/compiler.rs` (the inline append),
 `crates/jit/src/lib.rs` (the two inline-append tests).
 
+#### FOLLOW-UP (2026-09-11): the store gate shrink + the dense-array length probe
+
+Landing Phase C exposed three follow-ups; two paid, one did not.
+
+- **The gate.** Packed the object tag check into one `(object >> 44) ==
+  packed-prefix` compare, dropped the `is_double` block (the saturating
+  `fcvt_to_uint_sat` never traps, and a tagged key bitcasts to a NaN whose
+  round-trip compare fails), dropped the redundant `ge0` (the round trip
+  rejects negatives; `-0.0` canonicalizes to index 0), and reused the
+  round-trip `back` for the length compare instead of a second `fcvt`. JIT
+  `buildString shape` 17.5 -> 15.4-16.4 ms; `full` 18.1 -> 17.1-17.4.
+- **Measured, not worth touching.** The per-store `generation` bump is
+  ~0.06 ns/iter; the chain revalidation is ~0.87 ns/iter.
+- **Measured and REJECTED.** Merging the whole gate + chain into a single
+  branchless predicate (the select-as-dummy-pointer chain, one combined
+  `and` tree, one branch) REGRESSED to 18.7 ms: the serial `and` tree costs
+  more than the removed branches, because the CPU speculates through the
+  independent early checks. The branchy multi-block form stays.
+- **Added.** A native dense-array `length` read in the compiled
+  `GetMemberName` probe, after the typed-array probe: the member-value cell
+  can no longer serve a dense Array's `length` (the compiled append bumps
+  the generation every store, so the cell misses every read), which left
+  `a[a.length]`-shaped loops paying a `get_member_name` call per read.
+
+Re-validated: sweeps unchanged (language 23721/0/3, built-ins 23657/0/155,
+annexB 1086/0/0), the battery byte-identical under jit / `--jitless` /
+`--gc-stress` and vs node, `cargo test --workspace` + clippy green. Residual:
+`buildString shape` is ~2.2x node's 7.1 ms — the remaining cost is the
+per-store `PostInc` key lowering (branch + f64 math + slot traffic), the
+multi-branch gate, and the chain revalidation; closing it needs the loop to
+keep the append index in a register and hoist the invariant chain guard out
+of the loop (a guard/OSR-shaped change, not a tweak).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
