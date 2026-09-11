@@ -69,36 +69,99 @@ either consult the cell when `slots.dense` or re-sync from it:
   `member_cell_get` → a stale `properties[0]`. Adding the cell branch in
   `member_cell_get` is what fixed it.
 
-## 4. The inlined append must re-check [[Extensible]] and the chain verdict
+## 4. The inlined append re-checks [[Extensible]] and the elements protector
 
 `emit_dense_array_append_inline` skips the `DenseArrayAppend` helper on the
 hot path, so it must itself verify the two things the helper checks:
 
 - `[[Extensible]]` (a non-extensible array must fall back to `[[Set]]`).
-- The cached clean-chain verdict. `ChainVerdict` is a `pub #[repr(C)]`
-  struct on `JsObject` (`first_id == 0` = "no verdict"); re-validate it by
-  comparing the live two-link prototype chain's `(id, generation)` to the
-  cached tuple. A chain mutation (an own index prop / accessor on a
-  prototype) bumps that link's generation → mismatch → fall back to the
-  helper, which re-walks and re-records. Without this an
-  `Array.prototype[2] = setter` intercept is bypassed.
+- The cached clean-chain verdict, now an **elements-protector epoch compare**.
+  `store_chain_clean` is a `Cell<u64>` on `JsObject` holding the
+  `crux::PROTOTYPE_EPOCH` at which `store_chain_walk` found the two-link chain
+  clean (0 = no verdict). The compiled code loads it and compares against the
+  live `PROTOTYPE_EPOCH` — one load + compare replaces the old two-link
+  `(id, generation)` revalidation. A mismatch falls to the helper, which
+  re-walks and re-records. Without this an `Array.prototype[2] = setter`
+  intercept is bypassed.
 
-Null link handles are handled branchlessly by substituting the receiver's
-own box as the load base (`select`), so the field loads never fault and the
-unique-id compare fails. `store_chain_clean_hit`/`store_chain_walk` remain
-the reference implementation.
+The compiled fast path also declines a receiver that is itself a registered
+prototype (`is_prototype`), folded into the `[[Extensible]]` branch: a
+compiled append does not run `bump_generation`, so such a store must fall to
+the helper to advance the epoch for any child relying on a verdict.
 
-## 5. Keep the gate branchy — do NOT merge it into one predicate
+`store_chain_clean_hit`/`store_chain_walk` remain the reference
+implementation and the recorder.
 
-Measured on `buildString shape`: collapsing the whole gate + chain into one
-branchless block (dummy-pointer `select` chain, one combined `and` tree, one
-branch) **regressed 15.4 → 18.7 ms**. The serial `and` dependency costs more
-than the branches, because the CPU speculates through the independent early
-checks. Keep the multi-block form.
+## 5. Keep the gate branchy — do NOT merge or fold the checks
+
+Every attempt to cut branches lost to the multi-block form (measured on
+`buildString shape`):
+
+- Collapsing the whole gate + chain into one branchless block
+  (dummy-pointer `select` chain, one combined `and` tree, one branch):
+  **15.4 → 18.7 ms**.
+- Folding `[[Extensible]]` into the verdict branch: **~16.4 ms**.
+- Folding the cursor capacity into the chain branch: **~16.4 ms**.
+
+The serial `and` tree / longer branch predicate costs more than the removed
+branches, because the CPU speculates through the independent early checks.
+Keep each check its own short-predicate branch.
 
 - Do not emit unreachable/dead blocks to "disable" a check for a probe — a
   dead-branch experiment made the compiled body bail entirely (ratio ~1.0,
   i.e. it ran interpreted).
+- The `PostInc` key (`a[l++]`) is NOT the cost: stripping its `is_double`
+  branch + `canon` moves the row less than the noise, so the
+  register-resident-index idea does not pay.
+
+## 5b. What the residual actually is (why parity needs more than a tweak)
+
+The store is ~45 instructions and ~8 branches (tag, `array_dense`, key
+round-trip, length, extensible + `is_prototype`, the epoch compare, capacity,
+then the element/length/generation stores); V8's is ~5 instructions and one
+map/bounds branch. Do not re-derive this with more micro-folding; it has
+been measured.
+
+Measured budget per `buildString shape` iteration (~5.2 ns; node ~2.5),
+isolating each check by forcing its predicate true so Cranelift DCEs the
+loads:
+
+- two-link chain revalidation: **~0.87 ns** (the biggest removable piece)
+- key round-trip + bound: ~0.25 ns
+- tag + `array_dense` + `index == length` + [[Extensible]] + capacity: ~0.5 ns
+- element/`elem_len`/`length`/`generation` stores: ~0.5 ns
+- loop + `l === 10000` test + counter: ~1.0 ns (`l++` itself is free)
+
+The **realm-level elements protector** (V8's `no_elements_protector`) landed
+as Stage 1 of `.notes/dense-store-redesign.md`: a per-realm epoch
+(`crux::PROTOTYPE_EPOCH` — process-global, so it over-invalidates across
+agents, which is sound) plus a prototype *registry* (`is_prototype` on
+`JsObject`). `mark_prototype` registers a link from `canonical_empty_map`
+(every prototype-taking constructor) and `set_prototype_of`;
+`bump_generation` advances the epoch only when `is_prototype`, so the target
+loop's own appends (its array is not a prototype) do not self-invalidate the
+verdict. `buildString shape` 15.5 → ~13.4 ms (~1.8x node). The old
+unfunneled-bump design is why it looked unbuildable; the registry is what
+makes the invariant cheap.
+
+- Trap: `is_prototype` must be set in **every** `JsObject` constructor and
+the in-place initializers (`init_ordinary`, `array_create`) — a missed one
+silently bypasses a prototype setter. The two-engine generation split
+applies: the interpreter's `bump_generation` advances the epoch; the JIT
+must not append to a prototype receiver, hence the `is_prototype` gate.
+
+Parity needs the full V8-shaped redesign (integer index path, f64-free
+length field, elements kinds, no per-store generation bump) — a large
+project, not justified for one row. The gate is near-optimal for this
+representation.
+
+Loop-guard hoisting via a `readonly` load was scoped and rejected:
+Cranelift's egraph does hoist loop-invariant ops, but `readonly` asserts the
+memory is not mutated anywhere in the function, and the compiled body's own
+`DenseArrayAppend` fallback calls `store_chain_walk`, which writes
+`store_chain_clean` — so the verdict loads can't carry it; and the link
+loads could only if no user code runs in the body, which `buildString`'s
+`a.length = 0` (a possible setter) defeats for a sound analysis.
 
 ## 6. The per-store generation bump is deliberate and cheap
 

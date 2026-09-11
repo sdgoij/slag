@@ -9232,11 +9232,18 @@ Landing Phase C exposed three follow-ups; two paid, one did not.
   `buildString shape` 17.5 -> 15.4-16.4 ms; `full` 18.1 -> 17.1-17.4.
 - **Measured, not worth touching.** The per-store `generation` bump is
   ~0.06 ns/iter; the chain revalidation is ~0.87 ns/iter.
-- **Measured and REJECTED.** Merging the whole gate + chain into a single
-  branchless predicate (the select-as-dummy-pointer chain, one combined
-  `and` tree, one branch) REGRESSED to 18.7 ms: the serial `and` tree costs
-  more than the removed branches, because the CPU speculates through the
-  independent early checks. The branchy multi-block form stays.
+- **Measured and REJECTED.** Three attempts to cut branches all lost to
+  the branchy form: (1) merging the whole gate + chain into a single
+  branchless predicate (dummy-pointer `select` chain, one combined `and`
+  tree, one branch) regressed to 18.7 ms; (2) folding `[[Extensible]]` into
+  the verdict branch regressed to ~16.4 ms; (3) folding the cursor capacity
+  into the chain branch likewise. The serial `and` tree / longer predicate
+  costs more than the removed branches — the CPU speculates through the
+  independent early checks. Keep each check its own short-predicate branch.
+- **Measured, not the cost.** The `PostInc` key lowering (`l++` in
+  `a[l++] = i`) is ~free: stripping its `is_double` branch + `canon` moved
+  the row by less than the noise. So the register-resident-index idea does
+  not pay; the index is not where the time goes.
 - **Added.** A native dense-array `length` read in the compiled
   `GetMemberName` probe, after the typed-array probe: the member-value cell
   can no longer serve a dense Array's `length` (the compiled append bumps
@@ -9245,12 +9252,81 @@ Landing Phase C exposed three follow-ups; two paid, one did not.
 
 Re-validated: sweeps unchanged (language 23721/0/3, built-ins 23657/0/155,
 annexB 1086/0/0), the battery byte-identical under jit / `--jitless` /
-`--gc-stress` and vs node, `cargo test --workspace` + clippy green. Residual:
-`buildString shape` is ~2.2x node's 7.1 ms — the remaining cost is the
-per-store `PostInc` key lowering (branch + f64 math + slot traffic), the
-multi-branch gate, and the chain revalidation; closing it needs the loop to
-keep the append index in a register and hoist the invariant chain guard out
-of the loop (a guard/OSR-shaped change, not a tweak).
+`--gc-stress` and vs node, `cargo test --workspace` + clippy green.
+
+**Update (Stage 1 landed):** the 2-link revalidation was replaced by the
+elements-protector epoch compare — see the O1 note below and
+`.notes/dense-store-redesign.md`. `buildString shape` 15.5 → ~13.4 ms (~1.8x
+node's 7.1), `full` ~17.2 → ~15.7 ms, with the same sweep/battery results.
+Residual: the remaining cost is the per-store multi-branch gate (tag,
+`array_dense`, key round-trip, length, extensible + `is_prototype`, the epoch
+compare, capacity) and the element write/length/generation stores, i.e. ~45
+instructions and ~8 branches where V8's store is ~5 instructions and 1
+branch. Closing it is architectural (V8-style elements kinds), not a tweak.
+
+##### Scoping: what would close the remaining ~2x
+
+Measured budget per `buildString shape` iteration (~5.2 ns total; node
+~2.5), with the removable pieces isolated by forcing each check's predicate
+true so Cranelift DCEs its loads:
+
+| piece | cost/iter |
+|---|---|
+| two-link chain revalidation | **~0.87 ns** |
+| key round-trip + `< 2^32` bound | ~0.25 ns |
+| tag + `array_dense` + `index == length` + [[Extensible]] + capacity | ~0.5 ns |
+| element + `elem_len` + `length` + `generation` stores | ~0.5 ns |
+| loop (`l++` is free), `l === 10000` test, counter | ~1.0 ns |
+
+(These are floors: forcing a predicate true removes its loads and also
+shortens the branch, so the pieces overlap slightly.)
+
+**O1 — a realm-level prototype-elements protector** (V8's
+`no_elements_protector`). Replace the 2-link `(id, generation)` revalidation
+with a single realm epoch. A first design pass killed the naive form: the
+epoch must be bumped on every own-index-property creation, and that does NOT
+funnel through one function (`create_data_property_key` has a
+`fresh_data_define` fast path and a `define_property_key` fallback,
+`create_data_property_index` has its own dense path, dense element writes
+need a separate 0→1 bump, `set_prototype_of` is a fifth), so a miss silently
+bypasses a prototype setter. **The `is_prototype` registry resolves it and
+landed as Stage 1** (`.notes/dense-store-redesign.md`): a per-object
+`is_prototype` bool, set once by `mark_prototype` at child creation and on
+`set_prototype_of`, lets `bump_generation` advance the epoch only for
+objects that are prototypes — the single audited funnel, no self-
+invalidation (the loop array is not a prototype). The allocation-path cost
+is a conditional store that is a no-op after the first mark; the claimed
+"dirty cache line" did not materialize (sweeps unchanged). Gain: `buildString
+shape` 15.5 → ~13.4 ms. The compiled append must also decline a prototype
+receiver (`is_prototype` folded into the `[[Extensible]]` branch).
+
+**O2 — fold dense-ness + [[Extensible]] into one kind byte** on `ArraySlots`
+(keep `array_dense` for the box pointer). **Gain ~0.2 ns** (one fewer
+load+compare); touches every dense-mode transition. Not worth it alone.
+
+**O3 — the full V8-shaped redesign** (an integer/Smi index fast path, an
+f64-free length field, elements kinds with a dictionary fallback, no
+per-store generation bump, and O1's protector). This is the only path that
+reaches parity, and it is a multi-week rewrite of the array representation
+and every consumer. **Not justified for one benchmark row.**
+
+Recommendation: O1 landed (the `is_prototype` registry makes it cheap); O2
+is Stage 2, marginal. Parity needs O3 (or loop-guard hoisting/versioning,
+which would remove the check for call-free loops). Otherwise accept ~1.8x.
+
+**Loop-guard hoisting via `readonly` — scoped and rejected.** Cranelift
+0.134.3's egraph DOES hoist loop-invariant ops
+(`egraph::elaborate::elaborate_licm_hoist`), so a `MemFlagsData::new()
+.with_readonly()` load can be hoisted out of the loop body — which would
+make the chain check ~free without a global invariant. Two blockers kill it
+for this row: (1) `readonly` asserts the memory is not mutated anywhere in
+the function, and the compiled body's own `DenseArrayAppend` fallback calls
+`store_chain_walk`, which WRITES `store_chain_clean` — so the verdict loads
+cannot carry the flag; (2) the link loads could, but only if no user code
+runs in the body, and `buildString shape`'s loop contains `a.length = 0` (a
+member store on an unknown object, i.e. a possible setter) that a sound
+analysis must reject. A precise version needs shape/escape analysis the JIT
+does not have.
 
 ## Deferred milestones
 

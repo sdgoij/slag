@@ -12,6 +12,7 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt;
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{ErrorKind, JsError};
 use crate::function::call;
@@ -767,38 +768,33 @@ impl Trace for PrivateElement {
     }
 }
 
-/// The cached "chain is clean for index stores" verdict used by
-/// `array_element_write`: the two prototype links' (id, generation), where
-/// `first_id == 0` means "no verdict". A match against the live chain means
-/// neither link gained an own index property. `#[repr(C)]` so the compiled
-/// dense append re-validates it at fixed offsets.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ChainVerdict {
-    pub first_id: u64,
-    pub first_gen: u32,
-    pub second_id: u64,
-    pub second_gen: u32,
+/// The realm-wide elements protector (V8's `NoElementsProtector`): bumped
+/// whenever a registered prototype gains or changes an own property, or a
+/// prototype link is reassigned. The compiled dense append re-validates its
+/// cached clean-chain verdict against this with one load + compare instead
+/// of re-walking the two live prototype links per store. A plain (non-TLS)
+/// `static` so the JIT can materialize its address with `iconst`; being
+/// process-global it over-invalidates across agents, which is sound. Starts
+/// at 1 — 0 is reserved for "no verdict recorded".
+pub static PROTOTYPE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Advance the elements protector, invalidating every cached clean-chain
+/// verdict. Relaxed: it only needs to be observed by the same agent, and the
+/// JIT's plain load pairs with it.
+#[inline]
+pub fn bump_epoch() {
+    PROTOTYPE_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
-impl ChainVerdict {
-    pub const fn none() -> Self {
-        Self {
-            first_id: 0,
-            first_gen: 0,
-            second_id: 0,
-            second_gen: 0,
-        }
-    }
-
-    /// Whether a verdict is recorded.
-    pub const fn is_some(&self) -> bool {
-        self.first_id != 0
-    }
-
-    /// Whether no verdict is recorded.
-    pub const fn is_none(&self) -> bool {
-        self.first_id == 0
+/// Register `proto` as a prototype: mark it so a later own-property change to
+/// it advances [`PROTOTYPE_EPOCH`]. Idempotent, and a plain load/store (not a
+/// read-modify-write) so object creation stays cheap; a concurrent marking
+/// race is benign (the flag is monotone).
+pub fn mark_prototype(proto: Option<&Handle<JsObject>>) {
+    if let Some(proto) = proto
+        && !proto.is_prototype.get()
+    {
+        proto.is_prototype.set(true);
     }
 }
 
@@ -858,17 +854,22 @@ pub struct JsObject {
     /// so the JIT's inline global fast path can read it in place (via
     /// `offset_of!`) to validate its global-value cells.
     pub generation: Cell<u32>,
-    /// The write-side chain-verdict cache for `array_element_write`: (first
-    /// link id, generation, second link id, generation) — "the chain from
-    /// this Array is exactly these two Ordinary/Array links, neither
-    /// holding an index-keyed own property", so a missing-element store
-    /// skips the per-index prototype walk. The Array's own generation is
-    /// deliberately not part of the verdict: its own dense appends bump it
-    /// on every store, which would miss on the exact pattern the cache
-    /// exists for. The ids are raw (not handles): the links stay reachable
-    /// through the `prototype` cells while this object lives, so the cache
-    /// needs no trace edge (mirrors `prototype`).
-    pub store_chain_clean: Cell<ChainVerdict>,
+    /// Whether this object is registered as a [[Prototype]] of another object
+    /// (set by `mark_prototype` at the child's creation or on
+    /// `set_prototype_of`). When set, any own-property change to this object
+    /// advances `PROTOTYPE_EPOCH`, so the compiled dense append's cached
+    /// clean-chain verdict re-validates with one compare. `pub` so the JIT can
+    /// read it in place via `offset_of!`.
+    pub is_prototype: Cell<bool>,
+    /// The `PROTOTYPE_EPOCH` value at which `array_element_write` last
+    /// recorded a clean two-link chain from this Array: "at that epoch the
+    /// chain was exactly two Ordinary/Array links, neither holding an
+    /// index-keyed own property". A missing-element store skips the per-index
+    /// prototype walk while the global epoch is unchanged (0 = no verdict).
+    /// The Array's own generation is deliberately not part of it: its own
+    /// dense appends bump it on every store, which would miss on the exact
+    /// pattern the cache exists for.
+    pub store_chain_clean: Cell<u64>,
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
     pub properties: RefCell<SmallProps>,
@@ -1030,7 +1031,8 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(ChainVerdict::none()),
+            store_chain_clean: Cell::new(0),
+            is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1074,8 +1076,12 @@ impl JsObject {
             );
             std::ptr::write(std::ptr::addr_of_mut!((*this).generation), Cell::new(0));
             std::ptr::write(
+                std::ptr::addr_of_mut!((*this).is_prototype),
+                Cell::new(false),
+            );
+            std::ptr::write(
                 std::ptr::addr_of_mut!((*this).store_chain_clean),
-                Cell::new(ChainVerdict::none()),
+                Cell::new(0),
             );
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).properties),
@@ -1357,7 +1363,8 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(ChainVerdict::none()),
+            store_chain_clean: Cell::new(0),
+            is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1382,7 +1389,8 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(ChainVerdict::none()),
+            store_chain_clean: Cell::new(0),
+            is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1446,8 +1454,12 @@ impl JsObject {
                 );
                 std::ptr::write(std::ptr::addr_of_mut!((*this).generation), Cell::new(0));
                 std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).is_prototype),
+                    Cell::new(false),
+                );
+                std::ptr::write(
                     std::ptr::addr_of_mut!((*this).store_chain_clean),
-                    Cell::new(ChainVerdict::none()),
+                    Cell::new(0),
                 );
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*this).properties),
@@ -1502,7 +1514,8 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(ChainVerdict::none()),
+            store_chain_clean: Cell::new(0),
+            is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1538,7 +1551,8 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(ChainVerdict::none()),
+            store_chain_clean: Cell::new(0),
+            is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1569,7 +1583,8 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(ChainVerdict::none()),
+            store_chain_clean: Cell::new(0),
+            is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1681,7 +1696,8 @@ impl JsObject {
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(ChainVerdict::none()),
+            store_chain_clean: Cell::new(0),
+            is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1738,7 +1754,8 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(ChainVerdict::none()),
+            store_chain_clean: Cell::new(0),
+            is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1839,7 +1856,8 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(ChainVerdict::none()),
+            store_chain_clean: Cell::new(0),
+            is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1975,7 +1993,12 @@ impl JsObject {
                 }
             }
         }
+        mark_prototype(proto.as_ref());
         self.prototype.set(proto);
+        // A link reassignment can extend or replace the chain of every child
+        // that cached a clean-chain verdict, and the new link may have had
+        // index properties before it was registered, so invalidate them all.
+        bump_epoch();
         self.bump_generation();
         Ok(true)
     }
@@ -2648,35 +2671,13 @@ impl JsObject {
     }
 
     /// Re-validate the cached "chain is clean for index stores" verdict
-    /// (see `store_chain_clean`): the chain from this Array is still
-    /// exactly the two recorded links — same ids, unchanged generations
-    /// (so neither gained an own index property) — and the second link's
-    /// prototype is still null (the chain did not grow). ~5 cell reads,
-    /// where the walk pays a property lookup per link.
+    /// (see `store_chain_clean`): the recorded epoch is still the live
+    /// elements-protector epoch, so no registered prototype gained an index
+    /// property and no prototype link was reassigned since the walk. One
+    /// load + compare, where the walk pays a property lookup per link.
     fn store_chain_clean_hit(&self) -> bool {
-        let verdict = self.store_chain_clean.get();
-        if verdict.first_id == 0 {
-            return false;
-        }
-        let (first_id, first_gen, second_id, second_gen) = (
-            verdict.first_id,
-            verdict.first_gen,
-            verdict.second_id,
-            verdict.second_gen,
-        );
-        let Some(first) = self.prototype.get() else {
-            return false;
-        };
-        if first.id() != first_id || first.generation() != first_gen {
-            return false;
-        }
-        let Some(second) = first.prototype.get() else {
-            return false;
-        };
-        if second.id() != second_id || second.generation() != second_gen {
-            return false;
-        }
-        second.prototype.get().is_none()
+        let recorded = self.store_chain_clean.get();
+        recorded != 0 && recorded == PROTOTYPE_EPOCH.load(Ordering::Relaxed)
     }
 
     /// The per-index chain walk for `array_element_write` (semantics
@@ -2709,12 +2710,8 @@ impl JsObject {
             && !first.has_index_keyed_own_property()
             && !second.has_index_keyed_own_property()
         {
-            self.store_chain_clean.set(ChainVerdict {
-                first_id: first.id(),
-                first_gen: first.generation(),
-                second_id: second.id(),
-                second_gen: second.generation(),
-            });
+            self.store_chain_clean
+                .set(PROTOTYPE_EPOCH.load(Ordering::Relaxed));
         }
         true
     }
@@ -3416,6 +3413,14 @@ impl JsObject {
 
     fn bump_generation(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
+        // A registered prototype gaining any own property can intercept a
+        // store on a child that cached a clean-chain verdict, so advance the
+        // elements protector. The child array's own appends do not bump the
+        // epoch (it is not a prototype), which is what keeps the fast path
+        // live.
+        if self.is_prototype.get() {
+            bump_epoch();
+        }
     }
 
     /// CreateDataProperty (spec 7.3.4) fast path (Cut 22): the caller has
@@ -7273,7 +7278,7 @@ mod tests {
             "a clean chain must accept the first append"
         );
         assert!(
-            array.store_chain_clean.get().first_id != 0,
+            array.store_chain_clean.get() != 0,
             "the clean two-link chain must be cached on the first store"
         );
         for i in 1..5u64 {
@@ -7305,7 +7310,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(array.store_chain_clean.get().is_some());
+        assert!(array.store_chain_clean.get() != 0);
         array_proto
             .create_data_property(&key("custom"), Value::Undefined)
             .unwrap();
@@ -7321,7 +7326,7 @@ mod tests {
             "a string prop on the chain must not fall the store back"
         );
         assert!(
-            array.store_chain_clean.get().is_some(),
+            array.store_chain_clean.get() != 0,
             "the clean verdict must re-record after the string prop"
         );
         assert!(array.store_chain_clean_hit());
@@ -7348,7 +7353,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(array.store_chain_clean.get().is_some());
+        assert!(array.store_chain_clean.get() != 0);
         array_proto
             .create_data_property(&key("0"), Value::Number(99.0))
             .unwrap();
@@ -7398,7 +7403,7 @@ mod tests {
         }
         assert_eq!(array.get(&key("length")).unwrap(), Value::Number(5.0));
         assert!(
-            array.store_chain_clean.get().is_none(),
+            array.store_chain_clean.get() == 0,
             "an index-keyed prop anywhere on the chain must disable the verdict"
         );
         assert_eq!(
@@ -7424,7 +7429,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            array.store_chain_clean.get().is_none(),
+            array.store_chain_clean.get() == 0,
             "a three-link chain is not cacheable"
         );
         let string_link =
@@ -7435,7 +7440,7 @@ mod tests {
             None,
             "an exotic chain link must fall back to [[Set]]"
         );
-        assert!(array2.store_chain_clean.get().is_none());
+        assert!(array2.store_chain_clean.get() == 0);
     }
 
     #[test]

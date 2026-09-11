@@ -263,6 +263,10 @@ thread_local! {
 /// same prototype share one empty map; objects with different prototypes
 /// (including null vs. null) get separate maps.
 pub fn canonical_empty_map(prototype: Option<Handle<JsObject>>) -> Handle<Map> {
+    // Every constructor that takes a prototype funnels through here, so this
+    // is where a new link is registered with the elements protector before any
+    // child can record a clean-chain verdict against it.
+    crate::object::mark_prototype(prototype.as_ref());
     let key = prototype.map(|p| p.id());
     // The cache lookup must not hold its borrow across `Map::new_empty`: a
     // `--gc-stress` collection fires inside the allocation, and the sweep's
