@@ -3946,6 +3946,16 @@ impl Vm {
     /// bumps the generation, including `set_key`'s in-place value update).
     fn member_cell_get(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
         let object = Self::cell_object(object)?;
+        // A dense Array's `length` is authoritative in the slots cell, not the
+        // `properties[0]` mirror (the compiled dense append updates the cell
+        // in machine code and leaves the mirror stale until a spill or a
+        // generic length change re-syncs it). Serve the cell.
+        if name == Self::length_atom()
+            && let crux::object::ObjectKind::Array(slots) = &object.kind
+            && slots.dense.get()
+        {
+            return Some(Value::Number(slots.length.get()));
+        }
         if let Some(value) = Self::member_cell_warm_probe(agent, &object, name) {
             return Some(value);
         }
@@ -4900,7 +4910,11 @@ impl Vm {
         if let crux::object::ObjectKind::Array(slots) = &object.kind
             && slots.dense.get()
         {
-            let value = slots.elements.borrow().get(index as usize).and_then(|e| *e);
+            let value = slots
+                .elements()
+                .get(index as usize)
+                .filter(|value| !value.is_hole())
+                .copied();
             if let Some(value) = value {
                 let cache_index = Self::array_element_index(object.id(), index);
                 agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
@@ -4957,7 +4971,11 @@ impl Vm {
         if let crux::object::ObjectKind::Array(slots) = &object.kind
             && slots.dense.get()
         {
-            let value = slots.elements.borrow().get(index as usize).and_then(|e| *e);
+            let value = slots
+                .elements()
+                .get(index as usize)
+                .filter(|value| !value.is_hole())
+                .copied();
             if let Some(value) = value {
                 let cache_index = Self::array_element_index(object.id(), index);
                 agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
@@ -11272,17 +11290,18 @@ impl Vm {
                 {
                     let length = slots.length.get() as usize;
                     let fit = {
-                        let elements = slots.elements.borrow();
-                        elements.len() >= length && elements[..length].iter().all(Option::is_some)
+                        let elements = slots.elements();
+                        elements.len() >= length
+                            && elements[..length].iter().all(|value| !value.is_hole())
                     };
                     if fit {
                         self.stack.truncate(arg_start - 2);
                         self.stack.push(args[0]);
                         self.stack.push(callee);
                         {
-                            let elements = slots.elements.borrow();
+                            let elements = slots.elements();
                             for element in elements[..length].iter() {
-                                self.stack.push(element.unwrap());
+                                self.stack.push(*element);
                             }
                         }
                         return self.do_call_fast(agent, length, false);

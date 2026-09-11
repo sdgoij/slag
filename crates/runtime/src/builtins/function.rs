@@ -600,12 +600,12 @@ pub(crate) fn create_list_from_array_like(
         if let crux::object::ObjectKind::Array(slots) = &obj.kind
             && slots.dense.get()
         {
-            let elements = slots.elements.borrow();
+            let elements = slots.elements();
             let mut values = Vec::with_capacity(length as usize);
             for index in 0..length {
-                match elements.get(index as usize).and_then(|e| *e) {
-                    Some(item) => values.push(item),
-                    None => break,
+                match elements.get(index as usize) {
+                    Some(item) if !item.is_hole() => values.push(*item),
+                    _ => break,
                 }
             }
             if values.len() == length as usize {

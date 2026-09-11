@@ -111,8 +111,11 @@ fn dense_own_element(value: &Value, index: u64) -> Option<Value> {
     if !slots.dense.get() || (index as f64) >= slots.length.get() {
         return None;
     }
-    let elements = slots.elements.borrow();
-    elements.get(index as usize).copied().flatten()
+    let elements = slots.elements();
+    elements
+        .get(index as usize)
+        .copied()
+        .filter(|value| !value.is_hole())
 }
 
 /// IsArray (spec 7.2.2): Array exotics and proxies whose target is an

@@ -53,12 +53,25 @@ pub const TAG_FUNCTION: u64 = 8;
 /// access checks it before the value can reach user-visible ops, so it never
 /// escapes (and `kind()`'s reserved-tag `unreachable!` stays unreachable).
 const TAG_UNINITIALIZED: u64 = 9;
+/// The dense-array hole marker (tag 10 in the reserved range): the element
+/// slot of an array with an absent index. A dense buffer stores plain
+/// `Value`s (position == index), so a hole must be encoded in-band; tag 10
+/// is otherwise unused and no observable value can carry it (the Number
+/// constructor canonicalizes doubles whose top 16 bits are `TAG_PREFIX`, and
+/// no tagged value uses tag 10), so `kind()`'s reserved-tag `unreachable!`
+/// stays unreachable — every dense-buffer reader filters holes first.
+const TAG_HOLE: u64 = 10;
 
 /// The raw bits of the frame-slot TDZ / unset-inline-field marker (tag 9 in
 /// the reserved range): `TAG_PREFIX | (9 << 44)`. `pub` so the JIT's inline
 /// `in_fields` hole test compares against the frozen pattern with one load
 /// and one exact-bits compare.
 pub const UNINITIALIZED_BITS: u64 = TAG_PREFIX | (TAG_UNINITIALIZED << 44);
+
+/// The raw bits of the dense-array hole marker (tag 10 in the reserved
+/// range): `TAG_PREFIX | (10 << 44)`. `pub` so the JIT's inline dense-element
+/// read filters holes against the frozen pattern.
+pub const HOLE_BITS: u64 = TAG_PREFIX | (TAG_HOLE << 44);
 
 /// An ECMAScript language value (spec 6.1).
 ///
@@ -70,6 +83,7 @@ pub const UNINITIALIZED_BITS: u64 = TAG_PREFIX | (TAG_UNINITIALIZED << 44);
 /// churning every `.clone()` site.)
 /// `PartialEq` preserves the derived-enum semantics: `Number` compares via
 /// `f64::eq` (`NaN != NaN`), objects via their id equality.
+#[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct Value(u64, std::marker::PhantomData<Rc<()>>);
 
@@ -111,6 +125,18 @@ impl Value {
 
     pub fn is_uninitialized(&self) -> bool {
         !self.is_double() && self.tag() == TAG_UNINITIALIZED
+    }
+
+    /// The dense-array hole marker (see [`HOLE_BITS`]).
+    pub const fn hole() -> Value {
+        Value(HOLE_BITS, std::marker::PhantomData)
+    }
+
+    /// Whether this value is the dense-array hole marker. A dense buffer must
+    /// filter holes before `kind()`: the tag is reserved and would panic.
+    #[inline]
+    pub fn is_hole(&self) -> bool {
+        self.0 == HOLE_BITS
     }
 
     #[inline]

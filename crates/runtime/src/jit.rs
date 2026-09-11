@@ -1594,16 +1594,16 @@ extern "C" fn apply_args_fill(ctx: *mut c_void, arg_array: u64, dest: u64) -> u6
     if length > capacity {
         return u64::MAX;
     }
-    let elements = slots.elements.borrow();
+    let elements = slots.elements();
     // The whole range must be present before any write: a hole discovered
     // mid-copy must not leave a partial region the slow path would read.
-    if elements.len() < length || !elements[..length].iter().all(Option::is_some) {
+    if elements.len() < length || !elements[..length].iter().all(|value| !value.is_hole()) {
         return u64::MAX;
     }
     let dest = dest as *mut u64;
     for (index, element) in elements[..length].iter().enumerate() {
         // SAFETY: the capacity check above guarantees `length` slots fit.
-        unsafe { *dest.add(index) = element.unwrap().bits() };
+        unsafe { *dest.add(index) = element.bits() };
     }
     length as u64
 }

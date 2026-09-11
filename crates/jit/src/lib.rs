@@ -5336,9 +5336,9 @@ mod tests {
     #[test]
     fn installed_jit_dense_array_element_write_fast_path() {
         // The inline dense-array store: `a[a.length] = i` in a compiled
-        // loop must route through `dense_array_append` (the M1 C append
-        // gate — the counting wrapper proves the machine code called it
-        // ~n times) and store every element. The fallback shapes — a
+        // loop must take the Phase C machine-code append — the counting
+        // wrapper proves the helper runs only for growth/fallback, not per
+        // element — and store every element. The fallback shapes — a
         // non-Array receiver or a non-canonical-index key — still land
         // through `fast_array_element_write`/`assign_member_computed`.
         static APPEND_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5383,18 +5383,18 @@ mod tests {
         assert!(compiled >= 1, "{compiled} bodies");
         let calls = APPEND_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            calls >= 900,
-            "the compiled fill loop must take the inline append most of the time ({calls} appends)"
+            calls < 100,
+            "the compiled fill loop must inline the append (the helper runs only on growth; {calls} calls)"
         );
     }
 
     #[test]
     fn installed_jit_register_store_member_computed_takes_the_inline_append() {
-        // The M1 C register-path gate: `a[l++] = i` lowers to a register
-        // body (`StoreMemberComputed { key: PostInc(l), value: Counter }`)
-        // whose compiled store must route through `dense_array_append`
-        // (the counting wrapper proves the machine code called it ~n
-        // times) and store every element.
+        // The Phase C register-path append: `a[l++] = i` lowers to a
+        // register body (`StoreMemberComputed { key: PostInc(l), value:
+        // Counter }`) whose compiled store must inline the append — the
+        // counting wrapper proves the helper runs only on growth — and store
+        // every element.
         static APPEND_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         extern "C" fn counting_append(
             ctx: *mut c_void,
@@ -5431,8 +5431,8 @@ mod tests {
         assert!(compiled >= 1, "{compiled} bodies");
         let calls = APPEND_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            calls >= 900,
-            "the compiled register store must take the inline append most of the time ({calls} appends)"
+            calls < 100,
+            "the compiled register store must inline the append (the helper runs only on growth; {calls} calls)"
         );
     }
 

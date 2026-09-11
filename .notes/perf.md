@@ -9153,6 +9153,72 @@ ir.rs` (the `Builder`, the two steps, the op, `plan_builder`, the handlers),
 `crates/jit/src/compiler.rs` (the step/op arms, incl. the inlined append fast
 path).
 
+#### LANDED (2026-09-11): the inline dense-array append (Phase C)
+
+The bisect first, on `buildString shape` (3M `a[l++] = i` iterations):
+removing the dense gate (−11.2 ms), one extra idempotent helper call
+(+16 ms), and replacing the helper call with an inline length bump while
+keeping `idx == length` (−24 ms, ratio 0.12). So the ~11.8 ns/iter store was
+NOT the gate (only ~3.7 ns) or the helper body (≤1-2 ns) but the FFI call
+boundary itself — the indirect call plus the spill/reload of every live loop
+value across it. That is the Phase C lever the array-store plan had deferred.
+
+Landed:
+
+- **Representation.** `ArraySlots.elements` becomes `Vec<Value>` with an
+  in-band hole sentinel (`Value::hole()`, reserved tag 10), so one element is
+  one 8-byte store; `Value` gains `#[repr(transparent)]` and `ChainVerdict`
+  becomes a `pub #[repr(C)]` struct (`first_id == 0` = "no verdict") so the
+  compiled path can re-validate the cached clean-chain verdict at fixed
+offsets. All `elements` access funnels through `ArraySlots::elements()` /
+  `elements_mut()` guards.
+- **Cursor.** `ArraySlots` carries explicit public `elem_ptr`/`elem_len`/
+  `elem_cap` cursor fields (the builder precedent — no `Vec` internals are
+  read from compiled code). `elem_len` is authoritative; the backing `Vec`'s
+  length is brought up to it in `sync`, and `DenseElementsMut::drop`
+  refreshes the cursor after a safe mutation. `Trace` walks the cursor, so
+  elements written by machine code are visible to the collector.
+- **JIT.** `emit_dense_array_append_inline` re-verifies [[Extensible]] and
+  re-validates the two-link chain verdict inline, then checks `elem_len ==
+  idx && elem_len < elem_cap`; on a hit it writes `elem_ptr[elem_len]`,
+  bumps `elem_len`, `slots.length`, and `generation` in machine code (the
+  interpreter discipline). Any failure falls through to `DenseArrayAppend`
+  and then to the full `SetMemberComputed`.
+- **Mirror.** The compiled append deliberately does not write the
+  `properties[0]` length mirror. The only readers that could observe it were
+  made dense-aware: `member_cell_get` now serves a dense Array's `length`
+  from the cell, and `spill_dense_array` materializes the cell's true length
+  rather than copying the stale mirror.
+
+Measured (`--jit-bench`, same machine, node 24.12 for reference):
+
+| row | before | after | node |
+|---|---|---|---|
+| `buildString shape` jit | 34.7-35.4 ms | **17.4-19.0** (ratio 0.35 → 0.18) | ~7.1-8.3 |
+| `buildString full` jit | 24.7 ms | **18.0-20.4** (ratio 0.32 → 0.24) | ~10.2-12.6 |
+
+No other `--jit-bench` row regressed. The remaining ~2.4x on the shape is the
+per-append `generation` bump, the still-unreduced gate (tag + range +
+integrality + chain), and the array `length` read in `a[a.length]` shapes;
+node's store does none of the bookkeeping.
+
+Correctness: a differential battery (`scratch/battery.js`,
+`battery_gc.js`) covers post-inc and `a[a.length]` fills, hole fill, delete,
+`preventExtensions` fallback, an `Array.prototype` index setter intercepting
+the append, mid-loop `length = 0`, the mirror readers (`getOwnPropertyDescriptor`,
+`Object.keys`/`entries`, `JSON.stringify`), `length` grow, heap values, and
+reports byte-for-byte identical under jit / `--jitless` / `--gc-stress` and
+vs node. `cargo test --workspace` 0 fail; `cargo clippy --workspace
+--all-targets -D warnings` clean; full sweeps language 23721 / 0 / 3 / 0 /
+0, built-ins 23657 / 0 / 155 / 0 / 0, annexB 1086 / 0 / 0 / 0 / 0 (all
+exactly the parent baselines). Touches `crates/crux/src/value.rs` (the
+sentinel + `repr(transparent)`), `crates/crux/src/object.rs` (the
+representation change, cursor, `ChainVerdict`, the accessor guards, the
+spill sync), `crates/runtime/src/{ir,jit}.rs`,
+`crates/runtime/src/builtins/{array,function,typed_array}.rs`,
+`crates/jit/src/compiler.rs` (the inline append),
+`crates/jit/src/lib.rs` (the two inline-append tests).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

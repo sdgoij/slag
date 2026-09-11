@@ -701,7 +701,7 @@ fn typed_array_fast_source(
         return Ok(None);
     }
     let length = slots.length.get() as u64;
-    let elements = slots.elements.borrow();
+    let elements = slots.elements();
     if length as usize > elements.len() {
         // A trailing hole region (a length grown past the elements) reads
         // the prototype chain for the missing indices.
@@ -710,10 +710,10 @@ fn typed_array_fast_source(
     let mut values = Vec::with_capacity(length as usize);
     for slot in elements.iter().take(length as usize) {
         // A mid-array hole would read the chain, not the slot.
-        let Some(value) = slot else {
+        if slot.is_hole() {
             return Ok(None);
-        };
-        values.push(*value);
+        }
+        values.push(*slot);
     }
     Ok(Some(values))
 }

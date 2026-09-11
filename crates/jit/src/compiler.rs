@@ -2366,6 +2366,13 @@ impl<'a> Lowerer<'a> {
         let key_ok_check = self.builder.create_block();
         let len_check = self.builder.create_block();
         let append = self.builder.create_block();
+        let verdict = self.builder.create_block();
+        let link1 = self.builder.create_block();
+        let link2 = self.builder.create_block();
+        let link2_fields = self.builder.create_block();
+        let room = self.builder.create_block();
+        let fast_write = self.builder.create_block();
+        let helper = self.builder.create_block();
         let idx_var = self.builder.declare_var(types::I64);
         self.builder.ins().jump(inline, &[]);
         // Object tag: heap prefix + Object tag.
@@ -2468,8 +2475,191 @@ impl<'a> Lowerer<'a> {
         let append_ok = self.builder.ins().fcmp(FloatCC::Equal, idx_f, length);
         self.builder.ins().brif(append_ok, append, &[], legacy, &[]);
         self.builder.seal_block(len_check);
-        // The narrow append helper (raw — it cannot set the pending byte).
+        // The inline append (Phase C). The gate has proved a dense Array with
+        // a canonical index equal to its length; re-verify the two things the
+        // `DenseArrayAppend` helper would otherwise check — [[Extensible]] and
+        // the cached clean-chain verdict — then write the element and update
+        // the cursor / length / generation in machine code. The FFI call
+        // boundary (spill and reload of every live loop value) was the
+        // dominant cost of the store; every failure falls to `helper` (the
+        // narrow append) and then to `legacy`.
         self.builder.switch_to_block(append);
+        let extensible = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, extensible) as i32),
+        );
+        let ext_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, extensible, 0);
+        self.builder.ins().brif(ext_ok, verdict, &[], helper, &[]);
+        self.builder.seal_block(append);
+        // The verdict: a first link is recorded, present, and unchanged. A
+        // chain mutation on either link bumps its generation, so a mismatch
+        // falls to the helper (which re-walks and re-records).
+        let scc = std::mem::offset_of!(crux::JsObject, store_chain_clean) as i32;
+        let prototype_off = Offset32::new(std::mem::offset_of!(crux::JsObject, prototype) as i32);
+        let id_off = Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32);
+        let generation_off = Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32);
+        let data_off = crux::heap::GCBOX_DATA_OFFSET as i64;
+        self.builder.switch_to_block(verdict);
+        let first_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(scc + std::mem::offset_of!(crux::object::ChainVerdict, first_id) as i32),
+        );
+        let first_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(scc + std::mem::offset_of!(crux::object::ChainVerdict, first_gen) as i32),
+        );
+        let p1 = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), obj_ptr, prototype_off);
+        let has_verdict = self.builder.ins().icmp_imm_u(IntCC::NotEqual, first_id, 0);
+        let has_first = self.builder.ins().icmp_imm_u(IntCC::NotEqual, p1, 0);
+        let verdict_ok = self.builder.ins().band(has_verdict, has_first);
+        self.builder.ins().brif(verdict_ok, link1, &[], helper, &[]);
+        self.builder.seal_block(verdict);
+        self.builder.switch_to_block(link1);
+        let p1d = self.builder.ins().iadd_imm_s(p1, data_off);
+        let p1_id = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), p1d, id_off);
+        let p1_gen = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), p1d, generation_off);
+        let id1_ok = self.builder.ins().icmp(IntCC::Equal, p1_id, first_id);
+        let gen1_ok = self.builder.ins().icmp(IntCC::Equal, p1_gen, first_gen);
+        let link1_ok = self.builder.ins().band(id1_ok, gen1_ok);
+        self.builder.ins().brif(link1_ok, link2, &[], helper, &[]);
+        self.builder.seal_block(link1);
+        self.builder.switch_to_block(link2);
+        let p2 = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), p1d, prototype_off);
+        let has_second = self.builder.ins().icmp_imm_u(IntCC::NotEqual, p2, 0);
+        self.builder
+            .ins()
+            .brif(has_second, link2_fields, &[], helper, &[]);
+        self.builder.seal_block(link2);
+        self.builder.switch_to_block(link2_fields);
+        let second_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(scc + std::mem::offset_of!(crux::object::ChainVerdict, second_id) as i32),
+        );
+        let second_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(
+                scc + std::mem::offset_of!(crux::object::ChainVerdict, second_gen) as i32,
+            ),
+        );
+        let p2d = self.builder.ins().iadd_imm_s(p2, data_off);
+        let p2_id = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), p2d, id_off);
+        let p2_gen = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), p2d, generation_off);
+        let p3 = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), p2d, prototype_off);
+        let id2_ok = self.builder.ins().icmp(IntCC::Equal, p2_id, second_id);
+        let gen2_ok = self.builder.ins().icmp(IntCC::Equal, p2_gen, second_gen);
+        let link2_ok = self.builder.ins().band(id2_ok, gen2_ok);
+        let chain_end = self.builder.ins().icmp_imm_u(IntCC::Equal, p3, 0);
+        let chain_ok = self.builder.ins().band(link2_ok, chain_end);
+        self.builder.ins().brif(chain_ok, room, &[], helper, &[]);
+        self.builder.seal_block(link2_fields);
+        // The cursor: the append must land at the materialized end with the
+        // buffer already holding capacity (a grow falls to the helper).
+        self.builder.switch_to_block(room);
+        let elem_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+        );
+        let elem_cap = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_cap) as i32),
+        );
+        let at_end = self.builder.ins().icmp(IntCC::Equal, elem_len, idx);
+        let has_room = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, elem_len, elem_cap);
+        let room_ok = self.builder.ins().band(at_end, has_room);
+        self.builder
+            .ins()
+            .brif(room_ok, fast_write, &[], helper, &[]);
+        self.builder.seal_block(room);
+        // fast_write: elements[len] = value; len += 1; length = idx + 1;
+        // generation += 1 (the interpreter discipline — invalidate the
+        // generation-keyed element/length read cells).
+        self.builder.switch_to_block(fast_write);
+        let elem_ptr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+        );
+        let elem_size = self
+            .builder
+            .ins()
+            .iconst(types::I64, std::mem::size_of::<crux::value::Value>() as i64);
+        let byte_off = self.builder.ins().imul(elem_len, elem_size);
+        let dest = self.builder.ins().iadd(elem_ptr, byte_off);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), value, dest, 0);
+        let one = self.builder.ins().iconst(types::I64, 1);
+        let new_len = self.builder.ins().iadd(elem_len, one);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            new_len,
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+        );
+        let one_f = self.builder.ins().f64const(1.0);
+        let new_length = self.builder.ins().fadd(idx_f, one_f);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            new_length,
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+        );
+        let generation =
+            self.builder
+                .ins()
+                .load(types::I32, MemFlagsData::new(), obj_ptr, generation_off);
+        let new_generation = self.builder.ins().iadd_imm_u(generation, 1);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), new_generation, obj_ptr, generation_off);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(fast_write);
+        // The narrow append helper (raw — it cannot set the pending byte):
+        // re-runs the checks above for a grow, a spilled buffer, or a
+        // stale/re-corded chain verdict.
+        self.builder.switch_to_block(helper);
         let idx = self.builder.use_var(idx_var);
         let ok = self.emit_raw_call(
             self.sig_binary,
@@ -2478,7 +2668,7 @@ impl<'a> Lowerer<'a> {
         )?;
         let hit = self.builder.ins().icmp_imm_u(IntCC::Equal, ok, 1);
         self.builder.ins().brif(hit, merge, &[], legacy, &[]);
-        self.builder.seal_block(append);
+        self.builder.seal_block(helper);
         Ok(())
     }
 

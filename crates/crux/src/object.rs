@@ -9,7 +9,7 @@
 //! Integer-Indexed, Proxy, and Module namespace exotics join with their
 //! owning phases (12, 16, 7).
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt;
 use std::mem::MaybeUninit;
 
@@ -550,21 +550,117 @@ impl Trace for TypedArraySlots {
 /// `Property` struct, or lazy index-map entry — and `length` lives in the
 /// lock-free cell, mirrored in `properties[0]` so the generic paths stay
 /// coherent. The buffer is lazy: it holds `0..elements.len()` and is
-/// extended with `None` holes on demand, so `new Array(1e9)` sets the
+/// extended with `hole` markers on demand, so `new Array(1e9)` sets the
 /// cell without allocating. Any operation the buffer cannot represent
 /// exactly (a non-w/e/c element descriptor, non-writable length,
 /// freeze/seal, a generic index-keyed access) spills: the elements are
 /// materialized into `properties` in index order and `dense` clears —
 /// the array then behaves exactly like the generic properties path, so
 /// the buffer is a fast path, never a second implementation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ArraySlots {
-    /// Dense elements: position == index; `None` is a hole (absent).
-    pub elements: RefCell<Vec<Option<Value>>>,
+    elements: RefCell<Vec<Value>>,
     /// [[Length]] (a lock-free `Cell`, the `prototype` pattern).
     pub length: Cell<f64>,
     /// Whether the dense fast path is active; cleared by a spill.
     pub dense: Cell<bool>,
+    /// The compiled dense-append cursor: an explicit, layout-stable view of
+    /// `elements` for the JIT's inline append. `elem_ptr` is the buffer base,
+    /// `elem_cap` its capacity in elements, and `elem_len` the authoritative
+    /// materialized length — the compiled append writes `elem_ptr[elem_len]`
+    /// and bumps `elem_len` in place, and the `elements` Vec's own length is
+    /// brought up to `elem_len` by `sync` before any safe access.
+    pub elem_ptr: Cell<*mut Value>,
+    pub elem_len: Cell<usize>,
+    pub elem_cap: Cell<usize>,
+}
+
+impl ArraySlots {
+    pub fn new(elements: Vec<Value>, length: f64) -> Self {
+        let mut elements = elements;
+        let elem_ptr = elements.as_mut_ptr();
+        let (elem_len, elem_cap) = (elements.len(), elements.capacity());
+        Self {
+            elements: RefCell::new(elements),
+            length: Cell::new(length),
+            dense: Cell::new(true),
+            elem_ptr: Cell::new(elem_ptr),
+            elem_len: Cell::new(elem_len),
+            elem_cap: Cell::new(elem_cap),
+        }
+    }
+
+    /// Bring the backing Vec's length up to the cursor: the compiled append
+    /// grows `elem_len` without touching the Vec header. Must not be called
+    /// while a guard is live.
+    fn sync(&self) {
+        let len = self.elem_len.get();
+        let mut elements = self.elements.borrow_mut();
+        if elements.len() != len {
+            // SAFETY: `[elements.len(), len)` were written by the compiled
+            // append under a valid cursor, and the capacity gate held, so the
+            // slots are initialized and in bounds. `Value` is `Copy`.
+            unsafe { elements.set_len(len) };
+        }
+        self.elem_ptr.set(elements.as_mut_ptr());
+        self.elem_cap.set(elements.capacity());
+    }
+
+    /// Re-derive the cursor from the backing Vec (after a safe mutation or a
+    /// buffer move).
+    pub fn refresh(&self) {
+        let elements = self.elements.borrow();
+        self.elem_ptr.set(elements.as_ptr() as *mut Value);
+        self.elem_len.set(elements.len());
+        self.elem_cap.set(elements.capacity());
+    }
+
+    pub fn elements(&self) -> Ref<'_, Vec<Value>> {
+        self.sync();
+        self.elements.borrow()
+    }
+
+    pub fn elements_mut(&self) -> DenseElementsMut<'_> {
+        self.sync();
+        DenseElementsMut {
+            slot: self,
+            inner: Some(self.elements.borrow_mut()),
+        }
+    }
+}
+
+/// A mutable guard over a dense array's element buffer; on drop it refreshes
+/// the compiled append cursor (a `Vec` mutation may have moved the buffer or
+/// changed its length).
+pub struct DenseElementsMut<'a> {
+    slot: &'a ArraySlots,
+    inner: Option<RefMut<'a, Vec<Value>>>,
+}
+
+impl std::ops::Deref for DenseElementsMut<'_> {
+    type Target = Vec<Value>;
+    fn deref(&self) -> &Vec<Value> {
+        match &self.inner {
+            Some(inner) => inner,
+            None => unreachable!("dense elements guard used after drop"),
+        }
+    }
+}
+
+impl std::ops::DerefMut for DenseElementsMut<'_> {
+    fn deref_mut(&mut self) -> &mut Vec<Value> {
+        match &mut self.inner {
+            Some(inner) => inner,
+            None => unreachable!("dense elements guard used after drop"),
+        }
+    }
+}
+
+impl Drop for DenseElementsMut<'_> {
+    fn drop(&mut self) {
+        self.inner = None;
+        self.slot.refresh();
+    }
 }
 
 /// The largest hole span the dense buffer will materialize before spilling:
@@ -574,7 +670,18 @@ const DENSE_HOLE_SPILL_CAP: usize = 65536;
 
 impl Trace for ArraySlots {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.elements.trace(visit);
+        let len = self.elem_len.get();
+        if len == 0 {
+            return;
+        }
+        let ptr = self.elem_ptr.get();
+        // SAFETY: `elem_ptr`/`elem_len` describe the initialized elements of
+        // the live allocation (refreshed on every realloc; the compiled
+        // append's capacity gate keeps the pointer stable). Holes are not
+        // heap references, so they trace as no-ops.
+        for index in 0..len {
+            unsafe { (*ptr.add(index)).trace(visit) };
+        }
     }
 }
 
@@ -660,6 +767,41 @@ impl Trace for PrivateElement {
     }
 }
 
+/// The cached "chain is clean for index stores" verdict used by
+/// `array_element_write`: the two prototype links' (id, generation), where
+/// `first_id == 0` means "no verdict". A match against the live chain means
+/// neither link gained an own index property. `#[repr(C)]` so the compiled
+/// dense append re-validates it at fixed offsets.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ChainVerdict {
+    pub first_id: u64,
+    pub first_gen: u32,
+    pub second_id: u64,
+    pub second_gen: u32,
+}
+
+impl ChainVerdict {
+    pub const fn none() -> Self {
+        Self {
+            first_id: 0,
+            first_gen: 0,
+            second_id: 0,
+            second_gen: 0,
+        }
+    }
+
+    /// Whether a verdict is recorded.
+    pub const fn is_some(&self) -> bool {
+        self.first_id != 0
+    }
+
+    /// Whether no verdict is recorded.
+    pub const fn is_none(&self) -> bool {
+        self.first_id == 0
+    }
+}
+
 /// An ECMAScript object. Equality is identity: each object carries a unique
 /// `id` (mirroring `Symbol`), so `Handle<JsObject>` equality and the derived
 /// `PartialEq` on `Value` are identity tests.
@@ -726,7 +868,7 @@ pub struct JsObject {
     /// exists for. The ids are raw (not handles): the links stay reachable
     /// through the `prototype` cells while this object lives, so the cache
     /// needs no trace edge (mirrors `prototype`).
-    store_chain_clean: Cell<Option<(u64, u32, u64, u32)>>,
+    pub store_chain_clean: Cell<ChainVerdict>,
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
     pub properties: RefCell<SmallProps>,
@@ -888,7 +1030,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
+            store_chain_clean: Cell::new(ChainVerdict::none()),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -933,7 +1075,7 @@ impl JsObject {
             std::ptr::write(std::ptr::addr_of_mut!((*this).generation), Cell::new(0));
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).store_chain_clean),
-                Cell::new(None),
+                Cell::new(ChainVerdict::none()),
             );
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).properties),
@@ -1215,7 +1357,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
+            store_chain_clean: Cell::new(ChainVerdict::none()),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1240,7 +1382,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
+            store_chain_clean: Cell::new(ChainVerdict::none()),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1265,11 +1407,7 @@ impl JsObject {
                 "Invalid array length".into(),
             ));
         }
-        let slots = Handle::new(ArraySlots {
-            elements: RefCell::new(Vec::new()),
-            length: Cell::new(length),
-            dense: Cell::new(true),
-        });
+        let slots = Handle::new(ArraySlots::new(Vec::new(), length));
         // In-place init: `Handle::new(Self { .. })` would build the whole
         // JsObject on the stack and memcpy it into the arena slot (~80ns per
         // allocation on the hot creation paths — the `new_in_place` lesson);
@@ -1309,7 +1447,7 @@ impl JsObject {
                 std::ptr::write(std::ptr::addr_of_mut!((*this).generation), Cell::new(0));
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*this).store_chain_clean),
-                    Cell::new(None),
+                    Cell::new(ChainVerdict::none()),
                 );
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*this).properties),
@@ -1364,7 +1502,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
+            store_chain_clean: Cell::new(ChainVerdict::none()),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1400,7 +1538,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
+            store_chain_clean: Cell::new(ChainVerdict::none()),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1431,7 +1569,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
+            store_chain_clean: Cell::new(ChainVerdict::none()),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1543,7 +1681,7 @@ impl JsObject {
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
+            store_chain_clean: Cell::new(ChainVerdict::none()),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1600,7 +1738,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
+            store_chain_clean: Cell::new(ChainVerdict::none()),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1701,7 +1839,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
-            store_chain_clean: Cell::new(None),
+            store_chain_clean: Cell::new(ChainVerdict::none()),
             properties: RefCell::new(SmallProps::new()),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
@@ -1944,11 +2082,11 @@ impl JsObject {
                 if slots.dense.get() {
                     // An in-range index is the buffer slot: a hole reads
                     // absent, a value the canonical w/e/c element.
-                    let elements = slots.elements.borrow();
+                    let elements = slots.elements();
                     return Ok(elements
                         .get(index as usize)
-                        .and_then(|e| *e)
-                        .map(|value| Property::data(value, true, true, true)));
+                        .filter(|value| !value.is_hole())
+                        .map(|value| Property::data(*value, true, true, true)));
                 }
             }
         }
@@ -2187,8 +2325,8 @@ impl JsObject {
     ) -> Result<Option<()>, JsError> {
         let length = slots.length.get();
         if (index as f64) < length {
-            let mut elements = slots.elements.borrow_mut();
-            let hole = !matches!(elements.get(index as usize), Some(Some(_)));
+            let mut elements = slots.elements_mut();
+            let hole = !matches!(elements.get(index as usize), Some(v) if !v.is_hole());
             if hole {
                 // A huge hole span (e.g. `a[2^31] = v` on a short array)
                 // must not materialize billions of slots: fall back, and
@@ -2205,13 +2343,13 @@ impl JsObject {
                 if !self.store_chain_clean_hit() && !self.store_chain_walk(index) {
                     return Ok(None);
                 }
-                let mut elements = slots.elements.borrow_mut();
+                let mut elements = slots.elements_mut();
                 if elements.len() <= index as usize {
-                    elements.resize(index as usize + 1, None);
+                    elements.resize(index as usize + 1, Value::hole());
                 }
-                elements[index as usize] = Some(value);
+                elements[index as usize] = value;
             } else {
-                elements[index as usize] = Some(value);
+                elements[index as usize] = value;
             }
             self.bump_generation();
             return Ok(Some(()));
@@ -2230,7 +2368,7 @@ impl JsObject {
             return Ok(None);
         }
         {
-            let mut elements = slots.elements.borrow_mut();
+            let mut elements = slots.elements_mut();
             // The dense buffer can be shorter than `length` — a length grow
             // past the buffer (`a.length = N` on a short array) leaves
             // trailing holes — so the element lands at its real index
@@ -2241,9 +2379,9 @@ impl JsObject {
                 return Ok(None);
             }
             if elements.len() < index as usize {
-                elements.resize(index as usize, None);
+                elements.resize(index as usize, Value::hole());
             }
-            elements.push(Some(value));
+            elements.push(value);
         }
         slots.length.set(length + 1.0);
         self.write_length_mirror(length + 1.0);
@@ -2252,9 +2390,14 @@ impl JsObject {
     }
 
     /// Keep `properties[0]` (the `length` mirror) in sync while dense: the
-    /// generic paths read it as today, so a stale mirror would surface
-    /// through them. All length changes while dense funnel through this and
-    /// `array_set_length`'s dense branches.
+    /// generic property paths read it as today, so a stale mirror would
+    /// surface through them. The interpreter's dense length changes funnel
+    /// through this and `array_set_length`'s dense branches; the JIT's
+    /// inline dense append updates the `length` cell but NOT the mirror, so
+    /// every reader that could observe the mirror either consults the cell
+    /// (`ordinary_get_own_property`, `has_own_index_property`,
+    /// `member_cell_get`) or re-syncs from it on the way out
+    /// (`spill_dense_array`).
     fn write_length_mirror(&self, length: f64) {
         if let Some((_, length_prop)) = self.properties.borrow_mut().first_mut()
             && let PropertyKind::Data { value: slot, .. } = &mut length_prop.kind
@@ -2281,8 +2424,11 @@ impl JsObject {
         let ObjectKind::Array(slots) = &self.kind else {
             return None;
         };
-        let elements = slots.elements.borrow();
-        elements.get(index as usize).copied().flatten()
+        let elements = slots.elements();
+        elements
+            .get(index as usize)
+            .copied()
+            .filter(|value| !value.is_hole())
     }
 
     /// The dense `Array.prototype.pop` fast path: a dense Array whose last
@@ -2307,16 +2453,16 @@ impl JsObject {
         }
         let index = (length - 1.0) as u64;
         let value = {
-            let elements = slots.elements.borrow();
+            let elements = slots.elements();
             match elements.get(index as usize) {
-                Some(Some(value)) => Some(*value),
+                Some(value) if !value.is_hole() => Some(*value),
                 _ => None,
             }
         };
         let Some(value) = value else {
             return Ok(None);
         };
-        slots.elements.borrow_mut().truncate(index as usize);
+        slots.elements_mut().truncate(index as usize);
         slots.length.set(index as f64);
         self.write_length_mirror(index as f64);
         self.bump_generation();
@@ -2333,7 +2479,7 @@ impl JsObject {
         if !slots.dense.get() {
             return;
         }
-        let elements = std::mem::take(&mut *slots.elements.borrow_mut());
+        let elements = std::mem::take(&mut *slots.elements_mut());
         slots.dense.set(false);
         self.array_dense.set(None);
         let mut props = self.properties.borrow_mut();
@@ -2342,13 +2488,21 @@ impl JsObject {
         let mut rebuilt = SmallProps::new();
         let mut rest = props.iter();
         if let Some((name, property)) = rest.next() {
-            rebuilt.push((name.clone(), property.clone()));
+            // The compiled dense append leaves the `properties[0]` length
+            // mirror stale (the `length` cell is authoritative while dense),
+            // so materialize the true length here rather than copying the
+            // mirror.
+            let mut length_property = property.clone();
+            if let PropertyKind::Data { value, .. } = &mut length_property.kind {
+                *value = Value::Number(slots.length.get());
+            }
+            rebuilt.push((name.clone(), length_property));
         }
         for (i, element) in elements.iter().enumerate() {
-            if let Some(value) = element {
+            if !element.is_hole() {
                 rebuilt.push((
                     PropertyKey::from_index(i as u64),
-                    Property::data(*value, true, true, true),
+                    Property::data(*element, true, true, true),
                 ));
             }
         }
@@ -2453,7 +2607,7 @@ impl JsObject {
                     .elements
                     .borrow()
                     .get(index as usize)
-                    .is_some_and(|e| e.is_some());
+                    .is_some_and(|value| !value.is_hole());
             }
             return self
                 .ordinary_property_lookup(&PropertyKey::from_index(index))
@@ -2500,10 +2654,16 @@ impl JsObject {
     /// prototype is still null (the chain did not grow). ~5 cell reads,
     /// where the walk pays a property lookup per link.
     fn store_chain_clean_hit(&self) -> bool {
-        let Some((first_id, first_gen, second_id, second_gen)) = self.store_chain_clean.get()
-        else {
+        let verdict = self.store_chain_clean.get();
+        if verdict.first_id == 0 {
             return false;
-        };
+        }
+        let (first_id, first_gen, second_id, second_gen) = (
+            verdict.first_id,
+            verdict.first_gen,
+            verdict.second_id,
+            verdict.second_gen,
+        );
         let Some(first) = self.prototype.get() else {
             return false;
         };
@@ -2549,12 +2709,12 @@ impl JsObject {
             && !first.has_index_keyed_own_property()
             && !second.has_index_keyed_own_property()
         {
-            self.store_chain_clean.set(Some((
-                first.id(),
-                first.generation(),
-                second.id(),
-                second.generation(),
-            )));
+            self.store_chain_clean.set(ChainVerdict {
+                first_id: first.id(),
+                first_gen: first.generation(),
+                second_id: second.id(),
+                second_gen: second.generation(),
+            });
         }
         true
     }
@@ -2570,7 +2730,7 @@ impl JsObject {
         if let ObjectKind::Array(slots) = &self.kind
             && slots.dense.get()
         {
-            return slots.elements.borrow().iter().any(|e| e.is_some());
+            return slots.elements().iter().any(|value| !value.is_hole());
         }
         // Option-3 vector-free: the vector is empty while deferred, but the
         // map describes every own key — an index-keyed descriptor is an
@@ -3549,9 +3709,9 @@ impl JsObject {
             // generic properties removal below.
             ObjectKind::Array(slots) if slots.dense.get() => {
                 if let Some(index) = array_index_of(key) {
-                    let mut elements = slots.elements.borrow_mut();
+                    let mut elements = slots.elements_mut();
                     if let Some(slot) = elements.get_mut(index as usize) {
-                        *slot = None;
+                        *slot = Value::hole();
                         self.bump_generation();
                     }
                     return Ok(true);
@@ -3724,9 +3884,9 @@ fn array_own_property_keys(array: &JsObject) -> Vec<PropertyKey> {
     // absent), then `length` + string props, then symbols — the ordinary
     // [[OwnPropertyKeys]] order.
     let mut keys = Vec::new();
-    let elements = slots.elements.borrow();
+    let elements = slots.elements();
     for (i, element) in elements.iter().enumerate() {
-        if element.is_some() {
+        if !element.is_hole() {
             keys.push(PropertyKey::from_index(i as u64));
         }
     }
@@ -4168,15 +4328,15 @@ fn dense_index_define(array: &JsObject, index: u64, value: Value) -> Option<bool
     // A huge hole span (e.g. `a[2^31] = v`) must not materialize billions
     // of slots: spill, and the generic index define grows the length
     // through the properties path.
-    let elements_len = slots.elements.borrow().len();
+    let elements_len = slots.elements().len();
     if index as usize > elements_len + DENSE_HOLE_SPILL_CAP {
         return None;
     }
-    let mut elements = slots.elements.borrow_mut();
+    let mut elements = slots.elements_mut();
     if elements.len() <= index as usize {
-        elements.resize(index as usize + 1, None);
+        elements.resize(index as usize + 1, Value::hole());
     }
-    elements[index as usize] = Some(value);
+    elements[index as usize] = value;
     if (index as f64) >= length {
         slots.length.set(index as f64 + 1.0);
         array.write_length_mirror(index as f64 + 1.0);
@@ -4408,7 +4568,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
             && new_length_desc.enumerable != Some(true)
             && !new_length_desc.is_accessor_descriptor()
         {
-            slots.elements.borrow_mut().truncate(new_length as usize);
+            slots.elements_mut().truncate(new_length as usize);
             slots.length.set(new_length as f64);
             array.write_length_mirror(new_length as f64);
             array.bump_generation();
@@ -7113,7 +7273,7 @@ mod tests {
             "a clean chain must accept the first append"
         );
         assert!(
-            array.store_chain_clean.get().is_some(),
+            array.store_chain_clean.get().first_id != 0,
             "the clean two-link chain must be cached on the first store"
         );
         for i in 1..5u64 {
