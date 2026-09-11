@@ -27,8 +27,8 @@ use crux::object::JsObject as CruxObject;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 use raylib_sys::{
-    BoundingBox, Camera3D, Color, Image, Model, ModelAnimation, Rectangle, Sound, Texture2D,
-    Transform, Vector2, Vector3,
+    BoundingBox, Camera3D, Color, Image, Model, ModelAnimation, Rectangle, RenderTexture2D, Shader,
+    Sound, Texture2D, Transform, Vector2, Vector3,
 };
 
 use crate::agent::Agent;
@@ -67,6 +67,33 @@ struct ModelSlot {
 
 unsafe impl Send for ModelSlot {}
 unsafe impl Sync for ModelSlot {}
+
+/// Shaders created by `loadShaderFromMemory`, indexed by handle.
+static SHADERS: Mutex<Vec<ShaderSlot>> = Mutex::new(Vec::new());
+
+/// A shader plus its loaded flag. `Shader` carries a raw `locs` pointer, so the
+/// slot needs the manual `Send`/`Sync` impls to live in a static (it is still
+/// only ever touched from the window thread).
+struct ShaderSlot {
+    shader: Shader,
+    loaded: bool,
+}
+
+unsafe impl Send for ShaderSlot {}
+unsafe impl Sync for ShaderSlot {}
+
+/// Render textures created by `loadRenderTexture`, indexed by handle. Each slot
+/// caches the handle of its colour and depth attachments in [`TEXTURES`] at load
+/// time, so a shadow map can be bound to a shader or blitted by the existing
+/// `drawTexture`/`drawBillboard` bindings without re-registering every frame.
+static RENDER_TEXTURES: Mutex<Vec<RenderTextureSlot>> = Mutex::new(Vec::new());
+
+struct RenderTextureSlot {
+    target: RenderTexture2D,
+    color: i32,
+    depth: i32,
+    loaded: bool,
+}
 
 /// The camera passed to the most recent `beginMode3D`, replayed for the
 /// billboard draws: raylib's billboard API takes a whole `Camera3D`, but the
@@ -1046,6 +1073,360 @@ fn texture_height(args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Number(height))
 }
 
+// ---- shaders and render textures (needs the rcore module) ----
+
+/// Resolve a shader handle from [`SHADERS`].
+fn shader_arg(args: &[Value], index: usize, name: &str) -> Result<Shader, JsError> {
+    let handle = int_arg(args, index, name)?;
+    let registry = SHADERS.lock().unwrap();
+    match registry.get(handle as usize) {
+        Some(slot) if slot.loaded => Ok(slot.shader),
+        Some(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: shader {handle} was unloaded"),
+        )),
+        None => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: unknown shader {handle}"),
+        )),
+    }
+}
+
+/// Resolve a render-texture handle from [`RENDER_TEXTURES`].
+fn render_texture_arg(
+    args: &[Value],
+    index: usize,
+    name: &str,
+) -> Result<RenderTexture2D, JsError> {
+    let handle = int_arg(args, index, name)?;
+    let registry = RENDER_TEXTURES.lock().unwrap();
+    match registry.get(handle as usize) {
+        Some(slot) if slot.loaded => Ok(slot.target),
+        Some(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: render texture {handle} was unloaded"),
+        )),
+        None => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: unknown render texture {handle}"),
+        )),
+    }
+}
+
+fn load_shader_from_memory(args: &[Value]) -> Result<Value, JsError> {
+    let vs = text_arg(args, 0, "loadShaderFromMemory")?;
+    let fs = text_arg(args, 1, "loadShaderFromMemory")?;
+    // SAFETY: window-thread guard; raylib compiles the source strings, which
+    // stay alive for the duration of the call.
+    let shader = unsafe { raylib_sys::LoadShaderFromMemory(vs.as_ptr(), fs.as_ptr()) };
+    if shader.id == 0 {
+        return Ok(Value::Number(-1.0));
+    }
+    let mut registry = SHADERS.lock().unwrap();
+    registry.push(ShaderSlot {
+        shader,
+        loaded: true,
+    });
+    Ok(Value::Number((registry.len() - 1) as f64))
+}
+
+/// Whether `handle` refers to a shader this module compiled and has not unloaded.
+fn is_shader_valid(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "isShaderValid")?;
+    let registry = SHADERS.lock().unwrap();
+    let valid = registry
+        .get(handle as usize)
+        .is_some_and(|slot| slot.loaded);
+    Ok(Value::Boolean(valid))
+}
+
+fn unload_shader(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "unloadShader")?;
+    let mut registry = SHADERS.lock().unwrap();
+    if let Some(slot) = registry.get_mut(handle as usize) {
+        if slot.loaded {
+            // SAFETY: window-thread guard; the shader came from raylib and is
+            // freed exactly once (the slot is then marked unloaded).
+            unsafe { raylib_sys::UnloadShader(slot.shader) };
+            slot.loaded = false;
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn get_shader_location(args: &[Value]) -> Result<Value, JsError> {
+    let shader = shader_arg(args, 0, "getShaderLocation")?;
+    let name = text_arg(args, 1, "getShaderLocation")?;
+    // SAFETY: window-thread guard; the shader is live and `name` outlives the
+    // call. raylib returns -1 for a uniform that is not active in the program.
+    let location = unsafe { raylib_sys::GetShaderLocation(shader, name.as_ptr()) };
+    Ok(Value::Number(location as f64))
+}
+
+fn begin_shader_mode(args: &[Value]) -> Result<Value, JsError> {
+    let shader = shader_arg(args, 0, "beginShaderMode")?;
+    // SAFETY: window-thread guard; draw state during begin/endDrawing.
+    unsafe { raylib_sys::BeginShaderMode(shader) };
+    Ok(Value::Undefined)
+}
+
+fn end_shader_mode(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    unsafe { raylib_sys::EndShaderMode() };
+    Ok(Value::Undefined)
+}
+
+/// Set a scalar (`float`, `int` or `uint`) uniform. raylib reads the value
+/// through a `void*` sized by `uniformType`, so the integer forms must be given
+/// an integer and not the bit pattern of the float.
+fn set_shader_value(args: &[Value]) -> Result<Value, JsError> {
+    // Validate the uniform type before touching the shader: a vector type here
+    // would make raylib read past the single scalar through its `void*`.
+    let uniform_type = int_arg(args, 3, "setShaderValue")?;
+    if !matches!(uniform_type, 0 | 4 | 8) {
+        return Err(expected(
+            "setShaderValue",
+            3,
+            "SHADER_UNIFORM_FLOAT, SHADER_UNIFORM_INT or SHADER_UNIFORM_UINT",
+        ));
+    }
+    let shader = shader_arg(args, 0, "setShaderValue")?;
+    let location = int_arg(args, 1, "setShaderValue")?;
+    let value = num_arg(args, 2, "setShaderValue")?;
+    // SAFETY: window-thread guard; the local below outlives the call and raylib
+    // only reads the first four bytes for the scalar uniform types.
+    unsafe {
+        match uniform_type {
+            0 => {
+                let scalar = value as f32;
+                raylib_sys::SetShaderValue(
+                    shader,
+                    location,
+                    &scalar as *const f32 as *const std::ffi::c_void,
+                    0,
+                );
+            }
+            4 => {
+                let scalar = value as i32;
+                raylib_sys::SetShaderValue(
+                    shader,
+                    location,
+                    &scalar as *const i32 as *const std::ffi::c_void,
+                    4,
+                );
+            }
+            _ => {
+                let scalar = value as u32;
+                raylib_sys::SetShaderValue(
+                    shader,
+                    location,
+                    &scalar as *const u32 as *const std::ffi::c_void,
+                    8,
+                );
+            }
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn set_shader_value_vector2(args: &[Value]) -> Result<Value, JsError> {
+    let shader = shader_arg(args, 0, "setShaderValueVector2")?;
+    let location = int_arg(args, 1, "setShaderValueVector2")?;
+    let value = [
+        num_arg(args, 2, "setShaderValueVector2")? as f32,
+        num_arg(args, 3, "setShaderValueVector2")? as f32,
+    ];
+    // SAFETY: window-thread guard; `value` outlives the call (SHADER_UNIFORM_VEC2).
+    unsafe {
+        raylib_sys::SetShaderValue(
+            shader,
+            location,
+            value.as_ptr() as *const std::ffi::c_void,
+            1,
+        )
+    };
+    Ok(Value::Undefined)
+}
+
+fn set_shader_value_vector3(args: &[Value]) -> Result<Value, JsError> {
+    let shader = shader_arg(args, 0, "setShaderValueVector3")?;
+    let location = int_arg(args, 1, "setShaderValueVector3")?;
+    let value = [
+        num_arg(args, 2, "setShaderValueVector3")? as f32,
+        num_arg(args, 3, "setShaderValueVector3")? as f32,
+        num_arg(args, 4, "setShaderValueVector3")? as f32,
+    ];
+    // SAFETY: window-thread guard; `value` outlives the call (SHADER_UNIFORM_VEC3).
+    unsafe {
+        raylib_sys::SetShaderValue(
+            shader,
+            location,
+            value.as_ptr() as *const std::ffi::c_void,
+            2,
+        )
+    };
+    Ok(Value::Undefined)
+}
+
+fn set_shader_value_vector4(args: &[Value]) -> Result<Value, JsError> {
+    let shader = shader_arg(args, 0, "setShaderValueVector4")?;
+    let location = int_arg(args, 1, "setShaderValueVector4")?;
+    let value = [
+        num_arg(args, 2, "setShaderValueVector4")? as f32,
+        num_arg(args, 3, "setShaderValueVector4")? as f32,
+        num_arg(args, 4, "setShaderValueVector4")? as f32,
+        num_arg(args, 5, "setShaderValueVector4")? as f32,
+    ];
+    // SAFETY: window-thread guard; `value` outlives the call (SHADER_UNIFORM_VEC4).
+    unsafe {
+        raylib_sys::SetShaderValue(
+            shader,
+            location,
+            value.as_ptr() as *const std::ffi::c_void,
+            3,
+        )
+    };
+    Ok(Value::Undefined)
+}
+
+fn set_shader_value_texture(args: &[Value]) -> Result<Value, JsError> {
+    let shader = shader_arg(args, 0, "setShaderValueTexture")?;
+    let location = int_arg(args, 1, "setShaderValueTexture")?;
+    let texture = texture_arg(args, 2, "setShaderValueTexture")?;
+    // SAFETY: window-thread guard; both the shader and the texture are live.
+    unsafe { raylib_sys::SetShaderValueTexture(shader, location, texture) };
+    Ok(Value::Undefined)
+}
+
+fn load_render_texture(args: &[Value]) -> Result<Value, JsError> {
+    let width = int_arg(args, 0, "loadRenderTexture")?;
+    let height = int_arg(args, 1, "loadRenderTexture")?;
+    if width <= 0 || height <= 0 {
+        return Ok(Value::Number(-1.0));
+    }
+    // SAFETY: window-thread guard; raylib allocates the framebuffer on this
+    // thread and returns zeroed handles on failure.
+    let target = unsafe { raylib_sys::LoadRenderTexture(width, height) };
+    if target.id == 0 || target.texture.id == 0 {
+        return Ok(Value::Number(-1.0));
+    }
+    // Register the attachments once so they can be sampled by a shader or
+    // blitted with `drawTexture`; their handles stay valid until the render
+    // texture is unloaded.
+    let color = {
+        let mut textures = TEXTURES.lock().unwrap();
+        textures.push(target.texture);
+        (textures.len() - 1) as i32
+    };
+    let depth = {
+        let mut textures = TEXTURES.lock().unwrap();
+        textures.push(target.depth);
+        (textures.len() - 1) as i32
+    };
+    let mut registry = RENDER_TEXTURES.lock().unwrap();
+    registry.push(RenderTextureSlot {
+        target,
+        color,
+        depth,
+        loaded: true,
+    });
+    Ok(Value::Number((registry.len() - 1) as f64))
+}
+
+/// Whether `handle` refers to a render texture this module made and has not
+/// unloaded.
+fn is_render_texture_valid(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "isRenderTextureValid")?;
+    let registry = RENDER_TEXTURES.lock().unwrap();
+    let valid = registry
+        .get(handle as usize)
+        .is_some_and(|slot| slot.loaded);
+    Ok(Value::Boolean(valid))
+}
+
+fn unload_render_texture(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "unloadRenderTexture")?;
+    let mut registry = RENDER_TEXTURES.lock().unwrap();
+    if let Some(slot) = registry.get_mut(handle as usize) {
+        if slot.loaded {
+            // SAFETY: window-thread guard; freed exactly once. The texture
+            // handles registered at load time are not invalidated here, so a
+            // script must stop using them once the render texture is unloaded.
+            unsafe { raylib_sys::UnloadRenderTexture(slot.target) };
+            slot.loaded = false;
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn begin_texture_mode(args: &[Value]) -> Result<Value, JsError> {
+    let target = render_texture_arg(args, 0, "beginTextureMode")?;
+    // SAFETY: window-thread guard; draw state during begin/endDrawing.
+    unsafe { raylib_sys::BeginTextureMode(target) };
+    Ok(Value::Undefined)
+}
+
+fn end_texture_mode(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    unsafe { raylib_sys::EndTextureMode() };
+    Ok(Value::Undefined)
+}
+
+fn render_texture_size(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "renderTextureSize")?;
+    let registry = RENDER_TEXTURES.lock().unwrap();
+    let slot = registry
+        .get(handle as usize)
+        .filter(|slot| slot.loaded)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.renderTextureSize: unknown render texture {handle}"),
+            )
+        })?;
+    let object = CruxObject::ordinary_object_create(None);
+    for (name, value) in [
+        ("x", slot.target.texture.width),
+        ("y", slot.target.texture.height),
+    ] {
+        object.create_data_property_or_throw(
+            &JsString::from_utf8(name),
+            Value::Number(value as f64),
+        )?;
+    }
+    Ok(Value::Object(object))
+}
+
+fn render_texture_color(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "renderTextureColor")?;
+    let registry = RENDER_TEXTURES.lock().unwrap();
+    let slot = registry
+        .get(handle as usize)
+        .filter(|slot| slot.loaded)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.renderTextureColor: unknown render texture {handle}"),
+            )
+        })?;
+    Ok(Value::Number(slot.color as f64))
+}
+
+fn render_texture_depth(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "renderTextureDepth")?;
+    let registry = RENDER_TEXTURES.lock().unwrap();
+    let slot = registry
+        .get(handle as usize)
+        .filter(|slot| slot.loaded)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.renderTextureDepth: unknown render texture {handle}"),
+            )
+        })?;
+    Ok(Value::Number(slot.depth as f64))
+}
+
 // ---- audio + file-loaded assets (needs the raudio C module) ----
 
 fn init_audio_device(_args: &[Value]) -> Result<Value, JsError> {
@@ -1973,6 +2354,25 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("updateModelAnimation", 3, update_model_animation),
         ("modelBonePosition", 2, model_bone_position),
         ("modelBoneTransform", 2, model_bone_transform),
+        ("loadShaderFromMemory", 2, load_shader_from_memory),
+        ("isShaderValid", 1, is_shader_valid),
+        ("unloadShader", 1, unload_shader),
+        ("getShaderLocation", 2, get_shader_location),
+        ("beginShaderMode", 1, begin_shader_mode),
+        ("endShaderMode", 0, end_shader_mode),
+        ("setShaderValue", 4, set_shader_value),
+        ("setShaderValueVector2", 4, set_shader_value_vector2),
+        ("setShaderValueVector3", 5, set_shader_value_vector3),
+        ("setShaderValueVector4", 6, set_shader_value_vector4),
+        ("setShaderValueTexture", 3, set_shader_value_texture),
+        ("loadRenderTexture", 2, load_render_texture),
+        ("isRenderTextureValid", 1, is_render_texture_valid),
+        ("unloadRenderTexture", 1, unload_render_texture),
+        ("beginTextureMode", 1, begin_texture_mode),
+        ("endTextureMode", 0, end_texture_mode),
+        ("renderTextureSize", 1, render_texture_size),
+        ("renderTextureColor", 1, render_texture_color),
+        ("renderTextureDepth", 1, render_texture_depth),
         ("makeTexture", 3, make_texture),
         ("drawTexture", 10, draw_texture_rect),
         ("textureWidth", 1, texture_width),
@@ -2042,6 +2442,25 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         &JsString::from_utf8("MOUSE_BUTTON_MIDDLE"),
         Value::Number(2.0),
     )?;
+
+    // Shader uniform data types (`ShaderUniformDataType` in raylib.h).
+    for (name, code) in [
+        ("SHADER_UNIFORM_FLOAT", 0),
+        ("SHADER_UNIFORM_VEC2", 1),
+        ("SHADER_UNIFORM_VEC3", 2),
+        ("SHADER_UNIFORM_VEC4", 3),
+        ("SHADER_UNIFORM_INT", 4),
+        ("SHADER_UNIFORM_IVEC2", 5),
+        ("SHADER_UNIFORM_IVEC3", 6),
+        ("SHADER_UNIFORM_IVEC4", 7),
+        ("SHADER_UNIFORM_UINT", 8),
+        ("SHADER_UNIFORM_UIVEC2", 9),
+        ("SHADER_UNIFORM_UIVEC3", 10),
+        ("SHADER_UNIFORM_UIVEC4", 11),
+        ("SHADER_UNIFORM_SAMPLER2D", 12),
+    ] {
+        rl.create_data_property_or_throw(&JsString::from_utf8(name), Value::Number(code as f64))?;
+    }
 
     let global = realm.global_object;
     global.create_data_property_or_throw(&JsString::from_utf8("rl"), Value::Object(rl))?;
@@ -2164,6 +2583,65 @@ mod tests {
             context.eval("rl.isModelValid(-1)").unwrap().as_boolean(),
             Some(false)
         );
+        // Shader and render-texture bindings are installed; compiling/allocating
+        // needs a live window, so only the shape and handle checks run here.
+        for name in [
+            "loadShaderFromMemory",
+            "isShaderValid",
+            "unloadShader",
+            "getShaderLocation",
+            "beginShaderMode",
+            "endShaderMode",
+            "setShaderValue",
+            "setShaderValueVector2",
+            "setShaderValueVector3",
+            "setShaderValueVector4",
+            "setShaderValueTexture",
+            "loadRenderTexture",
+            "isRenderTextureValid",
+            "unloadRenderTexture",
+            "beginTextureMode",
+            "endTextureMode",
+            "renderTextureSize",
+            "renderTextureColor",
+            "renderTextureDepth",
+        ] {
+            assert_eq!(
+                context
+                    .eval(&format!("typeof rl.{name}"))
+                    .unwrap()
+                    .as_string()
+                    .as_deref(),
+                Some("function"),
+                "rl.{name}"
+            );
+        }
+        assert_eq!(
+            context
+                .eval("rl.SHADER_UNIFORM_FLOAT === 0 && rl.SHADER_UNIFORM_SAMPLER2D === 12")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context.eval("rl.isShaderValid(-1)").unwrap().as_boolean(),
+            Some(false)
+        );
+        assert_eq!(
+            context
+                .eval("rl.isRenderTextureValid(-1)")
+                .unwrap()
+                .as_boolean(),
+            Some(false)
+        );
+        // A scalar uniform with a non-scalar type is rejected rather than
+        // reading the wrong bytes out of a float.
+        let error = match context.eval("rl.setShaderValue(-1, 0, 1, rl.SHADER_UNIFORM_VEC3)") {
+            Ok(_) => panic!("rl.setShaderValue with a vector type must throw"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rl.setShaderValue"), "{error}");
+        assert!(error.contains("SHADER_UNIFORM"), "{error}");
         assert_eq!(
             context
                 .eval("rl.modelAnimationCount(-1)")
