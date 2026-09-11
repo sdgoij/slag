@@ -27,8 +27,8 @@ use crux::object::JsObject as CruxObject;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 use raylib_sys::{
-    BoundingBox, Camera3D, Color, Image, Model, ModelAnimation, Rectangle, RenderTexture2D, Shader,
-    Sound, Texture2D, Transform, Vector2, Vector3,
+    BoundingBox, Camera3D, Color, Image, Matrix, Model, ModelAnimation, Rectangle, RenderTexture2D,
+    Shader, Sound, Texture2D, Transform, Vector2, Vector3,
 };
 
 use crate::agent::Agent;
@@ -63,6 +63,10 @@ struct ModelSlot {
     animations: *mut ModelAnimation,
     animation_count: i32,
     loaded: bool,
+    /// The material shaders the model was loaded with, captured the first time
+    /// `setModelShader` overrides them so `setModelShader(model, -1)` can put
+    /// the originals back.
+    original_shaders: Vec<Shader>,
 }
 
 unsafe impl Send for ModelSlot {}
@@ -672,6 +676,7 @@ fn load_model(args: &[Value]) -> Result<Value, JsError> {
         animations,
         animation_count,
         loaded: true,
+        original_shaders: Vec::new(),
     });
     Ok(Value::Number((registry.len() - 1) as f64))
 }
@@ -757,6 +762,61 @@ fn draw_model_ex(args: &[Value]) -> Result<Value, JsError> {
             tint,
         )
     };
+    Ok(Value::Undefined)
+}
+
+/// Point every material of `model` at `shader`, or restore the shaders the model
+/// was loaded with when `shader` is negative.
+///
+/// `DrawMesh` binds `material.shader` and ignores any shader set with
+/// `beginShaderMode`, so a model can only be routed through a custom shader by
+/// writing its materials. The originals are captured on first use.
+fn set_model_shader(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "setModelShader")?;
+    let shader_handle = int_arg(args, 1, "setModelShader")?;
+    // Resolve the shader before locking the model registry to keep the two
+    // registry locks from ever being held at once.
+    let override_shader = if shader_handle < 0 {
+        None
+    } else {
+        Some(shader_arg(args, 1, "setModelShader")?)
+    };
+    let mut registry = MODELS.lock().unwrap();
+    let slot = registry
+        .get_mut(handle as usize)
+        .filter(|slot| slot.loaded)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.setModelShader: unknown model {handle}"),
+            )
+        })?;
+    let count = slot.model.materialCount;
+    if slot.model.materials.is_null() || count <= 0 {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.setModelShader: model {handle} has no materials"),
+        ));
+    }
+    let materials = slot.model.materials;
+    let count = count as usize;
+    if slot.original_shaders.len() != count {
+        let mut originals = Vec::with_capacity(count);
+        for index in 0..count {
+            // SAFETY: `index` is in range and the material array is owned by the
+            // model; the shader value is copied out (Shader is Copy).
+            originals.push(unsafe { (*materials.add(index)).shader });
+        }
+        slot.original_shaders = originals;
+    }
+    for index in 0..count {
+        let target = match override_shader {
+            Some(shader) => shader,
+            None => slot.original_shaders[index],
+        };
+        // SAFETY: as above; writing a Copy shader value into a live material.
+        unsafe { (*materials.add(index)).shader = target };
+    }
     Ok(Value::Undefined)
 }
 
@@ -1286,6 +1346,39 @@ fn set_shader_value_vector4(args: &[Value]) -> Result<Value, JsError> {
             3,
         )
     };
+    Ok(Value::Undefined)
+}
+
+/// Set a `mat4` uniform. The sixteen values are given in raylib's `Matrix`
+/// field order (`m0`, `m1`, ... `m15`), i.e. column-major as OpenGL expects.
+fn set_shader_value_matrix(args: &[Value]) -> Result<Value, JsError> {
+    let shader = shader_arg(args, 0, "setShaderValueMatrix")?;
+    let location = int_arg(args, 1, "setShaderValueMatrix")?;
+    let mut values = [0.0f32; 16];
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = num_arg(args, 2 + index, "setShaderValueMatrix")? as f32;
+    }
+    let matrix = Matrix {
+        m0: values[0],
+        m1: values[1],
+        m2: values[2],
+        m3: values[3],
+        m4: values[4],
+        m5: values[5],
+        m6: values[6],
+        m7: values[7],
+        m8: values[8],
+        m9: values[9],
+        m10: values[10],
+        m11: values[11],
+        m12: values[12],
+        m13: values[13],
+        m14: values[14],
+        m15: values[15],
+    };
+    // SAFETY: window-thread guard; the shader is live and `matrix` is copied by
+    // raylib into the uniform.
+    unsafe { raylib_sys::SetShaderValueMatrix(shader, location, matrix) };
     Ok(Value::Undefined)
 }
 
@@ -2345,6 +2438,7 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("unloadModel", 1, unload_model),
         ("drawModel", 6, draw_model),
         ("drawModelEx", 12, draw_model_ex),
+        ("setModelShader", 2, set_model_shader),
         ("modelBounds", 1, model_bounds),
         ("modelAnimationCount", 1, model_animation_count),
         ("modelBoneCount", 1, model_bone_count),
@@ -2364,6 +2458,7 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("setShaderValueVector2", 4, set_shader_value_vector2),
         ("setShaderValueVector3", 5, set_shader_value_vector3),
         ("setShaderValueVector4", 6, set_shader_value_vector4),
+        ("setShaderValueMatrix", 18, set_shader_value_matrix),
         ("setShaderValueTexture", 3, set_shader_value_texture),
         ("loadRenderTexture", 2, load_render_texture),
         ("isRenderTextureValid", 1, is_render_texture_valid),
@@ -2567,6 +2662,7 @@ mod tests {
             "updateModelAnimation",
             "modelBonePosition",
             "modelBoneTransform",
+            "setModelShader",
         ] {
             assert_eq!(
                 context
@@ -2596,6 +2692,7 @@ mod tests {
             "setShaderValueVector2",
             "setShaderValueVector3",
             "setShaderValueVector4",
+            "setShaderValueMatrix",
             "setShaderValueTexture",
             "loadRenderTexture",
             "isRenderTextureValid",
