@@ -28,7 +28,7 @@ use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 use raylib_sys::{
     BoundingBox, Camera3D, Color, Image, Model, ModelAnimation, Rectangle, Sound, Texture2D,
-    Vector2, Vector3,
+    Transform, Vector2, Vector3,
 };
 
 use crate::agent::Agent;
@@ -67,6 +67,11 @@ struct ModelSlot {
 
 unsafe impl Send for ModelSlot {}
 unsafe impl Sync for ModelSlot {}
+
+/// The camera passed to the most recent `beginMode3D`, replayed for the
+/// billboard draws: raylib's billboard API takes a whole `Camera3D`, but the
+/// surface exposes only the individual fields, so the binding caches them.
+static CAMERA_3D: Mutex<Option<Camera3D>> = Mutex::new(None);
 
 /// Assets embedded into the binary by an embedder (see
 /// `Context::register_raylib_asset`), looked up by their logical file name
@@ -291,6 +296,8 @@ fn begin_mode_3d(args: &[Value]) -> Result<Value, JsError> {
         fovy,
         projection: 0, // CAMERA_PERSPECTIVE
     };
+    // Remember the camera for `drawBillboard`/`drawBillboardRec`.
+    *CAMERA_3D.lock().unwrap() = Some(camera);
     // SAFETY: draw state on the installing thread (see `window_method`).
     unsafe { raylib_sys::BeginMode3D(camera) };
     Ok(Value::Undefined)
@@ -333,6 +340,177 @@ fn draw_grid(args: &[Value]) -> Result<Value, JsError> {
     let spacing = num_arg(args, 1, "drawGrid")? as f32;
     // SAFETY: as above.
     unsafe { raylib_sys::DrawGrid(slices, spacing) };
+    Ok(Value::Undefined)
+}
+
+fn draw_sphere(args: &[Value]) -> Result<Value, JsError> {
+    let x = num_arg(args, 0, "drawSphere")? as f32;
+    let y = num_arg(args, 1, "drawSphere")? as f32;
+    let z = num_arg(args, 2, "drawSphere")? as f32;
+    let radius = num_arg(args, 3, "drawSphere")? as f32;
+    let color = color_arg(args, 4, "drawSphere")?;
+    // SAFETY: draw state on the installing thread (see `window_method`).
+    unsafe { raylib_sys::DrawSphere(Vector3 { x, y, z }, radius, color) };
+    Ok(Value::Undefined)
+}
+
+fn draw_sphere_ex(args: &[Value]) -> Result<Value, JsError> {
+    let x = num_arg(args, 0, "drawSphereEx")? as f32;
+    let y = num_arg(args, 1, "drawSphereEx")? as f32;
+    let z = num_arg(args, 2, "drawSphereEx")? as f32;
+    let radius = num_arg(args, 3, "drawSphereEx")? as f32;
+    let rings = int_arg(args, 4, "drawSphereEx")?;
+    let slices = int_arg(args, 5, "drawSphereEx")?;
+    let color = color_arg(args, 6, "drawSphereEx")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::DrawSphereEx(Vector3 { x, y, z }, radius, rings, slices, color) };
+    Ok(Value::Undefined)
+}
+
+fn draw_line_3d(args: &[Value]) -> Result<Value, JsError> {
+    let x1 = num_arg(args, 0, "drawLine3D")? as f32;
+    let y1 = num_arg(args, 1, "drawLine3D")? as f32;
+    let z1 = num_arg(args, 2, "drawLine3D")? as f32;
+    let x2 = num_arg(args, 3, "drawLine3D")? as f32;
+    let y2 = num_arg(args, 4, "drawLine3D")? as f32;
+    let z2 = num_arg(args, 5, "drawLine3D")? as f32;
+    let color = color_arg(args, 6, "drawLine3D")?;
+    // SAFETY: as above.
+    unsafe {
+        raylib_sys::DrawLine3D(
+            Vector3 {
+                x: x1,
+                y: y1,
+                z: z1,
+            },
+            Vector3 {
+                x: x2,
+                y: y2,
+                z: z2,
+            },
+            color,
+        )
+    };
+    Ok(Value::Undefined)
+}
+
+fn draw_point_3d(args: &[Value]) -> Result<Value, JsError> {
+    let x = num_arg(args, 0, "drawPoint3D")? as f32;
+    let y = num_arg(args, 1, "drawPoint3D")? as f32;
+    let z = num_arg(args, 2, "drawPoint3D")? as f32;
+    let color = color_arg(args, 3, "drawPoint3D")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::DrawPoint3D(Vector3 { x, y, z }, color) };
+    Ok(Value::Undefined)
+}
+
+fn draw_triangle_3d(args: &[Value]) -> Result<Value, JsError> {
+    let x1 = num_arg(args, 0, "drawTriangle3D")? as f32;
+    let y1 = num_arg(args, 1, "drawTriangle3D")? as f32;
+    let z1 = num_arg(args, 2, "drawTriangle3D")? as f32;
+    let x2 = num_arg(args, 3, "drawTriangle3D")? as f32;
+    let y2 = num_arg(args, 4, "drawTriangle3D")? as f32;
+    let z2 = num_arg(args, 5, "drawTriangle3D")? as f32;
+    let x3 = num_arg(args, 6, "drawTriangle3D")? as f32;
+    let y3 = num_arg(args, 7, "drawTriangle3D")? as f32;
+    let z3 = num_arg(args, 8, "drawTriangle3D")? as f32;
+    let color = color_arg(args, 9, "drawTriangle3D")?;
+    // SAFETY: as above. Vertices must be counter-clockwise.
+    unsafe {
+        raylib_sys::DrawTriangle3D(
+            Vector3 {
+                x: x1,
+                y: y1,
+                z: z1,
+            },
+            Vector3 {
+                x: x2,
+                y: y2,
+                z: z2,
+            },
+            Vector3 {
+                x: x3,
+                y: y3,
+                z: z3,
+            },
+            color,
+        )
+    };
+    Ok(Value::Undefined)
+}
+
+/// Resolve a texture handle from the [`TEXTURES`] registry.
+fn texture_arg(args: &[Value], index: usize, name: &str) -> Result<Texture2D, JsError> {
+    let handle = int_arg(args, index, name)?;
+    TEXTURES
+        .lock()
+        .unwrap()
+        .get(handle as usize)
+        .copied()
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.{name}: unknown texture {handle}"),
+            )
+        })
+}
+
+/// The camera captured by the most recent `beginMode3D`.
+fn current_camera(name: &str) -> Result<Camera3D, JsError> {
+    CAMERA_3D.lock().unwrap().ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: call beginMode3D first (billboards use the active camera)"),
+        )
+    })
+}
+
+fn draw_billboard(args: &[Value]) -> Result<Value, JsError> {
+    let texture = texture_arg(args, 0, "drawBillboard")?;
+    let x = num_arg(args, 1, "drawBillboard")? as f32;
+    let y = num_arg(args, 2, "drawBillboard")? as f32;
+    let z = num_arg(args, 3, "drawBillboard")? as f32;
+    let size = num_arg(args, 4, "drawBillboard")? as f32;
+    let tint = color_arg(args, 5, "drawBillboard")?;
+    let camera = current_camera("drawBillboard")?;
+    // SAFETY: draw state on the installing thread; the camera came from the
+    // matching `beginMode3D`.
+    unsafe { raylib_sys::DrawBillboard(camera, texture, Vector3 { x, y, z }, size, tint) };
+    Ok(Value::Undefined)
+}
+
+fn draw_billboard_rec(args: &[Value]) -> Result<Value, JsError> {
+    let texture = texture_arg(args, 0, "drawBillboardRec")?;
+    let sx = num_arg(args, 1, "drawBillboardRec")? as f32;
+    let sy = num_arg(args, 2, "drawBillboardRec")? as f32;
+    let sw = num_arg(args, 3, "drawBillboardRec")? as f32;
+    let sh = num_arg(args, 4, "drawBillboardRec")? as f32;
+    let x = num_arg(args, 5, "drawBillboardRec")? as f32;
+    let y = num_arg(args, 6, "drawBillboardRec")? as f32;
+    let z = num_arg(args, 7, "drawBillboardRec")? as f32;
+    let width = num_arg(args, 8, "drawBillboardRec")? as f32;
+    let height = num_arg(args, 9, "drawBillboardRec")? as f32;
+    let tint = color_arg(args, 10, "drawBillboardRec")?;
+    let camera = current_camera("drawBillboardRec")?;
+    // SAFETY: as above.
+    unsafe {
+        raylib_sys::DrawBillboardRec(
+            camera,
+            texture,
+            Rectangle {
+                x: sx,
+                y: sy,
+                width: sw,
+                height: sh,
+            },
+            Vector3 { x, y, z },
+            Vector2 {
+                x: width,
+                y: height,
+            },
+            tint,
+        )
+    };
     Ok(Value::Undefined)
 }
 
@@ -643,6 +821,83 @@ fn update_model_animation(args: &[Value]) -> Result<Value, JsError> {
     // registry, and this only rewrites the model's pose buffers.
     unsafe { raylib_sys::UpdateModelAnimation(model, animation, frame) };
     Ok(Value::Undefined)
+}
+
+/// The current pose transform of `boneIndex`. raylib keeps the pose in
+/// `model.currentPose` (model space), refreshed by `updateModelAnimation` and
+/// initialised to the bind pose at load; the pose array is allocated for
+/// `skeleton.boneCount` entries.
+fn bone_pose(model: &Model, bone_index: i32, name: &str) -> Result<Transform, JsError> {
+    if model.currentPose.is_null() || model.skeleton.boneCount <= 0 {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: model has no skeleton"),
+        ));
+    }
+    if bone_index < 0 || bone_index >= model.skeleton.boneCount {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "rl.{name}: bone {bone_index} is out of range 0..{}",
+                model.skeleton.boneCount
+            ),
+        ));
+    }
+    // SAFETY: window-thread guard; `currentPose` is non-null with
+    // `boneCount` entries, and the bounds check above keeps the index inside.
+    let current = unsafe { *model.currentPose.add(bone_index as usize) };
+    // raylib zero-fills the runtime pose at load and only fills it from
+    // `updateModelAnimation`, so a zero quaternion means no animation has been
+    // applied yet: fall back to the bind pose rather than hand back a
+    // degenerate transform.
+    let rotation = current.rotation;
+    if rotation.x == 0.0
+        && rotation.y == 0.0
+        && rotation.z == 0.0
+        && rotation.w == 0.0
+        && !model.skeleton.bindPose.is_null()
+    {
+        // SAFETY: `bindPose` is non-null with `boneCount` entries.
+        return Ok(unsafe { *model.skeleton.bindPose.add(bone_index as usize) });
+    }
+    Ok(current)
+}
+
+fn float_object(entries: &[(&str, f32)]) -> Result<Value, JsError> {
+    let object = CruxObject::ordinary_object_create(None);
+    for (name, value) in entries {
+        object.create_data_property_or_throw(
+            &JsString::from_utf8(name),
+            Value::Number(*value as f64),
+        )?;
+    }
+    Ok(Value::Object(object))
+}
+
+fn model_bone_position(args: &[Value]) -> Result<Value, JsError> {
+    let model = model_arg(args, 0, "modelBonePosition")?;
+    let index = int_arg(args, 1, "modelBonePosition")?;
+    let pose = bone_pose(&model, index, "modelBonePosition")?;
+    float_object(&[
+        ("x", pose.translation.x),
+        ("y", pose.translation.y),
+        ("z", pose.translation.z),
+    ])
+}
+
+fn model_bone_transform(args: &[Value]) -> Result<Value, JsError> {
+    let model = model_arg(args, 0, "modelBoneTransform")?;
+    let index = int_arg(args, 1, "modelBoneTransform")?;
+    let pose = bone_pose(&model, index, "modelBoneTransform")?;
+    float_object(&[
+        ("x", pose.translation.x),
+        ("y", pose.translation.y),
+        ("z", pose.translation.z),
+        ("qx", pose.rotation.x),
+        ("qy", pose.rotation.y),
+        ("qz", pose.rotation.z),
+        ("qw", pose.rotation.w),
+    ])
 }
 
 // ---- textures (needs the rtextures C module) ----
@@ -1072,6 +1327,60 @@ fn draw_line(args: &[Value]) -> Result<Value, JsError> {
     // SAFETY: as above.
     unsafe { raylib_sys::DrawLine(x1, y1, x2, y2, color) };
     Ok(Value::Undefined)
+}
+
+fn draw_rectangle_lines(args: &[Value]) -> Result<Value, JsError> {
+    let x = int_arg(args, 0, "drawRectangleLines")?;
+    let y = int_arg(args, 1, "drawRectangleLines")?;
+    let width = int_arg(args, 2, "drawRectangleLines")?;
+    let height = int_arg(args, 3, "drawRectangleLines")?;
+    let color = color_arg(args, 4, "drawRectangleLines")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::DrawRectangleLines(x, y, width, height, color) };
+    Ok(Value::Undefined)
+}
+
+fn draw_rectangle_gradient_v(args: &[Value]) -> Result<Value, JsError> {
+    let x = int_arg(args, 0, "drawRectangleGradientV")?;
+    let y = int_arg(args, 1, "drawRectangleGradientV")?;
+    let width = int_arg(args, 2, "drawRectangleGradientV")?;
+    let height = int_arg(args, 3, "drawRectangleGradientV")?;
+    let top = color_arg(args, 4, "drawRectangleGradientV")?;
+    let bottom = color_arg(args, 5, "drawRectangleGradientV")?;
+    // SAFETY: as above.
+    unsafe { raylib_sys::DrawRectangleGradientV(x, y, width, height, top, bottom) };
+    Ok(Value::Undefined)
+}
+
+fn draw_text_ex(args: &[Value]) -> Result<Value, JsError> {
+    let text = text_arg(args, 0, "drawTextEx")?;
+    let x = num_arg(args, 1, "drawTextEx")? as f32;
+    let y = num_arg(args, 2, "drawTextEx")? as f32;
+    let size = num_arg(args, 3, "drawTextEx")? as f32;
+    let spacing = num_arg(args, 4, "drawTextEx")? as f32;
+    let tint = color_arg(args, 5, "drawTextEx")?;
+    // SAFETY: the default font is loaded lazily and cached process-globally;
+    // raylib reads the text only for the duration of the call.
+    let font = unsafe { raylib_sys::GetFontDefault() };
+    unsafe { raylib_sys::DrawTextEx(font, text.as_ptr(), Vector2 { x, y }, size, spacing, tint) };
+    Ok(Value::Undefined)
+}
+
+fn measure_text_ex(args: &[Value]) -> Result<Value, JsError> {
+    let text = text_arg(args, 0, "measureTextEx")?;
+    let size = num_arg(args, 1, "measureTextEx")? as f32;
+    let spacing = num_arg(args, 2, "measureTextEx")? as f32;
+    // SAFETY: as above.
+    let font = unsafe { raylib_sys::GetFontDefault() };
+    let measured = unsafe { raylib_sys::MeasureTextEx(font, text.as_ptr(), size, spacing) };
+    let object = CruxObject::ordinary_object_create(None);
+    for (name, value) in [("x", measured.x), ("y", measured.y)] {
+        object.create_data_property_or_throw(
+            &JsString::from_utf8(name),
+            Value::Number(value as f64),
+        )?;
+    }
+    Ok(Value::Object(object))
 }
 
 fn draw_pixel(args: &[Value]) -> Result<Value, JsError> {
@@ -1634,11 +1943,22 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("drawRectangle", 5, draw_rectangle),
         ("drawLine", 5, draw_line),
         ("drawPixel", 3, draw_pixel),
+        ("drawRectangleLines", 5, draw_rectangle_lines),
+        ("drawRectangleGradientV", 6, draw_rectangle_gradient_v),
+        ("drawTextEx", 6, draw_text_ex),
+        ("measureTextEx", 3, measure_text_ex),
         ("beginMode3D", 7, begin_mode_3d),
         ("endMode3D", 0, end_mode_3d),
         ("drawCube", 7, draw_cube),
         ("drawCubeWires", 7, draw_cube_wires),
         ("drawGrid", 2, draw_grid),
+        ("drawSphere", 5, draw_sphere),
+        ("drawSphereEx", 7, draw_sphere_ex),
+        ("drawLine3D", 7, draw_line_3d),
+        ("drawPoint3D", 4, draw_point_3d),
+        ("drawTriangle3D", 10, draw_triangle_3d),
+        ("drawBillboard", 6, draw_billboard),
+        ("drawBillboardRec", 11, draw_billboard_rec),
         ("loadModel", 1, load_model),
         ("isModelValid", 1, is_model_valid),
         ("unloadModel", 1, unload_model),
@@ -1651,6 +1971,8 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("modelAnimationFrameCount", 2, model_animation_frame_count),
         ("modelAnimationDuration", 2, model_animation_duration),
         ("updateModelAnimation", 3, update_model_animation),
+        ("modelBonePosition", 2, model_bone_position),
+        ("modelBoneTransform", 2, model_bone_transform),
         ("makeTexture", 3, make_texture),
         ("drawTexture", 10, draw_texture_rect),
         ("textureWidth", 1, texture_width),
@@ -1784,6 +2106,31 @@ mod tests {
                 .as_boolean(),
             Some(true)
         );
+        // The new 3D primitives, billboards and HUD helpers are installed;
+        // calling them needs a live window, so only the shape is checked.
+        for name in [
+            "drawSphere",
+            "drawSphereEx",
+            "drawLine3D",
+            "drawPoint3D",
+            "drawTriangle3D",
+            "drawBillboard",
+            "drawBillboardRec",
+            "drawRectangleLines",
+            "drawRectangleGradientV",
+            "drawTextEx",
+            "measureTextEx",
+        ] {
+            assert_eq!(
+                context
+                    .eval(&format!("typeof rl.{name}"))
+                    .unwrap()
+                    .as_string()
+                    .as_deref(),
+                Some("function"),
+                "rl.{name}"
+            );
+        }
         // Model bindings are installed; loading needs a window, so only the
         // shape and the non-window handle checks run here.
         for name in [
@@ -1799,6 +2146,8 @@ mod tests {
             "modelAnimationFrameCount",
             "modelAnimationDuration",
             "updateModelAnimation",
+            "modelBonePosition",
+            "modelBoneTransform",
         ] {
             assert_eq!(
                 context
