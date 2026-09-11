@@ -13,10 +13,15 @@
 //! itself, exactly like a raylib C example —
 //! `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...; rl.endDrawing(); }`.
 //!
+//! raylib's own `TraceLog` output is routed to stderr (through the
+//! `setLogCallbackWrapper` shim raylib-sys ships, which formats the variadic
+//! message before calling back into Rust), so a host can keep stdout for its
+//! own protocol — for example a command channel driven over stdin/stdout.
+//!
 //! With the additional `raygui` feature, raygui's `Gui*` controls are
 //! installed on the same object as `rl.gui*` (see the gated `gui` module).
 
-use std::ffi::CString;
+use std::ffi::{CString, c_char, c_int};
 use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
@@ -195,6 +200,31 @@ const KEY_CODES: &[(&str, i32)] = &[
     ("KEY_RIGHT_ALT", 346),
     ("KEY_RIGHT_SUPER", 347),
 ];
+
+unsafe extern "C" {
+    /// `setLogCallbackWrapper` from raylib-sys's `binding/utils_log.h`: it
+    /// installs a raylib `TraceLog` callback that formats the variadic message
+    /// (which Rust cannot do) and forwards it to `custom_trace_log_callback`.
+    fn setLogCallbackWrapper();
+}
+
+/// Receives every raylib `TraceLog` message after the raylib-sys shim has
+/// formatted it. Must keep this exact name; the shim declares it and the
+/// linker resolves it across the C boundary. raylib binds its logging to the
+/// window thread, so this runs there and writes straight to stderr, keeping
+/// stdout free for a host's command responses.
+#[unsafe(no_mangle)]
+pub extern "C" fn custom_trace_log_callback(_log_type: c_int, text: *const c_char) {
+    if text.is_null() {
+        return;
+    }
+    // SAFETY: the shim passes a NUL-terminated buffer valid for this call.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(text) }.to_bytes();
+    let stderr = std::io::stderr();
+    let mut out = stderr.lock();
+    let _ = std::io::Write::write_all(&mut out, bytes);
+    let _ = std::io::Write::write_all(&mut out, b"\n");
+}
 
 fn thread_error() -> JsError {
     JsError::new(
@@ -1943,6 +1973,14 @@ fn clear_background(args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Undefined)
 }
 
+fn take_screenshot(args: &[Value]) -> Result<Value, JsError> {
+    let path = text_arg(args, 0, "takeScreenshot")?;
+    // SAFETY: `path` is a valid NUL-terminated C string, and raylib writes the
+    // PNG synchronously before returning.
+    unsafe { raylib_sys::TakeScreenshot(path.as_ptr()) };
+    Ok(Value::Undefined)
+}
+
 fn draw_fps(args: &[Value]) -> Result<Value, JsError> {
     let x = int_arg(args, 0, "drawFPS")?;
     let y = int_arg(args, 1, "drawFPS")?;
@@ -2592,6 +2630,13 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
     // thread.
     WINDOW_THREAD.get_or_init(|| std::thread::current().id());
 
+    // Send raylib's own logging to stderr (see `custom_trace_log_callback`),
+    // so a host driving the game over stdin/stdout can reserve stdout for
+    // command responses.
+    // SAFETY: installs a C callback that forwards to the function above; the
+    // raylib-sys shim is linked whenever the `raylib` feature is on.
+    unsafe { setLogCallbackWrapper() };
+
     let realm = agent.current_realm()?;
     let object_proto = realm
         .intrinsics
@@ -2619,6 +2664,7 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("beginDrawing", 0, begin_drawing),
         ("endDrawing", 0, end_drawing),
         ("clearBackground", 1, clear_background),
+        ("takeScreenshot", 1, take_screenshot),
         ("drawFPS", 2, draw_fps),
         ("drawText", 5, draw_text),
         ("measureText", 2, measure_text),
@@ -2859,6 +2905,7 @@ mod tests {
             "drawRectangleGradientV",
             "drawTextEx",
             "measureTextEx",
+            "takeScreenshot",
         ] {
             assert_eq!(
                 context
