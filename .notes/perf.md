@@ -9034,6 +9034,125 @@ unchanged (base_100k 26.5, acc_num/loop floor 2.3-2.4ns). The throwaway
 `JsString::from_utf8` call in the write closure, which is what produced the
 misleading 0.37ns/B figure the padding A/B above corrects.
 
+### PROBE + RESEARCH (2026-09-11): the `string concat` append row is allocation-bound, and a builder transform is the only route to node parity
+
+Follow-up on the 2026-09-10 allocation probe with a fresh end-to-end
+decomposition on the pinned protocol and a reproducible native premise
+probe. Baselines on THIS machine (clean release; `scratch/sconcat/pin.js`,
+min-of-5, k=100): node `base_100k` 3.10 ns/iter, slag jit 26.2, slag
+jitless 44.0; `noop_100k` (loop only, no allocation) node 0.20, slag jit
+2.40, jitless 19.6. So the append machinery is ~24 ns on top of the loop
+floor, and the node gap is 8.5x.
+
+**Caveat: the `--jit-bench` row is not the same measurement.** For
+identical source it reads `interp ~8.2ms / jit ~7.0ms` per call — ~2.6x
+the pinned protocol's per-call time. The gap is the live-registry + GC
+rescan that `bench_once`'s repeated `context.call` re-eagerizes (a single
+call's extra registry/GC cost under that protocol is ~4ms, vs ~0.3ms on
+the pinned protocol). Tune against `pin.js`, not the suite row.
+
+Per-append model (jit, ~26 ns): loop ~2.4 + one 64B GC box (JsString's
+size class) ~10 + concat logic + handle plumbing ~5 + JIT helper FFI +
+redundant tag checks + Value encode/decode ~8.
+
+Measured levers (end-to-end skip-mask A/B on the pinned row; throwaway
+env-gated patch, since reverted): disabling `Heap::register` saves ~2.9ns
+(~11%); the per-alloc counter, the `--gc-stress` probe, and safe-point
+collection are all ~0. This does NOT reproduce the 2026-09-10 probe's
+"`register` = 5.1ns": that figure reappears only under the
+`--jit-bench`/repeated-call protocol, where it is a registry-rescan
+artifact, not the single-call cost. The GC-registry redesign the earlier
+probe proposed is therefore worth ~3ns on the honest protocol, not 5.
+
+Native decomposition (crate-local `#[cfg(test)]` probe, reverted):
+steady-state 64B `Gc::new_in_place` 10.2 ns/alloc (free-list reuse; TLS +
+`RefCell` borrow is only ~0.2-1.9 of that), `JsString::concat` chain 15.5
+ns/append, so the concat logic + handle plumbing is ~5.3 ns. A temp `+16B`
+node pad was already shown ~1.3ns by the 2026-09-10 probe.
+
+**Premise probe for the builder transform** (`scratch/sconcat/builder_probe.rs`,
+public-API, standalone: `cargo build --release -p crux` then `rustc` against
+`target/release/libcrux.rlib`; it forces a collection between passes so both
+sides are steady state; min of 5 passes): the current rope chain is
+14.4-15.0 ns/append, while pushing one code unit into a reserved `Vec<u16>`
+is ~0.40 ns/append and the single end-of-loop `from_utf16` materialization
+is ~0.02 ns/append-equivalent — **~0.42 ns/append total (~35x),
+byte-identical content**. The append allocation is the entire target, and a
+builder removes it rather than making it cheaper.
+
+Options, ranked (measured/est. saving vs the 26 ns jit row):
+
+| # | option | effect | risk |
+|---|---|---|---|
+| 1 | builder / escape-analysis transform for a non-escaping `s = s + e` accumulator | 26 -> ~4-6 ns (meets/beats node) | high: new compiler capability (no escape analysis exists today; cf. the `obj_100k` row, slag 150ns vs node 0.3) |
+| 2 | GC registry redesign (arena walk + per-slot live bit + box-header vtable) | ~3 ns (11%) | high: rewrites sweep enumeration + the stack-scan address list |
+| 3 | shrink the node 64 -> 48/32B (drop the inline flatten cache, `u32` len, cap `Small` at 8-15) | ~1.3-2.6 ns | med: enum-layout constrained; flatten-cache relocation |
+| 4 | JIT concat helper: pass decoded handles / drop the tag re-check the machine code already did | ~1-2 ns | low: `compiler.rs` `emit_binary_known` ~6752, `jit.rs` `concat_strings` ~1175 |
+| 5 | fold the alloc counter + stress TLS into the heap borrow | ~1 ns | low |
+| 6 | loop floor (2.4 vs node 0.2) | ~2 ns | med: separate dispatch/safepoint track |
+
+Options 2-5 together reach only ~20 ns (~6.5x node). Only option 1 reaches
+node parity, because it eliminates the per-append allocation. The transform
+to probe next: in the certified loop lowering (`RunRegBody` -> `emit_leaf_op`
+-> `LeafOp::BinStoreReg`/`BinStoreSlot` -> `emit_acc_binary`), recognize an
+accumulator frame slot whose only in-loop reads are the concat's own left
+operand (and `length`), with no call/closure/escape that could observe it,
+and lower the append into a scratch buffer materialized on loop exit or on
+any content read. `s.length` mid-loop is served from the builder's length.
+This is a compiler slice, not a tweak; probe it before landing.
+
+#### LANDED (2026-09-11): a `Vm` string builder for `s += e` append loops
+
+The compiler's `plan_builder` (right after `plan_loop_num`) proves an acc-path
+loop's body is exactly `[<pure operand load>, BinStoreReg { op: Add, slot }]`
+(the load is a `LoadReg`/`LoadContext`/`LoadPerIter`/`LoadConst`/`LoadCounter`,
+so no getter/call/coercion can observe `s` mid-loop; `slot != counter`; and a
+proven-Number seed keeps the numeric `BinStoreReg`/`BinStoreNum` path), then
+marks the loop's `Step::BuilderBind`/`BuilderStore` placeholders with `slot`
+and rewrites the op to `LeafOp::BuilderAppend`. The interpreter seeds a per-Vm
+builder from `slot` (only when the seed is a string), appends code units per
+iteration, and materializes one `JsString` at the loop exit; non-string
+seeds/operands fall back to the exact generic `+` (materializing first), so
+mixed/numeric/object cases stay spec-exact. The builder holds no GC edges
+(copied units), an active builder loop is excluded from leaf-inlining, and a
+nested builder loop finds the field occupied and runs generic.
+
+The JIT lowers the two steps and the op via three helpers
+(`builder_bind`/`builder_store`/`builder_append`, the four-file mirror). The
+helper caches the loop-invariant 1-unit operand, and the compiled append is
+INLINED: `Builder` exposes explicit `#[repr(C)]` `buf`/`len`/`cap` cursor
+fields (the toolchain lays `Vec` out as cap/ptr/len, so the machine code does
+NOT touch `Vec` internals — the offsets are `runtime/jit.rs` constants), and
+when the cached operand matches the compiled code stores the cached code unit
+straight into the buffer, growing via the helper only on a capacity miss.
+
+Measured (`scratch/sconcat/pin.js`, clean release, same machine):
+
+| | before | after |
+|---|---|---|
+| `base_100k` jit | 26.2-29.6 ns/iter | **1.8-1.9** |
+| `base_100k` jitless | 39.7 | 13.9 |
+| `lit_100k` (`s += "x"`) | ~25 | 1.9 |
+| `--jit-bench` string concat jit | 7.87 ms | **0.19 ms (~41x)** |
+
+The pinned row is now below node's 3.1 ns/iter; the compiled loop floor is
+0.75 ns/iter, so the append costs ~1ns/iter over it.
+
+Correctness: the 20-case differential battery
+(`scratch/sconcat/builder_battery.js`: string/number/undefined/null/true/object
+operands, const + param + counter RHS, member RHS, nested loops, zero
+iterations, break/continue, `let`/TDZ, 200k build) matches node byte-for-byte
+under jit and `--jitless`; `cargo test --workspace` 0 fail; `cargo clippy
+--workspace --all-targets -D warnings` clean. Full sweeps (the builder is now
+the only mode): language 23721 pass / 0 fail / 3 skip / 0 crash / 0 hang;
+built-ins 23657 / 0 / 155 / 0 crash / 0 hang; annexB 1086 / 0 / 0 / 0 crash / 0
+hang; `--jitless` language sample 3739 / 0 / 3. Touches `crates/runtime/src/
+ir.rs` (the `Builder`, the two steps, the op, `plan_builder`, the handlers),
+`crates/runtime/src/jit.rs` (3 helpers + table entries + the offset constants),
+`crates/jit/src/helpers.rs`/`lib.rs` (the mirror), and
+`crates/jit/src/compiler.rs` (the step/op arms, incl. the inlined append fast
+path).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

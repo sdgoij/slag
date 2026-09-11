@@ -327,6 +327,9 @@ fn runtime_helpers() -> JitHelpers {
     JitHelpers {
         binary_slow: Some(rt.binary_slow),
         concat_strings: Some(rt.concat_strings),
+        builder_bind: Some(rt.builder_bind),
+        builder_store: Some(rt.builder_store),
+        builder_append: Some(rt.builder_append),
         relational_slow: Some(rt.relational_slow),
         update_value_slow: Some(rt.update_value_slow),
         to_boolean_slow: Some(rt.to_boolean_slow),
@@ -539,6 +542,9 @@ mod tests {
         JitHelpers {
             binary_slow: Some(helpers::test_binary_slow),
             concat_strings: Some(helpers::test_concat_strings),
+            builder_bind: Some(helpers::test_builder_bind),
+            builder_store: Some(helpers::test_builder_store),
+            builder_append: Some(helpers::test_builder_append),
             relational_slow: Some(helpers::test_relational_slow),
             update_value_slow: Some(helpers::test_update_value_slow),
             to_boolean_slow: Some(helpers::test_to_boolean_slow),

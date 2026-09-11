@@ -41,12 +41,14 @@ use runtime::ir::{
     MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step, is_compound_assign,
 };
 use runtime::jit::{
-    AGENT_REALM_COUNT_OFFSET, GlobalValueCell, JIT_APPLY_MAX_ARGS, JIT_GC_PROBE_INTERVAL,
+    AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
+    BUILDER_LEN_OFFSET, BUILDER_OWNER_OFFSET, BUILDER_RHS_BITS_OFFSET, BUILDER_RHS_OK_OFFSET,
+    BUILDER_RHS_UNIT_OFFSET, GlobalValueCell, JIT_APPLY_MAX_ARGS, JIT_GC_PROBE_INTERVAL,
     JitCallContext, LEAF_CALL_CACHE_ENTRIES, LeafCallSiteCache, LeafInlineInfo,
-    TYPED_ARRAY_LENGTH_SENTINEL, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET,
-    VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET,
-    VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET,
-    VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    TYPED_ARRAY_LENGTH_SENTINEL, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BUILDER_OFFSET,
+    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
+    VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
+    VM_FOR_OF_STACK_LEN_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -4151,6 +4153,22 @@ impl<'a> Lowerer<'a> {
                 }
                 self.fall_through(index);
             }
+            // Seed/flush the per-Vm string builder around a planned
+            // append loop; the inert placeholder (`None`) is a no-op.
+            Step::BuilderBind { slot } => {
+                if let Some(slot) = slot {
+                    let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                    self.call_slow(self.sig_bool, Helper::BuilderBind, &[slot_imm])?;
+                }
+                self.fall_through(index);
+            }
+            Step::BuilderStore { slot } => {
+                if let Some(slot) = slot {
+                    let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                    self.call_slow(self.sig_bool, Helper::BuilderStore, &[slot_imm])?;
+                }
+                self.fall_through(index);
+            }
             Step::FastLoopHead {
                 var,
                 op,
@@ -7251,6 +7269,128 @@ impl<'a> Lowerer<'a> {
                 let res = self.emit_binary_known(*op, l, r, false, right_known)?;
                 self.store_slot(*slot, res);
                 self.set_acc_bits(res);
+            }
+            // The 1-unit append fast path, inlined. When the
+            // builder is active for `slot` and its cached operand matches the
+            // accumulator (a loop-invariant `s += x`), append the cached code
+            // unit straight into the builder's buffer; otherwise the helper
+            // (which decodes, caches, or runs the exact generic add).
+            LeafOp::BuilderAppend { slot } => {
+                let right = self.acc_bits();
+                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                let vm = self.vm_ptr();
+                let has_vm = self.builder.ins().icmp_imm_u(IntCC::NotEqual, vm, 0);
+                let has_vm = self.bint(has_vm);
+
+                let res_var = self.builder.declare_var(types::I64);
+                let merge = self.builder.create_block();
+                let slow = self.builder.create_block();
+                let check = self.builder.create_block();
+                let fast = self.builder.create_block();
+                let store = self.builder.create_block();
+
+                self.builder.ins().brif(has_vm, check, &[], slow, &[]);
+
+                let builder = VM_BUILDER_OFFSET;
+                let buf_off = builder + BUILDER_BUF_OFFSET;
+                let len_off = (builder + BUILDER_LEN_OFFSET) as i32;
+                let cap_off = (builder + BUILDER_CAP_OFFSET) as i32;
+
+                // check: active builder + matching cached 1-unit operand.
+                self.builder.switch_to_block(check);
+                let owner = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new((builder + BUILDER_OWNER_OFFSET) as i32),
+                );
+                let owner_ok = self.builder.ins().icmp(IntCC::Equal, owner, slot_imm);
+                let enabled = self.builder.ins().load(
+                    types::I8,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new((builder + BUILDER_ENABLED_OFFSET) as i32),
+                );
+                let enabled_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, enabled, 0);
+                let rhs_ok = self.builder.ins().load(
+                    types::I8,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new((builder + BUILDER_RHS_OK_OFFSET) as i32),
+                );
+                let rhs_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, rhs_ok, 0);
+                let rhs_bits = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new((builder + BUILDER_RHS_BITS_OFFSET) as i32),
+                );
+                let rhs_match = self.builder.ins().icmp(IntCC::Equal, rhs_bits, right);
+                let mut cond = self.builder.ins().band(owner_ok, enabled_ok);
+                cond = self.builder.ins().band(cond, rhs_ok);
+                cond = self.builder.ins().band(cond, rhs_match);
+                let cond = self.bint(cond);
+                self.builder.ins().brif(cond, fast, &[], slow, &[]);
+
+                // fast: capacity check.
+                self.builder.switch_to_block(fast);
+                let len = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new(len_off),
+                );
+                let cap = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new(cap_off),
+                );
+                let has_cap = self.builder.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+                let has_cap = self.bint(has_cap);
+                self.builder.ins().brif(has_cap, store, &[], slow, &[]);
+
+                // store: units[len] = cached unit; len += 1.
+                self.builder.switch_to_block(store);
+                let ptr = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new(buf_off as i32),
+                );
+                let unit = self.builder.ins().load(
+                    types::I16,
+                    MemFlagsData::new(),
+                    vm,
+                    Offset32::new((builder + BUILDER_RHS_UNIT_OFFSET) as i32),
+                );
+                let two = self.builder.ins().iconst(types::I64, 2);
+                let byte_off = self.builder.ins().imul(len, two);
+                let dest = self.builder.ins().iadd(ptr, byte_off);
+                self.builder.ins().store(MemFlagsData::new(), unit, dest, 0);
+                let one = self.builder.ins().iconst(types::I64, 1);
+                let new_len = self.builder.ins().iadd(len, one);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), new_len, vm, Offset32::new(len_off));
+                self.builder.def_var(res_var, right);
+                self.builder.ins().jump(merge, &[]);
+
+                // slow: the helper decodes, caches, or runs the generic add.
+                self.builder.switch_to_block(slow);
+                let res =
+                    self.call_slow(self.sig_get_name, Helper::BuilderAppend, &[slot_imm, right])?;
+                self.builder.def_var(res_var, res);
+                self.builder.ins().jump(merge, &[]);
+
+                self.builder.seal_block(check);
+                self.builder.seal_block(fast);
+                self.builder.seal_block(store);
+                self.builder.seal_block(slow);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
+                let merged = self.builder.use_var(res_var);
+                self.set_acc_bits(merged);
             }
             LeafOp::BinStoreNum { op, rhs, slot } => {
                 // Route B: the loop-carried Number slot lives in an f64

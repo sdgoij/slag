@@ -34,7 +34,9 @@ use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use crate::agent::Agent;
 use crate::context::ReferenceBase;
 use crate::env::EnvRecord;
-use crate::ir::{CompiledBody, EnvStack, MEMBER_CELLS, MemberValueCell, PropertyKeyName, Vm};
+use crate::ir::{
+    Builder, CompiledBody, EnvStack, MEMBER_CELLS, MemberValueCell, PropertyKeyName, Vm,
+};
 use crux::error::{ErrorKind, JsError};
 
 /// The compiled entry ABI (mirrors `jit::JitEntry`; all arguments are
@@ -177,6 +179,20 @@ pub const JIT_APPLY_MAX_ARGS: usize = 64;
 /// `pub(crate)` `Vm` to `offset_of!` its fields).
 pub const VM_COMPLETION_OFFSET: usize = std::mem::offset_of!(Vm, completion);
 pub const VM_COMPLETION_IS_EMPTY_OFFSET: usize = std::mem::offset_of!(Vm, completion_is_empty);
+
+/// The string-builder field offsets the compiled 1-unit append fast
+/// path reads/writes directly (the jit crate cannot name the `pub(crate)`
+/// `Vm`/`Builder`). `buf`/`len`/`cap` are explicit `#[repr(C)]` cursor fields,
+/// so the offsets are stable without depending on the `Vec`'s internal layout.
+pub const VM_BUILDER_OFFSET: usize = std::mem::offset_of!(Vm, builder);
+pub const BUILDER_OWNER_OFFSET: usize = std::mem::offset_of!(Builder, owner);
+pub const BUILDER_ENABLED_OFFSET: usize = std::mem::offset_of!(Builder, enabled);
+pub const BUILDER_RHS_OK_OFFSET: usize = std::mem::offset_of!(Builder, rhs_ok);
+pub const BUILDER_RHS_UNIT_OFFSET: usize = std::mem::offset_of!(Builder, rhs_unit);
+pub const BUILDER_RHS_BITS_OFFSET: usize = std::mem::offset_of!(Builder, rhs_bits);
+pub const BUILDER_BUF_OFFSET: usize = std::mem::offset_of!(Builder, buf);
+pub const BUILDER_LEN_OFFSET: usize = std::mem::offset_of!(Builder, len);
+pub const BUILDER_CAP_OFFSET: usize = std::mem::offset_of!(Builder, cap);
 
 /// The offset of a `Vec`'s length field: std's `Vec` is ptr + cap + len (the
 /// field is private, so `offset_of!` cannot name it; the layout is structural
@@ -401,6 +417,13 @@ pub struct JitSlowPaths {
     /// string value's bits are never 0 — the sentinel is unreachable from
     /// the compiled path's tag check).
     pub concat_strings: extern "C" fn(ctx: *mut c_void, a: u64, b: u64) -> u64,
+    /// Seed the string builder for a planned append loop.
+    pub builder_bind: extern "C" fn(ctx: *mut c_void, slot: u64) -> u64,
+    /// Materialize the string builder back into its slot.
+    pub builder_store: extern "C" fn(ctx: *mut c_void, slot: u64) -> u64,
+    /// Append `right` to the builder owning `slot`; returns the new
+    /// accumulator bits (the exact generic `+` on fallback).
+    pub builder_append: extern "C" fn(ctx: *mut c_void, slot: u64, right: u64) -> u64,
     /// JS relational semantics for a loop test on a non-Number; returns 1
     /// when the test holds.
     pub relational_slow: extern "C" fn(ctx: *mut c_void, op: u64, a: u64, b: u64) -> u64,
@@ -944,6 +967,9 @@ pub struct JitSlowPaths {
 pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     binary_slow,
     concat_strings,
+    builder_bind,
+    builder_store,
+    builder_append,
     relational_slow,
     update_value_slow,
     to_boolean_slow,
@@ -1182,6 +1208,47 @@ extern "C" fn concat_strings(_ctx: *mut c_void, a: u64, b: u64) -> u64 {
     match (a.as_string(), b.as_string()) {
         (Some(a), Some(b)) => Value::String(crux::string::JsString::concat(&a, &b)).bits(),
         _ => 0,
+    }
+}
+
+/// Seed the per-Vm string builder from `slot`.
+extern "C" fn builder_bind(ctx: *mut c_void, slot: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    if ctx.vm.is_null() {
+        return 0;
+    }
+    let vm = unsafe { &mut *ctx.vm };
+    vm.builder_bind(slot as usize);
+    0
+}
+
+/// Materialize the per-Vm string builder back into `slot`.
+extern "C" fn builder_store(ctx: *mut c_void, slot: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    if ctx.vm.is_null() {
+        return 0;
+    }
+    let vm = unsafe { &mut *ctx.vm };
+    vm.builder_store(slot as usize);
+    0
+}
+
+/// Append `right` to the builder owning `slot`, or run the exact
+/// generic `slot = slot + right`. Returns the accumulator bits.
+extern "C" fn builder_append(ctx: *mut c_void, slot: u64, right: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    if ctx.vm.is_null() {
+        return right;
+    }
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let right = Value::from_bits(right);
+    if vm.builder_try_append(slot as usize, &right) {
+        return right.bits();
+    }
+    match vm.builder_generic_add(agent, slot as usize, &right) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
     }
 }
 

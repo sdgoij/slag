@@ -937,6 +937,18 @@ pub enum Step {
         /// slot (the counterpart of `FastLoopBind`'s `num`).
         num: Option<usize>,
     },
+    /// Seed the per-Vm string builder from `slot` (`Some`) before the loop;
+    /// `None` is an inert placeholder for a loop the planner declined.
+    /// Emitted immediately before
+    /// `FastLoopBind`.
+    BuilderBind {
+        slot: Option<usize>,
+    },
+    /// Flush (materialize) the string builder back into `slot` after the
+    /// loop. Emitted after `NormalizeCompletion`.
+    BuilderStore {
+        slot: Option<usize>,
+    },
     /// Run a register-lowered loop body (Cut 35 slice 9): the ops address
     /// the current frame — the script's inline frame here (the leaf path
     /// uses the stack segment via `leaf_frame_base`) — with the
@@ -1211,6 +1223,12 @@ pub enum LeafOp {
         slot: usize,
         tdz: bool,
     },
+    /// Append the accumulator's string value to the per-Vm builder owning
+    /// `slot` (the planner rewrites the loop body's sole
+    /// `BinStoreReg { op: Add, slot }` into this). When the
+    /// operands are not both strings, falls back to the exact generic
+    /// `slot = slot + acc` (materializing the builder first).
+    BuilderAppend { slot: usize },
     /// acc = acc op context[slot].
     BinContext { op: BinaryOp, index: usize },
     /// acc = acc op per-iteration[slot].
@@ -2757,6 +2775,77 @@ pub(crate) fn with_leaf_run<T>(vm: *mut Vm, body: *const CompiledBody, f: impl F
 }
 
 /// The resumable VM state. Saved across suspension by the driver.
+/// A per-Vm string builder for a planned `s += e` append loop.
+/// Live only while the loop runs; holds copied UTF-16 units, so it has no GC
+/// edges and needs no tracing. `owner` keys it to the accumulator slot so a
+/// nested loop (which finds `builder` occupied and runs generic) cannot
+/// disturb it.
+#[derive(Debug)]
+#[repr(C)]
+pub(crate) struct Builder {
+    pub(crate) owner: usize,
+    pub(crate) enabled: bool,
+    /// The compiled 1-unit append fast path's cache: the last 1-unit operand
+    /// appended (`rhs_bits` = its handle bits, `rhs_unit` = the code unit,
+    /// `rhs_ok` = a valid entry). A loop-invariant `s += x` reuses it with no
+    /// string decode. Populated by `builder_try_append`.
+    pub(crate) rhs_ok: bool,
+    pub(crate) rhs_unit: u16,
+    pub(crate) rhs_bits: u64,
+    /// The append cursor: `buf` points into `storage`'s allocation, `len`
+    /// units are live, `cap` is the allocation's capacity. These explicit
+    /// `#[repr(C)]` fields give the compiled fast path stable offsets (the
+    /// `Vec`'s own `ptr`/`cap`/`len` order is a compiler-internal detail); the
+    /// helpers keep `storage.len` in sync with `len`.
+    pub(crate) buf: *mut u16,
+    pub(crate) len: usize,
+    pub(crate) cap: usize,
+    pub(crate) storage: Vec<u16>,
+}
+
+impl Builder {
+    const fn inactive() -> Builder {
+        Builder {
+            owner: usize::MAX,
+            enabled: false,
+            rhs_ok: false,
+            rhs_unit: 0,
+            rhs_bits: 0,
+            buf: std::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+            storage: Vec::new(),
+        }
+    }
+
+    /// Re-point `buf`/`len`/`cap` at `storage` (after any reserve/realloc).
+    fn sync_cursor(&mut self) {
+        self.buf = self.storage.as_mut_ptr();
+        self.cap = self.storage.capacity();
+        self.len = self.storage.len();
+    }
+
+    /// Make `storage`'s length match the append cursor: the `len` units were
+    /// initialized by the raw appends, and `len <= capacity`.
+    fn sync_storage_len(&mut self) {
+        // SAFETY: every unit below `len` has been written; the capacity check
+        // before each append keeps `len` within the allocation.
+        unsafe {
+            self.storage.set_len(self.len);
+        }
+    }
+}
+
+/// The live units of a builder (empty when nothing is buffered).
+fn builder_slice(builder: &Builder) -> &[u16] {
+    if builder.len == 0 {
+        &[]
+    } else {
+        // SAFETY: `buf`/`len` describe initialized units owned by `storage`.
+        unsafe { std::slice::from_raw_parts(builder.buf, builder.len) }
+    }
+}
+
 #[derive(Debug)]
 pub struct Vm {
     pub ip: usize,
@@ -2916,6 +3005,9 @@ pub struct Vm {
     /// `loop_counter` is — the compile-time plan admits only proven-Number
     /// slots with proven-Number RMWs.
     loop_num: f64,
+    /// The active string builder for a planned `s += e` append loop (see
+    /// [`Builder`]). `owner == usize::MAX` outside such a loop.
+    pub(crate) builder: Builder,
     /// Completion-register saves for the `finally` blocks currently running
     /// (nested finallys push in order).
     completion_stack: Vec<(Value, bool)>,
@@ -3130,6 +3222,7 @@ impl Vm {
             acc: Value::Undefined,
             loop_counter: 0.0,
             loop_num: 0.0,
+            builder: Builder::inactive(),
             completion_stack: Vec::new(),
             list_stack: Vec::new(),
             var_ref_stack: Vec::new(),
@@ -3192,6 +3285,7 @@ impl Vm {
         self.completion_is_empty = true;
         self.acc = Value::Undefined;
         self.loop_counter = 0.0;
+        self.builder = Builder::inactive();
         self.completion_stack.clear();
         self.list_stack.clear();
         self.var_ref_stack.clear();
@@ -5180,6 +5274,138 @@ impl Vm {
             FastLoopVar::Counter => unreachable!("FastLoopStore on the counter field itself"),
         }
         Ok(())
+    }
+
+    /// Seed the string builder from `slot` at loop entry. If the
+    /// seed is not a string the builder is left disabled and every append
+    /// falls back to the generic `+`. A nested builder loop finds the field
+    /// occupied and runs generic (its store then no-ops on the owner check).
+    pub(crate) fn builder_bind(&mut self, slot: usize) {
+        if self.builder.owner != usize::MAX {
+            return;
+        }
+        let value = *self.frame_get(slot);
+        let mut storage = Vec::new();
+        let enabled = if let Some(text) = value.as_string() {
+            storage.extend_from_slice(text.as_slice());
+            true
+        } else {
+            false
+        };
+        self.builder = Builder {
+            owner: slot,
+            enabled,
+            storage,
+            ..Builder::inactive()
+        };
+        self.builder.sync_cursor();
+    }
+
+    /// Materialize the builder back into `slot` at loop exit.
+    pub(crate) fn builder_store(&mut self, slot: usize) {
+        if self.builder.owner != slot {
+            return;
+        }
+        let enabled = self.builder.enabled;
+        let built = if enabled {
+            let units = builder_slice(&self.builder);
+            Some(Value::String(Handle::new(JsString::from_utf16(units))))
+        } else {
+            None
+        };
+        self.builder = Builder::inactive();
+        if let Some(text) = built {
+            *self.frame_get_mut(slot) = text;
+        }
+    }
+
+    /// Append the accumulator's value to the builder owning `slot`,
+    /// or fall back to the exact generic `slot = slot + acc`. If the builder
+    /// is enabled but the accumulator is not a string, materialize what was
+    /// built so far and continue generically.
+    fn builder_append(&mut self, agent: &mut Agent, slot: usize) -> Result<(), JsError> {
+        let right = self.acc;
+        if !self.builder_try_append(slot, &right) {
+            self.acc = self.builder_generic_add(agent, slot, &right)?;
+        }
+        Ok(())
+    }
+
+    /// Try to append `right` to the builder owning `slot`. Returns
+    /// true when appended; otherwise (no builder, or a non-string operand) it
+    /// materializes any partial build into `slot` and returns false so the
+    /// caller runs the generic `+`. Needs no agent.
+    pub(crate) fn builder_try_append(&mut self, slot: usize, right: &Value) -> bool {
+        let bits = right.bits();
+        let mut appended = false;
+        let mut materialized: Option<Vec<u16>> = None;
+        {
+            let builder = &mut self.builder;
+            if builder.owner == slot && builder.enabled {
+                // The 1-unit fast path: a cached loop-invariant operand needs
+                // no string decode.
+                if builder.rhs_ok && builder.rhs_bits == bits && builder.len < builder.cap {
+                    // SAFETY: the capacity check guarantees `len` is in
+                    // bounds; the element is initialized by this store.
+                    unsafe {
+                        *builder.buf.add(builder.len) = builder.rhs_unit;
+                    }
+                    builder.len += 1;
+                    builder.sync_storage_len();
+                    appended = true;
+                } else if let Some(text) = right.as_string() {
+                    let units = text.as_slice();
+                    if units.len() == 1 {
+                        builder.rhs_bits = bits;
+                        builder.rhs_unit = units[0];
+                        builder.rhs_ok = true;
+                    } else {
+                        builder.rhs_ok = false;
+                    }
+                    builder.sync_storage_len();
+                    if builder.len + units.len() > builder.cap {
+                        builder.storage.reserve(units.len());
+                        builder.sync_cursor();
+                    }
+                    // SAFETY: capacity ensured above; `buf` is valid for
+                    // `len + units.len()` units.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            units.as_ptr(),
+                            builder.buf.add(builder.len),
+                            units.len(),
+                        );
+                    }
+                    builder.len += units.len();
+                    builder.sync_storage_len();
+                    appended = true;
+                } else {
+                    materialized = Some(builder_slice(builder).to_vec());
+                    builder.storage.clear();
+                    builder.enabled = false;
+                    builder.rhs_ok = false;
+                }
+            }
+        }
+        if let Some(units) = materialized {
+            let text = Value::String(Handle::new(JsString::from_utf16(&units)));
+            *self.frame_get_mut(slot) = text;
+        }
+        appended
+    }
+
+    /// The exact generic `slot = slot + right` — the builder's
+    /// fallback and the plain string-append path.
+    pub(crate) fn builder_generic_add(
+        &mut self,
+        agent: &mut Agent,
+        slot: usize,
+        right: &Value,
+    ) -> Result<Value, JsError> {
+        let left = *self.frame_get(slot);
+        let result = Self::binary_inline(agent, BinaryOp::Add, &left, right)?;
+        *self.frame_get_mut(slot) = result;
+        Ok(result)
     }
 
     fn array_index(&mut self) -> Result<&mut usize, JsError> {
@@ -7960,6 +8186,16 @@ impl Vm {
                 Step::FastLoopStore { var, num } => {
                     self.fast_loop_store(agent, *var, *num)?;
                 }
+                Step::BuilderBind { slot } => {
+                    if let Some(slot) = slot {
+                        self.builder_bind(*slot);
+                    }
+                }
+                Step::BuilderStore { slot } => {
+                    if let Some(slot) = slot {
+                        self.builder_store(*slot);
+                    }
+                }
                 Step::RunRegBody { ops } => {
                     // The register body addresses the current frame (the
                     // script's inline frame — `leaf_frame_base` is `None`
@@ -10387,6 +10623,9 @@ impl Vm {
                     let result = Self::binary_inline(agent, *op, &left, &self.acc)?;
                     self.acc = result;
                     *self.frame_get_mut(*slot) = result;
+                }
+                LeafOp::BuilderAppend { slot } => {
+                    self.builder_append(agent, *slot)?;
                 }
                 LeafOp::BinStoreNum { op, rhs, .. } => {
                     // Route B: the loop-carried Number slot lives in
@@ -16721,6 +16960,93 @@ impl Compiler {
         }
     }
 
+    /// Prove that an acc-path loop's body is a plain string append
+    /// (`s += <pure operand>`) and mark the loop with a `Vm` string builder: the
+    /// `BuilderBind`/`BuilderStore` placeholders gain the accumulator slot, and
+    /// the body's sole `BinStoreReg { Add, slot }` becomes
+    /// `LeafOp::BuilderAppend`. Runs AFTER `plan_loop_num`, so a loop already
+    /// specialized to a Number slot (whose op is now `BinStoreNum`) is skipped.
+    ///
+    /// Safety: the body must be exactly `[<pure load>, BinStoreReg]` — no
+    /// getters/calls/coercions can run, so generic code inside the loop can
+    /// never observe `s` mid-build. The runtime handles non-string seeds and
+    /// non-string operands by falling back to the exact generic `+`.
+    fn plan_builder(&mut self, bb: usize, body_start: usize, head: usize, fbind: usize, bs: usize) {
+        if head != body_start + 1 {
+            return;
+        }
+        let counter = match &self.steps[fbind] {
+            Step::FastLoopBind {
+                var: FastLoopVar::Slot(slot),
+                ..
+            } => *slot,
+            _ => return,
+        };
+        let slot = {
+            let Step::RunRegBody { ops } = &self.steps[body_start] else {
+                return;
+            };
+            if ops.len() != 2 {
+                return;
+            }
+            let LeafOp::BinStoreReg {
+                op: BinaryOp::Add,
+                slot,
+            } = ops[1]
+            else {
+                return;
+            };
+            if !is_pure_load(&ops[0]) || leaf_op_touches_slot(&ops[0], slot) {
+                return;
+            }
+            slot
+        };
+        // The counter's own slot is written back by `FastLoopStore` at the
+        // exit, so a builder on it would be clobbered — never plan `s == i`.
+        if slot == counter {
+            return;
+        }
+        // Skip a loop whose accumulator is provably a Number at entry: a
+        // numeric RMW keeps the fused `BinStoreReg`/`BinStoreNum` path, and
+        // the builder would only deactivate at runtime anyway.
+        if self.proven_num_slots.contains(&slot) || self.slot_seed_is_number(slot, fbind) {
+            return;
+        }
+        if let Step::BuilderBind { slot: s } = &mut self.steps[bb] {
+            *s = Some(slot);
+        } else {
+            return;
+        }
+        if let Step::BuilderStore { slot: s } = &mut self.steps[bs] {
+            *s = Some(slot);
+        } else {
+            return;
+        }
+        let Step::RunRegBody { ops } = &mut self.steps[body_start] else {
+            return;
+        };
+        ops[1] = LeafOp::BuilderAppend { slot };
+    }
+
+    /// Whether `slot`'s last write before `before` is a straight-line store
+    /// of a Number literal (the entry proof `plan_loop_num` uses).
+    fn slot_seed_is_number(&self, slot: usize, before: usize) -> bool {
+        let Some(write) = (0..before)
+            .rev()
+            .find(|&i| step_writes_slot(&self.steps[i], slot))
+        else {
+            return false;
+        };
+        write > 0
+            && matches!(&self.steps[write - 1], Step::Push(value) if value.is_number())
+            && matches!(
+                &self.steps[write],
+                Step::InitLocal { slot: s }
+                    | Step::StoreLocal { slot: s }
+                    | Step::FusedStoreLocal { slot: s } if *s == slot
+            )
+    }
+
     fn compile_for(
         &mut self,
         init: Option<&ForInit>,
@@ -17013,6 +17339,8 @@ impl Compiler {
                         // written by the loop init) into the accumulator
                         // before the initial test, so a zero-iteration loop
                         // still stores the init value back.
+                        let builder_bind_index = self.steps.len();
+                        self.emit(Step::BuilderBind { slot: None });
                         let bind_index = self.steps.len();
                         self.emit(Step::FastLoopBind { var, num: None });
                         self.emit_fused_rel_test(op, loc, name, limit, end_label);
@@ -17054,7 +17382,16 @@ impl Compiler {
                         let store_index = self.steps.len();
                         self.emit(Step::FastLoopStore { var, num: None });
                         self.emit(Step::NormalizeCompletion);
+                        let builder_store_index = self.steps.len();
+                        self.emit(Step::BuilderStore { slot: None });
                         self.plan_loop_num(bind_index, body_start_index, index, store_index);
+                        self.plan_builder(
+                            builder_bind_index,
+                            body_start_index,
+                            index,
+                            bind_index,
+                            builder_store_index,
+                        );
                         self.scope_stack.pop();
                         return Ok(());
                     }
@@ -20328,6 +20665,20 @@ fn is_inline_arith(op: BinaryOp) -> bool {
     )
 }
 
+/// A leaf op that only reads a value with no user-observable side
+/// effect (no getters, no calls, no coercion) — the append RHS the builder
+/// planner accepts.
+fn is_pure_load(op: &LeafOp) -> bool {
+    matches!(
+        op,
+        LeafOp::LoadReg { .. }
+            | LeafOp::LoadContext { .. }
+            | LeafOp::LoadPerIter { .. }
+            | LeafOp::LoadConst(_)
+            | LeafOp::LoadCounter
+    )
+}
+
 /// The four inline arithmetic shapes (`is_inline_arith`) on two f64s — the
 /// register ops' fast path without the `Value` round-trip. The compile gate
 /// admits only these ops here.
@@ -20688,6 +21039,13 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 // Both stay out of leaves.
                 | Step::CreateArguments { .. }
         ) && !string_literal_step_reads_body(step)
+            // An ACTIVE builder loop must not be leaf-inlined (its
+            // builder lives on the running Vm); the inert placeholder
+            // (`None`) is a no-op and stays leaf-eligible.
+            && !matches!(
+                step,
+                Step::BuilderBind { slot: Some(_) } | Step::BuilderStore { slot: Some(_) }
+            )
     })
 }
 

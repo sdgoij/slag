@@ -23,6 +23,9 @@ use crux::Value;
 pub enum Helper {
     BinarySlow,
     ConcatStrings,
+    BuilderBind,
+    BuilderStore,
+    BuilderAppend,
     RelationalSlow,
     UpdateValueSlow,
     ToBooleanSlow,
@@ -176,6 +179,9 @@ impl Helper {
         match self {
             Helper::BinarySlow => "binary_slow",
             Helper::ConcatStrings => "concat_strings",
+            Helper::BuilderBind => "builder_bind",
+            Helper::BuilderStore => "builder_store",
+            Helper::BuilderAppend => "builder_append",
             Helper::RelationalSlow => "relational_slow",
             Helper::UpdateValueSlow => "update_value_slow",
             Helper::ToBooleanSlow => "to_boolean_slow",
@@ -325,6 +331,7 @@ impl Helper {
                 | Helper::ApplyArgsFill
                 | Helper::ToBooleanSlow
                 | Helper::ConcatStrings
+                | Helper::BuilderAppend
                 | Helper::LoadContext
                 | Helper::StoreContext
                 | Helper::InitContext
@@ -353,6 +360,13 @@ pub struct JitHelpers {
     /// Returns the concatenated value (0 when either operand is not a
     /// string).
     pub concat_strings: Option<extern "C" fn(vm: *mut c_void, a: u64, b: u64) -> u64>,
+    /// Seed the string builder for a planned append loop.
+    pub builder_bind: Option<extern "C" fn(vm: *mut c_void, slot: u64) -> u64>,
+    /// Materialize the string builder back into its slot.
+    pub builder_store: Option<extern "C" fn(vm: *mut c_void, slot: u64) -> u64>,
+    /// Append to the builder owning `slot`, or the generic add;
+    /// returns the accumulator bits.
+    pub builder_append: Option<extern "C" fn(vm: *mut c_void, slot: u64, right: u64) -> u64>,
     /// JS relational semantics for a loop test on a non-Number: `op` is a
     /// `BinaryOp` discriminant; returns 1 when the test holds, else 0.
     pub relational_slow: Option<extern "C" fn(vm: *mut c_void, op: u64, a: u64, b: u64) -> u64>,
@@ -758,6 +772,9 @@ impl JitHelpers {
         Self {
             binary_slow: None,
             concat_strings: None,
+            builder_bind: None,
+            builder_store: None,
+            builder_append: None,
             relational_slow: None,
             update_value_slow: None,
             to_boolean_slow: None,
@@ -890,6 +907,9 @@ impl JitHelpers {
         match helper {
             Helper::BinarySlow => self.binary_slow.map(|f| f as usize as u64),
             Helper::ConcatStrings => self.concat_strings.map(|f| f as usize as u64),
+            Helper::BuilderBind => self.builder_bind.map(|f| f as usize as u64),
+            Helper::BuilderStore => self.builder_store.map(|f| f as usize as u64),
+            Helper::BuilderAppend => self.builder_append.map(|f| f as usize as u64),
             Helper::RelationalSlow => self.relational_slow.map(|f| f as usize as u64),
             Helper::UpdateValueSlow => self.update_value_slow.map(|f| f as usize as u64),
             Helper::ToBooleanSlow => self.to_boolean_slow.map(|f| f as usize as u64),
@@ -1047,6 +1067,21 @@ pub extern "C" fn test_binary_slow(_vm: *mut c_void, _op: u64, _a: u64, _b: u64)
 /// with the right ABI.
 pub extern "C" fn test_concat_strings(_vm: *mut c_void, a: u64, _b: u64) -> u64 {
     a
+}
+
+/// Test double: reports the bind as a no-op.
+pub extern "C" fn test_builder_bind(_vm: *mut c_void, _slot: u64) -> u64 {
+    0
+}
+
+/// Test double: reports the store as a no-op.
+pub extern "C" fn test_builder_store(_vm: *mut c_void, _slot: u64) -> u64 {
+    0
+}
+
+/// Test double: echoes the right operand as the accumulator bits.
+pub extern "C" fn test_builder_append(_vm: *mut c_void, _slot: u64, right: u64) -> u64 {
+    right
 }
 
 pub extern "C" fn test_relational_slow(_vm: *mut c_void, _op: u64, _a: u64, _b: u64) -> u64 {
