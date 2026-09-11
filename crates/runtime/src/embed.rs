@@ -695,8 +695,8 @@ impl Context {
         crate::raylib::install(&mut self.agent)
     }
 
-    /// Make `bytes` available to `rl.loadTexture`/`rl.loadSound` under
-    /// `name` (used to embed assets so a raylib demo needs no files on
+    /// Make `bytes` available to `rl.loadTexture`/`rl.loadSound`/`rl.loadModel`
+    /// under `name` (used to embed assets so a raylib demo needs no files on
     /// disk). Both the name and the bytes must outlive this call (`&'static`,
     /// e.g. from `include_bytes!`).
     #[cfg(feature = "raylib")]

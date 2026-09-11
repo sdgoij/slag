@@ -26,7 +26,10 @@ use crux::handle::Handle;
 use crux::object::JsObject as CruxObject;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
-use raylib_sys::{Camera3D, Color, Image, Rectangle, Sound, Texture2D, Vector2, Vector3};
+use raylib_sys::{
+    BoundingBox, Camera3D, Color, Image, Model, ModelAnimation, Rectangle, Sound, Texture2D,
+    Vector2, Vector3,
+};
 
 use crate::agent::Agent;
 
@@ -46,6 +49,24 @@ static SOUNDS: Mutex<Vec<SoundSlot>> = Mutex::new(Vec::new());
 struct SoundSlot(Sound);
 unsafe impl Send for SoundSlot {}
 unsafe impl Sync for SoundSlot {}
+
+/// Models created by `loadModel`, indexed by handle. raylib keeps a model's
+/// animations in a separate array (loaded by `LoadModelAnimations`), so a slot
+/// owns both and frees them together on `unloadModel`.
+static MODELS: Mutex<Vec<ModelSlot>> = Mutex::new(Vec::new());
+
+/// raylib models are only ever touched from the single window thread (the
+/// `window_method` guard), so the raw-pointer payload can be shared behind a
+/// mutex safely.
+struct ModelSlot {
+    model: Model,
+    animations: *mut ModelAnimation,
+    animation_count: i32,
+    loaded: bool,
+}
+
+unsafe impl Send for ModelSlot {}
+unsafe impl Sync for ModelSlot {}
 
 /// Assets embedded into the binary by an embedder (see
 /// `Context::register_raylib_asset`), looked up by their logical file name
@@ -312,6 +333,315 @@ fn draw_grid(args: &[Value]) -> Result<Value, JsError> {
     let spacing = num_arg(args, 1, "drawGrid")? as f32;
     // SAFETY: as above.
     unsafe { raylib_sys::DrawGrid(slices, spacing) };
+    Ok(Value::Undefined)
+}
+
+// ---- models (needs the rmodels C module) ----
+
+/// A model file raylib can open. An embedded asset is materialised to a temp
+/// file for the duration of the load and removed afterwards: raylib's model
+/// loaders take a *path*, and both the model and its animations are read
+/// eagerly during the two load calls.
+struct ModelFile {
+    path: CString,
+    temp: Option<std::path::PathBuf>,
+}
+
+impl ModelFile {
+    fn open(name: &str) -> Result<ModelFile, JsError> {
+        if let Some((_, data)) = embedded_asset(name) {
+            let mut temp = std::env::temp_dir();
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0);
+            temp.push(format!("slag-raylib-{stamp}.glb"));
+            std::fs::write(&temp, data).map_err(|error| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    format!("rl.loadModel: cannot materialise embedded asset {name}: {error}"),
+                )
+            })?;
+            let path = CString::new(temp.to_string_lossy().as_bytes()).map_err(|_| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "rl.loadModel: temp path contains a NUL byte".into(),
+                )
+            })?;
+            Ok(ModelFile {
+                path,
+                temp: Some(temp),
+            })
+        } else {
+            let path = CString::new(name).map_err(|_| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "rl.loadModel: path contains a NUL byte".into(),
+                )
+            })?;
+            Ok(ModelFile { path, temp: None })
+        }
+    }
+}
+
+impl Drop for ModelFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.temp.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The model behind `handle`, if it is loaded.
+fn model_arg(args: &[Value], index: usize, name: &str) -> Result<Model, JsError> {
+    let handle = int_arg(args, index, name)?;
+    let registry = MODELS.lock().unwrap();
+    match registry.get(handle as usize) {
+        Some(slot) if slot.loaded => Ok(slot.model),
+        Some(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: model {handle} was unloaded"),
+        )),
+        None => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: unknown model {handle}"),
+        )),
+    }
+}
+
+/// The animation at `index` behind `handle`. `ModelAnimation` is plain data, so
+/// the element is read out by value; the registry keeps ownership.
+fn animation_arg(handle: i32, index: i32, name: &str) -> Result<ModelAnimation, JsError> {
+    let registry = MODELS.lock().unwrap();
+    let slot = registry
+        .get(handle as usize)
+        .filter(|slot| slot.loaded)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.{name}: unknown model {handle}"),
+            )
+        })?;
+    if index < 0 || index >= slot.animation_count {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "rl.{name}: animation {index} out of range (model has {})",
+                slot.animation_count
+            ),
+        ));
+    }
+    if slot.animations.is_null() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: model {handle} has no animations"),
+        ));
+    }
+    // SAFETY: `index` is in range; the element is plain data owned by the
+    // registry and only read (copied) here.
+    Ok(unsafe { std::ptr::read(slot.animations.add(index as usize)) })
+}
+
+fn load_model(args: &[Value]) -> Result<Value, JsError> {
+    let name = text_arg(args, 0, "loadModel")?;
+    let name_str = name.to_string_lossy();
+    let file = ModelFile::open(&name_str)?;
+    // SAFETY: window-thread guard; raylib reads the file during this call.
+    let model = unsafe { raylib_sys::LoadModel(file.path.as_ptr()) };
+    // Gate on the loaded mesh data rather than raylib's own `IsModelValid`:
+    // that check additionally demands an uploaded VBO for every non-null mesh
+    // attribute, and the bone buffers are only uploaded when
+    // `SUPPORT_GPU_SKINNING` is on — so it reports false for *every* skinned
+    // model in a CPU-skinning build (which is what `rl` ships).
+    if model.meshes.is_null() || model.meshCount <= 0 {
+        return Ok(Value::Number(-1.0));
+    }
+    let mut animation_count: std::ffi::c_int = 0;
+    // SAFETY: as above; the returned array is owned by us until `unloadModel`.
+    let animations =
+        unsafe { raylib_sys::LoadModelAnimations(file.path.as_ptr(), &mut animation_count) };
+    drop(file);
+    let mut registry = MODELS.lock().unwrap();
+    registry.push(ModelSlot {
+        model,
+        animations,
+        animation_count,
+        loaded: true,
+    });
+    Ok(Value::Number((registry.len() - 1) as f64))
+}
+
+/// Whether `handle` refers to a model this module loaded and has not unloaded.
+///
+/// This deliberately does *not* forward raylib's own `IsModelValid`: that check
+/// also requires an uploaded VBO for every non-null mesh attribute, and bone
+/// buffers are only uploaded under `SUPPORT_GPU_SKINNING`, so raylib reports
+/// every skinned model as invalid in the CPU-skinning build `rl` ships. The
+/// useful question for a script is whether the handle is a live model.
+fn is_model_valid(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "isModelValid")?;
+    let registry = MODELS.lock().unwrap();
+    let valid = registry
+        .get(handle as usize)
+        .is_some_and(|slot| slot.loaded);
+    Ok(Value::Boolean(valid))
+}
+
+fn unload_model(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "unloadModel")?;
+    let mut registry = MODELS.lock().unwrap();
+    if let Some(slot) = registry.get_mut(handle as usize) {
+        if slot.loaded {
+            // SAFETY: window-thread guard; both allocations came from raylib
+            // and are freed exactly once (the slot is then marked unloaded).
+            unsafe {
+                if !slot.animations.is_null() && slot.animation_count > 0 {
+                    raylib_sys::UnloadModelAnimations(slot.animations, slot.animation_count);
+                }
+                raylib_sys::UnloadModel(slot.model);
+            }
+            slot.animations = std::ptr::null_mut();
+            slot.animation_count = 0;
+            slot.loaded = false;
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn draw_model(args: &[Value]) -> Result<Value, JsError> {
+    let model = model_arg(args, 0, "drawModel")?;
+    let x = num_arg(args, 1, "drawModel")? as f32;
+    let y = num_arg(args, 2, "drawModel")? as f32;
+    let z = num_arg(args, 3, "drawModel")? as f32;
+    let scale = num_arg(args, 4, "drawModel")? as f32;
+    let tint = color_arg(args, 5, "drawModel")?;
+    // SAFETY: window-thread guard; draw state during begin/endDrawing.
+    unsafe { raylib_sys::DrawModel(model, Vector3 { x, y, z }, scale, tint) };
+    Ok(Value::Undefined)
+}
+
+fn draw_model_ex(args: &[Value]) -> Result<Value, JsError> {
+    let model = model_arg(args, 0, "drawModelEx")?;
+    let x = num_arg(args, 1, "drawModelEx")? as f32;
+    let y = num_arg(args, 2, "drawModelEx")? as f32;
+    let z = num_arg(args, 3, "drawModelEx")? as f32;
+    let axis_x = num_arg(args, 4, "drawModelEx")? as f32;
+    let axis_y = num_arg(args, 5, "drawModelEx")? as f32;
+    let axis_z = num_arg(args, 6, "drawModelEx")? as f32;
+    let angle = num_arg(args, 7, "drawModelEx")? as f32;
+    let scale_x = num_arg(args, 8, "drawModelEx")? as f32;
+    let scale_y = num_arg(args, 9, "drawModelEx")? as f32;
+    let scale_z = num_arg(args, 10, "drawModelEx")? as f32;
+    let tint = color_arg(args, 11, "drawModelEx")?;
+    // SAFETY: as above. `rotationAngle` is in degrees, as raylib expects.
+    unsafe {
+        raylib_sys::DrawModelEx(
+            model,
+            Vector3 { x, y, z },
+            Vector3 {
+                x: axis_x,
+                y: axis_y,
+                z: axis_z,
+            },
+            angle,
+            Vector3 {
+                x: scale_x,
+                y: scale_y,
+                z: scale_z,
+            },
+            tint,
+        )
+    };
+    Ok(Value::Undefined)
+}
+
+fn model_bounds(args: &[Value]) -> Result<Value, JsError> {
+    let model = model_arg(args, 0, "modelBounds")?;
+    // SAFETY: window-thread guard; reads the model's mesh vertex data.
+    let bounds: BoundingBox = unsafe { raylib_sys::GetModelBoundingBox(model) };
+    let object = CruxObject::ordinary_object_create(None);
+    for (name, value) in [
+        ("minX", bounds.min.x),
+        ("minY", bounds.min.y),
+        ("minZ", bounds.min.z),
+        ("maxX", bounds.max.x),
+        ("maxY", bounds.max.y),
+        ("maxZ", bounds.max.z),
+    ] {
+        object.create_data_property_or_throw(
+            &JsString::from_utf8(name),
+            Value::Number(value as f64),
+        )?;
+    }
+    Ok(Value::Object(object))
+}
+
+fn model_animation_count(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "modelAnimationCount")?;
+    let registry = MODELS.lock().unwrap();
+    let count = registry
+        .get(handle as usize)
+        .filter(|slot| slot.loaded)
+        .map(|slot| slot.animation_count)
+        .unwrap_or(0);
+    Ok(Value::Number(count as f64))
+}
+
+/// How many bones the model's skeleton has (0 for a static mesh). Animation
+/// playback is a no-op on a model without a skeleton.
+fn model_bone_count(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "modelBoneCount")?;
+    let registry = MODELS.lock().unwrap();
+    let count = registry
+        .get(handle as usize)
+        .filter(|slot| slot.loaded)
+        .map(|slot| slot.model.skeleton.boneCount)
+        .unwrap_or(0);
+    Ok(Value::Number(count as f64))
+}
+
+fn model_animation_name(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "modelAnimationName")?;
+    let index = int_arg(args, 1, "modelAnimationName")?;
+    let animation = animation_arg(handle, index, "modelAnimationName")?;
+    let bytes: Vec<u8> = animation
+        .name
+        .iter()
+        .take_while(|code| **code != 0)
+        .map(|code| *code as u8)
+        .collect();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
+}
+
+fn model_animation_frame_count(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "modelAnimationFrameCount")?;
+    let index = int_arg(args, 1, "modelAnimationFrameCount")?;
+    let animation = animation_arg(handle, index, "modelAnimationFrameCount")?;
+    Ok(Value::Number(animation.keyframeCount as f64))
+}
+
+/// The clip's duration in seconds. raylib resamples glTF animations at a fixed
+/// 60 fps (`GLTF_FRAMERATE`) and stores `keyframeCount = duration * 60 + 1`, so
+/// the duration is recoverable from the frame count.
+fn model_animation_duration(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "modelAnimationDuration")?;
+    let index = int_arg(args, 1, "modelAnimationDuration")?;
+    let animation = animation_arg(handle, index, "modelAnimationDuration")?;
+    const GLTF_FRAMERATE: f32 = 60.0;
+    let duration = ((animation.keyframeCount - 1) as f32 / GLTF_FRAMERATE).max(0.0);
+    Ok(Value::Number(duration as f64))
+}
+
+fn update_model_animation(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "updateModelAnimation")?;
+    let model = model_arg(args, 0, "updateModelAnimation")?;
+    let index = int_arg(args, 1, "updateModelAnimation")?;
+    let frame = num_arg(args, 2, "updateModelAnimation")? as f32;
+    let animation = animation_arg(handle, index, "updateModelAnimation")?;
+    // SAFETY: window-thread guard; the model and animation stay alive in the
+    // registry, and this only rewrites the model's pose buffers.
+    unsafe { raylib_sys::UpdateModelAnimation(model, animation, frame) };
     Ok(Value::Undefined)
 }
 
@@ -1309,6 +1639,18 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("drawCube", 7, draw_cube),
         ("drawCubeWires", 7, draw_cube_wires),
         ("drawGrid", 2, draw_grid),
+        ("loadModel", 1, load_model),
+        ("isModelValid", 1, is_model_valid),
+        ("unloadModel", 1, unload_model),
+        ("drawModel", 6, draw_model),
+        ("drawModelEx", 12, draw_model_ex),
+        ("modelBounds", 1, model_bounds),
+        ("modelAnimationCount", 1, model_animation_count),
+        ("modelBoneCount", 1, model_bone_count),
+        ("modelAnimationName", 2, model_animation_name),
+        ("modelAnimationFrameCount", 2, model_animation_frame_count),
+        ("modelAnimationDuration", 2, model_animation_duration),
+        ("updateModelAnimation", 3, update_model_animation),
         ("makeTexture", 3, make_texture),
         ("drawTexture", 10, draw_texture_rect),
         ("textureWidth", 1, texture_width),
@@ -1442,6 +1784,50 @@ mod tests {
                 .as_boolean(),
             Some(true)
         );
+        // Model bindings are installed; loading needs a window, so only the
+        // shape and the non-window handle checks run here.
+        for name in [
+            "loadModel",
+            "isModelValid",
+            "unloadModel",
+            "drawModel",
+            "drawModelEx",
+            "modelBounds",
+            "modelAnimationCount",
+            "modelBoneCount",
+            "modelAnimationName",
+            "modelAnimationFrameCount",
+            "modelAnimationDuration",
+            "updateModelAnimation",
+        ] {
+            assert_eq!(
+                context
+                    .eval(&format!("typeof rl.{name}"))
+                    .unwrap()
+                    .as_string()
+                    .as_deref(),
+                Some("function"),
+                "rl.{name}"
+            );
+        }
+        // A handle that was never handed out is simply invalid, not an error.
+        assert_eq!(
+            context.eval("rl.isModelValid(-1)").unwrap().as_boolean(),
+            Some(false)
+        );
+        assert_eq!(
+            context
+                .eval("rl.modelAnimationCount(-1)")
+                .unwrap()
+                .as_number(),
+            Some(0.0)
+        );
+        // Using an unknown model throws a TypeError naming the call.
+        let error = match context.eval("rl.updateModelAnimation(-1, 0, 0)") {
+            Ok(_) => panic!("rl.updateModelAnimation with an unknown model must throw"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rl.updateModelAnimation"), "{error}");
 
         // rl.color argument validation names the offending argument.
         let error = match context.eval("rl.color(300, 0, 0)") {
