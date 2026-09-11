@@ -820,6 +820,60 @@ fn set_model_shader(args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Undefined)
 }
 
+/// Point one material map (e.g. `MATERIAL_MAP_METALNESS`) of every material of
+/// `model` at `texture`, or clear it when `texture` is negative.
+///
+/// `DrawMesh` binds a material's maps to texture units and feeds the matching
+/// `texture0`/`texture1`/`texture2` sampler uniforms from them, so this is how a
+/// shader can be handed an extra texture (a shadow map, say) without racing the
+/// units `setShaderValueTexture` picks. `mapIndex` is a `MaterialMapIndex`.
+fn set_model_texture(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "setModelTexture")?;
+    let map_index = int_arg(args, 1, "setModelTexture")?;
+    // raylib sizes every material's map array to MAX_MATERIAL_MAPS.
+    const MAX_MATERIAL_MAPS: i32 = 12;
+    if !(0..MAX_MATERIAL_MAPS).contains(&map_index) {
+        return Err(expected(
+            "setModelTexture",
+            1,
+            "a material map index in 0..12 (MATERIAL_MAP_DIFFUSE, MATERIAL_MAP_METALNESS, ...)",
+        ));
+    }
+    let texture = if int_arg(args, 2, "setModelTexture")? < 0 {
+        Texture2D::default()
+    } else {
+        texture_arg(args, 2, "setModelTexture")?
+    };
+    let mut registry = MODELS.lock().unwrap();
+    let slot = registry
+        .get_mut(handle as usize)
+        .filter(|slot| slot.loaded)
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                format!("rl.setModelTexture: unknown model {handle}"),
+            )
+        })?;
+    if slot.model.materials.is_null() || slot.model.materialCount <= 0 {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.setModelTexture: model {handle} has no materials"),
+        ));
+    }
+    let materials = slot.model.materials;
+    for index in 0..slot.model.materialCount as usize {
+        // SAFETY: `index` is in range; each material owns a MAX_MATERIAL_MAPS-long
+        // map array, and `map_index` was validated against that bound.
+        unsafe {
+            let maps = (*materials.add(index)).maps;
+            if !maps.is_null() {
+                (*maps.add(map_index as usize)).texture = texture;
+            }
+        }
+    }
+    Ok(Value::Undefined)
+}
+
 fn model_bounds(args: &[Value]) -> Result<Value, JsError> {
     let model = model_arg(args, 0, "modelBounds")?;
     // SAFETY: window-thread guard; reads the model's mesh vertex data.
@@ -2439,6 +2493,7 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("drawModel", 6, draw_model),
         ("drawModelEx", 12, draw_model_ex),
         ("setModelShader", 2, set_model_shader),
+        ("setModelTexture", 3, set_model_texture),
         ("modelBounds", 1, model_bounds),
         ("modelAnimationCount", 1, model_animation_count),
         ("modelBoneCount", 1, model_bone_count),
@@ -2663,6 +2718,7 @@ mod tests {
             "modelBonePosition",
             "modelBoneTransform",
             "setModelShader",
+            "setModelTexture",
         ] {
             assert_eq!(
                 context
