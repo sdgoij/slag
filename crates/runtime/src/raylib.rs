@@ -177,6 +177,7 @@ const COLORS: &[(&str, u8, u8, u8, u8)] = &[
 /// codes and are added programmatically.
 const KEY_CODES: &[(&str, i32)] = &[
     ("KEY_SPACE", 32),
+    ("KEY_GRAVE", 96),
     ("KEY_ESCAPE", 256),
     ("KEY_ENTER", 257),
     ("KEY_TAB", 258),
@@ -2404,6 +2405,14 @@ fn get_key_pressed(_args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Number(key as f64))
 }
 
+fn get_char_pressed(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above. raylib queues one codepoint per key press with the
+    // layout and shift applied, and returns 0 once the queue is drained, so a
+    // text field reads it in a loop.
+    let code = unsafe { raylib_sys::GetCharPressed() };
+    Ok(Value::Number(code as f64))
+}
+
 fn is_mouse_button_down(args: &[Value]) -> Result<Value, JsError> {
     let button = int_arg(args, 0, "isMouseButtonDown")?;
     // SAFETY: as above.
@@ -3012,6 +3021,7 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("isKeyReleased", 1, is_key_released),
         ("isKeyUp", 1, is_key_up),
         ("getKeyPressed", 0, get_key_pressed),
+        ("getCharPressed", 0, get_char_pressed),
         ("isMouseButtonDown", 1, is_mouse_button_down),
         ("isMouseButtonPressed", 1, is_mouse_button_pressed),
         ("isMouseButtonReleased", 1, is_mouse_button_released),
@@ -3135,6 +3145,18 @@ mod tests {
         );
         assert_eq!(
             context.eval("rl.KEY_F11 === 300").unwrap().as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context.eval("rl.KEY_GRAVE === 96").unwrap().as_boolean(),
+            Some(true)
+        );
+        // Character input is installed; reading it needs a live window.
+        assert_eq!(
+            context
+                .eval("typeof rl.getCharPressed === 'function'")
+                .unwrap()
+                .as_boolean(),
             Some(true)
         );
         assert_eq!(
