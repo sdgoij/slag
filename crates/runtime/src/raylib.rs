@@ -32,7 +32,7 @@ use crux::object::JsObject as CruxObject;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 use raylib_sys::{
-    BoundingBox, Camera3D, Color, Image, Matrix, Model, ModelAnimation, Music, Rectangle,
+    BoundingBox, Camera3D, Color, Image, Matrix, Mesh, Model, ModelAnimation, Music, Rectangle,
     RenderTexture2D, Shader, Sound, Texture2D, Transform, Vector2, Vector3,
 };
 
@@ -735,6 +735,236 @@ fn load_model(args: &[Value]) -> Result<Value, JsError> {
         model,
         animations,
         animation_count,
+        loaded: true,
+        original_shaders: Vec::new(),
+    });
+    Ok(Value::Number((registry.len() - 1) as f64))
+}
+
+/// The flat number array at `args[index]`, or `None` when the argument is
+/// omitted (`undefined`/`null`). Only a dense `Array` of finite numbers is
+/// accepted, so a typo cannot silently build a mesh of zeroes.
+fn number_array_arg(args: &[Value], index: usize, name: &str) -> Result<Option<Vec<f64>>, JsError> {
+    match args.get(index).map(Value::kind) {
+        None | Some(ValueKind::Undefined) | Some(ValueKind::Null) => Ok(None),
+        Some(ValueKind::Object(object)) => {
+            let Some(length) = object.array_length_dense() else {
+                return Err(expected(name, index, "a flat array of numbers"));
+            };
+            let mut numbers = Vec::with_capacity(length as usize);
+            for slot in 0..length {
+                match object.dense_element(slot).map(|value| value.kind()) {
+                    Some(ValueKind::Number(number)) if number.is_finite() => numbers.push(number),
+                    _ => return Err(expected(name, index, "a flat array of numbers")),
+                }
+            }
+            Ok(Some(numbers))
+        }
+        _ => Err(expected(name, index, "a flat array of numbers")),
+    }
+}
+
+/// `len * size` as raylib's 32-bit allocation size, or `None` when it
+/// overflows (no real mesh comes close, but the cast must not wrap).
+fn alloc_bytes(len: usize, size: usize) -> Option<std::ffi::c_uint> {
+    std::ffi::c_uint::try_from(len.checked_mul(size)?).ok()
+}
+
+/// Copy a flat list of numbers into a block from raylib's allocator as `f32`s.
+/// An empty list gives a null pointer -- raylib reads that as "attribute
+/// absent" -- and so does a size overflow or a failed allocation, which the
+/// caller then reports.
+fn mem_alloc_f32(values: &[f64]) -> *mut f32 {
+    if values.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let Some(bytes) = alloc_bytes(values.len(), std::mem::size_of::<f32>()) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: `MemAlloc` returns a block of `bytes` bytes or null; every write
+    // below stays inside it.
+    unsafe {
+        let pointer = raylib_sys::MemAlloc(bytes).cast::<f32>();
+        if !pointer.is_null() {
+            for (index, value) in values.iter().enumerate() {
+                *pointer.add(index) = *value as f32;
+            }
+        }
+        pointer
+    }
+}
+
+/// The same as [`mem_alloc_f32`], for a `0..=255` byte list (vertex colours,
+/// which the caller has already range-checked).
+fn mem_alloc_u8(values: &[f64]) -> *mut u8 {
+    if values.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let Some(bytes) = alloc_bytes(values.len(), std::mem::size_of::<u8>()) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: as in `mem_alloc_f32`.
+    unsafe {
+        let pointer = raylib_sys::MemAlloc(bytes).cast::<u8>();
+        if !pointer.is_null() {
+            for (index, value) in values.iter().enumerate() {
+                *pointer.add(index) = *value as u8;
+            }
+        }
+        pointer
+    }
+}
+
+/// The same as [`mem_alloc_f32`], for a triangle list (`u16` vertex indices,
+/// already validated against the vertex count).
+fn mem_alloc_u16(values: &[f64]) -> *mut u16 {
+    if values.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let Some(bytes) = alloc_bytes(values.len(), std::mem::size_of::<u16>()) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: as in `mem_alloc_f32`.
+    unsafe {
+        let pointer = raylib_sys::MemAlloc(bytes).cast::<u16>();
+        if !pointer.is_null() {
+            for (index, value) in values.iter().enumerate() {
+                *pointer.add(index) = *value as u16;
+            }
+        }
+        pointer
+    }
+}
+
+/// Build a model from raw vertex arrays.
+///
+/// `vertices` is a required flat `[x, y, z, ...]` list. `indices` (a flat
+/// triangle list into the vertices), `normals`, `colors` (`[r, g, b, a, ...]`,
+/// 0..=255) and `texcoords` (`[u, v, ...]`) are optional, and when given must
+/// carry one element run per vertex.
+///
+/// The result is a handle in the same registry as `loadModel`, so every model
+/// binding (`drawModelEx`, `setModelShader`, `setModelTexture`, `modelBounds`,
+/// `unloadModel`) applies to it unchanged. raylib binds the canonical attribute
+/// names to fixed locations before linking a shader, so a mesh built here feeds
+/// a custom shader real per-vertex normals, colours and UVs -- which
+/// immediate-mode geometry cannot, as `drawCube`/`drawTriangle3D` leave the
+/// normal at the raylib default `(0, 0, 1)` and the texcoord at `(0, 0)`.
+fn make_model(args: &[Value]) -> Result<Value, JsError> {
+    let vertices = number_array_arg(args, 0, "makeModel")?
+        .ok_or_else(|| expected("makeModel", 0, "a flat array of x, y, z triples"))?;
+    if vertices.is_empty() || vertices.len() % 3 != 0 {
+        return Err(expected(
+            "makeModel",
+            0,
+            "a non-empty multiple of 3 (x, y, z triples)",
+        ));
+    }
+    let count = vertices.len() / 3;
+
+    let indices = number_array_arg(args, 1, "makeModel")?;
+    if let Some(indices) = &indices {
+        if indices.len() % 3 != 0 {
+            return Err(expected(
+                "makeModel",
+                1,
+                "a multiple of 3 (a triangle list)",
+            ));
+        }
+        if indices
+            .iter()
+            .any(|index| *index < 0.0 || *index >= count as f64)
+        {
+            return Err(expected("makeModel", 1, "indices into the vertex list"));
+        }
+    }
+    let normals = number_array_arg(args, 2, "makeModel")?;
+    if normals.as_ref().is_some_and(|list| list.len() != count * 3) {
+        return Err(expected("makeModel", 2, "one x, y, z normal per vertex"));
+    }
+    let colors = number_array_arg(args, 3, "makeModel")?;
+    if colors.as_ref().is_some_and(|list| list.len() != count * 4) {
+        return Err(expected("makeModel", 3, "one r, g, b, a colour per vertex"));
+    }
+    if let Some(colors) = &colors {
+        if colors
+            .iter()
+            .any(|channel| !(0.0..=255.0).contains(channel))
+        {
+            return Err(expected("makeModel", 3, "colour channels in 0..=255"));
+        }
+    }
+    let texcoords = number_array_arg(args, 4, "makeModel")?;
+    if texcoords
+        .as_ref()
+        .is_some_and(|list| list.len() != count * 2)
+    {
+        return Err(expected("makeModel", 4, "one u, v per vertex"));
+    }
+
+    // The arrays come from raylib's allocator because `LoadModelFromMesh` hands
+    // them to the model and `UnloadModel` frees them with `MemFree`: this is an
+    // ownership transfer, not a copy. A null pointer for a list that was given
+    // means the allocation failed; `UnloadMesh` frees whatever did succeed (it
+    // tolerates the null fields and the not-yet-uploaded VAO).
+    let out_of_memory = || {
+        JsError::new(
+            ErrorKind::RangeError,
+            "rl.makeModel: could not allocate the mesh arrays".to_string(),
+        )
+    };
+    let mut mesh = Mesh::default();
+    mesh.vertexCount = count as c_int;
+    mesh.triangleCount = (indices.as_ref().map_or(0, Vec::len) / 3) as c_int;
+    mesh.vertices = mem_alloc_f32(&vertices);
+    if mesh.vertices.is_null() {
+        return Err(out_of_memory());
+    }
+    if let Some(list) = &normals {
+        mesh.normals = mem_alloc_f32(list);
+        if mesh.normals.is_null() {
+            // SAFETY: frees the arrays set so far; `mesh` still owns them.
+            unsafe { raylib_sys::UnloadMesh(mesh) };
+            return Err(out_of_memory());
+        }
+    }
+    if let Some(list) = &colors {
+        mesh.colors = mem_alloc_u8(list);
+        if mesh.colors.is_null() {
+            // SAFETY: as above.
+            unsafe { raylib_sys::UnloadMesh(mesh) };
+            return Err(out_of_memory());
+        }
+    }
+    if let Some(list) = &texcoords {
+        mesh.texcoords = mem_alloc_f32(list);
+        if mesh.texcoords.is_null() {
+            // SAFETY: as above.
+            unsafe { raylib_sys::UnloadMesh(mesh) };
+            return Err(out_of_memory());
+        }
+    }
+    if let Some(list) = &indices {
+        mesh.indices = mem_alloc_u16(list);
+        if mesh.indices.is_null() {
+            // SAFETY: as above.
+            unsafe { raylib_sys::UnloadMesh(mesh) };
+            return Err(out_of_memory());
+        }
+    }
+
+    // SAFETY: window-thread guard; the attribute pointers came from raylib's
+    // allocator and `UploadMesh` builds the VAO/VBOs from them.
+    unsafe { raylib_sys::UploadMesh(&mut mesh, false) };
+    // SAFETY: as above; `LoadModelFromMesh` takes the mesh by value, so the
+    // model owns the arrays and `unloadModel` frees them exactly once.
+    let model = unsafe { raylib_sys::LoadModelFromMesh(mesh) };
+
+    let mut registry = MODELS.lock().unwrap();
+    registry.push(ModelSlot {
+        model,
+        animations: std::ptr::null_mut(),
+        animation_count: 0,
         loaded: true,
         original_shaders: Vec::new(),
     });
@@ -2716,6 +2946,7 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("drawBillboard", 6, draw_billboard),
         ("drawBillboardRec", 11, draw_billboard_rec),
         ("loadModel", 1, load_model),
+        ("makeModel", 5, make_model),
         ("isModelValid", 1, is_model_valid),
         ("unloadModel", 1, unload_model),
         ("drawModel", 6, draw_model),
@@ -2953,6 +3184,7 @@ mod tests {
         // shape and the non-window handle checks run here.
         for name in [
             "loadModel",
+            "makeModel",
             "isModelValid",
             "unloadModel",
             "drawModel",
@@ -2978,6 +3210,26 @@ mod tests {
                 Some("function"),
                 "rl.{name}"
             );
+        }
+        // `makeModel` validates its arrays before it touches the GPU, so the
+        // rejection paths are safe to exercise without a live window.
+        for call in [
+            "rl.makeModel()",
+            "rl.makeModel([])",
+            "rl.makeModel([0, 0])",
+            "rl.makeModel('nope')",
+            "rl.makeModel([0, 0, 0, 1, 0, 0, 0, 0, 1], [0, 1, 7])",
+            "rl.makeModel([0, 0, 0, 1, 0, 0, 0, 0, 1], [0, 1])",
+            "rl.makeModel([0, 0, 0, 1, 0, 0, 0, 0, 1], [0, 1, 2], [0, 1])",
+            "rl.makeModel([0, 0, 0, 1, 0, 0, 0, 0, 1], [0, 1, 2], [0, 0, 1, 0, 0, 1, 0, 0, 1], [0, 0, 0])",
+            "rl.makeModel([0, 0, 0, 1, 0, 0, 0, 0, 1], [0, 1, 2], [0, 0, 1, 0, 0, 1, 0, 0, 1], [1, 2, 3, 300, 1, 2, 3, 255, 1, 2, 3, 255])",
+            "rl.makeModel([0, 0, 0, 1, 0, 0, 0, 0, 1], [0, 1, 2], [0, 0, 1, 0, 0, 1, 0, 0, 1], [1, 2, 3, 255, 1, 2, 3, 255, 1, 2, 3, 255], [0])",
+        ] {
+            let error = match context.eval(call) {
+                Ok(_) => panic!("{call} must throw"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("rl.makeModel"), "{call}: {error}");
         }
         // A handle that was never handed out is simply invalid, not an error.
         assert_eq!(
