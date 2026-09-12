@@ -2420,6 +2420,29 @@ fn get_char_pressed(_args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Number(code as f64))
 }
 
+fn get_clipboard_text(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above. raylib returns a pointer into its own clipboard buffer,
+    // which stays valid until the next clipboard call.
+    let text = unsafe { raylib_sys::GetClipboardText() };
+    let text = if text.is_null() {
+        String::new()
+    } else {
+        // SAFETY: as above; the buffer is NUL-terminated.
+        unsafe { std::ffi::CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
+}
+
+fn set_clipboard_text(args: &[Value]) -> Result<Value, JsError> {
+    // `text_arg` already rejects an embedded NUL, which C would truncate at.
+    let text = text_arg(args, 0, "setClipboardText")?;
+    // SAFETY: as above; raylib copies the string out.
+    unsafe { raylib_sys::SetClipboardText(text.as_ptr()) };
+    Ok(Value::Undefined)
+}
+
 fn is_mouse_button_down(args: &[Value]) -> Result<Value, JsError> {
     let button = int_arg(args, 0, "isMouseButtonDown")?;
     // SAFETY: as above.
@@ -3029,6 +3052,8 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("isKeyUp", 1, is_key_up),
         ("getKeyPressed", 0, get_key_pressed),
         ("getCharPressed", 0, get_char_pressed),
+        ("getClipboardText", 0, get_clipboard_text),
+        ("setClipboardText", 1, set_clipboard_text),
         ("isMouseButtonDown", 1, is_mouse_button_down),
         ("isMouseButtonPressed", 1, is_mouse_button_pressed),
         ("isMouseButtonReleased", 1, is_mouse_button_released),
@@ -3166,6 +3191,18 @@ mod tests {
                 .as_boolean(),
             Some(true)
         );
+        // Clipboard access, so a long ticket can be pasted rather than typed.
+        for name in ["getClipboardText", "setClipboardText"] {
+            assert_eq!(
+                context
+                    .eval(&format!("typeof rl.{name}"))
+                    .unwrap()
+                    .as_string()
+                    .as_deref(),
+                Some("function"),
+                "rl.{name}"
+            );
+        }
         assert_eq!(
             context
                 .eval("rl.KEY_Q === 81 && rl.MOUSE_BUTTON_LEFT === 0")
