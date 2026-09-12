@@ -226,8 +226,14 @@ unsafe extern "C" {
 /// linker resolves it across the C boundary. raylib binds its logging to the
 /// window thread, so this runs there and writes straight to stderr, keeping
 /// stdout free for a host's command responses.
+///
+/// # Safety
+///
+/// `text` must be null or point to a NUL-terminated buffer that stays valid for
+/// the duration of the call. The shim guarantees this: the buffer comes from
+/// raylib's own formatter and lives until the callback returns.
 #[unsafe(no_mangle)]
-pub extern "C" fn custom_trace_log_callback(_log_type: c_int, text: *const c_char) {
+pub unsafe extern "C" fn custom_trace_log_callback(_log_type: c_int, text: *const c_char) {
     if text.is_null() {
         return;
     }
@@ -887,13 +893,12 @@ fn make_model(args: &[Value]) -> Result<Value, JsError> {
     if colors.as_ref().is_some_and(|list| list.len() != count * 4) {
         return Err(expected("makeModel", 3, "one r, g, b, a colour per vertex"));
     }
-    if let Some(colors) = &colors {
-        if colors
+    if let Some(colors) = &colors
+        && colors
             .iter()
             .any(|channel| !(0.0..=255.0).contains(channel))
-        {
-            return Err(expected("makeModel", 3, "colour channels in 0..=255"));
-        }
+    {
+        return Err(expected("makeModel", 3, "colour channels in 0..=255"));
     }
     let texcoords = number_array_arg(args, 4, "makeModel")?;
     if texcoords
@@ -914,10 +919,12 @@ fn make_model(args: &[Value]) -> Result<Value, JsError> {
             "rl.makeModel: could not allocate the mesh arrays".to_string(),
         )
     };
-    let mut mesh = Mesh::default();
-    mesh.vertexCount = count as c_int;
-    mesh.triangleCount = (indices.as_ref().map_or(0, Vec::len) / 3) as c_int;
-    mesh.vertices = mem_alloc_f32(&vertices);
+    let mut mesh = Mesh {
+        vertexCount: count as c_int,
+        triangleCount: (indices.as_ref().map_or(0, Vec::len) / 3) as c_int,
+        vertices: mem_alloc_f32(&vertices),
+        ..Default::default()
+    };
     if mesh.vertices.is_null() {
         return Err(out_of_memory());
     }
@@ -991,20 +998,20 @@ fn is_model_valid(args: &[Value]) -> Result<Value, JsError> {
 fn unload_model(args: &[Value]) -> Result<Value, JsError> {
     let handle = int_arg(args, 0, "unloadModel")?;
     let mut registry = MODELS.lock().unwrap();
-    if let Some(slot) = registry.get_mut(handle as usize) {
-        if slot.loaded {
-            // SAFETY: window-thread guard; both allocations came from raylib
-            // and are freed exactly once (the slot is then marked unloaded).
-            unsafe {
-                if !slot.animations.is_null() && slot.animation_count > 0 {
-                    raylib_sys::UnloadModelAnimations(slot.animations, slot.animation_count);
-                }
-                raylib_sys::UnloadModel(slot.model);
+    if let Some(slot) = registry.get_mut(handle as usize)
+        && slot.loaded
+    {
+        // SAFETY: window-thread guard; both allocations came from raylib
+        // and are freed exactly once (the slot is then marked unloaded).
+        unsafe {
+            if !slot.animations.is_null() && slot.animation_count > 0 {
+                raylib_sys::UnloadModelAnimations(slot.animations, slot.animation_count);
             }
-            slot.animations = std::ptr::null_mut();
-            slot.animation_count = 0;
-            slot.loaded = false;
+            raylib_sys::UnloadModel(slot.model);
         }
+        slot.animations = std::ptr::null_mut();
+        slot.animation_count = 0;
+        slot.loaded = false;
     }
     Ok(Value::Undefined)
 }
@@ -1548,13 +1555,13 @@ fn is_shader_valid(args: &[Value]) -> Result<Value, JsError> {
 fn unload_shader(args: &[Value]) -> Result<Value, JsError> {
     let handle = int_arg(args, 0, "unloadShader")?;
     let mut registry = SHADERS.lock().unwrap();
-    if let Some(slot) = registry.get_mut(handle as usize) {
-        if slot.loaded {
-            // SAFETY: window-thread guard; the shader came from raylib and is
-            // freed exactly once (the slot is then marked unloaded).
-            unsafe { raylib_sys::UnloadShader(slot.shader) };
-            slot.loaded = false;
-        }
+    if let Some(slot) = registry.get_mut(handle as usize)
+        && slot.loaded
+    {
+        // SAFETY: window-thread guard; the shader came from raylib and is
+        // freed exactly once (the slot is then marked unloaded).
+        unsafe { raylib_sys::UnloadShader(slot.shader) };
+        slot.loaded = false;
     }
     Ok(Value::Undefined)
 }
@@ -1785,14 +1792,14 @@ fn is_render_texture_valid(args: &[Value]) -> Result<Value, JsError> {
 fn unload_render_texture(args: &[Value]) -> Result<Value, JsError> {
     let handle = int_arg(args, 0, "unloadRenderTexture")?;
     let mut registry = RENDER_TEXTURES.lock().unwrap();
-    if let Some(slot) = registry.get_mut(handle as usize) {
-        if slot.loaded {
-            // SAFETY: window-thread guard; freed exactly once. The texture
-            // handles registered at load time are not invalidated here, so a
-            // script must stop using them once the render texture is unloaded.
-            unsafe { raylib_sys::UnloadRenderTexture(slot.target) };
-            slot.loaded = false;
-        }
+    if let Some(slot) = registry.get_mut(handle as usize)
+        && slot.loaded
+    {
+        // SAFETY: window-thread guard; freed exactly once. The texture
+        // handles registered at load time are not invalidated here, so a
+        // script must stop using them once the render texture is unloaded.
+        unsafe { raylib_sys::UnloadRenderTexture(slot.target) };
+        slot.loaded = false;
     }
     Ok(Value::Undefined)
 }
@@ -2022,13 +2029,13 @@ fn load_music_from_file(args: &[Value]) -> Result<Value, JsError> {
 fn unload_music(args: &[Value]) -> Result<Value, JsError> {
     let handle = int_arg(args, 0, "unloadMusic")?;
     let mut registry = MUSIC.lock().unwrap();
-    if let Some(slot) = registry.get_mut(handle as usize) {
-        if slot.loaded {
-            // SAFETY: window-thread guard; the stream came from raylib and is
-            // freed exactly once (the slot is then marked unloaded).
-            unsafe { raylib_sys::UnloadMusicStream(slot.music) };
-            slot.loaded = false;
-        }
+    if let Some(slot) = registry.get_mut(handle as usize)
+        && slot.loaded
+    {
+        // SAFETY: window-thread guard; the stream came from raylib and is
+        // freed exactly once (the slot is then marked unloaded).
+        unsafe { raylib_sys::UnloadMusicStream(slot.music) };
+        slot.loaded = false;
     }
     Ok(Value::Undefined)
 }
