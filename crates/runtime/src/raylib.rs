@@ -199,6 +199,18 @@ const KEY_CODES: &[(&str, i32)] = &[
     ("KEY_RIGHT_CONTROL", 345),
     ("KEY_RIGHT_ALT", 346),
     ("KEY_RIGHT_SUPER", 347),
+    ("KEY_F1", 290),
+    ("KEY_F2", 291),
+    ("KEY_F3", 292),
+    ("KEY_F4", 293),
+    ("KEY_F5", 294),
+    ("KEY_F6", 295),
+    ("KEY_F7", 296),
+    ("KEY_F8", 297),
+    ("KEY_F9", 298),
+    ("KEY_F10", 299),
+    ("KEY_F11", 300),
+    ("KEY_F12", 301),
 ];
 
 unsafe extern "C" {
@@ -1945,6 +1957,18 @@ fn get_screen_height(_args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Number(height as f64))
 }
 
+fn is_window_fullscreen(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    let fullscreen = unsafe { raylib_sys::IsWindowFullscreen() };
+    Ok(Value::Boolean(fullscreen))
+}
+
+fn toggle_fullscreen(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    unsafe { raylib_sys::ToggleFullscreen() };
+    Ok(Value::Undefined)
+}
+
 fn set_exit_key(args: &[Value]) -> Result<Value, JsError> {
     let key = int_arg(args, 0, "setExitKey")?;
     // SAFETY: as above.
@@ -2661,6 +2685,8 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("getScreenWidth", 0, get_screen_width),
         ("getScreenHeight", 0, get_screen_height),
         ("setExitKey", 1, set_exit_key),
+        ("toggleFullscreen", 0, toggle_fullscreen),
+        ("isWindowFullscreen", 0, is_window_fullscreen),
         ("beginDrawing", 0, begin_drawing),
         ("endDrawing", 0, end_drawing),
         ("clearBackground", 1, clear_background),
@@ -2877,6 +2903,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            context.eval("rl.KEY_F11 === 300").unwrap().as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
             context
                 .eval("rl.KEY_Q === 81 && rl.MOUSE_BUTTON_LEFT === 0")
                 .unwrap()
@@ -2906,6 +2936,8 @@ mod tests {
             "drawTextEx",
             "measureTextEx",
             "takeScreenshot",
+            "toggleFullscreen",
+            "isWindowFullscreen",
         ] {
             assert_eq!(
                 context
