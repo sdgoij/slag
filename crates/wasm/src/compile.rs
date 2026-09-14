@@ -1101,6 +1101,34 @@ fn body_globals(module: &Module, body: &FuncBody) -> Vec<u32> {
     indices
 }
 
+/// The memory indices (index space) a body touches, sorted and deduplicated
+/// (the order the descriptor variables are declared in).
+fn body_memories(body: &FuncBody) -> Vec<u32> {
+    let mut indices: Vec<u32> = Vec::new();
+    for instr in &body.body {
+        match instr {
+            Instr::Load { memory, .. }
+            | Instr::Store { memory, .. }
+            | Instr::MemorySize(memory)
+            | Instr::MemoryGrow(memory)
+            | Instr::MemoryFill(memory)
+            | Instr::MemoryInit { memory, .. }
+            | Instr::VecLoad { memory, .. }
+            | Instr::VecStore { memory, .. }
+            | Instr::VecLaneLoad { memory, .. }
+            | Instr::VecLaneStore { memory, .. } => indices.push(*memory),
+            Instr::MemoryCopy { dst, src } => {
+                indices.push(*dst);
+                indices.push(*src);
+            }
+            _ => {}
+        }
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 /// The byte width a load reads (little-endian, from the effective address).
 fn load_width(op: LoadOp) -> u64 {
     use LoadOp::*;
@@ -1590,9 +1618,14 @@ struct Lowerer<'a> {
     stack: Vec<ClifValue>,
     /// The per-call memory descriptor array (entry param 2): per module
     /// memory index, its data pointer then byte length (each a `u64`).
-    /// `memory.grow` refreshes the entry in place, so `mem_ea`/`memory.size`
-    /// must reload it on every use (they do).
+    /// `memory.grow` (and a callee that grows) refreshes entries in place, so
+    /// `mem_ea`/`memory.size` read them through cached variables that
+    /// [`Lowerer::reload_mem_vars`] refreshes at those boundaries.
     mems: ClifValue,
+    /// Per-memory descriptor variables (data pointer, byte length), one pair
+    /// per memory index the body touches, declared and seeded in the entry
+    /// block.
+    mem_vars: Vec<Option<(Variable, Variable)>>,
     /// The descriptor count (entry param 3), lent to a directly-called callee:
     /// the callee runs in this instance, so this body's descriptor array is
     /// its own.
@@ -2042,19 +2075,14 @@ impl<'a> Lowerer<'a> {
         width: u64,
     ) -> Result<ClifValue, String> {
         let memory64 = memory_is64(self.module, memory).ok_or("unresolved memory index")?;
-        let ptr_slot = self.builder.ins().iadd_imm_s(self.mems, 16 * memory as i64);
-        let len_slot = self
-            .builder
-            .ins()
-            .iadd_imm_s(self.mems, 16 * memory as i64 + 8);
-        let mem_ptr =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), ptr_slot, Offset32::new(0));
-        let mem_len =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), len_slot, Offset32::new(0));
+        let (ptr_var, len_var) = self
+            .mem_vars
+            .get(memory as usize)
+            .copied()
+            .flatten()
+            .ok_or("unresolved memory descriptor")?;
+        let mem_ptr = self.builder.use_var(ptr_var);
+        let mem_len = self.builder.use_var(len_var);
         let (ea, end) = if memory64 {
             // A memory64 address is an i64 bit pattern (unsigned u64). The
             // offset and width adds wrap mod 2^64; each carry means the true
@@ -2086,6 +2114,36 @@ impl<'a> Lowerer<'a> {
             .icmp(IntCC::UnsignedGreaterThan, end, mem_len);
         self.trap_if(oob, TRAP_MEMORY_OOB);
         Ok(self.builder.ins().iadd(mem_ptr, ea))
+    }
+
+    /// Reload the cached memory descriptor variables from the descriptor array
+    /// (a `memory.grow` or a callee may have rewritten the entries in place).
+    fn reload_mem_vars(&mut self) {
+        for memory in 0..self.mem_vars.len() {
+            let Some((ptr_var, len_var)) = self.mem_vars[memory] else {
+                continue;
+            };
+            let mem = memory as u32;
+            let ptr_slot = self.builder.ins().iadd_imm_s(self.mems, 16 * mem as i64);
+            let len_slot = self
+                .builder
+                .ins()
+                .iadd_imm_s(self.mems, 16 * mem as i64 + 8);
+            let ptr = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                ptr_slot,
+                Offset32::new(0),
+            );
+            let len = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                len_slot,
+                Offset32::new(0),
+            );
+            self.builder.def_var(ptr_var, ptr);
+            self.builder.def_var(len_var, len);
+        }
     }
 
     /// Lower a numeric load (little-endian) with its sign/zero extension.
@@ -2220,14 +2278,13 @@ impl<'a> Lowerer<'a> {
     /// i32 for memory32, an i64 for memory64).
     fn do_memory_size(&mut self, memory: u32) -> Result<(), String> {
         let memory64 = memory_is64(self.module, memory).ok_or("unresolved memory index")?;
-        let len_slot = self
-            .builder
-            .ins()
-            .iadd_imm_s(self.mems, 16 * memory as i64 + 8);
-        let mem_len =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), len_slot, Offset32::new(0));
+        let (_, len_var) = self
+            .mem_vars
+            .get(memory as usize)
+            .copied()
+            .flatten()
+            .ok_or("unresolved memory descriptor")?;
+        let mem_len = self.builder.use_var(len_var);
         let sixteen = self.iconst(types::I64, 16);
         let pages = self.builder.ins().ushr(mem_len, sixteen);
         let value = if memory64 {
@@ -2277,6 +2334,9 @@ impl<'a> Lowerer<'a> {
             &[self.store, self.instance, memory_index, delta64, desc],
         );
         let old = self.builder.inst_results(call)[0];
+        // The grow helper rewrote this memory's descriptor in place; refresh
+        // the cached variables so later accesses see the grown storage.
+        self.reload_mem_vars();
         let value = if memory64 {
             old
         } else {
@@ -3189,6 +3249,13 @@ impl<'a> Lowerer<'a> {
             Some(defined) => self.direct_call(defined, ty, &args)?,
             None if candidates.is_empty() => self.runtime_call(&args)?,
             None => self.catchable_runtime_call(&args, &candidates)?,
+        }
+        // A callee may have grown a memory (a directly-called body can still
+        // `memory.grow`); refresh the cached descriptors. A tail call returns
+        // the callee's results and leaves this body dead, so nothing to
+        // refresh.
+        if !tail {
+            self.reload_mem_vars();
         }
         let mut result_word = 0usize;
         for ty in ty.results.iter() {
@@ -5600,6 +5667,35 @@ fn lower(
         variables.push(variable);
     }
 
+    // Seed a descriptor variable pair per memory the body touches, loaded once
+    // in the entry block; `mem_ea`/`memory.size` read these, and
+    // `reload_mem_vars` refreshes them after a call or `memory.grow`.
+    let memory_vars = {
+        let mut vars: Vec<Option<(Variable, Variable)>> = Vec::new();
+        for memory in body_memories(body) {
+            let index = memory as usize;
+            if index >= vars.len() {
+                vars.resize(index + 1, None);
+            }
+            let ptr_var = builder.declare_var(types::I64);
+            let len_var = builder.declare_var(types::I64);
+            let ptr_slot = builder.ins().iadd_imm_s(mems, 16 * memory as i64);
+            let len_slot = builder.ins().iadd_imm_s(mems, 16 * memory as i64 + 8);
+            let ptr =
+                builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr_slot, Offset32::new(0));
+            let len =
+                builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), len_slot, Offset32::new(0));
+            builder.def_var(ptr_var, ptr);
+            builder.def_var(len_var, len);
+            vars[index] = Some((ptr_var, len_var));
+        }
+        vars
+    };
+
     let mut lowerer = Lowerer {
         builder,
         module,
@@ -5607,6 +5703,7 @@ fn lower(
         variables,
         stack: Vec::new(),
         mems,
+        mem_vars: memory_vars,
         ncount,
         globals_ptr,
         globals,

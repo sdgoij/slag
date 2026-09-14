@@ -246,9 +246,13 @@ Policy and gaps:
   call-bearing-body globals, table ops, pure-register SIMD and vec
   load/lane/shuffle, GC allocation/casts, and EH dynamic dispatch
   (`compile.rs:4817-4887`, `exec.rs:505-565`).
-- **Bounds checks are emitted per access** and the memory descriptor (ptr+len)
-  is reloaded every time, because `memory.grow` reallocates the backing `Vec`
-  (`compile.rs:1988-2031`, `1540-1541`).
+- **Bounds checks are emitted per access.** The memory descriptor (ptr+len) was
+  reloaded every time, because `memory.grow` reallocates the backing store.
+  **Fixed 2026-09-14:** the descriptor now rides a cached `Variable` pair seeded
+  in the entry block, re-read only after a call or `memory.grow`
+  (`Lowerer::mem_vars` / `reload_mem_vars`). The per-access bounds check itself
+  remains — its address is loop-varying, so it is not hoistable without range
+  analysis.
 - **Caps:** params+results ≤ `SCRATCH_SLOTS = 256` u64 words
   (`compile.rs:996-1005`), ratified as out of scope (plan decision 6).
 
@@ -457,7 +461,7 @@ JS-API boundary, "D" = decode/validate.
 | 3 | I | Remove the per-op `Vec<Value>` in `Instr::Num`; give `exec_num` scalar entry points (`4357-4366`) | High | Low |
 | 4 | I | Non-allocating `take_top`/`finish_top` via `copy_within` (`6113`, `6096`) | High | Low-Med |
 | 5 | I | Shrink `Value` 32→24 bytes: `V128` → `[u64;2]`, 8-byte aligned (`values.rs:266`) | Med | Low-Med |
-| 6 | C | Hoist/CSE bounds checks; cache descriptor loads, reloading after calls/grow (`compile.rs:1988-2031`, `1540`) | High | Medium |
+| 6 | C | CSE/hoist per-access bounds checks (address-dependent; needs range analysis) | Low | High |
 | 7 | C | Native direct calls between compiled bodies (or inline the leaf fast path), raising the depth-64 cap (`compile.rs:3127-3131`, `exec.rs:650-683`) | High | High |
 | 8 | J | Replace the full-memory memcpy bridge with zero-copy aliasing, syncing on grow/detach (`wasm.rs:1452-1502`, `3158/3174`) | High | High |
 | 9 | I | Cut call-setup allocation: cache declared locals per body, reuse frames (`5938-5959`) | Med-High | Medium |
@@ -500,6 +504,17 @@ interp-hot-loop 0.37→0.33 s, mem-loop 0.87→0.79 s. A `size_of::<Value>()`
 assertion pins the layout (the 24-byte form hosts `Value`'s discriminant in
 `RefValue`'s spare padding, so a new `RefValue` variant would otherwise grow it
 silently).
+
+Item 6 landed 2026-09-14 as its descriptor-load half only. The memory
+descriptor (data pointer + byte length) was reloaded from the caller-owned
+array on every access; it now rides a cached `Variable` pair seeded once in the
+entry block and re-read only after a call or `memory.grow` (`Lowerer::mem_vars`
+/ `reload_mem_vars`), so a memory loop's per-iteration descriptor loads are
+gone. The per-access bounds check stays: its address is loop-varying, so it is
+not hoistable without range analysis, which the compiled path deliberately
+does not do. The committed probe cannot show the win — `mem-loop.wast`'s 2M
+iterations are ~1-2 ms against ~20 ms of process startup, so the compiled
+column reads 0.021 s before and after.
 
 **Item 8 measured 2026-09-14, and it is the largest boundary cost by orders of
 magnitude.** `WebAssembly.Memory.prototype.buffer` is a *copy*: the JS-API keeps
