@@ -7,8 +7,9 @@ license.workspace = true
 [features]
 default = []
 # Cut 11 (wasm-to-native via Cranelift): an optional second execution path.
-# Off by default; the interpreter stays the shipped path until the
-# equivalence gate holds corpus-wide.
+# Off by default: it compiles lazily (a body on first reach, so instantiate
+# pays nothing for cold bodies), but the interpreter stays the shipped path
+# until default-on is decided.
 compile = [
     "dep:cranelift-codegen",
     "dep:cranelift-control",

@@ -240,7 +240,7 @@ fn run(paths: &[PathBuf], compiled: bool) -> ExitCode {
     let mut totals = Tally::default();
     for (source, is_json) in items {
         if is_json {
-            let (tally, _, _) = run_json_mode(&source, compiled, true);
+            let (tally, _, _) = run_json_mode(&source, compiled, true, false);
             println!(
                 "\n{}: {} pass, {} fail, {} pending",
                 source.display(),
@@ -266,7 +266,7 @@ fn run(paths: &[PathBuf], compiled: bool) -> ExitCode {
                 continue;
             }
         };
-        let (tally, _, _) = run_json_mode(&json, compiled, true);
+        let (tally, _, _) = run_json_mode(&json, compiled, true, false);
         println!(
             "\n{}: {} pass, {} fail, {} pending",
             json.display(),
@@ -376,8 +376,9 @@ fn equiv(paths: &[PathBuf]) -> ExitCode {
                 }
             }
         };
-        let (compiled_tally, compiled_log, compiled_coverage) = run_json_mode(&json, true, false);
-        let (interpreter_tally, interpreter_log, _) = run_json_mode(&json, false, false);
+        let (compiled_tally, compiled_log, compiled_coverage) =
+            run_json_mode(&json, true, false, true);
+        let (interpreter_tally, interpreter_log, _) = run_json_mode(&json, false, false, false);
         compared += 1;
         total.merge(&compiled_coverage);
         if compiled_log == interpreter_log {
@@ -534,13 +535,16 @@ pub(crate) fn excluded(source: &Path, exclusions: &[(String, String)]) -> Option
 
 /// Run one converted suite's commands. `compiled` selects the execution path
 /// (compiled bodies when true, the interpreter forced when false); `verbose`
-/// prints per-command fail/pending lines. Returns the tally plus a
+/// prints per-command fail/pending lines; `coverage_wanted` asks for the static
+/// compiled-coverage report, which forces every body through the lazy compile
+/// tier, so only callers that use it should ask. Returns the tally plus a
 /// per-command outcome log (command type + verdict) so two runs can be
 /// compared command-by-command.
 fn run_json_mode(
     json_path: &Path,
     compiled: bool,
     verbose: bool,
+    coverage_wanted: bool,
 ) -> (Tally, Vec<(String, Outcome)>, Coverage) {
     let mut tally = Tally::default();
     let mut log = Vec::new();
@@ -939,7 +943,7 @@ fn run_json_mode(
             }
         }
     }
-    let coverage = if compiled {
+    let coverage = if compiled && coverage_wanted {
         #[cfg(feature = "compile")]
         {
             let (compiled_count, defined, reasons) = store.compile_coverage();

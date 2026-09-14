@@ -32,8 +32,10 @@ jit = ["dep:jit"]
 # `--no-default-features` (keep the JIT with `--features jit`).
 wasm = ["runtime/wasm"]
 # Cut 11: run wasm bodies natively (native targets only). Off by default:
-# enabling it eagerly compiles every instantiated module's bodies, and a
-# compiled body's calls still re-enter the interpreter.
+# a compiled body's calls still re-enter the interpreter through the call
+# helper, so the win is confined to bodies whose hot path is call-free or
+# made of eligible direct calls. Compilation is lazy (a body compiles on
+# first reach), so instantiate pays nothing for cold bodies.
 wasm-compile = ["runtime/wasm-compile"]
 # The drop-in JavaScriptCore C API (`crates/jsc`): not part of the default
 # workspace build; this feature builds it alongside the CLI so a release can

@@ -50,8 +50,9 @@ wasm = ["dep:wasm"]
 # Cut 11: run wasm bodies natively through Cranelift. Native targets only —
 # the `wasm` crate scopes cranelift's dependencies off wasm32 and rejects the
 # combination with a `compile_error!`, because `region` (executable-page
-# allocation) has no wasm32 backend. Enabling it makes every instantiate
-# eagerly compile all of a module's bodies, so it stays opt-in.
+# allocation) has no wasm32 backend. Compilation is lazy — a body compiles the
+# first time execution reaches it — so it stays opt-in for the calls that still
+# re-enter the interpreter, not for instantiate cost.
 wasm-compile = ["wasm", "wasm/compile"]
 # Experimental multi-agent mode (PLAN Phase 17): workers run as OS threads
 # with their own realms and job queues, sharing SharedArrayBuffer blocks

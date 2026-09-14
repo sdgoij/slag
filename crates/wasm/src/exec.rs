@@ -668,20 +668,18 @@ pub unsafe extern "C" fn wasm_call_helper(
     // Native compiled-to-compiled re-entry: when the callee is itself a
     // compiled module-defined function and we are inside the native depth
     // budget, run it natively — each native level carries its own
-    // descriptor/global/scratch buffers. Deeper chains (or interpreted or
-    // host callees) fall through to the interpreter path below, which
-    // preserves the interpreter's exhaustion semantics and bounds the native
-    // stack.
+    // descriptor/global/scratch buffers. A callee the lazy tier has not
+    // reached yet compiles here first (`ensure_compiled`). Deeper chains (or
+    // interpreted or host callees) fall through to the interpreter path below,
+    // which preserves the interpreter's exhaustion semantics and bounds the
+    // native stack.
     let native = match target {
         FuncTarget::Owned {
             instance: own,
             defined,
-        } if !store.compile_off && store.native_depth < NATIVE_CALL_DEPTH => store
-            .instances
-            .get(own)
-            .and_then(|inst| inst.compiled.get(defined))
-            .and_then(|entry| entry.as_ref())
-            .map(|func| (own, func as *const crate::compile::CompiledFunc)),
+        } if !store.compile_off && store.native_depth < NATIVE_CALL_DEPTH => {
+            store.ensure_compiled(own, defined).map(|func| (own, func))
+        }
         _ => None,
     };
     if let Some((own, native_ptr)) = native {
@@ -710,7 +708,11 @@ pub unsafe extern "C" fn wasm_call_helper(
     // types themselves.
     let params = match mode {
         0 => store.func_params(instance as usize, x as usize),
-        _ => caller.module.func_at(z as u32).map(|ty| ty.params.clone()),
+        _ => store
+            .instances
+            .get(instance as usize)
+            .and_then(|inst| inst.module.func_at(z as u32))
+            .map(|ty| ty.params.clone()),
     };
     let Some(params) = params else {
         return code_of(Trap::UnknownFunction);
@@ -2779,31 +2781,91 @@ impl Store {
         self.compile_off = !enabled;
     }
 
+    /// Cut 11 item 14: the lazy compile tier. Returns the compiled entry for
+    /// module-defined body `defined` of `instance`, compiling it now if this
+    /// is the first time execution has reached it.
+    ///
+    /// `None` — the body stays interpreted — for an interpreter-forced store
+    /// (including the call helper's own interpreted fallback, which forces
+    /// `compile_off` for a whole subtree), a body whose callee graph can reach
+    /// an external host (it cannot suspend at a native frame), a body outside
+    /// the lowering subset, and an instance instantiated while compilation was
+    /// off (its `compiled` table is empty).
+    ///
+    /// Installing an entry overwrites one slot of a table that is only ever
+    /// resized by `instantiate`, which cannot run while a native call is in
+    /// flight, so a pointer handed out here stays valid for the call.
+    #[cfg(feature = "compile")]
+    fn ensure_compiled(
+        &mut self,
+        instance: usize,
+        defined: usize,
+    ) -> Option<*const crate::compile::CompiledFunc> {
+        if self.compile_off {
+            return None;
+        }
+        let inst = self.instances.get_mut(instance)?;
+        // A compile-off instantiation leaves the table empty; that is also how
+        // a store flipped back on leaves its older instances.
+        if inst.compiled.len() <= defined {
+            return None;
+        }
+        if let Some(func) = inst.compiled[defined].as_ref() {
+            return Some(func as *const crate::compile::CompiledFunc);
+        }
+        if inst.host_reachable.get(defined).copied().unwrap_or(false) {
+            return None;
+        }
+        let func = crate::compile::compile_body(&inst.module, defined)?;
+        inst.entries[defined] = func.entry_addr();
+        inst.compiled[defined] = Some(func);
+        inst.compiled[defined].as_ref().map(|func| func as *const _)
+    }
+
+    /// How many of `instance`'s module-defined bodies have compiled so far.
+    /// The lazy tier's progress: an uncompiled body simply runs interpreted,
+    /// so execution cannot observe it (`None` when compilation is off for the
+    /// instance, or there is no such instance).
+    #[cfg(feature = "compile")]
+    pub fn compiled_bodies(&self, instance: usize) -> Option<usize> {
+        self.instances
+            .get(instance)
+            .map(|inst| inst.compiled.iter().filter(|entry| entry.is_some()).count())
+    }
+
     /// Compiled-coverage totals across every live instance: how many
-    /// module-defined functions compiled vs. the total, plus a coarse reason
+    /// module-defined functions compile vs. the total, plus a coarse reason
     /// per function that did not (see [`crate::compile::body_compile_reason`]).
     /// An interpreter-forced store reports zeros. Each fallback records its
     /// module-defined body index alongside the coarse reason, so a run can
     /// pinpoint which functions of which module stayed interpreted.
+    ///
+    /// Instantiation compiles lazily, so a body that never ran has no entry
+    /// yet. This is a *static* measure, so it forces every body through the
+    /// tier before counting (`ensure_compiled` on an already-compiled body
+    /// just returns its entry).
     #[cfg(feature = "compile")]
-    pub fn compile_coverage(&self) -> (usize, usize, Vec<(usize, String)>) {
+    pub fn compile_coverage(&mut self) -> (usize, usize, Vec<(usize, String)>) {
         let mut compiled = 0usize;
         let mut defined = 0usize;
         let mut reasons = Vec::new();
-        for instance in &self.instances {
-            if instance.compiled.is_empty() {
+        for instance in 0..self.instances.len() {
+            if self.instances[instance].compiled.is_empty() {
                 // Interpreter-forced store: nothing was compiled.
                 continue;
             }
-            let bodies = instance.module.bodies.len();
+            let bodies = self.instances[instance].module.bodies.len();
             defined += bodies;
-            for (index, entry) in instance.compiled.iter().enumerate().take(bodies) {
-                if entry.is_some() {
+            for index in 0..bodies {
+                if self.ensure_compiled(instance, index).is_some() {
                     compiled += 1;
                 } else {
                     reasons.push((
                         index,
-                        crate::compile::body_compile_reason(&instance.module, index),
+                        crate::compile::body_compile_reason(
+                            &self.instances[instance].module,
+                            index,
+                        ),
                     ));
                 }
             }
@@ -3184,7 +3246,8 @@ impl Store {
 
         // Cut 11 Wave 3: bodies whose callee graph can reach an external host
         // function are not compiled (they run interpreted, whose parked-run
-        // protocol is the one host-call mechanism).
+        // protocol is the one host-call mechanism). `Store::ensure_compiled`
+        // consults this before compiling a body on demand.
         #[cfg(feature = "compile")]
         let host_reachable = if self.compile_off {
             Vec::new()
@@ -3193,18 +3256,15 @@ impl Store {
         };
 
         #[cfg(feature = "compile")]
-        let compiled = if self.compile_off {
+        let compiled: Vec<Option<crate::compile::CompiledFunc>> = if self.compile_off {
             // Interpreter-forced store: don't pay the compile cost at all (the
             // equivalence harness runs whole corpora twice).
             Vec::new()
         } else {
-            let mut compiled = crate::compile::compile_module(module);
-            for (entry, reachable) in compiled.iter_mut().zip(&host_reachable) {
-                if *reachable {
-                    *entry = None;
-                }
-            }
-            compiled
+            // Cut 11 item 14: nothing compiles up front. A body compiles the
+            // first time execution reaches it (`Store::ensure_compiled`), so a
+            // module with many rarely-called bodies pays only for what runs.
+            (0..module.bodies.len()).map(|_| None).collect()
         };
         // The direct-call table compiled bodies consult through the scratch
         // region's metadata slot: an address per compiled body, 0 where a body
@@ -3651,18 +3711,11 @@ impl Store {
         };
         // Cut 11: a compiled leaf entry runs synchronously (no host boundary
         // in the current subset), so it is a `Finished` run like an
-        // interpreter run that never suspends. `set_compile(false)` forces
+        // interpreter run that never suspends. A body not yet compiled
+        // compiles here on first reach (item 14); `set_compile(false)` forces
         // the interpreter for equivalence testing.
         #[cfg(feature = "compile")]
-        let compiled = if self.compile_off {
-            None
-        } else {
-            self.instances[instance]
-                .compiled
-                .get(defined)
-                .and_then(|entry| entry.as_ref())
-                .map(|func| func as *const crate::compile::CompiledFunc)
-        };
+        let compiled = self.ensure_compiled(instance, defined);
         #[cfg(feature = "compile")]
         if let Some(func_ptr) = compiled {
             // SAFETY: the instance (and its compiled entries) is stable for

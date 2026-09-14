@@ -427,14 +427,28 @@ pub fn run_compiled(
     Ok(results)
 }
 
+/// Compile one module-defined function body on demand. `None` when the body
+/// is outside the lowering subset (or native code generation is unavailable),
+/// which keeps it on the interpreter path.
+///
+/// This is the lazy tier's entry point: instantiation compiles nothing up
+/// front, so a module pays only for the bodies execution actually reaches.
+/// Every compiled call site already treats a zero entry as "not compiled" and
+/// falls back, so an uncompiled body is a supported state.
+pub fn compile_body(module: &Module, defined: usize) -> Option<CompiledFunc> {
+    let engine = Engine::new().ok()?;
+    engine.compile(module, defined).ok().flatten()
+}
+
 /// Compile every module-defined function body. `None` at index `i` means
-/// body `i` is not (yet) lowerable and keeps the interpreter path.
+/// body `i` is outside the lowering subset and keeps the interpreter path.
+///
+/// Instantiation compiles lazily through [`compile_body`], so this answers
+/// the static-coverage question (how much of this module *could* compile?)
+/// rather than being a step of the instantiate path.
 pub fn compile_module(module: &Module) -> Vec<Option<CompiledFunc>> {
-    let Ok(engine) = Engine::new() else {
-        return (0..module.bodies.len()).map(|_| None).collect();
-    };
     (0..module.bodies.len())
-        .map(|defined| engine.compile(module, defined).ok().flatten())
+        .map(|defined| compile_body(module, defined))
         .collect()
 }
 
@@ -5910,9 +5924,12 @@ mod tests {
     }
 
     #[test]
-    fn lowerable_functions_with_calls_stay_interpreted() {
-        // A function with a Call is not compiled; it still runs (the hook
-        // falls back to the interpreter) and produces the right answer.
+    fn bodies_compile_lazily_on_first_reach() {
+        // Item 14: instantiate compiles nothing, so both bodies start
+        // interpreted. Invoking the caller compiles it, and its `call` to the
+        // leaf compiles the leaf on the same first reach — an uncompiled
+        // callee would instead fall through the call helper to the
+        // interpreter.
         let module = Module {
             types: vec![
                 SubType::func(vec![], vec![ValType::I32]),
@@ -5939,10 +5956,18 @@ mod tests {
         let instance = store
             .instantiate(&module, &mut |_, _| None)
             .expect("module instantiates");
-        let results = store
-            .invoke(instance, 1, &[])
-            .expect("runs through the interpreter");
+        assert_eq!(
+            store.compiled_bodies(instance),
+            Some(0),
+            "instantiation must not compile bodies eagerly"
+        );
+        let results = store.invoke(instance, 1, &[]).expect("runs");
         assert_eq!(results, vec![Value::I32(42)]);
+        assert_eq!(
+            store.compiled_bodies(instance),
+            Some(2),
+            "the caller and the leaf it calls should compile on first reach"
+        );
     }
 
     #[test]

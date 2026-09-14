@@ -178,10 +178,22 @@ returned `i32` is a trap code (`compile.rs:62-70`, `214-227`).
 
 Policy and gaps:
 
-- **Eager, once, never invalidated.** `instantiate` compiles every body
-  (`exec.rs:3143` **(verified)**); there is no hotness threshold, no lazy
-  compile, no recompile, and `Instance.compiled` is only ever written at
-  instantiate.
+- **Lazy since 2026-09-14 (item 14).** `instantiate` compiles nothing; a body
+  compiles the first time execution reaches it (`Store::ensure_compiled`),
+  which installs the entry in `Instance.compiled` and in the instance's
+  direct-call table. Until then it runs interpreted — every compiled call site
+  already treats a zero entry as "not compiled" and falls back, so that state
+  needed no new plumbing. The call helper's native re-entry compiles on demand
+  too, so a callee the tier has not reached still ends up native there (that
+  path is depth-counted, so the native stack bound is unchanged). `compiled`
+  is written only there; nothing recompiles and nothing invalidates.
+  Measured on `fixtures/many-bodies.wast` (1,001 bodies of 24 ops, of which
+  only two are reached): **0.25 s → 0.054 s**, level with the interpreter's
+  0.053 s — the ~0.2 s of eager per-body compile cost is gone. The coverage
+  report stays a *static* measure, so `Store::compile_coverage` forces every
+  body through the tier; `wasmtest run --compiled` no longer asks for it
+  (`equiv`, which prints it, does), which is what let the probe path measure
+  the tier at all instead of a hidden eager compile.
 - **Host-reachable bodies are forced interpreted** (`exec.rs:3117-3152`,
   **(verified)**): a native run cannot park at an external-host boundary, so
   one host-call mechanism is kept (plan decision 7).
@@ -241,8 +253,11 @@ turns on `wasm/compile`. It is **native-only by construction**: cranelift's
 `wasm` crate scopes those dependencies off wasm32 and rejects the combination
 with a `compile_error!` naming the reason — a wasm embed always runs the
 interpreter, exactly like the JIT (`jit` fails the same way, in the same
-crate). It stays off by default because enabling it eagerly compiles every body
-at instantiate and a body's calls still re-enter the interpreter.
+crate). It stays off by default because the call helper's round-trip is still
+the cost of every call the direct form does not cover (a call-bearing,
+indirect, or `call_ref` callee), so the measured envelope is bodies whose hot
+path is call-free or made of eligible direct calls — not because of any
+instantiate-time overhead, which the lazy tier removed.
 
 What it buys, measured (release; the compiled column includes ~20 ms of process
 startup, so the leaf row understates the loop):
@@ -264,9 +279,11 @@ totals (§3).
 
 The shape is the gap list above: pure compute gets native speed, while helper
 work (GC allocation/casts, bulk ops) and the call helper's own round-trip stay
-on the slow side. Turning it on by default would need the rest of §7 item 7
-(skip the helper outright for a direct call to a compiled body) and item 14
-(lazy/tiered compile) first.
+on the slow side. §7 items 7 and 14 are both landed, so default-on is no
+longer blocked on instantiate cost; what is left to measure is whether the
+per-access bounds checks (item 6) and the SIMD helper round-trips (item 10)
+leave memory- and vector-heavy bodies ahead of the interpreter rather than at
+a wash.
 
 Verified for the landing: `equiv` over the control-flow files, `exceptions`,
 `bulk-memory`, and `gc` reports **36 suites, 0 diverged**, 1,986/1,986 module
@@ -413,6 +430,12 @@ call (five buffers plus the callee's declared type) and paying two Rust frames
 plus an indirect call for every call. The call-per-iteration probe went 2.6× →
 7.2× → 14.3× — see §5.
 
+Item 14 landed 2026-09-14 as a lazy tier rather than a hotness threshold:
+`instantiate` compiles nothing and `Store::ensure_compiled` compiles a body on
+first reach, reusing the null-entry fallback every call site already had. It is
+the instantiate half of the same "stop paying for work that is not executed"
+move; the probe is `fixtures/many-bodies.wast` (0.25 s → 0.054 s) — see §5.
+
 **Landed 2026-09-14 (items 1, 3, 4 and item 2's double clones).** Measured on a
 hot-loop probe (1M iterations; a call plus a `br_if` plus three numeric ops per
 iteration — `crates/wasmtest/fixtures/interp-hot-loop.wast`, timed as
@@ -454,10 +477,12 @@ before the change); `wasmtest equiv` over `block`/`br`/`br_if`/`br_table`/
    real-world benefit is limited to call-free leaf bodies. Either gate it on
    (runtime/CLI feature) after adding direct native calls, or record the
    decision that it stays a research path.
-   **Landed 2026-09-14 (the feature gate, not the native calls):** reachable as
+   **Landed 2026-09-14 (the feature gate, then both blockers):** reachable as
    `wasm-compile` on `runtime`/`slag`/`cli`, native-only with a `compile_error!`
-   guard, still opt-in. Measured envelope and the remaining blockers (§7 items 7
-   and 14) are in §5.
+   guard, still opt-in. §7 item 7 (direct native calls, including skipping the
+   helper for an eligible leaf call) and item 14 (lazy compile) have both
+   landed; measured envelope and the remaining blockers (§7 items 6 and 10) are
+   in §5.
 4. **JS-API memory bridge** (item 8) — the only boundary cost that is a whole
    linear-memory copy per call once a `buffer` has been materialised.
 5. Threads/atomics and `WebAssembly.Function` are the remaining whole-feature
@@ -480,7 +505,9 @@ cargo run -p wasmtest --features wasmtest/compile -- run ...   # + equiv gate
 
 - "The wasm Cranelift backend (`wasm/compile`) is off by default and is not
   enabled by `runtime` or `cli`: the CLI and browser demo always run the
-  interpreter. Enabling it makes every instantiate eagerly compile all bodies
-  (`wasmtest`'s feature-unification warning exists for this reason)."
+  interpreter. Compilation is lazy — a body compiles on first reach
+  (`Store::ensure_compiled`) — but `Store::compile_coverage` force-compiles
+  every body, because it reports static eligibility rather than what ran: a
+  timing measurement must not ask for coverage."
 - "`wasmtest run` cannot fail on `pending`; a real gate must check the pending
   count, and `equiv`/`coverage` need `--features compile`."

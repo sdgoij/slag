@@ -95,13 +95,25 @@ the interpreter — do not try to "ship the JIT to the browser".
 
 On native builds reach the compiled path with the `wasm-compile` feature
 (`runtime` → `slag` / `cli`), which enables `wasm/compile`. It is opt-in because
-enabling it eagerly compiles every body at instantiate, and a compiled body's
-calls still re-enter the interpreter:
+a compiled body's calls still re-enter the interpreter whenever the callee is
+not an eligible direct-call target:
 
 - `wasmtest run --compiled <path>` runs suites through it (needs a binary built
   with `--features compile`); `equiv` compares both paths.
 - One binary built with `--features compile` measures both: without `--compiled`
   the store forces the interpreter, which is what makes the A/B meaningful.
+- Compilation is **lazy**: `instantiate` compiles nothing, and
+  `Store::ensure_compiled` compiles a body the first time execution reaches it
+  (an uncompiled body just runs interpreted — every compiled call site already
+  treats a zero entry as "not compiled"). So a probe's wall time no longer
+  hides a per-body compile of the whole module; `fixtures/many-bodies.wast`
+  (1,001 bodies, two reached) is the probe for that, at instantiate-neutral
+  0.054 s vs the interpreter's 0.053 s.
+- The coverage report is a **static** measure, so `Store::compile_coverage`
+  force-compiles every body — asking for it re-introduces the eager cost. In
+  `wasmtest` it is behind an explicit flag that only `equiv` (which prints it)
+  passes, so `run --compiled` stays lazy. Forcing it inside `run` was what made
+  the lazy tier look like it had not landed.
 - The envelope, measured: ~80× on a call-free leaf loop and 14.3× on a loop with
   a call per iteration (the committed probes; medians of three). Suite timings
   are not a usable measure — they are dominated by convert/decode/validate,
