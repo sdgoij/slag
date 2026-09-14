@@ -13,10 +13,10 @@
 //! assert_eq!(value.as_number(), Some(3.0));
 //! ```
 
-pub use crux::error::JsError;
+pub use crux::error::{ErrorKind, JsError};
 pub use runtime::HostHooks;
 pub use runtime::dump;
-pub use runtime::embed::{Context, HostCallbacks, JsObject, JsValue};
+pub use runtime::embed::{Context, FunctionCall, HostCallbacks, HostFn, JsObject, JsValue};
 pub use runtime::embed::{OutputFn, RandomFn};
 
 /// Install the Cranelift JIT hook on `context`'s agent (feature `jit`).

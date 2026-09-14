@@ -22,7 +22,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crux::error::{ErrorKind, JsError};
-use crux::function::Function;
+use crux::function::{Function, NativeCtor, NativeFn};
 use crux::handle::Handle;
 use crux::object::{JsObject as CruxObject, ObjectKind, typed_array_effective_length};
 use crux::property::{PropertyDescriptor, PropertyKey};
@@ -40,6 +40,107 @@ pub type OutputFn = Box<dyn Fn(&str)>;
 
 /// A `Math.random` replacement source.
 pub type RandomFn = Box<dyn Fn() -> f64>;
+
+/// A native (host) function body: receives the call's `this` and arguments and
+/// returns a value, or an error the engine throws.
+pub type HostFn = Box<dyn Fn(&FunctionCall<'_>) -> Result<JsValue, JsError> + 'static>;
+
+/// The invocation a host function receives: `this`, the arguments, and — for
+/// a function created by [`Context::create_constructor`] — the construct
+/// context.
+///
+/// `args` is a zero-copy view over the engine's argument slice, so a host
+/// function observes the exact values the call passed without allocating.
+pub struct FunctionCall<'a> {
+    this: &'a Value,
+    args: &'a [Value],
+    new_target: Option<&'a Value>,
+}
+
+impl FunctionCall<'_> {
+    /// The `this` value of the call: the receiver, or the freshly created
+    /// instance when [`is_construct`](Self::is_construct) is true.
+    pub fn this(&self) -> JsValue {
+        JsValue(*self.this)
+    }
+
+    /// The number of arguments.
+    pub fn length(&self) -> usize {
+        self.args.len()
+    }
+
+    /// Whether this invocation is a `new` (construct) call. Always `false` for
+    /// a plain [`Context::create_function`] function.
+    pub fn is_construct(&self) -> bool {
+        self.new_target.is_some()
+    }
+
+    /// The `new.target` of the invocation: the constructor `new` was called
+    /// on, or *undefined* for a plain call.
+    pub fn new_target(&self) -> JsValue {
+        JsValue(self.new_target.copied().unwrap_or(Value::Undefined))
+    }
+
+    /// The argument at `index`, or `None` past the last one.
+    pub fn arg(&self, index: usize) -> Option<JsValue> {
+        self.args.get(index).copied().map(JsValue)
+    }
+
+    /// All arguments.
+    pub fn args(&self) -> &[JsValue] {
+        // SAFETY: `JsValue` is `#[repr(transparent)]` over `Value`, so the two
+        // element types have identical size and alignment and the slice can be
+        // reinterpreted in place. The layout equality is asserted in the tests.
+        unsafe { std::slice::from_raw_parts(self.args.as_ptr() as *const JsValue, self.args.len()) }
+    }
+
+    /// ToNumber coercion (spec 7.1.3) of a value passed to the host function.
+    pub fn to_number(&self, value: &JsValue) -> Result<f64, JsError> {
+        let agent = current_agent_mut()?;
+        let prim =
+            crate::context::to_primitive(agent, &value.0, crux::convert::ToPrimitiveHint::Number)?;
+        crux::convert::to_number(&prim)
+    }
+
+    /// ToString coercion (spec 7.1.12) of a value passed to the host function.
+    pub fn to_string(&self, value: &JsValue) -> Result<String, JsError> {
+        let agent = current_agent_mut()?;
+        Ok(crate::context::to_string(agent, &value.0)?.to_string_lossy())
+    }
+
+    /// Call a JS function synchronously and return its result. The engine state
+    /// the host function runs on is re-entered (the enclosing script/call is
+    /// suspended for the duration), so a thrown value propagates out of the
+    /// host function exactly as if the argument had thrown.
+    pub fn call(
+        &self,
+        function: &JsValue,
+        this: &JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let values: Vec<Value> = args.iter().map(|arg| arg.0).collect();
+        let agent = current_agent_mut()?;
+        let result = crate::function::call(agent, &function.0, this.0, &values)?;
+        Ok(JsValue(result))
+    }
+
+    /// Construct an object from a JS constructor (spec `new`), returning the
+    /// constructed instance.
+    pub fn construct(&self, constructor: &JsValue, args: &[JsValue]) -> Result<JsValue, JsError> {
+        let values: Vec<Value> = args.iter().map(|arg| arg.0).collect();
+        let agent = current_agent_mut()?;
+        let result = crate::function::construct(agent, &constructor.0, &values, &constructor.0)?;
+        Ok(JsValue(result))
+    }
+
+    /// Evaluate a Script in the current realm and return its completion value.
+    /// Unlike [`Context::eval`], queued jobs are not drained — the host
+    /// function is itself running inside the job/script it would drain.
+    pub fn eval(&self, source: &str) -> Result<JsValue, JsError> {
+        let agent = current_agent_mut()?;
+        Ok(JsValue(agent.run_script(source)?))
+    }
+}
 
 /// Host-defined behavior the embedding API exposes. Each callback is
 /// optional; `None` falls back to a sensible default (console output to
@@ -157,6 +258,213 @@ impl Context {
         let global = self.agent.current_realm()?.global_object;
         global.create_data_property_or_throw(&JsString::from_utf8(name), value.into_value())?;
         Ok(())
+    }
+
+    /// CreateBuiltinFunction (spec 10.2.3) over a Rust closure: a
+    /// non-constructible callable value linked to this realm's
+    /// `%Function.prototype%`.
+    ///
+    /// The result is rooted only by the host's own frame until it is defined on
+    /// a reachable object, so a host that stores it in native heap memory must
+    /// install it (via [`Context::set_global`], [`Context::register_fn`], or
+    /// [`JsObject::set`]) before the next evaluation.
+    pub fn create_function(
+        &self,
+        name: &str,
+        length: u32,
+        callback: HostFn,
+    ) -> Result<JsValue, JsError> {
+        let realm = self.agent.current_realm()?;
+        let function_prototype = realm
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|value| crate::context::as_object(&value));
+        let function = build_host_fn(
+            function_prototype,
+            Some(JsString::from_utf8(name)),
+            length as u64,
+            callback,
+        )?;
+        Ok(JsValue(Value::Function(function)))
+    }
+
+    /// CreateBuiltinFunction (spec 10.2.3) over a Rust closure with a
+    /// [[Construct]]: a host constructor. `new C(...)` creates an instance
+    /// inheriting from the constructor's `.prototype` and passes it as the
+    /// callback's `this` ([`FunctionCall::is_construct`] is then true). A plain
+    /// `C(...)` call runs the same callback with the caller's `this`.
+    ///
+    /// `.prototype` follows MakeConstructor (spec 10.2.5): writable and
+    /// non-enumerable on the constructor, with a `constructor` link back on the
+    /// prototype object. Returning an object from the callback replaces the
+    /// instance, matching ordinary `[[Construct]]`.
+    pub fn create_constructor(
+        &self,
+        name: &str,
+        length: u32,
+        callback: HostFn,
+    ) -> Result<JsValue, JsError> {
+        let realm = self.agent.current_realm()?;
+        let function_prototype = realm
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|value| crate::context::as_object(&value));
+        let object_prototype = realm
+            .intrinsics
+            .get("%Object.prototype%")
+            .and_then(|value| value.as_object());
+        let prototype_object = CruxObject::ordinary_object_create(object_prototype);
+
+        let callback = Rc::new(callback);
+        let call_callback = Rc::clone(&callback);
+        let call: NativeFn = Box::new(move |this, args| {
+            call_callback(&FunctionCall {
+                this,
+                args,
+                new_target: None,
+            })
+            .map(JsValue::into_value)
+        });
+        let construct_callback = Rc::clone(&callback);
+        let construct: NativeCtor = Box::new(move |new_target, args| {
+            let instance = match prototype_of(new_target) {
+                Some(prototype) => {
+                    Value::Object(CruxObject::ordinary_object_create(Some(prototype)))
+                }
+                None => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "host constructor has no .prototype".into(),
+                    ));
+                }
+            };
+            let result = construct_callback(&FunctionCall {
+                this: &instance,
+                args,
+                new_target: Some(new_target),
+            })?;
+            let raw = result.into_value();
+            // OrdinaryConstruct (spec 10.2.2): an object result replaces the
+            // instance, a primitive result yields the instance.
+            Ok(if raw.is_object() || raw.is_function() {
+                raw
+            } else {
+                instance
+            })
+        });
+
+        let function = Function::create_builtin(
+            Some(JsString::from_utf8(name)),
+            length as u64,
+            call,
+            Some(construct),
+            function_prototype,
+        )?;
+        function.define_property(
+            &JsString::from_utf8("prototype"),
+            &PropertyDescriptor {
+                value: Some(Value::Object(prototype_object)),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(false),
+            },
+        )?;
+        prototype_object.define_property_or_throw(
+            &JsString::from_utf8("constructor"),
+            &PropertyDescriptor {
+                value: Some(Value::Function(function)),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+        Ok(JsValue(Value::Function(function)))
+    }
+
+    /// A plain object inheriting `%Object.prototype%` — a namespace to hang
+    /// host functions on (no `eval("({})")` needed).
+    pub fn create_object(&self) -> Result<JsObject, JsError> {
+        let realm = self.agent.current_realm()?;
+        let object_prototype = realm
+            .intrinsics
+            .get("%Object.prototype%")
+            .and_then(|value| value.as_object());
+        Ok(JsObject(CruxObject::ordinary_object_create(
+            object_prototype,
+        )))
+    }
+
+    /// Define an accessor property on `target` whose getter and/or setter are
+    /// host functions (spec 7.3.6, an own accessor descriptor).
+    ///
+    /// Each callback receives the receiver of the property access as `this`;
+    /// a setter receives the assigned value as its first argument, and a
+    /// getter's return value is the property's value. The property is
+    /// enumerable and configurable (the [`JsObject::set`] attribute analogue).
+    pub fn define_accessor(
+        &self,
+        target: &JsObject,
+        key: &str,
+        get: Option<HostFn>,
+        set: Option<HostFn>,
+    ) -> Result<(), JsError> {
+        let realm = self.agent.current_realm()?;
+        let function_prototype = realm
+            .intrinsics
+            .get("%Function.prototype%")
+            .and_then(|value| crate::context::as_object(&value));
+        let getter = get
+            .map(|callback| {
+                build_host_fn(
+                    function_prototype,
+                    Some(JsString::from_utf8(&format!("get {key}"))),
+                    0,
+                    callback,
+                )
+                .map(Value::Function)
+            })
+            .transpose()?;
+        let setter = set
+            .map(|callback| {
+                build_host_fn(
+                    function_prototype,
+                    Some(JsString::from_utf8(&format!("set {key}"))),
+                    0,
+                    callback,
+                )
+                .map(Value::Function)
+            })
+            .transpose()?;
+        target.0.define_property_or_throw(
+            &JsString::from_utf8(key),
+            &PropertyDescriptor {
+                value: None,
+                writable: None,
+                get: getter,
+                set: setter,
+                enumerable: Some(true),
+                configurable: Some(true),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Create a host function and define it on the global object (the
+    /// [`Context::set_global`] attribute choice). The function is rooted before
+    /// this returns.
+    pub fn register_fn(
+        &mut self,
+        name: &str,
+        length: u32,
+        callback: HostFn,
+    ) -> Result<JsValue, JsError> {
+        let function = self.create_function(name, length, callback)?;
+        self.set_global(name, function.clone())?;
+        Ok(function)
     }
 
     /// Evaluate a Script in the global scope (spec 16.1.4-16.1.6) and drain
@@ -889,6 +1197,34 @@ impl Context {
     }
 }
 
+/// Build a non-constructible host function value over `callback` (the
+/// `[[Call]]` half of [`Context::create_function`] and the accessor callbacks
+/// of [`Context::define_accessor`]).
+fn build_host_fn(
+    prototype: Option<Handle<CruxObject>>,
+    name: Option<JsString>,
+    length: u64,
+    callback: HostFn,
+) -> Result<Handle<Function>, JsError> {
+    let call: NativeFn = Box::new(move |this, args| {
+        callback(&FunctionCall {
+            this,
+            args,
+            new_target: None,
+        })
+        .map(JsValue::into_value)
+    });
+    Function::create_builtin(name, length, call, None, prototype)
+}
+
+/// The `new.target`'s `.prototype` object, read at construct time so a
+/// reassignment of the constructor's `.prototype` is honoured.
+fn prototype_of(new_target: &Value) -> Option<Handle<CruxObject>> {
+    let function = new_target.as_function()?;
+    let value = function.get(&JsString::from_utf8("prototype")).ok()?;
+    crate::context::as_object(&value)
+}
+
 /// The agent recorded by the innermost `crux::function::with_agent` window,
 /// or a clear error when a host-global builtin runs outside one.
 fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
@@ -1399,6 +1735,7 @@ fn describe_value(value: &Value) -> String {
 }
 
 /// A host-facing handle over an ECMAScript language value.
+#[repr(transparent)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct JsValue(Value);
 
@@ -1512,6 +1849,14 @@ impl JsValue {
 
     pub fn into_value(self) -> Value {
         self.0
+    }
+
+    /// An error that throws this value verbatim (spec `throw`), for
+    /// `Err(value.thrown())` from a host function. Unlike
+    /// [`JsError::new`](crux::error::JsError::new) with an [`ErrorKind`], this
+    /// preserves non-`Error` values (strings, objects, ...).
+    pub fn thrown(&self) -> JsError {
+        JsError::new(ErrorKind::TypeError, self.0.to_string()).with_value(self.0)
     }
 }
 
@@ -1627,6 +1972,537 @@ mod tests {
         assert_eq!(eval("1 + 2").as_number(), Some(3.0));
         assert_eq!(eval("'a' + 'b'").as_string().as_deref(), Some("ab"));
         assert_eq!(eval("undefined").type_name(), "undefined");
+    }
+
+    #[test]
+    fn register_fn_installs_a_callable_global() {
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "sum",
+                2,
+                Box::new(|call| {
+                    let a = call
+                        .arg(0)
+                        .and_then(|value| value.as_number())
+                        .unwrap_or(0.0);
+                    let b = call
+                        .arg(1)
+                        .and_then(|value| value.as_number())
+                        .unwrap_or(0.0);
+                    Ok(JsValue::number(a + b))
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            context.eval("typeof sum").unwrap().as_string().as_deref(),
+            Some("function")
+        );
+        assert_eq!(
+            context.eval("sum.name").unwrap().as_string().as_deref(),
+            Some("sum")
+        );
+        assert_eq!(context.eval("sum.length").unwrap().as_number(), Some(2.0));
+        assert_eq!(context.eval("sum(20, 22)").unwrap().as_number(), Some(42.0));
+        // %Function.prototype% is wired ...
+        assert_eq!(
+            context
+                .eval("typeof sum.call")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("function")
+        );
+        assert_eq!(
+            context
+                .eval("sum.hasOwnProperty('length')")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        // ... and the function is not constructible.
+        assert_eq!(
+            context
+                .eval("(() => { try { new sum(1, 2); return 'no'; } catch (e) { return 'throws'; } })()")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("throws")
+        );
+    }
+
+    #[test]
+    fn host_function_receives_this_and_arguments() {
+        struct Observed {
+            this: String,
+            length: usize,
+            first: Option<String>,
+            args: usize,
+        }
+
+        let mut context = Context::new().unwrap();
+        let seen: Rc<RefCell<Vec<Observed>>> = Rc::new(RefCell::new(Vec::new()));
+        let captured = seen.clone();
+        context
+            .register_fn(
+                "record",
+                0,
+                Box::new(move |call| {
+                    captured.borrow_mut().push(Observed {
+                        this: call.this().type_name().to_string(),
+                        length: call.length(),
+                        first: call.arg(0).and_then(|value| value.as_string()),
+                        args: call.args().len(),
+                    });
+                    Ok(JsValue::undefined())
+                }),
+            )
+            .unwrap();
+        context
+            .eval("const holder = { m: record }; holder.m('a', 'b')")
+            .unwrap();
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].this, "object");
+        assert_eq!(seen[0].length, 2);
+        assert_eq!(seen[0].first.as_deref(), Some("a"));
+        assert_eq!(seen[0].args, 2);
+    }
+
+    #[test]
+    fn host_function_error_throws_a_real_error() {
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "fail",
+                0,
+                Box::new(|_| Err(JsError::new(ErrorKind::RangeError, "nope".into()))),
+            )
+            .unwrap();
+        assert_eq!(
+            context
+                .eval(
+                    "(() => { try { fail(); } catch (e) { return e.name + ':' + e.message; } })()"
+                )
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("RangeError:nope")
+        );
+    }
+
+    #[test]
+    fn host_function_throws_arbitrary_values() {
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "rethrow",
+                1,
+                Box::new(|call| Err(call.arg(0).unwrap_or_else(JsValue::undefined).thrown())),
+            )
+            .unwrap();
+        assert_eq!(
+            context
+                .eval("(() => { try { rethrow('boom'); } catch (e) { return e; } })()")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            context
+                .eval("(() => { const o = { code: 7 }; try { rethrow(o); } catch (e) { return e.code; } })()")
+                .unwrap()
+                .as_number(),
+            Some(7.0)
+        );
+    }
+
+    #[test]
+    fn create_object_builds_a_namespace() {
+        let mut context = Context::new().unwrap();
+        let host = context.create_object().unwrap();
+        let hypot = context
+            .create_function(
+                "hypot",
+                2,
+                Box::new(|call| {
+                    let a = call
+                        .arg(0)
+                        .and_then(|value| value.as_number())
+                        .unwrap_or(0.0);
+                    let b = call
+                        .arg(1)
+                        .and_then(|value| value.as_number())
+                        .unwrap_or(0.0);
+                    Ok(JsValue::number(a.hypot(b)))
+                }),
+            )
+            .unwrap();
+        host.set("hypot", hypot).unwrap();
+        context.set_global("host", host.as_value()).unwrap();
+        assert_eq!(
+            context.eval("host.hypot(3, 4)").unwrap().as_number(),
+            Some(5.0)
+        );
+        assert_eq!(
+            context
+                .eval("Object.getPrototypeOf(host) === Object.prototype")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn function_call_exposes_coercions_and_zero_copy_args() {
+        // The `args()` slice cast relies on the two types sharing a layout.
+        assert_eq!(std::mem::size_of::<JsValue>(), std::mem::size_of::<Value>());
+        assert_eq!(
+            std::mem::align_of::<JsValue>(),
+            std::mem::align_of::<Value>()
+        );
+
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "coerce",
+                2,
+                Box::new(|call| {
+                    assert_eq!(call.args().len(), call.length());
+                    assert_eq!(call.args()[0].as_number(), Some(1.0));
+                    let number = call.to_number(&JsValue::string("41"))?;
+                    let text = call.to_string(&JsValue::boolean(true))?;
+                    Ok(JsValue::string(format!("{number}:{text}")))
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            context.eval("coerce(1, 2)").unwrap().as_string().as_deref(),
+            Some("41:true")
+        );
+    }
+
+    #[test]
+    fn host_function_calls_a_js_callback() {
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "apply",
+                2,
+                Box::new(|call| {
+                    let function = call.arg(0).unwrap_or_else(JsValue::undefined);
+                    let value = call.arg(1).unwrap_or_else(JsValue::undefined);
+                    call.call(&function, &JsValue::undefined(), &[value])
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            context.eval("apply(x => x + 1, 41)").unwrap().as_number(),
+            Some(42.0)
+        );
+        // The receiver a host function passes is the callback's `this`.
+        assert_eq!(
+            context
+                .eval("apply(function () { return this.tag; }.bind({ tag: 'T' }), 0)")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("T")
+        );
+    }
+
+    #[test]
+    fn host_function_constructs_a_js_constructor() {
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "make",
+                1,
+                Box::new(|call| {
+                    let constructor = call.arg(0).unwrap_or_else(JsValue::undefined);
+                    call.construct(&constructor, &[])
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            context
+                .eval("make(function () { this.x = 7; }).x")
+                .unwrap()
+                .as_number(),
+            Some(7.0)
+        );
+    }
+
+    #[test]
+    fn js_throw_propagates_through_a_host_function() {
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "run",
+                1,
+                Box::new(|call| {
+                    let function = call.arg(0).unwrap_or_else(JsValue::undefined);
+                    call.call(&function, &JsValue::undefined(), &[])
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            context
+                .eval(
+                    "(() => { try { run(() => { throw new RangeError('inner'); }); } \
+                     catch (e) { return e.name + ':' + e.message; } })()"
+                )
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("RangeError:inner")
+        );
+    }
+
+    #[test]
+    fn host_function_reentrancy_and_eval_nest() {
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "bounce",
+                1,
+                Box::new(|call| {
+                    let value = call.arg(0).unwrap_or_else(JsValue::undefined);
+                    if value.is_number() {
+                        // Re-enter the engine: evaluate a JS callback and let it
+                        // call `bounce` again (nested host-function entry).
+                        let callback = call.eval("(x) => bounce(x)")?;
+                        return call.call(
+                            &callback,
+                            &JsValue::undefined(),
+                            &[JsValue::string("done")],
+                        );
+                    }
+                    Ok(value)
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            context.eval("bounce(1)").unwrap().as_string().as_deref(),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn create_constructor_builds_instances() {
+        let mut context = Context::new().unwrap();
+        let point = context
+            .create_constructor(
+                "Point",
+                2,
+                Box::new(|call| {
+                    let instance = call.this().as_object().ok_or_else(|| {
+                        JsError::new(ErrorKind::TypeError, "Point: requires new".into())
+                    })?;
+                    instance.set("x", call.arg(0).unwrap_or_else(JsValue::undefined))?;
+                    instance.set("y", call.arg(1).unwrap_or_else(JsValue::undefined))?;
+                    Ok(JsValue::undefined())
+                }),
+            )
+            .unwrap();
+        context.set_global("Point", point).unwrap();
+        assert_eq!(
+            context.eval("typeof Point").unwrap().as_string().as_deref(),
+            Some("function")
+        );
+        assert_eq!(
+            context.eval("(new Point(3, 4)).x").unwrap().as_number(),
+            Some(3.0)
+        );
+        assert_eq!(
+            context.eval("(new Point(3, 4)).y").unwrap().as_number(),
+            Some(4.0)
+        );
+        assert_eq!(
+            context
+                .eval("new Point(3, 4) instanceof Point")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context
+                .eval("Point.prototype.constructor === Point")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context
+                .eval("Object.getOwnPropertyDescriptor(Point, 'prototype').enumerable")
+                .unwrap()
+                .as_boolean(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn constructor_reports_construct_and_new_target() {
+        let mut context = Context::new().unwrap();
+        let seen: Rc<RefCell<Vec<(bool, &'static str)>>> = Rc::new(RefCell::new(Vec::new()));
+        let captured = seen.clone();
+        let constructor = context
+            .create_constructor(
+                "C",
+                0,
+                Box::new(move |call| {
+                    captured
+                        .borrow_mut()
+                        .push((call.is_construct(), call.new_target().type_name()));
+                    Ok(JsValue::undefined())
+                }),
+            )
+            .unwrap();
+        context.set_global("C", constructor).unwrap();
+        context.eval("new C()").unwrap();
+        context.eval("C()").unwrap();
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].0);
+        assert_eq!(seen[0].1, "function"); // new.target is the constructor
+        assert!(!seen[1].0);
+        assert_eq!(seen[1].1, "undefined"); // a plain call has no new.target
+    }
+
+    #[test]
+    fn constructor_callback_can_return_an_object() {
+        let mut context = Context::new().unwrap();
+        let constructor = context
+            .create_constructor(
+                "R",
+                0,
+                Box::new(|call| {
+                    if call.is_construct() {
+                        call.eval("({ replaced: true })")
+                    } else {
+                        Ok(JsValue::number(1.0))
+                    }
+                }),
+            )
+            .unwrap();
+        context.set_global("R", constructor).unwrap();
+        // An object result replaces the fresh instance.
+        assert_eq!(
+            context.eval("(new R()).replaced").unwrap().as_boolean(),
+            Some(true)
+        );
+        // The same closure serves the plain-call half.
+        assert_eq!(context.eval("R()").unwrap().as_number(), Some(1.0));
+    }
+
+    #[test]
+    fn constructor_honours_new_target() {
+        let mut context = Context::new().unwrap();
+        let base = context
+            .create_constructor("HostBase", 0, Box::new(|_| Ok(JsValue::undefined())))
+            .unwrap();
+        context.set_global("HostBase", base).unwrap();
+        assert_eq!(
+            context
+                .eval(
+                    "class Sub extends HostBase {}\n\
+                     Object.getPrototypeOf(new Sub()) === Sub.prototype"
+                )
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context
+                .eval("new Sub() instanceof HostBase")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn define_accessor_routes_to_host_callbacks() {
+        let mut context = Context::new().unwrap();
+        let object = context.create_object().unwrap();
+        let stored = Rc::new(std::cell::Cell::new(7.0_f64));
+        let get_stored = stored.clone();
+        let set_stored = stored.clone();
+        let receivers: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let get_receivers = receivers.clone();
+        let set_receivers = receivers.clone();
+        context
+            .define_accessor(
+                &object,
+                "x",
+                Some(Box::new(move |call| {
+                    get_receivers.borrow_mut().push(call.this().type_name());
+                    Ok(JsValue::number(get_stored.get()))
+                })),
+                Some(Box::new(move |call| {
+                    set_receivers.borrow_mut().push(call.this().type_name());
+                    set_stored.set(
+                        call.arg(0)
+                            .and_then(|value| value.as_number())
+                            .unwrap_or(0.0),
+                    );
+                    Ok(JsValue::undefined())
+                })),
+            )
+            .unwrap();
+        context.set_global("host", object.as_value()).unwrap();
+        assert_eq!(context.eval("host.x").unwrap().as_number(), Some(7.0));
+        context.eval("host.x = 9").unwrap();
+        assert_eq!(stored.get(), 9.0);
+        assert_eq!(context.eval("host.x").unwrap().as_number(), Some(9.0));
+        assert_eq!(
+            context
+                .eval("Object.keys(host).includes('x')")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        // Every access ran with the receiver as `this`.
+        let receivers = receivers.borrow();
+        assert_eq!(receivers.len(), 3);
+        assert!(receivers.iter().all(|name| *name == "object"));
+    }
+
+    #[test]
+    fn define_accessor_getter_only_ignores_writes() {
+        let mut context = Context::new().unwrap();
+        let object = context.create_object().unwrap();
+        context
+            .define_accessor(
+                &object,
+                "y",
+                Some(Box::new(|_| Ok(JsValue::number(5.0)))),
+                None,
+            )
+            .unwrap();
+        context.set_global("holder", object.as_value()).unwrap();
+        assert_eq!(context.eval("holder.y").unwrap().as_number(), Some(5.0));
+        assert_eq!(
+            context
+                .eval("typeof Object.getOwnPropertyDescriptor(holder, 'y').get")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("function")
+        );
+        // No setter: a sloppy-mode assignment is a silent no-op.
+        assert_eq!(
+            context.eval("holder.y = 1; holder.y").unwrap().as_number(),
+            Some(5.0)
+        );
+        assert_eq!(
+            context
+                .eval("Object.getOwnPropertyDescriptor(holder, 'y').set === undefined")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
     }
 
     #[test]

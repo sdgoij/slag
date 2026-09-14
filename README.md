@@ -130,7 +130,26 @@ println!("{doubled}"); // 42
 ```
 
 `HostCallbacks` routes `console` output and promise-rejection tracking;
-`install_process_argv` installs a Node-style `process.argv`. For declarative
+`install_process_argv` installs a Node-style `process.argv`. Native functions
+register from Rust with `Context::register_fn` (a global) or
+`Context::create_function` plus `Context::create_object` (a namespace object to
+hang them on); the callback receives a `FunctionCall` — `this`, the arguments,
+agent-backed coercions, and re-entrant `call`/`construct`/`eval` — and returns
+`Ok(JsValue)` or `Err(JsError)`, with `JsValue::thrown()` for throwing an
+arbitrary value. `Context::create_constructor` builds a host constructor instead
+(the fresh instance arrives as `this`, and `FunctionCall::{is_construct,
+new_target}` distinguish a `new` call), and `Context::define_accessor` defines a
+getter/setter pair backed by host closures:
+
+```rust
+context.register_fn("host_sum", 2, Box::new(|call| {
+    let a = call.arg(0).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let b = call.arg(1).and_then(|v| v.as_number()).unwrap_or(0.0);
+    Ok(JsValue::number(a + b))
+}))?;
+```
+
+For declarative
 UI, `Context::install_rlx` installs a small virtual-element layer — `rlx.h`
 trees driven frame-by-frame with `rlx.present`, retained per-path state via
 `rlx.useState`, and control events dispatched to `onClick`/`onChange` —

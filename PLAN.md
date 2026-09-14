@@ -2067,7 +2067,17 @@ Delivered:
   rejection tracking). Host globals (`console`, `setTimeout`/`setInterval`/
   `clearTimeout`/`clearInterval`, `process.argv`) are installed per-Context; `crux` gained a
   `current_agent()` accessor so host-global builtins reach the agent, and
-  `HostHooks::promise_rejection_tracker` now carries the rejection reason.
+  `HostHooks::promise_rejection_tracker` now carries the rejection reason. Native functions
+  register through `Context::register_fn` (a global) and `Context::create_function` +
+  `Context::create_object` (namespace objects): a `HostFn` callback receives a `FunctionCall`
+  (`this`, the arguments, and agent-backed coercions) and returns `Result<JsValue, JsError>`;
+  `JsValue::thrown()` throws an arbitrary value verbatim, and `ErrorKind` is re-exported so
+  hosts can build their own errors. A host function can re-enter the engine synchronously through
+  `FunctionCall::call`/`construct`/`eval` (a JS callback passed as an argument, a constructor, a
+  nested script), and `Context::create_constructor` builds a host constructor whose instances
+  inherit its MakeConstructor `.prototype` (honouring `new.target`; the callback distinguishes the
+  two halves through `FunctionCall::is_construct`/`new_target`), and
+  `Context::define_accessor` defines getter/setter properties backed by host closures.
 - **CLI polish** (`crates/cli`): `slag file.js [args]` with `process.argv`; multi-line REPL;
   `--dump-ast`/`--dump-tokens`; `--bench` micro-benchmarks; accepted no-op knobs
   (`--print-bytecode`, `--stack-size`, `--max-old-space`, `--harmony-*`).
