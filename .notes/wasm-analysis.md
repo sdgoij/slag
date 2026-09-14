@@ -155,8 +155,14 @@ Per-instruction costs that matter (all **(verified)**):
    (`exec.rs:6096`). **Fixed 2026-09-14:** `move_top_to` closes the gap in
    place with `copy_within` + `truncate`; only the outermost frame's results
    are still allocated, once per invocation.
-5. **`Value` is 32 bytes** because `V128(u128)` forces 16-byte alignment
-   (`values.rs:261-268`) — twice the necessary bandwidth for integer code.
+5. **`Value` is 24 bytes** (`values.rs:261-268`). It was 32: `V128(u128)` forced
+   16-byte alignment. **Fixed 2026-09-14:** `V128` is now `[u64; 2]` (the compiled
+   path's lo/hi word pair), 8-byte aligned. 16 needs the v128 payload ≤8 bytes —
+   an indirection, and both suggested mechanisms are unsound here: `Box<u128>`
+   breaks `Value: Copy` (relied on by the `seed_globals_into`/`ref_to_token`
+   matches), and a side v128 stack dangles because v128 values escape into
+   store-lifetime containers (global cells, struct/array cells, results). 24 is
+   the inline floor.
 6. **Call setup allocates**: a declared-locals `Vec<ValType>` clone, an args
    `Vec`, and a one-element `labels` `Vec` per call (`exec.rs:5938-5959`).
 7. **Memory access resolves the cell twice and re-checks twice**: `pop_mem_addr`
@@ -450,7 +456,7 @@ JS-API boundary, "D" = decode/validate.
 | 2 | I | Match a borrowed `&Instr` instead of cloning per step; drop the double clone (`4216`, `5647`, `4123`) | High | Med-High |
 | 3 | I | Remove the per-op `Vec<Value>` in `Instr::Num`; give `exec_num` scalar entry points (`4357-4366`) | High | Low |
 | 4 | I | Non-allocating `take_top`/`finish_top` via `copy_within` (`6113`, `6096`) | High | Low-Med |
-| 5 | I | Shrink `Value` 32→16 bytes (box `V128` or a side v128 stack) (`values.rs:266`) | High | Med-High |
+| 5 | I | Shrink `Value` 32→24 bytes: `V128` → `[u64;2]`, 8-byte aligned (`values.rs:266`) | Med | Low-Med |
 | 6 | C | Hoist/CSE bounds checks; cache descriptor loads, reloading after calls/grow (`compile.rs:1988-2031`, `1540`) | High | Medium |
 | 7 | C | Native direct calls between compiled bodies (or inline the leaf fast path), raising the depth-64 cap (`compile.rs:3127-3131`, `exec.rs:650-683`) | High | High |
 | 8 | J | Replace the full-memory memcpy bridge with zero-copy aliasing, syncing on grow/detach (`wasm.rs:1452-1502`, `3158/3174`) | High | High |
@@ -479,6 +485,21 @@ Item 14 landed 2026-09-14 as a lazy tier rather than a hotness threshold:
 first reach, reusing the null-entry fallback every call site already had. It is
 the instantiate half of the same "stop paying for work that is not executed"
 move; the probe is `fixtures/many-bodies.wast` (0.25 s → 0.054 s) — see §5.
+
+Item 5 landed 2026-09-14 as the 32→24 slice only: `V128(u128)` became
+`V128([u64; 2])` (the compiled path's lo/hi word pair), dropping the enum from
+32/align-16 to 24/align-8. The full 16-byte target needs the v128 payload ≤8
+bytes — an indirection — and both mechanisms the item proposed are unsound here:
+`Box<u128>` breaks `Value: Copy` (the `seed_globals_into`/`ref_to_token` sites
+match a `Value` out of a place), and a side v128 stack leaves a dangling index
+because v128 values escape into store-lifetime containers (`store.globals`,
+`Struct(Vec<Value>)`/`Array(Vec<Value>)` cells, and cross-frame results). 16 is
+only reachable by reintroducing per-value cost, so the inline floor is what
+landed. Interpreter probes moved ~9-13%: simd-loop 0.47→0.41 s,
+interp-hot-loop 0.37→0.33 s, mem-loop 0.87→0.79 s. A `size_of::<Value>()`
+assertion pins the layout (the 24-byte form hosts `Value`'s discriminant in
+`RefValue`'s spare padding, so a new `RefValue` variant would otherwise grow it
+silently).
 
 **Item 8 measured 2026-09-14, and it is the largest boundary cost by orders of
 magnitude.** `WebAssembly.Memory.prototype.buffer` is a *copy*: the JS-API keeps

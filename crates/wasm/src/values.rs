@@ -255,15 +255,16 @@ impl ExternInner {
     }
 }
 
-/// A runtime value. Floats are their IEEE bit patterns; v128 vectors are the
-/// 128-bit little-endian concatenation of their lanes.
+/// A runtime value. Floats are their IEEE bit patterns; a v128 is its
+/// 128-bit bit pattern held as little-endian low/high u64 words (so the
+/// value stays 8-byte aligned instead of the 16 `u128` would force).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
     I32(i32),
     I64(i64),
     F32(u32),
     F64(u64),
-    V128(u128),
+    V128([u64; 2]),
     Ref(RefValue),
 }
 
@@ -277,6 +278,17 @@ impl Value {
             _ => return None,
         })
     }
+
+    /// Build a v128 value from its 128-bit bit pattern (low 64 bits in the
+    /// first word).
+    pub const fn v128(bits: u128) -> Value {
+        Value::V128([bits as u64, (bits >> 64) as u64])
+    }
+}
+
+/// Reassemble a v128 word pair into its 128-bit bit pattern.
+pub const fn v128_to_u128(words: [u64; 2]) -> u128 {
+    (words[0] as u128) | ((words[1] as u128) << 64)
 }
 
 /// A runtime exception. Maps to `WebAssembly.RuntimeError` at the JS
@@ -1018,6 +1030,19 @@ mod tests {
 
     fn run(op: NumOp, operands: &[Value]) -> Result<Value, Trap> {
         exec_num(op, operands)
+    }
+
+    /// `Value` is stored in bulk — every operand stack, locals vector, argument
+    /// slice, global cell, and struct/array cell is a `Vec<Value>` — so its size
+    /// is a bandwidth invariant, not an implementation detail. The layout that
+    /// produces it is not obvious: `RefValue`'s spare padding is what currently
+    /// hosts `Value`'s discriminant, so a new `RefValue` variant can silently
+    /// grow `Value`. Pin it here so that shows up as a test failure.
+    #[test]
+    fn value_fits_its_size_budget() {
+        assert_eq!(std::mem::size_of::<Value>(), 24);
+        assert_eq!(std::mem::align_of::<Value>(), 8);
+        assert_eq!(std::mem::size_of::<RefValue>(), 24);
     }
 
     #[test]

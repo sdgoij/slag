@@ -27,7 +27,7 @@ use wasm::Value as WasmValue;
 use wasm::types::{FuncType, GlobalType, HeapType, Limits, MemType, RefType, TableType, ValType};
 use wasm::valid::Error as ValidError;
 use wasm::values::RefValue;
-use wasm::values::{ExternInner, FuncAddr};
+use wasm::values::{ExternInner, FuncAddr, v128_to_u128};
 use wasm::{
     DecodeError, ExecFail, ExternVal, InstantiateError, Module, Store, Trap, decode, validate,
 };
@@ -1173,7 +1173,7 @@ fn parse_arg(entry: &serde_json::Value, slot: Option<&ValType>) -> Option<WasmVa
 fn parse_const(entry: &serde_json::Value) -> Option<WasmValue> {
     let ty = entry.get("type").and_then(Value::as_str)?;
     if ty == "v128" {
-        return Some(WasmValue::V128(v128_lanes_to_bits(entry)?));
+        return Some(WasmValue::v128(v128_lanes_to_bits(entry)?));
     }
     let value = entry.get("value").and_then(Value::as_str)?;
     if value.starts_with("nan:") {
@@ -1278,7 +1278,7 @@ fn matches_expected(expected: &serde_json::Value, actual: WasmValue, module: usi
         let WasmValue::V128(bits) = actual else {
             return false;
         };
-        return matches_v128_lanes(expected, bits);
+        return matches_v128_lanes(expected, v128_to_u128(bits));
     }
     let value = expected.get("value").and_then(Value::as_str);
     let Some(value) = value else {

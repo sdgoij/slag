@@ -25,7 +25,7 @@ use crate::types::{
     BlockType, CompositeType, FieldType, FuncType, GlobalType, HeapType, Limits, MemType, RefType,
     StorageType, TableType, ValType,
 };
-use crate::values::{ExternInner, FuncAddr, RefValue, Trap, Value, exec_num};
+use crate::values::{ExternInner, FuncAddr, RefValue, Trap, Value, exec_num, v128_to_u128};
 
 /// How execution stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -840,7 +840,7 @@ pub unsafe extern "C" fn wasm_call_helper(
             ValType::V128 => {
                 let lo = unsafe { *scratch.add(word) };
                 let hi = unsafe { *scratch.add(word + 1) };
-                args.push(Value::V128(u128::from(lo) | (u128::from(hi) << 64)));
+                args.push(Value::V128([lo, hi]));
                 word += 2;
             }
             _ => {
@@ -874,10 +874,10 @@ pub unsafe extern "C" fn wasm_call_helper(
             let mut word = 0usize;
             for result in results.iter() {
                 match result {
-                    Value::V128(bits) => {
+                    Value::V128([lo, hi]) => {
                         unsafe {
-                            *scratch.add(word) = *bits as u64;
-                            *scratch.add(word + 1) = (*bits >> 64) as u64;
+                            *scratch.add(word) = *lo;
+                            *scratch.add(word + 1) = *hi;
                         }
                         word += 2;
                     }
@@ -1087,10 +1087,10 @@ fn exception_dispatch_op(
             for (arg, ty) in args.iter().zip(&params) {
                 match ty {
                     ValType::V128 => {
-                        let Value::V128(bits) = arg else { break };
+                        let Value::V128([lo, hi]) = arg else { break };
                         unsafe {
-                            *scratch.add(word) = *bits as u64;
-                            *scratch.add(word + 1) = (*bits >> 64) as u64;
+                            *scratch.add(word) = *lo;
+                            *scratch.add(word + 1) = *hi;
                         }
                         word += 2;
                     }
@@ -2634,7 +2634,7 @@ fn storage_slot_words(storage: StorageType) -> usize {
 fn storage_from_slot_words(storage: StorageType, scratch: *mut u64, word: usize) -> Option<Value> {
     if matches!(storage, StorageType::V128) {
         // SAFETY: the compiled caller spilled `word + 2` slots for the value.
-        Some(Value::V128(unsafe { scratch_read_v128(scratch, word) }))
+        Some(Value::v128(unsafe { scratch_read_v128(scratch, word) }))
     } else {
         // SAFETY: the compiled caller spilled the single word slot.
         let bits = unsafe { *scratch.add(word) };
@@ -2650,7 +2650,7 @@ fn write_value_slots(scratch: *mut u64, word: usize, value: Value) -> Option<()>
     match value {
         Value::V128(bits) => {
             // SAFETY: the caller reserves `word + 2` slots for the result.
-            unsafe { scratch_write_v128(scratch, word, bits) };
+            unsafe { scratch_write_v128(scratch, word, v128_to_u128(bits)) };
         }
         value => {
             let bits = value_to_call_slot(value)?;
@@ -2702,9 +2702,9 @@ fn seed_globals_into(store: &Store, cells: &[usize], out: &mut Vec<u64>) {
             Value::I64(bits) => out.push(bits as u64),
             Value::F32(bits) => out.push(u64::from(bits)),
             Value::F64(bits) => out.push(bits),
-            Value::V128(bits) => {
-                out.push(bits as u64);
-                out.push((bits >> 64) as u64);
+            Value::V128([lo, hi]) => {
+                out.push(lo);
+                out.push(hi);
             }
             _ => out.push(0),
         }
@@ -2739,10 +2739,10 @@ fn flush_globals(store: &mut Store, cells: &[usize], words: &[u64]) {
                 Value::F64(bits)
             }
             ValType::V128 => {
-                let lo = words[word] as u128;
-                let hi = words[word + 1] as u128;
+                let lo = words[word];
+                let hi = words[word + 1];
                 word += 2;
-                Value::V128(lo | (hi << 64))
+                Value::V128([lo, hi])
             }
             _ => {
                 // A compiled body never touches a non-carried global type;
@@ -2793,9 +2793,9 @@ fn global_op(store: &mut Store, instance: u64, mode: u64, x: u64, scratch: *mut 
         // call site the body can lower (two words for a v128).
         unsafe {
             match store.globals[cell] {
-                Value::V128(bits) => {
-                    *scratch = bits as u64;
-                    *scratch.add(1) = (bits >> 64) as u64;
+                Value::V128([lo, hi]) => {
+                    *scratch = lo;
+                    *scratch.add(1) = hi;
                 }
                 value => match value_to_call_slot(value) {
                     Some(slot) => *scratch = slot,
@@ -2814,9 +2814,9 @@ fn global_op(store: &mut Store, instance: u64, mode: u64, x: u64, scratch: *mut 
     let value = match value_ty {
         ValType::V128 => {
             // SAFETY: the compiled `global.set` spilled both words.
-            let lo = unsafe { *scratch } as u128;
-            let hi = unsafe { *scratch.add(1) } as u128;
-            Value::V128(lo | (hi << 64))
+            let lo = unsafe { *scratch };
+            let hi = unsafe { *scratch.add(1) };
+            Value::V128([lo, hi])
         }
         ValType::Ref(_) => {
             // SAFETY: the compiled `global.set` spilled the token.
@@ -4632,7 +4632,7 @@ impl<'a> Engine<'a> {
             }
             // ---- v128 (Cut 7) ----
             Instr::V128Const(bits) => {
-                self.stack.push(Value::V128(bits));
+                self.stack.push(Value::v128(bits));
                 Ok(Ctl::Next)
             }
             Instr::VecLoad {
@@ -4652,7 +4652,7 @@ impl<'a> Engine<'a> {
                 let start = ea as usize;
                 let bytes = &self.store.memories[cell].bytes[start..start + size as usize];
                 let value = load_vec(op, bytes).ok_or(ExecFail::Unsupported("simd load form"))?;
-                self.stack.push(Value::V128(value));
+                self.stack.push(Value::v128(value));
                 Ok(Ctl::Next)
             }
             Instr::VecStore { memory, offset, .. } => {
@@ -4672,7 +4672,7 @@ impl<'a> Engine<'a> {
                 }
                 let start = ea as usize;
                 self.store.memories[cell].bytes[start..start + 16]
-                    .copy_from_slice(&bits.to_le_bytes());
+                    .copy_from_slice(&v128_to_u128(bits).to_le_bytes());
                 Ok(Ctl::Next)
             }
             Instr::VecLaneLoad {
@@ -4703,7 +4703,7 @@ impl<'a> Engine<'a> {
                     bits |= u64::from(byte) << (8 * i);
                 }
                 let out = crate::simd::set_lane(vector, lane as usize, size as usize, bits);
-                self.stack.push(Value::V128(out));
+                self.stack.push(Value::v128(out));
                 Ok(Ctl::Next)
             }
             Instr::VecLaneStore {
@@ -4745,7 +4745,7 @@ impl<'a> Engine<'a> {
                     let byte = crate::simd::lane_bits(source, index, 1);
                     out = crate::simd::set_lane(out, i, 1, byte);
                 }
-                self.stack.push(Value::V128(out));
+                self.stack.push(Value::v128(out));
                 Ok(Ctl::Next)
             }
             Instr::Vec(sub) => self.simd_exec(sub, None),
@@ -5817,7 +5817,7 @@ impl<'a> Engine<'a> {
     /// Pop a v128 value (validated code only ever has one here).
     fn pop_v128(&mut self) -> Result<u128, ExecFail> {
         match self.pop()? {
-            Value::V128(value) => Ok(value),
+            Value::V128(value) => Ok(v128_to_u128(value)),
             _ => Err(ExecFail::Unsupported("expected v128 operand")),
         }
     }
@@ -5837,44 +5837,44 @@ impl<'a> Engine<'a> {
             let b = (arity >= 2).then(|| self.pop_v128()).transpose()?;
             let a = self.pop_v128()?;
             let out = crate::simd::exec_relaxed(sub, a, b, c).ok_or_else(unsupported)?;
-            self.stack.push(Value::V128(out));
+            self.stack.push(Value::v128(out));
             return Ok(Ctl::Next);
         }
         match crate::simd::sig(sub) {
             Some(VecSig::Not) => {
                 let v = self.pop_v128()?;
-                self.stack.push(Value::V128(crate::simd::exec_not(v)));
+                self.stack.push(Value::v128(crate::simd::exec_not(v)));
             }
             Some(VecSig::Unop) => {
                 let v = self.pop_v128()?;
                 let out = crate::simd::exec_unop(sub, v).ok_or_else(unsupported)?;
-                self.stack.push(Value::V128(out));
+                self.stack.push(Value::v128(out));
             }
             Some(VecSig::Binop) => {
                 let b = self.pop_v128()?;
                 let a = self.pop_v128()?;
                 let out = crate::simd::exec_binop(sub, a, b).ok_or_else(unsupported)?;
-                self.stack.push(Value::V128(out));
+                self.stack.push(Value::v128(out));
             }
             Some(VecSig::Ternop) => {
                 let c = self.pop_v128()?;
                 let b = self.pop_v128()?;
                 let a = self.pop_v128()?;
                 self.stack
-                    .push(Value::V128(crate::simd::exec_bitselect(a, b, c)));
+                    .push(Value::v128(crate::simd::exec_bitselect(a, b, c)));
             }
             Some(VecSig::Shift) => {
                 let count = self.pop_i32()? as u32;
                 let v = self.pop_v128()?;
                 let out = crate::simd::exec_shift(sub, v, count).ok_or_else(unsupported)?;
-                self.stack.push(Value::V128(out));
+                self.stack.push(Value::v128(out));
             }
             Some(VecSig::Splat(kind)) => {
                 let scalar = self.pop()?;
                 let bits =
                     crate::simd::scalar_to_lane_bits(scalar, kind).ok_or_else(unsupported)?;
                 let out = crate::simd::exec_splat(sub, bits).ok_or_else(unsupported)?;
-                self.stack.push(Value::V128(out));
+                self.stack.push(Value::v128(out));
             }
             Some(VecSig::ExtractS(kind) | VecSig::ExtractU(kind) | VecSig::Extract(kind)) => {
                 let v = self.pop_v128()?;
@@ -5890,7 +5890,7 @@ impl<'a> Engine<'a> {
                 let v = self.pop_v128()?;
                 let index = lane.ok_or_else(unsupported)? as usize;
                 let out = crate::simd::exec_replace(sub, v, index, bits).ok_or_else(unsupported)?;
-                self.stack.push(Value::V128(out));
+                self.stack.push(Value::v128(out));
             }
             Some(VecSig::Test) => {
                 let v = self.pop_v128()?;
@@ -6418,7 +6418,7 @@ fn default_value(ty: ValType) -> Result<Value, ExecFail> {
         ValType::I64 => Value::I64(0),
         ValType::F32 => Value::F32(0),
         ValType::F64 => Value::F64(0),
-        ValType::V128 => Value::V128(0),
+        ValType::V128 => Value::V128([0, 0]),
         // Non-defaultable (non-null) reference locals are validated as
         // initialized-before-use; the null placeholder below is never read by
         // a valid module.
@@ -6590,7 +6590,7 @@ fn write_mem(_op: StoreOp, value: Value, bytes: &mut [u8]) {
         Value::I64(v) => v as u64,
         Value::F32(bits) => bits as u64,
         Value::F64(bits) => bits,
-        Value::V128(bits) => bits as u64,
+        Value::V128([lo, _]) => lo,
         Value::Ref(_) => 0,
     };
     for (shift, byte) in bytes.iter_mut().enumerate() {
@@ -6667,7 +6667,7 @@ fn eval_const(
             Instr::I64Const(v) => stack.push(Value::I64(*v)),
             Instr::F32Const(bits) => stack.push(Value::F32(*bits)),
             Instr::F64Const(bits) => stack.push(Value::F64(*bits)),
-            Instr::V128Const(bits) => stack.push(Value::V128(*bits)),
+            Instr::V128Const(bits) => stack.push(Value::v128(*bits)),
             Instr::GlobalGet(index) => {
                 let value = *globals
                     .get(*index as usize)
@@ -6865,7 +6865,7 @@ fn default_storage(storage: StorageType) -> Result<Value, ExecFail> {
         StorageType::I64 => Value::I64(0),
         StorageType::F32 => Value::F32(0),
         StorageType::F64 => Value::F64(0),
-        StorageType::V128 => Value::V128(0),
+        StorageType::V128 => Value::V128([0, 0]),
         StorageType::Ref(reftype) if reftype.nullable => Value::Ref(RefValue::Null),
         StorageType::Ref(_) => {
             return Err(ExecFail::Unsupported("non-defaultable reference field"));
@@ -6946,7 +6946,7 @@ fn data_element(storage: StorageType, bytes: &[u8], at: usize) -> Option<Value> 
             for (i, &byte) in bytes.iter().enumerate() {
                 wide |= u128::from(byte) << (8 * i);
             }
-            Value::V128(wide)
+            Value::v128(wide)
         }
         StorageType::Ref(_) => return None,
     })

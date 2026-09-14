@@ -379,9 +379,9 @@ pub fn run_compiled(
     let mut input = Vec::with_capacity(args.len());
     for (value, param) in args.iter().zip(&ty.params) {
         match (param, value) {
-            (ValType::V128, Value::V128(bits)) => {
-                input.push(*bits as u64);
-                input.push((*bits >> 64) as u64);
+            (ValType::V128, Value::V128([lo, hi])) => {
+                input.push(*lo);
+                input.push(*hi);
             }
             (ValType::I32, Value::I32(bits)) => input.push(*bits as u32 as u64),
             (ValType::I64, Value::I64(bits)) => input.push(*bits as u64),
@@ -419,9 +419,9 @@ pub fn run_compiled(
     for result in &ty.results {
         let value = match result {
             ValType::V128 => {
-                let lo = output[word] as u128;
-                let hi = output[word + 1] as u128;
-                Value::V128(lo | (hi << 64))
+                let lo = output[word];
+                let hi = output[word + 1];
+                Value::V128([lo, hi])
             }
             ValType::I32 => Value::I32(output[word] as u32 as i32),
             ValType::I64 => Value::I64(output[word] as i64),
@@ -8195,20 +8195,20 @@ mod tests {
                     value: ValType::V128,
                     mutable: true,
                 },
-                Value::V128(0),
+                Value::v128(0),
             );
             vec![ExternVal::Global(cell), ExternVal::Global(cell)]
         };
         let patterns = [0u128, 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210, u128::MAX];
         let mut sequence = Vec::new();
         for pattern in patterns {
-            sequence.push((0, vec![Value::V128(pattern)]));
+            sequence.push((0, vec![Value::v128(pattern)]));
             sequence.push((1, vec![]));
         }
         let outcomes = run_imported_seq(&make_imports, &module, &sequence);
         for (k, pattern) in patterns.iter().enumerate() {
             assert_eq!(outcomes[2 * k], Ok(vec![]));
-            assert_eq!(outcomes[2 * k + 1], Ok(vec![Value::V128(*pattern)]));
+            assert_eq!(outcomes[2 * k + 1], Ok(vec![Value::v128(*pattern)]));
         }
     }
 
@@ -11001,18 +11001,18 @@ mod tests {
         assert!(
             matches!(&outcomes[1], Ok(v) if matches!(v.as_slice(), [Value::Ref(RefValue::Struct(_))]))
         );
-        assert_eq!(outcomes[2], Ok(vec![Value::V128(0)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::v128(0)]));
         assert_eq!(
             outcomes[3],
-            Ok(vec![Value::V128(0xdead_beef_cafe_f00d_0123_4567_89ab_cdef)])
+            Ok(vec![Value::v128(0xdead_beef_cafe_f00d_0123_4567_89ab_cdef)])
         );
         assert_eq!(
             outcomes[4],
-            Ok(vec![Value::V128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff)])
+            Ok(vec![Value::v128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff)])
         );
         assert_eq!(
             outcomes[5],
-            Ok(vec![Value::V128(0x8000_0000_0000_0000_0000_0000_0000_0001)])
+            Ok(vec![Value::v128(0x8000_0000_0000_0000_0000_0000_0000_0001)])
         );
         assert_eq!(outcomes[6], Ok(vec![Value::I32(0)]));
         assert_eq!(outcomes[7], Ok(vec![Value::I32(12345)]));
@@ -11194,7 +11194,7 @@ mod tests {
         assert_eq!(outcomes[1], Ok(vec![Value::I32(5)]));
         assert_eq!(
             outcomes[2],
-            Ok(vec![Value::V128(0x1234_5678_9abc_def0_0fed_cba9_8765_4321)])
+            Ok(vec![Value::v128(0x1234_5678_9abc_def0_0fed_cba9_8765_4321)])
         );
         assert!(matches!(
             outcomes[3],
@@ -11202,16 +11202,16 @@ mod tests {
         ));
         assert_eq!(
             outcomes[4],
-            Ok(vec![Value::V128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb)])
+            Ok(vec![Value::v128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb)])
         );
         assert_eq!(
             outcomes[5],
-            Ok(vec![Value::V128(0x5555_5555_5555_5555_5555_5555_5555_5555)])
+            Ok(vec![Value::v128(0x5555_5555_5555_5555_5555_5555_5555_5555)])
         );
-        assert_eq!(outcomes[6], Ok(vec![Value::V128(0)]));
+        assert_eq!(outcomes[6], Ok(vec![Value::v128(0)]));
         assert_eq!(
             outcomes[7],
-            Ok(vec![Value::V128(0x2222_2222_2222_2222_2222_2222_2222_2222)])
+            Ok(vec![Value::v128(0x2222_2222_2222_2222_2222_2222_2222_2222)])
         );
     }
 
@@ -11933,14 +11933,14 @@ mod tests {
         );
         let a = 0x0001_0002_0003_0004_0005_0006_0007_0008u128;
         let b = 0x0100_0200_0300_0400_0500_0600_0700_0800u128;
-        assert_equiv(&module, 0, &[vec![Value::V128(a), Value::V128(b)]]);
+        assert_equiv(&module, 0, &[vec![Value::v128(a), Value::v128(b)]]);
         assert_equiv(&module, 1, &[vec![]]);
-        assert_equiv(&module, 2, &[vec![Value::V128(a)]]);
+        assert_equiv(&module, 2, &[vec![Value::v128(a)]]);
         assert_equiv(&module, 3, &[vec![Value::I32(-7)]]);
-        assert_equiv(&module, 4, &[vec![Value::V128(0)], vec![Value::V128(a)]]);
-        assert_equiv(&module, 5, &[vec![Value::V128(a), Value::V128(b)]]);
-        assert_equiv(&module, 6, &[vec![Value::V128(a)]]);
-        assert_equiv(&module, 7, &[vec![Value::V128(a), Value::V128(b)]]);
+        assert_equiv(&module, 4, &[vec![Value::v128(0)], vec![Value::v128(a)]]);
+        assert_equiv(&module, 5, &[vec![Value::v128(a), Value::v128(b)]]);
+        assert_equiv(&module, 6, &[vec![Value::v128(a)]]);
+        assert_equiv(&module, 7, &[vec![Value::v128(a), Value::v128(b)]]);
     }
 
     #[test]
@@ -12069,46 +12069,46 @@ mod tests {
         let outcomes = run_seq(
             &module,
             &[
-                (0, vec![Value::I32(0), Value::V128(x)]),
+                (0, vec![Value::I32(0), Value::v128(x)]),
                 (1, vec![Value::I32(0)]),
-                (0, vec![Value::I32(16), Value::V128(y)]),
+                (0, vec![Value::I32(16), Value::v128(y)]),
                 (1, vec![Value::I32(16)]),
                 // Sign-extend the first 8 bytes of x into i16 lanes.
                 (5, vec![Value::I32(0)]),
                 // Load byte 0 of x into lane 0 of zz.
-                (2, vec![Value::I32(0), Value::V128(zz)]),
+                (2, vec![Value::I32(0), Value::v128(zz)]),
                 // Store zz at 8, then write zz's lane-2 i32 (bytes 8-12).
-                (0, vec![Value::I32(8), Value::V128(zz)]),
-                (3, vec![Value::I32(8), Value::V128(zz)]),
+                (0, vec![Value::I32(8), Value::v128(zz)]),
+                (3, vec![Value::I32(8), Value::v128(zz)]),
                 (1, vec![Value::I32(8)]),
-                (4, vec![Value::V128(x), Value::V128(y)]),
+                (4, vec![Value::v128(x), Value::v128(y)]),
             ],
         );
         // Round trips.
-        assert_eq!(outcomes[1], Ok(vec![Value::V128(x)]));
-        assert_eq!(outcomes[3], Ok(vec![Value::V128(y)]));
+        assert_eq!(outcomes[1], Ok(vec![Value::v128(x)]));
+        assert_eq!(outcomes[3], Ok(vec![Value::v128(y)]));
         // load8x8_s of bytes 0..8 of x.
         let mut ext = 0u128;
         for i in 0..8 {
             let b = byte(x, i) as u8;
             ext = set_lane(ext, i, 2, (b as i8 as i16 as u16) as u64);
         }
-        assert_eq!(outcomes[4], Ok(vec![Value::V128(ext)]));
+        assert_eq!(outcomes[4], Ok(vec![Value::v128(ext)]));
         // load8_lane: zz with byte 0 replaced by byte 0 of x.
         assert_eq!(
             outcomes[5],
-            Ok(vec![Value::V128(set_lane(zz, 0, 1, byte(x, 0)))])
+            Ok(vec![Value::v128(set_lane(zz, 0, 1, byte(x, 0)))])
         );
         // The lane store overwrote zz's bytes 8..12 with zz's own bytes 8..12
         // (all 0xab), so the read-back is still zz.
-        assert_eq!(outcomes[8], Ok(vec![Value::V128(zz)]));
+        assert_eq!(outcomes[8], Ok(vec![Value::v128(zz)]));
         // Shuffle interleaves a's bytes 0..8 with b's bytes 0..8.
         let mut shuffled = 0u128;
         for k in 0..16u128 {
             let (source, i) = if k % 2 == 0 { (x, k / 2) } else { (y, k / 2) };
             shuffled |= u128::from(byte(source, i as usize)) << (8 * k);
         }
-        assert_eq!(outcomes[9], Ok(vec![Value::V128(shuffled)]));
+        assert_eq!(outcomes[9], Ok(vec![Value::v128(shuffled)]));
     }
 
     #[test]
@@ -12184,11 +12184,11 @@ mod tests {
         let a = 0x0001_0002_0003_0004_0005_0006_0007_0008u128;
         let b = 0x0100_0200_0300_0400_0500_0600_0700_0800u128;
         assert_equiv(&module, 0, &[vec![Value::I32(7)]]);
-        assert_equiv(&module, 1, &[vec![Value::V128(a)]]);
-        assert_equiv(&module, 2, &[vec![Value::V128(a)]]);
-        assert_equiv(&module, 3, &[vec![Value::V128(a), Value::V128(b)]]);
-        assert_equiv(&module, 4, &[vec![Value::V128(b)]]);
-        assert_equiv(&module, 5, &[vec![Value::V128(a)]]);
+        assert_equiv(&module, 1, &[vec![Value::v128(a)]]);
+        assert_equiv(&module, 2, &[vec![Value::v128(a)]]);
+        assert_equiv(&module, 3, &[vec![Value::v128(a), Value::v128(b)]]);
+        assert_equiv(&module, 4, &[vec![Value::v128(b)]]);
+        assert_equiv(&module, 5, &[vec![Value::v128(a)]]);
         assert_equiv(&module, 6, &[vec![Value::I32(-5)]]);
     }
 
@@ -12246,21 +12246,21 @@ mod tests {
             &module,
             &[
                 (1, vec![]),
-                (0, vec![Value::V128(x)]),
+                (0, vec![Value::v128(x)]),
                 (1, vec![]),
                 (2, vec![]),
-                (0, vec![Value::V128(y)]),
+                (0, vec![Value::v128(y)]),
                 (1, vec![]),
             ],
         );
-        assert_eq!(outcomes[0], Ok(vec![Value::V128(initial)]));
+        assert_eq!(outcomes[0], Ok(vec![Value::v128(initial)]));
         assert_eq!(outcomes[1], Ok(vec![]));
-        assert_eq!(outcomes[2], Ok(vec![Value::V128(x)]));
+        assert_eq!(outcomes[2], Ok(vec![Value::v128(x)]));
         // Lane 0 of x is its low 32 bits: the 0x0007 16-bit group's high
         // half, i.e. 0x00070008.
         assert_eq!(outcomes[3], Ok(vec![Value::I32(0x0007_0008)]));
         assert_eq!(outcomes[4], Ok(vec![]));
-        assert_eq!(outcomes[5], Ok(vec![Value::V128(y)]));
+        assert_eq!(outcomes[5], Ok(vec![Value::v128(y)]));
     }
 
     #[test]
