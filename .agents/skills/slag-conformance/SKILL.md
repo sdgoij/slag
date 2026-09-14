@@ -126,6 +126,10 @@ with a stale pointer in the strict-unmapped `arguments` path); documented in
 
 ## Relationship to the other skills
 
+- `slag-wasm` — the WebAssembly engine and its sweeps (`wasmtest run` /
+  `wasmtest jsapi`): the load-bearing `Unsupported`/`Malformed` verdict
+  contract, the suite-splitting rule, and the shared-memory buffer sealing
+  scope. Load it for anything under `crates/wasm` or the wasm JS-API.
 - `slag-modules` — the module machinery: DFS evaluation waves, dynamic
   import, import-defer trigger matrix, cycle roots, module harness. Load it
   for anything `flags: [module]`.

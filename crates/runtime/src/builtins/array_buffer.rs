@@ -1874,7 +1874,10 @@ mod tests {
     fn shared_array_buffers_are_extensible() {
         // SharedArrayBuffer instances are ordinary extensible objects (the
         // pinned test262 corpus's SAB species fixtures assign `constructor`
-        // in strict mode and must not throw).
+        // in strict mode and must not throw). The one exception is the
+        // WebAssembly.Memory shared-memory path, which seals its buffer in
+        // `builtins/wasm.rs::shared_memory_buffer`; moving that seal in here
+        // breaks these fixtures.
         assert!(!bool("Object.isFrozen(new SharedArrayBuffer(4))"));
         assert!(bool("Object.isExtensible(new SharedArrayBuffer(4))"));
         assert!(!bool("Object.isFrozen(new ArrayBuffer(4))"));

@@ -7,16 +7,21 @@ Scope: `crates/wasm` (decode, validate, execute, compile), the JS-API layer
 Method: four deep read-only passes (interpreter, Cranelift backend,
 decoder/validator, JS-API + harness), then spot verification of the
 highest-impact claims. Every claim carries `file:line`; the ones marked
-**(verified)** were re-read directly while writing this. No sweeps were run —
-see the caveat in §3.
+**(verified)** were re-read directly while writing this. No sweeps were run
+while writing this; §3 now records the 2026-09-14 sweeps.
 
 Fix status (2026-09-14): §6.2.1-6.2.3 are landed in
-`crates/wasm/src/binary.rs` with four regression tests. The second half of
-§6.2.3 ("missing features reported as malformed") was deliberately left
-unchanged, and §6.2.4 remains open. Still no sweep — the evidence for the
-change is `cargo test -p wasm` (40 pass) plus
-`wasmtest check docs/slag.wasm` (ok), not conformance counts. The `file:line`
-anchors in §6.2 are pre-fix and drift by the ~86 lines this change added.
+`crates/wasm/src/binary.rs` (commit `d7ee662`) with four regression tests. The
+second half of §6.2.3 ("missing features reported as malformed") was
+deliberately left unchanged, and §6.2.4 remains open. The §3 sweeps pass with
+0 fail and 0 pendings, and the core total matches the documented 64,594 to the
+test — so **the corpus does not exercise any of the three fixes**. They are
+hardening changes (a reserved encoding or an oversized body can no longer be
+misclassified as pending, and an untrusted field count can no longer
+allocate), not a pass-count improvement: the pending tally was already 0
+before them. The `file:line` anchors in §6.2 are pre-fix and drift by the ~86
+lines that change added. Separately, §3's JS-API failure — a real gap, not a
+§6.2 item — is fixed in `builtins/wasm.rs::shared_memory_buffer`.
 
 ## 1. Where it stands
 
@@ -27,7 +32,7 @@ anchors in §6.2 are pre-fix and drift by the ~86 lines this change added.
 | Cranelift backend ("Cut 11") | Written, equivalence-gated per the plan, **default-off and not shipped** (§5) |
 | JS-API layer | Complete except `WebAssembly.Function` and the streaming helpers (§3, §6) |
 | Threads / atomics | **Not implemented at all** (§6.1) |
-| Conformance | Documented 64,594 core / 0 fail and 1,001 JS-API / 0 fail; not reproducible in this checkout (§3) |
+| Conformance | **Reproduced 2026-09-14:** 64,594 core / 0 fail / 0 pending; JS-API 1,001 / 0 (§3) |
 
 ## 2. Architecture
 
@@ -74,12 +79,50 @@ Not implemented (whole features):
 - **`compileStreaming` / `instantiateStreaming`** — deliberately not installed
   (`.notes/wasm-plan.md:820-822`).
 
-**Conformance caveat.** The documented totals (core 64,594 / 0; JS-API
-1,001 / 0; 0 pendings) come from `README.md:230-253` and
-`.notes/wasm-plan.md`. The `waspec` submodule is **uninitialised in this
-checkout** (`git submodule status` → `-37d6b0…`, empty directory), so no
-fixture exists on disk and none of those numbers is reproducible here
-**(verified)**. Treat them as documentation until the submodule is initialised.
+**Conformance, reproduced 2026-09-14.** With the submodule initialised
+(`waspec` @ `37d6b0591`) both sweeps reproduce every per-suite figure in
+`README.md:237-245`, and 0 pendings holds:
+
+| Suite | Pass / fail / pending |
+|---|---|
+| baseline `core/*.wast` | 20,662 / 0 / 0 (3 skipped) |
+| proposals (simd, relaxed-simd, bulk-memory, exceptions, gc, memory64, multi-memory) | 43,932 / 0 / 0 (1 skipped) |
+| **core total** | **64,594 / 0 / 0** |
+| JS-API (`wasmtest jsapi`) | 1,001 / 0 / — (16 skipped) |
+
+The core total matches the documented figure to the test, so the earlier
+"not reproducible here" caveat was purely the uninitialised submodule. The four
+skips are the `wasm-exclusions.txt` taxonomy entries (three baseline harness /
+module-linking / lexer files, plus `gc/type-subtyping.wast`); the one runner
+wart that remains is that duplicate `.wast` basenames share a cache key, so a
+combined `core` + `multi-memory` invocation refuses to run (`memory_grow.wast`
+exists in both) and the suites must be swept separately.
+
+The JS-API row first measured 1,000 pass / **1 fail**: `memory/grow.any.js`
+failed `Growing shared memory does not detach old buffer` on
+`assert_equals(Object.isFrozen(actual), shared)`
+(`js-api/memory/assertions.js:26`). That was a real gap, now fixed. The cause
+was scope, not a missing rule: `array_buffer::shared_array_buffer_from_block`
+never sealed its result, and `builtins/wasm.rs`'s own test even pinned the wrong
+behaviour (`if (Object.isFrozen(sab) || !Object.isExtensible(sab)) return false`
+— contradicting the comment directly above it). The wasm JS-API path now seals
+its buffer in `shared_memory_buffer`, while `new SharedArrayBuffer(...)` and the
+worker path stay extensible, which is exactly what V8 does:
+
+```
+node probes (v24.12.0):
+new SharedArrayBuffer(8)                        -> frozen false, extensible true
+new WebAssembly.Memory({shared:true}).buffer    -> frozen true,  extensible false
+new WebAssembly.Memory({}).buffer               -> frozen false, extensible true
+```
+
+Sealing globally would also have broken the pinned test262 SAB species fixtures
+(`test/built-ins/SharedArrayBuffer/prototype/slice/species-*.js` assign
+`constructor` on an instance), which is presumably why an earlier attempt was
+backed out — so the seal is scoped to the wasm path and pinned by
+`wasm::tests::shared_memory_buffers_are_sealed_but_plain_sabs_are_not`. Re-verified
+for the fix: JS-API 1,001 / 0, `built-ins` SAB 104/104, ArrayBuffer 221/221,
+Atomics 389/389, `cargo test -p runtime --lib` 759 pass, workspace clippy clean.
 
 ## 4. The interpreter (`exec.rs`)
 
@@ -196,6 +239,9 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
    threads proposal, `Limits::shared` is never populated, and `0xfe` is already
    `Malformed` for the same stated reason, so the atomics prefix and the
    shared-memory flag stay `Malformed`. Revisit only if a threads cut lands.
+   The corpus does not exercise the flipped arms — the core total is 64,594 / 0
+   with 0 pendings, unchanged (§3) — so this is hardening against inputs the
+   corpus lacks, not a counted fix.
 4. **The validator's `Unsupported` path is dead.** `valid::Error::Unsupported`
    (`valid.rs:28-31`) is never constructed, so any validator gap surfaces as a
    *failure* rather than *pending* — the honesty mechanism the crate documents

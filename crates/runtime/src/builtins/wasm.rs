@@ -1113,6 +1113,31 @@ fn memory_is_shared(agent: &Agent, cell: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// A shared memory's linear-memory buffer: a SharedArrayBuffer over the cell's
+/// byte block, sealed so `Object.isFrozen` is true and the buffer is not
+/// extensible (the JS-API shared-buffer rule; V8 reports the same for this
+/// path). The seal lives here rather than in
+/// `array_buffer::shared_array_buffer_from_block` because an ordinary
+/// `new SharedArrayBuffer(...)` — and the worker path that wraps a block for a
+/// spawned agent — must stay extensible: the pinned test262 corpus's SAB
+/// species fixtures assign `constructor` on the instance.
+fn shared_memory_buffer(
+    agent: &mut Agent,
+    block: SharedBuffer,
+    byte_length: usize,
+) -> Result<Value, JsError> {
+    let buffer = array_buffer::shared_array_buffer_from_block(agent, block, byte_length)?;
+    if let ValueKind::Object(object) = buffer.kind()
+        && !object.prevent_extensions()?
+    {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "shared memory buffer cannot be sealed".into(),
+        ));
+    }
+    Ok(buffer)
+}
+
 /// Materialize the current buffer of a memory cell: a fresh ArrayBuffer the
 /// cell's bytes are copied into, registered as the cell's live buffer so
 /// `buffer` keeps object identity until the memory grows. A shared memory's
@@ -1135,7 +1160,7 @@ fn materialize_memory_buffer(agent: &mut Agent, cell: usize) -> Result<Value, Js
             .max(bytes.len());
         let block = SharedBuffer::new_with_capacity(bytes.len(), capacity);
         block.write(0, &bytes)?;
-        array_buffer::shared_array_buffer_from_block(agent, block, bytes.len())?
+        shared_memory_buffer(agent, block, bytes.len())?
     } else {
         array_buffer_of(agent, &bytes)?
     };
@@ -1412,7 +1437,7 @@ fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                 state.borrow().shared.clone()
             };
             block.resize(new_len)?;
-            let fresh = array_buffer::shared_array_buffer_from_block(agent, block, new_len)?;
+            let fresh = shared_memory_buffer(agent, block, new_len)?;
             agent.wasm_memory_buffers.insert(cell, fresh);
         } else {
             agent.wasm_memory_buffers.remove(&cell);
@@ -1512,7 +1537,7 @@ fn memory_buffers_from_store(agent: &mut Agent) -> Result<(), JsError> {
                 .shared
                 .clone();
             block.resize(byte_len)?;
-            let fresh = array_buffer::shared_array_buffer_from_block(agent, block, byte_len)?;
+            let fresh = shared_memory_buffer(agent, block, byte_len)?;
             agent.wasm_memory_buffers.insert(cell, fresh);
         } else {
             array_buffer::detach_array_buffer(agent, id);
@@ -3570,7 +3595,7 @@ mod tests {
                 "(function(){ const m = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true });",
                 " const sab = m.buffer;",
                 " if (Object.prototype.toString.call(sab) !== '[object SharedArrayBuffer]') return false;",
-                " if (Object.isFrozen(sab) || !Object.isExtensible(sab)) return false;",
+                " if (!Object.isFrozen(sab) || Object.isExtensible(sab)) return false;",
                 " if (m.grow(1) !== 1) return false;",
                 " const cur = m.buffer;",
                 " if (sab === cur || sab.byteLength !== 65536 || cur.byteLength !== 131072) return false;",
@@ -3615,6 +3640,36 @@ mod tests {
                 " Object.getOwnPropertyDescriptor(WebAssembly.Memory.prototype, 'buffer').get.call({});",
                 " return false; } catch (e) { return e instanceof TypeError; } })()"
             ),
+        );
+    }
+
+    #[test]
+    fn shared_memory_buffers_are_sealed_but_plain_sabs_are_not() {
+        // The shared-memory buffer is sealed so `Object.isFrozen` holds and it
+        // is not extensible, both at first materialization and after a grow
+        // (V8 reports the same for `WebAssembly.Memory({shared:true}).buffer`).
+        let mut context = Context::new().unwrap();
+        eval_true(
+            &mut context,
+            concat!(
+                "(function(){ const m = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true });",
+                " const first = m.buffer;",
+                " if (!Object.isFrozen(first) || Object.isExtensible(first)) return false;",
+                " if (m.grow(1) !== 1) return false;",
+                " const grown = m.buffer;",
+                " return grown !== first && Object.isFrozen(grown) && !Object.isExtensible(grown); })()"
+            ),
+        );
+        // An ordinary SharedArrayBuffer and an unshared memory buffer stay
+        // extensible: the seal belongs to the wasm shared path only, because
+        // the test262 SAB species fixtures assign `constructor` on an instance.
+        eval_true(
+            &mut context,
+            "Object.isExtensible(new SharedArrayBuffer(4))",
+        );
+        eval_true(
+            &mut context,
+            "Object.isExtensible(new WebAssembly.Memory({ initial: 1, maximum: 2 }).buffer)",
         );
     }
 
