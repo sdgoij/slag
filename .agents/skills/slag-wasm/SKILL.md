@@ -15,12 +15,15 @@ layer, and the wasm conformance runner. State and design live in
 - The corpus is the pinned `waspec` submodule. Initialise it first
   (`git submodule update --init waspec`); with it empty, every documented
   number looks irreproducible and no fixture exists on disk.
-- Sweep the suites **separately**: `wasmtest run waspec/test/core/*.wast`,
-  then each proposal directory (`simd`, `relaxed-simd`, `bulk-memory`,
-  `exceptions`, `gc`, `memory64`, `multi-memory`). One invocation spanning
-  `core/` and `multi-memory/` refuses to run: `memory_grow.wast` exists in
-  both and they share the runner's cache key.
-- `wasmtest` takes paths only — `--timeout` is not one of its flags.
+- Sweep the suites **separately** and with `--strict`:
+  `wasmtest run --strict waspec/test/core/*.wast`, then each proposal
+  directory (`simd`, `relaxed-simd`, `bulk-memory`, `exceptions`, `gc`,
+  `memory64`, `multi-memory`). One invocation spanning `core/` and
+  `multi-memory/` refuses to run: `memory_grow.wast` exists in both and they
+  share the runner's cache key. `--strict` is what makes the "0 pendings"
+  claim a gate; without it a pending exits 0 and is invisible.
+- `wasmtest` takes paths, `--compiled`, and `--strict` — there is no
+  `--timeout` flag.
 - The per-suite totals must match `README.md`'s table (core **64,594 / 0**,
   JS-API **1,001 / 0**); a mismatch means a stale binary or a real
   regression, not a rounding difference.
@@ -160,11 +163,12 @@ not an eligible direct-call target:
   can still fail a suite with "module invalid"). Use it over `docs/slag.wasm`
   as a cheap decode gate on the real 7 MB compiler output.
 - `cargo test -p wasmtest` — runs `tests/decoder_classification.rs` over
-  `fixtures/decoder-classification.wast`. This is the *only* place the
-  "0 pendings" claim is enforced: the runner exits 0 on a pending, so a
-  regression that parks a reserved encoding as `Unsupported` is invisible to
-  the sweep and visible only here. Adding a fixture case means bumping the
-  pinned pass count in that test.
+  `fixtures/decoder-classification.wast`, the only place the decoder's
+  malformed/unsupported boundary is pinned (adding a fixture case means bumping
+  the pinned pass count in that test). The corpus's own "0 pendings" claim is
+  gated separately: `wasmtest run --strict` exits non-zero on a pending, too,
+  and the documented sweeps pass it. Without `--strict` a regression that parks
+  a reserved encoding as `Unsupported` is invisible to the sweep.
 - `cargo run -q -p wasmtest -- run …` and `-- jsapi waspec/test/js-api`.
   `WASM_JSAPI_VERBOSE=1` prints the failing-test messages.
 - When a hand-written `.wast`/`.wat` (a probe, a fixture) is reported

@@ -307,10 +307,13 @@ compiled path as the native default (§3).
   level because it cannot express "native only" on its own (confirmed:
   `cargo tree -p slag --target wasm32-unknown-unknown -e features` shows no
   cranelift) **(verified)**.
-- **Doc drift:** the module doc says tables are 32-bit and "GC objects are not
-  lowered yet" (`compile.rs:46`, `50-51`), but table64 and GC struct/array
-  lowering both landed; `body_compile_reason` still names a `try_table` gate
-  that `lowerable` no longer has (`compile.rs:418-419` vs `1085-1091`).
+- **Doc drift (fixed 2026-09-14):** the module doc claimed "GC objects are not
+  lowered yet" and 32-bit-only tables, and `body_compile_reason` named a
+  `try_table` gate that `lowerable` no longer has. All three are corrected: the
+  header now covers the GC aggregates and exception handling, says table
+  addressing may be 32- or 64-bit, and no longer calls the subset "leaf
+  functions" (calls lower); the gate list names only the structural gate, a
+  non-carried parameter/result/local type.
 
 ## 6. Gaps
 
@@ -377,15 +380,18 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
 
 ### 6.3 Operational and harness honesty
 
-- `wasmtest run` exits non-zero only on `fail`; `pending` never fails a sweep,
-  so "0 pendings" is enforced by documentation, not by the gate
-  (`wasmtest/src/main.rs:258-266`). `equiv` (the compile-vs-interpreter
-  equivalence gate) and the coverage report require `--features compile` and
-  are not part of the default sweep (`wasmtest/src/main.rs:303-333`).
-  (2026-09-14: the decoder's malformed/unsupported boundary is now gated by
+- `wasmtest run` exits non-zero on `fail`, and on `pending` once `--strict` is
+  passed — which is what the documented sweeps pass, so "0 pendings" is
+  enforced by the gate rather than by documentation. A `skip` is a written
+  taxonomy entry in `wasm-exclusions.txt` and never fails either way.
+  **Fixed 2026-09-14:** `--strict` added; all 16 documented sweeps (eight suites
+  × both paths) exit 0 under it. `equiv` (the compile-vs-interpreter equivalence
+  gate) and the coverage report are still not part of the default sweep; the
+  runner's `compile` feature is on by default, so reaching them needs no flag.
+  The decoder's malformed/unsupported boundary — encodings the corpus never
+  reaches — is *additionally* pinned by
   `crates/wasmtest/tests/decoder_classification.rs` driving
-  `fixtures/decoder-classification.wast`; the corpus sweep's own pending count
-  still is not.)
+  `fixtures/decoder-classification.wast`.
 - `valid.rs`'s cost is quadratic on hostile input: `push_frame` clones the
   whole `init: Vec<bool>` per structured construct (`valid.rs:693`) — O(n·depth)
   for many locals and deep nesting. Not measured; severity speculative.
@@ -508,10 +514,10 @@ before the change); `wasmtest equiv` over `block`/`br`/`br_if`/`br_table`/
 
 ```sh
 git submodule update --init waspec          # required for any wasm sweep
-cargo run -p wasmtest -- run waspec/test/core/*.wast
-cargo run -p wasmtest -- run waspec/test/core/simd   # and each proposal dir
+cargo run -p wasmtest -- run --strict waspec/test/core/*.wast
+cargo run -p wasmtest -- run --strict waspec/test/core/simd   # and each proposal dir
 cargo run -p wasmtest -- jsapi waspec/test/js-api
-cargo run -p wasmtest -- run --compiled ...          # compiled path
+cargo run -p wasmtest -- run --strict --compiled ...          # compiled path
 cargo run -p wasmtest -- equiv ...                   # both paths, command by command
 ```
 

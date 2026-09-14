@@ -10,7 +10,9 @@
 //! decoding/validation/`assert_invalid` are Cut 1-2; instantiating modules
 //! and running `assert_return`/`assert_trap`/`assert_exhaustion` are Cut 3+.
 //! Anything behind a later cut counts as *pending*, not pass or fail, so the
-//! runner stays honest as cuts land.
+//! runner stays honest as cuts land. `run` exits non-zero on a `fail`, and on a
+//! `pending` too once `--strict` is passed — otherwise a sweep's "0 pendings"
+//! would be a documented claim rather than a gate.
 
 use std::collections::HashMap;
 use std::fs;
@@ -41,9 +43,11 @@ usage:
                                     converter (JSON + per-module .wasm/.wat)
   wasmtest run <wast|json|dir>...      convert (if needed) and run suites;
                                     exits nonzero when any suite reports a fail.
+                                    `--strict` also fails on a pending, which is
+                                    how '0 pendings' becomes a gate rather than
+                                    a documented claim.
                                     `--compiled` runs them through the compiled
-                                    path; the binary must be built with
-                                    `--features compile`
+                                    path (on by default for native builds)
   wasmtest equiv <wast|json|dir>...   run each suite through the compiled and
                                     interpreter paths and report the first
                                     command whose outcomes diverge
@@ -105,10 +109,13 @@ fn main() -> ExitCode {
         }
         "run" => {
             let mut compiled = false;
+            let mut strict = false;
             let mut paths = Vec::new();
             for arg in args {
                 if arg == "--compiled" {
                     compiled = true;
+                } else if arg == "--strict" {
+                    strict = true;
                 } else if arg.starts_with('-') {
                     eprintln!("wasmtest run: unknown option {arg:?}\n\n{USAGE}");
                     return ExitCode::from(2);
@@ -126,7 +133,7 @@ fn main() -> ExitCode {
                 eprintln!("wasmtest run: --compiled needs a build with --features compile");
                 return ExitCode::from(2);
             }
-            run(&paths, compiled)
+            run(&paths, compiled, strict)
         }
         "equiv" => {
             let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
@@ -199,8 +206,11 @@ struct Tally {
 
 /// Run every suite named on the command line, converting `.wast` on the fly
 /// (skipping the exclusion manifest's entries) and executing converted or
-/// cached `.json` files. Exits nonzero when any suite reports a fail.
-fn run(paths: &[PathBuf], compiled: bool) -> ExitCode {
+/// cached `.json` files. Exits nonzero when any suite reports a fail, and —
+/// under `strict` — when any reports a pending, so a sweep can gate on the
+/// "0 pendings" claim instead of trusting it. A `skip` is a documented
+/// taxonomy exclusion and never fails either way.
+fn run(paths: &[PathBuf], compiled: bool, strict: bool) -> ExitCode {
     if compiled {
         println!("running through the compiled path");
     }
@@ -282,11 +292,26 @@ fn run(paths: &[PathBuf], compiled: bool) -> ExitCode {
         "\ntotal: {} pass, {} fail, {} pending, {} skipped",
         totals.pass, totals.fail, totals.pending, totals.skipped
     );
-    if totals.fail == 0 {
+    if sweep_ok(&totals, strict) {
         ExitCode::SUCCESS
+    } else if totals.fail > 0 {
+        ExitCode::FAILURE
     } else {
+        eprintln!(
+            "wasmtest run: {} pending under --strict (a pending is a suite this engine does not run yet)",
+            totals.pending
+        );
         ExitCode::FAILURE
     }
+}
+
+/// The exit verdict for a finished sweep: a `fail` always fails, and `strict`
+/// additionally fails a `pending` — which is how a sweep gates on the
+/// "0 pendings" claim instead of trusting the documentation. A `skip` is a
+/// documented taxonomy exclusion (the exclusion manifest is the written list,
+/// not a silent miss) and never fails either way.
+fn sweep_ok(tally: &Tally, strict: bool) -> bool {
+    tally.fail == 0 && !(strict && tally.pending > 0)
 }
 
 /// Compiled-coverage summary for one suite run (meaningful only on the
@@ -1721,4 +1746,31 @@ fn collect_wasm(path: &Path, out: &mut Vec<PathBuf>) {
     }
     files.sort();
     out.extend(files);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Tally, sweep_ok};
+
+    fn tally(fail: usize, pending: usize, skipped: usize) -> Tally {
+        Tally {
+            pass: 1,
+            fail,
+            pending,
+            skipped,
+        }
+    }
+
+    #[test]
+    fn a_sweep_fails_only_on_a_fail_or_a_strict_pending() {
+        assert!(sweep_ok(&tally(0, 0, 0), false));
+        assert!(sweep_ok(&tally(0, 0, 0), true));
+        // A skip is the documented taxonomy exclusion, not an unknown outcome.
+        assert!(sweep_ok(&tally(0, 0, 3), true));
+        // A pending only fails once it is asked for.
+        assert!(sweep_ok(&tally(0, 2, 0), false));
+        assert!(!sweep_ok(&tally(0, 2, 0), true));
+        assert!(!sweep_ok(&tally(1, 0, 0), false));
+        assert!(!sweep_ok(&tally(1, 0, 0), true));
+    }
 }

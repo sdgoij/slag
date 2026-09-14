@@ -42,6 +42,14 @@ API, a small embedding API, and drop-in JavaScriptCore C-API bindings.
   memory; every realm gets the `WebAssembly` global by default — a
   default-on cargo feature (V8/Node parity — no bare-`.wasm`-file
   mode).
+- **Compiled WebAssembly** — the wasm engine's Cranelift backend
+  (`crates/wasm/src/compile.rs`, "Cut 11") lowers function bodies to native
+  machine code and is **on by default for native targets**. It compiles
+  lazily (a body compiles the first time execution reaches it, so a module
+  pays only for what runs) and falls back to the interpreter per body, which
+  stays the equivalence oracle; the compiled path reproduces the corpus's
+  totals exactly. Native-only by construction: a wasm32 embed — the browser
+  demo included — always runs the interpreter.
 - **Experimental Cranelift JIT** — compiled bodies run as native machine
   code via [Cranelift](https://cranelift.dev): inline number/string fast
   paths, direct-mapped global/member value cells, and register-resident
@@ -257,17 +265,25 @@ across directories share the runner's cache key, so each suite directory
 runs separately:
 
 ```sh
-cargo run -p wasmtest -- run waspec/test/core/*.wast   # baseline (top-level files)
-cargo run -p wasmtest -- run waspec/test/core/simd      # ... and each proposal dir
-cargo run -p wasmtest -- run waspec/test/core/gc
-cargo run -p wasmtest -- jsapi waspec/test/js-api       # the JS-API fixtures
+cargo run -p wasmtest -- run --strict waspec/test/core/*.wast  # baseline (top-level files)
+cargo run -p wasmtest -- run --strict waspec/test/core/simd     # ... and each proposal dir
+cargo run -p wasmtest -- run --strict waspec/test/core/gc
+cargo run -p wasmtest -- jsapi waspec/test/js-api               # the JS-API fixtures
 ```
 
-`wasmtest run` exits non-zero only on a `fail`, so a pending count is not a
-gate on its own. The decoder's malformed/unsupported boundary — the encodings
-the vendored corpus never reaches — is pinned by
+`wasmtest run` exits non-zero on a `fail`; `--strict` makes it exit non-zero on
+a `pending` as well, which is how the "0 pendings" claim above is enforced
+rather than trusted — the documented sweeps pass `--strict`. A `skip` is a
+written taxonomy entry in `crates/wasmtest/wasm-exclusions.txt`, never a silent
+miss, and never fails. The decoder's malformed/unsupported boundary — the
+encodings the vendored corpus never reaches — is *additionally* pinned by
 `crates/wasmtest/fixtures/decoder-classification.wast`, which
 `cargo test -p wasmtest` runs and fails on any pending.
+
+`--compiled` runs a sweep through the compiled path instead (it is the native
+default, so plain `run` forces the interpreter to keep the oracle reachable);
+`wasmtest equiv` runs each suite through both and reports the first command
+whose outcomes diverge.
 
 The implementation plan, cut history, and status live in
 `.notes/wasm-plan.md`.

@@ -2,8 +2,8 @@
 //!
 //! An optional Cranelift backend for the `crates/wasm` interpreter. The
 //! interpreter stays the correctness oracle; this module lowers a subset of
-//! module-defined leaf functions to native code and hands the store a
-//! compiled entry it can invoke instead of running the `Engine` loop.
+//! module-defined functions to native code and hands the store a compiled entry
+//! it can invoke instead of running the `Engine` loop.
 //!
 //! Supported subset (everything else bails to the interpreter, per
 //! function):
@@ -42,15 +42,30 @@
 //!   imported globals, ref-typed globals, and every global of a
 //!   call-bearing body go straight to the store cell through a runtime helper
 //!   instead (a reference crosses as its u64 token), because an aliased
-//!   import slot or a callee can change a shared cell between accesses. GC
-//!   objects are not lowered yet;
+//!   import slot or a callee can change a shared cell between accesses;
 //! - (nullable or not) function references ride the compiled stack as opaque
 //!   u64 tokens (0 = null; a function reference packs its address), so
-//!   `ref.func`/`ref.null func`/`ref.is_null`, `table.get`/`table.set` over
-//!   32-bit funcref tables, and `call_ref`/`return_call_ref` lower too;
+//!   `ref.func`/`ref.null func`/`ref.is_null`, `table.get`/`table.set` over any
+//!   table whose element type the compiled value model carries, and
+//!   `call_ref`/`return_call_ref` lower too. Table addressing may be 32- or
+//!   64-bit;
+//! - GC aggregates over carried references: `struct.new`/`struct.get`/`set`,
+//!   the `array.*` family (`new`, `new_default`, `new_fixed`, `new_data`,
+//!   `new_elem`, `get`/`set`, `len`, `fill`, `copy`, `init_data`,
+//!   `init_elem`), the `i31` ops, the `ref.test`/`ref.cast`/`br_on_cast`
+//!   family, and `any.convert_extern`/`extern.convert_any`. They run through
+//!   runtime helpers against the store's object pool rather than a native
+//!   layout, so a GC object crosses the compiled boundary as the same u64 token
+//!   a reference does;
+//! - exception handling: `try_table` (plain `catch` and `catch_ref` clauses
+//!   alike), `throw`, and `throw_ref`. A `throw` under a statically-decidable
+//!   clause branches directly; anything dynamic — a callee-escaped exception, a
+//!   `throw_ref`, a `_ref` clause, or an imported-tag clause — dispatches at
+//!   runtime against the parked exception, so no body-level EH gate remains;
 //! - direct `call`/`return_call` and `call_indirect`/`return_call_indirect`
-//!   (32-bit-addressed tables) over carried signatures (numeric, function-
-//!   reference, or v128 — a v128 rides two u64 words at its slot offset):
+//!   over carried signatures (numeric, function-reference, or v128 — a v128
+//!   rides two u64 words at its slot offset) and 32- or 64-bit-addressed
+//!   tables:
 //!   the call site spills its params into a caller-owned scratch region and
 //!   calls a store-side helper (entry params 10-11), which resolves the target
 //!   and either re-enters a compiled callee natively (inside the helper's
@@ -453,8 +468,8 @@ pub fn compile_module(module: &Module) -> Vec<Option<CompiledFunc>> {
 }
 
 /// A reason a module-defined body is not compiled, for the coverage report:
-/// the structural gates first (non-carried types, a `try_table` handler),
-/// then the per-instruction subset. A body that passes the gates but is
+/// the structural gate first (a non-carried parameter/result/local type), then
+/// the per-instruction subset. A body that passes the gates but is
 /// still not compiled fails inside the lowering pipeline, so the report
 /// surfaces the concrete error (the latent-mismatch audit).
 pub fn body_compile_reason(module: &Module, defined: usize) -> String {
