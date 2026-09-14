@@ -3088,14 +3088,18 @@ fn invoke_export(
     instance: usize,
     index: usize,
 ) -> Result<Value, JsError> {
-    let ty = agent
-        .wasm_store
-        .borrow()
-        .func_type(instance, index)
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "unknown wasm function".into()))?;
+    // Only the parameter types are needed to convert the JS arguments; clone
+    // just those (the full `FuncType` clone would also copy the results Vec).
+    let params = {
+        let store = agent.wasm_store.borrow();
+        let ty = store
+            .func_type_ref(instance, index)
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "unknown wasm function".into()))?;
+        ty.params.clone()
+    };
     let mut wasm_args = Vec::with_capacity(args.len());
     for (position, argument) in args.iter().enumerate() {
-        let param = ty.params.get(position).cloned().unwrap_or(ValType::I32);
+        let param = params.get(position).copied().unwrap_or(ValType::I32);
         wasm_args.push(wasm_arg(agent, &param, argument)?);
     }
     let mut progress = {

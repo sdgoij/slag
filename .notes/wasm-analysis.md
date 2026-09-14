@@ -480,7 +480,7 @@ JS-API boundary, "D" = decode/validate.
 | 12 | I | Resolve the memory cell once and collapse the bounds test to one compare (`3988-4012`, `4487-4504`) | Medium | Low-Med |
 | 13 | I | Cache the body slice / `&mut Frame` once per step instead of re-indexing (`4212-4216`) | Medium | Medium |
 | 14 | C | Lazy/tiered compile instead of eager-at-instantiate (`exec.rs:3143`) | Medium | Medium |
-| 15 | J | Avoid per-call `FuncType`/module clones and per-i64 `BigInt` allocation (`wasm.rs:3129-3138`, `1220`, `754-758`) | Medium | Low-Med |
+| 15 | J | Avoid per-call `FuncType`/module clones and per-i64 `BigInt` allocation (`wasm.rs:3129-3138`, `1220`, `754-758`) | Low | Low-Med |
 | 16 | D | `Box<[Instr]>` bodies / immediate side-tables; stop the one-element `Vec<Instr>` per element item (`binary.rs:770`, `instr.rs:299-326`) | Medium | Medium |
 | 17 | D | Share `init: Vec<bool>` across frames instead of cloning (`valid.rs:693`) | Low-Med | Low |
 | 18 | D | `validate_exports` O(n²) duplicate check; `func_type_of` O(index) per `ref.func` (`valid.rs:336-341`, `2039-2053`) | Low | Low |
@@ -554,6 +554,20 @@ the bitcast, which changing lane count requires), and plain `v128.load` is a
 native 16-byte load. The runtime helper stays the fallback for everything else.
 `simd-loop`'s compiled column went 0.087 -> 0.023 s, moving the margin from
 ~4.8× to ~18× — the one item this session that delivered its rating.
+
+Item 15 landed 2026-09-14 as its FuncType half only. `invoke_export` cloned the
+whole `FuncType` per call even though only `ty.params` is used (`ty.results`
+was never read); it now clones just the params through `func_type_ref`. The
+i64 `BigInt` half is left alone: the result side (`WasmValue::I64` -> JS
+BigInt) is inherent to the JS BigInt representation, and the argument-side
+clone is a single cheap `crux::BigInt` copy, not worth a wider `webidl_bigint`
+refactor for the call path alone.
+
+Item 13 landed 2026-09-14 as the body-slice half only (the `&mut Frame` half is
+blocked by the same borrow that forces the per-step clone). `step` now resolves
+the body slice once instead of twice. It is ~0 at the probe scale — `leaf-loop`
+is unchanged at ~2.0 s — so the remaining per-step cost is the `Instr` clone
+(item 2's leftover) and the dispatch itself, not the double lookup.
 
 **Item 8 measured 2026-09-14, and it is the largest boundary cost by orders of
 magnitude.** `WebAssembly.Memory.prototype.buffer` is a *copy*: the JS-API keeps

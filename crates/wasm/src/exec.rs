@@ -4515,11 +4515,12 @@ impl<'a> Engine<'a> {
     /// Execute one instruction of the top frame.
     fn step(&mut self) -> Result<Ctl, ExecFail> {
         let frame_index = self.frames.len() - 1;
-        if self.frames[frame_index].pc >= self.body(frame_index).len() {
+        let body = self.body(frame_index);
+        if self.frames[frame_index].pc >= body.len() {
             return self.finish();
         }
         let pc = self.frames[frame_index].pc;
-        let instr = self.body(frame_index)[pc].clone();
+        let instr = body[pc].clone();
         match instr {
             Instr::Unreachable => Err(ExecFail::Trap(Trap::Unreachable)),
             Instr::Nop => Ok(Ctl::Next),
