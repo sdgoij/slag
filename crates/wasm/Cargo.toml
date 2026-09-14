@@ -19,6 +19,13 @@ compile = [
 ]
 
 [dependencies]
+
+# Cranelift's executable-memory allocator (`region`) has no wasm32 backend, so
+# the native-code path is native-only by construction. Scoping these to
+# non-wasm targets keeps a wasm build that turns the feature on from dying
+# inside `region` with errors that never name Slag: without the dependency in
+# the graph, the `compile_error!` in `src/lib.rs` is what the build reports.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cranelift-codegen = { version = "=0.134.3", optional = true }
 cranelift-control = { version = "=0.134.3", optional = true }
 cranelift-frontend = { version = "=0.134.3", optional = true }

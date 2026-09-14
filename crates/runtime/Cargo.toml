@@ -47,6 +47,12 @@ raylib-sys = { version = "6.0.0", default-features = false, features = ["GLFW_BU
 # it drops the feature (and the `wasm` crate) with `--no-default-features`.
 default = ["wasm"]
 wasm = ["dep:wasm"]
+# Cut 11: run wasm bodies natively through Cranelift. Native targets only —
+# the `wasm` crate scopes cranelift's dependencies off wasm32 and rejects the
+# combination with a `compile_error!`, because `region` (executable-page
+# allocation) has no wasm32 backend. Enabling it makes every instantiate
+# eagerly compile all of a module's bodies, so it stays opt-in.
+wasm-compile = ["wasm", "wasm/compile"]
 # Experimental multi-agent mode (PLAN Phase 17): workers run as OS threads
 # with their own realms and job queues, sharing SharedArrayBuffer blocks
 # with the main agent; Atomics.wait blocks and notify wakes via a global

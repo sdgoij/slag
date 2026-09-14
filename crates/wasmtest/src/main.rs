@@ -40,7 +40,10 @@ usage:
   wasmtest convert <file.wast> [out.json]   compile a .wast with the in-process
                                     converter (JSON + per-module .wasm/.wat)
   wasmtest run <wast|json|dir>...      convert (if needed) and run suites;
-                                    exits nonzero when any suite reports a fail
+                                    exits nonzero when any suite reports a fail.
+                                    `--compiled` runs them through the compiled
+                                    path; the binary must be built with
+                                    `--features compile`
   wasmtest equiv <wast|json|dir>...   run each suite through the compiled and
                                     interpreter paths and report the first
                                     command whose outcomes diverge
@@ -101,12 +104,29 @@ fn main() -> ExitCode {
             }
         }
         "run" => {
-            let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
+            let mut compiled = false;
+            let mut paths = Vec::new();
+            for arg in args {
+                if arg == "--compiled" {
+                    compiled = true;
+                } else if arg.starts_with('-') {
+                    eprintln!("wasmtest run: unknown option {arg:?}\n\n{USAGE}");
+                    return ExitCode::from(2);
+                } else {
+                    paths.push(PathBuf::from(arg));
+                }
+            }
             if paths.is_empty() {
                 eprintln!("wasmtest run: missing path\n\n{USAGE}");
                 return ExitCode::from(2);
             }
-            run(&paths)
+            if compiled && !cfg!(feature = "compile") {
+                // Without the feature the store's compile switch is compiled
+                // out, so this would silently measure the interpreter.
+                eprintln!("wasmtest run: --compiled needs a build with --features compile");
+                return ExitCode::from(2);
+            }
+            run(&paths, compiled)
         }
         "equiv" => {
             let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
@@ -180,7 +200,10 @@ struct Tally {
 /// Run every suite named on the command line, converting `.wast` on the fly
 /// (skipping the exclusion manifest's entries) and executing converted or
 /// cached `.json` files. Exits nonzero when any suite reports a fail.
-fn run(paths: &[PathBuf]) -> ExitCode {
+fn run(paths: &[PathBuf], compiled: bool) -> ExitCode {
+    if compiled {
+        println!("running through the compiled path");
+    }
     let exclusions = load_exclusions();
     let mut items: Vec<(PathBuf, bool)> = Vec::new();
     for path in paths {
@@ -217,7 +240,7 @@ fn run(paths: &[PathBuf]) -> ExitCode {
     let mut totals = Tally::default();
     for (source, is_json) in items {
         if is_json {
-            let (tally, _, _) = run_json_mode(&source, false, true);
+            let (tally, _, _) = run_json_mode(&source, compiled, true);
             println!(
                 "\n{}: {} pass, {} fail, {} pending",
                 source.display(),
@@ -243,7 +266,7 @@ fn run(paths: &[PathBuf]) -> ExitCode {
                 continue;
             }
         };
-        let (tally, _, _) = run_json_mode(&json, false, true);
+        let (tally, _, _) = run_json_mode(&json, compiled, true);
         println!(
             "\n{}: {} pass, {} fail, {} pending",
             json.display(),

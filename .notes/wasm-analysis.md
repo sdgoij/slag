@@ -199,6 +199,36 @@ Policy and gaps:
   (`compile.rs:1988-2031`, `1540-1541`).
 - **Caps:** params+results ≤ `SCRATCH_SLOTS = 256` u64 words
   (`compile.rs:996-1005`), ratified as out of scope (plan decision 6).
+
+**Shippable as of 2026-09-14, opt-in.** The backend is reachable from a native
+embed through the `wasm-compile` feature (`runtime` → `slag` / `cli`), which
+turns on `wasm/compile`. It is **native-only by construction**: cranelift's
+`region` dependency (executable-page allocation) has no wasm32 backend, so the
+`wasm` crate scopes those dependencies off wasm32 and rejects the combination
+with a `compile_error!` naming the reason — a wasm embed always runs the
+interpreter, exactly like the JIT (`jit` fails the same way, in the same
+crate). It stays off by default because enabling it eagerly compiles every body
+at instantiate and a body's calls still re-enter the interpreter.
+
+What it buys, measured (release; the compiled column includes ~20 ms of process
+startup, so the leaf row understates the loop):
+
+| Workload | Interpreter | Compiled | |
+|---|---|---|---|
+| call-free leaf loop, 10M iterations (`fixtures/leaf-loop.wast`) | 2.066 s | 0.026 s | ~80× |
+| loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.344 s | 0.133 s | 2.6× |
+| `bulk-memory` corpus (7,485 assertions) | 0.778 s | 0.546 s | 1.42× |
+| `gc` corpus (654 assertions) | 0.203 s | 0.219 s | 0.93× |
+
+The shape is the gap list above: pure compute gets native speed, while helper
+and call work (GC allocation/casts, bulk ops, every call) stays on the
+interpreter. Turning it on by default would need §7 items 7 (native direct
+calls) and 14 (lazy/tiered compile) first.
+
+Verified for the landing: `equiv` over the control-flow files, `exceptions`,
+`bulk-memory`, and `gc` reports **36 suites, 0 diverged**, 1,986/1,986 module
+definitions compiled; `cargo run -p slag --features wasm-compile --example
+wasm_smoke` passes (the same output as without the feature).
 - **Not shipped:** `wasm/compile` is default-off (`crates/wasm/Cargo.toml:8-19`)
   and neither `runtime` nor `cli` enables it, so the CLI and the browser demo
   always run the interpreter; only `wasmtest --features compile` and
@@ -376,6 +406,10 @@ before the change); `wasmtest equiv` over `block`/`br`/`br_if`/`br_table`/
    real-world benefit is limited to call-free leaf bodies. Either gate it on
    (runtime/CLI feature) after adding direct native calls, or record the
    decision that it stays a research path.
+   **Landed 2026-09-14 (the feature gate, not the native calls):** reachable as
+   `wasm-compile` on `runtime`/`slag`/`cli`, native-only with a `compile_error!`
+   guard, still opt-in. Measured envelope and the remaining blockers (§7 items 7
+   and 14) are in §5.
 4. **JS-API memory bridge** (item 8) — the only boundary cost that is a whole
    linear-memory copy per call once a `buffer` has been materialised.
 5. Threads/atomics and `WebAssembly.Function` are the remaining whole-feature

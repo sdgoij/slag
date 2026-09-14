@@ -84,6 +84,28 @@ as suspect: the wasm test here asserted
 `if (Object.isFrozen(sab) || !Object.isExtensible(sab)) return false` under
 a comment that already said "a frozen SharedArrayBuffer".
 
+## Trap 4 — the native-code path is native-only by construction
+
+Neither the JS `jit` nor the wasm `compile` backend can build for wasm32: both
+pull cranelift, whose `region` dependency (executable-page allocation) has no
+wasm32 backend. The `wasm` crate scopes those dependencies off wasm32 and
+rejects the combination with a `compile_error!`, so a wasm build that turns the
+feature on says why instead of dying inside `region`. A wasm embed always runs
+the interpreter — do not try to "ship the JIT to the browser".
+
+On native builds reach the compiled path with the `wasm-compile` feature
+(`runtime` → `slag` / `cli`), which enables `wasm/compile`. It is opt-in because
+enabling it eagerly compiles every body at instantiate, and a compiled body's
+calls still re-enter the interpreter:
+
+- `wasmtest run --compiled <path>` runs suites through it (needs a binary built
+  with `--features compile`); `equiv` compares both paths.
+- One binary built with `--features compile` measures both: without `--compiled`
+  the store forces the interpreter, which is what makes the A/B meaningful.
+- The envelope, measured: ~80× on a call-free leaf loop, 2.6× on a loop with a
+  call per iteration, 1.42× on the `bulk-memory` corpus, and a wash (0.93×) on
+  the GC corpus, whose work is helper-bound.
+
 ## Validation loop
 
 - `cargo test -p wasm`, `cargo test -p runtime --lib`.

@@ -27,4 +27,4 @@
       (br_if $l (i32.lt_s (local.get $i) (local.get $n))))
     (local.get $acc))
   (export "spin" (func $spin)))
-(invoke "spin" (i32.const 1000000))
+(assert_return (invoke "spin" (i32.const 1000000)) (i32.const 1972898159))

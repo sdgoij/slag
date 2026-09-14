@@ -10,6 +10,10 @@
 //! decoded module; Cut 3+ executes it.
 
 pub mod binary;
+#[cfg(all(feature = "compile", target_arch = "wasm32"))]
+compile_error!(
+    "the `compile` feature is native-only: cranelift's `region` dependency has no wasm32 backend, so a wasm embed must run the interpreter"
+);
 #[cfg(feature = "compile")]
 pub mod compile;
 pub mod exec;
