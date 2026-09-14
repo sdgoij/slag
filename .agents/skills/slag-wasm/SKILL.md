@@ -102,14 +102,20 @@ calls still re-enter the interpreter:
   with `--features compile`); `equiv` compares both paths.
 - One binary built with `--features compile` measures both: without `--compiled`
   the store forces the interpreter, which is what makes the A/B meaningful.
-- The envelope, measured: ~80× on a call-free leaf loop and 7.2× on a loop with
+- The envelope, measured: ~80× on a call-free leaf loop and 14.3× on a loop with
   a call per iteration (the committed probes; medians of three). Suite timings
   are not a usable measure — they are dominated by convert/decode/validate,
   which is why single-run suite figures did not reproduce.
-- A call still goes through a store-side helper: two Rust frames and an
-  indirect call. The per-call buffers are cached per native depth and the
-  callee's declared type is resolved by reference, so what remains is that
-  round-trip itself — a direct call to a compiled body could skip the helper.
+- An eligible direct call now skips the helper: the compiled code loads the
+  callee's entry from the instance's table (via the scratch metadata slot,
+  `compile::ENTRIES_SLOT`) and calls it. Eligibility is two derived predicates
+  — the callee needs no `gvals` buffer, and it makes no call at all.
+  **The second is load-bearing, not an optimisation:** a direct call adds a
+  native frame with no depth accounting, so allowing a call-bearing callee
+  makes recursion unbounded and overflows the native stack. The helper's
+  `NATIVE_CALL_DEPTH` budget is what bounds it. The first cut of this made that
+  mistake and only the whole-corpus compiled run caught it (`thread 'main' has
+  overflowed its stack` on core root) — the simpler suites were green.
 
 ## Validation loop
 

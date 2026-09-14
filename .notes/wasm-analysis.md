@@ -194,17 +194,36 @@ Policy and gaps:
   resolution and the per-call buffer setup in Rust first.) Past the cap, or for
   an interpreted or host callee, the helper runs the callee through the
   interpreter instead.
-  **Partly fixed 2026-09-14, in two slices:** the per-call buffers — memory
+  **Fixed 2026-09-14, in three slices.** (1) The per-call buffers — memory
   descriptors, the used-global cells and `gvals`, and a 2 KiB `SCRATCH_SLOTS`
-  scratch, five `Vec`s per call — are now cached per native depth on the store
-  and reused (`Store::native_frames`); and the callee's declared type is
-  resolved by reference (`Store::func_type_ref`, with `func_type` now a
-  one-line wrapper over it) so only the interpreted fallback materializes a
-  `FuncType`, which had been two more `Vec`s per call. Together they took the
-  call-per-iteration probe from 2.6× to **7.2×** over the interpreter. What is
-  left of item 7: every call still costs two Rust frames plus an indirect call
-  through the helper (a direct call to a compiled body could skip the helper
-  outright), and the depth cap is unchanged.
+  scratch, five `Vec`s per call — are cached per native depth on the store and
+  reused (`Store::native_frames`). (2) The callee's declared type is resolved by
+  reference (`Store::func_type_ref`, with `func_type` now a one-line wrapper
+  over it), so only the interpreted fallback materializes a `FuncType`, which
+  had been two more `Vec`s per call. (3) A `call`/`return_call` to a defined
+  function of the caller's own module now calls it **directly**: the instance's
+  compiled-entry table rides the scratch region's metadata slot
+  (`compile::ENTRIES_SLOT`), the callee's entry is loaded from it and invoked
+  with the same ABI, and a zero entry — the callee stayed interpreted, or the
+  store forced the interpreter — falls back to the helper, byte-for-byte the
+  old path. The caller's scratch is shared, which is safe because the entry
+  prologue reads its arguments out before any call site reuses those slots.
+
+  Two conditions gate the direct form, both derived from predicates the
+  compiler already computes rather than from a maintained allowlist: the callee
+  must need no `gvals` buffer (the caller lends its scratch but not its global
+  slots — the same `body_has_calls`/`body_globals` pair `Engine::compile` sizes
+  the buffer by), and it must make **no call at all**. The second is the
+  native-stack bound: a direct call adds a frame with no depth accounting in the
+  shared scratch, so only a body that cannot recurse may be reached that way;
+  call-bearing callees keep going through the helper, whose `NATIVE_CALL_DEPTH`
+  budget is what bounds the stack. The corpus caught exactly that: the first cut
+  allowed call-bearing callees and core root overflowed the native stack
+  (`thread 'main' has overflowed its stack`) — the suites without deep recursion
+  were all green, which is why the whole-corpus run is the gate.
+
+  Together the three slices took the call-per-iteration probe from 2.6× to
+  **14.3×**, leaving it at the call-free leaf's own floor.
 - **Helpers, not native lowering**, for: all calls, `memory.grow`, imported /
   call-bearing-body globals, table ops, pure-register SIMD and vec
   load/lane/shuffle, GC allocation/casts, and EH dynamic dispatch
@@ -231,7 +250,7 @@ startup, so the leaf row understates the loop):
 | Workload | Interpreter | Compiled | |
 |---|---|---|---|
 | call-free leaf loop, 10M iterations (`fixtures/leaf-loop.wast`) | 2.066 s | 0.026 s | ~80× |
-| loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.326 s | 0.045 s | 7.2× |
+| loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.328 s | 0.023 s | 14.3× |
 
 Both are medians of three runs of the committed probes, which isolate execution
 (the compiled column still includes ~20 ms of process startup). Whole-suite
@@ -387,11 +406,12 @@ JS-API boundary, "D" = decode/validate.
 
 Items 1-4 are all "remove an allocation or a scan from a per-instruction
 path", and can be validated with the existing compiled-vs-interpreted
-equivalence harness rather than new tests. Item 7's two slices (2026-09-14) were
-the same move one level up: the native call path allocated seven `Vec`s per call
-(five buffers plus the callee's declared type), and caching the buffers per
-depth plus resolving the type by reference moved the call-per-iteration probe
-from 2.6× to 7.2× — see §5.
+equivalence harness rather than new tests. Item 7's three slices (2026-09-14)
+were the same move one level up, ending in skipping the helper outright for an
+eligible direct call: the native call path had been allocating seven `Vec`s per
+call (five buffers plus the callee's declared type) and paying two Rust frames
+plus an indirect call for every call. The call-per-iteration probe went 2.6× →
+7.2× → 14.3× — see §5.
 
 **Landed 2026-09-14 (items 1, 3, 4 and item 2's double clones).** Measured on a
 hot-loop probe (1M iterations; a call plus a `br_if` plus three numeric ops per

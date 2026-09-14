@@ -52,10 +52,16 @@
 //!   (32-bit-addressed tables) over carried signatures (numeric, function-
 //!   reference, or v128 — a v128 rides two u64 words at its slot offset):
 //!   the call site spills its params into a caller-owned scratch region and
-//!   calls a store-side helper (entry params 10-11) that runs the callee
-//!   through the interpreter, so a compiled body can call anything —
-//!   interpreted or compiled, owned or host — without unbounded native
-//!   recursion. A call-bearing body that also uses globals lowers each
+//!   calls a store-side helper (entry params 10-11), which resolves the target
+//!   and either re-enters a compiled callee natively (inside the helper's
+//!   depth budget) or runs it through the interpreter — so a compiled body can
+//!   call anything, interpreted or compiled, owned or host, without unbounded
+//!   native recursion. A `call` to a defined function of this module that
+//!   cannot itself call and needs no `gvals` buffer skips the helper outright:
+//!   its entry comes from the instance's compiled-entry table, reached through
+//!   the scratch region's metadata slot ([`ENTRIES_SLOT`]), and a zero entry
+//!   (the callee stayed interpreted) falls back to the helper. A call-bearing
+//!   body that also uses globals lowers each
 //!   `global.get`/`set` through the store-cell helper (no `gvals` snapshot to
 //!   go stale across the callee).
 //!
@@ -125,6 +131,18 @@ pub const TRAP_PENDING_ERROR: i32 = 21;
 /// `[0..params)` and the call helper rewrites `[0..results)`; a body whose
 /// any call site needs more than this stays interpreted.
 pub const SCRATCH_SLOTS: usize = 256;
+
+/// The scratch region's runtime-metadata slot, allocated past the usable area.
+/// It carries the owning instance's direct-call entry table pointer (see
+/// `Instance::entries`) so a body can resolve a compiled callee's entry and
+/// call it directly instead of going through the call helper. The helper
+/// writes it when it builds a scratch region; a body that is itself
+/// direct-callable makes no call at all, so it never reads it.
+pub const ENTRIES_SLOT: usize = SCRATCH_SLOTS;
+
+/// Words to allocate for a scratch region: the argument/result area plus the
+/// metadata slot.
+pub const SCRATCH_WORDS: usize = SCRATCH_SLOTS + 1;
 
 /// Map a [`Trap`] back to the interpreter's code used to report it from a
 /// compiled entry.
@@ -241,6 +259,12 @@ impl CompiledFunc {
     /// buffer (slot order).
     pub fn used_globals(&self) -> &[u32] {
         &self.globals
+    }
+
+    /// The entry point's address, for the owning instance's direct-call table
+    /// (bodies reach it through the scratch region's metadata slot).
+    pub fn entry_addr(&self) -> u64 {
+        self.entry as usize as u64
     }
 
     /// Invoke the compiled body with `args` (bit patterns) and return the
@@ -1540,6 +1564,10 @@ struct Lowerer<'a> {
     /// `memory.grow` refreshes the entry in place, so `mem_ea`/`memory.size`
     /// must reload it on every use (they do).
     mems: ClifValue,
+    /// The descriptor count (entry param 3), lent to a directly-called callee:
+    /// the callee runs in this instance, so this body's descriptor array is
+    /// its own.
+    ncount: ClifValue,
     /// The per-call global-values buffer (entry param 4): one u64 word per
     /// used module-defined global of a call-free body (a v128 global occupies
     /// two); imported and call-bearing bodies leave it empty. `globals` maps
@@ -3065,7 +3093,10 @@ impl<'a> Lowerer<'a> {
     /// whose results are loaded back from `[0..results)`. A nonzero helper
     /// return (a trap code, or the pending-error sentinel) returns from the
     /// entry immediately. When `tail`, the results are the function's own
-    /// results and the body returns right away.
+    /// results and the body returns right away. `fast` names a defined body of
+    /// this module that can be called directly when it is compiled (see
+    /// [`Lowerer::direct_call`]); `None` always goes through the helper.
+    #[allow(clippy::too_many_arguments)]
     fn lower_call(
         &mut self,
         mode: i64,
@@ -3074,6 +3105,7 @@ impl<'a> Lowerer<'a> {
         z: i64,
         ty: &FuncType,
         tail: bool,
+        fast: Option<u32>,
     ) -> Result<(), String> {
         // The scratch layout is word-indexed: a v128 param/result occupies two
         // u64 words at its slot offset (the helper, the native callee, and
@@ -3124,10 +3156,10 @@ impl<'a> Lowerer<'a> {
         } else {
             self.open_try_candidates()
         };
-        if candidates.is_empty() {
-            self.runtime_call(&args)?;
-        } else {
-            self.catchable_runtime_call(&args, &candidates)?;
+        match fast.filter(|_| candidates.is_empty()) {
+            Some(defined) => self.direct_call(defined, ty, &args)?,
+            None if candidates.is_empty() => self.runtime_call(&args)?,
+            None => self.catchable_runtime_call(&args, &candidates)?,
         }
         let mut result_word = 0usize;
         for ty in ty.results.iter() {
@@ -3428,7 +3460,124 @@ impl<'a> Lowerer<'a> {
         let ty = func_type_of(self.module, index).ok_or("unresolved call target type")?;
         let x = self.iconst(types::I64, i64::from(index));
         let zero = self.iconst(types::I64, 0);
-        self.lower_call(0, x, zero, 0, &ty, tail)
+        let fast = self.direct_callable(index);
+        self.lower_call(0, x, zero, 0, &ty, tail, fast)
+    }
+
+    /// The defined body a direct call to `index` may reach without the helper,
+    /// or `None` when the target is an import (whose instance is not known
+    /// here, so this instance's entry table would not apply), when the callee
+    /// calls (see the native-stack bound below), or when it needs a `gvals`
+    /// buffer the caller cannot supply.
+    fn direct_callable(&self, index: u32) -> Option<u32> {
+        let imported = self
+            .module
+            .imports
+            .iter()
+            .filter(|import| matches!(import.desc, ImportDesc::Func(_)))
+            .count();
+        let defined = (index as usize).checked_sub(imported)?;
+        let body = self.module.bodies.get(defined)?;
+        // The callee must not call at all. A direct call adds a native frame
+        // with no depth accounting — the shared scratch has nowhere to keep a
+        // counter — so only a body that cannot recurse may be reached this
+        // way; anything call-bearing keeps going through the helper, whose
+        // `NATIVE_CALL_DEPTH` budget is what bounds the native stack.
+        if body_has_calls(body) {
+            return None;
+        }
+        // A body that makes a call gets no `gvals` buffer (its global accesses
+        // go through the store-cell helper), and one that touches no
+        // bufferable global needs none. This is exactly the condition
+        // `Engine::compile` sizes the buffer by, so a directly-called body
+        // never reads a slot the caller did not supply.
+        if !body_globals(self.module, body).is_empty() {
+            return None;
+        }
+        Some(defined as u32)
+    }
+
+    /// Emit a direct call to this instance's compiled body `defined`: load its
+    /// entry from the instance's table (reached through the scratch region's
+    /// metadata slot, entry param 11) and call it with the same ABI the helper
+    /// would have used. The callee runs in this instance, so this body's
+    /// memory descriptors are its own, and it needs no `gvals` buffer by
+    /// `direct_callable`'s construction.
+    ///
+    /// The caller's scratch is shared: the callee's prologue reads its
+    /// arguments out of those slots before any call site of its own reuses
+    /// them, so the two cannot clobber each other. `helper_args` are the
+    /// pre-built call-helper arguments for the fallback path, taken when the
+    /// entry is absent — the callee stayed interpreted, or the store forced
+    /// the interpreter — which is byte-for-byte the previous behaviour.
+    fn direct_call(
+        &mut self,
+        defined: u32,
+        ty: &FuncType,
+        helper_args: &[ClifValue],
+    ) -> Result<(), String> {
+        let table_address = self
+            .builder
+            .ins()
+            .iadd_imm_s(self.scratch, 8 * crate::compile::ENTRIES_SLOT as i64);
+        let table = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            table_address,
+            Offset32::new(0),
+        );
+        let entry_address = self.builder.ins().iadd_imm_s(table, 8 * i64::from(defined));
+        let entry = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            entry_address,
+            Offset32::new(0),
+        );
+        let zero = self.iconst(types::I64, 0);
+        let missing = self.builder.ins().icmp(IntCC::Equal, entry, zero);
+        let fallback = self.builder.create_block();
+        let direct = self.builder.create_block();
+        let merge = self.builder.create_block();
+        self.builder.ins().brif(missing, fallback, &[], direct, &[]);
+
+        self.builder.switch_to_block(direct);
+        let mut sig = Signature::new(self.conv);
+        for _ in 0..12 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let sig = self.builder.import_signature(sig);
+        let nargs = self.iconst(types::I64, ty.params.len() as i64);
+        let nout = self.iconst(types::I64, ty.results.len() as i64);
+        let args = [
+            self.scratch,
+            nargs,
+            self.mems,
+            self.ncount,
+            self.globals_ptr,
+            self.scratch,
+            nout,
+            self.store,
+            self.instance,
+            self.grow,
+            self.call,
+            self.scratch,
+        ];
+        let call = self.builder.ins().call_indirect(sig, entry, &args);
+        let code = self.builder.inst_results(call)[0];
+        let zero32 = self.iconst(types::I32, 0);
+        let failed = self.builder.ins().icmp(IntCC::NotEqual, code, zero32);
+        let trap_block = self.builder.create_block();
+        self.builder.ins().brif(failed, trap_block, &[], merge, &[]);
+        self.builder.switch_to_block(trap_block);
+        self.builder.ins().return_(&[code]);
+
+        self.builder.switch_to_block(fallback);
+        self.runtime_call(helper_args)?;
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        Ok(())
     }
 
     /// A `call_indirect`/`return_call_indirect` through `table_index` at the
@@ -3446,7 +3595,7 @@ impl<'a> Lowerer<'a> {
             .ok_or("unresolved call_indirect type")?;
         let element64 = self.pop_table_addr(table_index)?;
         let table = self.iconst(types::I64, i64::from(table_index));
-        self.lower_call(1, table, element64, i64::from(type_index), &ty, tail)
+        self.lower_call(1, table, element64, i64::from(type_index), &ty, tail, None)
     }
 
     /// A `call_ref`/`return_call_ref`: the function reference is the top
@@ -3459,7 +3608,7 @@ impl<'a> Lowerer<'a> {
             .ok_or("unresolved call_ref type")?;
         let reference = self.pop().ok_or("operand stack underflow")?;
         let zero = self.iconst(types::I64, 0);
-        self.lower_call(2, reference, zero, i64::from(type_index), &ty, tail)
+        self.lower_call(2, reference, zero, i64::from(type_index), &ty, tail, None)
     }
 
     /// A `ref.func`: push the function's token (`tag | instance << 32 | f`).
@@ -5327,9 +5476,9 @@ fn lower(
     builder.append_block_params_for_function_params(entry_block);
     builder.switch_to_block(entry_block);
     let params = builder.block_params(entry_block).to_vec();
-    let (args_ptr, mems, globals_ptr, out_ptr, store, instance, grow, call, scratch) = (
-        params[0], params[2], params[4], params[5], params[7], params[8], params[9], params[10],
-        params[11],
+    let (args_ptr, mems, ncount, globals_ptr, out_ptr, store, instance, grow, call, scratch) = (
+        params[0], params[2], params[3], params[4], params[5], params[7], params[8], params[9],
+        params[10], params[11],
     );
     // Each used module-defined global of a call-free body gets a `gvals`
     // buffer region sized by its value type (one u64 word, or two for a
@@ -5429,6 +5578,7 @@ fn lower(
         variables,
         stack: Vec::new(),
         mems,
+        ncount,
         globals_ptr,
         globals,
         out_ptr,

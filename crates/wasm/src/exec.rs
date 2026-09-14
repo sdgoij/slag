@@ -317,6 +317,12 @@ pub struct Instance {
     /// (parallel to `Module::bodies`); `None` keeps the interpreter path.
     #[cfg(feature = "compile")]
     compiled: Vec<Option<crate::compile::CompiledFunc>>,
+    /// Cut 11: per module-defined body (parallel to `Module::bodies`), the
+    /// compiled entry's address, or 0 where the body stays interpreted. A
+    /// compiled body reaches this table through the scratch region's metadata
+    /// slot (`compile::ENTRIES_SLOT`) to call a compiled callee directly.
+    #[cfg(feature = "compile")]
+    entries: Vec<u64>,
     /// Cut 11 Wave 3: per module-defined body (parallel to `Module::bodies`),
     /// whether its direct callee graph can reach an external host function (a
     /// function import resolved to a token'd host). The compiled path cannot
@@ -868,9 +874,12 @@ unsafe fn run_native_callee(
             .map(|index| store_ref.instances[own].globals[*index as usize]),
     );
     seed_globals_into(store_ref, &frame.cells, &mut frame.gvals);
-    if frame.scratch.len() < crate::compile::SCRATCH_SLOTS {
-        frame.scratch.resize(crate::compile::SCRATCH_SLOTS, 0);
+    if frame.scratch.len() < crate::compile::SCRATCH_WORDS {
+        frame.scratch.resize(crate::compile::SCRATCH_WORDS, 0);
     }
+    // A frame is reused across callees, so re-point its metadata slot at
+    // whichever instance this call targets.
+    frame.scratch[crate::compile::ENTRIES_SLOT] = store_ref.instances[own].entries.as_ptr() as u64;
     let runtime = crate::compile::CompiledRuntime {
         store: store as u64,
         instance: own as u64,
@@ -3183,6 +3192,28 @@ impl Store {
             self.host_reachable_bodies(module, &funcs)
         };
 
+        #[cfg(feature = "compile")]
+        let compiled = if self.compile_off {
+            // Interpreter-forced store: don't pay the compile cost at all (the
+            // equivalence harness runs whole corpora twice).
+            Vec::new()
+        } else {
+            let mut compiled = crate::compile::compile_module(module);
+            for (entry, reachable) in compiled.iter_mut().zip(&host_reachable) {
+                if *reachable {
+                    *entry = None;
+                }
+            }
+            compiled
+        };
+        // The direct-call table compiled bodies consult through the scratch
+        // region's metadata slot: an address per compiled body, 0 where a body
+        // stays interpreted (its callers then go through the helper).
+        #[cfg(feature = "compile")]
+        let entries: Vec<u64> = compiled
+            .iter()
+            .map(|entry| entry.as_ref().map_or(0, |func| func.entry_addr()))
+            .collect();
         self.instances.push(Instance {
             module: module.clone(),
             funcs,
@@ -3195,19 +3226,9 @@ impl Store {
             depth_limit: DEFAULT_DEPTH_LIMIT,
             body_maps: vec![None; module.bodies.len()],
             #[cfg(feature = "compile")]
-            compiled: if self.compile_off {
-                // Interpreter-forced store: don't pay the compile cost at
-                // all (the equivalence harness runs whole corpora twice).
-                Vec::new()
-            } else {
-                let mut compiled = crate::compile::compile_module(module);
-                for (entry, reachable) in compiled.iter_mut().zip(&host_reachable) {
-                    if *reachable {
-                        *entry = None;
-                    }
-                }
-                compiled
-            },
+            compiled,
+            #[cfg(feature = "compile")]
+            entries,
             #[cfg(feature = "compile")]
             host_reachable,
         });
@@ -3685,7 +3706,10 @@ impl Store {
             // helpers, the helpers' code addresses, and a caller-owned
             // scratch region for call argument/result slots (entry params
             // 7-11).
-            let scratch = vec![0u64; crate::compile::SCRATCH_SLOTS];
+            // The body's direct-call table rides the scratch metadata slot.
+            let entries_ptr = self.instances[instance].entries.as_ptr() as u64;
+            let mut scratch = vec![0u64; crate::compile::SCRATCH_WORDS];
+            scratch[crate::compile::ENTRIES_SLOT] = entries_ptr;
             let runtime = crate::compile::CompiledRuntime {
                 store: self as *mut Store as u64,
                 instance: instance as u64,
