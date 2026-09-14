@@ -22,6 +22,10 @@ compile = [
 ]
 
 [dependencies]
+# The ArrayBuffer byte block, shared with the runtime so `Memory.prototype.buffer`
+# can alias a linear memory instead of copying it (`.notes/wasm-analysis.md`
+# §7 item 8). A leaf crate, so the engine stays free of the JS value model.
+byteblock = { path = "../byteblock" }
 
 # Cranelift's executable-memory allocator (`region`) has no wasm32 backend, so
 # the native-code path is native-only by construction. Scoping these to

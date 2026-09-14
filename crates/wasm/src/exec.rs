@@ -17,6 +17,8 @@
 
 use std::rc::Rc;
 
+use byteblock::SharedBuffer;
+
 use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
 use crate::types::{
@@ -123,10 +125,78 @@ pub const NATIVE_CALL_DEPTH: usize = 64;
 /// The page size of linear memory, in bytes.
 pub const PAGE_SIZE: u64 = 65536;
 
+/// A linear memory's bytes: a handle to the shared byte block the runtime can
+/// alias (`Memory.prototype.buffer`), presented as the byte slice the engine
+/// addresses.
+///
+/// Deref keeps the engine's slice-level memory code (`len`, indexing,
+/// `copy_from_slice`, `fill`, `to_vec`, …) working over the new storage, so the
+/// conversion did not have to be rewritten around a byte-copy API
+/// (`.notes/wasm-analysis.md` §7 item 8; the block also carries the base the
+/// compiled path's descriptors read).
+///
+/// # Safety
+///
+/// Each deref rebuilds the slice from the block's live base ([`SharedBuffer::data_ptr`],
+/// which `resize` refreshes) and its current length, so no pointer is cached.
+/// A borrow taken here is invalidated by a `resize` that moves the storage, so
+/// a caller must not hold one across a grow — the contract the compiled path's
+/// descriptors and the JIT's inline element stores already rely on.
+#[derive(Debug)]
+pub(crate) struct MemoryBytes(SharedBuffer);
+
+impl MemoryBytes {
+    /// A zero-filled block of `byte_length` bytes.
+    fn new(byte_length: usize) -> Self {
+        MemoryBytes(SharedBuffer::new(byte_length))
+    }
+
+    /// Grow to `byte_length` (never shorter: wasm grows a memory only).
+    ///
+    /// The single-agent block resizes its `Vec` in place. Under `workers` the
+    /// storage is a fixed atomic array, so a grow past its capacity replaces
+    /// the block with a fresh one, copying the live bytes — the old block stays
+    /// alive for any view still holding it, which an unshared grow detaches
+    /// anyway.
+    fn resize(&mut self, byte_length: usize) {
+        if self.0.resize(byte_length).is_ok() {
+            return;
+        }
+        let live = self.0.read(0, self.0.byte_length()).unwrap_or_default();
+        let block = SharedBuffer::new(byte_length);
+        if !live.is_empty() && block.write(0, &live).is_err() {
+            // Unreachable: the new block is exactly `byte_length` long and
+            // `live` is the old block's length, which never exceeds it.
+            return;
+        }
+        self.0 = block;
+    }
+}
+
+impl std::ops::Deref for MemoryBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `data_ptr` is the block's live base and `byte_length` its
+        // current length, so the range is in bounds and valid for reads; the
+        // storage outlives every borrow of it (the handle holds it), and no
+        // borrow may be held across a resize (see the type's note).
+        unsafe { std::slice::from_raw_parts(self.0.data_ptr(), self.0.byte_length()) }
+    }
+}
+
+impl std::ops::DerefMut for MemoryBytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `deref`, and the `&mut self` borrow proves no other slice
+        // into this memory is live through the engine's own handle.
+        unsafe { std::slice::from_raw_parts_mut(self.0.data_ptr(), self.0.byte_length()) }
+    }
+}
+
 /// A linear memory: growable byte storage plus its declared maximum.
 #[derive(Debug)]
 pub struct Memory {
-    pub bytes: Vec<u8>,
+    pub(crate) bytes: MemoryBytes,
     max_pages: Option<u64>,
 }
 
@@ -134,7 +204,7 @@ impl Memory {
     /// A zero-filled memory of `min_pages` pages, capped at `max_pages`.
     pub fn new(min_pages: u64, max_pages: Option<u64>) -> Self {
         Memory {
-            bytes: vec![0; (min_pages * PAGE_SIZE) as usize],
+            bytes: MemoryBytes::new((min_pages * PAGE_SIZE) as usize),
             max_pages,
         }
     }
@@ -162,7 +232,7 @@ impl Memory {
         let Ok(byte_len) = usize::try_from(byte_len) else {
             return None;
         };
-        self.bytes.resize(byte_len, 0);
+        self.bytes.resize(byte_len);
         Some(old)
     }
 }
@@ -3945,9 +4015,7 @@ impl Store {
 
     /// A memory cell's current bytes (the whole linear memory).
     pub fn memory_bytes(&self, cell: usize) -> Option<&[u8]> {
-        self.memories
-            .get(cell)
-            .map(|memory| memory.bytes.as_slice())
+        self.memories.get(cell).map(|memory| &*memory.bytes)
     }
 
     /// Overwrite a whole memory cell. The caller matches lengths; returns

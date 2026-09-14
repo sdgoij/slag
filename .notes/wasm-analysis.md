@@ -522,15 +522,29 @@ belongs).
 historical paths, so every user — the JIT's `offset_of!` reads included — is
 source-compatible. The block's out-of-bounds error is the leaf crate's own type
 with a `From` impl in `crux`, so only the six *tail-expression* returns needed
-`.map_err(JsError::from)` and every `?` site is untouched. Behaviour is
-unchanged: the whole corpus is identical on both paths, the 1,001 JS-API tests
-pass, the `workers` build is clean (its block representation is the atomic one),
-and wasm32 still builds. **Open for slice 1b:** the engine can only use the
-block directly if it exposes a byte slice or pointer, which under `workers` it
-does not — so 1b has to decide whether an unshared memory aliases that atomic
-block (the engine taking the raw byte pointer `atomic_ptr` already hands out,
-correct only while no other agent observes it) or keeps the copy bridge in the
-`workers` build and aliases only in the single-agent one.
+`.map_err(JsError::from)` and every `?` site is untouched.
+
+**Slice 1b landed 2026-09-14:** the engine's storage is now the block.
+`Memory.bytes: Vec<u8>` became a `MemoryBytes` handle that derefs to `[u8]`, so
+all 48 `.bytes` sites in `exec.rs` are unchanged — the interpreter's loads/stores,
+`memory.copy`/`fill`/`init`, the data-segment paths, and the compiled path's
+descriptors (`as_ptr()`/`len()` re-read the live base). A handle rather than an
+explicit byte-copy API because the slice-level code is what the engine already
+wants and a mechanical rewrite of 48 sites was the larger risk: the raw-pointer
+invariant (every deref rebuilds from `SharedBuffer::data_ptr()` and
+`byte_length()`; no borrow held across a resize) is written down once, on the
+type. `Memory::resize` keeps the single-agent block resizing its `Vec` in place
+and, under `workers` where the storage is a fixed atomic array, falls back to
+replacing the block and copying — the old block stays alive for any view still
+holding it, which an unshared grow detaches anyway. The `workers` build takes
+design (a): the engine addresses bytes through the raw pointer, sound only while
+no other agent observes the block, and that assumption is recorded on
+`SharedBuffer::data_ptr`.
+
+**Slice 2 is what pays.** Nothing user-visible changed yet — the bridge still
+copies, so the ~5.4 ms/call above stands until `Memory.prototype.buffer` aliases
+`Store::memory_block(cell)` (a clone of the handle) and the six copy sites go
+away, leaving only grow/detach reconciliation.
 
 **Landed 2026-09-14 (items 1, 3, 4 and item 2's double clones).** Measured on a
 hot-loop probe (1M iterations; a call plus a `br_if` plus three numeric ops per

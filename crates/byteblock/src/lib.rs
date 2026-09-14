@@ -175,7 +175,6 @@ pub enum AtomicOp {
     CompareExchange,
 }
 
-
 impl SharedBuffer {
     /// Allocate a zero-filled buffer of `byte_length` bytes.
     pub fn new(byte_length: usize) -> Self {
@@ -354,6 +353,41 @@ impl SharedBuffer {
         #[cfg(feature = "workers")]
         {
             self.block.as_ptr() as usize
+        }
+    }
+
+    /// The address of the block's first byte.
+    ///
+    /// This is the *live* base — `resize` refreshes it when the storage moves
+    /// (the single-agent `Vec` can realloc) — and it is the same address the
+    /// JIT's inline element store reads through [`BlockState::data`], which
+    /// every clone shares. A caller addressing the bytes directly must
+    /// therefore re-read it after any resize rather than caching it across a
+    /// grow, and must not hold a slice built from it across one either.
+    ///
+    /// # Access discipline
+    ///
+    /// A single-agent block is borrowed through a `RefCell`, so a caller that
+    /// reads or writes through this pointer must not hold the borrow across a
+    /// call that borrows the same block.
+    ///
+    /// Under `workers` the storage is an atomic word array rather than a
+    /// `Vec<u8>`, so an access through this pointer is a plain (non-atomic)
+    /// one. That is sound only while no other agent can observe the block at
+    /// the same time — true for the linear memory of a `WebAssembly.Memory`
+    /// the JS-API owns and has not handed to another agent, which is the case
+    /// this exists for. A block another agent can see must be touched through
+    /// the atomic operations instead.
+    pub fn data_ptr(&self) -> *mut u8 {
+        #[cfg(not(feature = "workers"))]
+        {
+            self.state_rc.data.get() as *mut u8
+        }
+        #[cfg(feature = "workers")]
+        {
+            self.state_rc
+                .data
+                .load(std::sync::atomic::Ordering::Relaxed) as *mut u8
         }
     }
 

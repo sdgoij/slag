@@ -1076,6 +1076,7 @@ dependencies = [
 name = "wasm"
 version = "0.1.0"
 dependencies = [
+ "byteblock",
  "cranelift-codegen",
  "cranelift-control",
  "cranelift-frontend",
