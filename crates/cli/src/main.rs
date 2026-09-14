@@ -20,9 +20,8 @@ use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use runtime::embed::Context;
-#[cfg(feature = "jit")]
-use runtime::embed::JsValue;
+use crux::error::JsError;
+use runtime::embed::{Context, JsValue};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -189,6 +188,17 @@ fn report(error: impl std::fmt::Display) -> u8 {
     1
 }
 
+/// The text the CLI prints for an escaping script error. A thrown value prints
+/// the value itself — an `Error`'s `stack`, else its `console.log` rendering,
+/// as Node's uncaught handler does — while an engine error with no thrown value
+/// attached prints its kind and message.
+fn render_error(context: &mut Context, error: &JsError) -> String {
+    match error.value {
+        Some(value) => context.describe_thrown(&JsValue::from(value)),
+        None => error.to_string(),
+    }
+}
+
 /// The surfaces this binary was compiled with, shown in `--help` so a user
 /// can see what is active. The WebAssembly JS API ships behind the default-on
 /// `wasm` cargo feature (the runtime gates the whole engine behind the same
@@ -272,7 +282,7 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
         // al.); the REPL prints its own results.
         Ok(_) => Ok(()),
         Err(error) => {
-            eprintln!("slag: {error}");
+            eprintln!("slag: {}", render_error(&mut context, &error));
             Err(1)
         }
     }
@@ -392,7 +402,7 @@ fn repl(options: &Options) -> Result<(), u8> {
                     println!("{value}");
                 }
             }
-            Err(error) => eprintln!("{error}"),
+            Err(error) => eprintln!("{}", render_error(&mut context, &error)),
         }
     }
     Ok(())
@@ -982,6 +992,17 @@ mod tests {
         let result = run_file(path.to_str().unwrap(), &[], &Options::default());
         std::fs::remove_file(&path).ok();
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn render_error_prints_a_thrown_value_like_node() {
+        let mut context = Context::new().unwrap();
+        // A thrown Error renders its stack; an engine error with no thrown
+        // value keeps its kind and message.
+        let thrown = context.eval("throw new Error('boom')").unwrap_err();
+        assert!(render_error(&mut context, &thrown).starts_with("Error: boom"));
+        let engine = context.eval("null.x").unwrap_err();
+        assert!(render_error(&mut context, &engine).starts_with("TypeError:"));
     }
 
     #[test]

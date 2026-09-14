@@ -663,6 +663,24 @@ impl Context {
         }
     }
 
+    /// Render a thrown value the way a host reports it: an `Error`'s `stack`
+    /// when it has one (the shape Node's uncaught handler prints), else the
+    /// `console.log` rendering of the value. A script's escaping throw arrives
+    /// as a `JsError` whose [`JsError::value`](crux::error::JsError::value)
+    /// holds the thrown value; the CLI prints this for it.
+    pub fn describe_thrown(&mut self, value: &JsValue) -> String {
+        if let Some(object) = value.0.as_object()
+            && let Some(stack) = self.agent.error_stack.get(&object.id())
+        {
+            let text = stack.to_string_lossy();
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        render_console_value(&mut self.agent, &value.0, 0, false, &mut Vec::new())
+            .unwrap_or_else(|_| format!("uncaught {}", value.type_name()))
+    }
+
     /// Whether `value` is a Date instance (has a [[DateValue]] slot).
     pub fn is_date(&self, value: &JsValue) -> bool {
         match value.0.kind() {
@@ -2632,6 +2650,41 @@ mod tests {
             context.eval("build().computed").unwrap().as_number(),
             Some(9.0)
         );
+    }
+
+    #[test]
+    fn uncaught_throw_carries_its_value_and_never_leaks_debug() {
+        let mut context = Context::new().unwrap();
+        // A script-level throw and a timer job's throw both surface with the
+        // thrown value attached and a message free of the internal Debug form.
+        for source in [
+            "throw new Error('boom')",
+            "setTimeout(function () { throw new Error('boom'); }, 0)",
+        ] {
+            let error = context.eval(source).unwrap_err();
+            assert!(
+                !error.message.contains("Gc("),
+                "{source}: message leaked the internal value: {}",
+                error.message
+            );
+            let value = JsValue::from(error.value.expect("the thrown value is attached"));
+            let rendered = context.describe_thrown(&value);
+            assert!(
+                rendered.starts_with("Error: boom"),
+                "{source}: rendered {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn describe_thrown_renders_objects_and_primitives() {
+        let mut context = Context::new().unwrap();
+        let object = context.eval("({ a: 1 })").unwrap();
+        assert_eq!(context.describe_thrown(&object), "{ a: 1 }");
+        let text = context.eval("'boom'").unwrap();
+        assert_eq!(context.describe_thrown(&text), "boom");
+        let number = context.eval("42").unwrap();
+        assert_eq!(context.describe_thrown(&number), "42");
     }
 
     #[test]

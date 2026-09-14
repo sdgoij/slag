@@ -2387,9 +2387,7 @@ fn body_completion_to_value(completion: Completion) -> Result<Value, JsError> {
     match completion {
         Completion::Return(value) => Ok(value),
         Completion::Normal(_) | Completion::Empty => Ok(Value::Undefined),
-        Completion::Throw(value) => {
-            Err(JsError::new(ErrorKind::TypeError, format!("Uncaught {value:?}")).with_value(value))
-        }
+        Completion::Throw(value) => Err(crate::flow::uncaught_error(value)),
         Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
             ErrorKind::SyntaxError,
             "Illegal break/continue statement".into(),
@@ -2655,9 +2653,7 @@ pub(crate) fn create_mapped_arguments_object(
 /// errors into the error (spec 9.4.3) and returning the resulting error.
 fn body_error_after_disposal(agent: &mut Agent, env: &EnvRef, error: JsError) -> JsError {
     match crate::eval::dispose_env_resources(agent, env, Err(error)) {
-        Ok(Completion::Throw(value)) => {
-            JsError::new(ErrorKind::TypeError, format!("Uncaught {value:?}")).with_value(value)
-        }
+        Ok(Completion::Throw(value)) => crate::flow::uncaught_error(value),
         Ok(_) => JsError::new(ErrorKind::TypeError, "Uncaught disposal error".into()),
         Err(error) => error,
     }
@@ -2989,11 +2985,7 @@ fn ordinary_construct(
                     _ => Ok(this),
                 },
                 Completion::Normal(_) | Completion::Empty => Ok(this),
-                Completion::Throw(value) => Err(JsError::new(
-                    ErrorKind::TypeError,
-                    format!("Uncaught {value:?}"),
-                )
-                .with_value(value)),
+                Completion::Throw(value) => Err(crate::flow::uncaught_error(value)),
                 Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
                     ErrorKind::SyntaxError,
                     "Illegal break/continue statement".into(),
@@ -3186,11 +3178,7 @@ fn ordinary_construct(
                     Ok(this)
                 }
             }
-            Completion::Throw(value) => Err(JsError::new(
-                ErrorKind::TypeError,
-                format!("Uncaught {value:?}"),
-            )
-            .with_value(value)),
+            Completion::Throw(value) => Err(crate::flow::uncaught_error(value)),
             Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
                 ErrorKind::SyntaxError,
                 "Illegal break/continue statement".into(),

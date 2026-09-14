@@ -88,6 +88,20 @@ impl Completion {
     }
 }
 
+/// The error an ECMAScript `throw` becomes when it crosses into Rust. The
+/// thrown value rides on [`JsError::value`], so a later `to_throwable` rethrows
+/// it with its identity intact (an enclosing catch observes the original
+/// value); the message is only a fallback for a host that prints the error
+/// without rendering the value ([`crate::embed::Context::describe_thrown`]
+/// renders it the way Node's uncaught handler does).
+pub fn uncaught_error(value: Value) -> JsError {
+    JsError::new(
+        crux::error::ErrorKind::TypeError,
+        "Uncaught exception".into(),
+    )
+    .with_value(value)
+}
+
 /// Convert the script-level completion into the evaluator's `Result`
 /// (Phase 6): `Normal` yields its value; `return`/`break`/`continue` cannot
 /// escape a script; `throw` becomes an error carrying the thrown value.
@@ -95,11 +109,7 @@ pub fn completion_to_result(completion: Completion) -> Result<Value, JsError> {
     match completion {
         Completion::Normal(value) => Ok(value),
         Completion::Empty => Ok(Value::Undefined),
-        Completion::Throw(value) => Err(crux::error::JsError::new(
-            crux::error::ErrorKind::TypeError,
-            format!("Uncaught {value:?}"),
-        )
-        .with_value(value)),
+        Completion::Throw(value) => Err(uncaught_error(value)),
         Completion::Return(_) | Completion::Break { .. } | Completion::Continue { .. } => {
             Err(JsError::new(
                 crux::error::ErrorKind::SyntaxError,

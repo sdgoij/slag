@@ -3142,7 +3142,7 @@ const DISPATCH_SUSPEND: u64 = u64::MAX - 2;
 /// round-trips through the caller's `to_throwable`, so an enclosing catch
 /// observes the original thrown value.
 fn throw_value_error(value: Value) -> JsError {
-    JsError::new(ErrorKind::TypeError, format!("Uncaught {value:?}")).with_value(value)
+    crate::flow::uncaught_error(value)
 }
 
 /// Interpret a `control_transfer`/`throw_machinery` result for the compiled
