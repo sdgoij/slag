@@ -26,8 +26,9 @@ use crate::types::{
 pub enum Error {
     Malformed(&'static str),
     /// Structurally fine but from a feature this engine does not decode yet
-    /// (SIMD, GC, exceptions, memory64, multi-memory). Never reported as
-    /// malformed, so conformance counts don't lie.
+    /// (the stack-switching type/continuation markers and the abstract heap
+    /// types they introduce). Never reported as malformed, so conformance
+    /// counts don't lie.
     Unsupported(&'static str),
 }
 
@@ -411,7 +412,9 @@ fn decode_comptype(bytes: &[u8], pos: &mut usize) -> Result<CompositeType, Error
         0x5e => Ok(CompositeType::Array(decode_field_type(bytes, pos)?)),
         0x5f => {
             let count = read_u32(bytes, pos)?;
-            let mut fields = Vec::with_capacity(count as usize);
+            // No preallocation from an untrusted count: a malformed length
+            // would otherwise allocate before the bounds check rejects it.
+            let mut fields = Vec::new();
             for _ in 0..count {
                 fields.push(decode_field_type(bytes, pos)?);
             }
@@ -831,7 +834,7 @@ fn decode_data(bytes: &[u8], pos: &mut usize) -> Result<DataSegment, Error> {
                 bytes: bytes[start..end].to_vec(),
             })
         }
-        _ => Err(Error::Unsupported("data segment flags")),
+        _ => Err(Error::Malformed("malformed data segment flags")),
     }
 }
 
@@ -852,6 +855,12 @@ fn decode_body(body: &[u8]) -> Result<FuncBody, Error> {
         locals.resize(remaining, ty);
     }
     let instructions = decode_expr(body, &mut pos)?;
+    // The declared size must exactly cover the locals and the expression;
+    // trailing bytes mean the size prefix disagrees with the content (the
+    // `binary.wast` size-mismatch family).
+    if pos != body.len() {
+        return Err(Error::Malformed("trailing bytes in function body"));
+    }
     Ok(FuncBody {
         locals,
         body: instructions,
@@ -1078,7 +1087,7 @@ fn decode_instr(opcode: u8, bytes: &[u8], pos: &mut usize) -> Result<Instr, Erro
         // Structural bytes (block/loop/if/else/end/try_table) never reach
         // decode_instr — they are consumed by decode_expr — so this arm is
         // unreachable from the corpus but keeps the match exhaustive.
-        _ => Err(Error::Unsupported("instruction")),
+        _ => Err(Error::Malformed("illegal opcode")),
     }
 }
 
@@ -1103,13 +1112,13 @@ fn vec_load_op(sub: u16) -> VecLoadOp {
     }
 }
 
-/// Decode the 0xfd SIMD prefix (spec 5.4). The wave of opcodes with full
-/// decode+validate+exec support is handled; everything else stays
-/// [`Error::Unsupported`] so its modules count as pending, not wrong.
+/// Decode the 0xfd SIMD prefix (spec 5.4). Every opcode the pinned spec
+/// defines is in the dispatch below; an unrecognised subopcode is a malformed
+/// encoding rather than a feature a later cut owns.
 fn decode_simd(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
     let sub = read_u32(bytes, pos)?;
     if sub > u32::from(u16::MAX) {
-        return Err(Error::Unsupported("simd opcode"));
+        return Err(Error::Malformed("malformed simd opcode"));
     }
     let sub = sub as u16;
     match sub {
@@ -1191,7 +1200,7 @@ fn decode_simd(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
                 Ok(Instr::Vec(sub))
             }
         }
-        _ => Err(Error::Unsupported("simd opcode")),
+        _ => Err(Error::Malformed("malformed simd opcode")),
     }
 }
 
@@ -1238,7 +1247,7 @@ fn decode_fc(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
         15 => Ok(Instr::TableGrow(read_u32(bytes, pos)?)),
         16 => Ok(Instr::TableSize(read_u32(bytes, pos)?)),
         17 => Ok(Instr::TableFill(read_u32(bytes, pos)?)),
-        _ => Err(Error::Unsupported("0xfc subopcode")),
+        _ => Err(Error::Malformed("malformed 0xfc subopcode")),
     }
 }
 
@@ -1331,7 +1340,7 @@ fn decode_gc(bytes: &[u8], pos: &mut usize) -> Result<Instr, Error> {
         28 => Instr::RefI31,
         29 => Instr::I31GetS,
         30 => Instr::I31GetU,
-        _ => return Err(Error::Unsupported("GC opcode")),
+        _ => return Err(Error::Malformed("malformed GC opcode")),
     })
 }
 
@@ -2042,6 +2051,71 @@ mod tests {
 
         let decoded = decode_body(&body).unwrap();
         assert!(!decoded.body.is_empty());
+    }
+
+    #[test]
+    fn function_body_with_trailing_bytes_is_malformed() {
+        // `end`, then a byte the declared body size still covers.
+        assert_eq!(
+            decode(&module_with_body(&[0x0b, 0x00])).unwrap_err(),
+            Error::Malformed("trailing bytes in function body")
+        );
+    }
+
+    #[test]
+    fn reserved_subopcodes_are_malformed_not_unsupported() {
+        // Every opcode the pinned spec defines decodes; a subopcode outside
+        // those sets is a malformed encoding the runner must score as a
+        // failed `assert_malformed`, not a pending later-cut feature.
+        let unknown_simd = [0xfd, 0x80, 0x20, 0x0b]; // 0xfd 4096
+        assert_eq!(
+            decode(&module_with_body(&unknown_simd)).unwrap_err(),
+            Error::Malformed("malformed simd opcode")
+        );
+
+        let unknown_bulk = [0xfc, 0x64, 0x0b]; // 0xfc 100
+        assert_eq!(
+            decode(&module_with_body(&unknown_bulk)).unwrap_err(),
+            Error::Malformed("malformed 0xfc subopcode")
+        );
+
+        let unknown_gc = [0xfb, 0x64, 0x0b]; // 0xfb 100
+        assert_eq!(
+            decode(&module_with_body(&unknown_gc)).unwrap_err(),
+            Error::Malformed("malformed GC opcode")
+        );
+
+        let atomics = [0xfe, 0x0b]; // the threads prefix
+        assert_eq!(
+            decode(&module_with_body(&atomics)).unwrap_err(),
+            Error::Malformed("illegal opcode")
+        );
+    }
+
+    #[test]
+    fn reserved_data_segment_flags_are_malformed() {
+        let mut w = Writer::header();
+        let mut data = Vec::new();
+        count(1, &mut data);
+        data.push(0x03); // only 0 (active), 1 (passive), 2 (active + index)
+        w.section(11, &data);
+        assert_eq!(
+            decode(&w.into_module()).unwrap_err(),
+            Error::Malformed("malformed data segment flags")
+        );
+    }
+
+    #[test]
+    fn struct_field_count_beyond_the_payload_is_rejected() {
+        // A hostile field count must not preallocate; the read past the end of
+        // the section is what surfaces the error.
+        let mut w = Writer::header();
+        let mut types = Vec::new();
+        count(1, &mut types);
+        types.push(0x5f); // struct
+        types.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]); // 2^32-1 fields
+        w.section(1, &types);
+        assert!(matches!(decode(&w.into_module()), Err(Error::Malformed(_))));
     }
 
     #[test]
