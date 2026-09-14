@@ -249,9 +249,13 @@ Policy and gaps:
   Together the three slices took the call-per-iteration probe from 2.6× to
   **14.3×**, leaving it at the call-free leaf's own floor.
 - **Helpers, not native lowering**, for: all calls, `memory.grow`, imported /
-  call-bearing-body globals, table ops, pure-register SIMD and vec
-  load/lane/shuffle, GC allocation/casts, and EH dynamic dispatch
-  (`compile.rs:4817-4887`, `exec.rs:505-565`).
+  call-bearing-body globals, table ops, GC allocation/casts, EH dynamic
+  dispatch, and the SIMD forms outside the native subset (`compile.rs:4817-4887`,
+  `exec.rs:505-565`). **Partly fixed 2026-09-14:** plain `v128.load` and the
+  pure-register SIMD ops that map one-to-one onto Cranelift vector/bitwise
+  instructions (`v128.not`, bitwise `and`/`andnot`/`or`/`xor`, the integer
+  `*.add`/`*.sub` family, and `*.extract_lane`) lower natively; everything else
+  keeps the helper.
 - **Bounds checks are emitted per access.** The memory descriptor (ptr+len) was
   reloaded every time, because `memory.grow` reallocates the backing store.
   **Fixed 2026-09-14:** the descriptor now rides a cached `Variable` pair seeded
@@ -290,7 +294,7 @@ startup, so the leaf row understates the loop):
 | call-free leaf loop, 10M iterations (`fixtures/leaf-loop.wast`) | 2.044 s | 0.026 s | ~80× |
 | loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.324 s | 0.023 s | ~14× |
 | store + load per iteration, 2M (`fixtures/mem-loop.wast`) | 0.772 s | 0.021 s | ~37× |
-| two register v128 ops per iteration, 2M (`fixtures/simd-loop.wast`) | 0.416 s | 0.087 s | ~4.8× |
+| two register v128 ops per iteration, 2M (`fixtures/simd-loop.wast`) | 0.416 s | 0.023 s | ~18× |
 | `array.set` + `array.get` per iteration, 2M (`fixtures/gc-loop.wast`) | 0.302 s | 0.034 s | ~8.9× |
 
 All are medians of three runs of the committed probes, which isolate execution
@@ -471,7 +475,7 @@ JS-API boundary, "D" = decode/validate.
 | 7 | C | Native direct calls between compiled bodies (or inline the leaf fast path), raising the depth-64 cap (`compile.rs:3127-3131`, `exec.rs:650-683`) | High | High |
 | 8 | J | Replace the full-memory memcpy bridge with zero-copy aliasing, syncing on grow/detach (`wasm.rs:1452-1502`, `3158/3174`) | High | High |
 | 9 | I | Cut call-setup allocation: cache declared locals per body, reuse frames (`5938-5959`) | Med-High | Medium |
-| 10 | C | Lower `v128.load` natively; reduce SIMD helper round-trips (`compile.rs:4878-4887`, `4817-4833`) | Med-High | High |
+| 10 | C | Lower the remaining SIMD forms natively (float/compare/sat/shift/splat/shuffle/lane loads) | Low-Med | High |
 | 11 | J | Register the export wrapper in the O(1) `BUILTIN_HANDLERS` registry (drop a HashMap probe per call) (`wasm.rs:2786-2789`, `function.rs:1699-1702`) | Medium | Low |
 | 12 | I | Resolve the memory cell once and collapse the bounds test to one compare (`3988-4012`, `4487-4504`) | Medium | Low-Med |
 | 13 | I | Cache the body slice / `&mut Frame` once per step instead of re-indexing (`4212-4216`) | Medium | Medium |
@@ -540,6 +544,16 @@ address in one pass, and `mem_start` collapses the two adds into one
 add, and one compare. `mem-loop` is unchanged at 0.79 s — the removed work was
 ~1% of the access cost, below the probe's noise — so this closes the item as a
 code simplification, not a measured win.
+
+Item 10 landed 2026-09-14 as its highest-value slice: the register-SIMD ops
+that map one-to-one onto Cranelift vector/bitwise instructions. `v128.not`,
+`v128.and`/`andnot`/`or`/`xor`, the integer `*.add`/`*.sub` family, and
+`*.extract_lane` now lower natively (bitcast to the lane vector type, one
+vector/bitwise op, bitcast back — with an explicit little-endian byte order on
+the bitcast, which changing lane count requires), and plain `v128.load` is a
+native 16-byte load. The runtime helper stays the fallback for everything else.
+`simd-loop`'s compiled column went 0.087 -> 0.023 s, moving the margin from
+~4.8× to ~18× — the one item this session that delivered its rating.
 
 **Item 8 measured 2026-09-14, and it is the largest boundary cost by orders of
 magnitude.** `WebAssembly.Memory.prototype.buffer` is a *copy*: the JS-API keeps

@@ -96,8 +96,8 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64, Offset32};
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, Function, InstBuilder, MemFlagsData, Signature, Type, UserFuncName,
-    Value as ClifValue, types,
+    AbiParam, Block, BlockArg, Endianness, Function, InstBuilder, MemFlagsData, Signature, Type,
+    UserFuncName, Value as ClifValue, types,
 };
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
@@ -5057,6 +5057,69 @@ impl<'a> Lowerer<'a> {
             .load(types::I128, MemFlagsData::new(), address, Offset32::new(0))
     }
 
+    /// Lower a v128 binop natively when it maps to a single Cranelift vector
+    /// or bitwise instruction; `None` keeps the runtime helper. Bitwise ops act
+    /// on the raw `I128` pattern (shape-independent); integer add/sub bitcast
+    /// to the lane vector type and back.
+    fn native_binop(&mut self, sub: u16, a: ClifValue, b: ClifValue) -> Option<ClifValue> {
+        match sub {
+            0x4e => Some(self.builder.ins().band(a, b)),
+            0x4f => Some(self.builder.ins().band_not(a, b)),
+            0x50 => Some(self.builder.ins().bor(a, b)),
+            0x51 => Some(self.builder.ins().bxor(a, b)),
+            0x6e | 0x71 => self.native_iaddsub(types::I8X16, a, b, sub == 0x6e),
+            0x8e | 0x91 => self.native_iaddsub(types::I16X8, a, b, sub == 0x8e),
+            0xae | 0xb1 => self.native_iaddsub(types::I32X4, a, b, sub == 0xae),
+            0xce | 0xd1 => self.native_iaddsub(types::I64X2, a, b, sub == 0xce),
+            _ => None,
+        }
+    }
+
+    /// Native wrapping lane add/sub: bitcast to the vector type, apply the op,
+    /// and bitcast back to the raw 128-bit pattern. The bitcast changes the
+    /// lane count, so it needs an explicit little-endian byte order (the host
+    /// layout the interpreter's `u128` lanes assume).
+    fn native_iaddsub(
+        &mut self,
+        ty: Type,
+        a: ClifValue,
+        b: ClifValue,
+        add: bool,
+    ) -> Option<ClifValue> {
+        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
+        let a = self.builder.ins().bitcast(ty, flags, a);
+        let b = self.builder.ins().bitcast(ty, flags, b);
+        let out = if add {
+            self.builder.ins().iadd(a, b)
+        } else {
+            self.builder.ins().isub(a, b)
+        };
+        Some(self.builder.ins().bitcast(types::I128, flags, out))
+    }
+
+    /// Native `*.extract_lane`: bitcast to the lane vector type, extract the
+    /// lane, and sign/zero-extend small-integer lanes to the i32 result the
+    /// interpreter produces.
+    fn native_extract(&mut self, sub: u16, v: ClifValue, lane: u8) -> Option<ClifValue> {
+        let ty = match sub {
+            0x15 | 0x16 => types::I8X16,
+            0x18 | 0x19 => types::I16X8,
+            0x1b => types::I32X4,
+            0x1d => types::I64X2,
+            0x1f => types::F32X4,
+            0x21 => types::F64X2,
+            _ => return None,
+        };
+        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
+        let v = self.builder.ins().bitcast(ty, flags, v);
+        let lane = self.builder.ins().extractlane(v, lane);
+        Some(match sub {
+            0x15 | 0x18 => self.builder.ins().sextend(types::I32, lane),
+            0x16 | 0x19 => self.builder.ins().uextend(types::I32, lane),
+            _ => lane,
+        })
+    }
+
     /// Run the runtime simd helper (mode 70) over operands already spilled to
     /// the caller-owned scratch. The helper mirrors `simd_exec` exactly.
     fn simd_helper_call(&mut self, sub: u16, lane: u8) -> Result<(), String> {
@@ -5118,11 +5181,22 @@ impl<'a> Lowerer<'a> {
     }
 
     /// A `v128.load` form: pop the address, bounds-check the form's byte read
-    /// with `mem_ea`, and let the runtime helper (mode 72) materialize the
-    /// vector from the memory bytes at the effective address.
+    /// with `mem_ea`, and materialize the vector. The plain 16-byte form loads
+    /// its raw pattern natively; the extend/splat forms go through the runtime
+    /// helper (mode 72), which reproduces the interpreter's lane assembly.
     fn do_vec_load(&mut self, memory: u32, op: VecLoadOp, offset: u64) -> Result<(), String> {
         let addr = self.pop().ok_or("operand stack underflow")?;
         let ptr = self.mem_ea(memory, addr, offset, op.bytes() as u64)?;
+        if matches!(op, VecLoadOp::V128) {
+            // A native 16-byte little-endian load is the exact bit order the
+            // interpreter's `u128::from_le_bytes` produces.
+            let value =
+                self.builder
+                    .ins()
+                    .load(types::I128, MemFlagsData::new(), ptr, Offset32::new(0));
+            self.stack.push(value);
+            return Ok(());
+        }
         let x = self.iconst(types::I64, op.code() as i64);
         let zero = self.iconst(types::I64, 0);
         self.vec_mem_call(72, x, ptr, zero)?;
@@ -5229,7 +5303,11 @@ impl<'a> Lowerer<'a> {
             return Err("unsupported simd opcode reached the lowerer".to_string());
         };
         match shape {
-            VecSig::Not | VecSig::Unop => {
+            VecSig::Not => {
+                let v = self.pop().ok_or("operand stack underflow")?;
+                self.stack.push(self.builder.ins().bnot(v));
+            }
+            VecSig::Unop => {
                 let v = self.pop().ok_or("operand stack underflow")?;
                 self.spill_v128(0, v);
                 self.simd_helper_call(sub, lane.unwrap_or(0))?;
@@ -5239,11 +5317,15 @@ impl<'a> Lowerer<'a> {
             VecSig::Binop => {
                 let b = self.pop().ok_or("operand stack underflow")?;
                 let a = self.pop().ok_or("operand stack underflow")?;
-                self.spill_v128(0, b);
-                self.spill_v128(2, a);
-                self.simd_helper_call(sub, lane.unwrap_or(0))?;
-                let out = self.load_v128(0);
-                self.stack.push(out);
+                if let Some(out) = self.native_binop(sub, a, b) {
+                    self.stack.push(out);
+                } else {
+                    self.spill_v128(0, b);
+                    self.spill_v128(2, a);
+                    self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                    let out = self.load_v128(0);
+                    self.stack.push(out);
+                }
             }
             VecSig::Ternop => {
                 let c = self.pop().ok_or("operand stack underflow")?;
@@ -5276,11 +5358,16 @@ impl<'a> Lowerer<'a> {
             }
             VecSig::ExtractS(kind) | VecSig::ExtractU(kind) | VecSig::Extract(kind) => {
                 let v = self.pop().ok_or("operand stack underflow")?;
-                self.spill_v128(0, v);
-                self.simd_helper_call(sub, lane.ok_or("missing extract lane")?)?;
-                let wide = self.read_scratch(types::I64);
-                let value = self.value_from_slot(lane_valtype(kind), wide)?;
-                self.stack.push(value);
+                let index = lane.ok_or("missing extract lane")?;
+                if let Some(out) = self.native_extract(sub, v, index) {
+                    self.stack.push(out);
+                } else {
+                    self.spill_v128(0, v);
+                    self.simd_helper_call(sub, index)?;
+                    let wide = self.read_scratch(types::I64);
+                    let value = self.value_from_slot(lane_valtype(kind), wide)?;
+                    self.stack.push(value);
+                }
             }
             VecSig::Replace(kind) => {
                 let scalar = self.pop().ok_or("operand stack underflow")?;
