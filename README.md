@@ -263,6 +263,12 @@ cargo run -p wasmtest -- run waspec/test/core/gc
 cargo run -p wasmtest -- jsapi waspec/test/js-api       # the JS-API fixtures
 ```
 
+`wasmtest run` exits non-zero only on a `fail`, so a pending count is not a
+gate on its own. The decoder's malformed/unsupported boundary — the encodings
+the vendored corpus never reaches — is pinned by
+`crates/wasmtest/fixtures/decoder-classification.wast`, which
+`cargo test -p wasmtest` runs and fails on any pending.
+
 The implementation plan, cut history, and status live in
 `.notes/wasm-plan.md`.
 

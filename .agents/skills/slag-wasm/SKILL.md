@@ -90,6 +90,12 @@ a comment that already said "a frozen SharedArrayBuffer".
 - `cargo clippy --workspace --all-targets -- -D warnings`.
 - `wasmtest check docs/slag.wasm` — a cheap end-to-end decode + validate
   gate over the real 7 MB compiler output.
+- `cargo test -p wasmtest` — runs `tests/decoder_classification.rs` over
+  `fixtures/decoder-classification.wast`. This is the *only* place the
+  "0 pendings" claim is enforced: the runner exits 0 on a pending, so a
+  regression that parks a reserved encoding as `Unsupported` is invisible to
+  the sweep and visible only here. Adding a fixture case means bumping the
+  pinned pass count in that test.
 - `cargo run -q -p wasmtest -- run …` and `-- jsapi waspec/test/js-api`.
   `WASM_JSAPI_VERBOSE=1` prints the failing-test messages.
 - When the change touches the buffer machinery, cross-check the test262

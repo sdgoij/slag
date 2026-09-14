@@ -268,6 +268,10 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
   (`wasmtest/src/main.rs:258-266`). `equiv` (the compile-vs-interpreter
   equivalence gate) and the coverage report require `--features compile` and
   are not part of the default sweep (`wasmtest/src/main.rs:303-333`).
+  (2026-09-14: the decoder's malformed/unsupported boundary is now gated by
+  `crates/wasmtest/tests/decoder_classification.rs` driving
+  `fixtures/decoder-classification.wast`; the corpus sweep's own pending count
+  still is not.)
 - `valid.rs`'s cost is quadratic on hostile input: `push_frame` clones the
   whole `init: Vec<bool>` per structured construct (`valid.rs:693`) — O(n·depth)
   for many locals and deep nesting. Not measured; severity speculative.
