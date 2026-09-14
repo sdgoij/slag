@@ -738,10 +738,13 @@ fn write_fresh_element(
     };
     let mut bytes = [0u8; crux::typed_array::MAX_ELEMENT_SIZE];
     let size = crux::typed_array::encode_element_into(slots.element_type, &value, &mut bytes)?;
-    slots.buffer.write(
-        slots.byte_offset + index as usize * slots.element_type.size(),
-        &bytes[..size],
-    )
+    slots
+        .buffer
+        .write(
+            slots.byte_offset + index as usize * slots.element_type.size(),
+            &bytes[..size],
+        )
+        .map_err(JsError::from)
 }
 
 /// The single-object path of the TypedArray constructor: iterate (or treat

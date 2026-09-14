@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The byte block behind `[[ArrayBufferData]]`: a leaf crate so the wasm engine
+# can share one block with the runtime without depending on the JS value model.
+byteblock = { path = "../byteblock" }
 unicode = { path = "../unicode" }
 num-bigint = "0.4"
 num-traits = "0.2"
@@ -18,7 +21,7 @@ libc = "0.2"
 # Experimental multi-agent mode (PLAN Phase 17): SharedArrayBuffer storage
 # becomes `Arc`-backed and the Atomics operations use real atomic accesses,
 # so byte blocks can be shared across agent threads.
-workers = []
+workers = ["byteblock/workers"]
 
 [dev-dependencies]
 proptest = "1"

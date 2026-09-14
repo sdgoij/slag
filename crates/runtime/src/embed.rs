@@ -582,7 +582,10 @@ impl Context {
                             ),
                         ));
                     }
-                    slots.buffer.write(slots.byte_offset, bytes)
+                    slots
+                        .buffer
+                        .write(slots.byte_offset, bytes)
+                        .map_err(JsError::from)
                 }
                 _ => {
                     let cell = self.agent.buffer_data.get(&obj.id()).ok_or_else(|| {
@@ -608,7 +611,7 @@ impl Context {
                             ),
                         ));
                     }
-                    state.shared.write(0, bytes)
+                    state.shared.write(0, bytes).map_err(JsError::from)
                 }
             },
             _ => Err(JsError::new(

@@ -1,0 +1,13 @@
+[package]
+name = "byteblock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Byte blocks shared across agent threads: the representation becomes an
+# atomic word array (`Send + Sync`) instead of an `Rc<RefCell<Vec<u8>>>`.
+# `crux`'s `workers` feature forwards here, so the two never disagree.
+workers = []
+
+[dependencies]

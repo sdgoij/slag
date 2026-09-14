@@ -480,6 +480,58 @@ first reach, reusing the null-entry fallback every call site already had. It is
 the instantiate half of the same "stop paying for work that is not executed"
 move; the probe is `fixtures/many-bodies.wast` (0.25 s → 0.054 s) — see §5.
 
+**Item 8 measured 2026-09-14, and it is the largest boundary cost by orders of
+magnitude.** `WebAssembly.Memory.prototype.buffer` is a *copy*: the JS-API keeps
+it in sync by copying the whole buffer into the engine cell before a run and the
+whole cell back out after (`wasm.rs:1467-1550`), at six sites that include every
+host call in both directions (`3155-3258`). That is ~3 full copies of the linear
+memory per JS↔wasm call, ~5.4 ms each on a 16 MiB (256-page) memory — **360×
+the call it is attached to** (a 200-call loop: 3 ms with `.buffer` never touched,
+1080 ms once it is), and it scales linearly, so a 1 GiB memory would be ~340 ms
+per call. Anything that reads a string out of wasm memory makes every later call
+ruinous.
+
+The fix is real aliasing, not a cheaper copy: `buffer` must be an ArrayBuffer
+whose byte block *is* the cell's storage, which needs the linear memory to live
+in the same refcounted block the JS side uses (`crux::typed_array::SharedBuffer`;
+`array_buffer_from_block`/`shared_array_buffer_from_block` already wrap one, so
+the JS half exists). Two blockers decide the design:
+
+1. `crates/wasm` currently has **no dependencies at all**, and `crux` pulls
+   `num-bigint`/`ryu`/`half`/`libc` — so `wasm` → `crux` would tax the
+   nested-engine/wasm32 story (`.notes/wasm-depth.md`) for a byte block. A leaf
+   `byteblock` crate (no dependencies, one `workers` feature) re-exported by
+   `crux` keeps the engine dependency-free, at the cost of a new crate.
+2. Under the `workers` feature `SharedBuffer` is an `Arc<[AtomicU64]>`, which is
+   right for a *shared* memory (cross-agent atomics) and wrong for an unshared
+   one on the engine's hot path — and `SharedBuffer`'s layout is JIT-visible
+   (`crates/crux/src/typed_array.rs:195-201`), so whatever moves, the offsets
+   must not.
+
+Slices: (1) storage — `Memory.bytes: Vec<u8>` becomes the shared block behind
+`memory_bytes`/`write_memory` adapters (48 `.bytes` sites in `exec.rs`), behaviour
+unchanged and corpus-verified; (2) alias — materialise `buffer` over that same
+block and delete the six copy sites, keeping only the grow/detach reconciliation
+(the JS-API's detach-on-unshared-grow rule is unchanged, and `memory.grow` then
+moves the live bytes into a fresh block, which is where the one remaining copy
+belongs).
+
+**Slice 1a landed 2026-09-14:** the block type now lives in the new
+`crates/byteblock` leaf crate (no dependencies, one `workers` feature), and
+`crux` re-exports `SharedBuffer`/`BlockState`/`AtomicOp`/`WORKERS` under their
+historical paths, so every user — the JIT's `offset_of!` reads included — is
+source-compatible. The block's out-of-bounds error is the leaf crate's own type
+with a `From` impl in `crux`, so only the six *tail-expression* returns needed
+`.map_err(JsError::from)` and every `?` site is untouched. Behaviour is
+unchanged: the whole corpus is identical on both paths, the 1,001 JS-API tests
+pass, the `workers` build is clean (its block representation is the atomic one),
+and wasm32 still builds. **Open for slice 1b:** the engine can only use the
+block directly if it exposes a byte slice or pointer, which under `workers` it
+does not — so 1b has to decide whether an unshared memory aliases that atomic
+block (the engine taking the raw byte pointer `atomic_ptr` already hands out,
+correct only while no other agent observes it) or keeps the copy bridge in the
+`workers` build and aliases only in the single-agent one.
+
 **Landed 2026-09-14 (items 1, 3, 4 and item 2's double clones).** Measured on a
 hot-loop probe (1M iterations; a call plus a `br_if` plus three numeric ops per
 iteration — `crates/wasmtest/fixtures/interp-hot-loop.wast`, timed as

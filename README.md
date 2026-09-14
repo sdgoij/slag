@@ -296,6 +296,7 @@ The implementation plan, cut history, and status live in
 | Crate | Responsibility |
 |---|---|
 | `unicode` | Code-point tables, case conversion, ID_Start/ID_Continue, derived `\p{...}` tables (generated from the corpus at build time) |
+| `byteblock` | The refcounted byte block behind an ArrayBuffer's `[[ArrayBufferData]]` (an `Rc<RefCell<Vec<u8>>>`; atomic words under `workers`), with the geometry box the JIT reads. A leaf crate so the wasm engine can share one block with the runtime — the prerequisite for aliasing a linear memory instead of copying it |
 | `crux` | `Value`, strings, property keys, completion records, GC handles |
 | `syntax` | `SourceText`, `Span`, `Token`, the full AST |
 | `lexer` | Tokenizer: lexical goals, comments, literals, ASI |

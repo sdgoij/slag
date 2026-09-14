@@ -704,7 +704,10 @@ fn buffer_source_bytes(agent: &Agent, value: &Value) -> Result<Vec<u8>, JsError>
     match &object.kind {
         ObjectKind::IntegerIndexed(slots) => {
             let slots = slots.as_ref().clone();
-            slots.buffer.read(slots.byte_offset, slots.byte_length)
+            slots
+                .buffer
+                .read(slots.byte_offset, slots.byte_length)
+                .map_err(JsError::from)
         }
         _ => {
             let id = object.id();
@@ -716,7 +719,10 @@ fn buffer_source_bytes(agent: &Agent, value: &Value) -> Result<Vec<u8>, JsError>
                     "buffer is detached".into(),
                 ));
             }
-            state.shared.read(0, state.byte_length)
+            state
+                .shared
+                .read(0, state.byte_length)
+                .map_err(JsError::from)
         }
     }
 }

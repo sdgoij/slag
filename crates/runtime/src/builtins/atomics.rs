@@ -153,7 +153,10 @@ fn read_element(slots: &TypedArraySlots, offset: usize) -> Result<Value, JsError
 fn write_element(slots: &TypedArraySlots, offset: usize, value: &Value) -> Result<(), JsError> {
     let size = slots.element_type.size();
     let raw = element_raw(slots.element_type, value)?;
-    slots.buffer.atomic_store(offset, size, raw)
+    slots
+        .buffer
+        .atomic_store(offset, size, raw)
+        .map_err(JsError::from)
 }
 
 /// The native-order integer the element's bytes encode (the raw word the
