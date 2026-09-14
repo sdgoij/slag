@@ -102,11 +102,14 @@ calls still re-enter the interpreter:
   with `--features compile`); `equiv` compares both paths.
 - One binary built with `--features compile` measures both: without `--compiled`
   the store forces the interpreter, which is what makes the A/B meaningful.
-- The envelope, measured: ~80× on a call-free leaf loop, 3.6× on a loop with a
-  call per iteration, 1.42× on the `bulk-memory` corpus, and a wash (0.93×) on
-  the GC corpus, whose work is helper-bound. A call still goes through a
-  store-side helper that resolves the target and materializes a `FuncType`
-  before re-entering the callee natively, which is the remaining cost.
+- The envelope, measured: ~80× on a call-free leaf loop and 7.2× on a loop with
+  a call per iteration (the committed probes; medians of three). Suite timings
+  are not a usable measure — they are dominated by convert/decode/validate,
+  which is why single-run suite figures did not reproduce.
+- A call still goes through a store-side helper: two Rust frames and an
+  indirect call. The per-call buffers are cached per native depth and the
+  callee's declared type is resolved by reference, so what remains is that
+  round-trip itself — a direct call to a compiled body could skip the helper.
 
 ## Validation loop
 

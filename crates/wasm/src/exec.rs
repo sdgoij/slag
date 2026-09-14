@@ -583,20 +583,25 @@ pub unsafe extern "C" fn wasm_call_helper(
         Some(instance) => instance,
         None => return code_of(Trap::UnknownFunction),
     };
-    let declared = match mode {
+    // Resolve the target and the declared type's shape with immutable reads
+    // only, dropping every borrow before the store is mutated below. The type
+    // is materialized only on the interpreted fallback, which needs the
+    // parameter types to decode the argument slots.
+    let (nparams, nresults, target) = match mode {
         0 => {
-            let Some(ty) = store.func_type(instance as usize, x as usize) else {
+            let Some(ty) = store.func_type_ref(instance as usize, x as usize) else {
                 return code_of(Trap::UnknownFunction);
             };
             let Some(target) = caller.funcs.get(x as usize).copied() else {
                 return code_of(Trap::UnknownFunction);
             };
-            (ty, target)
+            (ty.params.len(), ty.results.len(), target)
         }
         1 => {
-            let Some(ty) = caller.module.func_at_cloned(z as u32) else {
+            let Some(ty) = caller.module.func_at(z as u32) else {
                 return code_of(Trap::UnknownFunction);
             };
+            let (nparams, nresults) = (ty.params.len(), ty.results.len());
             let Some(cell) = caller.tables.get(x as usize).copied() else {
                 return code_of(Trap::OutOfBoundsTableAccess);
             };
@@ -620,7 +625,7 @@ pub unsafe extern "C" fn wasm_call_helper(
             if !store.func_type_matches(&caller.module, z as u32, target) {
                 return code_of(Trap::IndirectCallTypeMismatch);
             }
-            (ty, target)
+            (nparams, nresults, target)
         }
         _ => {
             // `call_ref`: `x` is a function token (mode 2; anything else is
@@ -632,9 +637,10 @@ pub unsafe extern "C" fn wasm_call_helper(
             let Value::Ref(RefValue::Func(address)) = value else {
                 return code_of(Trap::NullFunctionReference);
             };
-            let Some(ty) = caller.module.func_at_cloned(z as u32) else {
+            let Some(ty) = caller.module.func_at(z as u32) else {
                 return code_of(Trap::UnknownFunction);
             };
+            let (nparams, nresults) = (ty.params.len(), ty.results.len());
             let Some(target) = store
                 .instances
                 .get(address.instance)
@@ -646,11 +652,10 @@ pub unsafe extern "C" fn wasm_call_helper(
             if !store.func_type_matches(&caller.module, z as u32, target) {
                 return code_of(Trap::IndirectCallTypeMismatch);
             }
-            (ty, target)
+            (nparams, nresults, target)
         }
     };
-    let ty = declared.0;
-    if ty.params.len() as u64 != nargs {
+    if nparams as u64 != nargs {
         store.set_pending_error(ExecFail::Unsupported("compiled call arity"));
         return crate::compile::TRAP_PENDING_ERROR;
     }
@@ -661,7 +666,7 @@ pub unsafe extern "C" fn wasm_call_helper(
     // host callees) fall through to the interpreter path below, which
     // preserves the interpreter's exhaustion semantics and bounds the native
     // stack.
-    let native = match declared.1 {
+    let native = match target {
         FuncTarget::Owned {
             instance: own,
             defined,
@@ -684,8 +689,8 @@ pub unsafe extern "C" fn wasm_call_helper(
                 native_ptr,
                 own,
                 NativeCall {
-                    argc: ty.params.len(),
-                    nout: ty.results.len(),
+                    argc: nparams,
+                    nout: nresults,
                     args_out: scratch,
                     caller_instance: instance as usize,
                     caller_mems: mems,
@@ -695,12 +700,21 @@ pub unsafe extern "C" fn wasm_call_helper(
         store.native_depth -= 1;
         return code;
     }
+    // The interpreted fallback is the one place this path needs the parameter
+    // types themselves.
+    let params = match mode {
+        0 => store.func_params(instance as usize, x as usize),
+        _ => caller.module.func_at(z as u32).map(|ty| ty.params.clone()),
+    };
+    let Some(params) = params else {
+        return code_of(Trap::UnknownFunction);
+    };
     // Decode the argument slots (numeric values, function tokens for
     // function-reference parameters, or a v128 as two words) in parameter
     // order.
-    let mut args = Vec::with_capacity(ty.params.len());
+    let mut args = Vec::with_capacity(params.len());
     let mut word = 0usize;
-    for param in &ty.params {
+    for param in &params {
         match param {
             ValType::V128 => {
                 let lo = unsafe { *scratch.add(word) };
@@ -727,7 +741,7 @@ pub unsafe extern "C" fn wasm_call_helper(
     // subtree): identical semantics, bounded native stack.
     let previous = store.compile_off;
     store.compile_off = true;
-    let outcome = store.run_target(declared.1, &args);
+    let outcome = store.run_target(target, &args);
     store.compile_off = previous;
     // The callee may have grown a memory (its `Vec` reallocated): refresh
     // the caller-owned descriptors so later compiled accesses see the new
@@ -3389,6 +3403,13 @@ impl Store {
     /// (a `ref.host` payload argument is an internal `any` value, while a
     /// `ref.extern` payload is wrapped as an external).
     pub fn func_type(&self, instance: usize, index: usize) -> Option<FuncType> {
+        self.func_type_ref(instance, index).cloned()
+    }
+
+    /// The declared function type at `index` by reference — the clone-free form
+    /// of [`Store::func_type`], for callers that need only its shape. The type
+    /// lives in the instance's own module, so it stays valid as long as `self`.
+    pub fn func_type_ref(&self, instance: usize, index: usize) -> Option<&FuncType> {
         let inst = self.instances.get(instance)?;
         let func_imports = inst
             .module
@@ -3408,7 +3429,7 @@ impl Store {
         } else {
             inst.module.functions.get(index - func_imports).copied()
         }?;
-        inst.module.func_at_cloned(ti)
+        inst.module.func_at(ti)
     }
 
     /// The parameter types of function `index` (full function index space) of

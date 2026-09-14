@@ -194,15 +194,17 @@ Policy and gaps:
   resolution and the per-call buffer setup in Rust first.) Past the cap, or for
   an interpreted or host callee, the helper runs the callee through the
   interpreter instead.
-  **Partly fixed 2026-09-14:** those per-call buffers — memory descriptors,
-  the used-global cells and `gvals`, and a 2 KiB `SCRATCH_SLOTS` scratch, five
-  `Vec`s per call — are now cached per native depth on the store and reused
-  (`Store::native_frames`), which took the call-per-iteration probe from 2.6×
-  to 3.6× over the interpreter. What is left of item 7: the helper still
-  resolves the callee and materializes a `FuncType` by value on every call
-  (`Store::func_type`, `func_at_cloned` for the indirect forms — two `Vec`s per
-  call), every call still costs two Rust frames plus an indirect call, and the
-  depth cap is unchanged.
+  **Partly fixed 2026-09-14, in two slices:** the per-call buffers — memory
+  descriptors, the used-global cells and `gvals`, and a 2 KiB `SCRATCH_SLOTS`
+  scratch, five `Vec`s per call — are now cached per native depth on the store
+  and reused (`Store::native_frames`); and the callee's declared type is
+  resolved by reference (`Store::func_type_ref`, with `func_type` now a
+  one-line wrapper over it) so only the interpreted fallback materializes a
+  `FuncType`, which had been two more `Vec`s per call. Together they took the
+  call-per-iteration probe from 2.6× to **7.2×** over the interpreter. What is
+  left of item 7: every call still costs two Rust frames plus an indirect call
+  through the helper (a direct call to a compiled body could skip the helper
+  outright), and the depth cap is unchanged.
 - **Helpers, not native lowering**, for: all calls, `memory.grow`, imported /
   call-bearing-body globals, table ops, pure-register SIMD and vec
   load/lane/shuffle, GC allocation/casts, and EH dynamic dispatch
@@ -229,15 +231,23 @@ startup, so the leaf row understates the loop):
 | Workload | Interpreter | Compiled | |
 |---|---|---|---|
 | call-free leaf loop, 10M iterations (`fixtures/leaf-loop.wast`) | 2.066 s | 0.026 s | ~80× |
-| loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.343 s | 0.095 s | 3.6× |
-| `bulk-memory` corpus (7,485 assertions) | 0.778 s | 0.546 s | 1.42× |
-| `gc` corpus (654 assertions) | 0.203 s | 0.219 s | 0.93× |
+| loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.326 s | 0.045 s | 7.2× |
+
+Both are medians of three runs of the committed probes, which isolate execution
+(the compiled column still includes ~20 ms of process startup). Whole-suite
+timings are **not** a usable per-path measure: a suite run is dominated by
+converting, decoding, validating, and instantiating, and the single-run figures
+previously quoted here (1.42× on `bulk-memory`, 0.93× on `gc`) did not
+reproduce — re-measured, both land inside the run-to-run noise, with the
+interpreter's own number moving as much as the difference. What the whole
+corpus does establish is correctness, and there both paths report identical
+totals (§3).
 
 The shape is the gap list above: pure compute gets native speed, while helper
-work (GC allocation/casts, bulk ops) and the call helper's Rust-side resolution
-stay on the slow side. Turning it on by default would need the rest of §7 item 7
-(skip the helper round-trip for direct calls) and item 14 (lazy/tiered compile)
-first.
+work (GC allocation/casts, bulk ops) and the call helper's own round-trip stay
+on the slow side. Turning it on by default would need the rest of §7 item 7
+(skip the helper outright for a direct call to a compiled body) and item 14
+(lazy/tiered compile) first.
 
 Verified for the landing: `equiv` over the control-flow files, `exceptions`,
 `bulk-memory`, and `gc` reports **36 suites, 0 diverged**, 1,986/1,986 module
@@ -377,10 +387,11 @@ JS-API boundary, "D" = decode/validate.
 
 Items 1-4 are all "remove an allocation or a scan from a per-instruction
 path", and can be validated with the existing compiled-vs-interpreted
-equivalence harness rather than new tests. Item 7's first slice (2026-09-14)
-was the same move one level up: the native call path allocated five `Vec`s per
-call, and caching them per depth moved the call-per-iteration probe from 2.6×
-to 3.6× — see §5.
+equivalence harness rather than new tests. Item 7's two slices (2026-09-14) were
+the same move one level up: the native call path allocated seven `Vec`s per call
+(five buffers plus the callee's declared type), and caching the buffers per
+depth plus resolving the type by reference moved the call-per-iteration probe
+from 2.6× to 7.2× — see §5.
 
 **Landed 2026-09-14 (items 1, 3, 4 and item 2's double clones).** Measured on a
 hot-loop probe (1M iterations; a call plus a `br_if` plus three numeric ops per
