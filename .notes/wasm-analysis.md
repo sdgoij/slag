@@ -165,6 +165,9 @@ Per-instruction costs that matter (all **(verified)**):
    the inline floor.
 6. **Call setup allocates**: a declared-locals `Vec<ValType>` clone, an args
    `Vec`, and a one-element `labels` `Vec` per call (`exec.rs:5938-5959`).
+   **Fixed 2026-09-14:** the clone is gone (the body's locals are re-borrowed,
+   not copied), and popped frames' `locals`/`labels` buffers recycle through
+   per-invocation pools instead of being reallocated per call.
 7. **Memory access resolves the cell twice and re-checks twice**: `pop_mem_addr`
    → `memory_is64` → `mem_cell`, then the access resolves again
    (`exec.rs:3988-4012`, `4487-4504`), with two `checked_add`s per access even
@@ -515,6 +518,15 @@ not hoistable without range analysis, which the compiled path deliberately
 does not do. The committed probe cannot show the win — `mem-loop.wast`'s 2M
 iterations are ~1-2 ms against ~20 ms of process startup, so the compiled
 column reads 0.021 s before and after.
+
+Item 9 landed 2026-09-14. Call setup was doing three heap allocations per
+call — a `body.locals.clone()`, the args `Vec` (which becomes the frame's
+`locals`), and a one-element `labels` `Vec`. The clone is gone (the declared
+locals are re-borrowed, not copied), and popped frames' `locals`/`labels`
+buffers now recycle through per-invocation pools on the `Engine`
+(`take_locals`/`take_labels`/`recycle_frame`), so a call-heavy loop allocates
+nothing after the pool warms. `interp-hot-loop` moved 0.33 -> 0.29 s (~11%);
+`leaf-loop` and `mem-loop` are unchanged.
 
 **Item 8 measured 2026-09-14, and it is the largest boundary cost by orders of
 magnitude.** `WebAssembly.Memory.prototype.buffer` is a *copy*: the JS-API keeps

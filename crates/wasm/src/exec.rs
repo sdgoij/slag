@@ -3685,6 +3685,8 @@ impl Store {
             store: self,
             stack: suspended.stack,
             frames: suspended.frames,
+            local_pool: Vec::new(),
+            label_pool: Vec::new(),
         };
         engine.stack.extend(results);
         engine.run()
@@ -3711,6 +3713,8 @@ impl Store {
             store: self,
             stack: suspended.stack,
             frames: suspended.frames,
+            local_pool: Vec::new(),
+            label_pool: Vec::new(),
         };
         // No wasm frames are left to catch (a top-level external-host call or
         // an outermost tail call): the exception escapes immediately.
@@ -3899,6 +3903,8 @@ impl Store {
         let mut engine = Engine {
             store: self,
             stack: Vec::new(),
+            local_pool: Vec::new(),
+            label_pool: Vec::new(),
             frames: vec![Frame {
                 instance,
                 pc: 0,
@@ -4154,6 +4160,11 @@ struct Engine<'a> {
     store: &'a mut Store,
     stack: Vec<Value>,
     frames: Vec<Frame>,
+    /// Reusable `locals` buffers from popped frames (avoids one `Vec`
+    /// allocation per call).
+    local_pool: Vec<Vec<Value>>,
+    /// Reusable `labels` buffers from popped frames.
+    label_pool: Vec<Vec<Label>>,
 }
 
 /// What the next engine iteration must do.
@@ -4355,7 +4366,9 @@ impl<'a> Engine<'a> {
             // The top frame had no handler: abandon it (and its operand-stack
             // contribution) and continue searching in its caller.
             let frame = self.frames.pop().unwrap();
-            self.stack.truncate(frame.base);
+            let base = frame.base;
+            self.recycle_frame(frame);
+            self.stack.truncate(base);
         }
     }
 
@@ -6198,12 +6211,8 @@ impl<'a> Engine<'a> {
                 instance: own,
                 defined,
             } => {
-                let (param_count, result_count, declared) = {
+                let (param_count, result_count) = {
                     let module = &self.store.instances[own].module;
-                    let body = module
-                        .bodies
-                        .get(defined)
-                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
                     let type_index = module
                         .functions
                         .get(defined)
@@ -6212,23 +6221,32 @@ impl<'a> Engine<'a> {
                     let signature = module
                         .func_at(type_index)
                         .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-                    (
-                        signature.params.len(),
-                        signature.results.len(),
-                        body.locals.clone(),
-                    )
+                    (signature.params.len(), signature.results.len())
                 };
-                let mut args = Vec::with_capacity(param_count);
+                let mut locals = self.take_locals();
                 for _ in 0..param_count {
-                    args.push(self.pop()?);
+                    locals.push(self.pop()?);
                 }
-                args.reverse();
-                let mut locals = args;
-                for ty in &declared {
-                    locals.push(default_value(*ty)?);
+                locals.reverse();
+                {
+                    let module = &self.store.instances[own].module;
+                    let body = module
+                        .bodies
+                        .get(defined)
+                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                    for ty in &body.locals {
+                        locals.push(default_value(*ty)?);
+                    }
                 }
                 let base = self.stack.len();
                 self.frames[caller].pc += 1;
+                let mut labels = self.take_labels();
+                labels.push(Label {
+                    arity: result_count,
+                    height: base,
+                    is_loop: false,
+                    open: 0,
+                });
                 self.frames.push(Frame {
                     instance: own,
                     pc: 0,
@@ -6236,12 +6254,7 @@ impl<'a> Engine<'a> {
                     base,
                     results: result_count,
                     body_index: defined,
-                    labels: vec![Label {
-                        arity: result_count,
-                        height: base,
-                        is_loop: false,
-                        open: 0,
-                    }],
+                    labels,
                 });
                 Ok(Ctl::Settled)
             }
@@ -6285,7 +6298,11 @@ impl<'a> Engine<'a> {
                         // the run resumes.
                         let base = self.frames[top].base;
                         self.stack.truncate(base);
-                        self.frames.pop();
+                        let recycled = self
+                            .frames
+                            .pop()
+                            .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                        self.recycle_frame(recycled);
                         Ok(Ctl::Host { token, args })
                     }
                     None => {
@@ -6303,12 +6320,8 @@ impl<'a> Engine<'a> {
                 instance: own,
                 defined,
             } => {
-                let (param_count, result_count, declared) = {
+                let (param_count, result_count) = {
                     let module = &self.store.instances[own].module;
-                    let body = module
-                        .bodies
-                        .get(defined)
-                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
                     let type_index = module
                         .functions
                         .get(defined)
@@ -6317,23 +6330,36 @@ impl<'a> Engine<'a> {
                     let signature = module
                         .func_at(type_index)
                         .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-                    (
-                        signature.params.len(),
-                        signature.results.len(),
-                        body.locals.clone(),
-                    )
+                    (signature.params.len(), signature.results.len())
                 };
-                let mut args = Vec::with_capacity(param_count);
+                let mut locals = self.take_locals();
                 for _ in 0..param_count {
-                    args.push(self.pop()?);
+                    locals.push(self.pop()?);
                 }
-                args.reverse();
-                let mut locals = args;
-                for ty in &declared {
-                    locals.push(default_value(*ty)?);
+                locals.reverse();
+                {
+                    let module = &self.store.instances[own].module;
+                    let body = module
+                        .bodies
+                        .get(defined)
+                        .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                    for ty in &body.locals {
+                        locals.push(default_value(*ty)?);
+                    }
                 }
                 let base = self.frames[top].base;
-                self.frames.pop();
+                let recycled = self
+                    .frames
+                    .pop()
+                    .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+                self.recycle_frame(recycled);
+                let mut labels = self.take_labels();
+                labels.push(Label {
+                    arity: result_count,
+                    height: base,
+                    is_loop: false,
+                    open: 0,
+                });
                 self.frames.push(Frame {
                     instance: own,
                     pc: 0,
@@ -6341,12 +6367,7 @@ impl<'a> Engine<'a> {
                     base,
                     results: result_count,
                     body_index: defined,
-                    labels: vec![Label {
-                        arity: result_count,
-                        height: base,
-                        is_loop: false,
-                        open: 0,
-                    }],
+                    labels,
                 });
                 Ok(Ctl::Settled)
             }
@@ -6373,12 +6394,15 @@ impl<'a> Engine<'a> {
             .frames
             .pop()
             .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
+        let results = frame.results;
+        let base = frame.base;
+        self.recycle_frame(frame);
         if self.frames.is_empty() {
             // Once per invocation: the popped frame's results *are* the return
             // value, so this is the one path that still needs an owned `Vec`.
-            return Ok(Some(self.take_top(frame.results)));
+            return Ok(Some(self.take_top(results)));
         }
-        self.move_top_to(frame.results, frame.base);
+        self.move_top_to(results, base);
         Ok(None)
     }
 
@@ -6409,6 +6433,29 @@ impl<'a> Engine<'a> {
         let values = self.stack[start..].to_vec();
         self.stack.truncate(start);
         values
+    }
+
+    /// Take a reusable `locals` buffer (or allocate a fresh one), cleared for
+    /// a new frame.
+    fn take_locals(&mut self) -> Vec<Value> {
+        let mut locals = self.local_pool.pop().unwrap_or_default();
+        locals.clear();
+        locals
+    }
+
+    /// Take a reusable `labels` buffer (or allocate a fresh one), cleared for
+    /// a new frame.
+    fn take_labels(&mut self) -> Vec<Label> {
+        let mut labels = self.label_pool.pop().unwrap_or_default();
+        labels.clear();
+        labels
+    }
+
+    /// Return a popped frame's buffers to the reuse pools. The caller reads
+    /// the frame's copy fields (`base`, `results`) before recycling.
+    fn recycle_frame(&mut self, frame: Frame) {
+        self.local_pool.push(frame.locals);
+        self.label_pool.push(frame.labels);
     }
 }
 
