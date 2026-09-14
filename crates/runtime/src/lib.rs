@@ -47,3 +47,11 @@ pub use env::{EnvRecord, EnvRef};
 pub use host::HostHooks;
 pub use realm::{Intrinsics, Realm};
 pub use script::ScriptRecord;
+
+/// Re-export the raw WebAssembly engine, so an embedder that wants to drive a
+/// module itself (rather than through the JS `WebAssembly` global) can own a
+/// `Store` and its memory. Gated on the `wasm` feature, the same feature that
+/// brings the crate in.
+#[cfg(feature = "wasm")]
+pub use wasm;
+

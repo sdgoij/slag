@@ -19,6 +19,12 @@ pub use runtime::dump;
 pub use runtime::embed::{Context, FunctionCall, HostCallbacks, HostFn, JsObject, JsValue};
 pub use runtime::embed::{OutputFn, RandomFn};
 
+/// Re-export the WebAssembly engine, so an embedder can drive a module from
+/// Rust (`Store`/`Instance`/`Memory`/`Value`) instead of through the JS API.
+#[cfg(feature = "wasm")]
+pub use runtime::wasm;
+
+
 /// Install the Cranelift JIT hook on `context`'s agent (feature `jit`).
 ///
 /// The hook is what makes hot certified bodies run at machine speed; the
