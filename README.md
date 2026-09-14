@@ -258,7 +258,10 @@ skips: three harness-tooling files in the baseline (`annotations`,
 module-linking `instance`, and `names` — confusing-unicode export names),
 one `gc/type-subtyping.wast` whose multi-supertype text the `wast`
 grammar rejects, and the out-of-scope `gc`/`js-string` JS-API proposals
-(the embedder-limit `limits.any.js` runs on demand).
+(the embedder-limit `limits.any.js` runs on demand). The rules that last
+file covers are pinned instead by
+`crates/wasmtest/fixtures/type-subtyping.wast`, which
+`cargo test -p wasmtest` gates.
 
 Run the sweeps with the `wasmtest` runner. Duplicate `.wast` file names
 across directories share the runner's cache key, so each suite directory

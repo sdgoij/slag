@@ -51,6 +51,16 @@ the pinned spec — e.g. every SIMD subopcode is in `simd::sig` (relaxed SIMD
 included, `0x100..=0x113`), so an unrecognised `0xfd` subopcode is malformed
 rather than unsupported.
 
+The same split has a third direction, which cost a real bug: an encoding the
+binary grammar *does* allow, whose restriction the spec states as a **validation**
+rule, must decode and fail in `valid` — enforcing it in the decoder reports
+`Malformed`, which turns the corpus's `assert_invalid` into a failure. The
+supertype *list* is the worked example: `x*:Blist(Btypeidx)` puts no bound on
+it, the corpus's `assert_invalid` for two supertypes expects *invalid*, and
+`decode_subtype` used to reject the count. Before adding a decoder check, ask
+which of the four files states the rule — `5.*`-binary is malformed territory,
+`2.*`-validation is not.
+
 ## Trap 2 — the decoder is strict end to end
 
 - `decode_body` must consume the declared body size exactly; trailing bytes
@@ -162,13 +172,16 @@ not an eligible direct-call target:
   means the bytes parsed, not that the module is valid (a module it calls `ok`
   can still fail a suite with "module invalid"). Use it over `docs/slag.wasm`
   as a cheap decode gate on the real 7 MB compiler output.
-- `cargo test -p wasmtest` — runs `tests/decoder_classification.rs` over
-  `fixtures/decoder-classification.wast`, the only place the decoder's
-  malformed/unsupported boundary is pinned (adding a fixture case means bumping
-  the pinned pass count in that test). The corpus's own "0 pendings" claim is
-  gated separately: `wasmtest run --strict` exits non-zero on a pending, too,
-  and the documented sweeps pass it. Without `--strict` a regression that parks
-  a reserved encoding as `Unsupported` is invisible to the sweep.
+- `cargo test -p wasmtest` — runs two fixture gates: `tests/decoder_classification.rs`
+  over `fixtures/decoder-classification.wast`, the only place the decoder's
+  malformed/unsupported boundary is pinned, and `tests/type_subtyping.rs` over
+  `fixtures/type-subtyping.wast`, which pins the subtype-declaration rules the
+  unsweepable `gc/type-subtyping.wast` would have covered. Adding a fixture case
+  means bumping the pinned pass count in the matching test. The corpus's own
+  "0 pendings" claim is gated separately: `wasmtest run --strict` exits non-zero
+  on a pending, too, and the documented sweeps pass it. Without `--strict` a
+  regression that parks a reserved encoding as `Unsupported` is invisible to the
+  sweep.
 - `cargo run -q -p wasmtest -- run …` and `-- jsapi waspec/test/js-api`.
   `WASM_JSAPI_VERBOSE=1` prints the failing-test messages.
 - When a hand-written `.wast`/`.wat` (a probe, a fixture) is reported

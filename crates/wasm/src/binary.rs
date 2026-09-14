@@ -360,8 +360,8 @@ fn decode_rectype(bytes: &[u8], pos: &mut usize, types: &mut Vec<SubType>) -> Re
 
 /// A defined type (spec 5.3). The 0x4f/0x50 prefixes mark `sub final`/`sub`;
 /// a bare composite type is the shorthand for a final type without
-/// supertypes. Both prefixes are followed by the supertype list (0 or 1 in
-/// the GC MVP), then the composite type.
+/// supertypes. Both prefixes are followed by the supertype list, then the
+/// composite type.
 fn decode_subtype(bytes: &[u8], pos: &mut usize, types: &mut Vec<SubType>) -> Result<(), Error> {
     let byte = bytes
         .get(*pos)
@@ -374,13 +374,14 @@ fn decode_subtype(bytes: &[u8], pos: &mut usize, types: &mut Vec<SubType>) -> Re
     };
     let supertypes = if prefixed {
         *pos += 1;
+        // The binary grammar puts no bound on the supertype list (`x*:
+        // Blist(Btypeidx)`, spec 5.3): the "at most one" rule is a validation
+        // condition (spec K-sub), so a longer list decodes here and `valid`
+        // rejects it. Reporting it malformed would turn the corpus's
+        // `assert_invalid` for it into a failure. No preallocation from the
+        // untrusted count, matching `read_valtype_vec`.
         let count = read_u32(bytes, pos)?;
-        // The GC MVP allows a single supertype; any count is a malformed
-        // module rather than a later feature.
-        if count > 1 {
-            return Err(Error::Malformed("malformed subtype"));
-        }
-        let mut list = Vec::with_capacity(count as usize);
+        let mut list = Vec::new();
         for _ in 0..count {
             list.push(read_u32(bytes, pos)?);
         }

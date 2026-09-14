@@ -88,10 +88,33 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
     let type_count = module.types.len();
     for (index, ty) in module.types.iter().enumerate() {
         let group_end = module.rec_group_end(index as u32) as usize;
-        if let Some(supertype) = ty.supertypes.first()
-            && (*supertype as usize >= type_count || *supertype as usize >= group_end)
-        {
-            return Err(Error::Invalid("unknown type"));
+        // `sub` well-formedness (spec K-sub). The supertype list is unbounded
+        // in the binary format, so the "at most one" rule lives here rather
+        // than in the decoder.
+        if ty.supertypes.len() > 1 {
+            return Err(Error::Invalid("multiple supertypes"));
+        }
+        if let Some(supertype) = ty.supertypes.first() {
+            // A supertype must be declared before the subtype that names it,
+            // so a later member of the subtype's own rec group is not one: the
+            // group-end bound alone admits it, and `x < x_0` is also what keeps
+            // the supertype walk acyclic.
+            if *supertype as usize >= index {
+                return Err(Error::Invalid("supertype must precede the subtype"));
+            }
+            if *supertype as usize >= type_count {
+                return Err(Error::Invalid("unknown type"));
+            }
+            let parent = &module.types[*supertype as usize];
+            // `final` forbids further subtyping. The corpus names a supertype
+            // that is final, or one whose composite does not match, `sub`
+            // `type`, so both report the same message it expects.
+            if parent.is_final {
+                return Err(Error::Invalid("sub type"));
+            }
+            if !comptype_matches(module, &ty.composite, &parent.composite) {
+                return Err(Error::Invalid("sub type"));
+            }
         }
         match &ty.composite {
             CompositeType::Func(func) => {
@@ -229,6 +252,117 @@ fn check_value_types(types: &[ValType], type_count: usize, _in: usize) -> Result
         }
     }
     Ok(())
+}
+
+/// Whether the composite type of a `sub` declaration matches its supertype's
+/// (spec `Comptype_sub`, S-comp): the kinds must agree, a struct's fields must
+/// begin with the supertype's, and fields, parameters, and results follow
+/// their variance. Parameters are contravariant and results covariant, so
+/// `func` matching is the one place the subtype relation runs backwards.
+fn comptype_matches(module: &Module, sub: &CompositeType, sup: &CompositeType) -> bool {
+    match (sub, sup) {
+        (CompositeType::Func(sub), CompositeType::Func(sup)) => {
+            sub.params.len() == sup.params.len()
+                && sub.results.len() == sup.results.len()
+                && sup
+                    .params
+                    .iter()
+                    .zip(&sub.params)
+                    .all(|(s, b)| valtype_matches(module, *s, *b))
+                && sub
+                    .results
+                    .iter()
+                    .zip(&sup.results)
+                    .all(|(s, b)| valtype_matches(module, *s, *b))
+        }
+        (CompositeType::Struct(sub), CompositeType::Struct(sup)) => {
+            sub.len() >= sup.len()
+                && sub
+                    .iter()
+                    .zip(sup)
+                    .all(|(s, b)| field_matches(module, s, b))
+        }
+        (CompositeType::Array(sub), CompositeType::Array(sup)) => field_matches(module, sub, sup),
+        _ => false,
+    }
+}
+
+/// Whether a subtype field matches its supertype's (spec `Fieldtype_sub`): a
+/// constant field is covariant in its storage type, a mutable one invariant
+/// (mutable storage is readable *and* writable, so it cannot widen).
+fn field_matches(module: &Module, sub: &FieldType, sup: &FieldType) -> bool {
+    sub.mutable == sup.mutable
+        && storage_matches(module, sub.ty, sup.ty)
+        && (!sub.mutable || storage_matches(module, sup.ty, sub.ty))
+}
+
+/// Whether storage type `sub` matches `sup` (spec `Storagetype_sub`): a packed
+/// type only matches itself, a value type follows value subtyping.
+fn storage_matches(module: &Module, sub: StorageType, sup: StorageType) -> bool {
+    match (sub, sup) {
+        (StorageType::Ref(sub), StorageType::Ref(sup)) => reftype_matches(module, sub, sup),
+        _ => sub == sup,
+    }
+}
+
+/// Whether value type `sub` matches `sup` (spec `Valtype_sub`).
+fn valtype_matches(module: &Module, sub: ValType, sup: ValType) -> bool {
+    match (sub, sup) {
+        (ValType::Ref(sub), ValType::Ref(sup)) => reftype_matches(module, sub, sup),
+        _ => sub == sup,
+    }
+}
+
+/// Whether reference type `sub` matches `sup` (spec `Reftype_sub`):
+/// nullability is covariant (a non-null reference fits a nullable one, never
+/// the reverse), and the heap types must be ordered.
+fn reftype_matches(module: &Module, sub: RefType, sup: RefType) -> bool {
+    (!sub.nullable || sup.nullable) && heap_matches(module, sub.heap, sup.heap)
+}
+
+/// Whether heap type `sub` is a subtype of `sup` (spec `Heaptype_sub`): the
+/// abstract lattice, the bottom types of each hierarchy, and the declared
+/// supertype chains of the module's concrete types.
+fn heap_matches(module: &Module, sub: HeapType, sup: HeapType) -> bool {
+    use HeapType::*;
+    if sub == sup {
+        return true;
+    }
+    // Whether a concrete type index unfolds to the given kind (`Expand`): a
+    // subtype of a struct is itself a struct, because `comptype_matches`
+    // requires the kinds to agree along the chain.
+    let unfolds_to = |index: u32, kind: HeapType| {
+        module.types.get(index as usize).is_some_and(|ty| {
+            matches!(
+                (&ty.composite, kind),
+                (CompositeType::Func(_), Func)
+                    | (CompositeType::Struct(_), Struct)
+                    | (CompositeType::Array(_), Array)
+            )
+        })
+    };
+    let aggregate = |index: u32| unfolds_to(index, Struct) || unfolds_to(index, Array);
+    match (sub, sup) {
+        // A concrete type is a subtype of another through its declared chain
+        // (equivalence or a supertype edge), and of the kind it unfolds to.
+        (Type(a), Type(b)) => module.type_is_subtype(a, b),
+        (Type(a), Func) => unfolds_to(a, Func),
+        (Type(a), Struct) => unfolds_to(a, Struct),
+        (Type(a), Array) => unfolds_to(a, Array),
+        (Type(a), Eq | Any) => aggregate(a),
+        // The abstract lattice: `i31`/`struct`/`array` sit under `eq`, which
+        // sits under `any`.
+        (I31 | Struct | Array, Eq | Any) => true,
+        (Eq, Any) => true,
+        // Each bottom type fits every member of its own hierarchy (`none` the
+        // internal one, `nofunc` the function one, and so on).
+        (None, Any | Eq | I31 | Struct | Array) => true,
+        (None, Type(b)) => aggregate(b),
+        (NoFunc, Func) => true,
+        (NoFunc, Type(b)) => unfolds_to(b, Func),
+        (NoExtern, Extern) | (NoExn, Exn) => true,
+        _ => false,
+    }
 }
 
 fn validate_table_type(ty: &TableType, type_count: usize) -> Result<(), Error> {

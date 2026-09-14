@@ -365,10 +365,34 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
    is inert in phase 2. **Deferred:** out of scope for the 2026-09-14 decoder
    cleanup; wiring it moves validator verdicts corpus-wide and needs its own
    sweep.
-5. **Supertype well-formedness is under-validated.** `build_spaces` bounds the
-   supertype index but does not check composite-kind compatibility, supertype
-   finality, or mutability/variance (`valid.rs:89-108`). `type-subtyping.wast`
-   is excluded from the corpus, which likely hides this.
+5. **Supertype well-formedness was under-validated.** `build_spaces` bounded the
+   supertype index but checked neither composite-kind compatibility, supertype
+   finality, nor field/parameter variance (`valid.rs:89-108`), and
+   `decode_subtype` rejected a supertype **count** above 1 as
+   `Malformed("malformed subtype")` — a *validation* rule (spec K-sub's
+   `|x*| <= 1`) enforced in the decoder, which would have turned the corpus's
+   `assert_invalid` for that case into a failure. **Fixed 2026-09-14, both
+   halves.** The decoder now accepts the list (the binary grammar bounds it not
+   at all: `x*:Blist(Btypeidx)`, spec 5.3) and pushes incrementally rather than
+   preallocating from the untrusted count, and `valid` enforces all four K-sub
+   conditions: at most one supertype, a supertype that strictly precedes the
+   subtype (the old group-end bound admitted a *later* member of the same rec
+   group, and `x < x_0` is also what keeps the supertype walk acyclic), a
+   non-final supertype, and `Comptype_sub` — kind agreement, a struct's fields
+   as a prefix, constant fields covariant, mutable fields invariant, and
+   function parameters contravariant with results covariant, over a new
+   `heap_matches` that covers the abstract lattice, the bottom types, and the
+   declared supertype chains.
+   **The corpus file stays excluded.** `gc/type-subtyping.wast` cannot be
+   swept: its `multiple supertypes` case is `(sub $a $b …)` *text*, and the
+   pinned `wast` 258.0.0 grammar rejects a second type index (the spec's own
+   text rule is `x*:Tlist(Ttypeidx)`, so this is a tooling lag, not a spec
+   limit; the local registry has no newer `wast`, and wabt is not on PATH).
+   `crates/wasmtest/fixtures/type-subtyping.wast` therefore pins the same rules
+   in a parseable form — the multi-supertype case encoded as bytes — and
+   `tests/type_subtyping.rs` gates it. Every module in it is cross-checked
+   against V8 (node v24.12.0), which accepts the valid module and rejects all
+   ten `assert_invalid` cases.
 6. **Tokenless host functions cannot return results.** A *type-only* host
    function with a non-empty result type is `Unsupported("host function
    results")` from the top frame and in tail position (`exec.rs:5880-5888`,

@@ -1,9 +1,9 @@
 //! The engine-owned decoder-classification fixtures must stay judged, not
 //! parked.
 //!
-//! `wasmtest run` exits zero on `pending`, so nothing else in the suite
-//! enforces the wasm sweep's "0 pendings" claim; this test does it for the
-//! decoder's malformed/unsupported boundary.
+//! The documented corpus sweeps pass `--strict`, so they fail on a pending; a
+//! *fixture* is not part of them, and this test is what keeps this one from
+//! quietly parking an encoding.
 
 use std::process::Command;
 
