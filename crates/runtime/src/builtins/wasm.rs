@@ -1097,19 +1097,10 @@ fn memory_cell(agent: &Agent, this: &Value) -> Result<usize, JsError> {
         .ok_or_else(error)
 }
 
-/// The whole bytes of a memory cell (a snapshot; no store borrow is held).
-fn memory_cell_bytes(agent: &Agent, cell: usize) -> Result<Vec<u8>, JsError> {
-    agent
-        .wasm_store
-        .borrow()
-        .memory_bytes(cell)
-        .map(<[u8]>::to_vec)
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "memory cell vanished".into()))
-}
-
+/// A shared memory's linear-memory buffer: a SharedArrayBuffer over the cell's
 /// Whether a memory cell is a JS-API shared memory (its buffer is a
-/// SharedArrayBuffer whose block survives grows; only an unshared grow
-/// detaches the previous buffer).
+/// SharedArrayBuffer whose block survives grows; only an unshared grow detaches
+/// the previous buffer).
 fn memory_is_shared(agent: &Agent, cell: usize) -> bool {
     agent
         .wasm_store
@@ -1144,31 +1135,24 @@ fn shared_memory_buffer(
     Ok(buffer)
 }
 
-/// Materialize the current buffer of a memory cell: a fresh ArrayBuffer the
-/// cell's bytes are copied into, registered as the cell's live buffer so
-/// `buffer` keeps object identity until the memory grows. A shared memory's
-/// buffer is a SharedArrayBuffer over a per-cell block that every grow-sized
-/// view aliases (the JS-API shared-memory buffer rule).
+/// Materialize the current buffer of a memory cell: a view over the cell's own
+/// byte block, registered so `buffer` keeps object identity until the memory
+/// grows. There is no copy — writing through the buffer reaches the engine and
+/// wasm's writes reach the buffer — so the two sides never need reconciling
+/// (`.notes/wasm-analysis.md` §7 item 8). A shared memory's buffer is a
+/// SharedArrayBuffer over the same block, which every grow resizes in place (the
+/// JS-API shared-memory buffer rule).
 fn materialize_memory_buffer(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
-    let bytes = memory_cell_bytes(agent, cell)?;
+    let block = agent
+        .wasm_store
+        .borrow()
+        .memory_block(cell)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "memory cell vanished".into()))?;
+    let byte_length = block.byte_length();
     let buffer = if memory_is_shared(agent, cell) {
-        // A shared memory's block must absorb every later grow in place (the
-        // workers `SharedBuffer` block is fixed-capacity and `resize` refuses
-        // to grow past it), so allocate the block at the declared maximum
-        // page count up front rather than at the current byte length.
-        let capacity = agent
-            .wasm_store
-            .borrow()
-            .memory_type(cell)
-            .and_then(|ty| ty.limits.max)
-            .map(|pages| (pages as usize).saturating_mul(wasm::exec::PAGE_SIZE as usize))
-            .unwrap_or(bytes.len())
-            .max(bytes.len());
-        let block = SharedBuffer::new_with_capacity(bytes.len(), capacity);
-        block.write(0, &bytes)?;
-        shared_memory_buffer(agent, block, bytes.len())?
+        shared_memory_buffer(agent, block, byte_length)?
     } else {
-        array_buffer_of(agent, &bytes)?
+        array_buffer::array_buffer_from_block(agent, block, byte_length)?
     };
     agent.wasm_memory_buffers.insert(cell, buffer);
     Ok(buffer)
@@ -1431,19 +1415,17 @@ fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         };
         let id = object.id();
         if memory_is_shared(agent, cell) {
-            let new_pages = old.checked_add(delta).ok_or_else(|| {
-                JsError::new(ErrorKind::RangeError, "memory grow overflow".into())
-            })?;
-            let new_len = usize::try_from(new_pages.saturating_mul(wasm::exec::PAGE_SIZE))
-                .map_err(|_| JsError::new(ErrorKind::RangeError, "memory grow overflow".into()))?;
-            let mut block = {
-                let state = agent.buffer_data.get(&id).ok_or_else(|| {
-                    JsError::new(ErrorKind::TypeError, "memory buffer state vanished".into())
-                })?;
-                state.borrow().shared.clone()
-            };
-            block.resize(new_len)?;
-            let fresh = shared_memory_buffer(agent, block, new_len)?;
+            // The memory's own block already grew in place (a shared memory's
+            // block is allocated at its declared maximum), and the old buffer
+            // stays attached and aliasing, so the registered buffer becomes a
+            // fresh view over it at the new length.
+            let block = agent
+                .wasm_store
+                .borrow()
+                .memory_block(cell)
+                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "memory cell vanished".into()))?;
+            let byte_length = block.byte_length();
+            let fresh = shared_memory_buffer(agent, block, byte_length)?;
             agent.wasm_memory_buffers.insert(cell, fresh);
         } else {
             agent.wasm_memory_buffers.remove(&cell);
@@ -1457,99 +1439,49 @@ fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     }
 }
 
-// ---- the JS <-> wasm memory bridge (Cut 10 wave 3b, slice 1) ----
+// ---- the JS <-> wasm memory path ----
 //
-// A `WebAssembly.Memory`'s ArrayBuffer (SharedArrayBuffer for a shared
-// memory) is a cache of its engine cell: JS writes through buffer views land
-// in the buffer, wasm writes land in the cell. The two are reconciled around
-// every wasm run — the buffer is flushed into the cell first, then refreshed
-// from it — so at every JS boundary the buffer shows the memory exactly. A
-// cell that outgrew its buffer (a `memory.grow` inside wasm) replaces the
-// buffer, detaching the stale one for an unshared memory (the JS-API
-// detach-on-grow rule); a shared memory keeps every prior buffer attached,
-// resizing the shared block so old and new views keep aliasing.
+// A `WebAssembly.Memory`'s ArrayBuffer (SharedArrayBuffer for a shared memory)
+// is a *view* over the memory's own byte block, so JS writes through its views
+// reach the engine and wasm's writes are visible to those views with no
+// reconciliation at all — including mid-run, when wasm calls an imported JS
+// function that reads `memory.buffer` (`.notes/wasm-analysis.md` §7 item 8).
+// Only a *grow* needs work: it moved the buffer's length (or, for an unshared
+// memory whose block could not grow in place, replaced the block).
 
-/// Push every live memory buffer into its engine cell (before wasm runs).
-fn memory_buffers_to_store(agent: &mut Agent) -> Result<(), JsError> {
+/// Reconcile every live memory buffer with its cell after wasm ran: an
+/// unshared grow detaches the stale buffer and lets the next `buffer` access
+/// materialise a fresh view (the JS-API detach-on-grow rule); a shared grow
+/// keeps every prior buffer attached and aliasing, registering a fresh view at
+/// the new length. A buffer whose length already matches needs nothing.
+fn memory_buffers_reconcile(agent: &mut Agent) -> Result<(), JsError> {
     let live: Vec<(usize, Value)> = agent
         .wasm_memory_buffers
         .iter()
         .map(|(&cell, &buffer)| (cell, buffer))
         .collect();
-    if live.is_empty() {
-        return Ok(());
-    }
-    let mut writes = Vec::with_capacity(live.len());
     for (cell, buffer) in live {
-        writes.push((cell, buffer_source_bytes(agent, &buffer)?));
-    }
-    let mut store = agent.wasm_store.borrow_mut();
-    for (cell, bytes) in writes {
-        store.write_memory(cell, &bytes);
-    }
-    Ok(())
-}
-
-/// Refresh every live memory buffer from its engine cell (after wasm ran).
-fn memory_buffers_from_store(agent: &mut Agent) -> Result<(), JsError> {
-    let live: Vec<(usize, Value)> = agent
-        .wasm_memory_buffers
-        .iter()
-        .map(|(&cell, &buffer)| (cell, buffer))
-        .collect();
-    if live.is_empty() {
-        return Ok(());
-    }
-    let mut snapshots = Vec::with_capacity(live.len());
-    {
-        let store = agent.wasm_store.borrow();
-        for &(cell, _) in &live {
-            if let Some(bytes) = store.memory_bytes(cell) {
-                snapshots.push((cell, bytes.len(), bytes.to_vec()));
-            }
-        }
-    }
-    for (cell, byte_len, bytes) in snapshots {
-        let Some(&buffer) = agent.wasm_memory_buffers.get(&cell) else {
-            continue;
-        };
         let ValueKind::Object(object) = buffer.kind() else {
             continue;
         };
         let id = object.id();
-        let same_size = agent
+        let Some(block) = agent.wasm_store.borrow().memory_block(cell) else {
+            continue;
+        };
+        let byte_length = block.byte_length();
+        let unchanged = agent
             .buffer_data
             .get(&id)
-            .map(|state| state.borrow().byte_length == byte_len)
-            .unwrap_or(false);
-        if same_size {
-            let shared = agent
-                .buffer_data
-                .get(&id)
-                .expect("buffer present")
-                .borrow()
-                .shared
-                .clone();
-            shared.write(0, &bytes)?;
-        } else if memory_is_shared(agent, cell) {
-            // A shared memory that grew inside wasm: resize the block and
-            // point `buffer` at a fresh SAB over it; the stale buffer stays
-            // attached and keeps aliasing the memory.
-            let mut block = agent
-                .buffer_data
-                .get(&id)
-                .expect("buffer present")
-                .borrow()
-                .shared
-                .clone();
-            block.resize(byte_len)?;
-            let fresh = shared_memory_buffer(agent, block, byte_len)?;
+            .is_some_and(|state| state.borrow().byte_length == byte_length);
+        if unchanged {
+            continue;
+        }
+        if memory_is_shared(agent, cell) {
+            let fresh = shared_memory_buffer(agent, block, byte_length)?;
             agent.wasm_memory_buffers.insert(cell, fresh);
         } else {
             array_buffer::detach_array_buffer(agent, id);
             agent.wasm_memory_buffers.remove(&cell);
-            let fresh = array_buffer_of(agent, &bytes)?;
-            agent.wasm_memory_buffers.insert(cell, fresh);
         }
     }
     Ok(())
@@ -2672,7 +2604,6 @@ fn instantiate_module(
 
     // Instantiate in the engine store (one borrow window), then collect the
     // exports (another). All store access ends before any agent work below.
-    memory_buffers_to_store(agent)?;
     let instantiated = {
         let mut store = agent.wasm_store.borrow_mut();
         store.instantiate(module, &mut |module_name: &str, name: &str| {
@@ -2687,7 +2618,7 @@ fn instantiate_module(
     let instance_id = match instantiated {
         Ok(id) => id,
         Err(_) => {
-            memory_buffers_from_store(agent)?;
+            memory_buffers_reconcile(agent)?;
             return Err(link_failure(
                 agent,
                 "module instantiation failed (only exported-wasm-function and \
@@ -2695,7 +2626,7 @@ fn instantiate_module(
             )?);
         }
     };
-    memory_buffers_from_store(agent)?;
+    memory_buffers_reconcile(agent)?;
 
     let exported: Vec<(String, wasm::ExternVal)> = {
         let store = agent.wasm_store.borrow();
@@ -3167,7 +3098,6 @@ fn invoke_export(
         let param = ty.params.get(position).cloned().unwrap_or(ValType::I32);
         wasm_args.push(wasm_arg(agent, &param, argument)?);
     }
-    memory_buffers_to_store(agent)?;
     let mut progress = {
         let mut store = agent.wasm_store.borrow_mut();
         store.start(instance, index, &wasm_args)
@@ -3176,17 +3106,16 @@ fn invoke_export(
         let step = match progress {
             Ok(step) => step,
             Err(fail) => {
-                memory_buffers_from_store(agent)?;
+                memory_buffers_reconcile(agent)?;
                 return Err(run_failure(agent, fail)?);
             }
         };
         match step {
             RunProgress::Finished(results) => break results,
             RunProgress::Host(request) => {
-                // Refresh the buffers so the host JS closure sees the wasm
-                // writes so far; run the closure; then flush its buffer
-                // writes back into the cells before resuming wasm.
-                memory_buffers_from_store(agent)?;
+                // Nothing to hand across: the host closure's `memory.buffer`
+                // views are the engine's own storage, so they already show the
+                // wasm writes so far and its writes land in the cell directly.
                 let reply = {
                     let (function, fty) = agent
                         .wasm_host_functions
@@ -3202,7 +3131,6 @@ fn invoke_export(
                     crate::function::call(agent, &function, Value::Undefined, &js_args)
                         .map(|value| (value, fty))
                 };
-                memory_buffers_to_store(agent)?;
                 match reply {
                     Ok((value, fty)) => {
                         let wasm_results = js_function_results(agent, &fty, &value)?;
@@ -3261,7 +3189,7 @@ fn invoke_export(
             }
         }
     };
-    memory_buffers_from_store(agent)?;
+    memory_buffers_reconcile(agent)?;
     match results.as_slice() {
         [] => Ok(Value::Undefined),
         [single] => wasm_result(agent, *single),

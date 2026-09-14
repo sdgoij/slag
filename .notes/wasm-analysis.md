@@ -541,10 +541,33 @@ design (a): the engine addresses bytes through the raw pointer, sound only while
 no other agent observes the block, and that assumption is recorded on
 `SharedBuffer::data_ptr`.
 
-**Slice 2 is what pays.** Nothing user-visible changed yet — the bridge still
-copies, so the ~5.4 ms/call above stands until `Memory.prototype.buffer` aliases
-`Store::memory_block(cell)` (a clone of the handle) and the six copy sites go
-away, leaving only grow/detach reconciliation.
+**Slice 2 landed 2026-09-14 — this is the one that pays.** `buffer` is now a
+view: `materialize_memory_buffer` wraps the cell's own block
+(`Store::memory_block`, via `array_buffer_from_block` for an unshared memory and
+`shared_array_buffer_from_block` for a shared one) and the six copy sites are
+gone — the two per-run flush/refresh passes, the mid-run pair around each host
+call, and the post-grow snapshot/copy. Reconciling survives only as
+`memory_buffers_reconcile`, which touches a buffer only when its length no longer
+matches the memory. Measured on the same probe: **5,225 µs/call → under the
+timer's resolution** (200 calls on a 16 MiB memory now complete in <1 ms, against
+1,048 ms), and a host call mid-run reads the live memory instead of costing two
+more full copies — which the old design needed for correctness, not just speed.
+
+One design point the corpus's JS-API suite caught, worth recording: an unshared
+grow must **move the memory to a fresh block**, not resize in place. Detaching
+the previous buffer marks the *block* unreachable (that flag is what views and
+the JIT's inline stores read), and under aliasing that block *is* the memory — so
+resizing in place leaves the next `buffer` born detached (`memory/grow.any.js`
+failed 10 assertions with `expected 0 but got undefined`). A shared grow still
+resizes in place, which is exactly why a shared memory's block is allocated at
+its declared maximum: prior SharedArrayBuffers must keep aliasing it. The one
+remaining copy per grow is therefore the JS-API's own detach rule, not a bridge
+tax. Both probes are committed: `tools/wasm_memory_bridge.js` (the A/B cost
+loop, over a 256-page memory) and `tools/wasm_memory_alias.js` (the semantics),
+each reading its module bytes from a `.hex` beside it, so the numbers above stay
+reproducible. The alias probe pins read-through and write-through in both
+directions, the detach rules (a stale buffer reports length 0 and constructing
+over it throws), a JS-side and a wasm-side grow, and the mid-run host read.
 
 **Landed 2026-09-14 (items 1, 3, 4 and item 2's double clones).** Measured on a
 hot-loop probe (1M iterations; a call plus a `br_if` plus three numeric ops per
@@ -595,8 +618,12 @@ before the change); `wasmtest equiv` over `block`/`br`/`br_if`/`br_table`/
    dependency table in `runtime`, which leaves the wasm32 browser build
    untouched. Measured envelope and the remaining refinements (§7 items 6 and
    10) are in §5.
-4. **JS-API memory bridge** (item 8) — the only boundary cost that is a whole
-   linear-memory copy per call once a `buffer` has been materialised.
+4. **JS-API memory bridge** (item 8) — the only boundary cost that was a whole
+   linear-memory copy per call once a `buffer` had been materialised.
+   **Landed 2026-09-14:** `buffer` is a view over the memory's own block (the
+   `byteblock` leaf crate, engine storage, then aliasing), so the copies are
+   gone and a mid-run host read is free. See §7 item 8 for the measurement and
+   the one design trap (an unshared grow must move to a fresh block).
 5. Threads/atomics and `WebAssembly.Function` are the remaining whole-feature
    gaps; both are proposal-sized cuts, not cleanups.
 

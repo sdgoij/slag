@@ -146,22 +146,39 @@ pub const PAGE_SIZE: u64 = 65536;
 pub(crate) struct MemoryBytes(SharedBuffer);
 
 impl MemoryBytes {
-    /// A zero-filled block of `byte_length` bytes.
-    fn new(byte_length: usize) -> Self {
-        MemoryBytes(SharedBuffer::new(byte_length))
+    /// A zero-filled block of `byte_length` bytes, with storage for up to
+    /// `capacity` bytes. A shared memory passes its declared maximum so the
+    /// block can absorb every later grow in place (old views keep aliasing it);
+    /// an unshared one passes its current length, because the JS-API detaches
+    /// the old buffer on a grow anyway.
+    fn new(byte_length: usize, capacity: usize) -> Self {
+        MemoryBytes(SharedBuffer::new_with_capacity(byte_length, capacity))
     }
 
-    /// Grow to `byte_length` (never shorter: wasm grows a memory only).
-    ///
-    /// The single-agent block resizes its `Vec` in place. Under `workers` the
-    /// storage is a fixed atomic array, so a grow past its capacity replaces
-    /// the block with a fresh one, copying the live bytes — the old block stays
-    /// alive for any view still holding it, which an unshared grow detaches
-    /// anyway.
-    fn resize(&mut self, byte_length: usize) {
+    /// The block itself, so an owner can alias these bytes instead of copying
+    /// them (the JS-API's `Memory.prototype.buffer`).
+    pub(crate) fn block(&self) -> &SharedBuffer {
+        &self.0
+    }
+
+    /// Grow in place to `byte_length` (never shorter: wasm grows a memory
+    /// only). Only a shared memory may use this: its block is allocated at the
+    /// declared maximum, so prior SharedArrayBuffers keep aliasing it.
+    fn grow_in_place(&mut self, byte_length: usize) {
         if self.0.resize(byte_length).is_ok() {
             return;
         }
+        self.move_to_new_block(byte_length);
+    }
+
+    /// Move to a fresh block of `byte_length`, copying the live bytes.
+    ///
+    /// An unshared grow detaches the previous buffer, and that buffer's storage
+    /// *is* this block — detaching it marks the block itself unreachable, so the
+    /// memory must leave it behind rather than resizing it in place. This is the
+    /// one copy the JS-API costs a grow, and why an unshared grow is the only
+    /// place the engine moves its storage.
+    fn move_to_new_block(&mut self, byte_length: usize) {
         let live = self.0.read(0, self.0.byte_length()).unwrap_or_default();
         let block = SharedBuffer::new(byte_length);
         if !live.is_empty() && block.write(0, &live).is_err() {
@@ -198,15 +215,37 @@ impl std::ops::DerefMut for MemoryBytes {
 pub struct Memory {
     pub(crate) bytes: MemoryBytes,
     max_pages: Option<u64>,
+    shared: bool,
 }
 
 impl Memory {
     /// A zero-filled memory of `min_pages` pages, capped at `max_pages`.
-    pub fn new(min_pages: u64, max_pages: Option<u64>) -> Self {
+    ///
+    /// A shared memory's block is allocated at the declared maximum so a grow
+    /// resizes it in place — every prior SharedArrayBuffer must keep aliasing
+    /// the memory — while an unshared memory's block starts at its current
+    /// length (a grow moves it, since the old buffer is detached then).
+    pub fn new(min_pages: u64, max_pages: Option<u64>, shared: bool) -> Self {
+        let byte_length = (min_pages * PAGE_SIZE) as usize;
+        let capacity = if shared {
+            max_pages
+                .map(|max| (max * PAGE_SIZE) as usize)
+                .unwrap_or(byte_length)
+                .max(byte_length)
+        } else {
+            byte_length
+        };
         Memory {
-            bytes: MemoryBytes::new((min_pages * PAGE_SIZE) as usize),
+            bytes: MemoryBytes::new(byte_length, capacity),
             max_pages,
+            shared,
         }
+    }
+
+    /// The memory's byte block, for an owner that must alias it (the JS-API's
+    /// `Memory.prototype.buffer`) rather than copy it.
+    pub fn block(&self) -> &SharedBuffer {
+        self.bytes.block()
     }
 
     pub fn pages(&self) -> u64 {
@@ -232,7 +271,11 @@ impl Memory {
         let Ok(byte_len) = usize::try_from(byte_len) else {
             return None;
         };
-        self.bytes.resize(byte_len);
+        if self.shared {
+            self.bytes.grow_in_place(byte_len);
+        } else {
+            self.bytes.move_to_new_block(byte_len);
+        }
         Some(old)
     }
 }
@@ -2980,7 +3023,7 @@ impl Store {
     pub fn memory(&mut self, ty: MemType) -> Result<usize, ExecFail> {
         self.memory_types.push(ty);
         self.memories
-            .push(Memory::new(ty.limits.min, ty.limits.max));
+            .push(Memory::new(ty.limits.min, ty.limits.max, ty.limits.shared));
         Ok(self.memories.len() - 1)
     }
 
@@ -3300,8 +3343,11 @@ impl Store {
 
         for memory in &module.memories {
             self.memory_types.push(*memory);
-            self.memories
-                .push(Memory::new(memory.limits.min, memory.limits.max));
+            self.memories.push(Memory::new(
+                memory.limits.min,
+                memory.limits.max,
+                memory.limits.shared,
+            ));
             memories.push(self.memories.len() - 1);
         }
 
@@ -4018,16 +4064,10 @@ impl Store {
         self.memories.get(cell).map(|memory| &*memory.bytes)
     }
 
-    /// Overwrite a whole memory cell. The caller matches lengths; returns
-    /// false when the cell is unknown or the byte slice does not fill it.
-    pub fn write_memory(&mut self, cell: usize, bytes: &[u8]) -> bool {
-        match self.memories.get_mut(cell) {
-            Some(memory) if memory.bytes.len() == bytes.len() => {
-                memory.bytes.copy_from_slice(bytes);
-                true
-            }
-            _ => false,
-        }
+    /// A memory cell's byte block, so the JS-API can present `buffer` as a view
+    /// over the engine's own storage rather than a copy of it.
+    pub fn memory_block(&self, cell: usize) -> Option<SharedBuffer> {
+        self.memories.get(cell).map(|memory| memory.block().clone())
     }
 
     /// A table cell's current length.
