@@ -4266,13 +4266,45 @@ impl<'a> Engine<'a> {
 
     /// Pop a memory instruction's address operand, sized by the referenced
     /// memory's index type (i32 for a memory32, i64 for a memory64), widened
-    /// to the unsigned u64 used for effective-address arithmetic.
-    fn pop_mem_addr(&mut self, instance: usize, memory: u32) -> Result<u64, ExecFail> {
-        if self.memory_is64(instance, memory)? {
-            Ok(self.pop_i64()? as u64)
+    /// to the unsigned u64 used for effective-address arithmetic, and resolve
+    /// the memory cell in the same pass (the access reads the cell's backing
+    /// bytes next).
+    fn pop_mem_addr_cell(
+        &mut self,
+        instance: usize,
+        memory: u32,
+    ) -> Result<(u64, usize), ExecFail> {
+        let cell = self.mem_cell(instance, memory)?;
+        let addr = if self.store.memory_types[cell].memory64 {
+            self.pop_i64()? as u64
         } else {
-            Ok(self.pop_i32()? as u32 as u64)
+            self.pop_i32()? as u32 as u64
+        };
+        Ok((addr, cell))
+    }
+
+    /// Pop a memory instruction's address operand only (the bulk-memory ops,
+    /// which address two memories or need the cell separately).
+    fn pop_mem_addr(&mut self, instance: usize, memory: u32) -> Result<u64, ExecFail> {
+        Ok(self.pop_mem_addr_cell(instance, memory)?.0)
+    }
+
+    /// The in-bounds byte offset for a memory access at `addr` with static
+    /// `offset` and `size`, or a trap. Collapses the two `checked_add`s
+    /// (offset, then size) into one runtime add on the address: `offset + size`
+    /// is a static constant, so only `addr + offset + size` and the length
+    /// compare remain.
+    fn mem_start(&self, cell: usize, addr: u64, offset: u64, size: u64) -> Result<usize, ExecFail> {
+        let span = offset
+            .checked_add(size)
+            .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+        let end = addr
+            .checked_add(span)
+            .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
+        if end > self.store.memories[cell].bytes.len() as u64 {
+            return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
         }
+        Ok((end - size) as usize)
     }
 
     /// The table cell the top frame addresses at `table_index`.
@@ -4652,17 +4684,9 @@ impl<'a> Engine<'a> {
                 memory, op, offset, ..
             } => {
                 let instance = self.frames[frame_index].instance;
-                let cell = self.mem_cell(instance, memory)?;
-                let addr = self.pop_mem_addr(instance, memory)?;
+                let (addr, cell) = self.pop_mem_addr_cell(instance, memory)?;
                 let size = op.bytes() as u64;
-                let ea = addr
-                    .checked_add(offset)
-                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
-                let len = self.store.memories[cell].bytes.len() as u64;
-                if ea.checked_add(size).is_none_or(|end| end > len) {
-                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
-                }
-                let start = ea as usize;
+                let start = self.mem_start(cell, addr, offset, size)?;
                 let bytes = &self.store.memories[cell].bytes[start..start + size as usize];
                 let value = load_vec(op, bytes).ok_or(ExecFail::Unsupported("simd load form"))?;
                 self.stack.push(Value::v128(value));
@@ -4671,19 +4695,11 @@ impl<'a> Engine<'a> {
             Instr::VecStore { memory, offset, .. } => {
                 let value = self.pop()?;
                 let instance = self.frames[frame_index].instance;
-                let cell = self.mem_cell(instance, memory)?;
-                let addr = self.pop_mem_addr(instance, memory)?;
+                let (addr, cell) = self.pop_mem_addr_cell(instance, memory)?;
                 let Value::V128(bits) = value else {
                     return Err(ExecFail::Unsupported("non-v128 store"));
                 };
-                let ea = addr
-                    .checked_add(offset)
-                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
-                let len = self.store.memories[cell].bytes.len() as u64;
-                if ea.checked_add(16).is_none_or(|end| end > len) {
-                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
-                }
-                let start = ea as usize;
+                let start = self.mem_start(cell, addr, offset, 16)?;
                 self.store.memories[cell].bytes[start..start + 16]
                     .copy_from_slice(&v128_to_u128(bits).to_le_bytes());
                 Ok(Ctl::Next)
@@ -4697,17 +4713,9 @@ impl<'a> Engine<'a> {
             } => {
                 let vector = self.pop_v128()?;
                 let instance = self.frames[frame_index].instance;
-                let cell = self.mem_cell(instance, memory)?;
-                let addr = self.pop_mem_addr(instance, memory)?;
+                let (addr, cell) = self.pop_mem_addr_cell(instance, memory)?;
                 let size = size as u64;
-                let ea = addr
-                    .checked_add(offset)
-                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
-                let len = self.store.memories[cell].bytes.len() as u64;
-                if ea.checked_add(size).is_none_or(|end| end > len) {
-                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
-                }
-                let start = ea as usize;
+                let start = self.mem_start(cell, addr, offset, size)?;
                 let mut bits = 0u64;
                 for (i, &byte) in self.store.memories[cell].bytes[start..start + size as usize]
                     .iter()
@@ -4728,17 +4736,9 @@ impl<'a> Engine<'a> {
             } => {
                 let vector = self.pop_v128()?;
                 let instance = self.frames[frame_index].instance;
-                let cell = self.mem_cell(instance, memory)?;
-                let addr = self.pop_mem_addr(instance, memory)?;
+                let (addr, cell) = self.pop_mem_addr_cell(instance, memory)?;
                 let size = size as u64;
-                let ea = addr
-                    .checked_add(offset)
-                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
-                let len = self.store.memories[cell].bytes.len() as u64;
-                if ea.checked_add(size).is_none_or(|end| end > len) {
-                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
-                }
-                let start = ea as usize;
+                let start = self.mem_start(cell, addr, offset, size)?;
                 let bits = crate::simd::lane_bits(vector, lane as usize, size as usize);
                 for (i, byte) in self.store.memories[cell].bytes[start..start + size as usize]
                     .iter_mut()
@@ -4767,17 +4767,9 @@ impl<'a> Engine<'a> {
                 memory, op, offset, ..
             } => {
                 let instance = self.frames[frame_index].instance;
-                let cell = self.mem_cell(instance, memory)?;
-                let addr = self.pop_mem_addr(instance, memory)?;
+                let (addr, cell) = self.pop_mem_addr_cell(instance, memory)?;
                 let size = load_size(op);
-                let ea = addr
-                    .checked_add(offset)
-                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
-                let len = self.store.memories[cell].bytes.len() as u64;
-                if ea.checked_add(size as u64).is_none_or(|end| end > len) {
-                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
-                }
-                let start = ea as usize;
+                let start = self.mem_start(cell, addr, offset, size as u64)?;
                 let value = read_mem(op, &self.store.memories[cell].bytes[start..start + size]);
                 self.stack.push(value);
                 Ok(Ctl::Next)
@@ -4787,17 +4779,9 @@ impl<'a> Engine<'a> {
             } => {
                 let value = self.pop()?;
                 let instance = self.frames[frame_index].instance;
-                let cell = self.mem_cell(instance, memory)?;
-                let addr = self.pop_mem_addr(instance, memory)?;
+                let (addr, cell) = self.pop_mem_addr_cell(instance, memory)?;
                 let size = store_size(op);
-                let ea = addr
-                    .checked_add(offset)
-                    .ok_or(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess))?;
-                let len = self.store.memories[cell].bytes.len() as u64;
-                if ea.checked_add(size as u64).is_none_or(|end| end > len) {
-                    return Err(ExecFail::Trap(Trap::OutOfBoundsMemoryAccess));
-                }
-                let start = ea as usize;
+                let start = self.mem_start(cell, addr, offset, size as u64)?;
                 write_mem(
                     op,
                     value,

@@ -172,6 +172,9 @@ Per-instruction costs that matter (all **(verified)**):
    → `memory_is64` → `mem_cell`, then the access resolves again
    (`exec.rs:3988-4012`, `4487-4504`), with two `checked_add`s per access even
    though `offset`/`size` are compile-time constants.
+   **Fixed 2026-09-14:** `pop_mem_addr_cell` resolves the cell and pops the
+   address in one pass, and `mem_start` collapses the two adds into one. It is
+   a code simplification, not a measured win (see §7's landing note).
 
 `.notes/wasm-depth.md:46-49` measures the consequence: **≈60-100× slower than
 native per wasm interpretation layer**, which is why the nested-engine
@@ -527,6 +530,16 @@ buffers now recycle through per-invocation pools on the `Engine`
 (`take_locals`/`take_labels`/`recycle_frame`), so a call-heavy loop allocates
 nothing after the pool warms. `interp-hot-loop` moved 0.33 -> 0.29 s (~11%);
 `leaf-loop` and `mem-loop` are unchanged.
+
+Item 12 landed 2026-09-14 as a refactor rather than a speedup. The
+load/store/vec access path resolved the memory cell twice (`mem_cell` then
+`memory_is64` inside `pop_mem_addr`) and did two `checked_add`s (offset, then
+size) per access. `pop_mem_addr_cell` now resolves the cell and pops the
+address in one pass, and `mem_start` collapses the two adds into one
+(`offset + size` is a static constant), so each access is one cell lookup, one
+add, and one compare. `mem-loop` is unchanged at 0.79 s — the removed work was
+~1% of the access cost, below the probe's noise — so this closes the item as a
+code simplification, not a measured win.
 
 **Item 8 measured 2026-09-14, and it is the largest boundary cost by orders of
 magnitude.** `WebAssembly.Memory.prototype.buffer` is a *copy*: the JS-API keeps
