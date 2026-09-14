@@ -136,15 +136,25 @@ Per-instruction costs that matter (all **(verified)**):
    `Vec`-carrying variants (`BrTable`, `SelectTyped`, `TryTable`). `enter_structured`
    clones the same instruction again (`exec.rs:5647`) and `catch_in_top_frame`
    clones the `TryTable` again (`exec.rs:4123`).
+   **Partly fixed 2026-09-14:** both double clones are gone — `enter_structured`
+   takes the instruction `step` already owns, and `catch_in_top_frame` decides
+   its clause under an immutable borrow instead of cloning the `TryTable` and
+   building a per-clause cell `Vec`. The per-step clone itself remains: see
+   §7's landing note.
 2. **The body map is rebuilt per branch.** `map_for` calls `precompute`, which
    allocates two `Vec`s sized to the whole body and rescans it (`exec.rs:5746`,
    `3936-3959`) — on every `br`/`br_if`/`br_table`, `if`, `else`, and catch
-   dispatch.
+   dispatch. **Fixed 2026-09-14:** computed once per body and cached on the
+   instance (`Instance::body_maps`, filled lazily on the first branch into the
+   body).
 3. **`Instr::Num` allocates a `Vec<Value>` per numeric instruction**
-   (`exec.rs:4357-4366`).
+   (`exec.rs:4357-4366`). **Fixed 2026-09-14:** a stack array (the arity is at
+   most 2).
 4. **Branches and returns allocate.** `take_top` does
    `self.stack[start..].to_vec()` (`exec.rs:6113`), and `finish_top` likewise
-   (`exec.rs:6096`).
+   (`exec.rs:6096`). **Fixed 2026-09-14:** `move_top_to` closes the gap in
+   place with `copy_within` + `truncate`; only the outermost frame's results
+   are still allocated, once per invocation.
 5. **`Value` is 32 bytes** because `V128(u128)` forces 16-byte alignment
    (`values.rs:261-268`) — twice the necessary bandwidth for integer code.
 6. **Call setup allocates**: a declared-locals `Vec<ValType>` clone, an args
@@ -325,6 +335,29 @@ Items 1-4 are all "remove an allocation or a scan from a per-instruction
 path", and can be validated with the existing compiled-vs-interpreted
 equivalence harness rather than new tests.
 
+**Landed 2026-09-14 (items 1, 3, 4 and item 2's double clones).** Measured on a
+hot-loop probe (1M iterations; a call plus a `br_if` plus three numeric ops per
+iteration — `crates/wasmtest/fixtures/interp-hot-loop.wast`, timed as
+`target/release/wasmtest run crates/wasmtest/fixtures/interp-hot-loop.wast`):
+**0.60 s → 0.32 s**
+(~1.87×), item 3 + 4 first (0.60 → 0.41) then item 1 (→ 0.32). Item 2's double
+clones do not move that loop (it enters no block and raises no exception), so
+they are unmeasured but strictly less work.
+
+The remaining half of item 2 — the per-step `Instr` clone — is deliberately
+still in place. `step` matches an owned value because its arms call `&mut self`
+methods while the instruction is live, so removing the clone needs either an
+`Rc`'d module handle held outside `self` or a split between fetch and execute (a
+`Copy` decode-op enum). At ~32 bytes per step that is a few percent, and the two
+heap-carrying variants (`BrTable`, `SelectTyped`) still clone their `Vec` on
+every execution — the targeted follow-up if `br_table`-heavy code matters.
+
+Verified for the landing: core `20,662` + proposals `43,932` = **64,594 pass,
+0 fail, 0 pending** and JS-API **1,001 pass / 0 fail** (both unchanged from
+before the change); `wasmtest equiv` over `block`/`br`/`br_if`/`br_table`/
+`loop`/`if`/`return`/`call`/`exceptions` reports **12 suites, 0 diverged**, with
+577/577 functions compiled; `cargo test -p wasm --lib` 40 pass.
+
 ## 8. Recommended sequencing
 
 1. **Correctness first, cheaply:** the body-trailing-bytes bug, the untrusted
@@ -335,6 +368,9 @@ equivalence harness rather than new tests.
    6.2.4 is still open.
 2. **Interpreter wins 1-4** — the highest impact/effort ratio in the engine,
    verify covered by `wasmtest equiv`.
+   **Landed 2026-09-14:** items 1, 3, and 4, plus item 2's double clones (the
+   per-step clone remains — see §7). Measured 0.60 s → 0.32 s on the hot-loop
+   probe; corpus totals unchanged, `equiv` clean.
 3. **Make the compiler shippable or shelve it explicitly:** as it stands Cut 11
    is a large, default-off artifact with no native call linkage, so its
    real-world benefit is limited to call-free leaf bodies. Either gate it on

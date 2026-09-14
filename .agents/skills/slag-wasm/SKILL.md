@@ -88,8 +88,10 @@ a comment that already said "a frozen SharedArrayBuffer".
 
 - `cargo test -p wasm`, `cargo test -p runtime --lib`.
 - `cargo clippy --workspace --all-targets -- -D warnings`.
-- `wasmtest check docs/slag.wasm` — a cheap end-to-end decode + validate
-  gate over the real 7 MB compiler output.
+- `wasmtest check <path>` — **decode only**; it never validates, so `ok`
+  means the bytes parsed, not that the module is valid (a module it calls `ok`
+  can still fail a suite with "module invalid"). Use it over `docs/slag.wasm`
+  as a cheap decode gate on the real 7 MB compiler output.
 - `cargo test -p wasmtest` — runs `tests/decoder_classification.rs` over
   `fixtures/decoder-classification.wast`. This is the *only* place the
   "0 pendings" claim is enforced: the runner exits 0 on a pending, so a
@@ -98,6 +100,17 @@ a comment that already said "a frozen SharedArrayBuffer".
   pinned pass count in that test.
 - `cargo run -q -p wasmtest -- run …` and `-- jsapi waspec/test/js-api`.
   `WASM_JSAPI_VERBOSE=1` prints the failing-test messages.
+- When a hand-written `.wast`/`.wat` (a probe, a fixture) is reported
+  invalid, check it against a real engine before suspecting the validator:
+  `node -e "const b=new Uint8Array(require('fs').readFileSync('<m>.wasm')); console.log(WebAssembly.validate(b))"`.
+  A `br_if` that carries a value leaves that value on the fall-through path —
+  the usual way a hand-written control-flow probe is genuinely invalid.
+- Measuring the interpreter: time a hot loop through the release runner
+  (`target/release/wasmtest run <bench>.wast`); the conversion is cached in
+  `target/wastest`, so repeat runs measure execution. A loop with a call, a
+  `br_if`, and a few numeric ops per iteration exercises the return path, the
+  per-branch path, and the numeric path respectively. Compare medians of
+  three runs — the first run after a rebuild reads cold.
 - When the change touches the buffer machinery, cross-check the test262
   clusters too: `target/release/sweep.exe built-ins --filter
   'SharedArrayBuffer*'` (and `ArrayBuffer*`, `Atomics*`) at

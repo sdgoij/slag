@@ -15,6 +15,8 @@
 //! Not executed yet ([`ExecFail::Unsupported`]): threads and the atomic
 //! memory operations (a separate proposal outside the pinned corpus).
 
+use std::rc::Rc;
+
 use crate::instr::{Catch, Instr, LoadOp, NumOp, StoreOp, VecLoadOp};
 use crate::module::{DataMode, ElementMode, ExportKind, ImportDesc, Module};
 use crate::types::{
@@ -306,6 +308,11 @@ pub struct Instance {
     element_segments: Vec<Option<Vec<RefValue>>>,
     data_segments: Vec<Option<Vec<u8>>>,
     depth_limit: usize,
+    /// Per-body structural maps (`end`/`else` positions), computed once per
+    /// body on the first branch into it and cached here. Recomputing per
+    /// branch made every `br`/`br_if`/`br_table`/`if`/`else`/catch dispatch
+    /// scan the whole body with two allocations.
+    body_maps: Vec<Option<Rc<BodyMap>>>,
     /// Cut 11: one optional compiled entry per module-defined function
     /// (parallel to `Module::bodies`); `None` keeps the interpreter path.
     #[cfg(feature = "compile")]
@@ -3134,6 +3141,7 @@ impl Store {
             element_segments: Vec::new(),
             data_segments: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
+            body_maps: vec![None; module.bodies.len()],
             #[cfg(feature = "compile")]
             compiled: if self.compile_off {
                 // Interpreter-forced store: don't pay the compile cost at
@@ -4118,53 +4126,61 @@ impl<'a> Engine<'a> {
     ) -> Result<CatchResult, ExecFail> {
         let frame_index = self.frames.len() - 1;
         let count = self.frames[frame_index].labels.len();
+        // Resolve the clause and its payload under an immutable borrow, then
+        // branch (which needs `&mut self`): scanning a scope must not clone its
+        // `TryTable` nor build a per-clause cell table.
+        let mut hit: Option<(usize, u32, Vec<Value>)> = None;
         for pos in (0..count).rev() {
             let open = self.frames[frame_index].labels[pos].open;
-            let instr = self.body(frame_index).get(open).cloned();
-            let clauses = match instr {
-                Some(Instr::TryTable { catches, .. }) => catches,
-                _ => continue,
-            };
-            // The clause tags are indices into this frame's tag space; the
-            // thrown exception carries the tag's store cell, so resolve each
-            // clause against the same instance before comparing.
             let instance = self.frames[frame_index].instance;
-            let cells: Vec<Option<usize>> = clauses
-                .iter()
-                .map(|clause| match clause {
-                    Catch::Tag { tag, .. } | Catch::TagRef { tag, .. } => self.store.instances
-                        [instance]
-                        .tags
-                        .get(*tag as usize)
-                        .copied(),
-                    Catch::All { .. } | Catch::AllRef { .. } => None,
-                })
-                .collect();
-            for (clause, cell) in clauses.iter().zip(&cells) {
-                match (clause, cell) {
-                    (Catch::Tag { label, .. }, Some(cell)) if *cell == tag => {
-                        return self.catch_branch(pos, *label, args.to_vec());
+            let Some(Instr::TryTable { catches, .. }) = self.body(frame_index).get(open) else {
+                continue;
+            };
+            for clause in catches {
+                // The clause tags are indices into this frame's tag space; the
+                // thrown exception carries the tag's store cell, so resolve each
+                // clause against the same instance before comparing.
+                let matched = match clause {
+                    Catch::Tag {
+                        tag: clause_tag,
+                        label,
+                    } => {
+                        let cell = self.store.instances[instance]
+                            .tags
+                            .get(*clause_tag as usize)
+                            .copied();
+                        (cell == Some(tag)).then(|| (*label, args.to_vec()))
                     }
-                    (Catch::TagRef { label, .. }, Some(cell)) if *cell == tag => {
-                        let mut payload = args.to_vec();
-                        payload.push(Value::Ref(RefValue::Exn(exn)));
-                        return self.catch_branch(pos, *label, payload);
+                    Catch::TagRef {
+                        tag: clause_tag,
+                        label,
+                    } => {
+                        let cell = self.store.instances[instance]
+                            .tags
+                            .get(*clause_tag as usize)
+                            .copied();
+                        (cell == Some(tag)).then(|| {
+                            let mut payload = args.to_vec();
+                            payload.push(Value::Ref(RefValue::Exn(exn)));
+                            (*label, payload)
+                        })
                     }
-                    (Catch::All { label }, _) => {
-                        return self.catch_branch(pos, *label, Vec::new());
-                    }
-                    (Catch::AllRef { label }, _) => {
-                        return self.catch_branch(
-                            pos,
-                            *label,
-                            vec![Value::Ref(RefValue::Exn(exn))],
-                        );
-                    }
-                    (Catch::Tag { .. } | Catch::TagRef { .. }, _) => {}
+                    Catch::All { label } => Some((*label, Vec::new())),
+                    Catch::AllRef { label } => Some((*label, vec![Value::Ref(RefValue::Exn(exn))])),
+                };
+                if let Some((label, payload)) = matched {
+                    hit = Some((pos, label, payload));
+                    break;
                 }
             }
+            if hit.is_some() {
+                break;
+            }
         }
-        Ok(CatchResult::Miss)
+        match hit {
+            Some((pos, label, payload)) => self.catch_branch(pos, label, payload),
+            None => Ok(CatchResult::Miss),
+        }
     }
 
     /// Perform the branch a matched catch clause requests: drop the try's
@@ -4218,7 +4234,7 @@ impl<'a> Engine<'a> {
             Instr::Unreachable => Err(ExecFail::Trap(Trap::Unreachable)),
             Instr::Nop => Ok(Ctl::Next),
             Instr::Block(_) | Instr::Loop(_) | Instr::If(_) | Instr::TryTable { .. } => {
-                self.enter_structured(pc)?;
+                self.enter_structured(pc, instr)?;
                 Ok(Ctl::Settled)
             }
             Instr::Else => {
@@ -4355,13 +4371,18 @@ impl<'a> Engine<'a> {
                 Ok(Ctl::Next)
             }
             Instr::Num(op) => {
-                let inputs = num_inputs(op);
-                let mut operands = Vec::with_capacity(inputs);
-                for _ in 0..inputs {
-                    operands.push(self.pop()?);
-                }
-                operands.reverse();
-                self.stack.push(exec_num(op, &operands)?);
+                // A stack array rather than a Vec: this is the interpreter's
+                // hottest allocation site (every numeric instruction) and the
+                // arity is at most 2.
+                let value = if num_inputs(op) == 1 {
+                    let a = self.pop()?;
+                    exec_num(op, &[a])?
+                } else {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    exec_num(op, &[a, b])?
+                };
+                self.stack.push(value);
                 Ok(Ctl::Next)
             }
             // ---- v128 (Cut 7) ----
@@ -5641,10 +5662,11 @@ impl<'a> Engine<'a> {
         Ok(Ctl::Next)
     }
 
-    /// Enter a `block`/`loop`/`if` at `pc` (which is the top frame's pc).
-    fn enter_structured(&mut self, pc: usize) -> Result<(), ExecFail> {
+    /// Enter a `block`/`loop`/`if` at `pc` (which is the top frame's pc). The
+    /// instruction is passed in because `step` already has it — re-fetching and
+    /// cloning it here was a second clone per structured instruction.
+    fn enter_structured(&mut self, pc: usize, instr: Instr) -> Result<(), ExecFail> {
         let frame_index = self.frames.len() - 1;
-        let instr = self.body(frame_index)[pc].clone();
         let (params, arity) = self.block_counts(&instr)?;
         let height = self.stack.len().saturating_sub(params);
         match instr {
@@ -5725,9 +5747,7 @@ impl<'a> Engine<'a> {
                 pos == 0,
             )
         };
-        let values = self.take_top(arity);
-        self.stack.truncate(height);
-        self.stack.extend(values);
+        self.move_top_to(arity, height);
         if is_func {
             return Ok(true);
         }
@@ -5743,8 +5763,23 @@ impl<'a> Engine<'a> {
         Ok(false)
     }
 
-    fn map_for(&self, frame_index: usize) -> BodyMap {
-        precompute(self.body(frame_index))
+    /// The structural map of the top-`frame_index` frame's body: the matching
+    /// `end` for each opening structured instruction and the `Else` for each
+    /// `if`. Computed once per body and cached on its instance, because this
+    /// sits on the per-branch path (`br`/`br_if`/`br_table`, `if`/`else`, and
+    /// catch dispatch), where rescanning is O(body length) plus two
+    /// allocations every time.
+    fn map_for(&mut self, frame_index: usize) -> Rc<BodyMap> {
+        let (instance, body_index) = {
+            let frame = &self.frames[frame_index];
+            (frame.instance, frame.body_index)
+        };
+        if let Some(map) = &self.store.instances[instance].body_maps[body_index] {
+            return Rc::clone(map);
+        }
+        let map = Rc::new(precompute(self.body(frame_index)));
+        self.store.instances[instance].body_maps[body_index] = Some(Rc::clone(&map));
+        map
     }
 
     fn block_counts(&self, instr: &Instr) -> Result<(usize, usize), ExecFail> {
@@ -6093,12 +6128,12 @@ impl<'a> Engine<'a> {
             .frames
             .pop()
             .ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
-        let results = self.take_top(frame.results);
         if self.frames.is_empty() {
-            return Ok(Some(results));
+            // Once per invocation: the popped frame's results *are* the return
+            // value, so this is the one path that still needs an owned `Vec`.
+            return Ok(Some(self.take_top(frame.results)));
         }
-        self.stack.truncate(frame.base);
-        self.stack.extend(results);
+        self.move_top_to(frame.results, frame.base);
         Ok(None)
     }
 
@@ -6108,6 +6143,19 @@ impl<'a> Engine<'a> {
             Some(results) => Ok(Ctl::Finished(results)),
             None => Ok(Ctl::Settled),
         }
+    }
+
+    /// Move the top `count` values down to `target` (a height at or below
+    /// them), closing the gap in place. This is what a branch and a returning
+    /// frame do with their values; `take_top` + `extend` allocated a `Vec` on
+    /// every branch and every return.
+    fn move_top_to(&mut self, count: usize, target: usize) {
+        let len = self.stack.len();
+        let start = len.saturating_sub(count);
+        if start > target {
+            self.stack.copy_within(start..len, target);
+        }
+        self.stack.truncate(target + count);
     }
 
     fn take_top(&mut self, count: usize) -> Vec<Value> {
