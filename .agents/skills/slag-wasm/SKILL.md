@@ -93,15 +93,24 @@ rejects the combination with a `compile_error!`, so a wasm build that turns the
 feature on says why instead of dying inside `region`. A wasm embed always runs
 the interpreter — do not try to "ship the JIT to the browser".
 
-On native builds reach the compiled path with the `wasm-compile` feature
-(`runtime` → `slag` / `cli`), which enables `wasm/compile`. It is opt-in because
-a compiled body's calls still re-enter the interpreter whenever the callee is
+The compiled path is **on by default for native builds**: `runtime` activates
+`wasm/compile` from a `cfg(not(target_arch = "wasm32"))` dependency table, so
+`cli`, `slag`, and every native embed get it, while a wasm32 build never does
+(which is why the documented `--target wasm32-unknown-unknown` example command
+needs no extra flags). There is no build-time opt-out on native — a target table
+cannot be feature-gated — so the way back to the interpreter is
+`Store::set_compile(false)`. The `wasm-compile` feature still exists as an
+explicit request, and on wasm32 an explicit request is the `compile_error!`.
+
+A compiled body's calls still re-enter the interpreter whenever the callee is
 not an eligible direct-call target:
 
-- `wasmtest run --compiled <path>` runs suites through it (needs a binary built
-  with `--features compile`); `equiv` compares both paths.
-- One binary built with `--features compile` measures both: without `--compiled`
-  the store forces the interpreter, which is what makes the A/B meaningful.
+- `wasmtest run --compiled <path>` runs suites through it; `equiv` compares both
+  paths. No feature flag is needed — the runner's `compile` feature is on by
+  default, because otherwise its interpreter-forcing call is compiled out and a
+  plain `run` would silently stop being the oracle.
+- One binary measures both: without `--compiled` the store forces the
+  interpreter, which is what makes the A/B meaningful.
 - Compilation is **lazy**: `instantiate` compiles nothing, and
   `Store::ensure_compiled` compiles a body the first time execution reaches it
   (an uncompiled body just runs interpreted — every compiled call site already
@@ -114,10 +123,23 @@ not an eligible direct-call target:
   `wasmtest` it is behind an explicit flag that only `equiv` (which prints it)
   passes, so `run --compiled` stays lazy. Forcing it inside `run` was what made
   the lazy tier look like it had not landed.
-- The envelope, measured: ~80× on a call-free leaf loop and 14.3× on a loop with
-  a call per iteration (the committed probes; medians of three). Suite timings
-  are not a usable measure — they are dominated by convert/decode/validate,
-  which is why single-run suite figures did not reproduce.
+- The envelope, measured (release, medians of three). Suite timings are not a
+  usable measure — they are dominated by convert/decode/validate — so use the
+  committed probes, all of which V8-verifies the expected value:
+
+  | probe (2M iterations unless noted) | interpreter | compiled | |
+  |---|---|---|---|
+  | `leaf-loop.wast` (10M, call-free) | 2.044 s | 0.026 s | ~80× |
+  | `interp-hot-loop.wast` (1M, a call per iteration) | 0.324 s | 0.023 s | ~14× |
+  | `mem-loop.wast` (store + load per iteration) | 0.772 s | 0.021 s | ~37× |
+  | `simd-loop.wast` (two register v128 ops per iteration) | 0.416 s | 0.087 s | ~4.8× |
+  | `gc-loop.wast` (array.set + get per iteration) | 0.302 s | 0.034 s | ~8.9× |
+
+  The memory row is the one that matters for policy: the compiled path's
+  per-access bounds check is a few cycles against the interpreter's heavy
+  per-access cost, so a store+load round-trip is invisible next to the
+  arithmetic (the same loop with no memory at all is 0.020 s compiled). §7
+  item 6 is polish, not a blocker.
 - An eligible direct call now skips the helper: the compiled code loads the
   callee's entry from the instance's table (via the scratch metadata slot,
   `compile::ENTRIES_SLOT`) and calls it. Eligibility is two derived predicates

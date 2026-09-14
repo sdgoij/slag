@@ -7,9 +7,11 @@ license.workspace = true
 [features]
 default = []
 # Cut 11 (wasm-to-native via Cranelift): an optional second execution path.
-# Off by default: it compiles lazily (a body on first reach, so instantiate
-# pays nothing for cold bodies), but the interpreter stays the shipped path
-# until default-on is decided.
+# Off by default at the crate level, because the feature cannot express
+# "native targets only" by itself: `runtime` activates it from a
+# `cfg(not(target_arch = "wasm32"))` table, so native embeds get it by default
+# while a wasm32 build never does. Compilation is lazy — a body compiles on
+# first reach — so instantiate pays nothing for cold bodies.
 compile = [
     "dep:cranelift-codegen",
     "dep:cranelift-control",

@@ -29,7 +29,7 @@ lines that change added. Separately, §3's JS-API failure — a real gap, not a
 |---|---|
 | Decoder / validator | Complete for the decoded proposal set; a full spec validator (§3) |
 | Interpreter | The shipped path; correct against the corpus, and the slow path (§4) |
-| Cranelift backend ("Cut 11") | Written, equivalence-gated per the plan, **default-off and not shipped** (§5) |
+| Cranelift backend ("Cut 11") | Written, equivalence-gated, **on by default for native builds, interpreter-only on wasm32** (§5) |
 | JS-API layer | Complete except `WebAssembly.Function` and the streaming helpers (§3, §6) |
 | Threads / atomics | **Not implemented at all** (§6.1) |
 | Conformance | **Reproduced 2026-09-14:** 64,594 core / 0 fail / 0 pending; JS-API 1,001 / 0 (§3) |
@@ -246,53 +246,67 @@ Policy and gaps:
 - **Caps:** params+results ≤ `SCRATCH_SLOTS = 256` u64 words
   (`compile.rs:996-1005`), ratified as out of scope (plan decision 6).
 
-**Shippable as of 2026-09-14, opt-in.** The backend is reachable from a native
-embed through the `wasm-compile` feature (`runtime` → `slag` / `cli`), which
-turns on `wasm/compile`. It is **native-only by construction**: cranelift's
-`region` dependency (executable-page allocation) has no wasm32 backend, so the
-`wasm` crate scopes those dependencies off wasm32 and rejects the combination
-with a `compile_error!` naming the reason — a wasm embed always runs the
-interpreter, exactly like the JIT (`jit` fails the same way, in the same
-crate). It stays off by default because the call helper's round-trip is still
-the cost of every call the direct form does not cover (a call-bearing,
-indirect, or `call_ref` callee), so the measured envelope is bodies whose hot
-path is call-free or made of eligible direct calls — not because of any
-instantiate-time overhead, which the lazy tier removed.
+**Shipped and on by default for native builds (2026-09-14).** `runtime`
+activates `wasm/compile` from a `cfg(not(target_arch = "wasm32"))` dependency
+table, so `cli`, `slag`, and every native embed get the compiled path without a
+feature flag. It is **native-only by construction**: cranelift's `region`
+dependency (executable-page allocation) has no wasm32 backend, so the `wasm`
+crate scopes those dependencies off wasm32 and rejects the combination with a
+`compile_error!` naming the reason — a wasm embed always runs the interpreter,
+exactly like the JIT (`jit` fails the same way, in the same crate). The target
+table is what keeps that honest without changing any build command: the
+documented `--target wasm32-unknown-unknown` example build never sees the
+feature, so the browser demo is untouched. There is deliberately **no
+build-time opt-out on native** (a target table cannot be feature-gated) —
+`Store::set_compile(false)` is the per-store way back, and the `wasm-compile`
+feature remains an explicit request (on wasm32, a hard error). A marker feature
+that the target table keys off, so a native embed could drop cranelift, was
+considered and declined (2026-09-14): the compiled path is the native default,
+and the per-store switch covers the only case that needs it. `crates/wasm`
+still defaults the feature off at the crate level, because the crate cannot
+express "native only" by itself.
 
 What it buys, measured (release; the compiled column includes ~20 ms of process
 startup, so the leaf row understates the loop):
 
 | Workload | Interpreter | Compiled | |
 |---|---|---|---|
-| call-free leaf loop, 10M iterations (`fixtures/leaf-loop.wast`) | 2.066 s | 0.026 s | ~80× |
-| loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.328 s | 0.023 s | 14.3× |
+| call-free leaf loop, 10M iterations (`fixtures/leaf-loop.wast`) | 2.044 s | 0.026 s | ~80× |
+| loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.324 s | 0.023 s | ~14× |
+| store + load per iteration, 2M (`fixtures/mem-loop.wast`) | 0.772 s | 0.021 s | ~37× |
+| two register v128 ops per iteration, 2M (`fixtures/simd-loop.wast`) | 0.416 s | 0.087 s | ~4.8× |
+| `array.set` + `array.get` per iteration, 2M (`fixtures/gc-loop.wast`) | 0.302 s | 0.034 s | ~8.9× |
 
-Both are medians of three runs of the committed probes, which isolate execution
-(the compiled column still includes ~20 ms of process startup). Whole-suite
-timings are **not** a usable per-path measure: a suite run is dominated by
-converting, decoding, validating, and instantiating, and the single-run figures
-previously quoted here (1.42× on `bulk-memory`, 0.93× on `gc`) did not
-reproduce — re-measured, both land inside the run-to-run noise, with the
-interpreter's own number moving as much as the difference. What the whole
-corpus does establish is correctness, and there both paths report identical
-totals (§3).
+All are medians of three runs of the committed probes, which isolate execution
+(the compiled column still includes ~20 ms of process startup) and whose
+expected values are V8-verified. Whole-suite timings are **not** a usable
+per-path measure: a suite run is dominated by converting, decoding, validating,
+and instantiating, and the single-run figures previously quoted here (1.42× on
+`bulk-memory`, 0.93× on `gc`) did not reproduce — re-measured, both land inside
+the run-to-run noise, with the interpreter's own number moving as much as the
+difference. What the whole corpus does establish is correctness, and there both
+paths report identical totals (§3).
 
-The shape is the gap list above: pure compute gets native speed, while helper
-work (GC allocation/casts, bulk ops) and the call helper's own round-trip stay
-on the slow side. §7 items 7 and 14 are both landed, so default-on is no
-longer blocked on instantiate cost; what is left to measure is whether the
-per-access bounds checks (item 6) and the SIMD helper round-trips (item 10)
-leave memory- and vector-heavy bodies ahead of the interpreter rather than at
-a wash.
+The memory and GC rows are what settled the default-on question. The earlier
+reading here was that helper round-trips might leave memory- and vector-heavy
+bodies at a wash against the interpreter, which would have made item 6 and item
+10 blockers. They do not: the compiled access is a few cycles against the
+interpreter's heavy per-access cost, and the two regimes where that could have
+gone the other way are ~37× (memory) and ~8.9× (GC aggregates) ahead. Register
+SIMD is the narrowest margin at ~4.8×, where item 10's helper round-trip is
+indeed most of the compiled time — a further win, not a correction.
 
 Verified for the landing: `equiv` over the control-flow files, `exceptions`,
 `bulk-memory`, and `gc` reports **36 suites, 0 diverged**, 1,986/1,986 module
-definitions compiled; `cargo run -p slag --features wasm-compile --example
-wasm_smoke` passes (the same output as without the feature).
-- **Not shipped:** `wasm/compile` is default-off (`crates/wasm/Cargo.toml:8-19`)
-  and neither `runtime` nor `cli` enables it, so the CLI and the browser demo
-  always run the interpreter; only `wasmtest --features compile` and
-  `cargo test -p wasm --features compile` exercise it **(verified)**.
+definitions compiled; the corpus and JS-API totals are unchanged with the
+compiled path as the native default (§3).
+- **Shipped and default-on for native:** `runtime` activates `wasm/compile`
+  from a `cfg(not(target_arch = "wasm32"))` table (above), so `cli`, `slag`, and
+  native embeds run the compiled path without a flag. The wasm32 browser build
+  is unchanged, and `crates/wasm` still defaults the feature off at the crate
+  level because it cannot express "native only" on its own (confirmed:
+  `cargo tree -p slag --target wasm32-unknown-unknown -e features` shows no
+  cranelift) **(verified)**.
 - **Doc drift:** the module doc says tables are 32-bit and "GC objects are not
   lowered yet" (`compile.rs:46`, `50-51`), but table64 and GC struct/array
   lowering both landed; `body_compile_reason` still names a `try_table` gate
@@ -477,12 +491,14 @@ before the change); `wasmtest equiv` over `block`/`br`/`br_if`/`br_table`/
    real-world benefit is limited to call-free leaf bodies. Either gate it on
    (runtime/CLI feature) after adding direct native calls, or record the
    decision that it stays a research path.
-   **Landed 2026-09-14 (the feature gate, then both blockers):** reachable as
-   `wasm-compile` on `runtime`/`slag`/`cli`, native-only with a `compile_error!`
-   guard, still opt-in. §7 item 7 (direct native calls, including skipping the
-   helper for an eligible leaf call) and item 14 (lazy compile) have both
-   landed; measured envelope and the remaining blockers (§7 items 6 and 10) are
-   in §5.
+   **Landed 2026-09-14 (all three steps):** reachable as `wasm-compile` on
+   `runtime`/`slag`/`cli`, native-only with a `compile_error!` guard; §7 item 7
+   (direct native calls, including skipping the helper for an eligible leaf
+   call) and item 14 (lazy compile) landed next, and the decision was then made
+   to turn it **on by default for native targets** via a target-scoped
+   dependency table in `runtime`, which leaves the wasm32 browser build
+   untouched. Measured envelope and the remaining refinements (§7 items 6 and
+   10) are in §5.
 4. **JS-API memory bridge** (item 8) — the only boundary cost that is a whole
    linear-memory copy per call once a `buffer` has been materialised.
 5. Threads/atomics and `WebAssembly.Function` are the remaining whole-feature
@@ -495,19 +511,26 @@ git submodule update --init waspec          # required for any wasm sweep
 cargo run -p wasmtest -- run waspec/test/core/*.wast
 cargo run -p wasmtest -- run waspec/test/core/simd   # and each proposal dir
 cargo run -p wasmtest -- jsapi waspec/test/js-api
-cargo run -p wasmtest --features wasmtest/compile -- run ...   # + equiv gate
+cargo run -p wasmtest -- run --compiled ...          # compiled path
+cargo run -p wasmtest -- equiv ...                   # both paths, command by command
 ```
 
-`wasmtest equiv` (or `coverage`) is the compile-path gate; without
-`--features compile` it is not exercised.
+`wasmtest`'s `compile` feature is on by default (without it the runner cannot
+force the interpreter, so a plain `run` would silently measure the compiled
+path). `equiv` is the compile-path gate: it runs each suite through both paths
+and compares the per-command verdicts, and its coverage line is the static
+measure of how much of a module can compile.
 
 ## 10. Suggested `.rules` additions
 
-- "The wasm Cranelift backend (`wasm/compile`) is off by default and is not
-  enabled by `runtime` or `cli`: the CLI and browser demo always run the
-  interpreter. Compilation is lazy — a body compiles on first reach
-  (`Store::ensure_compiled`) — but `Store::compile_coverage` force-compiles
-  every body, because it reports static eligibility rather than what ran: a
-  timing measurement must not ask for coverage."
+- "The wasm Cranelift backend (`wasm/compile`) is on by default for native
+  builds: `runtime` activates it from a `cfg(not(target_arch = "wasm32"))`
+  dependency table, so `cli`/`slag`/native embeds get it and a wasm32 build
+  never does. There is no build-time opt-out on native (a target table cannot
+  be feature-gated) — `Store::set_compile(false)` is the per-store way back.
+  Compilation is lazy (a body compiles on first reach, `Store::ensure_compiled`)
+  but `Store::compile_coverage` force-compiles every body, because it reports
+  static eligibility rather than what ran: a timing measurement must not ask
+  for coverage."
 - "`wasmtest run` cannot fail on `pending`; a real gate must check the pending
   count, and `equiv`/`coverage` need `--features compile`."

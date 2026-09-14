@@ -26,6 +26,15 @@ regexp = { path = "../regexp" }
 syntax = { path = "../syntax" }
 unicode = { path = "../unicode" }
 
+# Cut 11: the compiled path is on for native builds by default. Cargo applies
+# features from the target tables matching the platform being built, so this
+# activates `wasm/compile` for every native target while a wasm32 build (where
+# the `wasm` crate raises its `compile_error!`) never sees it — which is what
+# keeps `cargo build -p slag --example wasm_binding --target
+# wasm32-unknown-unknown` working without extra flags.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasm = { path = "../wasm", optional = true, features = ["compile"] }
+
 # The stack-exhaustion guard's thread-stack query (unix platforms).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -47,12 +56,17 @@ raylib-sys = { version = "6.0.0", default-features = false, features = ["GLFW_BU
 # it drops the feature (and the `wasm` crate) with `--no-default-features`.
 default = ["wasm"]
 wasm = ["dep:wasm"]
-# Cut 11: run wasm bodies natively through Cranelift. Native targets only —
-# the `wasm` crate scopes cranelift's dependencies off wasm32 and rejects the
-# combination with a `compile_error!`, because `region` (executable-page
-# allocation) has no wasm32 backend. Compilation is lazy — a body compiles the
-# first time execution reaches it — so it stays opt-in for the calls that still
-# re-enter the interpreter, not for instantiate cost.
+# Cut 11: run wasm bodies natively through Cranelift. Native builds get this
+# by default — the `cfg(not(target_arch = "wasm32"))` table above activates
+# `wasm/compile` for them — so the feature is only an explicit request, and on
+# wasm32 an explicit request is an error: cranelift's `region` (executable-page
+# allocation) has no wasm32 backend, so the `wasm` crate scopes those
+# dependencies off wasm32 and rejects the combination with a `compile_error!`
+# rather than failing inside `region`. Compilation is lazy — a body compiles the
+# first time execution reaches it — so instantiate pays nothing for cold bodies.
+# There is deliberately no build-time opt-out on native (the target table
+# cannot be feature-gated); `Store::set_compile(false)` is the per-store way
+# back to the interpreter.
 wasm-compile = ["wasm", "wasm/compile"]
 # Experimental multi-agent mode (PLAN Phase 17): workers run as OS threads
 # with their own realms and job queues, sharing SharedArrayBuffer blocks

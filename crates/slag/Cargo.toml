@@ -17,8 +17,12 @@ jit = { path = "../jit", optional = true }
 # for a minimal embed build).
 default = ["wasm"]
 wasm = ["runtime/wasm"]
-# Cut 11: run wasm bodies natively (native targets only; see the runtime's
-# `wasm-compile`).
+# Cut 11: run wasm bodies natively (native targets only). On by default for
+# native builds — `runtime` activates `wasm/compile` from a
+# `cfg(not(target_arch = "wasm32"))` table, which is also why the
+# `wasm32-unknown-unknown` example build needs no extra flags. This feature is
+# only an explicit request (and on wasm32 a hard error); see the runtime's
+# `wasm-compile`.
 wasm-compile = ["runtime/wasm-compile"]
 # The Cranelift JIT hook (`install_jit`); off by default so embedders who do
 # not need it avoid the Cranelift dependency tree.

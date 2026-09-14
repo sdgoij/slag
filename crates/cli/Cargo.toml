@@ -31,11 +31,14 @@ jit = ["dep:jit"]
 # The WebAssembly JS API (`WebAssembly` global): on by default; drop it with
 # `--no-default-features` (keep the JIT with `--features jit`).
 wasm = ["runtime/wasm"]
-# Cut 11: run wasm bodies natively (native targets only). Off by default:
-# a compiled body's calls still re-enter the interpreter through the call
-# helper, so the win is confined to bodies whose hot path is call-free or
-# made of eligible direct calls. Compilation is lazy (a body compiles on
-# first reach), so instantiate pays nothing for cold bodies.
+# Cut 11: run wasm bodies natively (native targets only). On by default for
+# native builds — `runtime` activates `wasm/compile` from a
+# `cfg(not(target_arch = "wasm32"))` table — so this feature is only an explicit
+# request, and on wasm32 an explicit request is a hard error (cranelift's
+# `region` has no wasm32 backend). A compiled body's calls still re-enter the
+# interpreter through the call helper when the callee is not an eligible direct
+# call; `Store::set_compile(false)` is the per-store way back to the
+# interpreter.
 wasm-compile = ["runtime/wasm-compile"]
 # The drop-in JavaScriptCore C API (`crates/jsc`): not part of the default
 # workspace build; this feature builds it alongside the CLI so a release can
