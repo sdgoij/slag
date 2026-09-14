@@ -361,6 +361,13 @@ pub struct Store {
     /// exhaustion semantics still hold for runaway recursion.
     #[cfg(feature = "compile")]
     native_depth: usize,
+    /// Cut 11: per-native-depth buffers for compiled-to-compiled re-entry,
+    /// reused across calls. Allocating them per call (two descriptor words per
+    /// module memory, a cell and a word per used global, and a `SCRATCH_SLOTS`
+    /// scratch) was several `Vec`s per call, including a 2 KiB scratch. Indexed
+    /// by depth, so a nested call never disturbs an outer level's buffers.
+    #[cfg(feature = "compile")]
+    native_frames: Vec<NativeFrame>,
 }
 
 impl Default for Store {
@@ -761,6 +768,21 @@ pub unsafe extern "C" fn wasm_call_helper(
     }
 }
 
+/// Cut 11: one native call level's buffers, kept for the life of the store and
+/// reused by every call at that depth (see `Store::native_frames`).
+#[cfg(feature = "compile")]
+#[derive(Default)]
+struct NativeFrame {
+    /// Memory descriptors: a data pointer and a byte length per module memory.
+    descriptors: Vec<u64>,
+    /// The callee's used-global cells, in `gvals` order.
+    cells: Vec<usize>,
+    /// The callee's global values.
+    gvals: Vec<u64>,
+    /// Argument/result slots for the callee's own call sites.
+    scratch: Vec<u64>,
+}
+
 /// The caller-side buffers a native compiled re-entry (Wave 3) hands to the
 /// callee: the argument slots the caller already spilled (also where results
 /// land), plus the caller's instance index and descriptor pointer so the
@@ -788,7 +810,8 @@ struct NativeCall {
 /// `store` stays valid and uniquely borrowed for the whole call;
 /// `native_ptr` points at a compiled entry kept alive by its instance;
 /// `call.args_out`/`call.caller_mems` are the caller's buffers, alive for the
-/// call; the buffers allocated here stay alive until the native call returns.
+/// call; the buffers live on the store and are reused at this depth, so the
+/// native call sets no new allocation up.
 #[cfg(feature = "compile")]
 unsafe fn run_native_callee(
     store: *mut Store,
@@ -798,36 +821,48 @@ unsafe fn run_native_callee(
 ) -> i32 {
     let func = unsafe { &*native_ptr };
     let store_ref = unsafe { &mut *store };
+    // This depth's buffers, taken out of the store for the call so the flush
+    // below can borrow the store mutably again; they go back with their
+    // allocations intact.
+    let depth = store_ref.native_depth;
+    while store_ref.native_frames.len() <= depth {
+        store_ref.native_frames.push(NativeFrame::default());
+    }
+    let mut frame = std::mem::take(&mut store_ref.native_frames[depth]);
     // The callee's memory descriptors, from its own instance's cells.
-    let memories = store_ref.instances[own].memories.clone();
-    let mut descriptors = Vec::with_capacity(2 * memories.len());
-    for cell in &memories {
+    frame.descriptors.clear();
+    for cell in &store_ref.instances[own].memories {
         match store_ref.memories.get(*cell) {
             Some(memory) => {
-                descriptors.push(memory.bytes.as_ptr() as u64);
-                descriptors.push(memory.bytes.len() as u64);
+                frame.descriptors.push(memory.bytes.as_ptr() as u64);
+                frame.descriptors.push(memory.bytes.len() as u64);
             }
             None => {
-                descriptors.push(0);
-                descriptors.push(0);
+                frame.descriptors.push(0);
+                frame.descriptors.push(0);
             }
         }
     }
-    // The callee's used globals ride a caller-owned buffer seeded from its
-    // cells (word layout per `seed_globals`), flushed back after the call.
-    let used = func.used_globals().to_vec();
-    let cells: Vec<usize> = used
-        .iter()
-        .map(|index| store_ref.instances[own].globals[*index as usize])
-        .collect();
-    let mut gvals = seed_globals(store_ref, &cells);
-    let callee_scratch = vec![0u64; crate::compile::SCRATCH_SLOTS];
+    // The callee's used globals ride this level's buffer, seeded from its
+    // cells (word layout per `seed_globals_into`) and flushed back after the
+    // call. The scratch was zeroed when this depth first allocated it; every
+    // read of it is preceded by the caller's spill.
+    let used = func.used_globals();
+    frame.cells.clear();
+    frame.cells.extend(
+        used.iter()
+            .map(|index| store_ref.instances[own].globals[*index as usize]),
+    );
+    seed_globals_into(store_ref, &frame.cells, &mut frame.gvals);
+    if frame.scratch.len() < crate::compile::SCRATCH_SLOTS {
+        frame.scratch.resize(crate::compile::SCRATCH_SLOTS, 0);
+    }
     let runtime = crate::compile::CompiledRuntime {
         store: store as u64,
         instance: own as u64,
         grow: memory_grow_helper as *const () as usize as u64,
         call: wasm_call_helper as *const () as usize as u64,
-        scratch: callee_scratch.as_ptr() as u64,
+        scratch: frame.scratch.as_ptr() as u64,
     };
     // SAFETY: enforced by `CompiledFunc::call_raw`'s contract (the buffers
     // above stay alive for the call).
@@ -835,9 +870,9 @@ unsafe fn run_native_callee(
         func.call_raw(
             call.args_out,
             call.argc as u64,
-            descriptors.as_ptr(),
-            descriptors.len() as u64,
-            gvals.as_mut_ptr(),
+            frame.descriptors.as_ptr(),
+            frame.descriptors.len() as u64,
+            frame.gvals.as_mut_ptr(),
             call.args_out,
             call.nout as u64,
             runtime,
@@ -847,7 +882,8 @@ unsafe fn run_native_callee(
     // refresh the caller's descriptors (the callee may have grown a memory
     // shared with the caller, or any memory the caller later touches).
     let store_ref = unsafe { &mut *store };
-    flush_globals(store_ref, &cells, &gvals);
+    flush_globals(store_ref, &frame.cells, &frame.gvals);
+    store_ref.native_frames[depth] = frame;
     refresh_descriptors(store_ref, call.caller_instance as u64, call.caller_mems);
     code
 }
@@ -2515,12 +2551,13 @@ fn refresh_descriptors(store: &mut Store, instance: u64, mems: *mut u64) {
     }
 }
 
-/// Seed a compiled body's `gvals` buffer from the store's global cells: one
+/// Fill a compiled body's `gvals` buffer from the store's global cells: one
 /// u64 word per numeric global, two (lo/hi) per v128, in `cells` order — the
 /// layout the compiled `do_global_get`/`set` use (cumulative word offsets).
+/// `out` keeps its allocation between calls.
 #[cfg(feature = "compile")]
-fn seed_globals(store: &Store, cells: &[usize]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(cells.len());
+fn seed_globals_into(store: &Store, cells: &[usize], out: &mut Vec<u64>) {
+    out.clear();
     for &cell in cells {
         match store.globals[cell] {
             Value::I32(bits) => out.push(bits as u32 as u64),
@@ -2534,11 +2571,10 @@ fn seed_globals(store: &Store, cells: &[usize]) -> Vec<u64> {
             _ => out.push(0),
         }
     }
-    out
 }
 
 /// Flush a compiled body's `gvals` buffer back to the store's global cells,
-/// consuming the same per-type word layout [`seed_globals`] produced.
+/// consuming the same per-type word layout [`seed_globals_into`] produced.
 #[cfg(feature = "compile")]
 fn flush_globals(store: &mut Store, cells: &[usize], words: &[u64]) {
     let mut word = 0usize;
@@ -2695,6 +2731,8 @@ impl Store {
             pending_error: None,
             #[cfg(feature = "compile")]
             native_depth: 0,
+            #[cfg(feature = "compile")]
+            native_frames: Vec::new(),
         }
     }
 
@@ -3619,7 +3657,8 @@ impl Store {
                 .iter()
                 .map(|index| self.instances[instance].globals[*index as usize])
                 .collect::<Vec<_>>();
-            let mut globals = seed_globals(self, &cells);
+            let mut globals = Vec::with_capacity(cells.len());
+            seed_globals_into(self, &cells, &mut globals);
             // Runtime pointers the compiled body can call back into: the
             // store address and instance index for the `memory.grow` and call
             // helpers, the helpers' code addresses, and a caller-owned

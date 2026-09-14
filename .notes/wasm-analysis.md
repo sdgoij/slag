@@ -185,11 +185,24 @@ Policy and gaps:
 - **Host-reachable bodies are forced interpreted** (`exec.rs:3117-3152`,
   **(verified)**): a native run cannot park at an external-host boundary, so
   one host-call mechanism is kept (plan decision 7).
-- **Calls are never native.** Direct, indirect, `call_ref`, and tail forms all
-  go through a store-side helper that runs the callee through the interpreter
-  (`compile.rs:3069-3187`, `exec.rs:492-755`). Compiled→compiled native
-  re-entry is capped at `NATIVE_CALL_DEPTH = 64` (`exec.rs:119`,
-  **(verified)**); past it the helper drops to interpreted subtrees.
+- **Calls go through a store-side helper.** Direct, indirect, `call_ref`, and
+  tail forms spill their arguments into a scratch region and call the helper
+  (`compile.rs:3069-3187`, `exec.rs:492-755`), which resolves the target and —
+  within `NATIVE_CALL_DEPTH = 64` (`exec.rs:119`) — re-enters the callee's
+  compiled entry natively. (The earlier note here said "calls are never
+  native"; that misread the helper, which does re-enter — it just does the
+  resolution and the per-call buffer setup in Rust first.) Past the cap, or for
+  an interpreted or host callee, the helper runs the callee through the
+  interpreter instead.
+  **Partly fixed 2026-09-14:** those per-call buffers — memory descriptors,
+  the used-global cells and `gvals`, and a 2 KiB `SCRATCH_SLOTS` scratch, five
+  `Vec`s per call — are now cached per native depth on the store and reused
+  (`Store::native_frames`), which took the call-per-iteration probe from 2.6×
+  to 3.6× over the interpreter. What is left of item 7: the helper still
+  resolves the callee and materializes a `FuncType` by value on every call
+  (`Store::func_type`, `func_at_cloned` for the indirect forms — two `Vec`s per
+  call), every call still costs two Rust frames plus an indirect call, and the
+  depth cap is unchanged.
 - **Helpers, not native lowering**, for: all calls, `memory.grow`, imported /
   call-bearing-body globals, table ops, pure-register SIMD and vec
   load/lane/shuffle, GC allocation/casts, and EH dynamic dispatch
@@ -216,14 +229,15 @@ startup, so the leaf row understates the loop):
 | Workload | Interpreter | Compiled | |
 |---|---|---|---|
 | call-free leaf loop, 10M iterations (`fixtures/leaf-loop.wast`) | 2.066 s | 0.026 s | ~80× |
-| loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.344 s | 0.133 s | 2.6× |
+| loop with one call per iteration, 1M (`fixtures/interp-hot-loop.wast`) | 0.343 s | 0.095 s | 3.6× |
 | `bulk-memory` corpus (7,485 assertions) | 0.778 s | 0.546 s | 1.42× |
 | `gc` corpus (654 assertions) | 0.203 s | 0.219 s | 0.93× |
 
 The shape is the gap list above: pure compute gets native speed, while helper
-and call work (GC allocation/casts, bulk ops, every call) stays on the
-interpreter. Turning it on by default would need §7 items 7 (native direct
-calls) and 14 (lazy/tiered compile) first.
+work (GC allocation/casts, bulk ops) and the call helper's Rust-side resolution
+stay on the slow side. Turning it on by default would need the rest of §7 item 7
+(skip the helper round-trip for direct calls) and item 14 (lazy/tiered compile)
+first.
 
 Verified for the landing: `equiv` over the control-flow files, `exceptions`,
 `bulk-memory`, and `gc` reports **36 suites, 0 diverged**, 1,986/1,986 module
@@ -363,7 +377,10 @@ JS-API boundary, "D" = decode/validate.
 
 Items 1-4 are all "remove an allocation or a scan from a per-instruction
 path", and can be validated with the existing compiled-vs-interpreted
-equivalence harness rather than new tests.
+equivalence harness rather than new tests. Item 7's first slice (2026-09-14)
+was the same move one level up: the native call path allocated five `Vec`s per
+call, and caching them per depth moved the call-per-iteration probe from 2.6×
+to 3.6× — see §5.
 
 **Landed 2026-09-14 (items 1, 3, 4 and item 2's double clones).** Measured on a
 hot-loop probe (1M iterations; a call plus a `br_if` plus three numeric ops per

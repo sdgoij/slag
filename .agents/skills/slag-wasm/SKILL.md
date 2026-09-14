@@ -102,9 +102,11 @@ calls still re-enter the interpreter:
   with `--features compile`); `equiv` compares both paths.
 - One binary built with `--features compile` measures both: without `--compiled`
   the store forces the interpreter, which is what makes the A/B meaningful.
-- The envelope, measured: ~80× on a call-free leaf loop, 2.6× on a loop with a
+- The envelope, measured: ~80× on a call-free leaf loop, 3.6× on a loop with a
   call per iteration, 1.42× on the `bulk-memory` corpus, and a wash (0.93×) on
-  the GC corpus, whose work is helper-bound.
+  the GC corpus, whose work is helper-bound. A call still goes through a
+  store-side helper that resolves the target and materializes a `FuncType`
+  before re-entering the callee natively, which is the remaining cost.
 
 ## Validation loop
 
