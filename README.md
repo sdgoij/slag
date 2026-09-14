@@ -83,7 +83,8 @@ target/release/slag                       # REPL
 ```
 
 The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
-`readdirSync`/`statSync`) to scripts, and accepts `--dump-ast`,
+`readdirSync`/`statSync`) to scripts — `readFileSync` returns the raw bytes as a
+`Uint8Array` unless a `'utf8'` encoding is passed — and accepts `--dump-ast`,
 `--dump-tokens`, `--print-bytecode` (dump the compiled `Step` stream),
 `--bench` (interpreter micro-benchmarks), and — when the JIT feature is
 compiled, the default — `--jitless` (disable the Cranelift JIT for the run;
@@ -134,9 +135,10 @@ println!("{doubled}"); // 42
 register from Rust with `Context::register_fn` (a global) or
 `Context::create_function` plus `Context::create_object` (a namespace object to
 hang them on); the callback receives a `FunctionCall` — `this`, the arguments,
-agent-backed coercions, and re-entrant `call`/`construct`/`eval` — and returns
-`Ok(JsValue)` or `Err(JsError)`, with `JsValue::thrown()` for throwing an
-arbitrary value. `Context::create_constructor` builds a host constructor instead
+agent-backed coercions, re-entrant `call`/`construct`/`eval`, and value
+construction — and returns `Ok(JsValue)` or `Err(JsError)`, with
+`JsValue::thrown()` for throwing an arbitrary value. `Context::create_constructor`
+builds a host constructor instead
 (the fresh instance arrives as `this`, and `FunctionCall::{is_construct,
 new_target}` distinguish a `new` call), and `Context::define_accessor` defines a
 getter/setter pair backed by host closures:

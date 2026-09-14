@@ -1,10 +1,15 @@
 # Registering native functions through the public embedding API — proposal
 
 > **Status:** all four slices landed — `HostFn`, `FunctionCall` (including the
-> re-entrant `call`/`construct`/`eval`, `is_construct`, and `new_target`),
+> re-entrant `call`/`construct`/`eval` and `create_object`/`create_function`/
+> `define_accessor`, `is_construct`, and `new_target`),
 > `Context::{create_function, create_constructor, create_object, register_fn,
 > define_accessor}`, the `ErrorKind` re-export, and `JsValue::thrown`, with tests
-> in `embed.rs` and the `examples/embed.rs` walkthrough.
+> in `embed.rs` and the `examples/embed.rs` walkthrough. `examples/wasm_binding`
+> was migrated onto the facade (slice 4's stated motivation): the re-entrant
+> creation methods exist because that bridge builds the elements and method
+> functions it returns from inside a host callback, and only the
+> dynamically-keyed `dataset` host object still needs `crux`.
 
 ## 1. Summary
 

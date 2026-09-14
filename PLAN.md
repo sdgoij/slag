@@ -2074,7 +2074,8 @@ Delivered:
   `JsValue::thrown()` throws an arbitrary value verbatim, and `ErrorKind` is re-exported so
   hosts can build their own errors. A host function can re-enter the engine synchronously through
   `FunctionCall::call`/`construct`/`eval` (a JS callback passed as an argument, a constructor, a
-  nested script), and `Context::create_constructor` builds a host constructor whose instances
+  nested script) and value construction (`FunctionCall::create_object`/`create_function`/
+  `define_accessor`), `Context::create_constructor` builds a host constructor whose instances
   inherit its MakeConstructor `.prototype` (honouring `new.target`; the callback distinguishes the
   two halves through `FunctionCall::is_construct`/`new_target`), and
   `Context::define_accessor` defines getter/setter properties backed by host closures.

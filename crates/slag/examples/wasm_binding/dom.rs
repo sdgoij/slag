@@ -1,6 +1,7 @@
 //! A minimal host DOM bridge for the dogfood experiment, kept *outside* the
-//! engine: this module only uses crux's public host-object machinery and the
-//! public `embed` facade, so nothing in `crates/runtime` changes.
+//! engine: the bridge registers its globals, methods, and element properties
+//! through the public `slag` embedding API, and keeps `crux` only for the one
+//! host object the facade cannot express (the dynamically-keyed `dataset`).
 //!
 //! [`install`] gives the running realm a `document` global whose elements
 //! are host exotic objects: `textContent`-style property reads/writes and
@@ -17,16 +18,14 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use crux::error::{ErrorKind, JsError};
-use crux::function::Function;
 use crux::handle::Handle;
 use crux::host::HostOps;
 use crux::object::JsObject as CruxObject;
 use crux::property::PropertyKey;
 use crux::string::JsString;
-use crux::value::{Value, ValueKind, is_callable};
+use crux::value::{Value, ValueKind};
 
-use runtime::embed::{Context, JsValue};
+use slag::{Context, ErrorKind, FunctionCall, HostFn, JsError, JsObject, JsValue};
 
 /// Where the listener registry is rooted on the global (a key no script
 /// would use). Listener functions live as own properties of an ordinary
@@ -269,7 +268,7 @@ impl DomHost {
 struct State {
     host: DomHost,
     attached: RefCell<HashSet<(u32, String)>>,
-    registry: Handle<CruxObject>,
+    registry: JsObject,
 }
 
 /// The `el.dataset` object: any property read/write maps to a `data-*`
@@ -325,72 +324,6 @@ impl HostOps for DatasetOps {
     }
 }
 
-/// Per-element host behaviour: intercept the value properties, fall back to
-/// ordinary storage (own method properties, the prototype chain) otherwise.
-struct ElementOps {
-    id: u32,
-    state: Rc<State>,
-}
-
-impl std::fmt::Debug for ElementOps {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ElementOps").field("id", &self.id).finish()
-    }
-}
-
-impl HostOps for ElementOps {
-    fn get(
-        &self,
-        _object: &CruxObject,
-        key: &PropertyKey,
-        _receiver: &Value,
-    ) -> Option<Result<Value, JsError>> {
-        let PropertyKey::String(atom) = key else {
-            return None;
-        };
-        let name = crux::string::lookup(*atom).to_string_lossy();
-        if name == "classList" {
-            return Some(class_list_object(&self.state, self.id).map(Value::Object));
-        }
-        if name == "dataset" {
-            let dataset = CruxObject::host_object_create(
-                Rc::new(DatasetOps {
-                    id: self.id,
-                    state: self.state.clone(),
-                }),
-                None,
-            );
-            return Some(Ok(Value::Object(dataset)));
-        }
-        if !VALUE_PROPS.contains(&name.as_str()) {
-            return None;
-        }
-        Some(Ok(host_value_to_js(
-            &self.state.host.get_property(self.id, &name),
-        )))
-    }
-
-    fn set(
-        &self,
-        _object: &CruxObject,
-        key: &PropertyKey,
-        value: &Value,
-        _receiver: &Value,
-    ) -> Option<Result<bool, JsError>> {
-        let PropertyKey::String(atom) = key else {
-            return None;
-        };
-        let name = crux::string::lookup(*atom).to_string_lossy();
-        if !VALUE_PROPS.contains(&name.as_str()) {
-            return None;
-        }
-        self.state
-            .host
-            .set_property(self.id, &name, &js_to_host_value(value));
-        Some(Ok(true))
-    }
-}
-
 /// Map a bridge value to the engine value it represents.
 fn host_value_to_js(value: &HostDomValue) -> Value {
     match value.tag {
@@ -424,24 +357,71 @@ fn js_to_host_value(value: &Value) -> HostDomValue {
     }
 }
 
-/// A `document`/element method body: `(state, element-id, args)`.
-type DomMethod = fn(&Rc<State>, u32, &[Value]) -> Result<Value, JsError>;
+/// The value-creation surface the bridge needs. During [`install`] a
+/// [`Context`] provides it; inside a host callback the re-entrant
+/// [`FunctionCall`] does, because the elements a method returns must be built
+/// while the call is running.
+trait HostApi {
+    fn make_object(&self) -> Result<JsObject, JsError>;
+    fn make_function(&self, name: &str, length: u32, callback: HostFn) -> Result<JsValue, JsError>;
+    fn make_accessor(
+        &self,
+        target: &JsObject,
+        key: &str,
+        get: Option<HostFn>,
+        set: Option<HostFn>,
+    ) -> Result<(), JsError>;
+}
 
-/// A `localStorage` method body.
-type DomStorageMethod = fn(&Rc<State>, &[Value]) -> Result<Value, JsError>;
+impl HostApi for Context {
+    fn make_object(&self) -> Result<JsObject, JsError> {
+        Context::create_object(self)
+    }
+
+    fn make_function(&self, name: &str, length: u32, callback: HostFn) -> Result<JsValue, JsError> {
+        Context::create_function(self, name, length, callback)
+    }
+
+    fn make_accessor(
+        &self,
+        target: &JsObject,
+        key: &str,
+        get: Option<HostFn>,
+        set: Option<HostFn>,
+    ) -> Result<(), JsError> {
+        Context::define_accessor(self, target, key, get, set)
+    }
+}
+
+impl HostApi for FunctionCall<'_> {
+    fn make_object(&self) -> Result<JsObject, JsError> {
+        FunctionCall::create_object(self)
+    }
+
+    fn make_function(&self, name: &str, length: u32, callback: HostFn) -> Result<JsValue, JsError> {
+        FunctionCall::create_function(self, name, length, callback)
+    }
+
+    fn make_accessor(
+        &self,
+        target: &JsObject,
+        key: &str,
+        get: Option<HostFn>,
+        set: Option<HostFn>,
+    ) -> Result<(), JsError> {
+        FunctionCall::define_accessor(self, target, key, get, set)
+    }
+}
+
+/// A `document`/element method body: `(state, element-id, call)`.
+type DomMethod = fn(&Rc<State>, u32, &FunctionCall<'_>) -> Result<JsValue, JsError>;
 
 /// Install `document` on the realm's global.
 pub fn install(context: &mut Context, host: DomHost) -> Result<(), String> {
     let global = context.global().map_err(|error| error.to_string())?;
-    let registry = CruxObject::ordinary_object_create(None);
+    let registry = context.create_object().map_err(|error| error.to_string())?;
     global
-        .define(
-            REGISTRY_KEY,
-            JsValue::from(Value::Object(registry)),
-            false,
-            false,
-            false,
-        )
+        .define(REGISTRY_KEY, registry.as_value(), false, false, false)
         .map_err(|error| error.to_string())?;
 
     let state = Rc::new(State {
@@ -450,178 +430,131 @@ pub fn install(context: &mut Context, host: DomHost) -> Result<(), String> {
         registry,
     });
 
-    let document = CruxObject::ordinary_object_create(None);
+    let document = context.create_object().map_err(|error| error.to_string())?;
     for (name, builtin) in [
         ("getElementById", dom_get_element_by_id as DomMethod),
         ("createElement", dom_create_element as DomMethod),
         ("querySelectorAll", dom_query_all as DomMethod),
     ] {
         let state = state.clone();
-        let function = Function::create_builtin(
-            Some(JsString::from_utf8(name)),
-            1,
-            Box::new(move |_, args| builtin(&state, 0, args)),
-            None,
-            None,
-        )
-        .map_err(|error| error.to_string())?;
+        let function = context
+            .create_function(name, 1, Box::new(move |call| builtin(&state, 0, call)))
+            .map_err(|error| error.to_string())?;
         document
-            .create_data_property_or_throw(&JsString::from_utf8(name), Value::Function(function))
+            .set(name, function)
             .map_err(|error| error.to_string())?;
     }
     if let Some(root_id) = state.host.root_node() {
-        let root = make_element(&state, root_id).map_err(|error| error.to_string())?;
+        let root = make_element(&*context, &state, root_id).map_err(|error| error.to_string())?;
         document
-            .create_data_property_or_throw(
-                &JsString::from_utf8("documentElement"),
-                Value::Object(root),
-            )
+            .set("documentElement", root.as_value())
             .map_err(|error| error.to_string())?;
     }
     global
-        .define(
-            "document",
-            JsValue::from(Value::Object(document)),
-            true,
-            false,
-            false,
-        )
+        .define("document", document.as_value(), true, false, false)
         .map_err(|error| error.to_string())?;
 
-    let storage = CruxObject::ordinary_object_create(None);
+    let storage = context.create_object().map_err(|error| error.to_string())?;
     for (name, builtin) in [
-        ("getItem", dom_storage_get as DomStorageMethod),
-        ("setItem", dom_storage_set as DomStorageMethod),
+        ("getItem", dom_storage_get as DomMethod),
+        ("setItem", dom_storage_set as DomMethod),
     ] {
         let state = state.clone();
-        let function = Function::create_builtin(
-            Some(JsString::from_utf8(name)),
-            2,
-            Box::new(move |_, args| builtin(&state, args)),
-            None,
-            None,
-        )
-        .map_err(|error| error.to_string())?;
+        let function = context
+            .create_function(name, 2, Box::new(move |call| builtin(&state, 0, call)))
+            .map_err(|error| error.to_string())?;
         storage
-            .create_data_property_or_throw(&JsString::from_utf8(name), Value::Function(function))
+            .set(name, function)
             .map_err(|error| error.to_string())?;
     }
     global
-        .define(
-            "localStorage",
-            JsValue::from(Value::Object(storage)),
-            true,
-            false,
-            false,
-        )
+        .define("localStorage", storage.as_value(), true, false, false)
         .map_err(|error| error.to_string())?;
 
     // A small host object for engine-side helpers the demo app needs: the
     // CLI's debug dumps and clipboard copy.
-    let host_global = CruxObject::ordinary_object_create(None);
-    let dump_function = Function::create_builtin(
-        Some(JsString::from_utf8("dump")),
-        2,
-        Box::new(|_, args| {
-            let kind = match args.first().map(|value| value.kind()) {
-                Some(ValueKind::Number(number)) => number as u32,
-                _ => 0,
-            };
-            let source = match args.get(1).map(|value| value.kind()) {
-                Some(ValueKind::String(text)) => text.to_string_lossy(),
-                _ => {
+    let host_global = context.create_object().map_err(|error| error.to_string())?;
+    let dump_function = context
+        .create_function(
+            "dump",
+            2,
+            Box::new(|call| {
+                let kind = call
+                    .arg(0)
+                    .and_then(|value| value.as_number())
+                    .unwrap_or(0.0) as u32;
+                let Some(source) = call.arg(1).and_then(|value| value.as_string()) else {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "__host.dump: expected a source string".into(),
                     ));
-                }
-            };
-            engine_dump(kind, &source)
-                .map(|text| Value::String(Handle::new(JsString::from_utf8(&text))))
-                .map_err(|message| JsError::new(ErrorKind::TypeError, message))
-        }),
-        None,
-        None,
-    )
-    .map_err(|error| error.to_string())?;
+                };
+                engine_dump(kind, &source)
+                    .map(JsValue::string)
+                    .map_err(|message| JsError::new(ErrorKind::TypeError, message))
+            }),
+        )
+        .map_err(|error| error.to_string())?;
     host_global
-        .create_data_property_or_throw(&JsString::from_utf8("dump"), Value::Function(dump_function))
+        .set("dump", dump_function)
         .map_err(|error| error.to_string())?;
     let state_for_copy = state.clone();
-    let copy_function = Function::create_builtin(
-        Some(JsString::from_utf8("copy")),
-        1,
-        Box::new(move |_, args| {
-            let text = match args.first().map(|value| value.kind()) {
-                Some(ValueKind::String(text)) => text.to_string_lossy(),
-                _ => String::new(),
-            };
-            Ok(Value::Boolean(state_for_copy.host.copy_text(&text)))
-        }),
-        None,
-        None,
-    )
-    .map_err(|error| error.to_string())?;
+    let copy_function = context
+        .create_function(
+            "copy",
+            1,
+            Box::new(move |call| {
+                let text = call
+                    .arg(0)
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_default();
+                Ok(JsValue::boolean(state_for_copy.host.copy_text(&text)))
+            }),
+        )
+        .map_err(|error| error.to_string())?;
     host_global
-        .create_data_property_or_throw(&JsString::from_utf8("copy"), Value::Function(copy_function))
+        .set("copy", copy_function)
         .map_err(|error| error.to_string())?;
     // Run/reset the separate user-sandbox realm (dogfood). The request goes
     // to the host because only it can call the sandbox exports — engine code
     // cannot reach the other Context. The host defers the actual run until
     // the current engine call has returned.
     let state_for_user_run = state.clone();
-    let user_run_function = Function::create_builtin(
-        Some(JsString::from_utf8("userRun")),
-        1,
-        Box::new(move |_, args| {
-            let source = match args.first().map(|value| value.kind()) {
-                Some(ValueKind::String(text)) => text.to_string_lossy(),
-                _ => {
+    let user_run_function = context
+        .create_function(
+            "userRun",
+            1,
+            Box::new(move |call| {
+                let Some(source) = call.arg(0).and_then(|value| value.as_string()) else {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "__host.userRun: expected a source string".into(),
                     ));
-                }
-            };
-            state_for_user_run.host.user_run(&source);
-            Ok(Value::Undefined)
-        }),
-        None,
-        None,
-    )
-    .map_err(|error| error.to_string())?;
-    host_global
-        .create_data_property_or_throw(
-            &JsString::from_utf8("userRun"),
-            Value::Function(user_run_function),
+                };
+                state_for_user_run.host.user_run(&source);
+                Ok(JsValue::undefined())
+            }),
         )
+        .map_err(|error| error.to_string())?;
+    host_global
+        .set("userRun", user_run_function)
         .map_err(|error| error.to_string())?;
     let state_for_user_reset = state.clone();
-    let user_reset_function = Function::create_builtin(
-        Some(JsString::from_utf8("userReset")),
-        0,
-        Box::new(move |_, _| {
-            state_for_user_reset.host.user_reset();
-            Ok(Value::Undefined)
-        }),
-        None,
-        None,
-    )
-    .map_err(|error| error.to_string())?;
-    host_global
-        .create_data_property_or_throw(
-            &JsString::from_utf8("userReset"),
-            Value::Function(user_reset_function),
+    let user_reset_function = context
+        .create_function(
+            "userReset",
+            0,
+            Box::new(move |_| {
+                state_for_user_reset.host.user_reset();
+                Ok(JsValue::undefined())
+            }),
         )
         .map_err(|error| error.to_string())?;
+    host_global
+        .set("userReset", user_reset_function)
+        .map_err(|error| error.to_string())?;
     global
-        .define(
-            "__host",
-            JsValue::from(Value::Object(host_global)),
-            true,
-            false,
-            false,
-        )
+        .define("__host", host_global.as_value(), true, false, false)
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -638,51 +571,65 @@ fn engine_dump(kind: u32, source: &str) -> Result<String, String> {
 }
 
 /// `localStorage.getItem(key)` — `null` when the host has no value.
-fn dom_storage_get(state: &Rc<State>, args: &[Value]) -> Result<Value, JsError> {
-    let key = match args.first().map(|value| value.kind()) {
-        Some(ValueKind::String(text)) => text.to_string_lossy(),
-        _ => return Ok(Value::Null),
+fn dom_storage_get(
+    state: &Rc<State>,
+    _id: u32,
+    call: &FunctionCall<'_>,
+) -> Result<JsValue, JsError> {
+    let Some(key) = call.arg(0).and_then(|value| value.as_string()) else {
+        return Ok(JsValue::null());
     };
     match state.host.storage_get(&key) {
-        Some(value) => Ok(Value::String(Handle::new(JsString::from_utf8(&value)))),
-        None => Ok(Value::Null),
+        Some(value) => Ok(JsValue::string(value)),
+        None => Ok(JsValue::null()),
     }
 }
 
 /// `localStorage.setItem(key, value)`.
-fn dom_storage_set(state: &Rc<State>, args: &[Value]) -> Result<Value, JsError> {
-    let key = match args.first().map(|value| value.kind()) {
-        Some(ValueKind::String(text)) => text.to_string_lossy(),
-        _ => return Ok(Value::Undefined),
+fn dom_storage_set(
+    state: &Rc<State>,
+    _id: u32,
+    call: &FunctionCall<'_>,
+) -> Result<JsValue, JsError> {
+    let Some(key) = call.arg(0).and_then(|value| value.as_string()) else {
+        return Ok(JsValue::undefined());
     };
-    let value = match args.get(1).map(|value| value.kind()) {
-        Some(ValueKind::String(text)) => text.to_string_lossy(),
-        _ => String::new(),
-    };
+    let value = call
+        .arg(1)
+        .and_then(|value| value.as_string())
+        .unwrap_or_default();
     state.host.storage_set(&key, &value);
-    Ok(Value::Undefined)
+    Ok(JsValue::undefined())
 }
 
 /// `document.getElementById(id)`.
-fn dom_get_element_by_id(state: &Rc<State>, _id: u32, args: &[Value]) -> Result<Value, JsError> {
-    let name = match args.first().map(|value| value.kind()) {
-        Some(ValueKind::String(text)) => text.to_string_lossy(),
-        _ => String::new(),
-    };
+fn dom_get_element_by_id(
+    state: &Rc<State>,
+    _id: u32,
+    call: &FunctionCall<'_>,
+) -> Result<JsValue, JsError> {
+    let name = call
+        .arg(0)
+        .and_then(|value| value.as_string())
+        .unwrap_or_default();
     match state.host.element_by_id(&name) {
-        Some(id) => Ok(Value::Object(make_element(state, id)?)),
-        None => Ok(Value::Null),
+        Some(id) => Ok(make_element(call, state, id)?.as_value()),
+        None => Ok(JsValue::null()),
     }
 }
 
 /// `document.createElement(tag)`.
-fn dom_create_element(state: &Rc<State>, _id: u32, args: &[Value]) -> Result<Value, JsError> {
-    let tag = match args.first().map(|value| value.kind()) {
-        Some(ValueKind::String(text)) => text.to_string_lossy(),
-        _ => String::new(),
-    };
+fn dom_create_element(
+    state: &Rc<State>,
+    _id: u32,
+    call: &FunctionCall<'_>,
+) -> Result<JsValue, JsError> {
+    let tag = call
+        .arg(0)
+        .and_then(|value| value.as_string())
+        .unwrap_or_default();
     match state.host.create_element(&tag) {
-        Some(id) => Ok(Value::Object(make_element(state, id)?)),
+        Some(id) => Ok(make_element(call, state, id)?.as_value()),
         None => Err(JsError::new(
             ErrorKind::TypeError,
             format!("createElement: the host cannot create <{tag}>"),
@@ -690,72 +637,89 @@ fn dom_create_element(state: &Rc<State>, _id: u32, args: &[Value]) -> Result<Val
     }
 }
 
-/// A fresh element host object for `id`: it carries its node id as an own
-/// property (so `appendChild` can recover it) plus its method functions.
-fn make_element(state: &Rc<State>, id: u32) -> Result<Handle<CruxObject>, JsError> {
-    let element = CruxObject::host_object_create(
-        Rc::new(ElementOps {
+/// A fresh element object for `id`: it carries its node id as an own property
+/// (so the methods can recover it), the DOM methods, a `classList` object, a
+/// `dataset` host object, and an accessor for every browser-backed value
+/// property.
+fn make_element(api: &impl HostApi, state: &Rc<State>, id: u32) -> Result<JsObject, JsError> {
+    let element = api.make_object()?;
+    element.define(
+        HIDDEN_ID_KEY,
+        JsValue::number(f64::from(id)),
+        false,
+        false,
+        false,
+    )?;
+
+    let dataset = CruxObject::host_object_create(
+        Rc::new(DatasetOps {
             id,
             state: state.clone(),
         }),
-        crux::property::current_object_proto(),
+        None,
     );
-    element.define_property_or_throw(
-        &JsString::from_utf8(HIDDEN_ID_KEY),
-        &crux::property::PropertyDescriptor {
-            value: Some(Value::Number(f64::from(id))),
-            writable: Some(false),
-            get: None,
-            set: None,
-            enumerable: Some(false),
-            configurable: Some(false),
-        },
-    )?;
+    element.set("dataset", JsValue::from(Value::Object(dataset)))?;
+    element.set("classList", class_list_object(api, state, id)?.as_value())?;
+
     for (name, builtin) in [
         ("addEventListener", dom_add_event_listener as DomMethod),
         ("appendChild", dom_append_child as DomMethod),
         ("focus", dom_focus as DomMethod),
     ] {
         let state = state.clone();
-        let function = Function::create_builtin(
-            Some(JsString::from_utf8(name)),
-            2,
-            Box::new(move |_, args| builtin(&state, id, args)),
-            None,
-            None,
+        let function =
+            api.make_function(name, 2, Box::new(move |call| builtin(&state, id, call)))?;
+        element.set(name, function)?;
+    }
+
+    for name in VALUE_PROPS {
+        let (get_state, get_name) = (state.clone(), (*name).to_string());
+        let (set_state, set_name) = (state.clone(), (*name).to_string());
+        api.make_accessor(
+            &element,
+            name,
+            Some(Box::new(move |_| {
+                Ok(JsValue::from(host_value_to_js(
+                    &get_state.host.get_property(id, &get_name),
+                )))
+            })),
+            Some(Box::new(move |call| {
+                let value = call.arg(0).unwrap_or_else(JsValue::undefined);
+                set_state
+                    .host
+                    .set_property(id, &set_name, &js_to_host_value(value.value()));
+                Ok(JsValue::undefined())
+            })),
         )?;
-        element
-            .create_data_property_or_throw(&JsString::from_utf8(name), Value::Function(function))?;
     }
     Ok(element)
 }
 
-/// The node id an element host object wraps, read from its hidden property.
-fn element_id_of(value: &Value) -> Option<u32> {
-    let ValueKind::Object(object) = value.kind() else {
-        return None;
-    };
-    match object.get(&JsString::from_utf8(HIDDEN_ID_KEY)) {
-        Ok(value) => match value.kind() {
-            ValueKind::Number(number) => Some(number as u32),
-            _ => None,
-        },
+/// The node id an element wraps, read from its hidden property.
+fn element_id_of(value: &JsValue) -> Option<u32> {
+    let object = value.as_object()?;
+    match object.get(HIDDEN_ID_KEY) {
+        Ok(id) => id.as_number().map(|number| number as u32),
         Err(_) => None,
     }
 }
 
 /// `parent.appendChild(child)` — returns the appended child, like the DOM.
-fn dom_append_child(state: &Rc<State>, id: u32, args: &[Value]) -> Result<Value, JsError> {
-    let Some(child) = args.first() else {
+fn dom_append_child(
+    state: &Rc<State>,
+    id: u32,
+    call: &FunctionCall<'_>,
+) -> Result<JsValue, JsError> {
+    let Some(child) = call.arg(0) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "appendChild: expected an element".into(),
         ));
     };
-    match element_id_of(child) {
+    match element_id_of(&child) {
         Some(child_id) => {
             state.host.append_child(id, child_id);
-            Ok(*child)
+            Ok(child)
         }
         None => Err(JsError::new(
             ErrorKind::TypeError,
@@ -765,38 +729,34 @@ fn dom_append_child(state: &Rc<State>, id: u32, args: &[Value]) -> Result<Value,
 }
 
 /// `el.focus()` — give the native node keyboard focus.
-fn dom_focus(state: &Rc<State>, id: u32, _args: &[Value]) -> Result<Value, JsError> {
+fn dom_focus(state: &Rc<State>, id: u32, _call: &FunctionCall<'_>) -> Result<JsValue, JsError> {
     state.host.focus_node(id);
-    Ok(Value::Undefined)
+    Ok(JsValue::undefined())
 }
 
 /// `document.querySelectorAll(selector)` — an array-like list of element
 /// wrappers (`length` + numeric properties), enough for `Array.from`.
-fn dom_query_all(state: &Rc<State>, _id: u32, args: &[Value]) -> Result<Value, JsError> {
-    let selector = match args.first().map(|value| value.kind()) {
-        Some(ValueKind::String(text)) => text.to_string_lossy(),
-        _ => String::new(),
-    };
+fn dom_query_all(state: &Rc<State>, _id: u32, call: &FunctionCall<'_>) -> Result<JsValue, JsError> {
+    let selector = call
+        .arg(0)
+        .and_then(|value| value.as_string())
+        .unwrap_or_default();
     let ids = state.host.query_all(&selector);
-    let list = CruxObject::ordinary_object_create(None);
+    let list = call.make_object()?;
     for (index, id) in ids.iter().enumerate() {
-        let element = make_element(state, *id)?;
-        list.create_data_property_or_throw(
-            &JsString::from_utf8(&index.to_string()),
-            Value::Object(element),
+        list.set(
+            &index.to_string(),
+            make_element(call, state, *id)?.as_value(),
         )?;
     }
-    list.create_data_property_or_throw(
-        &JsString::from_utf8("length"),
-        Value::Number(ids.len() as f64),
-    )?;
-    Ok(Value::Object(list))
+    list.set("length", JsValue::number(ids.len() as f64))?;
+    Ok(list.as_value())
 }
 
 /// A `classList` object for one element: `add`/`remove`/`toggle`/`contains`
 /// builtins that forward to the host's class op.
-fn class_list_object(state: &Rc<State>, id: u32) -> Result<Handle<CruxObject>, JsError> {
-    let list = CruxObject::ordinary_object_create(None);
+fn class_list_object(api: &impl HostApi, state: &Rc<State>, id: u32) -> Result<JsObject, JsError> {
+    let list = api.make_object()?;
     for (name, op) in [
         ("add", 0u8),
         ("remove", 1u8),
@@ -804,80 +764,63 @@ fn class_list_object(state: &Rc<State>, id: u32) -> Result<Handle<CruxObject>, J
         ("contains", 3u8),
     ] {
         let state = state.clone();
-        let method = Function::create_builtin(
-            Some(JsString::from_utf8(name)),
+        let method = api.make_function(
+            name,
             1,
-            Box::new(move |_, args| {
-                let token = match args.first().map(|value| value.kind()) {
-                    Some(ValueKind::String(text)) => text.to_string_lossy(),
-                    _ => String::new(),
-                };
-                let force = match args.get(1).map(|value| value.kind()) {
-                    Some(ValueKind::Boolean(boolean)) => Some(boolean),
-                    _ => None,
-                };
-                Ok(Value::Boolean(state.host.class_op(id, op, &token, force)))
+            Box::new(move |call| {
+                let token = call
+                    .arg(0)
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_default();
+                let force = call.arg(1).and_then(|value| value.as_boolean());
+                Ok(JsValue::boolean(state.host.class_op(id, op, &token, force)))
             }),
-            None,
-            None,
         )?;
-        list.create_data_property_or_throw(&JsString::from_utf8(name), Value::Function(method))?;
+        list.set(name, method)?;
     }
     Ok(list)
 }
 
 /// `el.addEventListener(type, listener)`: store the listener on the rooted
-/// registry (keyed `id:type`, one ordinary bucket object per pair) and ask
-/// the host to attach a native listener once.
-fn dom_add_event_listener(state: &Rc<State>, id: u32, args: &[Value]) -> Result<Value, JsError> {
-    let event_type = match args.first().map(|value| value.kind()) {
-        Some(ValueKind::String(text)) => text.to_string_lossy(),
-        _ => {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "addEventListener: expected an event type string".into(),
-            ));
-        }
+/// registry (keyed `id:type`, one bucket object per pair) and ask the host to
+/// attach a native listener once.
+fn dom_add_event_listener(
+    state: &Rc<State>,
+    id: u32,
+    call: &FunctionCall<'_>,
+) -> Result<JsValue, JsError> {
+    let Some(event_type) = call.arg(0).and_then(|value| value.as_string()) else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "addEventListener: expected an event type string".into(),
+        ));
     };
-    let listener = args.get(1).cloned().unwrap_or(Value::Undefined);
-    if !is_callable(&listener) {
+    let listener = call.arg(1).unwrap_or_else(JsValue::undefined);
+    if !listener.is_callable() {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "addEventListener: listener is not a function".into(),
         ));
     }
 
-    let bucket_key = JsString::from_utf8(&format!("{id}:{event_type}"));
-    let bucket = match state.registry.get(&bucket_key)? {
-        value if matches!(value.kind(), ValueKind::Object(_)) => {
-            let ValueKind::Object(object) = value.kind() else {
-                unreachable!()
-            };
-            object
-        }
-        _ => {
-            let bucket = CruxObject::ordinary_object_create(None);
-            state
-                .registry
-                .create_data_property_or_throw(&bucket_key, Value::Object(bucket))?;
+    let bucket_key = format!("{id}:{event_type}");
+    let bucket = match state.registry.get(&bucket_key)?.as_object() {
+        Some(bucket) => bucket,
+        None => {
+            let bucket = call.make_object()?;
+            state.registry.set(&bucket_key, bucket.as_value())?;
             bucket
         }
     };
 
-    let length = match bucket.get(&JsString::from_utf8("length"))?.kind() {
-        ValueKind::Number(number) => number as u64,
-        _ => 0,
-    };
-    bucket.create_data_property_or_throw(&JsString::from_utf8(&length.to_string()), listener)?;
-    bucket.create_data_property_or_throw(
-        &JsString::from_utf8("length"),
-        Value::Number((length + 1) as f64),
-    )?;
+    let length = bucket.get("length")?.as_number().unwrap_or(0.0) as u64;
+    bucket.set(&length.to_string(), listener)?;
+    bucket.set("length", JsValue::number((length + 1) as f64))?;
 
     if state.attached.borrow_mut().insert((id, event_type.clone())) {
         state.host.attach_listener(id, &event_type);
     }
-    Ok(Value::Undefined)
+    Ok(JsValue::undefined())
 }
 
 /// Fire a native event into the engine: call every listener registered for
@@ -895,10 +838,10 @@ pub fn fire(
         .global()
         .and_then(|global| global.get(REGISTRY_KEY))
         .map_err(|error| error.to_string())?;
-    let Some(registry) = registry_value.value().as_object() else {
+    let Some(registry) = registry_value.as_object() else {
         return Ok(false);
     };
-    let bucket_key = JsString::from_utf8(&format!("{id}:{event_type}"));
+    let bucket_key = format!("{id}:{event_type}");
     let Some(bucket) = (match registry.get(&bucket_key) {
         Ok(value) => value.as_object(),
         Err(_) => None,
@@ -906,24 +849,19 @@ pub fn fire(
         return Ok(false);
     };
 
-    let length = match bucket.get(&JsString::from_utf8("length")) {
-        Ok(value) => match value.kind() {
-            ValueKind::Number(number) => number as u64,
-            _ => 0,
-        },
-        Err(_) => 0,
-    };
+    let length = bucket
+        .get("length")
+        .ok()
+        .and_then(|value| value.as_number())
+        .unwrap_or(0.0) as u64;
 
-    let event = CruxObject::ordinary_object_create(None);
+    let event = context.create_object().map_err(|error| error.to_string())?;
     event
-        .create_data_property(
-            &JsString::from_utf8("type"),
-            Value::String(Handle::new(JsString::from_utf8(event_type))),
-        )
+        .set("type", JsValue::string(event_type))
         .map_err(|error| error.to_string())?;
     for (name, value) in decode_event_props(props) {
         event
-            .create_data_property(&JsString::from_utf8(&name), host_value_to_js(&value))
+            .set(&name, JsValue::from(host_value_to_js(&value)))
             .map_err(|error| error.to_string())?;
     }
     // preventDefault/stopPropagation are engine-side stubs; the prevented
@@ -931,30 +869,25 @@ pub fn fire(
     // event.
     let prevented = Rc::new(std::cell::Cell::new(false));
     let mark = prevented.clone();
-    let prevent_default = Function::create_builtin(
-        Some(JsString::from_utf8("preventDefault")),
-        0,
-        Box::new(move |_, _| {
-            mark.set(true);
-            Ok(Value::Undefined)
-        }),
-        None,
-        None,
-    )
-    .map_err(|error| error.to_string())?;
-    event
-        .create_data_property(
-            &JsString::from_utf8("preventDefault"),
-            Value::Function(prevent_default),
+    let prevent_default = context
+        .create_function(
+            "preventDefault",
+            0,
+            Box::new(move |_| {
+                mark.set(true);
+                Ok(JsValue::undefined())
+            }),
         )
         .map_err(|error| error.to_string())?;
-    let event = JsValue::from(Value::Object(event));
+    event
+        .set("preventDefault", prevent_default)
+        .map_err(|error| error.to_string())?;
+    let event = event.as_value();
 
     for index in 0..length {
         let listener = bucket
-            .get(&JsString::from_utf8(&index.to_string()))
+            .get(&index.to_string())
             .map_err(|error| error.to_string())?;
-        let listener = JsValue::from(listener);
         context
             .call(&listener, &event, std::slice::from_ref(&event))
             .map_err(|error| error.to_string())?;

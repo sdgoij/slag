@@ -2596,14 +2596,10 @@ fn write_uint8_bytes(slots: &TypedArraySlots, bytes: &[u8]) -> Result<(), JsErro
     Ok(())
 }
 
-/// spec 25.2.4.4 Uint8Array.fromHex: the result is created after decoding,
-/// with exactly the decoded length.
-fn from_hex(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let hex = string_arg(args)?;
-    let result = decode_hex(hex.as_slice(), usize::MAX);
-    if let Some(error) = result.error {
-        return Err(error);
-    }
+/// A fresh `Uint8Array` holding `bytes`. The `fromHex`/`fromBase64`
+/// constructors build their result through this, as do the byte-returning
+/// host bindings (the embedding `fs`).
+pub(crate) fn uint8_array_from_bytes(agent: &mut Agent, bytes: &[u8]) -> Result<Value, JsError> {
     let proto = agent
         .current_realm()?
         .intrinsics
@@ -2615,11 +2611,21 @@ fn from_hex(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, J
                 "%Uint8Array.prototype% missing".into(),
             )
         })?;
-    let result_value =
-        allocate_typed_array_buffer(agent, proto, ElementType::Uint8, result.bytes.len())?;
-    let slots = validate_uint8(agent, &result_value)?;
-    write_uint8_bytes(&slots, &result.bytes)?;
-    Ok(result_value)
+    let value = allocate_typed_array_buffer(agent, proto, ElementType::Uint8, bytes.len())?;
+    let slots = validate_uint8(agent, &value)?;
+    write_uint8_bytes(&slots, bytes)?;
+    Ok(value)
+}
+
+/// spec 25.2.4.4 Uint8Array.fromHex: the result is created after decoding,
+/// with exactly the decoded length.
+fn from_hex(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let hex = string_arg(args)?;
+    let result = decode_hex(hex.as_slice(), usize::MAX);
+    if let Some(error) = result.error {
+        return Err(error);
+    }
+    uint8_array_from_bytes(agent, &result.bytes)
 }
 
 /// spec 25.2.4.5 Uint8Array.fromBase64.
@@ -2632,22 +2638,7 @@ fn from_base64(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Value
     if let Some(error) = result.error {
         return Err(error);
     }
-    let proto = agent
-        .current_realm()?
-        .intrinsics
-        .get("%Uint8Array.prototype%")
-        .and_then(|value| as_object(&value))
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                "%Uint8Array.prototype% missing".into(),
-            )
-        })?;
-    let result_value =
-        allocate_typed_array_buffer(agent, proto, ElementType::Uint8, result.bytes.len())?;
-    let slots = validate_uint8(agent, &result_value)?;
-    write_uint8_bytes(&slots, &result.bytes)?;
-    Ok(result_value)
+    uint8_array_from_bytes(agent, &result.bytes)
 }
 
 /// SetUint8ArrayFromHex (spec 25.2.4.7): write the decoded pairs, then

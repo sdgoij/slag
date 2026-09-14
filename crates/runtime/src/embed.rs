@@ -140,6 +140,51 @@ impl FunctionCall<'_> {
         let agent = current_agent_mut()?;
         Ok(JsValue(agent.run_script(source)?))
     }
+
+    /// Create an ordinary object in the running realm (the re-entrant
+    /// counterpart of [`Context::create_object`]).
+    pub fn create_object(&self) -> Result<JsObject, JsError> {
+        Ok(JsObject(CruxObject::ordinary_object_create(
+            realm_object_prototype(current_agent_mut()?)?,
+        )))
+    }
+
+    /// Create a host function in the running realm (the re-entrant counterpart
+    /// of [`Context::create_function`]), for a host function that must build
+    /// the functions it returns.
+    pub fn create_function(
+        &self,
+        name: &str,
+        length: u32,
+        callback: HostFn,
+    ) -> Result<JsValue, JsError> {
+        let function = build_host_fn(
+            realm_function_prototype(current_agent_mut()?)?,
+            Some(JsString::from_utf8(name)),
+            length as u64,
+            callback,
+        )?;
+        Ok(JsValue(Value::Function(function)))
+    }
+
+    /// Define an accessor property on `target` (the re-entrant counterpart of
+    /// [`Context::define_accessor`]), for a host function that must build the
+    /// objects it returns.
+    pub fn define_accessor(
+        &self,
+        target: &JsObject,
+        key: &str,
+        get: Option<HostFn>,
+        set: Option<HostFn>,
+    ) -> Result<(), JsError> {
+        define_accessor_with(
+            realm_function_prototype(current_agent_mut()?)?,
+            target,
+            key,
+            get,
+            set,
+        )
+    }
 }
 
 /// Host-defined behavior the embedding API exposes. Each callback is
@@ -274,13 +319,8 @@ impl Context {
         length: u32,
         callback: HostFn,
     ) -> Result<JsValue, JsError> {
-        let realm = self.agent.current_realm()?;
-        let function_prototype = realm
-            .intrinsics
-            .get("%Function.prototype%")
-            .and_then(|value| crate::context::as_object(&value));
         let function = build_host_fn(
-            function_prototype,
+            realm_function_prototype(&self.agent)?,
             Some(JsString::from_utf8(name)),
             length as u64,
             callback,
@@ -304,15 +344,8 @@ impl Context {
         length: u32,
         callback: HostFn,
     ) -> Result<JsValue, JsError> {
-        let realm = self.agent.current_realm()?;
-        let function_prototype = realm
-            .intrinsics
-            .get("%Function.prototype%")
-            .and_then(|value| crate::context::as_object(&value));
-        let object_prototype = realm
-            .intrinsics
-            .get("%Object.prototype%")
-            .and_then(|value| value.as_object());
+        let function_prototype = realm_function_prototype(&self.agent)?;
+        let object_prototype = realm_object_prototype(&self.agent)?;
         let prototype_object = CruxObject::ordinary_object_create(object_prototype);
 
         let callback = Rc::new(callback);
@@ -388,13 +421,8 @@ impl Context {
     /// A plain object inheriting `%Object.prototype%` — a namespace to hang
     /// host functions on (no `eval("({})")` needed).
     pub fn create_object(&self) -> Result<JsObject, JsError> {
-        let realm = self.agent.current_realm()?;
-        let object_prototype = realm
-            .intrinsics
-            .get("%Object.prototype%")
-            .and_then(|value| value.as_object());
         Ok(JsObject(CruxObject::ordinary_object_create(
-            object_prototype,
+            realm_object_prototype(&self.agent)?,
         )))
     }
 
@@ -412,45 +440,13 @@ impl Context {
         get: Option<HostFn>,
         set: Option<HostFn>,
     ) -> Result<(), JsError> {
-        let realm = self.agent.current_realm()?;
-        let function_prototype = realm
-            .intrinsics
-            .get("%Function.prototype%")
-            .and_then(|value| crate::context::as_object(&value));
-        let getter = get
-            .map(|callback| {
-                build_host_fn(
-                    function_prototype,
-                    Some(JsString::from_utf8(&format!("get {key}"))),
-                    0,
-                    callback,
-                )
-                .map(Value::Function)
-            })
-            .transpose()?;
-        let setter = set
-            .map(|callback| {
-                build_host_fn(
-                    function_prototype,
-                    Some(JsString::from_utf8(&format!("set {key}"))),
-                    0,
-                    callback,
-                )
-                .map(Value::Function)
-            })
-            .transpose()?;
-        target.0.define_property_or_throw(
-            &JsString::from_utf8(key),
-            &PropertyDescriptor {
-                value: None,
-                writable: None,
-                get: getter,
-                set: setter,
-                enumerable: Some(true),
-                configurable: Some(true),
-            },
-        )?;
-        Ok(())
+        define_accessor_with(
+            realm_function_prototype(&self.agent)?,
+            target,
+            key,
+            get,
+            set,
+        )
     }
 
     /// Create a host function and define it on the global object (the
@@ -849,7 +845,9 @@ impl Context {
     /// `readFileSync`, `writeFileSync`, `readdirSync`, `statSync` — backed
     /// by the host filesystem. Not a full Node `fs`; enough for host tools
     /// written in Slag (the regexp table generator and the test262 fixture
-    /// tally are two). Only compiled with the `fs` feature.
+    /// tally are two). `readFileSync` follows Node's encoding rule: with no
+    /// encoding it returns the bytes as a `Uint8Array`, with `'utf8'` it
+    /// returns the lossily-decoded text. Only compiled with the `fs` feature.
     #[cfg(feature = "fs")]
     pub fn install_fs(&mut self) -> Result<(), JsError> {
         let realm = self.agent.current_realm()?;
@@ -867,8 +865,11 @@ impl Context {
                 let bytes = std::fs::read(&path).map_err(|e| {
                     JsError::new(ErrorKind::TypeError, format!("readFileSync: {path}: {e}"))
                 })?;
-                let text = String::from_utf8_lossy(&bytes);
-                Ok(Value::String(Handle::new(JsString::from_utf8(&text))))
+                if read_file_wants_text(args)? {
+                    let text = String::from_utf8_lossy(&bytes);
+                    return Ok(Value::String(Handle::new(JsString::from_utf8(&text))));
+                }
+                crate::builtins::typed_array::uint8_array_from_bytes(current_agent_mut()?, &bytes)
             }),
             None,
             None,
@@ -1197,6 +1198,70 @@ impl Context {
     }
 }
 
+/// The current realm's `%Function.prototype%` as an object — callable, so
+/// `Value::as_object` would miss it; `crate::context::as_object` maps it.
+fn realm_function_prototype(agent: &Agent) -> Result<Option<Handle<CruxObject>>, JsError> {
+    Ok(agent
+        .current_realm()?
+        .intrinsics
+        .get("%Function.prototype%")
+        .and_then(|value| crate::context::as_object(&value)))
+}
+
+/// The current realm's `%Object.prototype%`.
+fn realm_object_prototype(agent: &Agent) -> Result<Option<Handle<CruxObject>>, JsError> {
+    Ok(agent
+        .current_realm()?
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| value.as_object()))
+}
+
+/// The shared body of `Context::define_accessor` and
+/// `FunctionCall::define_accessor`.
+fn define_accessor_with(
+    function_prototype: Option<Handle<CruxObject>>,
+    target: &JsObject,
+    key: &str,
+    get: Option<HostFn>,
+    set: Option<HostFn>,
+) -> Result<(), JsError> {
+    let getter = get
+        .map(|callback| {
+            build_host_fn(
+                function_prototype,
+                Some(JsString::from_utf8(&format!("get {key}"))),
+                0,
+                callback,
+            )
+            .map(Value::Function)
+        })
+        .transpose()?;
+    let setter = set
+        .map(|callback| {
+            build_host_fn(
+                function_prototype,
+                Some(JsString::from_utf8(&format!("set {key}"))),
+                0,
+                callback,
+            )
+            .map(Value::Function)
+        })
+        .transpose()?;
+    target.0.define_property_or_throw(
+        &JsString::from_utf8(key),
+        &PropertyDescriptor {
+            value: None,
+            writable: None,
+            get: getter,
+            set: setter,
+            enumerable: Some(true),
+            configurable: Some(true),
+        },
+    )?;
+    Ok(())
+}
+
 /// Build a non-constructible host function value over `callback` (the
 /// `[[Call]]` half of [`Context::create_function`] and the accessor callbacks
 /// of [`Context::define_accessor`]).
@@ -1239,6 +1304,28 @@ fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
     // the duration of the enclosing call; builtin closures only run inside
     // those windows.
     Ok(unsafe { &mut *(agent as *mut Agent) })
+}
+
+/// Whether `readFileSync`'s optional second argument asks for text: a UTF-8
+/// encoding name (case-insensitive) selects the decode, while an absent
+/// `null`/`undefined` encoding selects the raw bytes (Node's rule).
+#[cfg(feature = "fs")]
+fn read_file_wants_text(args: &[Value]) -> Result<bool, JsError> {
+    match args.get(1).map(|value| value.kind()) {
+        None | Some(ValueKind::Undefined) | Some(ValueKind::Null) => Ok(false),
+        Some(ValueKind::String(text)) => match text.to_string_lossy().to_ascii_lowercase().as_str()
+        {
+            "utf8" | "utf-8" => Ok(true),
+            other => Err(JsError::new(
+                ErrorKind::TypeError,
+                format!("readFileSync: unsupported encoding {other:?} (expected 'utf8')"),
+            )),
+        },
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "readFileSync: the encoding must be a string or null".into(),
+        )),
+    }
 }
 
 /// The `index`-th argument of an `fs` builtin as a UTF-8 string path, or a
@@ -2506,6 +2593,48 @@ mod tests {
     }
 
     #[test]
+    fn function_call_can_build_values_reentrantly() {
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "build",
+                0,
+                Box::new(|call| {
+                    let object = call.create_object()?;
+                    object.set("plain", JsValue::number(1.0))?;
+                    object.set(
+                        "method",
+                        call.create_function("method", 0, Box::new(|_| Ok(JsValue::string("ok"))))?,
+                    )?;
+                    call.define_accessor(
+                        &object,
+                        "computed",
+                        Some(Box::new(|_| Ok(JsValue::number(9.0)))),
+                        None,
+                    )?;
+                    Ok(object.as_value())
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            context.eval("build().plain").unwrap().as_number(),
+            Some(1.0)
+        );
+        assert_eq!(
+            context
+                .eval("build().method()")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            context.eval("build().computed").unwrap().as_number(),
+            Some(9.0)
+        );
+    }
+
+    #[test]
     fn console_routes_to_callbacks() {
         let mut context = Context::new().unwrap();
         let seen = Rc::new(RefCell::new(Vec::new()));
@@ -2758,7 +2887,7 @@ mod tests {
         std::fs::write(&file, "hello slag").unwrap();
         let js_path = |path: &std::path::Path| path.to_str().unwrap().replace('\\', "\\\\");
         let content = context
-            .eval(&format!("fs.readFileSync('{}')", js_path(&file)))
+            .eval(&format!("fs.readFileSync('{}', 'utf8')", js_path(&file)))
             .unwrap();
         assert_eq!(content.as_string().as_deref(), Some("hello slag"));
         let is_file = context
@@ -2769,6 +2898,27 @@ mod tests {
             .eval(&format!("fs.readdirSync('{}').join(',')", js_path(&dir)))
             .unwrap();
         assert_eq!(listing.as_string().as_deref(), Some("hello.txt"));
+
+        // No encoding yields the raw bytes as a Uint8Array (Node's Buffer
+        // analogue), preserving sequences that are not valid UTF-8.
+        let binary = dir.join("bytes.bin");
+        std::fs::write(&binary, [0u8, 255, 128, 65]).unwrap();
+        let summary = context
+            .eval(&format!(
+                "(function () {{ const b = fs.readFileSync('{}'); \
+                 return [b instanceof Uint8Array, b.length, b[1], b[3]].join(','); }})()",
+                js_path(&binary)
+            ))
+            .unwrap();
+        assert_eq!(summary.as_string().as_deref(), Some("true,4,255,65"));
+
+        // An unsupported encoding is rejected rather than silently decoded.
+        assert!(
+            context
+                .eval(&format!("fs.readFileSync('{}', 'latin1')", js_path(&file)))
+                .is_err()
+        );
+
         let out = dir.join("out.txt");
         context
             .eval(&format!(
