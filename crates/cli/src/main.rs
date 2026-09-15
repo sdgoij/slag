@@ -608,6 +608,13 @@ fn run_jit_benchmarks() -> Result<(), u8> {
             "function bench(n) { var s = 0; for (var i = 0; i < n; i++) { s += Math.abs(i - 50000); } return s; } bench(100_000);",
         ),
         (
+            "non-leaf call",
+            "function leaf(x) { return x + 1; }\n\
+             function mid(x) { return leaf(x) + 1; }\n\
+             function bench(n) { var s = 0; for (var i = 0; i < n; i++) { s += mid(i); } return s; }\n\
+             bench(100_000);",
+        ),
+        (
             "global read",
             "var g = 1; function bench(n) { var s = 0; for (var i = 0; i < n; i++) { s += g; } return s; } bench(1_000_000);",
         ),

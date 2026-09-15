@@ -9749,6 +9749,62 @@ hashes on the way to `call_inner` (a `FunctionKind::EcmaScript`/`Bound`
 short-circuit would skip them), and `apply leaf call`'s JIT column is the
 separate Cut 41 residual above.
 
+### PROBE + LANDED (2026-09-15): the non-leaf call is memcpy-bound — the Vm pool hands out boxed Vms
+
+The probe the builtin-cell entry queued (skip the two hashes on a non-leaf
+call). The premise measured OUT: profiling a non-leaf call puts the two
+lookups at ~2%, while `__memcpy_generic` is **37.6%**, entirely under
+`run_compiled_body` (22.7%, the `take_vm` return copy + the `return_vm`
+argument copy) and `Agent::return_vm` (14.8%, the `vm_pool.push`). `Vm` is
+**1096 bytes** (35 `Vec` headers plus the inline frame), and the pool handed
+it out and took it back BY VALUE, so a take/return round trip copied ~1.1KB
+three or four times. A non-leaf call costs ~255ns in the JIT and ~288ns
+jitless, versus ~7ns for an inlined leaf call — 35x — and none of it is the
+call's actual work.
+
+LANDED: `vm_pool` becomes `Vec<Box<Vm>>` (with an `#[allow(clippy::vec_box)]`
+— the box is the point: `Vec<Vm>` moves the element, which is the cost being
+removed). `take_vm` returns `Box<Vm>`, `return_vm` takes one, and the GC trace
+iterates the boxes. No other logic changes.
+
+Measured (`--corpus`, 100k calls, JIT): a non-leaf param callee (`mid` calls
+`leaf`) 25.6 -> 15.8 ms (**-38%**), a non-leaf global callee 25.7 -> 15.8
+(-38%), a non-leaf closure callee 34.6 -> 24.5 (-29%); jitless moves the same
+way with the closures. The `__memcpy_generic` symbol disappears from the
+profile. The leaf-call rows and the builtin/`Math` rows are flat.
+
+Suite: a new `non-leaf call` row (100k, jit 15.8ms) makes the win visible —
+all three existing call rows (`function calls`, `wide leaf call`, `apply leaf
+call`) use a certified LEAF callee, which the JIT inlines and which never
+touches the pool, so the suite had no non-leaf row at all.
+
+Recorded trade-off: two interpreter rows move the OTHER way — `buildString
+full` interp 71.08 -> 72.12 (+1.5%) and `typed-array write` interp 27.69 ->
+28.00 (+1.1%), consistent over 6 alternating rounds; `global read`, an earlier
+suspected casualty, is flat. The Vm is now heap-allocated, so the interpreter
+loop's field accesses lose the stack-local provenance the by-value pool gave
+them. The non-leaf win (a ~100ns/call reduction, on the most common real shape:
+any callee that itself calls something, or recurses) is worth the ~1%
+interpreter cost.
+
+Verification: clippy `--workspace --all-targets -D warnings` clean; `cargo test
+--workspace` green (36 test binaries); six test262 sweeps at baseline (language
+23724 pass / 0 fail / 0 skip / 0 crash / 0 hang, built-ins 23658 / 0 / 154 / 0 /
+0, annexB 1086 / 0 / 0 / 0 / 0, with the JIT and with `--jitless`) — with one
+caveat: the FIRST built-ins JIT run reported
+`TypedArray/prototype/copyWithin/coerced-values-{start,end}-detached.js` as
+crash/hang while the machine was loaded (load ~6-8 from the profiling runs),
+but both PASS individually in ~7-9s each (inherently slow, near the 15s batch
+deadline) and the clean re-run is at baseline, so this is the documented
+load-dependent classification, not a regression. Four differential batteries
+(`scratch/battery.js`, `battery_fused.js`, `battery_builtin.js`, and a new
+`battery_pool.js` covering recursion, mutual recursion, deep frames with heap
+values, closures, generators, try/finally unwinding, and a recursive tree walk)
+byte-identical under jit / `--jitless` / `--gc-stress`.
+
+Next candidate (queued by the same profile): `Vm::reset` is now 9% — it runs
+TWICE per call (in `take_vm` and again in `return_vm` for the GC-4 reset).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

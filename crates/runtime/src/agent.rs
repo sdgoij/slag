@@ -435,8 +435,13 @@ pub struct Agent {
     /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
     /// construct fast path, and the script/eval paths take one, run, and
     /// return it — a pooled Vm is never handed to a suspended
-    /// generator/async state (those own their Vm).
-    pub(crate) vm_pool: Vec<crate::ir::Vm>,
+    /// generator/async state (those own their Vm). Boxed so taking and
+    /// returning a Vm moves only the pointer: `Vm` is ~1.1KB, and the
+    /// by-value pool copies dominated the non-leaf call path's profile
+    /// (memcpy 37.6%, non-leaf calls -38% once boxed). `vec_box` would
+    /// restore exactly that cost, so it is allowed here.
+    #[allow(clippy::vec_box)]
+    pub(crate) vm_pool: Vec<Box<crate::ir::Vm>>,
     /// The installed JIT hook (the `jit` crate's `install`), consulted by
     /// the leaf-call path before interpreting a certified body. The Drop
     /// impl frees the installed cache.
@@ -1234,19 +1239,19 @@ impl Agent {
         &mut self,
         lexical_env: crate::env::EnvRef,
         strict: bool,
-    ) -> crate::ir::Vm {
+    ) -> Box<crate::ir::Vm> {
         match self.vm_pool.pop() {
             Some(mut vm) => {
                 vm.reset(lexical_env, strict);
                 vm
             }
-            None => crate::ir::Vm::new(lexical_env, strict),
+            None => Box::new(crate::ir::Vm::new(lexical_env, strict)),
         }
     }
 
     /// Return a Vm to the pool after its run finished (the next run reuses
     /// its Vec capacities and inline frame).
-    pub(crate) fn return_vm(&mut self, mut vm: crate::ir::Vm) {
+    pub(crate) fn return_vm(&mut self, mut vm: Box<crate::ir::Vm>) {
         // GC-4: fully reset the pooled Vm's traceable state — a stale frame
         // slot, value-stack entry, or scope-env binding would otherwise keep
         // a WeakRef/FR target alive until the next run resets it (`vm_pool`
@@ -1596,7 +1601,9 @@ impl Agent {
         for map in self.function_boilerplate_maps.iter().flatten() {
             map.trace(visit);
         }
-        self.vm_pool.trace(visit);
+        for vm in &self.vm_pool {
+            vm.trace(visit);
+        }
         self.promise_jobs.trace(visit);
         self.generic_jobs.trace(visit);
         for (_, job) in &self.timeout_jobs {

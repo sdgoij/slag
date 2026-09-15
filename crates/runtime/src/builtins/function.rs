@@ -467,7 +467,7 @@ fn try_leaf_call(
     // active run for the whole leaf window (the pushes and the body), so
     // a budget collection inside the body traces it exactly like
     // `run_inner`.
-    let result = crate::ir::with_leaf_run(&mut vm, std::rc::Rc::as_ptr(&entry.ir), || {
+    let result = crate::ir::with_leaf_run(&mut *vm, std::rc::Rc::as_ptr(&entry.ir), || {
         vm.stack.push(this_arg);
         vm.stack.push(*func);
         vm.stack.extend_from_slice(arg_list);
