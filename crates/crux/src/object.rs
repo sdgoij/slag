@@ -2390,14 +2390,29 @@ impl JsObject {
         if !self.store_chain_clean_hit() && !self.store_chain_walk(index) {
             return Ok(None);
         }
-        {
+        // The common exactly-at-the-end append writes through the compiled
+        // append's cursor (`elem_ptr`/`elem_len`/`elem_cap`) instead of taking
+        // the `elements_mut` guard — a borrow plus `sync`/`refresh` round trip
+        // through the `RefCell` for one element. The length cell stays
+        // authoritative and the `properties[0]` mirror stays stale exactly as
+        // the compiled append leaves it: every mirror reader consults the cell
+        // while dense (`ordinary_get_own_property`, `has_own_index_property`,
+        // `array_own_property_keys`, `array_length_dense`) and `spill_dense_array`
+        // materializes the true length from the cell.
+        let len = slots.elem_len.get();
+        if index as usize == len && len < slots.elem_cap.get() {
+            // SAFETY: the cursor is refreshed on every safe mutation of the
+            // buffer, and `len < elem_cap` puts the slot inside the live
+            // allocation. `Value` is `Copy`.
+            unsafe { *slots.elem_ptr.get().add(len) = value };
+            slots.elem_len.set(len + 1);
+        } else {
             let mut elements = slots.elements_mut();
-            // The dense buffer can be shorter than `length` — a length grow
-            // past the buffer (`a.length = N` on a short array) leaves
-            // trailing holes — so the element lands at its real index
-            // (`length`), materializing the intervening holes, instead of a
-            // naive push that would store it at `elements.len()`. A huge gap
-            // spills (mirrors the hole-fill guard below).
+            // The buffer can be shorter than `length` — a length grow past the
+            // buffer (`a.length = N` on a short array) leaves trailing holes —
+            // so the element lands at its real index (`length`), materializing
+            // the intervening holes. A huge gap spills (mirrors the hole-fill
+            // guard above).
             if index as usize > elements.len() + DENSE_HOLE_SPILL_CAP {
                 return Ok(None);
             }
@@ -2407,20 +2422,19 @@ impl JsObject {
             elements.push(value);
         }
         slots.length.set(length + 1.0);
-        self.write_length_mirror(length + 1.0);
         self.bump_generation();
         Ok(Some(()))
     }
 
-    /// Keep `properties[0]` (the `length` mirror) in sync while dense: the
-    /// generic property paths read it as today, so a stale mirror would
-    /// surface through them. The interpreter's dense length changes funnel
-    /// through this and `array_set_length`'s dense branches; the JIT's
-    /// inline dense append updates the `length` cell but NOT the mirror, so
-    /// every reader that could observe the mirror either consults the cell
-    /// (`ordinary_get_own_property`, `has_own_index_property`,
-    /// `member_cell_get`) or re-syncs from it on the way out
-    /// (`spill_dense_array`).
+    /// Keep `properties[0]` (the `length` mirror) in sync while dense. The
+    /// dense append paths (the interpreter's `array_element_write_dense` and
+    /// the compiled inline append) update the `length` cell but NOT the
+    /// mirror, so every reader that could observe the mirror either consults
+    /// the cell (`ordinary_get_own_property`, `has_own_index_property`,
+    /// `array_own_property_keys`, `member_cell_get`) or re-syncs from it on
+    /// the way out (`spill_dense_array`). The remaining dense length changes
+    /// (`dense_index_define`/`array_define_own_property`, `array_set_length`)
+    /// still funnel through this.
     fn write_length_mirror(&self, length: f64) {
         if let Some((_, length_prop)) = self.properties.borrow_mut().first_mut()
             && let PropertyKind::Data { value: slot, .. } = &mut length_prop.kind
@@ -7180,6 +7194,52 @@ mod tests {
         assert_eq!(array.get(&key("10")).unwrap(), Value::Number(7.0));
         assert_eq!(array.get(&key("5")).unwrap(), Value::Undefined);
         assert_eq!(array.get(&key("length")).unwrap(), Value::Number(11.0));
+    }
+
+    #[test]
+    fn dense_cursor_append_leaves_the_length_cell_authoritative() {
+        // The append's cursor fast path writes through `elem_ptr`/`elem_len`
+        // and leaves the `properties[0]` length mirror stale (the compiled
+        // append's contract). The cell is authoritative, so `length`, the
+        // own keys, and a subsequent spill must all report the true length,
+        // never the stale mirror. A fresh `[]` also crosses the Vec's
+        // capacity growth, exercising the fallback branch.
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        for i in 0..40u64 {
+            assert!(
+                array
+                    .array_element_write(i, Value::Number(i as f64))
+                    .unwrap()
+                    .is_some(),
+                "a dense append must store the element"
+            );
+        }
+        assert_eq!(array.array_length_dense(), Some(40));
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(40.0));
+        let names: Vec<String> = array
+            .own_property_keys()
+            .unwrap()
+            .iter()
+            .map(|k| k.display_string())
+            .collect();
+        assert_eq!(names.len(), 41, "40 indices + length");
+        assert_eq!(names[39], "39");
+        assert_eq!(names[40], "length");
+        // A non-canonical element define spills the buffer, materializing the
+        // true length from the cell rather than copying the stale mirror.
+        let desc = PropertyDescriptor {
+            value: Some(Value::Number(0.0)),
+            writable: Some(false),
+            get: None,
+            set: None,
+            enumerable: Some(true),
+            configurable: Some(true),
+        };
+        assert!(array.define_property(&key("0"), &desc).unwrap());
+        assert_eq!(array.array_length_dense(), None);
+        assert_eq!(array.get(&key("length")).unwrap(), Value::Number(40.0));
+        assert_eq!(array.get(&key("39")).unwrap(), Value::Number(39.0));
+        assert_eq!(array.get(&key("0")).unwrap(), Value::Number(0.0));
     }
 
     #[test]

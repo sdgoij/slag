@@ -9328,6 +9328,55 @@ member store on an unknown object, i.e. a possible setter) that a sound
 analysis must reject. A precise version needs shape/escape analysis the JIT
 does not have.
 
+### LANDED (2026-09-15): the interpreter's dense append writes through the compiled-append cursor
+
+The interpreter half of the Phase C inline append. `array_element_write_dense`'s
+append branch (index == length) took the `elements_mut` guard — a borrow, a
+`sync` (which re-derives `elem_ptr`/`elem_cap`) and a `refresh` on drop — then
+pushed through the `Vec`, and re-synced the `properties[0]` length mirror on
+every element. The exactly-at-the-end case now writes through the same cursor
+the compiled append uses (`elem_ptr[elem_len] = value; elem_len += 1`) and sets
+only the authoritative `length` cell, leaving the mirror stale exactly as the
+compiled append already does. The `Vec` path stays for the fallbacks (a length
+grow past the buffer, a full buffer, a huge hole span).
+
+Why the mirror skip is sound: every reader of the mirror consults the cell
+while `dense` is set — `ordinary_get_own_property` (length and the index
+range), `has_own_index_property`, `array_own_property_keys`,
+`array_length_dense`/`member_cell_get` — and `spill_dense_array` materializes
+the true length from the cell rather than copying the mirror, the contract the
+compiled append already relies on (Phase C follow-up, 2026-09-11).
+
+PROBE (`--jitless`, `crates/cli` `--corpus`): the interpreter's `a[l++] = i`
+(3M) profile is `run_inner_inner` ~29% (the dispatch floor, 2 ops/iter),
+`array_element_write` ~19%, `leaf_operand_value` ~19% (2 operands),
+`assign_computed_plain` ~17%. The guard round trip plus the per-store mirror
+write were the removable part; the dispatch and operand resolution are at
+their floors. Decomposition A/B: the cursor write alone (mirror kept) is
+idx 96.6 -> 92.4 / shape 147.0 -> 141.7; dropping the mirror too takes it to
+idx 89.5 / shape 139.0.
+
+Measured (interleaved A/B, min-of-3, `--jitless`): `a[l++] = i` (3M) 96.6 ->
+89.5 ms (~7.1%); `a[i] = i` (3M) 85.2 -> 77.5 (~8.6%); the `if`-bearing shape
+148.4 -> 140.3 (~5.5%). `--jit-bench`: `buildString shape` interp 139.6-141.6
+-> 131.0-131.1 ms (~6.4%), `buildString full` 77.7-77.9 -> 70.7 (~9.2%); both
+JIT columns flat (21.5 / 15.8), every other row unchanged.
+
+Verification: clippy `--workspace --all-targets -D warnings` clean (also
+fixes a pre-existing `unnecessary_mut_passed` lint in `crates/runtime/src/
+stack.rs` that the current toolchain flags); `cargo test --workspace` green
+(incl. the new `crux::object::tests::
+dense_cursor_append_leaves_the_length_cell_authoritative`); six test262 sweeps
+at baseline (language 23724 pass / 0 fail / 0 skip / 0 crash / 0 hang,
+built-ins 23658 / 0 / 154 / 0 / 0, annexB 1086 / 0 / 0 / 0 / 0, with the JIT
+and with `--jitless`); an 18-case differential
+battery (`scratch/battery.js`: sequential/`l++`/`a[a.length]` fills, the reset
+shape, every mirror reader — keys/entries/gopd/JSON/for-in/hasOwn/slice/concat
+— spill-after-stale-mirror, hole fill, delete, length grow/shrink,
+preventExtensions, a prototype index setter, an own-element shadow, frozen
+strict, heap values, sparse, nested) byte-identical under jit / `--jitless` /
+`--gc-stress`.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

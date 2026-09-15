@@ -64,8 +64,7 @@ fn stack_bounds() -> Option<(usize, usize)> {
                 let mut attr = attr.assume_init();
                 let mut stackaddr: *mut libc::c_void = std::ptr::null_mut();
                 let mut stacksize: libc::size_t = 0;
-                let ok =
-                    libc::pthread_attr_getstack(&mut attr, &mut stackaddr, &mut stacksize) == 0;
+                let ok = libc::pthread_attr_getstack(&attr, &mut stackaddr, &mut stacksize) == 0;
                 let _ = libc::pthread_attr_destroy(&mut attr);
                 if ok && !stackaddr.is_null() && stacksize > 0 {
                     let low = stackaddr as usize;
