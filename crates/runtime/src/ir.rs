@@ -12498,34 +12498,41 @@ impl Vm {
         // are bypassed; the single-realm guard mirrors the leaf path — the
         // general path otherwise pushes the callee's owning realm so a
         // cross-realm handler creates its errors in the right realm.
+        //
+        // One direct-mapped cell now carries the whole verdict (Cut 79's
+        // handler / Cut 80's crux-native closure / neither), so a warm
+        // builtin call no longer SipHashes the thread-local handler map and
+        // the `builtin_dispatch_cache` HashMap on every call.
         if agent.realm_count.get() == 1
             && let ValueKind::Function(function) = callee.kind()
-            && let Some(handler) = agent.builtin_handler_lookup(function.id())
         {
-            let result = handler(agent, &this, args)?;
-            self.stack.truncate(arg_start - below);
-            self.stack.push(result);
-            return Ok(());
-        }
-        // Warm crux-native builtins (Math/JSON/typed-array methods whose
-        // body is a plain `NativeFn`): the memoized dispatch verdict 0 means
-        // no agent-dependent module chain applies, so the function's own
-        // native closure is the whole call — run it directly, skipping the
-        // %eval% identity check (a JsString alloc + HashMap hit), the
-        // callable check, and `call_inner`'s redispatch. `%eval%` is never
-        // memoized (the %eval% identity check below runs before any
-        // resolution), so it cannot reach this arm.
-        if agent.realm_count.get() == 1
-            && let ValueKind::Function(function) = callee.kind()
-            && agent.builtin_dispatch_cache.get(&function.id()) == Some(&0)
-            && let crux::function::FunctionKind::Builtin {
-                call: Some(native), ..
-            } = &function.kind
-        {
-            let result = native(&this, args)?;
-            self.stack.truncate(arg_start - below);
-            self.stack.push(result);
-            return Ok(());
+            let is_native = matches!(
+                &function.kind,
+                crux::function::FunctionKind::Builtin { call: Some(_), .. }
+            );
+            match agent.builtin_call_lookup(function.id(), is_native) {
+                crate::function::BuiltinCall::Handler(handler) => {
+                    let result = handler(agent, &this, args)?;
+                    self.stack.truncate(arg_start - below);
+                    self.stack.push(result);
+                    return Ok(());
+                }
+                // Warm crux-native builtins (Math/JSON/typed-array methods
+                // whose body is a plain `NativeFn`): the function's own
+                // native closure is the whole call.
+                crate::function::BuiltinCall::Native => {
+                    if let crux::function::FunctionKind::Builtin {
+                        call: Some(native), ..
+                    } = &function.kind
+                    {
+                        let result = native(&this, args)?;
+                        self.stack.truncate(arg_start - below);
+                        self.stack.push(result);
+                        return Ok(());
+                    }
+                }
+                crate::function::BuiltinCall::Other => {}
+            }
         }
         if is_eval_function(agent, &callee)? {
             let source = args.first().cloned().unwrap_or(Value::Undefined);

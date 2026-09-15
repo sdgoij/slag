@@ -1759,6 +1759,21 @@ pub(crate) fn call_inner(
 /// adapter closures in the per-chain `handler_for` tables reconcile that).
 pub(crate) type BuiltinHandler = fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>;
 
+/// The verdict of the per-function-id builtin-call probe: which direct
+/// dispatch (if any) a builtin call takes. A `Copy` value, so the agent's
+/// direct-mapped cell can hand it back without touching either backing map.
+#[derive(Clone, Copy)]
+pub(crate) enum BuiltinCall {
+    /// Run this registered agent-dependent handler (Cut 79/81).
+    Handler(BuiltinHandler),
+    /// A crux-native builtin whose own closure runs directly (Cut 80): the
+    /// `builtin_dispatch_cache` verdict is 0 and the function carries a
+    /// `FunctionKind::Builtin { call: Some(..) }`.
+    Native,
+    /// Neither: fall through to the general call path.
+    Other,
+}
+
 thread_local! {
     /// Agent-dependent builtins by function id, registered by
     /// `Intrinsics::define` at install time (each realm creates its own
@@ -3611,6 +3626,29 @@ mod tests {
 
     fn number(value: f64) -> Value {
         Value::Number(value)
+    }
+
+    #[test]
+    fn builtin_call_verdict_cell_memoizes_and_stays_correct() {
+        // The direct-mapped cell memoizes a function id's builtin-call
+        // verdict: a crux-native builtin (its own closure runs), a registered
+        // agent-dependent handler, and a plain JS function. Call each kind
+        // enough times to hit the cell, then check the results are unaffected
+        // by the memo (a stale verdict would mis-dispatch).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "var s = 0;\n\
+                 for (var i = 0; i < 200; i++) { s += Math.abs(i - 100); }\n\
+                 function add1(x) { return x + 1; }\n\
+                 for (var j = 0; j < 200; j++) { s += add1(j); }\n\
+                 for (var k = 0; k < 200; k++) { s += 'abc'.charCodeAt(1); }\n\
+                 s",
+            )
+            .unwrap();
+        // sum |i-100| over 0..199 = 10000; sum 1..200 = 20100; 200 * 98 = 19600.
+        assert_eq!(value, number(49700.0));
     }
 
     #[test]

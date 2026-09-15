@@ -604,6 +604,10 @@ fn run_jit_benchmarks() -> Result<(), u8> {
              bench({ f: function (x) { return x + 1; } }, 100_000);",
         ),
         (
+            "builtin call",
+            "function bench(n) { var s = 0; for (var i = 0; i < n; i++) { s += Math.abs(i - 50000); } return s; } bench(100_000);",
+        ),
+        (
             "global read",
             "var g = 1; function bench(n) { var s = 0; for (var i = 0; i < n; i++) { s += g; } return s; } bench(1_000_000);",
         ),

@@ -9698,6 +9698,57 @@ this journal are the precedent for gating it).
 separate, pre-existing gap: `Function.prototype.apply` to a certified leaf still
 runs the builtin round-trip plus the per-call arg-list build (Cut 41's residual).
 
+### LANDED (2026-09-15): the builtin-call verdict takes one direct-mapped cell
+
+The bonus finding the call-path probe queued. Profiling the JIT's `Math.abs`
+row showed ~34% of the run in `hash_one` + `sip::Hasher::write` + the thread-local
+`LocalKey::with`: every crux-native builtin call hashed TWO maps —
+`builtin_handler_lookup`'s miss fell through to the thread-local
+`BUILTIN_HANDLERS` HashMap, then `fast_call_core` hashed the agent's
+`builtin_dispatch_cache` HashMap. Only crux-native builtins paid both:
+registered agent-dependent handlers already hit Cut 81's direct-mapped cell, and
+a certified leaf call short-circuits before the builtin lookups (so the JS-call
+rows never see it).
+
+Cut 81's cell is widened to carry the whole verdict —
+`BuiltinCall::{Handler(fn), Native, Other}` — so a warm builtin call is ONE
+direct-mapped probe. A miss fills from the thread-local handler map, then the
+dispatch cache (verdict 0 + a `FunctionKind::Builtin { call: Some(..) }` is
+`Native`); an id matching neither is NOT cached, because a builtin whose first
+general call has not yet memoized its dispatch verdict must be re-probed.
+The native closure itself is re-read from the (immutable) function kind, so the
+cell stays a `Copy` value. The JIT inherits it for free: `jit::call_slow`
+routes through `fast_call_core`.
+
+Measured (`--corpus`, 100k calls, ns/iteration): `Math.abs` jit **44.4 -> 24.3
+(-45%)**, jitless 63.3 -> 48.9 (-23%); `Math.floor` jit 45.0 -> 25.0 (-44%);
+`Math.max` jit 73.2 -> 55.2 (-25%); a JS leaf call, an agent-dependent handler
+(`charCodeAt`, `hasOwnProperty`), and the loop floor are all flat (the handlers
+were already direct-mapped by Cut 81).
+
+The suite had NO crux-native builtin row (its builtin-heavy rows are
+handlers/apply), so the win was invisible to it: a new `builtin call` row
+(`s += Math.abs(i - 50000)`, 100k) is added — jit 2.51ms vs the ~4.4ms the same
+source measured before the cell. Every existing suite row is flat.
+
+Verification: clippy `--workspace --all-targets -D warnings` clean; `cargo test
+--workspace` green (incl. the new
+`function::tests::builtin_call_verdict_cell_memoizes_and_stays_correct`, which
+mixes a crux-native builtin, a registered handler, and a JS function in loops);
+six test262 sweeps at baseline (language 23724 pass / 0 fail / 0 skip / 0 crash /
+0 hang, built-ins 23658 / 0 / 154 / 0 / 0, annexB 1086 / 0 / 0 / 0 / 0, with the
+JIT and with `--jitless`); the three differential batteries
+(`scratch/battery.js`, `battery_fused.js`, and a new `battery_builtin.js`
+covering Math/String/Array/Number/Object/JSON/typed-array/Map/Set dispatch,
+bound functions, `call`/`apply`, a dynamically-read builtin, a getter-returned
+builtin, and `eval`/the Function constructor) byte-identical under jit /
+`--jitless` / `--gc-stress`.
+
+Remaining call-path notes (not acted on): a NON-leaf JS call still pays both
+hashes on the way to `call_inner` (a `FunctionKind::EcmaScript`/`Bound`
+short-circuit would skip them), and `apply leaf call`'s JIT column is the
+separate Cut 41 residual above.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

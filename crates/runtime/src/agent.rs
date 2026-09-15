@@ -416,17 +416,20 @@ pub struct Agent {
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
     /// Cut 27 lesson.
     pub(crate) leaf_cache: Box<[Option<(u64, crate::ir::LeafEntry)>; crate::ir::LEAF_CACHE]>,
-    /// The installed-builtin handler cache (Cut 81): function id → the
-    /// registered agent-dependent native handler, so the Cut-79 direct-call
-    /// arm skips the thread-local `BUILTIN_HANDLERS` RefCell<HashMap> get
-    /// on a hit. Boxed per the Cut 27 lesson.
-    pub(crate) builtin_handler_cells:
-        Box<[Option<(u64, crate::function::BuiltinHandler)>; crate::ir::BUILTIN_HANDLER_CELLS]>,
+    /// The builtin-call verdict cache (Cut 81's handler cell, widened to the
+    /// full direct-dispatch decision): function id → the handler to run, the
+    /// crux-native "run its own closure" verdict, or neither. Filling it
+    /// skips BOTH the thread-local `BUILTIN_HANDLERS` get and the agent's
+    /// `builtin_dispatch_cache` HashMap get on a warm builtin call — the two
+    /// SipHash lookups that dominated the JIT's `Math.abs` row. Boxed per the
+    /// Cut 27 lesson.
+    pub(crate) builtin_call_cells:
+        Box<[Option<(u64, crate::function::BuiltinCall)>; crate::ir::BUILTIN_HANDLER_CELLS]>,
     /// The installed-builtin CONSTRUCT handler cache (the construct-side
-    /// mirror of `builtin_handler_cells`): function id → the registered
-    /// agent-dependent constructor, so a warm `new` skips the thread-local
-    /// `CONSTRUCT_HANDLERS` RefCell<HashMap> get. Boxed per the Cut 27
-    /// lesson.
+    /// mirror of the handler verdict `builtin_call_cells` carries): function
+    /// id → the registered agent-dependent constructor, so a warm `new` skips
+    /// the thread-local `CONSTRUCT_HANDLERS` RefCell<HashMap> get. Boxed per
+    /// the Cut 27 lesson.
     pub(crate) builtin_ctor_cells:
         Box<[Option<(u64, crate::function::BuiltinCtor)>; crate::ir::BUILTIN_HANDLER_CELLS]>,
     /// The free-list of Vms for per-call reuse: `run_compiled_body`, the
@@ -1051,7 +1054,7 @@ impl Agent {
             spread_cells: std::array::from_fn(|_| None),
             for_in_cells: Box::new(std::array::from_fn(|_| None)),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
-            builtin_handler_cells: Box::new(std::array::from_fn(|_| None)),
+            builtin_call_cells: Box::new(std::array::from_fn(|_| None)),
             builtin_ctor_cells: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             construct_maps: Box::new(std::array::from_fn(|_| None)),
@@ -1293,28 +1296,39 @@ impl Agent {
         slot.as_ref().map(|(_, entry)| entry)
     }
 
-    /// The registered agent-dependent builtin handler for `id` (Cut 81): a
-    /// direct-mapped probe that fills from the thread-local `BUILTIN_HANDLERS`
-    /// on a miss. Registrations complete at realm bootstrap before any JS
-    /// runs, so a fill is final; a non-registered id (eval hosts, crux-native
-    /// builtins, EcmaScript functions) probes the empty slot every call and
-    /// returns None — never cached, so a later registration would still be
-    /// seen (none happen, but the miss path costs only the array probe).
-    pub(crate) fn builtin_handler_lookup(
+    /// The direct-mapped builtin-call verdict for `id`: a probe that fills from
+    /// the thread-local `BUILTIN_HANDLERS` and the agent's
+    /// `builtin_dispatch_cache` on a miss, so a warm builtin call skips both
+    /// hashes. Registrations complete at realm bootstrap and the dispatch memo
+    /// only ever gains ids for `FunctionKind::Builtin` functions, so a fill is
+    /// final. An id matching NEITHER source is not cached: it may be a builtin
+    /// whose dispatch verdict `call_inner` has not memoized yet (the first
+    /// general call fills it), so a later call must re-probe.
+    pub(crate) fn builtin_call_lookup(
         &mut self,
         id: u64,
-    ) -> Option<crate::function::BuiltinHandler> {
+        is_native: bool,
+    ) -> crate::function::BuiltinCall {
         let index = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize
             & (crate::ir::BUILTIN_HANDLER_CELLS - 1);
-        let slot = &mut self.builtin_handler_cells[index];
-        if let Some((cached_id, handler)) = slot
-            && *cached_id == id
+        if let Some((cached_id, call)) = self.builtin_call_cells[index]
+            && cached_id == id
         {
-            return Some(*handler);
+            return call;
         }
-        let handler = crate::function::builtin_handler(id)?;
-        *slot = Some((id, handler));
-        Some(handler)
+        let call = if let Some(handler) = crate::function::builtin_handler(id) {
+            crate::function::BuiltinCall::Handler(handler)
+        } else if let Some(verdict) = self.builtin_dispatch_cache.get(&id) {
+            if *verdict == 0 && is_native {
+                crate::function::BuiltinCall::Native
+            } else {
+                crate::function::BuiltinCall::Other
+            }
+        } else {
+            return crate::function::BuiltinCall::Other;
+        };
+        self.builtin_call_cells[index] = Some((id, call));
+        call
     }
 
     /// The registered agent-dependent builtin CONSTRUCT handler for `id` (the
