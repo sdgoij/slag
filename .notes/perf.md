@@ -9563,6 +9563,51 @@ console.log("jsacc   " + t(function () { acc.year; }));
 console.log("date    " + t(function () { d.getTime(); }));
 ```
 
+### LANDED (2026-09-15): the computed member store fuses the frame-slot receiver load
+
+The next slice the cursor landing's profile pointed at. After it, the
+interpreter's `a[l++] = i` (3M) is `run_inner_inner` ~33% (the dispatch floor,
+two ops/iter) with `leaf_operand_value` ~22% next; the pair `LoadReg { a }` +
+`StoreMemberComputed` is two dispatches for what is semantically one store.
+`Step::AssignMemberComputed` (plain `=`) now lowers a `tdz=false` frame-slot
+receiver to a single `LeafOp::StoreMemberComputedSlot { object_slot, key,
+value }`; any other receiver (Context/PerIter/Const/Acc) keeps the separate
+load and `StoreMemberComputed`. The fused op captures the object from its slot
+before the key/value operands resolve — exactly the order the separate
+`LoadReg` gave — so a key/value operand that writes the receiver's slot (a
+`PostInc` key, the `a[l++] = i` shape) cannot change what was captured.
+
+Measured (interleaved A/B, min-of-3, `--jitless`): `a[l++] = i` (3M) 85.4 ->
+82.5 ms (~3.7%), `a[i] = i` (3M) 74.5 -> 70.6 (~5.2%), the `if`-bearing shape
+135.6 -> 133.0 (~1.7%). `--jit-bench` (vs the cursor-only parent):
+`buildString shape` interp 127.7 -> 124.0 ms (~2.9%), `compound assign` 4.166
+-> 4.100 (~1.6%), `typed-array length` 13.83 -> 13.55 (~2%); the JIT columns
+are flat (the new op lowers through the same `emit_computed_store` tail as
+`StoreMemberComputed`, so the compiled append path is unchanged). Cumulative
+over both landings (`a[l++] = i` 96.0 -> 82.5, ~14%; `buildString shape`
+141.8 -> 123.9 ms, ~12.6%).
+
+Side finding (recorded, not actionable): the cursor landing carried a code-layout
+shift on `compound assign` (a named member store, semantically untouched) —
+3.934 -> 4.166 ms interp on a cursor-only build, +5.9%, with the jit column flat.
+The fused op recovers ~1.7% of it (4.100). The journal's earlier build-layout
+notes (the typed-array row, the `register-run coverage` f4/f1 artifacts) are the
+precedent; no source-level cause was found.
+
+Verification: clippy `--workspace --all-targets -D warnings` clean; `cargo test
+--workspace` green (the updated
+`eval::tests::braced_member_store_body_keeps_its_set_completion_absorbed` now
+pins the fused form; `builtins::function::tests::
+register_post_inc_member_store_stays_spec_exact` covers the operand order); six
+test262 sweeps at baseline (language 23724 pass / 0 fail / 0 skip / 0 crash / 0
+hang, built-ins 23658 / 0 / 154 / 0 / 0, annexB 1086 / 0 / 0 / 0 / 0, with the
+JIT and with `--jitless`); the 18-case dense-append battery and a 15-case
+fused-store battery (`scratch/battery_fused.js`: post-inc key old-value/write-back,
+key-then-value order, the counter shape, Symbol/object keys, a receiver setter,
+a Proxy `set` trap, nullish receivers, a prototype setter, typed arrays, primitive
+receivers, a getter/setter pair, the `valueOf` PostInc fallback) byte-identical
+under jit / `--jitless` / `--gc-stress`.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -4504,7 +4504,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert!(matches!(
             runs[0].last(),
-            Some(crate::ir::LeafOp::StoreMemberComputed { .. })
+            Some(crate::ir::LeafOp::StoreMemberComputedSlot { .. })
         ));
         // And the statement's value still completes correctly at the top
         // level (the absorbed `SetCompletion` is the statement's only pop).

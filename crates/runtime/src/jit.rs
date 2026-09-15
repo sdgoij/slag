@@ -3107,6 +3107,8 @@ extern "C" fn load_const(ctx: *mut c_void, step: u64, op: u64, field: u64) -> u6
         | (crate::ir::LeafOp::GetMemberComputedLocal { key, .. }, 2) => reg_const(key),
         (crate::ir::LeafOp::StoreMemberComputed { key, .. }, 3) => reg_const(key),
         (crate::ir::LeafOp::StoreMemberComputed { value, .. }, 4) => reg_const(value),
+        (crate::ir::LeafOp::StoreMemberComputedSlot { key, .. }, 3) => reg_const(key),
+        (crate::ir::LeafOp::StoreMemberComputedSlot { value, .. }, 4) => reg_const(value),
         (crate::ir::LeafOp::StoreMemberComputedLocal { key, .. }, 5) => reg_const(key),
         (crate::ir::LeafOp::CompoundMemberComputedLocal { rhs, .. }, 5) => reg_const(rhs),
         (crate::ir::LeafOp::CompoundMemberComputedLocal { key, .. }, 6) => reg_const(key),

@@ -7606,6 +7606,19 @@ impl<'a> Lowerer<'a> {
                 let value = self.leaf_operand(step, op_index, 4, value)?;
                 self.emit_computed_store(object, key, value)?;
             }
+            LeafOp::StoreMemberComputedSlot {
+                object_slot,
+                key,
+                value,
+            } => {
+                // The fused object-load + computed store: the object is the
+                // frame slot (read at store time), the key and value direct
+                // operands. Same store tail as `StoreMemberComputed`.
+                let object = self.load_slot(*object_slot);
+                let key = self.leaf_operand(step, op_index, 3, key)?;
+                let value = self.leaf_operand(step, op_index, 4, value)?;
+                self.emit_computed_store(object, key, value)?;
+            }
             LeafOp::StoreMemberComputedLocal { object_slot, key } => {
                 // The object is the frame slot (read at store time — the
                 // late-read contract), the key a `Reg`/`Const` operand, the

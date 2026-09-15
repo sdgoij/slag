@@ -1151,6 +1151,10 @@ fn trace_leaf_op_heaps(op: &LeafOp, visit: &mut dyn FnMut(GcAny)) {
             operand(key, visit);
             operand(value, visit);
         }
+        LeafOp::StoreMemberComputedSlot { key, value, .. } => {
+            operand(key, visit);
+            operand(value, visit);
+        }
         LeafOp::StoreMemberComputedLocal { key, .. } => operand(key, visit),
         LeafOp::CompoundMemberComputedLocal { key, rhs, .. } => {
             operand(key, visit);
@@ -1289,6 +1293,20 @@ pub enum LeafOp {
     /// property-key machinery. Neither operand may be `Acc` — the object
     /// load would clobber it.
     StoreMemberComputed { key: RegOperand, value: RegOperand },
+    /// Write `value` onto the computed `key` property of the object in frame
+    /// `object_slot` — the plain computed member store whose receiver is a
+    /// frame slot and whose key and value are both direct operands. Fuses the
+    /// `LoadReg` + `StoreMemberComputed` pair the `a[l++] = v` / `a[i] = v`
+    /// shapes otherwise lower to: the object is captured before the key/value
+    /// operands resolve, exactly as the separate object load did, so the one
+    /// op is observably identical (a key/value operand that writes the object
+    /// slot cannot change what was already captured). The lowering emits it
+    /// only for a `tdz=false` frame-slot object.
+    StoreMemberComputedSlot {
+        object_slot: usize,
+        key: RegOperand,
+        value: RegOperand,
+    },
     /// Write the accumulator onto the computed `key` property of the object
     /// in frame `object_slot`, resolving the key operand at store time (the
     /// computed counterpart of `StoreMemberNameLocal`: the store of a
@@ -10498,6 +10516,19 @@ impl Vm {
                     // load would have clobbered it). Shares the fast-array
                     // and property-key machinery with the step path.
                     let object = self.acc;
+                    let key = self.leaf_operand_value(agent, key)?;
+                    let value = self.leaf_operand_value(agent, value)?;
+                    self.assign_computed_plain(agent, object, key, value)?;
+                }
+                LeafOp::StoreMemberComputedSlot {
+                    object_slot,
+                    key,
+                    value,
+                } => {
+                    // The fused `LoadReg` + `StoreMemberComputed`: the object
+                    // is read from its frame slot BEFORE the operands resolve,
+                    // exactly as the separate object load captured it.
+                    let object = *self.frame_get(*object_slot);
                     let key = self.leaf_operand_value(agent, key)?;
                     let value = self.leaf_operand_value(agent, value)?;
                     self.assign_computed_plain(agent, object, key, value)?;
@@ -20751,6 +20782,11 @@ fn leaf_op_touches_slot(op: &LeafOp, slot: usize) -> bool {
         LeafOp::StoreMemberComputedLocal { object_slot, key } => {
             *object_slot == slot || operand(key)
         }
+        LeafOp::StoreMemberComputedSlot {
+            object_slot,
+            key,
+            value,
+        } => *object_slot == slot || operand(key) || operand(value),
         LeafOp::CompoundMemberComputedLocal {
             object_slot,
             key,
@@ -21086,6 +21122,7 @@ fn leaf_op_has_heap_const(op: &LeafOp) -> bool {
         LeafOp::LoadConst(value) | LeafOp::BinConst { value, .. } => value_is_heap(value),
         LeafOp::StoreMemberName { value, .. } => operand(value),
         LeafOp::StoreMemberComputed { key, value } => operand(key) || operand(value),
+        LeafOp::StoreMemberComputedSlot { key, value, .. } => operand(key) || operand(value),
         LeafOp::StoreMemberComputedLocal { key, .. } => operand(key),
         LeafOp::CompoundMemberComputedLocal { key, rhs, .. } => operand(key) || operand(rhs),
         LeafOp::UpdateMemberComputedLocal { key, .. } => operand(key),
@@ -21710,6 +21747,21 @@ fn lower_step(
             {
                 return None;
             }
+            // A `tdz=false` frame-slot object fuses the object load into the
+            // store (one dispatch instead of `LoadReg` + `StoreMemberComputed`);
+            // any other receiver keeps the separate load.
+            if let RegOperand::Reg {
+                slot: object_slot,
+                tdz: false,
+            } = object
+            {
+                ops.push(LeafOp::StoreMemberComputedSlot {
+                    object_slot,
+                    key,
+                    value,
+                });
+                return Some(());
+            }
             if !load_operand(ops, object) {
                 return None;
             }
@@ -22066,6 +22118,7 @@ fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
         | Some(LeafOp::BinStoreReg { .. })
         | Some(LeafOp::StoreMemberName { .. })
         | Some(LeafOp::StoreMemberComputed { .. })
+        | Some(LeafOp::StoreMemberComputedSlot { .. })
         | Some(LeafOp::StoreMemberComputedLocal { .. })
         | Some(LeafOp::CompoundMemberComputedLocal { .. })
         | Some(LeafOp::UpdateMemberComputedLocal { .. })
@@ -22098,6 +22151,9 @@ fn leaf_op_reads_per_iter(op: &LeafOp) -> bool {
         LeafOp::StoreMemberComputed { key, value } => {
             reg_operand_is_per_iter(key) || reg_operand_is_per_iter(value)
         }
+        LeafOp::StoreMemberComputedSlot { key, value, .. } => {
+            reg_operand_is_per_iter(key) || reg_operand_is_per_iter(value)
+        }
         LeafOp::StoreMemberComputedLocal { key, .. }
         | LeafOp::UpdateMemberComputedLocal { key, .. }
         | LeafOp::GetMemberComputed { key }
@@ -22117,6 +22173,9 @@ fn leaf_op_reads_context(op: &LeafOp) -> bool {
         LeafOp::LoadContext { .. } | LeafOp::BinContext { .. } | LeafOp::BinCtxReg { .. } => true,
         LeafOp::StoreMemberName { value, .. } => reg_operand_is_ctx(value),
         LeafOp::StoreMemberComputed { key, value } => {
+            reg_operand_is_ctx(key) || reg_operand_is_ctx(value)
+        }
+        LeafOp::StoreMemberComputedSlot { key, value, .. } => {
             reg_operand_is_ctx(key) || reg_operand_is_ctx(value)
         }
         LeafOp::StoreMemberComputedLocal { key, .. }
