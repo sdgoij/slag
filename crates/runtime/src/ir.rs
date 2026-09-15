@@ -3314,6 +3314,23 @@ impl Vm {
         self.current_new_target = None;
     }
 
+    /// Re-point a pooled Vm at a new run's env and strictness. The pool hands
+    /// out only Vms that `reset` already cleared (`return_vm` resets before
+    /// pooling), so this is the whole per-take setup.
+    pub fn rebind(&mut self, lexical_env: EnvRef, strict: bool) {
+        self.lexical_env = lexical_env;
+        self.strict = strict;
+        self.env_stack.reset(lexical_env);
+    }
+
+    /// Reset in place for pooling when no running context is available to
+    /// supply an env: keep the Vm's own env and reset everything else.
+    pub fn reset_for_pool(&mut self) {
+        let env = self.lexical_env;
+        let strict = self.strict;
+        self.reset(env, strict);
+    }
+
     /// GC-4: clear every frame slot so a Vm's stale values are never traced
     /// as roots (a WeakRef or FinalizationRegistry target that lived in a
     /// frame slot must die when the script/function that held it returns).

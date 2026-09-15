@@ -1241,8 +1241,10 @@ impl Agent {
         strict: bool,
     ) -> Box<crate::ir::Vm> {
         match self.vm_pool.pop() {
+            // `return_vm` fully reset the pooled Vm before it was pooled, so
+            // only the per-run env and strictness need re-pointing.
             Some(mut vm) => {
-                vm.reset(lexical_env, strict);
+                vm.rebind(lexical_env, strict);
                 vm
             }
             None => Box::new(crate::ir::Vm::new(lexical_env, strict)),
@@ -1252,14 +1254,20 @@ impl Agent {
     /// Return a Vm to the pool after its run finished (the next run reuses
     /// its Vec capacities and inline frame).
     pub(crate) fn return_vm(&mut self, mut vm: Box<crate::ir::Vm>) {
-        // GC-4: fully reset the pooled Vm's traceable state — a stale frame
-        // slot, value-stack entry, or scope-env binding would otherwise keep
-        // a WeakRef/FR target alive until the next run resets it (`vm_pool`
-        // traces the pool). Re-pointing the env at the current context's
-        // (itself a traced root) adds no retention.
-        if let Ok(context) = self.running_context() {
-            let env = context.lexical_environment;
-            vm.reset(env, false);
+        // GC-4: the pooled Vm must not trace the finished run's stale state —
+        // a frame slot, value-stack entry, or scope-env binding holding a
+        // WeakRef/FinalizationRegistry target would keep it alive until the
+        // next run resets the Vm. So the Vm is ALWAYS fully reset before it
+        // is pooled; `take_vm` then only has to re-point the env and
+        // strictness for the next run (a pooled Vm is otherwise clean).
+        match self.running_context() {
+            Ok(context) => {
+                let env = context.lexical_environment;
+                vm.reset(env, false);
+            }
+            // No running context (defensive; every caller has one): reset in
+            // place, keeping the Vm's own env, so the pooled Vm is still clean.
+            Err(_) => vm.reset_for_pool(),
         }
         self.vm_pool.push(vm);
     }

@@ -9805,6 +9805,41 @@ byte-identical under jit / `--jitless` / `--gc-stress`.
 Next candidate (queued by the same profile): `Vm::reset` is now 9% — it runs
 TWICE per call (in `take_vm` and again in `return_vm` for the GC-4 reset).
 
+### PROBE + LANDED (2026-09-15): the pooled Vm is reset on RETURN, so take is just a rebind
+
+The candidate the boxed-pool entry queued. `Vm::reset` is ~9% of a non-leaf
+call and ran twice per call — once in `take_vm`, once in `return_vm` (the GC-4
+reset that keeps a pooled Vm from retaining a WeakRef/FR target).
+
+PROBE: a throwaway env-gated patch that skips the `return_vm` reset drops the
+non-leaf param-callee row 15.6 -> 14.2 ms (**-8.5%**), i.e. one of the two
+resets is the whole cost. Recorded trap: the probe's first cut read
+`std::env::var_os` on every return and measured 45% SLOWER — the probe's env
+read must be cached (`OnceLock`), or it swamps the signal.
+
+LANDED, the safe form. `return_vm` already ran the GC-4 reset; that reset was
+conditional on a running context, so a Vm could be pooled UNRESET (which is
+why `take_vm` re-reset). Now `return_vm` ALWAYS resets — the no-context
+fallback `Vm::reset_for_pool` keeps the Vm's own env — and `take_vm` calls a
+new `Vm::rebind(env, strict)` that only re-points `lexical_env`, `strict`, and
+`env_stack`. A pooled Vm is clean by construction, so the take-side full reset
+was redundant. The pool's `Trace` is untouched, so GC-4's semantics are
+identical (the pools are clean either way).
+
+Measured (`--corpus`, 100k calls, JIT): non-leaf param callee 15.6 -> 14.4 ms
+(-7.4%), non-leaf global callee 15.8 -> 14.6 (-7.4%), non-leaf closure callee
+24.5 -> 23.1 (-5.5%). The `non-leaf call` suite row moves with it (jit 15.75 ->
+14.60, interp 19.2 -> 17.7); every other suite row is flat within noise over
+four alternating rounds.
+
+Verification: clippy `--workspace --all-targets -D warnings` clean; `cargo test
+--workspace` green (36 test binaries); the weak-reference clusters — GC-4's
+direct gate — all green (`WeakRef` 29/29, `FinalizationRegistry` 47/47,
+`WeakMap` 141/141, `WeakSet` 85/85); six test262 sweeps at baseline (language
+23724 pass / 0 fail / 0 skip / 0 crash / 0 hang, built-ins 23658 / 0 / 154 / 0 /
+0, annexB 1086 / 0 / 0 / 0 / 0, with the JIT and with `--jitless`); four
+differential batteries byte-identical under jit / `--jitless` / `--gc-stress`.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
