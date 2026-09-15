@@ -175,7 +175,17 @@ surface to scripts as the `rl` global: window control, `beginDrawing`/
 `draw*`/`endDrawing` 2D primitives, a small 3D surface
 (`beginMode3D`/`drawCube`/`drawGrid`, needs raylib's `rmodels` module),
 input queries, plus raylib's palette and key/mouse
-constants. Building with `raygui` as well (`--features raylib,raygui`)
+constants. Textures and images are part of it as well: `loadTexture` and
+`loadImage` resolve an embedded asset by name (any format raylib decodes,
+from the name's extension) or a path on disk, `textureWidth`/`textureHeight`
+and `imageWidth`/`imageHeight`/`imagePixel` read what they hold, and
+`drawBillboardRec`/`drawQuad3D` draw a source rectangle — a flipbook frame,
+or a decal lying on the ground — with `beginBlendMode`/`endBlendMode`
+(raylib's `BLEND_*` modes, the custom pair included: `setBlendFactors` and
+`setBlendFactorsSeparate` take the `BLEND_FACTOR_*`/`BLEND_EQUATION_*` enums),
+`setTextureFilter` and `unloadTexture` alongside.
+The binding table in `crates/runtime/src/raylib.rs` is the authoritative
+surface list. Building with `raygui` as well (`--features raylib,raygui`)
 additionally installs raygui's immediate-mode controls (`rl.guiButton`,
 `rl.guiSlider`, ...) for UI inside the render loop. A script owns the whole render loop, exactly like a raylib C
 example — `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...;

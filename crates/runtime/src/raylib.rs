@@ -43,7 +43,30 @@ use crate::agent::Agent;
 static WINDOW_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
 /// GPU textures created by `makeTexture`/`loadTexture`, indexed by handle.
-static TEXTURES: Mutex<Vec<Texture2D>> = Mutex::new(Vec::new());
+static TEXTURES: Mutex<Vec<TextureSlot>> = Mutex::new(Vec::new());
+
+/// A GPU texture plus whether it is still live. `attachment_of` names the render
+/// texture that owns a colour/depth attachment registered at load time, so
+/// `unloadTexture` cannot free a texture another handle still owns.
+struct TextureSlot {
+    texture: Texture2D,
+    loaded: bool,
+    attachment_of: Option<i32>,
+}
+
+/// CPU images created by `loadImage`, indexed by handle.
+static IMAGES: Mutex<Vec<ImageSlot>> = Mutex::new(Vec::new());
+
+/// An image plus its loaded flag. `Image` carries a raw data pointer, so the
+/// slot needs the manual `Send`/`Sync` impls to live in a static (it is still
+/// only ever touched from the window thread).
+struct ImageSlot {
+    image: Image,
+    loaded: bool,
+}
+
+unsafe impl Send for ImageSlot {}
+unsafe impl Sync for ImageSlot {}
 
 /// Sounds created by `loadSound`, indexed by handle.
 static SOUNDS: Mutex<Vec<SoundSlot>> = Mutex::new(Vec::new());
@@ -220,6 +243,37 @@ unsafe extern "C" {
     /// (which Rust cannot do) and forwards it to `custom_trace_log_callback`.
     fn setLogCallbackWrapper();
 }
+
+/// The source/destination factors `setBlendFactors` accepts. OpenGL's own
+/// enums, which is what raylib's C API takes there -- a `BLEND_CUSTOM` mode
+/// blends with a pair of them rather than with one of raylib's named modes.
+const BLEND_FACTORS: &[(&str, i32)] = &[
+    ("BLEND_FACTOR_ZERO", 0x0000),
+    ("BLEND_FACTOR_ONE", 0x0001),
+    ("BLEND_FACTOR_SRC_COLOR", 0x0300),
+    ("BLEND_FACTOR_ONE_MINUS_SRC_COLOR", 0x0301),
+    ("BLEND_FACTOR_SRC_ALPHA", 0x0302),
+    ("BLEND_FACTOR_ONE_MINUS_SRC_ALPHA", 0x0303),
+    ("BLEND_FACTOR_DST_ALPHA", 0x0304),
+    ("BLEND_FACTOR_ONE_MINUS_DST_ALPHA", 0x0305),
+    ("BLEND_FACTOR_DST_COLOR", 0x0306),
+    ("BLEND_FACTOR_ONE_MINUS_DST_COLOR", 0x0307),
+    ("BLEND_FACTOR_SRC_ALPHA_SATURATE", 0x0308),
+    ("BLEND_FACTOR_CONSTANT_COLOR", 0x8001),
+    ("BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR", 0x8002),
+    ("BLEND_FACTOR_CONSTANT_ALPHA", 0x8003),
+    ("BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA", 0x8004),
+];
+
+/// The blend equations, likewise OpenGL's enums. `MIN` and `MAX` ignore the
+/// factors and come from GL 1.4 (ES 3), which every desktop target has.
+const BLEND_EQUATIONS: &[(&str, i32)] = &[
+    ("BLEND_EQUATION_ADD", 0x8006),
+    ("BLEND_EQUATION_MIN", 0x8007),
+    ("BLEND_EQUATION_MAX", 0x8008),
+    ("BLEND_EQUATION_SUBTRACT", 0x800A),
+    ("BLEND_EQUATION_REVERSE_SUBTRACT", 0x800B),
+];
 
 /// Receives every raylib `TraceLog` message after the raylib-sys shim has
 /// formatted it. Must keep this exact name; the shim declares it and the
@@ -532,20 +586,40 @@ fn draw_triangle_3d(args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Undefined)
 }
 
-/// Resolve a texture handle from the [`TEXTURES`] registry.
+/// Resolve a texture handle from the [`TEXTURES`] registry. A handle that was
+/// never handed out and one whose texture has been unloaded are reported
+/// separately: the first is a script bug, the second is a use-after-free.
 fn texture_arg(args: &[Value], index: usize, name: &str) -> Result<Texture2D, JsError> {
     let handle = int_arg(args, index, name)?;
-    TEXTURES
-        .lock()
-        .unwrap()
-        .get(handle as usize)
-        .copied()
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                format!("rl.{name}: unknown texture {handle}"),
-            )
-        })
+    let registry = TEXTURES.lock().unwrap();
+    match registry.get(handle as usize) {
+        Some(slot) if slot.loaded => Ok(slot.texture),
+        Some(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: texture {handle} was unloaded"),
+        )),
+        None => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: unknown texture {handle}"),
+        )),
+    }
+}
+
+/// Resolve an image handle from the [`IMAGES`] registry.
+fn image_arg(args: &[Value], index: usize, name: &str) -> Result<Image, JsError> {
+    let handle = int_arg(args, index, name)?;
+    let registry = IMAGES.lock().unwrap();
+    match registry.get(handle as usize) {
+        Some(slot) if slot.loaded => Ok(slot.image),
+        Some(_) => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: image {handle} was unloaded"),
+        )),
+        None => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("rl.{name}: unknown image {handle}"),
+        )),
+    }
 }
 
 /// The camera captured by the most recent `beginMode3D`.
@@ -604,6 +678,107 @@ fn draw_billboard_rec(args: &[Value]) -> Result<Value, JsError> {
             tint,
         )
     };
+    Ok(Value::Undefined)
+}
+
+/// A textured quad with an explicit basis: `right` and `up` are the quad's edge
+/// directions, so a unit basis makes `width`/`height` metres and the quad can
+/// lie on the ground, which a camera-facing billboard cannot. The vertex order
+/// and the texcoord mapping are raylib's own `DrawBillboardPro`'s, which is what
+/// keeps a source rectangle a flipbook frame here too.
+///
+/// raylib culls back faces, so the quad is visible from the side that
+/// `right × up` points to. A ground decal therefore passes an `up` that points
+/// away from the viewer -- `right = (1, 0, 0)`, `up = (0, 0, -1)` -- and the
+/// opposite handedness draws nothing.
+fn draw_quad_3d(args: &[Value]) -> Result<Value, JsError> {
+    let texture = texture_arg(args, 0, "drawQuad3D")?;
+    let sx = num_arg(args, 1, "drawQuad3D")? as f32;
+    let sy = num_arg(args, 2, "drawQuad3D")? as f32;
+    let sw = num_arg(args, 3, "drawQuad3D")? as f32;
+    let sh = num_arg(args, 4, "drawQuad3D")? as f32;
+    let cx = num_arg(args, 5, "drawQuad3D")? as f32;
+    let cy = num_arg(args, 6, "drawQuad3D")? as f32;
+    let cz = num_arg(args, 7, "drawQuad3D")? as f32;
+    let rx = num_arg(args, 8, "drawQuad3D")? as f32;
+    let ry = num_arg(args, 9, "drawQuad3D")? as f32;
+    let rz = num_arg(args, 10, "drawQuad3D")? as f32;
+    let ux = num_arg(args, 11, "drawQuad3D")? as f32;
+    let uy = num_arg(args, 12, "drawQuad3D")? as f32;
+    let uz = num_arg(args, 13, "drawQuad3D")? as f32;
+    let width = num_arg(args, 14, "drawQuad3D")? as f32;
+    let height = num_arg(args, 15, "drawQuad3D")? as f32;
+    let tint = color_arg(args, 16, "drawQuad3D")?;
+    let half_right = Vector3 {
+        x: rx * width * 0.5,
+        y: ry * width * 0.5,
+        z: rz * width * 0.5,
+    };
+    let half_up = Vector3 {
+        x: ux * height * 0.5,
+        y: uy * height * 0.5,
+        z: uz * height * 0.5,
+    };
+    // Counter-clockwise from the corner opposite the basis: bottom-left,
+    // bottom-right, top-right, top-left.
+    let corners = [
+        Vector3 {
+            x: cx - half_right.x - half_up.x,
+            y: cy - half_right.y - half_up.y,
+            z: cz - half_right.z - half_up.z,
+        },
+        Vector3 {
+            x: cx + half_right.x - half_up.x,
+            y: cy + half_right.y - half_up.y,
+            z: cz + half_right.z - half_up.z,
+        },
+        Vector3 {
+            x: cx + half_right.x + half_up.x,
+            y: cy + half_right.y + half_up.y,
+            z: cz + half_right.z + half_up.z,
+        },
+        Vector3 {
+            x: cx - half_right.x + half_up.x,
+            y: cy - half_right.y + half_up.y,
+            z: cz - half_right.z + half_up.z,
+        },
+    ];
+    // The texture's v axis points down, so the quad's lower vertices take the
+    // source rectangle's lower edge.
+    let tw = texture.width as f32;
+    let th = texture.height as f32;
+    let texcoords = [
+        Vector2 {
+            x: sx / tw,
+            y: (sy + sh) / th,
+        },
+        Vector2 {
+            x: (sx + sw) / tw,
+            y: (sy + sh) / th,
+        },
+        Vector2 {
+            x: (sx + sw) / tw,
+            y: sy / th,
+        },
+        Vector2 {
+            x: sx / tw,
+            y: sy / th,
+        },
+    ];
+    // SAFETY: window-thread guard; draw state during begin/endDrawing. The
+    // rlgl batch is bound to the texture for these four vertices and released
+    // afterwards, exactly as raylib's own textured-quad primitives do.
+    unsafe {
+        raylib_sys::rlSetTexture(texture.id);
+        raylib_sys::rlBegin(raylib_sys::RL_QUADS as c_int);
+        raylib_sys::rlColor4ub(tint.r, tint.g, tint.b, tint.a);
+        for index in 0..4 {
+            raylib_sys::rlTexCoord2f(texcoords[index].x, texcoords[index].y);
+            raylib_sys::rlVertex3f(corners[index].x, corners[index].y, corners[index].z);
+        }
+        raylib_sys::rlEnd();
+        raylib_sys::rlSetTexture(0);
+    }
     Ok(Value::Undefined)
 }
 
@@ -1395,12 +1570,16 @@ fn make_texture(args: &[Value]) -> Result<Value, JsError> {
     // SAFETY: as above. TEXTURE_FILTER_POINT keeps the chunky look.
     unsafe { raylib_sys::SetTextureFilter(texture, 0) };
     let mut registry = TEXTURES.lock().unwrap();
-    registry.push(texture);
+    registry.push(TextureSlot {
+        texture,
+        loaded: true,
+        attachment_of: None,
+    });
     Ok(Value::Number((registry.len() - 1) as f64))
 }
 
 fn draw_texture_rect(args: &[Value]) -> Result<Value, JsError> {
-    let handle = int_arg(args, 0, "drawTexture")?;
+    let texture = texture_arg(args, 0, "drawTexture")?;
     let sx = num_arg(args, 1, "drawTexture")? as f32;
     let sy = num_arg(args, 2, "drawTexture")? as f32;
     let sw = num_arg(args, 3, "drawTexture")? as f32;
@@ -1410,17 +1589,6 @@ fn draw_texture_rect(args: &[Value]) -> Result<Value, JsError> {
     let dw = num_arg(args, 7, "drawTexture")? as f32;
     let dh = num_arg(args, 8, "drawTexture")? as f32;
     let shade = num_arg(args, 9, "drawTexture")?;
-    let texture = TEXTURES
-        .lock()
-        .unwrap()
-        .get(handle as usize)
-        .copied()
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                format!("rl.drawTexture: unknown texture {handle}"),
-            )
-        })?;
     let light = shade.clamp(0.0, 1.0);
     let tint = Color::new(
         (255.0 * light) as u8,
@@ -1454,35 +1622,140 @@ fn draw_texture_rect(args: &[Value]) -> Result<Value, JsError> {
 }
 
 fn texture_width(args: &[Value]) -> Result<Value, JsError> {
-    let handle = int_arg(args, 0, "textureWidth")?;
-    let width = TEXTURES
-        .lock()
-        .unwrap()
-        .get(handle as usize)
-        .map(|t| t.width as f64)
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                format!("rl.textureWidth: unknown texture {handle}"),
-            )
-        })?;
-    Ok(Value::Number(width))
+    let texture = texture_arg(args, 0, "textureWidth")?;
+    Ok(Value::Number(texture.width as f64))
 }
 
 fn texture_height(args: &[Value]) -> Result<Value, JsError> {
-    let handle = int_arg(args, 0, "textureHeight")?;
-    let height = TEXTURES
-        .lock()
-        .unwrap()
-        .get(handle as usize)
-        .map(|t| t.height as f64)
-        .ok_or_else(|| {
-            JsError::new(
+    let texture = texture_arg(args, 0, "textureHeight")?;
+    Ok(Value::Number(texture.height as f64))
+}
+
+/// `SetTextureFilter`, with raylib's `TextureFilter` modes validated first: a
+/// mode outside the enum would be passed to OpenGL as an unrelated constant.
+fn set_texture_filter(args: &[Value]) -> Result<Value, JsError> {
+    let filter = int_arg(args, 1, "setTextureFilter")?;
+    if !(0..=5).contains(&filter) {
+        return Err(expected("setTextureFilter", 1, "a TEXTURE_FILTER_* mode"));
+    }
+    let texture = texture_arg(args, 0, "setTextureFilter")?;
+    // SAFETY: window-thread guard; the texture is live on this thread.
+    unsafe { raylib_sys::SetTextureFilter(texture, filter) };
+    Ok(Value::Undefined)
+}
+
+/// `UnloadTexture`. A render texture's colour and depth attachments are owned by
+/// that render texture, so freeing one here would leave `unloadRenderTexture`
+/// freeing the same GPU texture twice; the call is refused instead.
+fn unload_texture(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "unloadTexture")?;
+    let mut registry = TEXTURES.lock().unwrap();
+    if let Some(slot) = registry.get_mut(handle as usize)
+        && slot.loaded
+    {
+        if let Some(owner) = slot.attachment_of {
+            return Err(JsError::new(
                 ErrorKind::TypeError,
-                format!("rl.textureHeight: unknown texture {handle}"),
-            )
-        })?;
-    Ok(Value::Number(height))
+                format!(
+                    "rl.unloadTexture: texture {handle} belongs to render texture \
+                     {owner} (unloadRenderTexture frees it)"
+                ),
+            ));
+        }
+        // SAFETY: window-thread guard; the texture came from raylib and is
+        // freed exactly once (the slot is then marked unloaded).
+        unsafe { raylib_sys::UnloadTexture(slot.texture) };
+        slot.loaded = false;
+    }
+    Ok(Value::Undefined)
+}
+
+// ---- images (needs the rtextures module) ----
+
+/// The decoder hint for an embedded asset's bytes, taken from the asset's own
+/// name: `LoadImageFromMemory` picks stb_image's decoder from this string.
+fn image_format_hint(name: &str) -> CString {
+    let hint = std::path::Path::new(name)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_else(|| ".png".to_string());
+    CString::new(hint).unwrap_or_default()
+}
+
+/// The image's pixels, in CPU memory: a Blender-authored mask or height stamp
+/// is read once through `imagePixel` instead of being sampled every frame.
+fn load_image(args: &[Value]) -> Result<Value, JsError> {
+    let path = text_arg(args, 0, "loadImage")?;
+    let path_str = path.to_string_lossy();
+    let image = if let Some((name, data)) = embedded_asset(&path_str) {
+        let format = image_format_hint(name);
+        // SAFETY: window-thread guard; raylib decodes from our static bytes and
+        // the returned image owns its pixel data until `UnloadImage`.
+        unsafe {
+            raylib_sys::LoadImageFromMemory(format.as_ptr(), data.as_ptr(), data.len() as i32)
+        }
+    } else {
+        // SAFETY: raylib reads the file during this call; window-thread guard.
+        unsafe { raylib_sys::LoadImage(path.as_ptr()) }
+    };
+    if image.data.is_null() || image.width <= 0 || image.height <= 0 {
+        return Ok(Value::Number(-1.0));
+    }
+    let mut registry = IMAGES.lock().unwrap();
+    registry.push(ImageSlot {
+        image,
+        loaded: true,
+    });
+    Ok(Value::Number((registry.len() - 1) as f64))
+}
+
+fn image_width(args: &[Value]) -> Result<Value, JsError> {
+    let width = image_arg(args, 0, "imageWidth")?.width;
+    Ok(Value::Number(width as f64))
+}
+
+fn image_height(args: &[Value]) -> Result<Value, JsError> {
+    let height = image_arg(args, 0, "imageHeight")?.height;
+    Ok(Value::Number(height as f64))
+}
+
+/// A pixel as a packed `0xRRGGBBAA` color, the same form the palette and
+/// `color()` use. raylib's `GetImageColor` reads without a bounds check, so a
+/// coordinate outside the image is refused rather than read out of the buffer.
+fn image_pixel(args: &[Value]) -> Result<Value, JsError> {
+    let x = int_arg(args, 1, "imagePixel")?;
+    let y = int_arg(args, 2, "imagePixel")?;
+    let image = image_arg(args, 0, "imagePixel")?;
+    if x < 0 || y < 0 || x >= image.width || y >= image.height {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "rl.imagePixel: ({x}, {y}) is outside the {}x{} image",
+                image.width, image.height
+            ),
+        ));
+    }
+    // SAFETY: window-thread guard; the coordinates are inside the image, whose
+    // pixel data raylib keeps in CPU memory until `UnloadImage`.
+    Ok(to_js_color(unsafe {
+        raylib_sys::GetImageColor(image, x, y)
+    }))
+}
+
+fn unload_image(args: &[Value]) -> Result<Value, JsError> {
+    let handle = int_arg(args, 0, "unloadImage")?;
+    let mut registry = IMAGES.lock().unwrap();
+    if let Some(slot) = registry.get_mut(handle as usize)
+        && slot.loaded
+    {
+        // SAFETY: window-thread guard; the image came from raylib and is freed
+        // exactly once (the slot is then marked unloaded).
+        unsafe { raylib_sys::UnloadImage(slot.image) };
+        slot.loaded = false;
+    }
+    Ok(Value::Undefined)
 }
 
 // ---- shaders and render textures (needs the rcore module) ----
@@ -1585,6 +1858,81 @@ fn begin_shader_mode(args: &[Value]) -> Result<Value, JsError> {
 fn end_shader_mode(_args: &[Value]) -> Result<Value, JsError> {
     // SAFETY: as above.
     unsafe { raylib_sys::EndShaderMode() };
+    Ok(Value::Undefined)
+}
+
+/// Complete-vertex blend modes (`BlendMode` in raylib.h). The custom pair
+/// blends with `setBlendFactors`/`setBlendFactorsSeparate`, which have to be set
+/// before the mode is entered -- raylib applies them on `BeginBlendMode` -- and
+/// re-entering `BLEND_CUSTOM` after changing them re-applies them.
+fn begin_blend_mode(args: &[Value]) -> Result<Value, JsError> {
+    let mode = int_arg(args, 0, "beginBlendMode")?;
+    if !(0..=7).contains(&mode) {
+        return Err(expected("beginBlendMode", 0, "a BLEND_* mode"));
+    }
+    // SAFETY: window-thread guard; draw state during begin/endDrawing.
+    unsafe { raylib_sys::BeginBlendMode(mode) };
+    Ok(Value::Undefined)
+}
+
+fn end_blend_mode(_args: &[Value]) -> Result<Value, JsError> {
+    // SAFETY: as above.
+    unsafe { raylib_sys::EndBlendMode() };
+    Ok(Value::Undefined)
+}
+
+/// A blend factor from [`BLEND_FACTORS`]. An unknown value would be handed to
+/// OpenGL as an unrelated enum and silently keep the previous state.
+fn blend_factor_arg(args: &[Value], index: usize, name: &str) -> Result<i32, JsError> {
+    let factor = int_arg(args, index, name)?;
+    if !BLEND_FACTORS.iter().any(|(_, code)| *code == factor) {
+        return Err(expected(name, index, "a BLEND_FACTOR_* constant"));
+    }
+    Ok(factor)
+}
+
+/// A blend equation from [`BLEND_EQUATIONS`].
+fn blend_equation_arg(args: &[Value], index: usize, name: &str) -> Result<i32, JsError> {
+    let equation = int_arg(args, index, name)?;
+    if !BLEND_EQUATIONS.iter().any(|(_, code)| *code == equation) {
+        return Err(expected(name, index, "a BLEND_EQUATION_* constant"));
+    }
+    Ok(equation)
+}
+
+/// The factors a `BLEND_CUSTOM` mode blends with, described by the method the
+/// two new blend modes are meant to be reached through -- on their own they
+/// would blend with whatever the state happens to hold.
+fn set_blend_factors(args: &[Value]) -> Result<Value, JsError> {
+    let src = blend_factor_arg(args, 0, "setBlendFactors")?;
+    let dst = blend_factor_arg(args, 1, "setBlendFactors")?;
+    let equation = blend_equation_arg(args, 2, "setBlendFactors")?;
+    // SAFETY: window-thread guard; writes raylib's blend state, which the next
+    // `beginBlendMode` applies. No GL call happens here.
+    unsafe { raylib_sys::rlSetBlendFactors(src, dst, equation) };
+    Ok(Value::Undefined)
+}
+
+/// The same for `BLEND_CUSTOM_SEPARATE`, whose factors and equation may differ
+/// between the colour and alpha channels.
+fn set_blend_factors_separate(args: &[Value]) -> Result<Value, JsError> {
+    let src_rgb = blend_factor_arg(args, 0, "setBlendFactorsSeparate")?;
+    let dst_rgb = blend_factor_arg(args, 1, "setBlendFactorsSeparate")?;
+    let src_alpha = blend_factor_arg(args, 2, "setBlendFactorsSeparate")?;
+    let dst_alpha = blend_factor_arg(args, 3, "setBlendFactorsSeparate")?;
+    let equation_rgb = blend_equation_arg(args, 4, "setBlendFactorsSeparate")?;
+    let equation_alpha = blend_equation_arg(args, 5, "setBlendFactorsSeparate")?;
+    // SAFETY: as above.
+    unsafe {
+        raylib_sys::rlSetBlendFactorsSeparate(
+            src_rgb,
+            dst_rgb,
+            src_alpha,
+            dst_alpha,
+            equation_rgb,
+            equation_alpha,
+        )
+    };
     Ok(Value::Undefined)
 }
 
@@ -1756,16 +2104,26 @@ fn load_render_texture(args: &[Value]) -> Result<Value, JsError> {
         return Ok(Value::Number(-1.0));
     }
     // Register the attachments once so they can be sampled by a shader or
-    // blitted with `drawTexture`; their handles stay valid until the render
-    // texture is unloaded.
+    // blitted with `drawTexture`; they belong to the render texture, which is
+    // what the `attachment_of` handle records. The slot about to be pushed
+    // lands at the registry's current length, which is its handle.
+    let owner = RENDER_TEXTURES.lock().unwrap().len() as i32;
     let color = {
         let mut textures = TEXTURES.lock().unwrap();
-        textures.push(target.texture);
+        textures.push(TextureSlot {
+            texture: target.texture,
+            loaded: true,
+            attachment_of: Some(owner),
+        });
         (textures.len() - 1) as i32
     };
     let depth = {
         let mut textures = TEXTURES.lock().unwrap();
-        textures.push(target.depth);
+        textures.push(TextureSlot {
+            texture: target.depth,
+            loaded: true,
+            attachment_of: Some(owner),
+        });
         (textures.len() - 1) as i32
     };
     let mut registry = RENDER_TEXTURES.lock().unwrap();
@@ -1775,7 +2133,7 @@ fn load_render_texture(args: &[Value]) -> Result<Value, JsError> {
         depth,
         loaded: true,
     });
-    Ok(Value::Number((registry.len() - 1) as f64))
+    Ok(Value::Number(owner as f64))
 }
 
 /// Whether `handle` refers to a render texture this module made and has not
@@ -1791,15 +2149,27 @@ fn is_render_texture_valid(args: &[Value]) -> Result<Value, JsError> {
 
 fn unload_render_texture(args: &[Value]) -> Result<Value, JsError> {
     let handle = int_arg(args, 0, "unloadRenderTexture")?;
-    let mut registry = RENDER_TEXTURES.lock().unwrap();
-    if let Some(slot) = registry.get_mut(handle as usize)
-        && slot.loaded
-    {
-        // SAFETY: window-thread guard; freed exactly once. The texture
-        // handles registered at load time are not invalidated here, so a
-        // script must stop using them once the render texture is unloaded.
-        unsafe { raylib_sys::UnloadRenderTexture(slot.target) };
-        slot.loaded = false;
+    let attachments = {
+        let mut registry = RENDER_TEXTURES.lock().unwrap();
+        match registry.get_mut(handle as usize) {
+            Some(slot) if slot.loaded => {
+                // SAFETY: window-thread guard; freed exactly once.
+                unsafe { raylib_sys::UnloadRenderTexture(slot.target) };
+                slot.loaded = false;
+                Some((slot.color, slot.depth))
+            }
+            _ => None,
+        }
+    };
+    if let Some((color, depth)) = attachments {
+        // The attachment handles are marked unloaded too, so a later draw with
+        // one of them reports the use instead of sampling a freed GPU texture.
+        let mut textures = TEXTURES.lock().unwrap();
+        for attachment in [color, depth] {
+            if let Some(slot) = textures.get_mut(attachment as usize) {
+                slot.loaded = false;
+            }
+        }
     }
     Ok(Value::Undefined)
 }
@@ -1889,8 +2259,8 @@ fn close_audio_device(_args: &[Value]) -> Result<Value, JsError> {
 fn load_texture_from_file(args: &[Value]) -> Result<Value, JsError> {
     let path = text_arg(args, 0, "loadTexture")?;
     let path_str = path.to_string_lossy();
-    let texture = if let Some((_, data)) = embedded_asset(&path_str) {
-        let format = CString::new(".png").unwrap();
+    let texture = if let Some((name, data)) = embedded_asset(&path_str) {
+        let format = image_format_hint(name);
         // SAFETY: window-thread guard; raylib decodes from our static bytes.
         let image = unsafe {
             raylib_sys::LoadImageFromMemory(format.as_ptr(), data.as_ptr(), data.len() as i32)
@@ -1909,7 +2279,11 @@ fn load_texture_from_file(args: &[Value]) -> Result<Value, JsError> {
         return Ok(Value::Number(-1.0));
     }
     let mut registry = TEXTURES.lock().unwrap();
-    registry.push(texture);
+    registry.push(TextureSlot {
+        texture,
+        loaded: true,
+        attachment_of: None,
+    });
     Ok(Value::Number((registry.len() - 1) as f64))
 }
 
@@ -2984,6 +3358,7 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("drawTriangle3D", 10, draw_triangle_3d),
         ("drawBillboard", 6, draw_billboard),
         ("drawBillboardRec", 11, draw_billboard_rec),
+        ("drawQuad3D", 17, draw_quad_3d),
         ("loadModel", 1, load_model),
         ("makeModel", 5, make_model),
         ("isModelValid", 1, is_model_valid),
@@ -3007,6 +3382,10 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("getShaderLocation", 2, get_shader_location),
         ("beginShaderMode", 1, begin_shader_mode),
         ("endShaderMode", 0, end_shader_mode),
+        ("beginBlendMode", 1, begin_blend_mode),
+        ("endBlendMode", 0, end_blend_mode),
+        ("setBlendFactors", 3, set_blend_factors),
+        ("setBlendFactorsSeparate", 6, set_blend_factors_separate),
         ("setShaderValue", 4, set_shader_value),
         ("setShaderValueVector2", 4, set_shader_value_vector2),
         ("setShaderValueVector3", 5, set_shader_value_vector3),
@@ -3025,6 +3404,13 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("drawTexture", 10, draw_texture_rect),
         ("textureWidth", 1, texture_width),
         ("textureHeight", 1, texture_height),
+        ("setTextureFilter", 2, set_texture_filter),
+        ("unloadTexture", 1, unload_texture),
+        ("loadImage", 1, load_image),
+        ("imageWidth", 1, image_width),
+        ("imageHeight", 1, image_height),
+        ("imagePixel", 3, image_pixel),
+        ("unloadImage", 1, unload_image),
         ("initAudioDevice", 0, init_audio_device),
         ("closeAudioDevice", 0, close_audio_device),
         ("loadTexture", 1, load_texture_from_file),
@@ -3123,6 +3509,36 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("SHADER_UNIFORM_UIVEC3", 10),
         ("SHADER_UNIFORM_UIVEC4", 11),
         ("SHADER_UNIFORM_SAMPLER2D", 12),
+    ] {
+        rl.create_data_property_or_throw(&JsString::from_utf8(name), Value::Number(code as f64))?;
+    }
+
+    // Blend modes (`BlendMode` in raylib.h), and the factors the two custom
+    // ones blend with (OpenGL's own enums).
+    for (name, code) in [
+        ("BLEND_ALPHA", 0),
+        ("BLEND_ADDITIVE", 1),
+        ("BLEND_MULTIPLIED", 2),
+        ("BLEND_ADD_COLORS", 3),
+        ("BLEND_SUBTRACT_COLORS", 4),
+        ("BLEND_ALPHA_PREMULTIPLY", 5),
+        ("BLEND_CUSTOM", 6),
+        ("BLEND_CUSTOM_SEPARATE", 7),
+    ] {
+        rl.create_data_property_or_throw(&JsString::from_utf8(name), Value::Number(code as f64))?;
+    }
+    for (name, code) in BLEND_FACTORS.iter().chain(BLEND_EQUATIONS) {
+        rl.create_data_property_or_throw(&JsString::from_utf8(name), Value::Number(*code as f64))?;
+    }
+
+    // Texture filter modes (`TextureFilter` in raylib.h).
+    for (name, code) in [
+        ("TEXTURE_FILTER_POINT", 0),
+        ("TEXTURE_FILTER_BILINEAR", 1),
+        ("TEXTURE_FILTER_TRILINEAR", 2),
+        ("TEXTURE_FILTER_ANISOTROPIC_4X", 3),
+        ("TEXTURE_FILTER_ANISOTROPIC_8X", 4),
+        ("TEXTURE_FILTER_ANISOTROPIC_16X", 5),
     ] {
         rl.create_data_property_or_throw(&JsString::from_utf8(name), Value::Number(code as f64))?;
     }
@@ -3228,6 +3644,7 @@ mod tests {
             "drawTriangle3D",
             "drawBillboard",
             "drawBillboardRec",
+            "drawQuad3D",
             "drawRectangleLines",
             "drawRectangleGradientV",
             "drawTextEx",
@@ -3246,6 +3663,121 @@ mod tests {
                 "rl.{name}"
             );
         }
+        // Texture bindings: loading and drawing need a live window, so only the
+        // shape and the handle checks run here.
+        for name in [
+            "loadTexture",
+            "makeTexture",
+            "drawTexture",
+            "textureWidth",
+            "textureHeight",
+            "setTextureFilter",
+            "unloadTexture",
+            "loadImage",
+            "imageWidth",
+            "imageHeight",
+            "imagePixel",
+            "unloadImage",
+        ] {
+            assert_eq!(
+                context
+                    .eval(&format!("typeof rl.{name}"))
+                    .unwrap()
+                    .as_string()
+                    .as_deref(),
+                Some("function"),
+                "rl.{name}"
+            );
+        }
+        // Blend modes are constants plus a begin/end pair and the factors the
+        // custom pair blends with; entering a mode needs a live window, so the
+        // validation and the factor state writes are what run here.
+        assert_eq!(
+            context
+                .eval("rl.BLEND_ALPHA === 0 && rl.BLEND_ADDITIVE === 1 && rl.BLEND_ALPHA_PREMULTIPLY === 5 && rl.BLEND_CUSTOM_SEPARATE === 7")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context
+                .eval(
+                    "typeof rl.beginBlendMode === 'function' && typeof rl.endBlendMode === 'function' && typeof rl.setBlendFactors === 'function' && typeof rl.setBlendFactorsSeparate === 'function'"
+                )
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context
+                .eval("rl.BLEND_FACTOR_ONE === 1 && rl.BLEND_FACTOR_SRC_ALPHA === 0x0302 && rl.BLEND_FACTOR_ONE_MINUS_SRC_COLOR === 0x0301 && rl.BLEND_EQUATION_ADD === 0x8006 && rl.BLEND_EQUATION_MAX === 0x8008")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        // Setting factors only writes raylib's blend state, so it is safe
+        // without a window: this is the additive pair raylib itself uses.
+        assert!(
+            context
+                .eval("rl.setBlendFactors(rl.BLEND_FACTOR_SRC_ALPHA, rl.BLEND_FACTOR_ONE, rl.BLEND_EQUATION_ADD)")
+                .is_ok()
+        );
+        assert!(
+            context
+                .eval("rl.setBlendFactorsSeparate(rl.BLEND_FACTOR_SRC_ALPHA, rl.BLEND_FACTOR_ONE, rl.BLEND_FACTOR_ONE, rl.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, rl.BLEND_EQUATION_ADD, rl.BLEND_EQUATION_ADD)")
+                .is_ok()
+        );
+        // A factor or equation outside the published sets is refused rather
+        // than handed to OpenGL as an unrelated enum.
+        for call in [
+            "rl.setBlendFactors(999, rl.BLEND_FACTOR_ONE, rl.BLEND_EQUATION_ADD)",
+            "rl.setBlendFactors(rl.BLEND_FACTOR_ONE, rl.BLEND_FACTOR_ONE, 999)",
+            "rl.setBlendFactorsSeparate(rl.BLEND_FACTOR_ONE, rl.BLEND_FACTOR_ONE, rl.BLEND_FACTOR_ONE, 999, rl.BLEND_EQUATION_ADD, rl.BLEND_EQUATION_ADD)",
+        ] {
+            let error = match context.eval(call) {
+                Ok(_) => panic!("{call} must throw"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("BLEND_"), "{call}: {error}");
+        }
+        let error = match context.eval("rl.beginBlendMode(8)") {
+            Ok(_) => panic!("rl.beginBlendMode with a mode outside the enum must throw"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rl.beginBlendMode"), "{error}");
+        assert!(error.contains("BLEND_"), "{error}");
+        assert_eq!(
+            context
+                .eval("rl.TEXTURE_FILTER_POINT === 0 && rl.TEXTURE_FILTER_TRILINEAR === 2 && rl.TEXTURE_FILTER_ANISOTROPIC_16X === 5")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        // A filter mode outside the enum is rejected before the texture is
+        // touched, and an unknown texture is reported by its own name.
+        let error = match context.eval("rl.setTextureFilter(-1, 9)") {
+            Ok(_) => panic!("rl.setTextureFilter with an out-of-range mode must throw"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rl.setTextureFilter"), "{error}");
+        assert!(error.contains("TEXTURE_FILTER"), "{error}");
+        let error = match context.eval("rl.setTextureFilter(-1, 0)") {
+            Ok(_) => panic!("rl.setTextureFilter with an unknown texture must throw"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unknown texture"), "{error}");
+        // Unloading a handle that was never handed out is a no-op, like the
+        // other unload bindings.
+        assert!(context.eval("rl.unloadTexture(-1)").is_ok());
+        for call in ["rl.imageWidth(-1)", "rl.imagePixel(-1, 0, 0)"] {
+            let error = match context.eval(call) {
+                Ok(_) => panic!("{call} must throw"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("unknown image"), "{call}: {error}");
+        }
+        assert!(context.eval("rl.unloadImage(-1)").is_ok());
+
         // Model bindings are installed; loading needs a window, so only the
         // shape and the non-window handle checks run here.
         for name in [
