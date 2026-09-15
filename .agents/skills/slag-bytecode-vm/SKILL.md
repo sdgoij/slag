@@ -259,6 +259,19 @@ arguments state.
   `assign_computed_plain` (nullish check, fast array element write,
   `to_property_key` + `assign_member`) — extend the helper, not the two
   call sites separately.
+- **A `tdz=false` frame-slot receiver fuses into the computed store**
+  (`StoreMemberComputedSlot`): `o[k] = v` lowers to one op instead of
+  `LoadReg` + `StoreMemberComputed`. It reads the object from its slot
+  BEFORE the key/value operands resolve — the order the separate
+  `LoadReg` gave — so a `PostInc` key that writes the receiver's own slot
+  cannot change what was captured. The JIT arm emits that same order
+  (`load_slot` → operands → `emit_computed_store`); do not move the load
+  after the operands. Adding ANY `LeafOp` means the full mirror set:
+  `run_leaf_ops`, `lower_step`, `lower_leaf_ops`' accept-list,
+  `trace_leaf_op_heaps`, `leaf_op_touches_slot`, `leaf_op_has_heap_const`,
+  `leaf_op_reads_per_iter`, and the JIT's `load_const` reg-operand table
+  (`crates/runtime/src/jit.rs`) — that last one is in another crate, so a
+  missing arm is not a compile error but `unreachable!` at runtime.
 - **`GetMemberName`/`GetMemberComputed` reads** (Cut 35 slice 8): `o.x` /
   `o[k]` in value position lower with the object in the accumulator (the
   computed key a direct operand, never `Acc`), sharing the step path's
@@ -691,6 +704,31 @@ accepts `Small` operands alongside `Flat` — a `Small` + `Small` of total
 `concat_strings` helper and the interpreter's `binary_inline` share the
 same `JsString::concat`, so a string-representation change shows up in
 both paths — measure both when A/B-ing.
+
+## The Vm pool hands out only reset Vms
+
+`Agent::vm_pool` is `Vec<Box<Vm>>` — boxed so a take/return moves a pointer
+instead of the ~1.1KB `Vm` (the non-leaf call was memcpy-bound before: 37.6%
+of the profile under `run_compiled_body`/`return_vm`). The `vec_box` allow on
+the field is deliberate: `Vec<Vm>` moves the element, which is the cost being
+removed. `take_vm` returns `Box<Vm>` and `return_vm` takes one; every
+non-leaf call (`run_compiled_body`, both construct paths, `eval_program`,
+`try_leaf_call`) takes and returns one, and the pool's `Trace` iterates the
+boxes (`Vm` must still be `Trace`, and `vec_box` does not change that).
+
+- **The invariant is "a pooled Vm is clean by construction"**: `return_vm`
+  ALWAYS fully resets the Vm before pooling (the GC-4 frame/stack/env reset,
+  with `Vm::reset_for_pool` keeping the Vm's own env when no context is
+  running), and `take_vm` only calls `Vm::rebind` (env + strict + env_stack).
+  So any NEW path that puts a Vm into `vm_pool` must reset it first — the take
+  side no longer covers a dirty push, and a dirty pooled Vm means a leak of
+  WeakRef/FinalizationRegistry targets *and* a caller inheriting the previous
+  run's state.
+- The reset moved to the return side because it was 9% of a non-leaf call run
+  twice (once per side). The GC-4 semantics are unchanged: a direct probe (a
+  `WeakRef` to a frame-slot object created in a non-leaf call, 64 calls under
+  `--gc-stress`) reports the same single-live target on both sides of the
+  change.
 
 ## 17. A nested closure's `this` bails the ENCLOSING body's scope certification
 

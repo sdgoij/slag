@@ -322,19 +322,29 @@ both paths computed the same value):
 
 | Body | Interpreter | JIT | Ratio |
 |---|---|---|---|
-| `arithmetic` | 8.98 ms | 0.650 ms | 0.07x |
-| `property read` | 10.77 ms | 0.762 ms | 0.07x |
-| `wide leaf call` | 22.64 ms | 1.672 ms | 0.07x |
-| `bare loop` | 8.06 ms | 0.603 ms | 0.08x |
-| `global read` | 11.88 ms | 1.377 ms | 0.12x |
-| `function calls` | 6.00 ms | 0.756 ms | 0.13x |
-| `buildString shape` | 97.56 ms | 13.890 ms | 0.14x |
-| `typed-array length` | 13.00 ms | 1.870 ms | 0.14x |
-| `string concat` | 1.25 ms | 0.188 ms | 0.15x |
-| `buildString full` | 73.96 ms | 16.587 ms | 0.22x |
-| `typed-array write` | 34.11 ms | 12.269 ms | 0.36x |
-| `apply leaf call` | 20.33 ms | 7.537 ms | 0.37x |
-| `compound assign` | 4.00 ms | 1.548 ms | 0.39x |
+| `arithmetic` | 8.15 ms | 0.627 ms | 0.08x |
+| `bare loop` | 7.74 ms | 0.621 ms | 0.08x |
+| `wide leaf call` | 21.93 ms | 1.679 ms | 0.08x |
+| `property read` | 9.77 ms | 0.797 ms | 0.08x |
+| `function calls` | 6.18 ms | 0.757 ms | 0.12x |
+| `global read` | 11.15 ms | 1.384 ms | 0.12x |
+| `buildString shape` | 93.28 ms | 13.840 ms | 0.15x |
+| `string concat` | 1.28 ms | 0.191 ms | 0.15x |
+| `typed-array length` | 12.12 ms | 1.941 ms | 0.16x |
+| `buildString full` | 73.36 ms | 16.631 ms | 0.23x |
+| `apply leaf call` | 20.80 ms | 7.594 ms | 0.37x |
+| `typed-array write` | 31.15 ms | 12.565 ms | 0.40x |
+| `compound assign` | 3.61 ms | 1.562 ms | 0.43x |
+| `builtin call` | 5.56 ms | 2.445 ms | 0.44x |
+| `non-leaf call` | 18.89 ms | 13.045 ms | 0.69x |
+
+`builtin call` and `non-leaf call` are the two rows the pooled-`Vm` and
+builtin-verdict work added; every other call row's callee is a certified leaf,
+which the JIT inlines. Neither of these can inline — a body that contains a
+call is not a leaf, and a crux-native builtin is not a JS leaf — so both engines
+run the general call path there and the ratio is set by that machinery, not by
+code generation. `.notes/perf.md` has the per-shape probe and what each row
+moved.
 
 ### Against V8
 
