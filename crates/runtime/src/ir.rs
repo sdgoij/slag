@@ -10780,7 +10780,11 @@ impl Vm {
 
     /// Load a register operand to a value for a store op, mirroring the
     /// `LoadReg`/`LoadContext`/`LoadPerIter`/`LoadConst` ops' semantics
-    /// (including the TDZ and context-transparent-env walks).
+    /// (including the TDZ and context-transparent-env walks). The hot arms
+    /// (a frame slot, a constant, the counter, and a Number post-increment)
+    /// stay here; the env walks and the non-Number update go out of line so
+    /// their coercion and BigInt machinery does not bloat the hot loader.
+    #[inline]
     fn leaf_operand_value(
         &mut self,
         agent: &mut Agent,
@@ -10791,13 +10795,17 @@ impl Vm {
             RegOperand::Reg { slot, tdz } => {
                 let value = *self.frame_get(*slot);
                 if *tdz && value.is_uninitialized() {
-                    return Err(JsError::new(
-                        ErrorKind::ReferenceError,
-                        "Cannot access a binding before initialization".into(),
-                    ));
+                    return Err(uninitialized_binding_error());
                 }
                 Ok(value)
             }
+            RegOperand::Const(value) => Ok(*value),
+            // The loop counter lives in the dedicated `loop_counter` field
+            // (Cut 35 slice 21: no entry push — the field IS the storage, so
+            // the operand reads it directly, mirroring `LeafOp::LoadCounter`
+            // and the JIT's `counter_bits`). The read-count guard keeps the
+            // shadow stack at most two `Counter` entries.
+            RegOperand::Counter => Ok(Value::Number(self.loop_counter)),
             RegOperand::PostInc { slot, tdz, op } => {
                 // A post-increment key: read the slot, write the update back,
                 // yield the OLD value — exactly what the `UpdateLocal` step
@@ -10807,10 +10815,7 @@ impl Vm {
                 // [[Set]] throws on a nullish receiver).
                 let old = *self.frame_get(*slot);
                 if *tdz && old.is_uninitialized() {
-                    return Err(JsError::new(
-                        ErrorKind::ReferenceError,
-                        "Cannot access a binding before initialization".into(),
-                    ));
+                    return Err(uninitialized_binding_error());
                 }
                 // A slot that already holds a Number updates on the raw f64:
                 // the postfix key (`a[l++] = v` on the buildString rows) skips
@@ -10828,10 +10833,36 @@ impl Vm {
                     *self.frame_get_mut(*slot) = Value::Number(number + delta);
                     return Ok(old);
                 }
-                let (old_numeric, new) = update_value(agent, op, &old)?;
-                *self.frame_get_mut(*slot) = new;
-                Ok(old_numeric)
+                self.post_inc_operand_slow(agent, *slot, *op, old)
             }
+            RegOperand::Ctx { .. } | RegOperand::PerIter { .. } | RegOperand::Spilled => {
+                self.leaf_operand_env_slow(operand)
+            }
+        }
+    }
+
+    /// The non-Number post-increment operand (`update_value`'s ToNumeric
+    /// path — a String, an object with `valueOf`, a BigInt): out of line so
+    /// the coercion/BigInt machinery does not bloat `leaf_operand_value`.
+    #[inline(never)]
+    fn post_inc_operand_slow(
+        &mut self,
+        agent: &mut Agent,
+        slot: usize,
+        op: UpdateOp,
+        old: Value,
+    ) -> Result<Value, JsError> {
+        let (old_numeric, new) = update_value(agent, &op, &old)?;
+        *self.frame_get_mut(slot) = new;
+        Ok(old_numeric)
+    }
+
+    /// The env-path operand arms (a capture-context binding, a per-iteration
+    /// binding, or the compiler-bug spill): out of line, since the env chain
+    /// walks are cold for the register stores that read a plain frame slot.
+    #[inline(never)]
+    fn leaf_operand_env_slow(&self, operand: &RegOperand) -> Result<Value, JsError> {
+        match operand {
             RegOperand::Ctx { index } => {
                 let mut env = self.body_context_env();
                 while is_context_transparent(&env) {
@@ -10857,19 +10888,13 @@ impl Vm {
                         "Cannot access a binding before initialization".into(),
                     )
                 }),
-            RegOperand::Const(value) => Ok(*value),
             // The lowering rejects spilled keys/values; a reaching spill
             // would be a compiler bug.
             RegOperand::Spilled => Err(JsError::new(
                 ErrorKind::SyntaxError,
                 "spilled register operand cannot be re-loaded".into(),
             )),
-            // The loop counter lives in the dedicated `loop_counter` field
-            // (Cut 35 slice 21: no entry push — the field IS the storage, so
-            // the operand reads it directly, mirroring `LeafOp::LoadCounter`
-            // and the JIT's `counter_bits`). The read-count guard keeps the
-            // shadow stack at most two `Counter` entries.
-            RegOperand::Counter => Ok(Value::Number(self.loop_counter)),
+            _ => unreachable!("a hot operand arm reached the env slow path"),
         }
     }
 
@@ -13194,6 +13219,16 @@ pub(crate) fn string_units_of(value: &Value) -> Vec<u16> {
 
 pub(crate) fn error_message_value(error: &JsError) -> Value {
     Value::String(Handle::new(JsString::from_utf8(&error.message)))
+}
+
+/// The TDZ access error shared by the register operand loads: cold, so its
+/// `String` construction stays out of the hot operand paths.
+#[cold]
+fn uninitialized_binding_error() -> JsError {
+    JsError::new(
+        ErrorKind::ReferenceError,
+        "Cannot access a binding before initialization".into(),
+    )
 }
 
 /// The `++`/`--` result pair: (numeric old, new) — the postfix update

@@ -9608,6 +9608,96 @@ a Proxy `set` trap, nullish receivers, a prototype setter, typed arrays, primiti
 receivers, a getter/setter pair, the `valueOf` PostInc fallback) byte-identical
 under jit / `--jitless` / `--gc-stress`.
 
+### LANDED (2026-09-15): the register operand loader's cold arms move out of line
+
+The probe the fused-store entry queued. After the fusion, the interpreter's
+`a[l++] = i` profile is `run_inner_inner` ~33% (dispatch) with
+`leaf_operand_value` ~22% next — two operand loads per store. The loader's four
+cold arms (the `Ctx`/`PerIter` env walks, the `Spilled` error, and the
+non-Number `PostInc` `update_value` path, whose ToNumeric/BigInt machinery is
+the bulk) sat inline beside the four hot arms (frame slot, constant, counter,
+Number post-increment). They move to `#[inline(never)]`
+`leaf_operand_env_slow`/`post_inc_operand_slow`, and the shared TDZ error to a
+`#[cold]` constructor.
+
+RECORDED, so a future probe does not re-derive it: the `#[inline]` on the
+loader does NOT get it inlined into the executor — the profile still shows it
+as a separate symbol at ~20% self (22.0 -> 19.7). The gain is the smaller
+out-of-line function, not the inlining.
+
+Measured (interleaved A/B, min-of-3, `--jitless`): the counter-key computed
+store `a[i] = i` (3M) 70.5-70.8 -> 68.6-68.9 ms (~2.5%) — the shape whose path
+is exactly the loader's trivial `Counter` arm, the mechanically attributable
+part. `--jit-bench`: `compound assign` interp 4.100 -> 4.036 (~1.6%),
+`typed-array write` interp 27.78 -> 27.52 (~0.9%), `leaf_operand_value` self
+22.0% -> 19.7%. `buildString shape`/`full`, the other corpus rows, and every
+JIT column are flat within noise. The `compound assign` and `typed-array write`
+shifts are NOT mechanically attributable (both are named/element stores that do
+not call this loader) — layout, per the standing caveat; they do partially
+recover the +5.9% layout shift the cursor landing introduced on `compound
+assign` (3.934 -> 4.036, from 4.166).
+
+Verification: clippy `--workspace --all-targets -D warnings` clean; `cargo test
+--workspace` green (36 test binaries, 0 failed); six test262 sweeps at baseline
+(language 23724 pass / 0 fail / 0 skip / 0 crash / 0 hang, built-ins 23658 / 0 /
+154 / 0 / 0, annexB 1086 / 0 / 0 / 0 / 0, with the JIT and with `--jitless`);
+both differential batteries (`scratch/battery.js`, `scratch/battery_fused.js`)
+byte-identical under jit / `--jitless` / `--gc-stress`.
+
+### PROBE (2026-09-15): the interpreter's call rows are step-dispatch-bound — a body with a call cannot register-lower
+
+The follow-up probe the append track pointed at (the interpreter's call rows are
+7-10x the JIT). `lower_step` has no arm for ANY `Call*` step, so a body
+containing a call bails wholly to the step path: `function bench(f, n) { var s
+= 0; for (...) { s += f(i); } }` compiles to `LoadLocal{s}`, `PushAcc`,
+`CallFastSlot`, `Binary(Add)`, `FusedStoreLocal{s}` — five step dispatches per
+iteration, no `RunRegBody` (confirmed by dumping the body). The certified
+leaf-inline call itself is small: `fast_call_core` (with `run_inline_leaf`
+inlined) is ~28% self and the caller's `run_inner_inner` dispatch is ~54%.
+
+Measured (`--jitless` / jit, 100k calls, per iteration; `--corpus`):
+
+| shape | jitless | jit |
+|---|---|---|
+| loop floor `s += i` (register run) | 10.6 | 5.3 |
+| `s = f(i)` (slot callee, fused store) | 33.1 | 5.5 |
+| `s += f(i)` (slot callee) | 42.0 | 7.3 |
+| `s += o.f(i)` (member callee; the `function calls` row) | 59.9 | 8.4 |
+| `s += g(i)` (global callee) | 51.3 | 8.1 |
+| `s += f(...33 args)` (the `wide leaf call` row shape) | 113.5 | 10.5 |
+| `s += Math.abs(i)` | 63.9 | 44.2 |
+| `s += f(i)`, callee has try/catch (uncertified) | 346 | 335 |
+
+So a certified 1-arg call costs the interpreter ~31ns (param) / ~49ns (member)
+over the register-run floor, while the JIT's is ~2ns / ~3ns; an uncertified
+callee is ~335ns in BOTH engines (no leaf inline, and the JIT does not compile
+it). The same call-free shape register-lowers to 10.6ns, so the residual is the
+per-iteration step dispatch of the calling body, not the call machinery.
+
+Bounded slice considered and NOT taken: fusing the compound call-store. `s =
+f(i)` is 8.9ns/iter cheaper than `s += f(i)` in the interpreter (33.1 vs 42.0) —
+exactly the two extra steps (`Binary` + the pushed left operand). A fused
+`s = f(...)` accumulate-store would recover that (~9ns/iter: `function calls`
+~15%, `apply leaf call` ~9%, `wide leaf call` ~8%), but the stack-based call
+steps push their result, so the accumulator does not hold it: the fusion needs
+either an accumulator-returning call variant (the call/leaf protocol reworked,
+its four callee forms x an op) or a `Step::BinStoreLocal` whose slot read is
+late (unsound for a captured slot the RHS can write — the current register
+`BinStoreReg` fusion only fires inside a straight-line run, where no call can
+interleave). For ~10% on three rows that is a step-VM call-contract change, not
+a tweak.
+
+What would actually close it: register-lowering call-containing bodies (a
+register-op call with an argument stack protocol and abrupt-completion
+unwinding), which the `steps_are_leaf` predicate deliberately excludes today.
+That is the large slice; this probe is its gate, and it should not be started
+without an explicit decision to spend on it (the `M4`/`L3` falsifications in
+this journal are the precedent for gating it).
+
+`apply leaf call`'s JIT column (40.5ns/call, ~5x the leaf-inline rows) is a
+separate, pre-existing gap: `Function.prototype.apply` to a certified leaf still
+runs the builtin round-trip plus the per-call arg-list build (Cut 41's residual).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
