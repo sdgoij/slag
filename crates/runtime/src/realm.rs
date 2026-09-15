@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
@@ -49,11 +50,53 @@ impl Realm {
     }
 }
 
+/// The intrinsic names a chain dispatcher's callee was defined under: what
+/// `Intrinsics::name_of` resolves once per call, so the dispatcher's arms can
+/// answer "is the callee the intrinsic named `X`?" with a string compare
+/// instead of an `Intrinsics::get` probe per arm.
+pub struct ResolvedNames(Option<Rc<Vec<Rc<str>>>>);
+
+impl ResolvedNames {
+    /// Is the callee the intrinsic defined under `name`? (A function object
+    /// can hold more than one name, so this is a membership test.)
+    #[inline]
+    pub fn is(&self, name: &str) -> bool {
+        self.0
+            .as_deref()
+            .is_some_and(|names| names.iter().any(|n| &**n == name))
+    }
+
+    /// Every name the callee was defined under, empty when it is not one of
+    /// this realm's intrinsics. A dispatcher that fronts several others (the
+    /// Intl and Temporal namespace routers) reads the namespace off a name's
+    /// prefix before it compares whole names.
+    #[inline]
+    pub fn names(&self) -> &[Rc<str>] {
+        match &self.0 {
+            Some(names) => names.as_slice(),
+            None => &[],
+        }
+    }
+}
+
 /// The intrinsic registry (spec 9.3.1): %-named values installed by each
 /// built-in phase, in spec bootstrap order.
 #[derive(Debug, Default)]
 pub struct Intrinsics {
-    entries: RefCell<HashMap<JsString, Value>>,
+    /// Every intrinsic by name, keyed by `Rc<str>` rather than `JsString` so a
+    /// lookup by name borrows the key instead of encoding a UTF-16 string per
+    /// probe (`JsString` is UTF-16, so `from_utf8` allocates on every probe).
+    /// The identity-chain dispatchers are the hot path:
+    /// `temporal::shell::dispatch_call` alone probes up to 111 names per call.
+    entries: RefCell<HashMap<Rc<str>, Value>>,
+    /// Every name each entry was defined under, by function id: a function
+    /// object can hold more than one name (spec aliases such as
+    /// `%Array.prototype.values%` / `%Array.prototype[Symbol.iterator]%` are
+    /// the same object), so this is a set per id. `define` shares the `Rc`
+    /// with `entries`, so the index costs a refcount bump per intrinsic, and
+    /// the identity-chain dispatchers resolve their callee's names once per
+    /// call and compare strings instead of probing the table per arm.
+    names: RefCell<HashMap<u64, Rc<Vec<Rc<str>>>>>,
     /// Cut 26: the realm's %Object.prototype% handle, cached after the first
     /// resolution — the intrinsics table is populated at bootstrap and never
     /// reassigned, so the handle is stable for the realm's life. Object
@@ -158,10 +201,16 @@ impl Trace for Intrinsics {
 
 impl Intrinsics {
     pub fn get(&self, name: &str) -> Option<Value> {
-        self.entries
-            .borrow()
-            .get(&JsString::from_utf8(name))
-            .cloned()
+        self.entries.borrow().get(name).cloned()
+    }
+
+    /// The intrinsic names `callee` was defined under, if it is one of this
+    /// realm's intrinsics. One lookup, against the per-arm table probes the
+    /// chain dispatchers used to do (`temporal::shell::dispatch_call` walks up
+    /// to 111 arms per call, and each probe encoded a `JsString`).
+    pub fn name_of(&self, callee: &Value) -> ResolvedNames {
+        let id = callee.as_function().map(|function| function.id());
+        ResolvedNames(id.and_then(|id| self.names.borrow().get(&id).cloned()))
     }
 
     /// The realm's %Object.prototype% value, cached after the first
@@ -248,9 +297,17 @@ impl Intrinsics {
     }
 
     pub fn define(&self, name: &str, value: Value) {
-        self.entries
-            .borrow_mut()
-            .insert(JsString::from_utf8(name), value);
+        let key: Rc<str> = Rc::from(name);
+        self.entries.borrow_mut().insert(Rc::clone(&key), value);
+        if let Some(function) = value.as_function() {
+            let mut names = self.names.borrow_mut();
+            match names.get_mut(&function.id()) {
+                Some(aliases) => Rc::make_mut(aliases).push(Rc::clone(&key)),
+                None => {
+                    names.insert(function.id(), Rc::new(vec![Rc::clone(&key)]));
+                }
+            }
+        }
         // Register an agent-dependent builtin's native handler so a warm
         // call dispatches in O(1) (see `builtins::array::handler_for`);
         // functions without a registered handler (prototypes, plain

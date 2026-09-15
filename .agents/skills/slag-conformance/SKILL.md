@@ -1,6 +1,6 @@
 ---
 name: slag-conformance
-description: Load when running or triaging Slag's test262 conformance sweeps (language/built-ins/annexB areas), fixing engine gaps exposed by fixtures, or debugging sweep failures/hangs. Covers the sweep workflow, the failure-triage loop, and the non-module traps (proxy has-trap chain walks, async-module hang misdiagnosis, stale release binaries). For module-machinery specifics (import-defer, dynamic import, cycle roots) load slag-modules instead.
+description: Load when running or triaging Slag's test262 conformance sweeps (language/built-ins/annexB/intl402 areas), fixing engine gaps exposed by fixtures, or debugging sweep failures/hangs. Covers the sweep workflow, the failure-triage loop, and the non-module traps (proxy has-trap chain walks, async-module hang misdiagnosis, stale release binaries). For module-machinery specifics (import-defer, dynamic import, cycle roots) load slag-modules instead.
 ---
 
 # Slag test262 conformance triage
@@ -17,14 +17,20 @@ over the vendored test262 submodule. The engine's own test suite is
   the binary's timestamp against `crates/**/*.rs` before debugging the engine.
 - Full area: `target/release/sweep.exe language --jobs 8 --batch 32
   --timeout 15 --recheck-timeout 15 --json > out.json` (areas:
-  `language` | `built-ins` | `annexB` | `all`). The JSON has
+  `language` | `built-ins` | `annexB` | `intl402` | `all`). The JSON has
   `total/pass/fail/skip/crash/hang` plus `failures` and `hangs` arrays;
   the `failures` array holds fail AND crash entries (the summary `fail`
   and `crash` counts are separate). HARD RULE: never pass a timeout above
   15 seconds — anything that cannot finish within 15 seconds is by
   definition too slow, and a fixture classified as a `hang` under the 15s
   deadline is a real result (re-run it individually only to confirm it is
-  genuinely slow, never to reclassify it away).
+  genuinely slow, never to reclassify it away). The one scoped exception
+  is `.github/workflows/ci.yml`, which sweeps at 30s/60s: a runner VM is
+  slower than the author's box by more than the local deadline covers —
+  Windows reported hangs at a shorter pair for fixtures this checkout runs
+  in well under 15s — so the extra margin keeps a slow-but-correct fixture
+  out of the `hang` bucket. That is a CI-only deviation — never cite it to
+  raise a local deadline.
 - Cluster: `--list FILE` where every line is an AREA-ROOT-RELATIVE path
   (`import/import-defer/x.js`, never `language/import/…`). Generate the
   list with a frontmatter-aware walk (Python or `tools/skip_tally.js` style
@@ -104,7 +110,12 @@ three areas, not just your cluster.
 Batch classification wobbles with machine load: a fixture that errors can
 report as `fail`, `crash` ("fixture process died" / "batch process died
 mid-fixture"), or `hang` depending on whether its batch times out and how
-the individual recheck lands. The known decodeURI/decodeURIComponent
+the individual recheck lands. A batch that overruns is never a verdict by
+itself: every fixture in it is re-run on its own under `--recheck-timeout`
+(measured: 32 fixtures under a 1s batch deadline still report `32 pass, 0
+hang`), so a reported `hang` is a fixture that missed the *recheck*
+deadline alone — under the load the other batches put on the box. The known
+decodeURI/decodeURIComponent
 batch-death fixtures moved between `fail` and `crash` on the SAME binary
 across runs. When A/B-ing two builds, diff the fail+crash UNION of paths
 (from the `failures` array), not the raw summary `fail` counts, and run

@@ -224,56 +224,57 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    if intrinsics.get(LOCALE_TO_STRING).as_ref() == Some(callee) {
+    let resolved = intrinsics.name_of(callee);
+    if resolved.is(LOCALE_TO_STRING) {
         return Some(
             locale_record(agent, this)
                 .map(|record| Value::String(Handle::new(JsString::from_utf8(&record.locale)))),
         );
     }
-    if intrinsics.get(LOCALE_MAXIMIZE).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_MAXIMIZE) {
         return Some(maximize_or_minimize(agent, this, true));
     }
-    if intrinsics.get(LOCALE_MINIMIZE).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_MINIMIZE) {
         return Some(maximize_or_minimize(agent, this, false));
     }
-    if intrinsics.get(LOCALE_BASENAME).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_BASENAME) {
         return Some(getter(agent, this, bcp47::base_name));
     }
-    if intrinsics.get(LOCALE_LANGUAGE).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_LANGUAGE) {
         return Some(getter(agent, this, bcp47::language));
     }
-    if intrinsics.get(LOCALE_SCRIPT).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_SCRIPT) {
         return Some(getter_opt(agent, this, bcp47::script));
     }
-    if intrinsics.get(LOCALE_REGION).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_REGION) {
         return Some(getter_opt(agent, this, bcp47::region));
     }
-    if intrinsics.get(LOCALE_CALENDAR).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_CALENDAR) {
         return Some(getter_opt(agent, this, |tag| {
             bcp47::unicode_extension_value(tag, "ca")
         }));
     }
-    if intrinsics.get(LOCALE_COLLATION).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_COLLATION) {
         return Some(getter_opt(agent, this, |tag| {
             bcp47::unicode_extension_value(tag, "co")
         }));
     }
-    if intrinsics.get(LOCALE_CASEFIRST).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_CASEFIRST) {
         return Some(getter_opt(agent, this, |tag| {
             bcp47::unicode_extension_value(tag, "kf")
         }));
     }
-    if intrinsics.get(LOCALE_HOURCYCLE).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_HOURCYCLE) {
         return Some(getter_opt(agent, this, |tag| {
             bcp47::unicode_extension_value(tag, "hc")
         }));
     }
-    if intrinsics.get(LOCALE_NUMBERINGSYSTEM).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_NUMBERINGSYSTEM) {
         return Some(getter_opt(agent, this, |tag| {
             bcp47::unicode_extension_value(tag, "nu")
         }));
     }
-    if intrinsics.get(LOCALE_NUMERIC).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_NUMERIC) {
         // [[Numeric]]: the kn value is "true" or the empty String → true;
         // anything else (including an absent keyword) → false.
         return Some(
@@ -281,12 +282,12 @@ pub fn dispatch_call(
                 .map(|record| Value::Boolean(bcp47::unicode_numeric(&record.locale) == Some(true))),
         );
     }
-    if intrinsics.get(LOCALE_FIRST_DAY_OF_WEEK).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_FIRST_DAY_OF_WEEK) {
         return Some(getter_opt(agent, this, |tag| {
             bcp47::unicode_extension_value(tag, "fw")
         }));
     }
-    if intrinsics.get(LOCALE_VARIANTS).as_ref() == Some(callee) {
+    if resolved.is(LOCALE_VARIANTS) {
         return Some(getter_opt(agent, this, bcp47::get_locale_variants));
     }
     None
@@ -340,7 +341,8 @@ pub fn dispatch_construct(
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
-    if realm.intrinsics.get(LOCALE).as_ref() != Some(callee) {
+    let resolved = realm.intrinsics.name_of(callee);
+    if !resolved.is(LOCALE) {
         return None;
     }
     Some(construct(agent, new_target, args))

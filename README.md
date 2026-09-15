@@ -1,34 +1,28 @@
 # Slag
 
-> The stony waste matter separated from metals during the smelting or
-> refining of ore. It's gritty, memorable, and definitely unconventional.
+> The stony waste matter separated from metals during the smelting or refining of ore.
 
 > A test262 runner. It also happens to execute JavaScript.
 
-Slag is a from-scratch, spec-faithful JavaScript engine in Rust,
-implementing the ECMAScript® 2026 Language Specification (17th edition). It
-began as a spite project — when Bun refused to compile JavaScriptCore for
-the author's OS, the author wrote a JavaScript engine from scratch instead.
+Slag is a from-scratch, spec-faithful JavaScript engine in Rust, implementing the ECMAScript® 2026 Language Specification (17th edition). 
 
-The full pinned `test262` corpus is the regression net: **48,006 pass /
-0 fail / 0 crash** across the `language`, `built-ins`, and Annex B sweep
-areas (a fourth `intl402` area runs the ECMA-402 fixtures). That includes
-**proper tail calls** — the one spec feature V8 and JSC still skip —
-the **Intl** surface (ECMA-402 Cuts 1–8: NumberFormat, Locale,
-PluralRules, RelativeTimeFormat, ListFormat, DisplayNames, DateTimeFormat,
-Collator, Segmenter, DurationFormat), and **Temporal**. It ships a
-command-line runner/REPL, a full WebAssembly engine and its JavaScript
-API, a small embedding API, and drop-in JavaScriptCore C-API bindings.
+The full pinned `test262` corpus is the regression net: **51,669 pass / 0 fail / 0 crash / 0 hang** across 
+the `language`, `built-ins`, Annex B and `intl402` sweep areas. That includes **proper tail calls** the 
+**Intl**  surface (ECMA-402 Cuts 1–8: NumberFormat, Locale, PluralRules, RelativeTimeFormat, ListFormat, 
+DisplayNames, DateTimeFormat, Collator, Segmenter, DurationFormat), and **Temporal**. 
+
+It ships a command-line runner/REPL, a full WebAssembly engine  and its JavaScript API, a small 
+embedding API, and drop-in JavaScriptCore C-API bindings.
 
 ## Highlights
 
 - **Spec-faithful** — written chapter-by-chapter against the vendored
   `spec.html`; abstract operations keep the spec's names, ordering, and
   edge cases so conformance bugs are easy to diff.
-- **Conformant** — 48,006 passing fixtures, **0 failures / 0 crashes**
-  across 48,622 `test262` fixtures (runnable-only; see
+- **Conformant** — 51,669 passing fixtures, **0 failures / 0 crashes /
+  0 hangs** across 51,979 `test262` fixtures (runnable-only; see
   `.notes/conformance.md`). Proper tail calls: 34/34 `tco-*`. Workspace
-  tests: 4,316 pass / 0 fail.
+  tests: 4,887 pass / 0 fail.
 - **Complete modern feature surface** — modules (source-text module
   machinery, top-level await, dynamic import), async/await, generators,
   Proxy/Reflect, TypedArrays, SharedArrayBuffer/Atomics with worker
@@ -50,7 +44,7 @@ API, a small embedding API, and drop-in JavaScriptCore C-API bindings.
   stays the equivalence oracle; the compiled path reproduces the corpus's
   totals exactly. Native-only by construction: a wasm32 embed — the browser
   demo included — always runs the interpreter.
-- **Experimental Cranelift JIT** — compiled bodies run as native machine
+- **Cranelift JIT** — compiled bodies run as native machine
   code via [Cranelift](https://cranelift.dev): inline number/string fast
   paths, direct-mapped global/member value cells, and register-resident
   fast loops. Compiled with the `jit` feature (on by default in the CLI;
@@ -109,6 +103,13 @@ script (`cargo run -p cli --features raylib -- game.js`); add `raygui`
 (`--features raylib,raygui`) to also get raygui's controls as `rl.gui*`. The
 `--stack-size`, `--max-old-space`, and `--harmony-*` knobs are accepted
 for compatibility (no-ops for now).
+
+CI builds and publishes six archives on a `v*` tag —
+`slag-<version>-<platform>` and `slag-raylib-<version>-<platform>` for
+windows-x86_64, linux-x86_64 and linux-aarch64, as `.zip` on Windows and
+`.tar.gz` elsewhere, alongside a `SHA256SUMS` file. Each archive is the
+single `slag` binary (the raylib variant links raylib and raygui statically)
+plus this readme and the licence.
 
 ## Embedding
 
@@ -195,25 +196,36 @@ cargo run -p cli --features raylib -- game.js
 The pinned `test262` submodule is the regression net: the sweep runner
 (`cargo run --release -p test262 --bin sweep`) runs any area in parallel,
 timeout-guarded batches, and the `unicode` build script derives the
-property-escape tables from the same fixtures. Current sweep result
-(release build, default 15s deadline):
+property-escape tables from the same fixtures. CI sweeps all four areas on
+Linux and Windows and fails on a `fail`, `crash` **or** `hang` — at a 30s
+batch deadline with a 60s per-fixture recheck rather than the 15s local
+methodology, since the runner VMs are slower than the machine below and the
+deadline is wall clock (a batch that overruns is re-decided fixture by
+fixture, so a reported `hang` is one that missed the recheck deadline on its
+own); current result (release build, this machine, 15s deadlines):
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,724 | 23,721 | 0 | 3 | 0 | 100.0% |
-| built-ins | 23,812 | 23,199 | 0 | 155 | 458 | 100.0% |
+| built-ins | 23,812 | 23,657 | 0 | 155 | 0 | 100.0% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| **Total** | **48,622** | **48,006** | **0** | **158** | **458** | **100.0%** |
+| intl402 | 3,357 | 3,205 | 0 | 152 | 0 | 100.0% |
+| **Total** | **51,979** | **51,669** | **0** | **310** | **0** | **100.0%** |
 
 The skips are the out-of-scope `await-dictionary` (89) and `ShadowRealm`
-(64) proposal fixtures, one stale Temporal fixture, and 4 fixtures this
-Windows checkout cannot run: the submodule is checked out CRLF by
-`core.autocrlf`, so their byte-exact assertions read `\r\n` where the
-corpus asserts `\n` (the skip is conditional — a clean LF checkout runs
-them). The 458 hangs are slow-but-correct fixtures at the default
-deadline; the long config (`--timeout 120 --recheck-timeout 120`)
-reclassifies them as passes. The full methodology and triage live in
-`.notes/conformance.md`.
+(64) proposal fixtures, 152 `intl402` fixtures tagged with `Intl.*` features
+whose plan cuts have not landed (`.notes/intl-plan.md`), one stale Temporal
+fixture, and 4 fixtures this Windows checkout cannot run: the submodule is
+checked out CRLF by `core.autocrlf`, so their byte-exact assertions read
+`\r\n` where the corpus asserts `\n` (the skip is conditional — a clean LF
+checkout runs them). The 458 hangs this table used to report are closed: the
+RegExp property-escape cluster, the dense-elements and typed-array work, and
+the Temporal `since`/`until` day-difference loop (one iteration per day over
+edge-of-range dates, now a closed-form epoch-day difference) all landed
+since, and the last one — `intl402`'s quadratic walk over every pair of the
+444 supported time zones — went from 18.7s to 4.4s when the intrinsics probe
+stopped encoding a UTF-16 string per name lookup (see Performance). The full
+methodology and triage live in `.notes/conformance.md`.
 
 ## WebAssembly
 
@@ -290,6 +302,125 @@ whose outcomes diverge.
 
 The implementation plan, cut history, and status live in
 `.notes/wasm-plan.md`.
+
+## Performance
+
+Two harnesses measure the engine, and both are reproducible from the repo:
+the CLI's micro-suite (`slag --jit-bench` runs the same bodies through the
+Cranelift JIT and the interpreter) and the cross-engine workload corpus
+(`node tools/corpus/bench.js` runs 37 workloads under Slag and V8, each with
+its JIT and with it disabled — see `tools/corpus/README.md`). The numbers
+below are one machine (AMD Ryzen 9 7950X, Windows 11, rustc 1.96.0, node
+v24.12.0): medians of three runs for the micro-suite, one run for the corpus.
+The standing detail, the benchmark gates, and the deferred work live in
+`.notes/perf.md`.
+
+### The JIT against the interpreter
+
+Ratio < 1 means the JIT is faster than the interpreter (`result-ok` checks
+both paths computed the same value):
+
+| Body | Interpreter | JIT | Ratio |
+|---|---|---|---|
+| `arithmetic` | 8.98 ms | 0.650 ms | 0.07x |
+| `property read` | 10.77 ms | 0.762 ms | 0.07x |
+| `wide leaf call` | 22.64 ms | 1.672 ms | 0.07x |
+| `bare loop` | 8.06 ms | 0.603 ms | 0.08x |
+| `global read` | 11.88 ms | 1.377 ms | 0.12x |
+| `function calls` | 6.00 ms | 0.756 ms | 0.13x |
+| `buildString shape` | 97.56 ms | 13.890 ms | 0.14x |
+| `typed-array length` | 13.00 ms | 1.870 ms | 0.14x |
+| `string concat` | 1.25 ms | 0.188 ms | 0.15x |
+| `buildString full` | 73.96 ms | 16.587 ms | 0.22x |
+| `typed-array write` | 34.11 ms | 12.269 ms | 0.36x |
+| `apply leaf call` | 20.33 ms | 7.537 ms | 0.37x |
+| `compound assign` | 4.00 ms | 1.548 ms | 0.39x |
+
+### Against V8
+
+The corpus runner checks parity as well as time: all four engine/mode
+combinations return the same value for every workload (`mismatches 0`).
+Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
+
+| Family | Workloads | JIT gap | Interpreter gap |
+|---|---|---|---|
+| arrays | 6 | 42.13x | 7.50x |
+| builtins | 5 | 18.82x | 7.12x |
+| calls | 6 | 28.20x | 6.05x |
+| control | 5 | 70.16x | 7.03x |
+| language | 3 | 15.98x | 8.81x |
+| objects | 7 | 43.74x | 3.34x |
+| strings | 5 | 27.54x | 6.59x |
+| **All** | **37** | **36.72x** | **6.35x** |
+
+A sample of the per-workload rows (the command above prints all 37), ms per
+`bench()` call:
+
+| Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
+|---|---|---|---|---|---|---|
+| `arrays/for_of_dense.js` | 40.1 | 64.7 | 1.8 | 63.9 | 22.79x | 1.01x |
+| `arrays/typed_array.js` | 103.8 | 210.5 | 1.1 | 39.7 | 92.22x | 5.30x |
+| `builtins/json_roundtrip.js` | 88.4 | 87.0 | 13.1 | 16.0 | 6.75x | 5.42x |
+| `builtins/math_intrinsics.js` | 100.3 | 127.8 | 149.7 | 185.9 | 0.67x | 0.69x |
+| `calls/direct_leaf.js` | 10.5 | 74.2 | 1.1 | 37.5 | 9.10x | 1.98x |
+| `calls/recursive_fib.js` | 415.5 | 557.0 | 7.4 | 33.5 | 56.00x | 16.61x |
+| `control/generator_loop.js` | 94.1 | 115.9 | 2.4 | 9.6 | 38.96x | 12.10x |
+| `objects/destructure.js` | 166.6 | 243.8 | 0.8 | 53.4 | 209.20x | 4.57x |
+| `objects/own_read.js` | 2.9 | 43.1 | 1.3 | 49.7 | 2.31x | 0.87x |
+| `objects/warm_store.js` | 49.8 | 133.8 | 2.3 | 54.6 | 21.23x | 2.45x |
+| `strings/char_ops.js` | 28.2 | 34.6 | 0.4 | 6.3 | 75.39x | 5.46x |
+
+Read the gaps as "where the work is", not as a verdict on the engine shape:
+the corpus's own README records the workloads V8 folds or scalar-evolves to a
+near-constant (which is why `destructure` and the other such rows have
+outsized JIT ratios), and a sub-1 gap means Slag was faster on that workload.
+
+### Temporal and Intl dispatch (fixed)
+
+A Temporal property read or method call used to cost 11-41µs against ~0.25µs
+for a `Date` method. Three changes, all keyed off
+`crates/runtime/src/realm.rs`:
+
+1. The intrinsics table was keyed by `JsString` — which is UTF-16, so every
+   `Intrinsics::get(name)` probe encoded a fresh UTF-16 string before it could
+   hash. Keyed by `Rc<str>`, a probe borrows instead: a `PlainDate` getter
+   11.2µs → 2.0µs, `withTimeZone` 41.6µs → 7.5µs.
+2. `define` now also records each intrinsic's name(s) by function id (a set per
+   id, because spec aliases such as `%Array.prototype.values%` /
+   `%Array.prototype[Symbol.iterator]%` are one object), so a chain dispatcher
+   resolves its callee once per call and its arms become string compares
+   (`ResolvedNames::is`) instead of table probes: 155 probe sites across the
+   temporal (`shell`, `duration`, `instant`, `mod`) and Intl (`mod` + 11
+   modules) chains, plus 13 construct-side sites.
+3. Both namespace fronts (`builtins/intl/mod.rs`, `builtins/temporal/mod.rs`)
+   then walked their sub-dispatchers in turn, each of which resolved the
+   callee's names again — thirteen times over for one `format` call. They now
+   route on the `%Intl.<Name>…%` / `%Temporal.<Name>…%` prefix first
+   (`component_of` plus a table of sub-dispatcher pointers) and keep the walk
+   as the fallback for the names no component claims (the
+   `%IntlSegmentsPrototype…%` iterators), so a routing miss costs time and
+   never a verdict.
+
+Final: getters **0.63µs** (`PlainDate.prototype.year`; `day`, `hour`,
+`epochNanoseconds` and `timeZoneId` land at 0.57-0.92µs), `withTimeZone`
+**2.3µs**, `Intl.DateTimeFormat.prototype.format` 5.8µs → 3.1µs. The control
+row does not move (`Date.getTime` 0.26µs), and `--jitless` tracks the same
+rows (0.62-0.99µs, `withTimeZone` 2.5µs), so this is the dispatch and not code
+generation.
+`Intl.NumberFormat` construction (~9.5µs) is locale resolution rather than
+dispatch, which is why the routing leaves it alone. The first two steps are
+also what cut `control/generator_loop` from 182 ms to 94 ms in the corpus above
+and closed `intl402`'s zone-matrix fixture (18.7s → 4.4s).
+
+What is left is the methods' own work — a getter still costs ~0.6µs against
+the 11.2µs it started at — plus the twelve other chains (`array_buffer`,
+`iterator`, `generator`, `promise`, `error`, `symbol`, `function`, `weakref`,
+`disposable`, `proxy`, `reflect`, `module_source`), which keep the same probe
+shape and can take the same mechanical conversion (a `let resolved = …` per
+dispatcher plus the condition rewrite); their measured costs are 0.4-3µs per
+call, so the win there is smaller. Twelve modules already dispatch O(1) through
+the `handler_for`/`BuiltinHandler` tables registered at `Intrinsics::define`
+time (`crates/runtime/src/builtins/array.rs` is the model) and need nothing.
 
 ## Repository layout
 

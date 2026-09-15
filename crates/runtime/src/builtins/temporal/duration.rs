@@ -167,99 +167,100 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    if intrinsics.get(DURATION).as_ref() == Some(callee) {
+    let resolved = intrinsics.name_of(callee);
+    if resolved.is(DURATION) {
         // The constructor is not callable.
         return Some(Err(JsError::new(
             ErrorKind::TypeError,
             "Temporal.Duration cannot be called as a function".into(),
         )));
     }
-    if intrinsics.get(DURATION_FROM).as_ref() == Some(callee) {
+    if resolved.is(DURATION_FROM) {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(
             to_temporal_duration(agent, &item)
                 .and_then(|fields| create_temporal_duration(agent, &fields, &Value::Undefined)),
         );
     }
-    if intrinsics.get(DURATION_COMPARE).as_ref() == Some(callee) {
+    if resolved.is(DURATION_COMPARE) {
         return Some(duration_compare(agent, args));
     }
-    if intrinsics.get(P_YEARS).as_ref() == Some(callee) {
+    if resolved.is(P_YEARS) {
         return Some(duration_field(agent, this, 0));
     }
-    if intrinsics.get(P_MONTHS).as_ref() == Some(callee) {
+    if resolved.is(P_MONTHS) {
         return Some(duration_field(agent, this, 1));
     }
-    if intrinsics.get(P_WEEKS).as_ref() == Some(callee) {
+    if resolved.is(P_WEEKS) {
         return Some(duration_field(agent, this, 2));
     }
-    if intrinsics.get(P_DAYS).as_ref() == Some(callee) {
+    if resolved.is(P_DAYS) {
         return Some(duration_field(agent, this, 3));
     }
-    if intrinsics.get(P_HOURS).as_ref() == Some(callee) {
+    if resolved.is(P_HOURS) {
         return Some(duration_field(agent, this, 4));
     }
-    if intrinsics.get(P_MINUTES).as_ref() == Some(callee) {
+    if resolved.is(P_MINUTES) {
         return Some(duration_field(agent, this, 5));
     }
-    if intrinsics.get(P_SECONDS).as_ref() == Some(callee) {
+    if resolved.is(P_SECONDS) {
         return Some(duration_field(agent, this, 6));
     }
-    if intrinsics.get(P_MILLISECONDS).as_ref() == Some(callee) {
+    if resolved.is(P_MILLISECONDS) {
         return Some(duration_field(agent, this, 7));
     }
-    if intrinsics.get(P_MICROSECONDS).as_ref() == Some(callee) {
+    if resolved.is(P_MICROSECONDS) {
         return Some(duration_field(agent, this, 8));
     }
-    if intrinsics.get(P_NANOSECONDS).as_ref() == Some(callee) {
+    if resolved.is(P_NANOSECONDS) {
         return Some(duration_field(agent, this, 9));
     }
-    if intrinsics.get(P_SIGN).as_ref() == Some(callee) {
+    if resolved.is(P_SIGN) {
         return Some(sign(agent, this));
     }
-    if intrinsics.get(P_BLANK).as_ref() == Some(callee) {
+    if resolved.is(P_BLANK) {
         return Some(blank(agent, this));
     }
-    if intrinsics.get(P_WITH).as_ref() == Some(callee) {
+    if resolved.is(P_WITH) {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(with(agent, this, &item));
     }
-    if intrinsics.get(P_NEGATED).as_ref() == Some(callee) {
+    if resolved.is(P_NEGATED) {
         return Some(negated(agent, this));
     }
-    if intrinsics.get(P_ABS).as_ref() == Some(callee) {
+    if resolved.is(P_ABS) {
         return Some(abs(agent, this));
     }
-    if intrinsics.get(P_ADD).as_ref() == Some(callee) {
+    if resolved.is(P_ADD) {
         let other = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(match require_duration(agent, this) {
             Ok(duration) => super::add_durations(agent, &duration, &other, false),
             Err(e) => Err(e),
         });
     }
-    if intrinsics.get(P_SUBTRACT).as_ref() == Some(callee) {
+    if resolved.is(P_SUBTRACT) {
         let other = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(match require_duration(agent, this) {
             Ok(duration) => super::add_durations(agent, &duration, &other, true),
             Err(e) => Err(e),
         });
     }
-    if intrinsics.get(P_ROUND).as_ref() == Some(callee) {
+    if resolved.is(P_ROUND) {
         let round_to = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(round(agent, this, &round_to));
     }
-    if intrinsics.get(P_TOTAL).as_ref() == Some(callee) {
+    if resolved.is(P_TOTAL) {
         let total_of = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(total(agent, this, &total_of));
     }
-    if intrinsics.get(P_TO_STRING).as_ref() == Some(callee) {
+    if resolved.is(P_TO_STRING) {
         let options = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(to_string_impl(agent, this, &options));
     }
-    if intrinsics.get(P_TO_JSON).as_ref() == Some(callee) {
+    if resolved.is(P_TO_JSON) {
         return Some(to_json(agent, this));
     }
-    if intrinsics.get(P_TO_LOCALE).as_ref() == Some(callee) {
+    if resolved.is(P_TO_LOCALE) {
         return Some(match require_duration(agent, this) {
             Ok(duration) => {
                 let locales = args.first().cloned().unwrap_or(Value::Undefined);
@@ -274,7 +275,7 @@ pub fn dispatch_call(
             Err(error) => Err(error),
         });
     }
-    if intrinsics.get(P_VALUE_OF).as_ref() == Some(callee) {
+    if resolved.is(P_VALUE_OF) {
         return Some(Err(JsError::new(
             ErrorKind::TypeError,
             "Temporal.Duration.prototype.valueOf throws".into(),
@@ -290,7 +291,8 @@ pub fn dispatch_construct(
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
-    if realm.intrinsics.get(DURATION).as_ref() == Some(callee) {
+    let resolved = realm.intrinsics.name_of(callee);
+    if resolved.is(DURATION) {
         return Some(construct(agent, args, new_target));
     }
     None

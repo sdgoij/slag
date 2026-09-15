@@ -802,6 +802,7 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
+    let resolved = intrinsics.name_of(callee);
     // Constructors are not callable.
     for (name, key) in [
         ("PlainDate", PLAIN_DATE),
@@ -811,7 +812,7 @@ pub fn dispatch_call(
         ("PlainYearMonth", PLAIN_YEAR_MONTH),
         ("PlainMonthDay", PLAIN_MONTH_DAY),
     ] {
-        if intrinsics.get(key).as_ref() == Some(callee) {
+        if resolved.is(key) {
             return Some(Err(JsError::new(
                 ErrorKind::TypeError,
                 format!("Temporal.{name} cannot be called as a function"),
@@ -819,7 +820,7 @@ pub fn dispatch_call(
         }
     }
     // Field getters.
-    let field = |name: &str| intrinsics.get(name).as_ref() == Some(callee);
+    let field = |name: &str| resolved.is(name);
     if field("%Temporal.PlainDate.prototype.year%") {
         return Some(calendar_year_getter(agent, this, RecordKind::PlainDate));
     }
@@ -1072,37 +1073,37 @@ pub fn dispatch_call(
         return Some(calendar_id(agent, this, RecordKind::MonthDay));
     }
     // Statics.
-    if intrinsics.get("%Temporal.PlainDate.from%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainDate.from%") {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
         let options = args.get(1).cloned().unwrap_or(Value::Undefined);
         return Some(to_plain_date_with_options(agent, &item, &options));
     }
-    if intrinsics.get("%Temporal.PlainTime.from%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainTime.from%") {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
         let options = args.get(1).cloned().unwrap_or(Value::Undefined);
         return Some(to_plain_time_with_options(agent, &item, &options));
     }
-    if intrinsics.get("%Temporal.PlainDateTime.from%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainDateTime.from%") {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
         let options = args.get(1).cloned().unwrap_or(Value::Undefined);
         return Some(to_plain_date_time(agent, &item, &options));
     }
-    if intrinsics.get("%Temporal.ZonedDateTime.from%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.ZonedDateTime.from%") {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
         let options = args.get(1).cloned().unwrap_or(Value::Undefined);
         return Some(to_zoned(agent, &item, &options));
     }
-    if intrinsics.get("%Temporal.PlainYearMonth.from%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainYearMonth.from%") {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
         let options = args.get(1).cloned().unwrap_or(Value::Undefined);
         return Some(to_plain_year_month(agent, &item, &options));
     }
-    if intrinsics.get("%Temporal.PlainMonthDay.from%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainMonthDay.from%") {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
         let options = args.get(1).cloned().unwrap_or(Value::Undefined);
         return Some(to_plain_month_day(agent, &item, &options));
     }
-    if intrinsics.get("%Temporal.PlainDate.compare%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainDate.compare%") {
         return Some(compare_records(
             agent,
             args,
@@ -1110,7 +1111,7 @@ pub fn dispatch_call(
             plain_compare_key,
         ));
     }
-    if intrinsics.get("%Temporal.PlainTime.compare%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainTime.compare%") {
         return Some(compare_records(
             agent,
             args,
@@ -1118,7 +1119,7 @@ pub fn dispatch_call(
             time_compare_key,
         ));
     }
-    if intrinsics.get("%Temporal.PlainDateTime.compare%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainDateTime.compare%") {
         return Some(compare_records(
             agent,
             args,
@@ -1126,7 +1127,7 @@ pub fn dispatch_call(
             date_time_compare_key,
         ));
     }
-    if intrinsics.get("%Temporal.ZonedDateTime.compare%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.ZonedDateTime.compare%") {
         return Some(compare_records(
             agent,
             args,
@@ -1134,7 +1135,7 @@ pub fn dispatch_call(
             zoned_compare_key,
         ));
     }
-    if intrinsics.get("%Temporal.PlainYearMonth.compare%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainYearMonth.compare%") {
         return Some(compare_records(
             agent,
             args,
@@ -1142,7 +1143,7 @@ pub fn dispatch_call(
             year_month_compare_key,
         ));
     }
-    if intrinsics.get("%Temporal.PlainMonthDay.compare%").as_ref() == Some(callee) {
+    if resolved.is("%Temporal.PlainMonthDay.compare%") {
         return Some(compare_records(
             agent,
             args,
@@ -1530,7 +1531,7 @@ pub fn dispatch_call(
             "%Temporal.PlainMonthDay.prototype.valueOf%",
         ),
     ] {
-        if intrinsics.get(key).as_ref() == Some(callee) {
+        if resolved.is(key) {
             return Some(Err(JsError::new(
                 ErrorKind::TypeError,
                 format!("Temporal.{name}.prototype.valueOf throws"),
@@ -1583,22 +1584,23 @@ pub fn dispatch_construct(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    if intrinsics.get(PLAIN_DATE).as_ref() == Some(callee) {
+    let resolved = intrinsics.name_of(callee);
+    if resolved.is(PLAIN_DATE) {
         return Some(construct_plain_date(agent, args, new_target));
     }
-    if intrinsics.get(PLAIN_TIME).as_ref() == Some(callee) {
+    if resolved.is(PLAIN_TIME) {
         return Some(construct_plain_time(agent, args, new_target));
     }
-    if intrinsics.get(PLAIN_DATE_TIME).as_ref() == Some(callee) {
+    if resolved.is(PLAIN_DATE_TIME) {
         return Some(construct_plain_date_time(agent, args, new_target));
     }
-    if intrinsics.get(ZONED).as_ref() == Some(callee) {
+    if resolved.is(ZONED) {
         return Some(construct_zoned(agent, args, new_target));
     }
-    if intrinsics.get(PLAIN_YEAR_MONTH).as_ref() == Some(callee) {
+    if resolved.is(PLAIN_YEAR_MONTH) {
         return Some(construct_year_month(agent, args, new_target));
     }
-    if intrinsics.get(PLAIN_MONTH_DAY).as_ref() == Some(callee) {
+    if resolved.is(PLAIN_MONTH_DAY) {
         return Some(construct_month_day(agent, args, new_target));
     }
     None

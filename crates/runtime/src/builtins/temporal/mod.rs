@@ -24,7 +24,7 @@ use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::context::as_object;
-use crate::realm::Realm;
+use crate::realm::{Realm, ResolvedNames};
 
 use iso::{Category, FracPrecision, RoundingMode, Unit};
 
@@ -1712,19 +1712,20 @@ fn now_dispatch(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
+    let resolved = intrinsics.name_of(callee);
     let ns = system_utc_epoch_nanoseconds();
-    if intrinsics.get(NOW_TZ).as_ref() == Some(callee) {
+    if resolved.is(NOW_TZ) {
         return Some(Ok(Value::String(Handle::new(JsString::from_utf8("UTC")))));
     }
-    if intrinsics.get(NOW_INSTANT).as_ref() == Some(callee) {
+    if resolved.is(NOW_INSTANT) {
         return Some(instant::create_instant(agent, ns, &Value::Undefined));
     }
     // Only the four time-zone-taking methods reach past this point; verify
     // the callee first so unrelated builtins never see their arguments here.
-    let is_tz_method = intrinsics.get(NOW_PLAIN_DATE).as_ref() == Some(callee)
-        || intrinsics.get(NOW_PLAIN_TIME).as_ref() == Some(callee)
-        || intrinsics.get(NOW_PLAIN_DATE_TIME).as_ref() == Some(callee)
-        || intrinsics.get(NOW_ZONED_DATE_TIME).as_ref() == Some(callee);
+    let is_tz_method = resolved.is(NOW_PLAIN_DATE)
+        || resolved.is(NOW_PLAIN_TIME)
+        || resolved.is(NOW_PLAIN_DATE_TIME)
+        || resolved.is(NOW_ZONED_DATE_TIME);
     if !is_tz_method {
         return None;
     }
@@ -1743,7 +1744,7 @@ fn now_dispatch(
     let (y, m, d, h, min, s, ms, us, n) = iso::iso_parts_from_epoch(ns);
     let (y, m, d, h, min, s, ms, us, ns_local) =
         instant::balance_iso_date_time(y, m, d, h, min, s, ms, us, (n as i128 + offset) as i64);
-    if intrinsics.get(NOW_PLAIN_DATE).as_ref() == Some(callee) {
+    if resolved.is(NOW_PLAIN_DATE) {
         let record = TemporalRecord::PlainDate([y, m, d]);
         return Some(create_temporal_object(
             agent,
@@ -1752,7 +1753,7 @@ fn now_dispatch(
             record,
         ));
     }
-    if intrinsics.get(NOW_PLAIN_TIME).as_ref() == Some(callee) {
+    if resolved.is(NOW_PLAIN_TIME) {
         let record = TemporalRecord::PlainTime([h, min, s, ms, us, ns_local]);
         return Some(create_temporal_object(
             agent,
@@ -1761,7 +1762,7 @@ fn now_dispatch(
             record,
         ));
     }
-    if intrinsics.get(NOW_PLAIN_DATE_TIME).as_ref() == Some(callee) {
+    if resolved.is(NOW_PLAIN_DATE_TIME) {
         let record = TemporalRecord::PlainDateTime([y, m, d, h, min, s, ms, us, ns_local]);
         return Some(create_temporal_object(
             agent,
@@ -1770,7 +1771,7 @@ fn now_dispatch(
             record,
         ));
     }
-    if intrinsics.get(NOW_ZONED_DATE_TIME).as_ref() == Some(callee) {
+    if resolved.is(NOW_ZONED_DATE_TIME) {
         let record = TemporalRecord::ZonedDateTime(ns, JsString::from_utf8(&time_zone));
         return Some(create_temporal_object(
             agent,
@@ -1782,6 +1783,57 @@ fn now_dispatch(
     None
 }
 
+type CallDispatch = fn(&mut Agent, &Value, &Value, &[Value]) -> Option<Result<Value, JsError>>;
+type ConstructDispatch = fn(&mut Agent, &Value, &[Value], &Value) -> Option<Result<Value, JsError>>;
+
+/// The Temporal component a `%Temporal.<Name>…%` intrinsic belongs to: the
+/// text between `%Temporal.` and the next `.` or `%`. `None` when the callee
+/// is not a `%Temporal.` intrinsic, or when its names disagree about the
+/// component — which routes the call to the chain below rather than to a
+/// guess.
+fn component_of(resolved: &ResolvedNames) -> Option<&str> {
+    let mut owner = None;
+    for name in resolved.names() {
+        let Some(rest) = name.strip_prefix("%Temporal.") else {
+            continue;
+        };
+        let head = rest.split('.').next().unwrap_or(rest);
+        let head = head.strip_suffix('%').unwrap_or(head);
+        match owner {
+            Some(existing) if existing != head => return None,
+            _ => owner = Some(head),
+        }
+    }
+    owner
+}
+
+/// The `dispatch_call` of the component that owns a `%Temporal.<Name>%`
+/// prefix. Each component owns exactly one namespace, so this picks it in one
+/// string compare where the chain below resolves the callee's names once per
+/// sub-dispatcher it visits. `Temporal.Now` is not here: its members take no
+/// `this` and go to [`now_dispatch`].
+fn routed_call(owner: &str) -> Option<CallDispatch> {
+    Some(match owner {
+        "Duration" => duration::dispatch_call,
+        "Instant" => instant::dispatch_call,
+        "PlainDate" | "PlainTime" | "PlainDateTime" | "PlainYearMonth" | "PlainMonthDay"
+        | "ZonedDateTime" => shell::dispatch_call,
+        _ => return None,
+    })
+}
+
+/// The construct side of [`routed_call`]: the three namespaces whose
+/// constructors are reachable through `new`.
+fn routed_construct(owner: &str) -> Option<ConstructDispatch> {
+    Some(match owner {
+        "Duration" => duration::dispatch_construct,
+        "Instant" => instant::dispatch_construct,
+        "PlainDate" | "PlainTime" | "PlainDateTime" | "PlainYearMonth" | "PlainMonthDay"
+        | "ZonedDateTime" => shell::dispatch_construct,
+        _ => return None,
+    })
+}
+
 /// Dispatch Temporal method calls by intrinsic identity.
 pub fn dispatch_call(
     agent: &mut Agent,
@@ -1789,6 +1841,21 @@ pub fn dispatch_call(
     this: &Value,
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
+    let realm = agent.current_realm().ok()?;
+    let resolved = realm.intrinsics.name_of(callee);
+    let owner = component_of(&resolved);
+    // Routing is a pure shortcut: a component that does not claim the callee
+    // falls through to the walk, which stays the thing that decides.
+    if owner == Some("Now")
+        && let Some(result) = now_dispatch(agent, callee, args)
+    {
+        return Some(result);
+    }
+    if let Some(dispatch) = owner.and_then(routed_call)
+        && let Some(result) = dispatch(agent, callee, this, args)
+    {
+        return Some(result);
+    }
     if let Some(result) = now_dispatch(agent, callee, args) {
         return Some(result);
     }
@@ -1808,6 +1875,14 @@ pub fn dispatch_construct(
     args: &[Value],
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
+    let realm = agent.current_realm().ok()?;
+    let resolved = realm.intrinsics.name_of(callee);
+    let owner = component_of(&resolved);
+    if let Some(dispatch) = owner.and_then(routed_construct)
+        && let Some(result) = dispatch(agent, callee, args, new_target)
+    {
+        return Some(result);
+    }
     if let Some(result) = duration::dispatch_construct(agent, callee, args, new_target) {
         return Some(result);
     }

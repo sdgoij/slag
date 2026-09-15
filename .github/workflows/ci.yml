@@ -1,0 +1,357 @@
+name: CI
+
+# Every push and pull request runs the four gates — format + lints, the
+# workspace test suite, both conformance sweeps (the pinned test262 and waspec
+# corpora), and the release builds. A `v*` tag additionally publishes the six
+# release archives (standard and raylib, per platform) as a GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Format and lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # The pinned submodules are build inputs, not just test data: the
+      # `unicode` build script derives the RegExp property-escape tables from
+      # the test262 corpus at compile time.
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      # `rust-toolchain.toml` pins the channel and the clippy/rustfmt
+      # components; `rustup show` materialises it and logs what was used.
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  test:
+    name: Workspace tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # One invocation covers every crate, `jsc` included (a workspace member
+      # deliberately outside `default-members`): the engine suites, the
+      # vendored test262 fixtures, and the wasm decode/validation fixtures.
+      - name: Test the workspace
+        run: cargo test --locked --workspace
+
+  # The sweep areas run as separate jobs, which is also how they are measured
+  # locally: `annexB` is small and `language`/`built-ins` are ~24k fixtures each.
+  # The Windows runner is the author's platform and its CRLF checkout takes the
+  # four byte-exact fixtures out of the run (the harness skip, see the README),
+  # so its totals differ by those four without changing any verdict.
+  test262:
+    name: test262 sweep (${{ matrix.area }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        area: [language, built-ins, annexB, intl402]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # The runner re-execs `target/release/sweep` for every batch, so the
+      # measurement has to be the release build of the tree under test.
+      - name: Build the sweep runner
+        run: cargo build --locked --release -p test262
+      # 30s/60s rather than the 15s local methodology: the deadline is wall
+      # clock and a runner VM is slower than the dev box the README's numbers
+      # were measured on by more than that — Windows reported hangs at the
+      # shorter pair for fixtures this checkout runs in well under 15s. A batch
+      # that overruns is not a verdict on its own: every fixture in it is
+      # re-run individually under the recheck deadline, so a reported `hang` is
+      # a fixture that missed that deadline by itself (measured locally: 32
+      # fixtures under a 1s batch deadline still report 32 pass, 0 hang). The
+      # runner exits non-zero on a `hang` as well as a `fail`/`crash`, so the
+      # area is a gate, not a report. `--jobs` stays at its default (one batch
+      # per core), and `pipefail` is what keeps the runner's status through
+      # `tee`, which puts the report in the log as well as on disk.
+      - name: Sweep ${{ matrix.area }}
+        shell: bash
+        run: |
+          set -o pipefail
+          target/release/sweep ${{ matrix.area }} --batch 32 \
+            --timeout 30 --recheck-timeout 60 | tee target/sweep-${{ matrix.area }}.txt
+      - name: Upload the sweep report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          # The OS belongs in the name: both matrix legs sweep the same area,
+          # and an artifact name has to be unique within a workflow run.
+          name: sweep-${{ matrix.area }}-${{ matrix.os }}
+          path: target/sweep-${{ matrix.area }}.txt
+          if-no-files-found: error
+
+  wasm:
+    name: WebAssembly conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    # The sweep steps invoke `target/release/wasmtest` directly, which the
+    # Windows runner's default PowerShell shell cannot do (it needs a path
+    # prefix Git Bash supplies).
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the wasm runner
+        run: cargo build --locked --release -p wasmtest
+      # The suites cannot share one invocation — duplicate `.wast` names across
+      # directories (memory_grow.wast in core/ and multi-memory/) collide on the
+      # runner's cache key — so each is swept on its own. Every step runs even
+      # after an earlier one failed, so one push reports every verdict.
+      # `--strict` fails on a `pending` too, which is what turns the "0
+      # pendings" claim into a gate.
+      - name: Sweep the baseline core corpus
+        if: always()
+        run: target/release/wasmtest run --strict waspec/test/core/*.wast
+      - name: Sweep exceptions
+        if: always()
+        run: target/release/wasmtest run --strict waspec/test/core/exceptions
+      - name: Sweep simd
+        if: always()
+        run: target/release/wasmtest run --strict waspec/test/core/simd
+      - name: Sweep relaxed-simd
+        if: always()
+        run: target/release/wasmtest run --strict waspec/test/core/relaxed-simd
+      - name: Sweep bulk-memory
+        if: always()
+        run: target/release/wasmtest run --strict waspec/test/core/bulk-memory
+      - name: Sweep memory64
+        if: always()
+        run: target/release/wasmtest run --strict waspec/test/core/memory64
+      - name: Sweep multi-memory
+        if: always()
+        run: target/release/wasmtest run --strict waspec/test/core/multi-memory
+      - name: Sweep gc
+        if: always()
+        run: target/release/wasmtest run --strict waspec/test/core/gc
+      - name: Run the JS-API fixtures
+        if: always()
+        run: target/release/wasmtest jsapi waspec/test/js-api
+      # `check` is decode-only (it never validates), so it is the cheap gate
+      # that the committed browser-demo compiler output still decodes.
+      - name: Decode the committed browser-demo module
+        if: always()
+        run: target/release/wasmtest check docs/slag.wasm
+
+  # Each release is the single `slag` binary plus the readme and licence: the
+  # engine embeds its assets, and the raylib variant links raylib statically.
+  build:
+    name: Package (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            ext: zip
+          - name: linux-x86_64
+            os: ubuntu-latest
+            ext: tar.gz
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            ext: tar.gz
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # The CLI's default features are exactly the standard surface (`jit`,
+      # `wasm`), so the standard build needs no flags.
+      - name: Build the standard binary
+        run: cargo build --locked --release -p cli
+      # The archive names carry the compiled version rather than the tag: the
+      # binary is what a user downloads, so its own `--version` is the source
+      # of truth for it.
+      - name: Resolve the version
+        shell: bash
+        run: |
+          version=$(cargo run --locked --release -q -p cli --bin slag -- --version | awk '{print $2}')
+          test -n "$version" || { echo "no version reported by --version" >&2; exit 1; }
+          echo "SLAG_VERSION=$version" >> "$GITHUB_ENV"
+      # Nothing else runs a release-profile binary: the sweeps use their own,
+      # and the workspace tests use debug ones.
+      - name: Write the smoke script
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/smoke.js" <<'JS'
+          var sum = 0;
+          for (var i = 0; i < 200000; i++) sum += i;
+          if (sum !== 19999900000) throw new Error("arithmetic smoke failed: " + sum);
+          new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+          console.log("slag smoke ok");
+          JS
+      - name: Smoke-test the standard binary
+        shell: bash
+        run: |
+          cargo run --locked --release -q -p cli --bin slag -- --version
+          cargo run --locked --release -q -p cli --bin slag -- "$RUNNER_TEMP/smoke.js"
+      - name: Package the standard release (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/standard | Out-Null
+          Copy-Item target/release/slag.exe dist/standard/
+          Copy-Item README.md, LICENSE.md dist/standard/
+          Compress-Archive -Path dist/standard/* -DestinationPath dist/slag-${{ env.SLAG_VERSION }}-${{ matrix.name }}.zip -Force
+      - name: Package the standard release (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/standard
+          cp target/release/slag README.md LICENSE.md dist/standard/
+          tar -czf dist/slag-${{ env.SLAG_VERSION }}-${{ matrix.name }}.tar.gz -C dist/standard .
+      - name: Upload the standard package
+        uses: actions/upload-artifact@v7
+        with:
+          # The artifact name is the archive's name without its version, so the
+          # two variants read the same way in the run's artifact list.
+          name: slag-${{ matrix.name }}
+          path: dist/slag-${{ env.SLAG_VERSION }}-${{ matrix.name }}.${{ matrix.ext }}
+          if-no-files-found: error
+
+      # raylib is compiled by cmake, and its bindings by bindgen, which needs
+      # libclang. The runtime enables GLFW's Wayland backend, so GLFW needs the
+      # Wayland protocol headers at build time (it dlopens libwayland-client at
+      # runtime, which is why Wayland is not a link-time dependency); raylib-sys
+      # still emits `-lX11`, which needs the X11 dev package to link (dropped by
+      # --as-needed at runtime). Mesa covers the OpenGL it links.
+      - name: Install the Linux graphics build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config clang libclang-dev \
+            libasound2-dev \
+            libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libxext-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+      # The raylib build replaces `target/release/slag`, so the standard
+      # archive above is packaged before this step runs.
+      - name: Build the raylib binary
+        run: cargo build --locked --release -p cli --features raylib,raygui
+      # Installing `raylib` opens no window until a script calls
+      # `rl.initWindow`, so the smoke run stays headless.
+      - name: Smoke-test the raylib binary
+        shell: bash
+        run: |
+          # The built binary is invoked directly rather than through `cargo
+          # run`: run without the raylib features, cargo rebuilds the
+          # default-feature CLI over it, and the step would then smoke-test (and
+          # the package step below would ship) a binary with no `rl` module.
+          target/release/slag "$RUNNER_TEMP/smoke.js"
+          # `--help` is the usage path and exits 2, and the runner's bash runs
+          # with `-o pipefail`, so the feature line is captured before it is
+          # grepped: piped straight into grep, the step would fail on that
+          # status no matter what grep found.
+          features=$(target/release/slag --help 2>&1 || true)
+          echo "$features"
+          grep -q raygui <<<"$features"
+      - name: Package the raylib release (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/raylib | Out-Null
+          Copy-Item target/release/slag.exe dist/raylib/
+          Copy-Item README.md, LICENSE.md dist/raylib/
+          Compress-Archive -Path dist/raylib/* -DestinationPath dist/slag-raylib-${{ env.SLAG_VERSION }}-${{ matrix.name }}.zip -Force
+      - name: Package the raylib release (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/raylib
+          cp target/release/slag README.md LICENSE.md dist/raylib/
+          tar -czf dist/slag-raylib-${{ env.SLAG_VERSION }}-${{ matrix.name }}.tar.gz -C dist/raylib .
+      - name: Upload the raylib package
+        uses: actions/upload-artifact@v7
+        with:
+          name: slag-raylib-${{ matrix.name }}
+          path: dist/slag-raylib-${{ env.SLAG_VERSION }}-${{ matrix.name }}.${{ matrix.ext }}
+          if-no-files-found: error
+
+  # Only a tag publishes, and only when every gate above passed; ordinary pushes
+  # just build and keep the artifacts.
+  release:
+    name: Publish release
+    needs: [lint, test, test262, wasm, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List the assets
+        run: ls -la dist
+      # One checksum file for every archive, written where the release step can
+      # pick it up with the rest of `dist/*`.
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum *.zip *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          # A semver prerelease (`v0.2.0-rc.1`) publishes as a prerelease;
+          # `v0.2.0` stays a normal release.
+          prerelease: ${{ contains(github.ref_name, '-') }}

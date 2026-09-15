@@ -30,7 +30,7 @@ use crux::value::Value;
 
 use crate::agent::Agent;
 use crate::context::{as_object, get_property, to_object, to_string};
-use crate::realm::Realm;
+use crate::realm::{Realm, ResolvedNames};
 
 const INTL: &str = "%Intl%";
 const GET_CANONICAL_LOCALES: &str = "%Intl.getCanonicalLocales%";
@@ -129,6 +129,68 @@ fn placeholder(name: &str) -> NativeFn {
     Box::new(move |_, _| Err(type_error(&format!("{name} must be dispatched"))))
 }
 
+type CallDispatch = fn(&mut Agent, &Value, &Value, &[Value]) -> Option<Result<Value, JsError>>;
+type ConstructDispatch = fn(&mut Agent, &Value, &[Value], &Value) -> Option<Result<Value, JsError>>;
+
+/// The ECMA-402 component a `%Intl.<Name>…%` intrinsic belongs to: the text
+/// between `%Intl.` and the next `.` or `%`. `None` when the callee is not an
+/// `%Intl.` intrinsic, or when its names disagree about the component — which
+/// routes the call to the chain below rather than to a guess.
+fn component_of(resolved: &ResolvedNames) -> Option<&str> {
+    let mut owner = None;
+    for name in resolved.names() {
+        let Some(rest) = name.strip_prefix("%Intl.") else {
+            continue;
+        };
+        let head = rest.split('.').next().unwrap_or(rest);
+        let head = head.strip_suffix('%').unwrap_or(head);
+        match owner {
+            Some(existing) if existing != head => return None,
+            _ => owner = Some(head),
+        }
+    }
+    owner
+}
+
+/// The sub-dispatcher of the component that owns an `%Intl.<Name>%` prefix.
+/// Each component owns exactly one namespace, so this picks it in one string
+/// compare where the chain below resolves the callee's names once per
+/// sub-dispatcher it visits.
+fn routed_call(owner: &str) -> Option<CallDispatch> {
+    Some(match owner {
+        "Collator" => collator::dispatch_call,
+        "DateTimeFormat" => date_time_format::dispatch_call,
+        "DisplayNames" => display_names::dispatch_call,
+        "DurationFormat" => duration_format::dispatch_call,
+        "ListFormat" => list_format::dispatch_call,
+        "Locale" => locale::dispatch_call,
+        "NumberFormat" => number_format::dispatch_call,
+        "PluralRules" => plural_rules::dispatch_call,
+        "RelativeTimeFormat" => relative_time_format::dispatch_call,
+        "Segmenter" => segmenter::dispatch_call,
+        "supportedValuesOf" => supported_values::dispatch_call,
+        _ => return None,
+    })
+}
+
+/// The construct side of [`routed_call`]: the components whose constructors
+/// are reachable through `new` (`Intl.supportedValuesOf` is not one).
+fn routed_construct(owner: &str) -> Option<ConstructDispatch> {
+    Some(match owner {
+        "Collator" => collator::dispatch_construct,
+        "DateTimeFormat" => date_time_format::dispatch_construct,
+        "DisplayNames" => display_names::dispatch_construct,
+        "DurationFormat" => duration_format::dispatch_construct,
+        "ListFormat" => list_format::dispatch_construct,
+        "Locale" => locale::dispatch_construct,
+        "NumberFormat" => number_format::dispatch_construct,
+        "PluralRules" => plural_rules::dispatch_construct,
+        "RelativeTimeFormat" => relative_time_format::dispatch_construct,
+        "Segmenter" => segmenter::dispatch_construct,
+        _ => return None,
+    })
+}
+
 /// dispatch_call: `Intl.getCanonicalLocales`, `Intl.supportedValuesOf` and
 /// the `Intl.Locale`/`Intl.NumberFormat` prototype members.
 pub fn dispatch_call(
@@ -139,11 +201,19 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    if intrinsics.get(GET_CANONICAL_LOCALES).as_ref() == Some(callee) {
+    let resolved = intrinsics.name_of(callee);
+    if resolved.is(GET_CANONICAL_LOCALES) {
         return Some(get_canonical_locales(
             agent,
             args.first().cloned().unwrap_or(Value::Undefined),
         ));
+    }
+    // Routing is a pure shortcut: a component that does not claim the callee
+    // falls through to the walk, which stays the thing that decides.
+    if let Some(dispatch) = component_of(&resolved).and_then(routed_call)
+        && let Some(result) = dispatch(agent, callee, this, args)
+    {
+        return Some(result);
     }
     if let Some(result) = supported_values::dispatch_call(agent, callee, this, args) {
         return Some(result);
@@ -185,6 +255,13 @@ pub fn dispatch_construct(
     args: &[Value],
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
+    let realm = agent.current_realm().ok()?;
+    let resolved = realm.intrinsics.name_of(callee);
+    if let Some(dispatch) = component_of(&resolved).and_then(routed_construct)
+        && let Some(result) = dispatch(agent, callee, args, new_target)
+    {
+        return Some(result);
+    }
     if let Some(result) = locale::dispatch_construct(agent, callee, args, new_target) {
         return Some(result);
     }

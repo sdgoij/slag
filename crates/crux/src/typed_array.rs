@@ -75,7 +75,6 @@ impl ElementType {
     }
 }
 
-
 /// The `[[ArrayBufferData]]` block and its geometry box live in the
 /// dependency-free `byteblock` crate, so the WebAssembly engine can share a
 /// linear memory with an aliased `Memory.prototype.buffer` without depending

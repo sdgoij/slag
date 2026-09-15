@@ -393,7 +393,10 @@ hot enough to justify the migration.
   15 seconds (`--timeout 15 --recheck-timeout 15`, or the default):
   anything that cannot finish in 15s is too slow by definition, and a
   hang under the deadline is a real result, not something to reclassify
-  with a longer timeout.
+  with a longer timeout. CI is the one scoped exception — its runner VMs
+  are slower than this box by more than 15s covers, so the workflow sweeps
+  at 30s/60s (see the comment there); that is a property of the runner, not
+  a licence to relax a local run.
 
 ## Reference model — why V8 is fast and what Slag mirrors
 
@@ -9376,6 +9379,189 @@ shape, every mirror reader — keys/entries/gopd/JSON/for-in/hasOwn/slice/concat
 preventExtensions, a prototype index setter, an own-element shadow, frozen
 strict, heap values, sparse, nested) byte-identical under jit / `--jitless` /
 `--gc-stress`.
+
+### LANDED (2026-09-15): cheap intrinsic probes, and chains that resolve their callee once
+
+`Intrinsics::entries` was a `HashMap<JsString, Value>` (`crates/runtime/src/
+realm.rs`), so every `get(name)` encoded a fresh UTF-16 `JsString`
+(`JsString::from_utf8`) and hashed two bytes per character before the table
+could answer. Every identity-chain dispatcher is built on that probe:
+`temporal::shell::dispatch_call` alone runs up to 111 `if field("...")`
+checks per call, with `field = |name| intrinsics.get(name).as_ref() ==
+Some(callee)`.
+
+The fix keys the table by `Rc<str>`: `define` allocates the key once at
+bootstrap, `get` borrows it (`Rc<str>: Borrow<str>`, so `get(name: &str)`
+needs no allocation), and the `Trace` impl for `HashMap` only requires
+`K: Eq + Hash + 'static`, so the GC walk is untouched. No chain arm changed —
+every dispatcher got the cheaper probe for free.
+
+PROBE (`scratch`-style script, release CLI, 20k iterations per row, ms; each
+row is one closure call per iteration, and the non-Temporal rows are the
+control):
+
+| row | jit before | jit after | jitless before | jitless after |
+|---|---|---|---|---|
+| `Date.prototype.getTime` | 1 | 1 | 2 | 2 |
+| a plain JS accessor getter | 5 | 5 | 8 | 7 |
+| `PlainDate.prototype.year` | 217 | 33 | 220 | 36 |
+| `ZonedDateTime.prototype.withTimeZone("UTC")` | 832 | 132 | 809 | 140 |
+
+A second probe (100k iterations) walks the chain by position, which is where
+the cost sat: `PlainDate.prototype.year` (first arm) 1121 -> 197,
+`PlainDate.prototype.day` (3rd) 1161 -> 204, `PlainTime.prototype.hour` (7th)
+1302 -> 205, `ZonedDateTime.prototype.epochNanoseconds` 1459 -> 266,
+`timeZoneId` 1454 -> 268, `withTimeZone` (~40th) 4100 -> 745 — i.e. 11.2µs ->
+2.0µs at the head and 41.6µs -> 7.5µs late, against an unchanged ~0.25µs for
+`Date.getTime`. `--jitless` tracks the JIT exactly, so this was never code
+generation.
+
+That is what reclassified `intl402`'s outstanding hang:
+`Temporal/ZonedDateTime/prototype/equals/canonical-not-equal.js` (a quadratic
+walk over the 444 ids `Intl.supportedValuesOf("timeZone")` returns) went from
+18.7s to 4.38s standalone, so the area now clears its deadline with margin and
+joined the CI gate (which runs at 30s/60s, see the workflow).
+
+Step 2 — one-shot name resolution. Making a probe cheap still leaves the walk
+linear, and the walk is the other half of the cost. `Intrinsics::name_of`
+resolves the callee to the name(s) it was defined under (one `u64` lookup; the
+reverse index is a set per id because spec aliases such as
+`%Array.prototype.values%` / `%Array.prototype[Symbol.iterator]%` are the same
+object), and a dispatcher's arms then ask `ResolvedNames::is(name)` — a string
+compare — instead of probing the table. 155 probe sites across the temporal
+(`shell`, `duration`, `instant`, `mod`) and Intl (`mod` + 11 modules) chains
+were converted, plus 13 construct-side sites; every arm body is unchanged, so
+the diff is 155 insertions / 139 deletions over 15 files.
+
+Final ladder (release CLI, 100k iterations, ms; the head-of-chain getter
+first, a late method last): `PlainDate.prototype.year` 1121 -> 197 -> **83**,
+`PlainDate.prototype.day` 1161 -> 204 -> **85**, `PlainTime.prototype.hour`
+1302 -> 205 -> **80**, `ZonedDateTime.prototype.epochNanoseconds` 1459 -> 266 ->
+**109**, `timeZoneId` 1454 -> 268 -> **95**, `withTimeZone` 4100 -> 745 ->
+**262**. Per call: getters 11.2µs -> **0.83µs**, `withTimeZone` 41.6µs ->
+**2.6µs** — 13x and 16x overall. On the same probe `Intl.DateTimeFormat
+.prototype.format` went 5.8µs -> 3.3µs while `new Intl.NumberFormat("en")`
+stayed ~8.7µs (locale resolution, not dispatch), and `Date.getTime` / a plain
+JS accessor stayed at 0.25µs throughout — the control rows that say this was
+the probes, not the call path.
+
+The construct-side conversion is below the probe's resolution (13 sites, one
+per module, against a 13-deep sub-dispatcher walk): measured neutral, kept
+because it is the same one-line pattern.
+
+Corpus effect (`tools/corpus/bench.js`, one run each side): overall mean gap
+37.79x -> 36.72x, the machinery-heavy rows flat, and
+`control/generator_loop` 182 ms -> 94 ms (its `next`/`return` calls dispatch
+through the same chains). Nothing regressed in either harness.
+
+Step 3 — the namespace fronts route on the name prefix. With the probe cheap,
+the walk was the other half: `intl::dispatch_call` called its eleven
+sub-dispatchers in turn and `temporal::dispatch_call` its three, and each one
+re-ran `agent.current_realm()` and `Intrinsics::name_of` before its first arm.
+Both fronts now read the component off the callee's name prefix
+(`%Intl.DateTimeFormat.prototype.format%` -> `DateTimeFormat`,
+`%Temporal.PlainDate.prototype.year%` -> `PlainDate`) and call that
+component's dispatcher straight from a `fn`-pointer table (`component_of` +
+`routed_call`/`routed_construct` in the two `mod.rs` files; `ResolvedNames::names`
+is the accessor that exposes the names). The walk stays as the fallback both
+for names no component owns (the `%IntlSegmentsPrototype…%` /
+`%IntlSegmentIteratorPrototype…%` iterators, which the segmenter claims) and
+for a routed dispatcher that answers `None`, so the routing can only ever cost
+time, never a verdict.
+
+PROBE (the script below at `N = 100000`, release CLI, ms; medians of 3, with
+`--jitless` in parentheses):
+
+| row | step 2 | step 3 |
+|---|---|---|
+| `PlainDate.prototype.year` | 83 | 63 (69) |
+| `PlainDate.prototype.day` | 85 | 64 (70) |
+| `PlainTime.prototype.hour` | 80 | 57 (62) |
+| `ZonedDateTime.prototype.epochNanoseconds` | 109 | 92 (99) |
+| `ZonedDateTime.prototype.timeZoneId` | 95 | 82 (89) |
+| `ZonedDateTime.prototype.withTimeZone("UTC")` | 262 | 230 (253) |
+| `Intl.DateTimeFormat.prototype.format` | 330 | 310 (313) |
+| `new Intl.NumberFormat("en")` | 870 | 950 (960) |
+| `Date.prototype.getTime` (control) | 26 | 26 (29) |
+
+```js
+var N = 100000;
+var p = new Temporal.PlainDate(2020, 1, 1);
+var t2 = new Temporal.PlainTime(1, 2, 3);
+var z = new Temporal.ZonedDateTime(0n, "UTC");
+var d = new Date(0);
+var acc = { get year() { return 2020; } };
+var dtf = new Intl.DateTimeFormat("en");
+function bench(f) { var t0 = Date.now(); for (var k = 0; k < N; k++) f(); return Date.now() - t0; }
+function row(name, f) { console.log(name + "  " + bench(f)); }
+row("year", function () { p.year; });
+row("day", function () { p.day; });
+row("hour", function () { t2.hour; });
+row("epochNanoseconds", function () { z.epochNanoseconds; });
+row("timeZoneId", function () { z.timeZoneId; });
+row("withTimeZone", function () { z.withTimeZone("UTC"); });
+row("dtf.format", function () { dtf.format(0); });
+row("nf.construct", function () { new Intl.NumberFormat("en"); });
+row("date.getTime", function () { d.getTime(); });
+row("js.accessor", function () { acc.year; });
+```
+
+Per call: getters 0.83µs -> **0.63µs**, `withTimeZone` 2.6µs -> **2.3µs**,
+`format` 3.3µs -> **3.1µs**. The ~0.2-0.3µs the routing takes off each row is
+the two or three `current_realm()` + `name_of` pairs it skips; the getters'
+remaining 0.63µs is the arms' own work. `new Intl.NumberFormat` is untouched by
+both steps (8.7µs recorded at step 2, 9.5µs here) — it is locale resolution, and
+that row alone measures 921-999 ms across six runs of the same binary, so the
+two figures are the same measurement. The remaining controls are flat:
+`Date.getTime` 0.26µs, and a plain JS accessor 0.52µs on this probe shape (it
+was recorded at 0.25µs on the 20k shape; neither row touches the dispatch
+chains, which is all they are here for).
+
+Corpus: `node tools/corpus/bench.js` -> overall mean-jitGap 37.23, mean-jlGap
+6.41, mismatches 0. The corpus calls neither `Intl` nor `Temporal` (no such
+identifier in `tools/corpus/workloads`), so this step cannot move it: the
+36.72 -> 37.23 difference against the step-2 run is run-to-run spread on the
+37-workload mean.
+
+Open work: the twelve other chains — `array_buffer`, `iterator`, `generator`,
+`promise`, `error`, `symbol`, `function`, `weakref`, `disposable`, `proxy`,
+`reflect`, `module_source` — keep the same probe shape and can take the same
+mechanical change (a `let resolved = ...` line per dispatcher plus the
+condition rewrite); their measured costs are 0.4-3µs per call, so the win
+there is smaller. A front that walks several of them can also take the prefix
+routing, where its namespace gives names a prefix to route on — `intl` and
+`temporal` are the two that do, which is why they are the two that got it.
+Twelve modules already dispatch O(1) through
+`handler_for`/`BuiltinHandler` tables registered at `Intrinsics::define` time
+(`crates/runtime/src/builtins/array.rs` is the model) and need nothing.
+
+Verification: `cargo test --locked --workspace` green (4,887 pass / 0 fail);
+clippy `--workspace --all-targets -D warnings` and `cargo fmt --all --
+--check` clean; all four test262 areas green on a CRLF Windows checkout at the
+15s local deadline (language 23,724 total / 23,721 pass / 0 fail / 3 skip / 0
+hang; built-ins 23,812 / 23,657 / 0 / 155 / 0; annexB 1,086 / 1,086 / 0 / 0 / 0;
+intl402 3,357 / 3,205 / 0 / 152 / 0 — unchanged by steps 2 and 3, which is the
+point: the dispatch rewrite moved no verdict); every waspec suite at its
+documented totals (core 20,662, simd 25,990, bulk-memory 7,485, memory64 8,709,
+multi-memory 912, exceptions 105, gc 654, relaxed-simd 77, all 0 fail / 0
+pending, JS-API 1,001 / 0). Step 3 re-ran the whole set and returned it
+unchanged. CI runs all four areas on Linux and Windows with the longer deadline
+pair the workflow documents (30s/60s, since a runner VM is slower than this box
+by more than the 15s rule covers): Linux is green for the tree; Windows needed
+that pair to clear fixtures this checkout runs in well under 15s.
+
+```js
+var N = 20000;
+var a = new Temporal.ZonedDateTime(0n, "UTC");
+var p = new Temporal.PlainDate(2020, 1, 1);
+var acc = { get year() { return 2020; } };
+var d = new Date(0);
+function t(f) { var t0 = Date.now(); for (var k = 0; k < N; k++) f(); return Date.now() - t0; }
+console.log("zoned   " + t(function () { a.withTimeZone("UTC"); }));
+console.log("getter  " + t(function () { p.year; }));
+console.log("jsacc   " + t(function () { acc.year; }));
+console.log("date    " + t(function () { d.getTime(); }));
+```
 
 ## Deferred milestones
 

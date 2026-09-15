@@ -444,13 +444,14 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    if intrinsics.get(DISPLAY_NAMES).as_ref() == Some(callee) {
+    let resolved = intrinsics.name_of(callee);
+    if resolved.is(DISPLAY_NAMES) {
         return Some(Err(type_error("Intl.DisplayNames requires 'new'")));
     }
-    if intrinsics.get(DN_RESOLVED_OPTIONS).as_ref() == Some(callee) {
+    if resolved.is(DN_RESOLVED_OPTIONS) {
         return Some(resolved_options_method(agent, this));
     }
-    if intrinsics.get(DN_OF).as_ref() == Some(callee) {
+    if resolved.is(DN_OF) {
         return Some(of_method(agent, this, args));
     }
     None
@@ -464,7 +465,8 @@ pub fn dispatch_construct(
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
-    if realm.intrinsics.get(DISPLAY_NAMES).as_ref() == Some(callee) {
+    let resolved = realm.intrinsics.name_of(callee);
+    if resolved.is(DISPLAY_NAMES) {
         let proto = match proto_from_ctor(agent, new_target) {
             Ok(proto) => proto,
             Err(error) => return Some(Err(error)),

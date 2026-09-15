@@ -71,7 +71,8 @@ pub fn dispatch_call(
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
-    if realm.intrinsics.get(SUPPORTED_VALUES_OF).as_ref() != Some(callee) {
+    let resolved = realm.intrinsics.name_of(callee);
+    if !resolved.is(SUPPORTED_VALUES_OF) {
         return None;
     }
     Some(supported_values_of(

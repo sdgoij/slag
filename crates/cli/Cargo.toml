@@ -3,6 +3,9 @@ name = "cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# The package ships two binaries; `cargo run -p cli` must resolve to the
+# engine without `--bin slag` (every documented invocation relies on this).
+default-run = "slag"
 
 # The product binary is `slag`; the package stays `cli` so a future rename
 # only touches this one line.

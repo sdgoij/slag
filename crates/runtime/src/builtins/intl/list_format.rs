@@ -536,23 +536,24 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    if intrinsics.get(LIST_FORMAT).as_ref() == Some(callee) {
+    let resolved = intrinsics.name_of(callee);
+    if resolved.is(LIST_FORMAT) {
         return Some(Err(type_error("Intl.ListFormat requires 'new'")));
     }
-    if intrinsics.get(LF_SUPPORTED_LOCALES_OF).as_ref() == Some(callee) {
+    if resolved.is(LF_SUPPORTED_LOCALES_OF) {
         return Some(supported_locales_of(
             agent,
             args.first().cloned().unwrap_or(Value::Undefined),
             args.get(1).cloned().unwrap_or(Value::Undefined),
         ));
     }
-    if intrinsics.get(LF_RESOLVED_OPTIONS).as_ref() == Some(callee) {
+    if resolved.is(LF_RESOLVED_OPTIONS) {
         return Some(resolved_options_method(agent, this));
     }
-    if intrinsics.get(LF_FORMAT).as_ref() == Some(callee) {
+    if resolved.is(LF_FORMAT) {
         return Some(format_method(agent, this, args));
     }
-    if intrinsics.get(LF_FORMAT_TO_PARTS).as_ref() == Some(callee) {
+    if resolved.is(LF_FORMAT_TO_PARTS) {
         return Some(format_to_parts_method(agent, this, args));
     }
     None
@@ -566,7 +567,8 @@ pub fn dispatch_construct(
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
-    if realm.intrinsics.get(LIST_FORMAT).as_ref() == Some(callee) {
+    let resolved = realm.intrinsics.name_of(callee);
+    if resolved.is(LIST_FORMAT) {
         let proto = match proto_from_ctor(agent, new_target) {
             Ok(proto) => proto,
             Err(error) => return Some(Err(error)),

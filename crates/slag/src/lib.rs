@@ -24,7 +24,6 @@ pub use runtime::embed::{OutputFn, RandomFn};
 #[cfg(feature = "wasm")]
 pub use runtime::wasm;
 
-
 /// Install the Cranelift JIT hook on `context`'s agent (feature `jit`).
 ///
 /// The hook is what makes hot certified bodies run at machine speed; the

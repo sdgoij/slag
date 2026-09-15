@@ -540,24 +540,25 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    if intrinsics.get(PLURAL_RULES).as_ref() == Some(callee) {
+    let resolved = intrinsics.name_of(callee);
+    if resolved.is(PLURAL_RULES) {
         // NewTarget is undefined → the spec throws a TypeError.
         return Some(Err(type_error("Intl.PluralRules requires 'new'")));
     }
-    if intrinsics.get(PR_SUPPORTED_LOCALES_OF).as_ref() == Some(callee) {
+    if resolved.is(PR_SUPPORTED_LOCALES_OF) {
         return Some(supported_locales_of(
             agent,
             args.first().cloned().unwrap_or(Value::Undefined),
             args.get(1).cloned().unwrap_or(Value::Undefined),
         ));
     }
-    if intrinsics.get(PR_RESOLVED_OPTIONS).as_ref() == Some(callee) {
+    if resolved.is(PR_RESOLVED_OPTIONS) {
         return Some(resolved_options_method(agent, this));
     }
-    if intrinsics.get(PR_SELECT).as_ref() == Some(callee) {
+    if resolved.is(PR_SELECT) {
         return Some(select_method(agent, this, args));
     }
-    if intrinsics.get(PR_SELECT_RANGE).as_ref() == Some(callee) {
+    if resolved.is(PR_SELECT_RANGE) {
         return Some(select_range_method(agent, this, args));
     }
     None
@@ -571,7 +572,8 @@ pub fn dispatch_construct(
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
-    if realm.intrinsics.get(PLURAL_RULES).as_ref() == Some(callee) {
+    let resolved = realm.intrinsics.name_of(callee);
+    if resolved.is(PLURAL_RULES) {
         let proto = match proto_from_ctor(agent, new_target) {
             Ok(proto) => proto,
             Err(error) => return Some(Err(error)),

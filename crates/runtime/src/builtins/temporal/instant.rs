@@ -149,69 +149,70 @@ pub fn dispatch_call(
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    if intrinsics.get(INSTANT).as_ref() == Some(callee) {
+    let resolved = intrinsics.name_of(callee);
+    if resolved.is(INSTANT) {
         return Some(Err(JsError::new(
             ErrorKind::TypeError,
             "Temporal.Instant cannot be called as a function".into(),
         )));
     }
-    if intrinsics.get(INSTANT_FROM).as_ref() == Some(callee) {
+    if resolved.is(INSTANT_FROM) {
         let item = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(
             to_temporal_instant(agent, &item)
                 .and_then(|ns| create_instant(agent, ns, &Value::Undefined)),
         );
     }
-    if intrinsics.get(INSTANT_FROM_MS).as_ref() == Some(callee) {
+    if resolved.is(INSTANT_FROM_MS) {
         let value = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(from_epoch_milliseconds(agent, &value));
     }
-    if intrinsics.get(INSTANT_FROM_NS).as_ref() == Some(callee) {
+    if resolved.is(INSTANT_FROM_NS) {
         let value = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(from_epoch_nanoseconds(agent, &value));
     }
-    if intrinsics.get(INSTANT_COMPARE).as_ref() == Some(callee) {
+    if resolved.is(INSTANT_COMPARE) {
         let one = args.first().cloned().unwrap_or(Value::Undefined);
         let two = args.get(1).cloned().unwrap_or(Value::Undefined);
         return Some(to_temporal_instant(agent, &one).and_then(|a| {
             to_temporal_instant(agent, &two).map(|b| Value::Number(cmp(a, b) as f64))
         }));
     }
-    if intrinsics.get(P_EPOCH_MS).as_ref() == Some(callee) {
+    if resolved.is(P_EPOCH_MS) {
         return Some(epoch_ms(agent, this));
     }
-    if intrinsics.get(P_EPOCH_NS).as_ref() == Some(callee) {
+    if resolved.is(P_EPOCH_NS) {
         return Some(epoch_ns(agent, this));
     }
-    if intrinsics.get(P_ADD).as_ref() == Some(callee) {
+    if resolved.is(P_ADD) {
         let d = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(add_subtract(agent, this, &d, false));
     }
-    if intrinsics.get(P_SUBTRACT).as_ref() == Some(callee) {
+    if resolved.is(P_SUBTRACT) {
         let d = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(add_subtract(agent, this, &d, true));
     }
-    if intrinsics.get(P_UNTIL).as_ref() == Some(callee) {
+    if resolved.is(P_UNTIL) {
         return Some(difference(agent, this, args, false));
     }
-    if intrinsics.get(P_SINCE).as_ref() == Some(callee) {
+    if resolved.is(P_SINCE) {
         return Some(difference(agent, this, args, true));
     }
-    if intrinsics.get(P_ROUND).as_ref() == Some(callee) {
+    if resolved.is(P_ROUND) {
         let round_to = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(round(agent, this, &round_to));
     }
-    if intrinsics.get(P_EQUALS).as_ref() == Some(callee) {
+    if resolved.is(P_EQUALS) {
         let other = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(to_temporal_instant(agent, &other).and_then(|other_ns| {
             require_instant(agent, this).map(|ns| Value::Boolean(ns == other_ns))
         }));
     }
-    if intrinsics.get(P_TO_STRING).as_ref() == Some(callee) {
+    if resolved.is(P_TO_STRING) {
         let options = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(to_string_impl(agent, this, &options));
     }
-    if intrinsics.get(P_TO_LOCALE).as_ref() == Some(callee) {
+    if resolved.is(P_TO_LOCALE) {
         return Some(match require_instant(agent, this) {
             Ok(ns) => {
                 let locales = args.first().cloned().unwrap_or(Value::Undefined);
@@ -229,16 +230,16 @@ pub fn dispatch_call(
             Err(error) => Err(error),
         });
     }
-    if intrinsics.get(P_TO_JSON).as_ref() == Some(callee) {
+    if resolved.is(P_TO_JSON) {
         return Some(to_string_impl(agent, this, &Value::Undefined));
     }
-    if intrinsics.get(P_VALUE_OF).as_ref() == Some(callee) {
+    if resolved.is(P_VALUE_OF) {
         return Some(Err(JsError::new(
             ErrorKind::TypeError,
             "Temporal.Instant.prototype.valueOf throws".into(),
         )));
     }
-    if intrinsics.get(P_TO_ZDT).as_ref() == Some(callee) {
+    if resolved.is(P_TO_ZDT) {
         let tz = args.first().cloned().unwrap_or(Value::Undefined);
         return Some(to_zoned_date_time_iso(agent, this, &tz));
     }
@@ -252,7 +253,8 @@ pub fn dispatch_construct(
     new_target: &Value,
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
-    if realm.intrinsics.get(INSTANT).as_ref() == Some(callee) {
+    let resolved = realm.intrinsics.name_of(callee);
+    if resolved.is(INSTANT) {
         return Some(construct(agent, args, new_target));
     }
     None
