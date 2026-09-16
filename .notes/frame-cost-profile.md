@@ -72,7 +72,8 @@ build rather than the revision, which is itself the most actionable finding here
   deforming the mesh every frame and `drawModelEx` feeds the already-computed
   bone matrices to the material shader. The engine now exposes that as a cargo
   feature (§7.1 item 4); the price is that the scene must supply a skinned
-  shader. Not re-measured here — see the item for why this repo cannot.
+  shader (the scene half of the migration is `.notes/gpu-skinning.md`). Not
+  re-measured here — see the item for why this repo cannot.
 - **The 370 grass crossings are not a lever: they cost ~13 µs.** A crossing is
   29–36 ns and does not measurably grow with argument count, so the whole
   batched-immediate-mode item is 0.08% of a 16.3 ms frame — and batching could
@@ -727,11 +728,21 @@ no sub-millisecond timer — see `.notes/perf.md` (2026-09-16).
 3. **Draw the grass once.** Build the visible field as a mesh instead of ~370
    immediate-mode cubes, and/or cut the shadow pass's grass (`shadow_grass`,
    0.35 ms after this session, draws the same grass the main pass already drew).
+   Note that the immediate-mode path has a hard trip at ~910 cubes per batch,
+   where the batch's `matModel` stops being identity and the lit pass's
+   `fragWorldPos` drifts without the geometry ever moving — `.notes/gpu-skinning.md`
+   §1c, which is the thing to read before raising `half` instead of reaching for
+   a mesh.
 4. **Attribute the mods.** ~0.9 ms/frame for four mods, down from 1.4; measure
    per mod and per hook before adding a fifth.
 5. Keep the herd honest: `bots_ai` is 0.16 ms while `bots` (pose + draw) is
    5.5 ms. The AI is not the problem; the rendering of it is, and it is one
    engine call per bot.
+6. **Adopt GPU skinning for the herd** (§7.1 item 4). The engine half has landed
+   as the `gpu-skinning` build feature; the scene half — the shader declarations
+   raylib requires, the one routing call per model, the shadow pass that would
+   otherwise draw the herd at its bind pose, and the per-model fallback — is
+   written up in `.notes/gpu-skinning.md`.
 
 ## 8. Caveats
 
