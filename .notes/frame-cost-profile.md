@@ -607,10 +607,23 @@ is 1024 (evicting to 512) and an evicted body re-earns the compile threshold,
 which cuts the recompile rate by the threshold factor under pressure. The
 scene-level win wants a client-side `rl.getTime()` re-measure — the engine has
 no sub-millisecond timer — see `.notes/perf.md` (2026-09-16).
-3. **Attack the per-crossing cost.** A frame here is thousands of `rl.*` reads
-   and calls. Concrete things to check: whether each call builds
-   an arguments array or formats anything on the success path; whether the texture
-   registry's `Mutex` is taken per draw.
+3. **The per-crossing cost — measured (2026-09-16): it is not a frame lever.**
+   A host call costs **~35 ns** (jit) / 53 ns (jitless) against ~6 ns for a JS
+   leaf call, and an `rl` CONSTANT read costs 4.2 ns with no crossing at all
+   (they are plain data properties, not accessors — §4's "a property read costs
+   more than a call" is retired). None of the three suspects holds: no per-call
+   arguments array (the args are a Vm-stack slice), no success-path formatting
+   (scalar extraction only; `format!` is on the error paths), and the
+   window-thread check measures free (deleting it moved a 100k-call probe by
+   less than the noise). The asset `Mutex`es are taken only by asset-*taking*
+   bindings, and this scene's draw volume is 370 `drawCube` (no registry) plus
+   7 `drawModelEx`/7 `updateModelAnimation` — a few dozen locks a frame.
+   Frame arithmetic: 5,000 crossings x 35 ns = **0.175 ms of a 16.3 ms frame
+   (~1%)**; 20,000 would be ~0.7 ms. What §4 read as ~3.1 us per call was ~97%
+   the probe body being interpreted (the nested-body global reads, now closed)
+   plus this 35 ns. Attack the call COUNT (item 5) or the work per call (item
+   4), not the crossing. Measurements and the reproducible probe are in
+   `.notes/perf.md` ("Premises falsified by probe").
 4. **GPU skinning.** CPU skinning is what makes the herd cost 5.4 ms and what
    forces one model per goat (`updateModelAnimation` deforms the mesh itself, so
    two goats cannot share one). Bone matrices as uniforms would collapse both the

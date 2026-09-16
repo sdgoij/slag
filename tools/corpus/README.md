@@ -69,6 +69,11 @@ excluded on both sides.
 
 ## Caveats (prototype)
 
+- A CLI built with `--features raylib` installs the `rl` host surface for corpus
+  runs too (`bench_once`), so a probe directory can time host crossings
+  (`rl.getFPS()` in a loop, say) on the same protocol as any other row. The
+  workloads shipped here stay engine-agnostic — no `rl` — so their numbers hold
+  for any build.
 - Per-workload iteration counts are still hand-set so one `bench()` runs
   roughly 50-1500ms under slag jit (jitless is slower by 1-10x). The
   runner-side sample floor keeps every measurement stable regardless of

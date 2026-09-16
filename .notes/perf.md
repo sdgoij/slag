@@ -142,6 +142,52 @@ measurement that killed or bounded it, and its disposition.
   (bump + size-classed free-list; the free-list half measured net-neutral
   and registration ~11ns/alloc). No arena work is indicated.
 
+- **The `rl.*` per-crossing cost** (2026-09-16, frame-profile §7.1 item 3).
+  The premise — "a frame is thousands of `rl.*` reads and calls, so the
+  crossing is a lever; check whether each call builds an arguments array or
+  formats anything on the success path, and whether the texture registry's
+  `Mutex` is taken per draw" — is not one. Reproducible with the CLI's own
+  corpus protocol, which now installs the `rl` surface under the raylib feature
+  (`bench_once`), so a probe dir can time host crossings like any row:
+  `target/release/slag.exe --corpus scratch/rlprobe` (100k iterations each):
+
+  | workload | jit | jitless |
+  | --- | ---: | ---: |
+  | `js_call` — a JS leaf call per iteration | 0.599 ms (**6.0 ns**) | 4.398 ms (44 ns) |
+  | `rl_call` — `rl.getFPS()` per iteration | 3.499 ms (**35.0 ns**) | 5.324 ms (53 ns) |
+  | `rl_const` — `rl.KEY_SPACE` per iteration | 0.416 ms (**4.2 ns**) | 2.477 ms (25 ns) |
+
+  So a host call is ~35 ns against ~6 ns for a JS leaf call: ~29 ns of
+  crossing, and every named suspect measured out:
+  - **no arguments array** — `fast_call_core` passes `&self.stack[arg_start..n]`,
+    a Vm-stack slice;
+  - **no success-path formatting** — `draw_cube` is seven `num_arg`/`color_arg`
+    scalar extractions returning `Value::Undefined`; `format!` appears only on
+    the error paths;
+  - **the dispatch is already O(1)** — the per-function-id verdict cell (Cut
+    79/80) skips both SipHash lookups, and a plain closure builtin takes the
+    same `BuiltinCall::Native` arm as `Math.abs`;
+  - **the window-thread check is free** — deleting `on_window_thread` from every
+    window method moved `rl_call` 3.499 -> 3.561 ms (inside noise, i.e. <0.6 ns
+    of the 35), so the thread-local verdict cache that looked like the obvious
+    win is not one; the same run showed the closure indirection is the only
+    visible difference from a crux-native builtin (23 ns for `Math.abs`);
+  - **the asset `Mutex`es are not on the frame's hot path** — they are taken by
+    asset-*taking* bindings (texture/shader/model/camera handle lookups), and
+    this scene draws 370 `drawCube` (no registry), 7 `drawModelEx` and 7
+    `updateModelAnimation` (the herd) per frame: a few dozen locks, a few us;
+  - **`rl` constants are plain data properties** on a plain object, not native
+    accessors: a constant read is 4.2 ns jit / 25 ns jitless and involves no
+    crossing at all, which retires §4's "a property read costs MORE than a
+    call" for good.
+
+  Frame arithmetic: 5,000 crossings x 35 ns = 0.175 ms of a 16.3 ms frame
+  (~1%); even 20,000 would be ~0.7 ms. The levers are the call COUNT (batching,
+  §7.1 item 5) and the work inside the calls (CPU skinning, item 4), not the
+  per-crossing overhead. What §4 measured as ~3.1 us per native call was ~97%
+  the probe body running interpreted — the nested-body global reads this
+  session's cell work closed — plus this 35 ns.
+
 ### Measured-closed candidates (worth re-checking only on new evidence)
 
 - **The field-authoritative (Option 3) storage migration.** Rejected by

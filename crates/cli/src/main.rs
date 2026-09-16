@@ -767,6 +767,12 @@ fn bench_once(
     // split the same way as the in-table rows.
     let source = source.trim_end();
     let mut context = Context::new().map_err(report)?;
+    // A corpus directory may exercise the host surface (`rl.*`): install it
+    // when the build has it, so those workloads are timed on the same protocol
+    // as everything else. Installing binds raylib's window thread and is safe
+    // without a window (a real one is opened by `rl.initWindow`).
+    #[cfg(feature = "raylib")]
+    context.install_raylib().map_err(report)?;
     // The crux heap is thread-global and shared across the suite's rows, so
     // the previous row's garbage would otherwise carry into this one's first
     // collections (allocation-heavy rows are sensitive to where the first
