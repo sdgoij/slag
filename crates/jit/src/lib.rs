@@ -232,12 +232,15 @@ struct Entry {
 }
 
 /// The cache's capacity: beyond this many entries the least-recently-used
-/// bodies are evicted.
-pub const MAX_CACHE_ENTRIES: usize = 256;
+/// bodies are evicted. Sized for a whole application's body set — a scene with
+/// more bodies than the cap recompiles its LRU tail (a small body compiles in
+/// ~0.4ms, which is a frame's budget), and the entries are bounded machine code
+/// rather than heap objects, so the cap is generous on purpose.
+pub const MAX_CACHE_ENTRIES: usize = 1024;
 
 /// Eviction removes entries down to this floor (half the capacity), so a
 /// burst of new bodies does not thrash the cache entry by entry.
-pub const EVICT_TO_ENTRIES: usize = 128;
+pub const EVICT_TO_ENTRIES: usize = 512;
 
 impl JitCache {
     /// A cache whose compile step uses `helpers` as the slow-path table.
@@ -305,8 +308,15 @@ impl JitCache {
             if let Some(entry) = self.entries.remove(&key) {
                 // Clear the per-body fast pointer: the compiled info it
                 // points at is freed with the entry, so the next call must
-                // reconsult the cache (and recompile).
+                // reconsult the cache (and recompile). The eviction count and
+                // the reset consult counter are what keep that recompile from
+                // repeating every call — see `CompiledBody::jit_evictions`.
                 entry.body.jit_info.set(0);
+                entry.body.jit_calls.set(0);
+                entry
+                    .body
+                    .jit_evictions
+                    .set(entry.body.jit_evictions.get().saturating_add(1));
             }
         }
     }
@@ -533,6 +543,7 @@ mod tests {
             script_globals: None,
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
+            jit_evictions: std::cell::Cell::new(0),
             has_loop: false,
             has_call_apply: false,
         }
@@ -1535,6 +1546,11 @@ mod tests {
         assert_eq!(cache.compiled_count(), 2, "B was evicted");
         // B's fast pointer was cleared by the eviction...
         assert_eq!(b.jit_info.get(), 0);
+        // ...and the eviction is counted, with the consult count restarted, so
+        // the runtime's lookup gate makes B wait for the threshold again
+        // instead of recompiling it on its next call.
+        assert_eq!(b.jit_evictions.get(), 1);
+        assert_eq!(b.jit_calls.get(), 0);
         // ...and a later call recompiles it fresh (evicting the LRU, A).
         assert!(!cache.lookup(&b, false).is_null());
         assert_eq!(cache.compiled_count(), 2, "recompiled B evicted the LRU");
@@ -1571,6 +1587,30 @@ mod tests {
             "eviction resumes after the frame"
         );
         assert_eq!(b.jit_info.get(), 0, "B was the LRU and got evicted");
+    }
+
+    #[test]
+    fn cache_keeps_an_application_sized_working_set_compiled() {
+        // An application's body set routinely runs to a few hundred bodies
+        // (a scene plus its mods). All of them stay compiled: evicting the LRU
+        // tail would make every evicted body recompile per frame.
+        let mut cache = JitCache::new(helpers_all()).expect("isa");
+        let bodies: Vec<std::rc::Rc<CompiledBody>> = (0..300)
+            .map(|i| {
+                std::rc::Rc::new(make_body(
+                    vec![Step::Push(Value::Number(i as f64)), Step::Return],
+                    0,
+                ))
+            })
+            .collect();
+        for body in &bodies {
+            assert!(!cache.lookup(body, false).is_null());
+        }
+        assert_eq!(cache.compiled_count(), 300);
+        assert!(
+            bodies.iter().all(|body| body.jit_evictions.get() == 0),
+            "no body of a 300-body working set is evicted"
+        );
     }
 
     #[test]
@@ -4541,6 +4581,56 @@ mod tests {
                 .expect("runs")
         });
         assert_eq!(value.as_number(), Some(9.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_declarative_binding_invalidates_a_warmed_object_cell() {
+        // `K` is first an OBJECT-record global (a plain property of the global
+        // object), which warms the global-value cell; a LATER script declares
+        // `const K`, which changes what `K` resolves to while leaving the global
+        // object untouched. The global env's generation bump is the only thing
+        // that can invalidate the warmed cell — without it the compiled read
+        // keeps serving 5 (the second completion would be 10, not 6). Neither
+        // the declaration script nor the last one may write a global of its
+        // own: that would bump the generation too and mask the hole.
+        let (value, compiled) = with_jit_agent(|agent| {
+            let first = agent
+                .run_script(
+                    "globalThis.K = 5; \
+                     function rk() { var s = 0; for (var i = 0; i < 2; i++) { s += K; } return s; } \
+                     rk();",
+                )
+                .expect("runs");
+            assert_eq!(first.as_number(), Some(10.0), "the object-record read");
+            agent.run_script("const K = 3;").expect("declares");
+            agent.run_script("rk();").expect("runs")
+        });
+        assert_eq!(
+            value.as_number(),
+            Some(6.0),
+            "the later declaration invalidated the warmed cell"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_declarative_read_sees_a_callees_write() {
+        // The cell caches a top-level `let`'s value, so a write from a called
+        // function must invalidate it: the loop reads 1, then 2, 2.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "let n = 1; \
+                     function bump() { n = 2; } \
+                     function rd() { var s = 0; \
+                       for (var i = 0; i < 3; i++) { if (i === 1) { bump(); } s += n; } \
+                       return s; } \
+                     (rd() === 5) ? 1 : 0;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1.0), "the callee's write is seen");
         assert!(compiled >= 1, "{compiled} bodies");
     }
 

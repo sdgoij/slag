@@ -354,10 +354,12 @@ pub const JIT_GC_PROBE_INTERVAL: u64 = 1024;
 /// A direct-mapped global-value cell the compiled `LoadGlobal`/`StoreGlobal`
 /// fast paths read and write in place: `name` plus the capturing
 /// `(global_id, generation)` validate the cached `value` against the global
-/// object's LIVE identity and generation (the generation bumps on any
-/// own-property change, so a match means no mutation since the cell was
-/// recorded — including one a slow-path helper performed mid-run), and
-/// `slot` locates the binding's property-vector entry for the store side.
+/// object's LIVE identity and generation, and `slot` locates the binding's
+/// property-vector entry for the store side. The generation must move on
+/// EVERY change to what a global name resolves to, not just own-property
+/// changes: a slow-path helper that mutated the global mid-run bumps it, and
+/// so does a change to the global env's declarative record (the global env
+/// bumps it for those, which is what makes a declarative binding cacheable).
 /// `#[repr(C)]` with all-scalar fields: the compiled code loads the fields
 /// at fixed offsets (`offset_of!`).
 #[repr(C)]
@@ -367,13 +369,15 @@ pub struct GlobalValueCell {
     pub name: crux::AtomId,
     /// The global object's identity at capture time.
     pub global_id: u64,
-    /// The global object's generation at capture time.
+    /// The global object's generation at capture time (see the type doc: it
+    /// also moves for the global env's declarative bindings).
     pub generation: u32,
     /// The binding's property-vector slot at capture time — the compiled
     /// `StoreGlobal` fast path passes it to `set_global_slot` (the property
     /// write cannot be inlined: the vector's enum layout is runtime
-    /// internal). `u32::MAX` when the slot was never resolved, which
-    /// disables the store fast path (a load-only cell still validates).
+    /// internal). `u32::MAX` when the slot was never resolved or when the
+    /// binding is declarative (no property backs it), which disables the
+    /// store fast path (a load-only cell still validates).
     pub slot: u32,
     /// The cached value's bits.
     pub value: crux::Value,
@@ -1793,18 +1797,20 @@ extern "C" fn load_ident(ctx: *mut c_void, name: u64) -> u64 {
         Err(error) => return slow_error(ctx, error),
     };
     // Warm the JIT's global fast cell when the resolved binding is a global
-    // OBJECT-record (var/function/undeclared) data property — the compiled
-    // `LoadIdent` probe then serves the next read as a native load. A
-    // DECLARATIVE-record binding (a top-level `let`/`const`/`class`) or any
-    // other env never warms: the probe validates only the cell's name and
-    // the global object's version, which a declarative shadow does not
-    // disturb. Best-effort — a name whose shape does not fit (an accessor,
-    // an absent property) stays missing and the resolve path keeps running.
+    // environment-record binding — the compiled `LoadIdent` probe then serves
+    // the next read as a native load. An OBJECT-record binding
+    // (var/function/undeclared) records with its property slot, so a compiled
+    // `StoreGlobal` can write through the cell too; a DECLARATIVE-record
+    // binding (a top-level `let`/`const`/`class`) records load-only and is
+    // invalidated by the generation bump the global env performs on every
+    // declarative mutation. Any other env never warms. Best-effort — a name
+    // whose shape does not fit (an accessor, an absent property) stays
+    // missing and the resolve path keeps running.
     if let ReferenceBase::Environment(env) = &reference.base
         && let EnvRecord::Global(_) = &**env
-        && !env.has_lexical_declaration(&name_string)
     {
-        vm.warm_global_cell(agent, name_atom, value);
+        let declarative = env.has_lexical_declaration(&name_string);
+        vm.warm_global_cell(agent, name_atom, value, declarative);
     }
     value.bits()
 }
@@ -4783,7 +4789,15 @@ pub(crate) fn lookup_info(
         // sticks. A loop body compiles on the first consult — it runs once
         // with many internal iterations, so a pure count would never
         // promote it. `saturating_add` bounds the counter.
-        if ir.jit_calls.get() < JIT_COMPILE_THRESHOLD && !ir.has_loop {
+        //
+        // An EVICTED body waits for the threshold again whatever its shape:
+        // its slot was lost to a program whose working set exceeds the cache,
+        // and without this a body used once per frame is recompiled on every
+        // frame — a small body compiles in ~0.4ms, which is a frame's budget.
+        // The cache bumps `jit_evictions` and resets the count when it evicts.
+        if ir.jit_calls.get() < JIT_COMPILE_THRESHOLD
+            && (!ir.has_loop || ir.jit_evictions.get() > 0)
+        {
             ir.jit_calls.set(ir.jit_calls.get().saturating_add(1));
             return std::ptr::null();
         }
@@ -5544,6 +5558,10 @@ mod tests {
         FAKE_LOOKUP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn fake_loop_lookup_calls() -> usize {
+        FAKE_LOOP_LOOKUP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn make_body(steps: Vec<crate::ir::Step>, has_loop: bool) -> std::rc::Rc<CompiledBody> {
         std::rc::Rc::new(CompiledBody {
             steps,
@@ -5558,6 +5576,7 @@ mod tests {
             script_globals: None,
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
+            jit_evictions: std::cell::Cell::new(0),
             has_loop,
             has_call_apply: false,
         })
@@ -5627,6 +5646,83 @@ mod tests {
             0,
             "the threshold count is skipped for loops"
         );
+    }
+
+    #[test]
+    fn a_declarative_global_read_warms_the_value_cell() {
+        // A top-level `let`/`const` lives in the global env's DECLARATIVE
+        // record, so no property slot describes it — but it is cacheable: the
+        // cell records the value load-only, and the global env bumps the global
+        // object's generation on every declarative mutation, which is exactly
+        // what the cell's validation reads. The interpreter warms it here; the
+        // compiled `LoadIdent` probe reads the same agent table.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let name = crux::string::intern_utf8("K");
+        let index = name as usize & (crate::ir::GLOBAL_CELLS - 1);
+        agent
+            .run_script("let K = 3; function read() { return K; } read();")
+            .unwrap();
+        let warmed = agent.global_value_cells[index];
+        assert_eq!(warmed.name, name, "the declarative read warmed the cell");
+        assert_eq!(warmed.value.as_number(), Some(3.0));
+        assert_eq!(
+            warmed.slot,
+            u32::MAX,
+            "a declarative cell has no property slot to write through"
+        );
+        // A write to the binding must move the generation the cell captured, or
+        // a compiled read would keep serving the pre-write value.
+        agent.run_script("K = 4; read();").unwrap();
+        let refreshed = agent.global_value_cells[index];
+        assert_eq!(
+            refreshed.value.as_number(),
+            Some(4.0),
+            "the post-write read re-warmed the cell"
+        );
+        assert_ne!(
+            refreshed.generation, warmed.generation,
+            "the declarative write bumped the generation"
+        );
+    }
+
+    #[test]
+    fn lookup_info_waits_for_the_threshold_after_an_eviction() {
+        // A body evicted from the cache does not recompile on its next call
+        // however hot it is — it waits for the threshold again, which is what
+        // keeps a once-per-frame body from paying a compile per frame. A loop
+        // body bypasses the threshold only until it has been evicted once.
+        FAKE_LOOP_LOOKUP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let hook = JitHook {
+            cache: std::ptr::null_mut(),
+            lookup: fake_loop_lookup,
+            drop_cache: fake_drop_cache,
+            helpers: &JIT_SLOW_PATHS as *const JitSlowPaths,
+        };
+        let body = make_body(vec![crate::ir::Step::Push(Value::Undefined)], true);
+        assert!(
+            !lookup_info(hook, &body, false).is_null(),
+            "a loop body compiles on the first consult"
+        );
+        // The cache's eviction: fast pointer cleared, eviction counted, and
+        // the consult count restarted.
+        body.jit_info.set(0);
+        body.jit_evictions.set(1);
+        body.jit_calls.set(0);
+        let consulted = fake_loop_lookup_calls();
+        for _ in 0..JIT_COMPILE_THRESHOLD {
+            assert!(lookup_info(hook, &body, false).is_null());
+        }
+        assert_eq!(
+            fake_loop_lookup_calls(),
+            consulted,
+            "an evicted loop body waits for the threshold"
+        );
+        assert!(
+            !lookup_info(hook, &body, false).is_null(),
+            "the (K+1)th consult recompiles it"
+        );
+        assert_eq!(fake_loop_lookup_calls(), consulted + 1);
     }
 
     #[test]

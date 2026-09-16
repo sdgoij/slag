@@ -35,7 +35,9 @@ build rather than the revision, which is itself the most actionable finding here
   costs ~163 ns/iter where the same loop with the builtin frozen into a captured
   `const` costs ~27 ns (§4b, corrected). Calls, member accesses, captured
   bindings, nested loops and `continue` are all fine. Our scene hangs off `rl.*`
-  and `TUNING`, so its kernels pay the resolve path on every read.
+  and `TUNING`, so its kernels pay the resolve path on every read. **(b) landed
+  2026-09-16** — a declarative read now hits the cell (52.5 ms → 2.5 ms in the
+  corpus); **(a) is open**, and it is the one the mod helpers pay.
 - **Removing global reads from three hot bodies recovered 2.1–2.3 ms/frame**: the
   grass grid 2.88 → 1.78 ms (`shadow_grass` 0.53 → 0.36), the goat collision
   resolve 0.49 → 0.22 ms, and the birds mod (0.70 → 0.47–0.53 update, 0.68 →
@@ -51,6 +53,14 @@ build rather than the revision, which is itself the most actionable finding here
   figures §4 read off the probe are mostly resolve-path time, not the crossing
   (§4b): widen the cell and the scene's own kernels stop paying it — without any
   scene change.
+- **The "once per frame" penalty of §5b was the JIT cache, and it is fixed.**
+  In the same process the same body measured ~9 µs/call in a burst and ~226 µs/call
+  reached once per frame: the app's body set exceeds the cache's capacity, so the
+  cache cleared its LRU tail and `lookup_info` recompiled each cleared body on its
+  very next call — a frame's whole budget at one call per frame. Landed in the
+  engine (2026-09-16): the cache holds 1024 bodies before it evicts, and an
+  evicted body re-earns the compile threshold instead of recompiling on the next
+  call (~16× fewer recompiles under pressure).
 
 ## 1. What was measured, and how
 
@@ -271,8 +281,13 @@ value cell does not cover.**
 > name use the cell from any body (the proof the scope analysis already has), and
 > giving the declarative record a cell of its own, are both local changes, and
 > neither needs a scene to change. The declarative half is analysed in its own
-> note — `.notes/global-read-cells.md` (*measured, not started*) — which is where
-> that fix should land.
+> note — `.notes/global-read-cells.md` — and **landed on 2026-09-16**: the cell
+> is warmed for a declarative binding too (load-only, validated by a generation
+> the global environment bumps on every declarative mutation), which takes the
+> corpus row from 52.5 ms to 2.5 ms and closes the 21x gap. The nested-body half
+> (`clean_chain`) is still open and is the one this scene pays — see
+> `.notes/perf.md`'s 2026-09-16 entry for why it needs a per-name, per-run
+> verdict rather than a chain-shape flag.
 >
 > Re-measure before sizing the win: the rows above are from a pin that is not
 > `main`, built at cargo's default profile, and the `LoadIdent` cell probe is
@@ -316,6 +331,22 @@ in the engine: 226 µs for a body that measures 9 µs in a burst.
 measured 4147 ns/iter early and 93 ns/iter later, which is the same
 pattern-dependence seen from the other side. Treat any single measurement of a
 newly-called body as provisional until it is repeated.)
+
+> **Resolved (2026-09-16, engine fix landed).** The dependence is the JIT cache,
+> not the call itself. The scene's body set exceeds `MAX_CACHE_ENTRIES`, so a
+> cache overflow cleared the LRU tail's per-body fast pointer, and `lookup_info`
+> then recompiled each cleared body on its very next call — a loop body with no
+> threshold at all, a straight-line body because its consult count was already
+> past the threshold. A small body compiles in ~0.4 ms, which is the 226 µs/call
+> figure once the compile is amortised over a frame with one call to the body in
+> it, and it is the whole of the "still interpreted" reading: these bodies were
+> compiled, then evicted, then compiled again, every frame.
+>
+> The engine's cache policy changed, not the scene's calling pattern: the cache
+> holds 1024 bodies (evicting to 512) and an evicted body re-earns the 16-consult
+> compile threshold. `.notes/perf.md` (2026-09-16) has the numbers and the
+> verification; a client should confirm the scene-level win with `rl.getTime()`,
+> which the engine cannot do for itself (no sub-millisecond timer).
 
 ## 5. Where our usage spends the frame
 
@@ -542,16 +573,33 @@ table in §3 should be read as "this build is faster than that build", not as
 1. **Widen the value cell's coverage before attacking the crossing.** The JIT
 already has the `load_ident`/`get_global` slow paths, so nothing needs
 relaxing in certification (§4b, corrected): a body that names a global
-compiles today. Two local gaps to close, both measured: the `clean_chain` gate
-that skips `LoadIdent`'s cell probe for any body whose env is not the bare
-global record (a mod helper's read: **163 ns/iter → ~24** with the same body
-at top level), and the global env's declarative record, which the cell is
-never warmed for (corpus `globals`: **52.5 ms → 2.5 ms** for the hoisted
-workaround). Neither change needs a scene to change, ours included.
-2. **Then the calling-pattern dependence (§4b).** The same global-free body costs
-~9 µs/call in a burst and ~226 µs/call once per frame, in the same process. If a
-compiled body can be reached reliably once per frame, the kernels this session
-rewrote would go to ~0.01 ms each instead of 0.22 and ~0.9.
+compiles today. Two local gaps, both measured — one closed, one open:
+- **Landed (2026-09-16): the global env's declarative record.** The cell is
+  warmed for a top-level `let`/`const`/`class` too now — load-only, validated
+  by a generation the global environment bumps on every declarative mutation
+  — so the corpus `globals` row goes **52.5 ms → 2.5 ms** and the family gap
+  30.9x → 2.8x. No scene change needed (our `TUNING` is a mod-wrapper
+  `const`, i.e. already a context slot), but every top-level binding in a
+  bundled script now reads like a local. `.notes/perf.md` (2026-09-16).
+- **Open: the `clean_chain` gate**, which skips `LoadIdent`'s cell probe for
+  any body whose env is not the bare global record — i.e. every helper
+  nested inside a mod wrapper. Measured: **163 ns/iter vs ~24** for the same
+  body at top level. The declarative fix above does not help it (with
+  `clean_chain` false the probe is skipped entirely), and it is the half this
+  scene pays on `rl.*`/`Math` reads inside mod functions. It needs a
+  per-name, per-run verdict rather than a chain-shape flag — the cell table
+  is shared by name across bodies, so "this body's chain is closed" would let
+  a nested body read the global value of a name its own wrapper env binds.
+  `.notes/perf.md`'s 2026-09-16 entry has the hazard list.
+2. **The calling-pattern dependence (§4b) — resolved (2026-09-16): it was the
+JIT cache.** A ~9 µs/call burst body costing ~226 µs/call once per frame was
+the cache recompiling what it had just evicted: the app's body set exceeds
+`MAX_CACHE_ENTRIES`, and every cleared body recompiled on its next call, so a
+body reached once per frame paid a ~0.4 ms compile per frame. Landed: the cap
+is 1024 (evicting to 512) and an evicted body re-earns the compile threshold,
+which cuts the recompile rate by the threshold factor under pressure. The
+scene-level win wants a client-side `rl.getTime()` re-measure — the engine has
+no sub-millisecond timer — see `.notes/perf.md` (2026-09-16).
 3. **Attack the per-crossing cost.** A frame here is thousands of `rl.*` reads
    and calls. Concrete things to check: whether each call builds
    an arguments array or formats anything on the success path; whether the texture

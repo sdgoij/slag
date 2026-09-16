@@ -1674,6 +1674,12 @@ pub struct CompiledBody {
     /// every `Rc` clone of the body (the per-site closures of one body), so
     /// the consult counts aggregate.
     pub jit_calls: std::cell::Cell<u32>,
+    /// How many times this body has been evicted from the JIT cache. A body
+    /// that lost its slot has to earn a recompilation the way a straight-line
+    /// body earns its first one — otherwise a body used once per frame is
+    /// recompiled on every frame once a program's working set exceeds the
+    /// cache, and a small body compiles in ~0.4ms, which is a frame's budget.
+    pub jit_evictions: std::cell::Cell<u32>,
     /// Cut 69: whether the body contains a loop (see [`body_has_loop`]).
     /// Loop bodies compile on first JIT use — they run once with many
     /// internal iterations, so a pure call-count threshold would never
@@ -3632,18 +3638,36 @@ impl Vm {
     }
 
     /// Best-effort warm of the JIT's global-value cell after an identifier
-    /// resolve landed on the global object record (the compiled `LoadIdent`
-    /// probe's miss path). Records only when the name is an own data
-    /// property of the global object — the probe's fast path is exactly the
-    /// declared-var read shape; an accessor or absent name stays on the
-    /// resolve path (an accessor can run code and an inherited property can
-    /// change without the global's generation bumping, so caching either
-    /// would go stale). The read already succeeded, so errors are swallowed
-    /// (the cell is an optimization).
-    pub(crate) fn warm_global_cell(&mut self, agent: &mut Agent, name: crux::AtomId, value: Value) {
+    /// resolve landed on the global environment record (the compiled
+    /// `LoadIdent` probe's miss path). Two shapes record:
+    ///
+    /// - a DECLARATIVE binding (a top-level `let`/`const`/`class`, reported by
+    ///   `declarative`): the value comes from the global env's declarative
+    ///   record, so the cell is load-only (`slot` = `u32::MAX`, which disables
+    ///   the compiled store fast path) and is invalidated by the generation
+    ///   bump every declarative mutation performs (`GlobalEnv`).
+    /// - an own DATA property of the global object (var/function/undeclared):
+    ///   the original fast path, with the property's slot so a compiled
+    ///   `StoreGlobal` can write through it.
+    ///
+    /// An accessor or absent name stays on the resolve path (an accessor can
+    /// run code and an inherited property can change without the global's
+    /// generation bumping, so caching either would go stale). The read already
+    /// succeeded, so errors are swallowed (the cell is an optimization).
+    pub(crate) fn warm_global_cell(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        value: Value,
+        declarative: bool,
+    ) {
         let Ok(global) = self.global_object(agent) else {
             return;
         };
+        if declarative {
+            Self::record_global_cell(agent, name, value, &global, None);
+            return;
+        }
         Self::resolve_global_cell(agent, name);
         let Some((_, slot)) = agent.global_cells[Self::global_cell_index(name)] else {
             return;
@@ -3653,10 +3677,12 @@ impl Vm {
 
     /// The Cut 36 `LoadIdent` fast path: read the warmed global-value cell
     /// when its captured name and the live global's identity + generation
-    /// still match (the same probe the compiled `LoadIdent` runs). The cell
-    /// is only ever written by a resolve that landed on a global-object
-    /// binding, so a hit is exactly the value the env walk would produce;
-    /// `None` falls back to the full resolve.
+    /// still match (the same probe the compiled `LoadIdent` runs). The cell is
+    /// only ever written by a resolve that landed on the global environment
+    /// record — an object-record data property or a declarative binding — and
+    /// every change either record can undergo moves the generation, so a hit
+    /// is exactly the value the env walk would produce; `None` falls back to
+    /// the full resolve.
     fn try_global_cell_read(&mut self, agent: &mut Agent, name: crux::AtomId) -> Option<Value> {
         let cell = agent.global_value_cells[Self::global_cell_index(name)];
         if cell.name != name {
@@ -5936,13 +5962,15 @@ impl Vm {
                         && self.clean_chain
                         && let crate::context::ReferenceBase::Environment(env) = &reference.base
                         && let EnvRecord::Global(_) = &**env
-                        && !env.has_lexical_declaration(&crux::lookup(*name))
                     {
                         // The JIT's `load_ident` warm gate: a global-object
-                        // binding (var/function/undeclared), never a top-level
-                        // `let`/`const`/`class` (a declarative shadow would
-                        // not bump the global object's generation).
-                        self.warm_global_cell(agent, *name, value);
+                        // binding (var/function/undeclared) records with its
+                        // property slot; a declarative binding (a top-level
+                        // `let`/`const`/`class`) records load-only, and the
+                        // global env bumps the object's generation on every
+                        // declarative mutation, which is what invalidates it.
+                        let declarative = env.has_lexical_declaration(&crux::lookup(*name));
+                        self.warm_global_cell(agent, *name, value, declarative);
                     }
                     self.stack.push(value);
                 }
@@ -22392,6 +22420,7 @@ pub fn compile_body(
             script_globals: None,
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
+            jit_evictions: std::cell::Cell::new(0),
             has_loop,
             has_call_apply,
         },
@@ -22470,6 +22499,7 @@ pub fn compile_statements(
         script_globals: compiler.script_globals,
         jit_info: std::cell::Cell::new(0),
         jit_calls: std::cell::Cell::new(0),
+        jit_evictions: std::cell::Cell::new(0),
         has_loop,
         has_call_apply,
     })

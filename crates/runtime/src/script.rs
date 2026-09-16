@@ -605,20 +605,11 @@ pub fn global_declaration_instantiation(
     }
 
     // Lexical declarations: instantiated here, initialized at evaluation.
+    // Creating the binding is what bumps the global object's generation
+    // (`GlobalEnv`), which is how the JIT's inline global fast cells find out
+    // that a `let x` now shadows a previous script's `var x` property — a cell
+    // recorded for that property would otherwise keep serving its value.
     let lexical_decls = top_level_lexically_scoped_declarations(&program.body);
-    if !lexical_decls.is_empty() {
-        // A global lexical binding lives in the env's DECLARATIVE record —
-        // not an own property of the global object — so creating one does
-        // not bump the object's generation. Bump it anyway: the JIT's
-        // inline global fast cells validate against that generation, and a
-        // `let x` that shadows a previous script's `var x` property must
-        // invalidate a cell recorded for the property (a stale cell would
-        // serve the shadowed property value).
-        let global = agent.running_context()?.realm.global_object;
-        global
-            .generation
-            .set(global.generation.get().wrapping_add(1));
-    }
     for decl in lexical_decls {
         let mut names = Vec::new();
         bound_names_of_decl(decl, &mut names);

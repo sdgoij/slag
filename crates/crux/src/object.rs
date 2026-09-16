@@ -3425,7 +3425,13 @@ impl JsObject {
         self.generation.get()
     }
 
-    fn bump_generation(&self) {
+    /// Bump the generation without an own-property change. The global object
+    /// needs this: its environment's DECLARATIVE record (a top-level
+    /// `let`/`const`/`class`) changes what a name resolves to while leaving
+    /// the object untouched, and the JIT's global-value cell validates a
+    /// cached read against this counter alone — so a declarative change must
+    /// bump it or the cell would keep serving the pre-change value.
+    pub fn bump_generation(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
         // A registered prototype gaining any own property can intercept a
         // store on a child that cached a clean-chain verdict, so advance the

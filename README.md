@@ -375,43 +375,47 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 35.31x | 5.65x |
-| builtins | 5 | 15.26x | 6.25x |
-| calls | 6 | 22.80x | 4.50x |
-| control | 5 | 67.33x | 6.60x |
-| globals | 3 | 30.94x | 2.39x |
-| language | 3 | 13.74x | 7.60x |
-| objects | 7 | 48.60x | 2.93x |
-| strings | 5 | 25.20x | 5.76x |
-| **All** | **40** | **34.05x** | **5.11x** |
+| arrays | 6 | 36.08x | 5.65x |
+| builtins | 5 | 15.09x | 5.99x |
+| calls | 6 | 22.15x | 4.91x |
+| control | 5 | 67.40x | 6.40x |
+| globals | 3 | 2.82x | 0.92x |
+| language | 3 | 14.26x | 7.75x |
+| objects | 7 | 44.94x | 3.08x |
+| strings | 5 | 24.14x | 6.15x |
+| **All** | **40** | **31.21x** | **5.09x** |
 
 A sample of the per-workload rows (the command above prints all 40), ms per
 `bench()` call:
 
 | Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
 |---|---|---|---|---|---|---|
-| `arrays/for_of_dense.js` | 34.0 | 55.1 | 1.8 | 65.0 | 18.74x | 0.85x |
-| `arrays/typed_array.js` | 90.5 | 185.9 | 1.1 | 40.3 | 83.93x | 4.62x |
-| `builtins/json_roundtrip.js` | 81.1 | 84.6 | 12.7 | 16.0 | 6.40x | 5.28x |
-| `builtins/math_intrinsics.js` | 47.0 | 73.5 | 149.7 | 178.5 | 0.31x | 0.41x |
-| `calls/direct_leaf.js` | 10.2 | 78.7 | 1.1 | 36.3 | 8.99x | 2.17x |
-| `calls/recursive_fib.js` | 277.1 | 360.9 | 7.5 | 39.9 | 36.81x | 9.04x |
-| `control/generator_loop.js` | 78.5 | 93.4 | 2.6 | 9.1 | 30.68x | 10.29x |
-| `globals/declarative_read.js` | 52.5 | 86.1 | 0.6 | 14.6 | 88.63x | 5.91x |
-| `globals/hoisted_local.js` | 2.5 | 16.2 | 0.6 | 14.7 | 4.15x | 1.10x |
-| `globals/object_read.js` | 2.5 | 16.6 | 82.7 | 97.3 | 0.03x | 0.17x |
-| `objects/destructure.js` | 188.1 | 255.2 | 0.8 | 48.2 | 247.47x | 5.30x |
-| `objects/own_read.js` | 2.9 | 32.1 | 1.3 | 60.3 | 2.25x | 0.53x |
-| `objects/warm_store.js` | 48.8 | 100.4 | 2.3 | 58.2 | 21.45x | 1.72x |
-| `strings/char_ops.js` | 23.8 | 28.2 | 0.4 | 5.8 | 63.25x | 4.88x |
+| `arrays/for_of_dense.js` | 34.5 | 59.2 | 1.8 | 66.8 | 18.92x | 0.89x |
+| `arrays/typed_array.js` | 110.3 | 177.9 | 1.2 | 40.9 | 93.68x | 4.35x |
+| `builtins/json_roundtrip.js` | 78.9 | 82.4 | 13.7 | 16.1 | 5.75x | 5.13x |
+| `builtins/math_intrinsics.js` | 47.9 | 76.0 | 156.9 | 192.8 | 0.31x | 0.39x |
+| `calls/direct_leaf.js` | 10.5 | 86.3 | 1.3 | 38.6 | 8.29x | 2.24x |
+| `calls/recursive_fib.js` | 272.8 | 373.6 | 7.8 | 34.0 | 35.03x | 10.99x |
+| `control/generator_loop.js` | 77.6 | 88.7 | 2.5 | 9.5 | 31.19x | 9.37x |
+| `globals/declarative_read.js` | 2.5 | 17.0 | 0.6 | 12.5 | 4.21x | 1.35x |
+| `globals/hoisted_local.js` | 2.5 | 16.9 | 0.6 | 13.5 | 4.23x | 1.25x |
+| `globals/object_read.js` | 2.5 | 16.7 | 87.1 | 101.1 | 0.03x | 0.16x |
+| `objects/destructure.js` | 189.2 | 245.2 | 0.8 | 50.1 | 225.83x | 4.89x |
+| `objects/own_read.js` | 3.0 | 33.5 | 1.3 | 49.1 | 2.20x | 0.68x |
+| `objects/warm_store.js` | 50.6 | 105.9 | 2.5 | 54.0 | 20.56x | 1.96x |
+| `strings/char_ops.js` | 23.1 | 29.0 | 0.4 | 5.7 | 56.56x | 5.11x |
 
 The `globals` trio is the one family that is a controlled experiment rather
 than a workload: the same loop reading the same value as a top-level `const`
 (`declarative_read`), hoisted into a local first (`hoisted_local`), and read
-through the global object (`object_read`). The declarative read is 21x the
-hoisted one and 21x the object read *while all three are compiled*: the value
-cell that serves global object-record reads as a native load is never warmed
-for the global env's declarative record. See `.notes/frame-cost-profile.md`
+through the global object (`object_read`). All three now measure the same
+2.5 ms — the value cell serves the declarative binding like any other global,
+which closed a 21x gap: the read used to cost 52.5 ms because the cell was
+never warmed for the global env's declarative record. A declarative binding has
+no property slot, so its cell is load-only, and it stays valid because the
+global environment bumps the global object's generation on every declarative
+mutation (a `let` write, a later script's declaration) — which is what the
+cell's validation reads in the first place. See `.notes/frame-cost-profile.md`
 §4b.
 
 Read the gaps as "where the work is", not as a verdict on the engine shape:

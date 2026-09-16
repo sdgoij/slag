@@ -1001,6 +1001,14 @@ impl GlobalEnv {
         }
     }
 
+    /// A declarative binding change alters what a name resolves to without
+    /// touching the global object, and the JIT's global-value cell validates a
+    /// cached read against the object's generation alone — so every mutation of
+    /// the declarative record bumps it.
+    fn bump_declarative_generation(&self) {
+        self.object.bump_generation();
+    }
+
     fn has_binding(&self, name: &JsString) -> Result<bool, JsError> {
         Ok(self.declarative.has_binding(name) || self.object.has_property(name)?)
     }
@@ -1012,7 +1020,9 @@ impl GlobalEnv {
                 format!("Binding {:?} already exists", name.to_string_lossy()),
             ));
         }
-        self.declarative.create_mutable_binding(name, deletable)
+        self.declarative.create_mutable_binding(name, deletable)?;
+        self.bump_declarative_generation();
+        Ok(())
     }
 
     fn create_immutable_binding(&self, name: &JsString, strict: bool) -> Result<(), JsError> {
@@ -1022,12 +1032,16 @@ impl GlobalEnv {
                 format!("Binding {:?} already exists", name.to_string_lossy()),
             ));
         }
-        self.declarative.create_immutable_binding(name, strict)
+        self.declarative.create_immutable_binding(name, strict)?;
+        self.bump_declarative_generation();
+        Ok(())
     }
 
     fn initialize_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {
         if self.declarative.has_binding(name) {
-            return self.declarative.initialize_binding(name, value);
+            self.declarative.initialize_binding(name, value)?;
+            self.bump_declarative_generation();
+            return Ok(());
         }
         self.object.set(name, value, false)?;
         Ok(())
@@ -1040,7 +1054,9 @@ impl GlobalEnv {
         strict: bool,
     ) -> Result<(), JsError> {
         if self.declarative.has_binding(name) {
-            return self.declarative.set_mutable_binding(name, value, strict);
+            self.declarative.set_mutable_binding(name, value, strict)?;
+            self.bump_declarative_generation();
+            return Ok(());
         }
         // spec 9.2.6.5 steps 2.b-c: a write to a global property that no
         // longer exists (e.g. a getter deleted it) throws a ReferenceError
@@ -1075,7 +1091,9 @@ impl GlobalEnv {
 
     fn delete_binding(&self, name: &JsString) -> Result<bool, JsError> {
         if self.declarative.has_binding(name) {
-            return self.declarative.delete_binding(name);
+            let deleted = self.declarative.delete_binding(name)?;
+            self.bump_declarative_generation();
+            return Ok(deleted);
         }
         if self.object.has_own_property(name)? {
             return self.object.delete(name);
@@ -1245,6 +1263,43 @@ mod tests {
 
     fn name(text: &str) -> JsString {
         JsString::from_utf8(text)
+    }
+
+    #[test]
+    fn global_declarative_changes_bump_the_global_object_generation() {
+        // The JIT's global-value cell validates a cached read against the global
+        // object's generation alone, and a declarative binding changes what a
+        // name resolves to without touching the object — so every declarative
+        // mutation has to move the generation, or a warmed cell would keep
+        // serving the pre-change value.
+        let object = JsObject::ordinary_object_create(None);
+        let global = GlobalEnv::new(object, object);
+        let mut generation = object.generation();
+        global.create_mutable_binding(&name("px"), true).unwrap();
+        assert_ne!(object.generation(), generation, "creating bumps it");
+        generation = object.generation();
+        global
+            .initialize_binding(&name("px"), Value::Number(1.0))
+            .unwrap();
+        assert_ne!(object.generation(), generation, "initializing bumps it");
+        generation = object.generation();
+        global
+            .set_mutable_binding(&name("px"), Value::Number(2.0), false)
+            .unwrap();
+        assert_ne!(object.generation(), generation, "a write bumps it");
+        generation = object.generation();
+        assert!(global.delete_binding(&name("px")).unwrap());
+        assert_ne!(object.generation(), generation, "deleting bumps it");
+        // An OBJECT-record binding still bumps through its own property write.
+        generation = object.generation();
+        global
+            .initialize_binding(&name("py"), Value::Number(3.0))
+            .unwrap();
+        assert_ne!(
+            object.generation(),
+            generation,
+            "an object binding bumps it"
+        );
     }
 
     fn declarative() -> EnvRef {

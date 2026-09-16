@@ -9920,6 +9920,158 @@ Verification: `cargo test --locked --workspace` 4,888 pass / 0 fail; clippy
 `annexB` swept 1,086 / 1,086 pass, 0 fail / 0 hang with the release sweep
 runner rebuilt under the new profile.
 
+### LANDED (2026-09-16): an evicted body re-earns the compile threshold
+
+`frame-cost-profile.md` §4b left a puzzle: the same global-free body cost ~9 µs
+per call in a burst and ~226 µs per call when reached once per frame, in the same
+process. The mechanism was the JIT cache, not the calling pattern. An
+application's body set (a scene plus its mods) exceeds `MAX_CACHE_ENTRIES`, so
+`JitCache::evict_if_needed` cleared the LRU tail's `jit_info` on every overflow
+and `lookup_info` recompiled each cleared body on its very next call — a
+straight-line body only consults the threshold while `jit_calls` is below it, and
+a loop body bypassed the threshold entirely (Cut 69). A small body compiles in
+~0.4 ms, so a body reached once per frame handed a frame's whole budget to the
+JIT.
+
+Two changes, one policy:
+
+- **The cache is sized for an application.** `MAX_CACHE_ENTRIES` 256 → **1024**,
+  `EVICT_TO_ENTRIES` 128 → **512**. A few-hundred-body working set now never
+  evicts at all, and the entries are bounded machine code rather than heap
+  objects, so the cap can afford to be generous.
+- **An eviction makes the body re-earn its compilation.** The cache resets
+  `jit_calls` to 0 and bumps a new `CompiledBody::jit_evictions`, and
+  `lookup_info` waits for the threshold again whenever `jit_evictions > 0` — for a
+  loop body too (a loop body skips the threshold only while it has never been
+  evicted). A body that lost its slot therefore runs interpreted for at most 16
+  consults per compile instead of compiling once per call: the recompile rate
+  under sustained pressure drops by the threshold factor (~16x). The tri-state
+  `jit_info` is untouched, so a genuinely unsupported body still sticks at `1`,
+  and the count saturates.
+
+Verification of the policy: the `jit` unit tests pin both halves —
+`cache_keeps_an_application_sized_working_set_compiled` (300 distinct bodies, no
+`jit_evictions`), `cache_evicts_least_recently_used_bodies` (an eviction counts
+and restarts the consult count) and
+`lookup_info_waits_for_the_threshold_after_an_eviction` (K consults are refused
+before the (K+1)th recompiles).
+
+The win itself is NOT timed end-to-end here, and the honest reason is that this
+repo has no sub-millisecond JS timer (`Date.now()` is 1 ms; there is no
+`performance`/`rl.getTime()`), so a once-per-frame probe cannot be timed from a
+script. The defensible evidence is the compile cost (~0.4 ms for a small body;
+eight distinct first-calls 3-4 ms against 0.006 ms warm) and the gate itself — a
+client with `rl.getTime()` can confirm it by timing a per-frame kernel across a
+body set larger than the old cap, or by counting `JitCache::compile` calls
+behind a temporary print (the recipe in the `slag-jit` skill §18). No JS-visible
+number is promised.
+
+Verification: `cargo test --locked --workspace` 4,890 pass / 0 fail (4,888 +
+the two new tests); clippy `--workspace --all-targets -D warnings` and
+`cargo fmt --all -- --check` clean; all four test262 areas at 15s/15s with the
+release binaries rebuilt — language 23,721 / 0 / 3 skip, built-ins 23,657 / 0 /
+155 skip, annexB 1,086 / 1,086, intl402 3,205 / 0 / 152 skip, every area 0 fail /
+0 crash / 0 hang; the wasm corpus at its README totals (core 64,594 / 0, JS-API
+1,001 / 0); corpus 40 workloads, 0 mismatches, mean-jitGap 33.75 and 35.86 in two
+runs against 34.05 before the change — within run-to-run spread, as expected,
+since a single-workload process never fills the cache.
+
+### LANDED (2026-09-16): the value cell serves the global env's declarative record
+
+`.notes/global-read-cells.md` and `frame-cost-profile.md` §4b both measured the
+same gap: a read of a top-level `let`/`const`/`class` — a binding in the global
+environment's DECLARATIVE record, which is the shape every top-level binding in
+a bundle has — took **52.5 ms** in the corpus loop where the same value read
+from a local, or read through the global OBJECT, took **2.5 ms**, all three
+compiled. 21x, on one of the most common operations in application code.
+
+The cell could not represent it: `warm_global_cell` recorded only an own DATA
+property of the global object, because the compiled probe validates a cached
+read against the global object's **identity and generation** — and the note's
+comment says why a declarative binding was excluded (a declarative change does
+not disturb the object, so a validated cell could serve a stale value).
+
+The fix makes that version actually cover what it claims to:
+
+- **The global environment bumps the global object's generation on every
+declarative mutation** (`GlobalEnv::bump_declarative_generation`, on create,
+initialize, write and delete of its declarative record). `JsObject::
+`bump_generation` became `pub` for it, with the contract documented there:
+the counter must move on every change to what a global name resolves to, not
+just own-property changes. `script.rs`'s own raw `generation.set(...)` — which
+handled exactly this for a NEW declaration, the `let x` shadowing a previous
+script's `var x` case — is gone: the owner type now does it, once, for all
+five mutations, and the consolidation also gets the prototype-epoch bookkeeping
+that the raw write bypassed. The other `push_initialized_binding` caller class
+only ever targets fresh per-iteration envs, so create/initialize/write/delete
+is the complete set for the global record (audited).
+- **`warm_global_cell` now takes the binding kind**: a declarative binding
+records the value with `slot = u32::MAX`, i.e. a load-only cell — which also
+disables the compiled `StoreGlobal` fast path, so a cell that came from a
+`const` can never be written through a property slot. Both warm gates (the
+interpreter's `LoadIdent` arm and the JIT's `load_ident` helper) dropped their
+`!has_lexical_declaration` guard; they now pass the flag instead.
+- **The compiled probe is unchanged.** It already validates
+`(name, global_id, generation)`, so one i32 compare now covers both records —
+no new cell field, no new ctx field, no codegen change. `HoistGlobalGuard`
+(LICM) therefore hoists a declarative read out of a loop for free once the cell
+is warm.
+
+Measured (corpus, 1M iterations, same binary, `tools/corpus/bench.js`):
+
+| `globals` workload | before | after |
+|---|---:|---:|
+| `declarative_read.js` (jit) | 52.5 ms | **2.47 ms** |
+| `declarative_read.js` (`--jitless`) | 96.6 ms | **17.0 ms** |
+| `hoisted_local.js` (jit) | 2.48 ms | 2.47 ms |
+| `object_read.js` (jit) | 2.46 ms | 2.52 ms |
+
+The three binding kinds are now the same speed — the point of the trio. The
+family gap went 30.94x -> **2.82x** (interpreter 2.39x -> 0.92x) and the corpus
+overall 34.05x -> **31.21x** / 5.11x -> **5.09x**, 0 mismatches. The README's
+two corpus tables were re-measured from one run (the documented protocol).
+
+**The bump is load-bearing, not defensive.** `bump_declarative_generation`
+stubbed to a no-op fails both new e2e tests: the later-
+declaration test reads 10 instead of 6 (the warmed OBJECT cell for a `globalThis.K`
+kept serving 5 through a `const K` that shadowed it), and the callee's-write test
+returns 0 instead of 1 (a `let` read cached across a write by a called function).
+Both shapes are pinned as `installed_jit_declarative_binding_invalidates_a_
+warmed_object_cell` and `installed_jit_declarative_read_sees_a_callees_write` in
+`crates/jit/src/lib.rs`, plus `global_declarative_changes_bump_the_global_object_
+generation` (env.rs, all five mutations) and `a_declarative_global_read_warms_
+the_value_cell` (runtime/jit.rs, the cell is warm, load-only, and re-warmed at a
+new generation after a write — which is what pins the OPTIMISATION, not just the
+semantics).
+
+Verification: `cargo test --locked --workspace` 4,894 pass / 0 fail; clippy
+`--workspace --all-targets -D warnings` and `cargo fmt --all -- --check` clean;
+all four test262 areas at 15s/15s with the release binaries rebuilt — unchanged
+from baseline (language 23,721 / 0 / 3 skip, built-ins 23,657 / 0 / 155 skip,
+annexB 1,086 / 1,086, intl402 3,205 / 0 / 152 skip, 0 fail / 0 crash / 0 hang
+everywhere); corpus 0 mismatches.
+
+**Not landed — the other half of §7.1 item 1.** A nested body (a mod helper)
+still pays the resolve for EVERY global read, because `LoadIdent`'s probe is
+gated on `clean_chain` (the body's env chain is exactly the global env; a
+top-level function qualifies, a helper inside a wrapper does not). §4b measured
+that at 163 ns/iter vs 24 for the same body at top level. The declarative work
+above does NOT touch it: with `clean_chain` false the probe is skipped entirely,
+warmed cell or not. It is a genuinely different fix and it needs a design
+decision, because of a trap that is easy to miss: **the cell table is shared by
+name across every body**, so a chain-shape gate (`"this body's chain is closed"`)
+is unsound — a nested body whose own wrapper env binds `x` would read the GLOBAL
+`x` from a cell another body warmed. The gate has to be per-name and per-run
+(`"no record between this body's env and the global record binds this name"`),
+which means a run-entry walk over the body's `LoadIdent` names (bounded, once
+per call, and the reason it is worth doing: the read is per iteration). The
+other hazards to keep closed: a `with` object in the chain can gain the name
+later (detectable at run entry by the `is_with` flag, and the existing
+`installed_jit_ident_read_with_scope_shadow_is_respected` test pins it), and a
+direct eval in an OWNER body can inject a `var` into a chain env (only before
+this body's run entry, which the same walk catches). `.notes/global-read-cells.md`
+carries the measured mod-vs-script swing for it (2.9 us/iter vs 7 ns).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
