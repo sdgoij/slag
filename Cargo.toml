@@ -46,3 +46,19 @@ default-members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+
+# The profile every published binary and every benchmarked build uses. With
+# cargo's default 16 codegen units, the package's source id feeds the partition
+# hash, so the *same source* built two ways is laid out differently and differs
+# by up to ~13% on native-dispatch paths — larger than any source change this
+# journal measures, and indistinguishable from a regression from the outside.
+# `codegen-units = 1` removes that freedom and `lto = "thin"` cross-crates the
+# hot paths on top of it. Measured on `--jit-bench` (medians of five runs; both
+# profiles built from the same tree): the interpreter column improves ~13% and
+# the JIT column ~3%, and the `slag` binary is ~2% smaller. Cost: the release
+# build roughly doubles, which the CI build job has the time budget for.
+# Note for measurements: this is part of the measurement environment now — A/B
+# two builds with the same profile, or the delta contains a layout confound.
+[profile.release]
+lto = "thin"
+codegen-units = 1

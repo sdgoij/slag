@@ -397,6 +397,12 @@ hot enough to justify the migration.
   are slower than this box by more than 15s covers, so the workflow sweeps
   at 30s/60s (see the comment there); that is a property of the runner, not
   a licence to relax a local run.
+- **Build both sides of an A/B with the same profile.** `[profile.release]`
+  pins `codegen-units = 1` + `lto = "thin"` (Cargo.toml) because at cargo's
+  default 16 codegen units the same source is partitioned and laid out
+  differently per build, which moves interpreter paths by up to ~13% — larger
+  than the deltas these notes record. Two binaries from different profiles
+  measure packaging, not code.
 
 ## Reference model — why V8 is fast and what Slag mirrors
 
@@ -9839,6 +9845,80 @@ direct gate — all green (`WeakRef` 29/29, `FinalizationRegistry` 47/47,
 23724 pass / 0 fail / 0 skip / 0 crash / 0 hang, built-ins 23658 / 0 / 154 / 0 /
 0, annexB 1086 / 0 / 0 / 0 / 0, with the JIT and with `--jitless`); four
 differential batteries byte-identical under jit / `--jitless` / `--gc-stress`.
+
+### LANDED (2026-09-16): the release profile is codegen-units = 1 + thin LTO
+
+`.notes/frame-cost-profile.md` (a client project's frame profile) traced a ±20%
+build-to-build spread on every path that enters native code — larger than any
+source change it could measure — to cargo's default partitioning: the package's
+source id feeds the codegen-unit hash, so the SAME source built two ways is
+split into different units, inlined differently and laid out differently.
+`[profile.release]` now pins `codegen-units = 1` and `lto = "thin"`, so the
+layout has no freedom left to exploit and the shipping binaries stop carrying
+the lottery.
+
+Measured: two profiles built from the same tree, `--jit-bench`, medians of five
+interleaved runs (ms; the parenthesised figure is the change):
+
+| row | interp 16 CGU | interp pinned | jit 16 CGU | jit pinned |
+|---|---|---|---|---|
+| `arithmetic` | 8.046 | 6.970 (-13.4%) | 0.607 | 0.608 (+0.1%) |
+| `bare loop` | 7.602 | 6.348 (-16.5%) | 0.598 | 0.604 (+1.1%) |
+| `property read` | 9.060 | 7.674 (-15.3%) | 0.753 | 0.758 (+0.7%) |
+| `string concat` | 1.239 | 1.122 (-9.5%) | 0.195 | 0.185 (-4.9%) |
+| `function calls` | 6.696 | 6.060 (-9.5%) | 0.860 | 0.833 (-3.1%) |
+| `builtin call` | 5.613 | 4.736 (-15.6%) | 2.446 | 2.282 (-6.7%) |
+| `non-leaf call` | 19.491 | 17.933 (-8.0%) | 13.479 | 12.413 (-7.9%) |
+| `global read` | 10.311 | 10.333 (+0.2%) | 1.379 | 1.377 (-0.2%) |
+| `compound assign` | 3.859 | 3.137 (-18.7%) | 1.553 | 1.543 (-0.6%) |
+| `buildString shape` | 91.503 | 71.808 (-21.5%) | 13.820 | 13.657 (-1.2%) |
+| `buildString full` | 72.386 | 63.478 (-12.3%) | 17.111 | 16.275 (-4.9%) |
+| `typed-array write` | 32.184 | 26.640 (-17.2%) | 12.378 | 12.530 (+1.2%) |
+| `typed-array length` | 11.646 | 11.913 (+2.3%) | 1.894 | 1.910 (+0.8%) |
+| `wide leaf call` | 21.419 | 25.853 (**+20.7%**) | 1.704 | 1.714 (+0.6%) |
+| `apply leaf call` | 21.785 | 20.161 (-7.5%) | 8.476 | 6.629 (-21.8%) |
+| **column sum** | **322.84** | **284.16 (-12.0%)** | **77.25** | **73.32 (-5.1%)** |
+
+The one row that moves the wrong way — `wide leaf call`, the 33-argument call
+shape — is the suite's noisiest (±20% within one binary). An isolated
+3M-iteration probe of the same shape measured 331 ms (16 CGU) vs 388 ms
+(pinned), +17.2%, with the pinned values tightly clustered; a LATER session
+(after three builds in the background) could not separate the arms at all
+(352 / 354 / 367 ms medians for 16-CGU-no-LTO / thin-LTO-16-CGU / thin-LTO-1-CGU,
+heavily overlapping), so the regression is neither confirmed as real nor
+attributed to one knob. Re-check it with the isolated probe on a quiet machine
+before acting on it; the column totals are what the profile change rests on, and
+they reproduce across two sessions (-12.8% and -12.0%).
+
+Cost: a `-p cli` release build 1m48s -> 3m57s, the `slag` binary 14,550,528 ->
+14,229,504 bytes (-2.2%), the release sweep runner ~2m43s — all well inside the
+CI jobs' budgets. Consumer builds are unaffected (cargo ignores a dependency's
+profile, so a client sets the same two keys itself, as the goat client does).
+
+The profile is now part of the measurement environment: every number in the
+README's two tables was re-measured under it, and the working rules gained the
+same-profile-A/B bullet above.
+
+Corpus (now 40 workloads, including the `globals` family): overall mean-jitGap
+34.05, mean-jlGap 5.11, mismatches 0. The `globals` trio is the cleanest
+measurement of the global-access gap so far (the declarative half of it is
+tracked in `.notes/global-read-cells.md`, which measured 63.5 ms for the same
+row at the old default profile — 52.5 is what the pinned profile gives):
+reading a top-level `const` in a hot loop costs **52.5 ms** where the same value
+hoisted into a local, or read through the global OBJECT, costs **2.5 ms** — 21x
+— with all three compiled.
+The value cell serves global object-record data properties; the global env's
+DECLARATIVE record is never warmed for it (which is why `globals/declarative_read`
+is 88x node while `globals/object_read` is 0.03x). The nested-body half of the
+same gap is `clean_chain`: it gates `LoadIdent`'s cell probe off for any body
+whose running env is not the bare global record, so a mod helper's global read
+takes the `load_ident` resolve per iteration (`.notes/frame-cost-profile.md`
+§4b has both, with the probes).
+
+Verification: `cargo test --locked --workspace` 4,888 pass / 0 fail; clippy
+`--workspace --all-targets -D warnings` and `cargo fmt --all -- --check` clean;
+`annexB` swept 1,086 / 1,086 pass, 0 fail / 0 hang with the release sweep
+runner rebuilt under the new profile.
 
 ## Deferred milestones
 
