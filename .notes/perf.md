@@ -188,6 +188,20 @@ measurement that killed or bounded it, and its disposition.
   the probe body running interpreted — the nested-body global reads this
   session's cell work closed — plus this 35 ns.
 
+- **"Batching the ~370 grass `drawCube`s is worth attacking"** (2026-09-16,
+  frame-profile §7.1 item 5). The crossing does not measurably grow with arity.
+  100k iterations, three runs each, both rows accumulating an integer:
+  `rl.getFPS()` 3.485 / 3.538 / 3.488 ms (35 ns) against
+  `rl.setBlendFactors(a, b, c)` 2.903 / 2.986 / 2.902 ms (29 ns) — three extra
+  scalars moved nothing (the two rows differ in their binding bodies, not in
+  their arity). Probes: `scratch/rlprobe/rl_0arg.js` vs `rl_3arg.js`, run with
+  `target/release/slag.exe --corpus scratch/rlprobe`. `drawCube` itself cannot
+  be probed headlessly: `rlBegin`/`rlVertex3f` dereference rlgl's render batch,
+  which is NULL until a GL context exists. So the item is 370 x 36 ns = **13 us,
+  0.08% of a 16.3 ms frame**, and a batched binding cannot remove the rest — the
+  8,880 vertices are pushed either way. The phase's remaining cost is the JS
+  grid walk, which §5b already cut 2.88 -> 1.78 ms.
+
 ### Measured-closed candidates (worth re-checking only on new evidence)
 
 - **The field-authoritative (Option 3) storage migration.** Rejected by
@@ -10191,6 +10205,55 @@ all four test262 areas at 15s/15s with the release binaries rebuilt — language
 built-ins 23,657 / 0, annexB 1,086 / 1,086, intl402 3,205 / 0, every area 0 crash /
 0 hang; wasm at its README totals (core 64,594 / 0, JS-API 1,001 / 0); corpus 0
 mismatches.
+
+### LANDED (2026-09-16): the GPU-skinning build switch
+
+Frame-profile §7.1 item 4. The herd (5.37–5.45 ms) and the player's own pose
+(0.78–0.80) are the only phases that moved in *none* of the four builds §6
+profiled, because that cost is real per-vertex work inside
+`UpdateModelAnimation` rather than crossing overhead. What makes the work happen
+is a raylib *build* flag, not anything the `rl` surface controls.
+
+`SUPPORT_GPU_SKINNING` (raylib's `config.h`, `0` by default) does three things at
+once: it uploads the `vertexBoneIndices`/`vertexBoneWeights` attributes, it skips
+allocating `mesh.animVertices`/`animNormals` at load, and — because
+`UpdateModelAnimationVertexBuffers` `continue`s per mesh when `animVertices` is
+NULL — it puts the per-frame deform loop and its two `rlUpdateVertexBuffer` calls
+out of reach. The bone matrices are still computed: `UpdateModelAnimation` fills
+`currentPose` and `boneMatrices` outside that guard, and `DrawModelEx` already
+uploads `boneMatrices` to the material shader whenever the shader declares the
+uniform (`LoadShaderFromMemory` maps it by name). The surface therefore needed
+no new binding at all — the whole of GPU skinning was wired through `rl`
+except the switch itself.
+
+Landed as the `gpu-skinning` cargo feature (`runtime`, passed through `slag` and
+`cli`), which passes `SUPPORT_GPU_SKINNING=ON` to raylib-sys's cmake, plus
+`rl.GPU_SKINNING` — a boolean constant, so a scene that ships one skinned shader
+for both builds can branch instead of assuming. The two comments that asserted
+"which is what `rl` ships" about CPU skinning now say "off in the default
+build", which is what they now mean.
+
+The price is that skinning moves into a shader the caller supplies: raylib's
+default shader declares no `boneMatrices`, so with the switch on an animated
+model left on the default material draws at its bind pose. A scene authors one
+skinned vertex shader (`loadShaderFromMemory`) and routes each model through it
+with `setModelShader`; the shadow pass needs the same declaration, since it draws
+the same meshes through its own shader.
+
+Verification: the flag reaches cmake and raylib recompiles
+(`SUPPORT_GPU_SKINNING:BOOL=ON` in raylib-sys's `CMakeCache.txt`);
+`cargo test -p runtime --features raylib --lib` and
+`--features raylib,gpu-skinning --lib` both pass 766 / 0, the new assertion keyed
+to `cfg!(feature = "gpu-skinning")` so it means something in both; clippy
+`-D warnings` clean on the default workspace and on
+`-p cli --all-targets --features raylib,raygui,gpu-skinning`.
+
+No millisecond figure is claimed. The engine repo ships no skinned model asset,
+and both `LoadModel` (mesh upload needs a GL context) and `updateModelAnimation`
+(the CPU path calls `rlUpdateVertexBuffer`) need a live window, so there is no
+in-repo probe for either side of the switch. What is claimed is the mechanism,
+and that the loop this document charged for `bots`/`goat_pose` does not exist in
+a `gpu-skinning` build.
 
 ## Deferred milestones
 

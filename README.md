@@ -187,7 +187,14 @@ or a decal lying on the ground — with `beginBlendMode`/`endBlendMode`
 The binding table in `crates/runtime/src/raylib.rs` is the authoritative
 surface list. Building with `raygui` as well (`--features raylib,raygui`)
 additionally installs raygui's immediate-mode controls (`rl.guiButton`,
-`rl.guiSlider`, ...) for UI inside the render loop. A script owns the whole render loop, exactly like a raylib C
+`rl.guiSlider`, ...) for UI inside the render loop. `--features gpu-skinning`
+moves skeletal animation off the CPU: raylib then uploads each mesh's bone
+attributes and leaves the per-vertex deform buffers unallocated, so
+`updateModelAnimation` only computes the bone matrices and the model's own
+shader does the skinning — route the model through one that declares
+`boneMatrices`, `vertexBoneIndices` and `vertexBoneWeights` (`setModelShader`),
+since raylib's default shader does not skin, and read `rl.GPU_SKINNING` to learn
+which way a build went. A script owns the whole render loop, exactly like a raylib C
 example — `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...;
 rl.endDrawing(); }`. raylib's window state is bound to the thread that
 installed the module; calls from worker agents throw a clean `TypeError`

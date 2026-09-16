@@ -36,3 +36,6 @@ raylib = ["runtime/raylib"]
 # The raygui control set (`rl.gui*`), a separate opt-in on top of `raylib`;
 # implies it so the host module is actually installed.
 raygui = ["raylib", "runtime/raygui"]
+# Skin animated models in the shader instead of on the CPU; implies `raylib`
+# and changes raylib's own build. See `runtime`'s `gpu-skinning`.
+gpu-skinning = ["raylib", "runtime/gpu-skinning"]

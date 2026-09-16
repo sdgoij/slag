@@ -86,6 +86,20 @@ raylib = ["dep:raylib-sys"]
 # raylib.rs. Implies `raylib`; a raygui build without the window/drawing
 # surface would have nothing to attach controls to.
 raygui = ["raylib", "raylib-sys/raygui"]
+# Skin on the GPU instead of the CPU. This is a raylib *build* switch, not a
+# runtime one, because it also decides the mesh layout at load: with
+# `SUPPORT_GPU_SKINNING` raylib uploads the two bone attributes
+# (`vertexBoneIndices`/`vertexBoneWeights`) and leaves `mesh.animVertices` and
+# `mesh.animNormals` NULL, so `updateModelAnimation` no longer deforms the mesh
+# every frame (it still fills `currentPose` and `boneMatrices`) and `drawModelEx`
+# feeds `boneMatrices` to the material shader.
+#
+# Callers must then route every animated model through a shader that declares
+# `boneMatrices`, `vertexBoneIndices` and `vertexBoneWeights` (see
+# `rl.setModelShader`); raylib's own default shader does not skin, so a model
+# left on it draws at its bind pose. `rl.GPU_SKINNING` reports which way this
+# build went.
+gpu-skinning = ["raylib", "raylib-sys/SUPPORT_GPU_SKINNING"]
 
 [dev-dependencies]
 # Compile `.wat` module text to wasm bytes for the JS-API tests (the same

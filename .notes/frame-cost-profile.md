@@ -65,6 +65,19 @@ build rather than the revision, which is itself the most actionable finding here
   engine (2026-09-16): the cache holds 1024 bodies before it evicts, and an
   evicted body re-earns the compile threshold instead of recompiling on the next
   call (~16× fewer recompiles under pressure).
+- **The herd is the one phase with an engine-side exit, and it is a build
+  switch rather than a call.** CPU skinning is only forced by raylib's
+  `SUPPORT_GPU_SKINNING=0`: with the switch on, the bone attributes are uploaded
+  and `mesh.animVertices` is never allocated, so `updateModelAnimation` stops
+  deforming the mesh every frame and `drawModelEx` feeds the already-computed
+  bone matrices to the material shader. The engine now exposes that as a cargo
+  feature (§7.1 item 4); the price is that the scene must supply a skinned
+  shader. Not re-measured here — see the item for why this repo cannot.
+- **The 370 grass crossings are not a lever: they cost ~13 µs.** A crossing is
+  29–36 ns and does not measurably grow with argument count, so the whole
+  batched-immediate-mode item is 0.08% of a 16.3 ms frame — and batching could
+  not remove more, because the 370 calls push the same vertices either way
+  (§7.1 item 5).
 
 ## 1. What was measured, and how
 
@@ -624,15 +637,66 @@ no sub-millisecond timer — see `.notes/perf.md` (2026-09-16).
    plus this 35 ns. Attack the call COUNT (item 5) or the work per call (item
    4), not the crossing. Measurements and the reproducible probe are in
    `.notes/perf.md` ("Premises falsified by probe").
-4. **GPU skinning.** CPU skinning is what makes the herd cost 5.4 ms and what
-   forces one model per goat (`updateModelAnimation` deforms the mesh itself, so
-   two goats cannot share one). Bone matrices as uniforms would collapse both the
-   cost and the memory.
-5. **A batched immediate-mode path.** ~370 `drawCube` crossings per frame for the
-   grass; anything that lets the scene submit N quads in one crossing (or a mesh
-   it can rebuild) removes them. Note that the JS *round* the draws is already
-   compiled-eligible after this session, so the remaining crossing cost is what is
-   left to attack.
+4. **GPU skinning — the blocker was a raylib build switch, not the `rl` surface
+   (landed 2026-09-16).** The draw-side plumbing was already there and was not
+   the problem: `LoadShaderFromMemory` maps a shader's `boneMatrices` uniform and
+   its `vertexBoneIndices`/`vertexBoneWeights` attributes, `UpdateModelAnimation`
+   already fills `model.boneMatrices`, and `DrawModelEx` already uploads them to
+   the material's shader. What was missing was the build: raylib compiled with
+   `SUPPORT_GPU_SKINNING=0` never uploads those two bone attribute buffers
+   (`UploadMesh`'s whole bone-attribute block sits inside that `#if`), so a
+   skinned shader would read a zeroed constant attribute — and it allocates
+   `mesh.animVertices`/`animNormals` at load, which is the *only* reason
+   `UpdateModelAnimationVertexBuffers` runs at all (it `continue`s per mesh when
+   `animVertices` is NULL). So both the per-frame vertex loop and the two VBO
+   re-uploads per model were a compile-time choice — one cargo feature away, with
+   no new binding to design.
+
+   Landed: `gpu-skinning` on `runtime` (passed through `slag` and `cli`) turns
+   `SUPPORT_GPU_SKINNING` on in raylib-sys's cmake, and `rl.GPU_SKINNING` reports
+   which way a build went so a scene can branch instead of assuming. The scene
+   side is one shader (`boneMatrices`, `vertexBoneIndices`, `vertexBoneWeights` —
+   the names raylib binds by default) routed in with `setModelShader`, plus the
+   same declaration in whatever shader the shadow pass draws the herd with;
+   raylib's default shader does not skin, so a skinned model left on it draws at
+   its bind pose. Memory falls too: no `animVertices`/`animNormals` per mesh, which
+   is what forced one model per goat.
+
+   What this does *not* ship is a number. `bots` (5.37–5.45) plus `goat_pose`
+   (0.78–0.80) is the CPU-skinning cost by this document's own accounting, and
+   the loop that produced it is gone in a `gpu-skinning` build — but the engine
+   repo has no skinned model asset and `updateModelAnimation` needs a live GL
+   context, so there is no in-repo probe that can re-measure those phases. The
+   confirmation has to come from the client's own frame; the engine side is
+   verified by the mechanism above, not by a stopwatch.
+5. **A batched immediate-mode path — measured-closed (2026-09-16).** The item
+   asked for anything that lets the scene submit the ~370 grass quads in one
+   crossing. Two measurements close it:
+
+   - **A crossing does not scale with argument count.** 100k-iteration probes,
+     three runs each, both accumulating an integer: `rl.getFPS()` 3.485 / 3.538 /
+     3.488 ms (35 ns) against `rl.setBlendFactors(a, b, c)` 2.903 / 2.986 / 2.902 ms
+     (29 ns). Three extra scalars moved nothing — the two rows differ in their
+     binding bodies, not in their arity, and `drawCube`'s seven
+     `num_arg`/`color_arg` extractions are scalar work of exactly that kind.
+     (`drawCube` cannot be probed directly: `rlBegin`/`rlVertex3f` dereference
+     rlgl's render batch, which is NULL until a GL context exists, so there is no
+     headless loop over the real call.)
+   - **So the whole item is 13 µs.** 370 x the top of that 29–36 ns band =
+     **0.08% of a 16.3 ms frame** — and batching cannot recover more than the
+     crossings, because the 370 calls push the same 8,880 vertices through rlgl
+     either way.
+
+   The item's second premise — "the JS round the draws is already
+   compiled-eligible after this session, so the remaining crossing cost is what
+   is left to attack" — predates the value-cell work it was written beside: §5b
+   already recovered the grass grid 2.88 -> 1.78 ms by taking the global reads out
+   of the walk, and the LTO table has `tufts` at 2.77–2.82. What is left in that
+   phase is the JS walk. Making it cheaper than that is the other half of this
+   item — "a mesh it can rebuild" — and that is a scene change the surface
+   already supports (`makeModel` + `drawModelEx`: one VBO draw instead of 370
+   CPU-submitted cubes), so it is §7.2 work and its win is vertex submission, not
+   the crossing.
 
 ### 7.2 Scene
 

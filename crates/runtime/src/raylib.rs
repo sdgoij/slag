@@ -902,8 +902,8 @@ fn load_model(args: &[Value]) -> Result<Value, JsError> {
     // Gate on the loaded mesh data rather than raylib's own `IsModelValid`:
     // that check additionally demands an uploaded VBO for every non-null mesh
     // attribute, and the bone buffers are only uploaded when
-    // `SUPPORT_GPU_SKINNING` is on — so it reports false for *every* skinned
-    // model in a CPU-skinning build (which is what `rl` ships).
+    // `SUPPORT_GPU_SKINNING` is on — off in the default build — so it reports
+    // false for *every* skinned model there.
     if model.meshes.is_null() || model.meshCount <= 0 {
         return Ok(Value::Number(-1.0));
     }
@@ -1158,9 +1158,9 @@ fn make_model(args: &[Value]) -> Result<Value, JsError> {
 ///
 /// This deliberately does *not* forward raylib's own `IsModelValid`: that check
 /// also requires an uploaded VBO for every non-null mesh attribute, and bone
-/// buffers are only uploaded under `SUPPORT_GPU_SKINNING`, so raylib reports
-/// every skinned model as invalid in the CPU-skinning build `rl` ships. The
-/// useful question for a script is whether the handle is a live model.
+/// buffers are only uploaded under `SUPPORT_GPU_SKINNING` — which the default
+/// build leaves off — so raylib reports every skinned model as invalid there.
+/// The useful question for a script is whether the handle is a live model.
 fn is_model_valid(args: &[Value]) -> Result<Value, JsError> {
     let handle = int_arg(args, 0, "isModelValid")?;
     let registry = MODELS.lock().unwrap();
@@ -3494,6 +3494,16 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         Value::Number(2.0),
     )?;
 
+    // Whether raylib was compiled with `SUPPORT_GPU_SKINNING` (the
+    // `gpu-skinning` feature). It is raylib's load-time choice — it decides
+    // whether the bone attributes are uploaded at all and whether
+    // `updateModelAnimation` deforms the mesh — so a scene that ships one
+    // skinned shader for both builds has to branch here rather than assume.
+    rl.create_data_property_or_throw(
+        &JsString::from_utf8("GPU_SKINNING"),
+        Value::Boolean(cfg!(feature = "gpu-skinning")),
+    )?;
+
     // Shader uniform data types (`ShaderUniformDataType` in raylib.h).
     for (name, code) in [
         ("SHADER_UNIFORM_FLOAT", 0),
@@ -3625,6 +3635,14 @@ mod tests {
                 .unwrap()
                 .as_boolean(),
             Some(true)
+        );
+        // The GPU-skinning build switch is reported, not assumed: it is
+        // raylib's compile-time choice, so the surface has to say which way
+        // this build went before a scene decides to route a model through a
+        // skinned shader.
+        assert_eq!(
+            context.eval("rl.GPU_SKINNING").unwrap().as_boolean(),
+            Some(cfg!(feature = "gpu-skinning"))
         );
         // Draw calls installed but need a live window, so only check shape.
         assert_eq!(
