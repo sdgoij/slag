@@ -252,14 +252,15 @@ pub struct JitCallContext {
     /// the descriptor layout for every instance of the shape, so a hit needs
     /// no per-object identity or generation).
     pub member_map_cells: *mut c_void,
-    /// Whether the body's env chain is EXACTLY the global env (no
-    /// intermediate envs): the compiled `LoadIdent` probe is sound only then
-    /// — a named function expression's self-binding scope, a block/catch
-    /// scope, a `with` object, or a module env could hold a binding of the
-    /// read name that shadows the global property the cell records.
-    /// Computed once per call — a certified body adds no envs mid-run (no
-    /// `with`/`eval` in its own statements).
-    pub clean_chain: bool,
+    /// Whether every name the body reads through the env chain
+    /// ([`CompiledBody::ident_names`]) resolves at the global environment
+    /// record — the compiled `LoadIdent` probe is sound only then, because a
+    /// cell hit returns the GLOBAL binding's value and the cell table is
+    /// shared by name across bodies (an intervening record could hold a
+    /// shadowing binding of that name). Computed once per call by
+    /// `Vm::global_reads_are_unshadowed` — a certified body adds no envs of its
+    /// own mid-run (no `with`/`eval` in its own statements).
+    pub globals_unshadowed: bool,
     /// One-past-the-end of the JIT's working buffer (in bytes): the
     /// compiled leaf-call probe checks the inline leaf's frame + working
     /// area fits above the current stack top before accepting.
@@ -1951,6 +1952,11 @@ extern "C" fn set_member_slot(ctx: *mut c_void, object: u64, name: u64, value: u
                 generation: obj.generation(),
                 value,
             };
+        // A GLOBAL object is additionally read through the name-keyed
+        // global-value cell, which validates by this same generation — the one
+        // thing this in-place store deliberately does not bump (see
+        // `Vm::refresh_global_read_cell`).
+        Vm::refresh_global_read_cell(agent, &obj, name, value);
         return value.bits();
     }
     // The narrow write declined. The common case on a FRESH constructor
@@ -4926,19 +4932,16 @@ pub(crate) fn run_jit_body(
     // cached on this Vm; the machine code re-reads its id/generation in
     // place, so a mid-run mutation invalidates the value cells).
     let global = vm.global_object(agent)?;
-    // The compiled `LoadIdent` probe is sound only when the body's env chain
-    // is EXACTLY the global env ([[Environment]] == the global object's
-    // record, no intermediate envs): any other env — a named function
-    // expression's self-binding scope, a block/catch scope, a `with` object,
-    // a module env — could hold a binding of the read name that shadows the
-    // global property the cell records. Certified top-level declarations
-    // have [[Environment]] == the global env; nested bodies fall back to
-    // the `load_ident` resolve. A certified body adds no envs mid-run (no
-    // `with`/`eval` in its own statements), so one walk at entry covers the
-    // whole run.
-    let clean_chain = {
+    // A compiled `LoadIdent` hit serves the global-value cell for the name, and
+    // that cell table is shared BY NAME across bodies — so the body's own reads
+    // must be unshadowed, not merely "the chain is the global env" (a nested
+    // body's wrapper could bind a name another body warmed the cell for).
+    // `Vm::global_reads_are_unshadowed` walks the chain once for exactly the
+    // names this body reads; a certified body adds no envs mid-run (no
+    // `with`/`eval` in its own statements), so one walk at entry covers the run.
+    let globals_unshadowed = {
         let current = agent.running_context()?.lexical_environment;
-        matches!(&*current, EnvRecord::Global(_)) && current.outer().is_none()
+        Vm::global_reads_are_unshadowed(current, &ir.ident_names)
     };
     // M10: the compiled `CallApply` fast path compares the member-read
     // result against the realm's intrinsic — snapshot the bits per run (a
@@ -4957,7 +4960,7 @@ pub(crate) fn run_jit_body(
         global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
         member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
         member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
-        clean_chain,
+        globals_unshadowed,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
         leaf_call_cache: [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES],
@@ -5166,9 +5169,12 @@ pub(crate) fn run_jit_resume(
     }
     let work_ptr = work.as_mut_ptr() as *mut c_void;
     let global = vm.global_object(agent)?;
-    let clean_chain = {
+    // See `run_jit_body`: a `LoadIdent` hit serves the global-value cell, whose
+    // table is shared by name across bodies, so the body's own reads must be
+    // unshadowed (walked once here, for the names this body reads).
+    let globals_unshadowed = {
         let current = agent.running_context()?.lexical_environment;
-        matches!(&*current, EnvRecord::Global(_)) && current.outer().is_none()
+        Vm::global_reads_are_unshadowed(current, &ir.ident_names)
     };
     // M10: see `run_jit_body` — the resumed body's `CallApply` sites compare
     // against the realm's intrinsic bits.
@@ -5186,7 +5192,7 @@ pub(crate) fn run_jit_resume(
         global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
         member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
         member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
-        clean_chain,
+        globals_unshadowed,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
         leaf_call_cache: [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES],
@@ -5577,6 +5583,7 @@ mod tests {
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             jit_evictions: std::cell::Cell::new(0),
+            ident_names: Vec::new(),
             has_loop,
             has_call_apply: false,
         })
@@ -5683,6 +5690,79 @@ mod tests {
         assert_ne!(
             refreshed.generation, warmed.generation,
             "the declarative write bumped the generation"
+        );
+    }
+
+    #[test]
+    fn global_reads_are_unshadowed_checks_each_name_against_the_chain() {
+        use crate::env::{
+            new_declarative_environment, new_global_environment, new_object_environment,
+        };
+        let object = crux::object::JsObject::ordinary_object_create(None);
+        let global = new_global_environment(object, object);
+        let x = crux::string::intern_utf8("x");
+        let y = crux::string::intern_utf8("y");
+        // The bare global record cannot shadow a read, and a body that reads no
+        // global through the chain has nothing to admit.
+        assert!(Vm::global_reads_are_unshadowed(global, &[x]));
+        assert!(!Vm::global_reads_are_unshadowed(global, &[]));
+        // A wrapper binding the name blocks THAT name's read, not another's.
+        // (A declared enclosing binding is compiled as a CAPTURE — a context
+        // slot — rather than a `LoadIdent`, so this shape does not actually
+        // reach the probe; the walk is exercised here for the mechanism, and
+        // the reachable shadow is a DYNAMIC one: an eval-injected `var`, or a
+        // `with` object's property.)
+        let wrapper = new_declarative_environment(Some(global));
+        wrapper
+            .create_mutable_binding(&crux::lookup(x), false)
+            .unwrap();
+        wrapper
+            .initialize_binding(&crux::lookup(x), Value::Number(2.0))
+            .unwrap();
+        assert!(!Vm::global_reads_are_unshadowed(wrapper, &[x]));
+        assert!(Vm::global_reads_are_unshadowed(wrapper, &[y]));
+        assert!(!Vm::global_reads_are_unshadowed(wrapper, &[x, y]));
+        // A `with` scope is refused even when it does not bind the name: its
+        // object can gain the property later without moving the global's
+        // generation, which is all the cell's validation reads.
+        let with_object = crux::object::JsObject::ordinary_object_create(None);
+        let with_env = new_object_environment(with_object, true, Some(wrapper));
+        assert!(!Vm::global_reads_are_unshadowed(with_env, &[y]));
+        // A chain that never reaches a global record is refused too.
+        let detached = new_declarative_environment(None);
+        assert!(!Vm::global_reads_are_unshadowed(detached, &[y]));
+    }
+
+    #[test]
+    fn a_nested_global_read_warms_the_value_cell() {
+        // A helper nested in another function is not on the bare global record,
+        // but its chain cannot shadow the name it reads as a global — so the
+        // gate has to admit it and the read has to warm the cell (it used to be
+        // refused for every nested body, at a resolve per read).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let name = crux::string::intern_utf8("Math");
+        let index = name as usize & (crate::ir::GLOBAL_CELLS - 1);
+        let value = agent
+            .run_script(
+                "function outer() { \
+                   function inner() { var s = 0; \
+                     for (var i = 0; i < 4; i++) { s += Math.PI; } \
+                     return s; } \
+                   return inner(); } \
+                 outer();",
+            )
+            .unwrap();
+        assert!(value.as_number().is_some(), "the nested loop ran");
+        let cell = agent.global_value_cells[index];
+        assert_eq!(
+            cell.name, name,
+            "the nested read warmed the global-value cell"
+        );
+        assert_ne!(
+            cell.slot,
+            u32::MAX,
+            "`Math` is an object-record binding, so the cell carries its slot"
         );
     }
 

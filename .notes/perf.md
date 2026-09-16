@@ -10072,6 +10072,80 @@ direct eval in an OWNER body can inject a `var` into a chain env (only before
 this body's run entry, which the same walk catches). `.notes/global-read-cells.md`
 carries the measured mod-vs-script swing for it (2.9 us/iter vs 7 ns).
 
+### LANDED (2026-09-16): a nested body reads globals through the cell too
+
+The other half of `frame-cost-profile.md` §7.1 item 1, and the half the client's
+scene actually pays: a body whose `[[Environment]]` is not the bare global record
+— every helper nested in a mod wrapper — could not use the global-value cell at
+all, because `LoadIdent`'s probe was gated on `clean_chain` ("the running env IS
+the global record"). §4b measured that at 163 ns/iter against 24 for the same
+body at top level, and the declarative work above does not touch it: with the gate
+false the probe is skipped entirely, warm cell or not.
+
+**The gate is now per name.** `CompiledBody` carries `ident_names` (the distinct
+`LoadIdent` atoms, collected with the other scans at compile time), and
+`Vm::global_reads_are_unshadowed` walks the body's chain once per run: no record
+before the global record may bind one of those names, a `with` record disqualifies
+the run outright, and the walk must actually reach a `Global` record. Any name
+failing is conservative for the whole run — that body keeps today's behaviour.
+A body on the bare global record answers without walking, so the top-level case
+is unchanged. The flag (`globals_unshadowed`, replacing `clean_chain` in `Vm`,
+`JitCallContext`, both `LoadIdent` arms and the LICM guard) keeps its single-bool
+shape, so no codegen change beyond the field rename.
+
+Why per name and not a chain-shape flag: the cell table is shared BY NAME across
+bodies, so another body may have warmed it for the GLOBAL binding of a name this
+body's chain shadows. The reachable shadow is a DYNAMIC one — an eval-injected
+`var`, or a `with` object's property. A statically declared enclosing binding is
+compiled as a capture (a context slot), so it never becomes a `LoadIdent`; the
+first cut of the regression test used exactly that shape and passed under a
+chain-shape-only gate, which is why the shipped test uses the `eval` form (and is
+verified to fail without the per-name check).
+
+Measured (corpus, 1M iterations):
+
+| workload | before | after |
+| --- | ---: | ---: |
+| `globals/nested_read.js` (jit) | 130.2 ms | **2.5 ms** |
+| `globals/nested_read.js` (`--jitless`) | 125.9 ms | **18.1 ms** |
+| `globals/object_read.js` (the same read, top level) | 2.5 ms | 2.5 ms |
+
+50x on the row, and all four `globals` workloads now measure the same 2.5 ms —
+the family is 2.07x over V8 (interpreter 0.83x) where it was 30.94x / 2.39x. The
+corpus overall on a 41-workload run (the new row is the 41st) is 30.34x / 4.94x,
+0 mismatches; the run-to-run spread on that mean is a few percent, and
+`objects/warm_store` — the row that exercises exactly the in-place store path the
+refresh touched — did not move (50.3 vs 50.6 ms before).
+
+**The relaxation exposed a store-side gap, which this change also fixes.** An
+in-place VALUE write deliberately does not bump the receiver's generation (the
+L1c no-bump discipline, `.agents/skills/slag-property-writes` §1), but the
+name-keyed global cell is validated BY that generation. So a member store to a
+global object — compiled `set_member_slot`, or the interpreter's L1a path — left
+the read cell serving the pre-write value. Before this change only bare-global
+chain bodies probed that cell; widening the probe set turned it into a visible
+bug: test262's `language/types/reference/get-value-prop-base-primitive-realm.js`
+(which reads a global through `eval` in a second realm, writes it with a member
+store, and reads again) started failing in one sweep, and an A/B against the old
+gate confirmed the change as the trigger. `Vm::refresh_global_read_cell` now
+fronts the fresh value at the unchanged generation from every in-place store path
+— `warm_store_put`, `warm_store_map_put`, `warm_store_fallback`'s deferred field
+write, `warm_store_direct_put` and the JIT's `set_member_slot`. Two extra compares
+per in-place write on an ordinary object (the cell's name and the receiver's id);
+structural changes still bump and invalidate normally, so nothing else moves.
+
+Verification of the refresh: `installed_jit_member_store_to_a_global_refreshes_
+the_read_cell` fails with the refresh stubbed out (the post-write read returns
+the pre-write value), and the fixture above passes again.
+
+Verification: `cargo test --locked --workspace` 4,900 pass / 0 fail; clippy
+`--workspace --all-targets -D warnings` and `cargo fmt --all -- --check` clean;
+all four test262 areas at 15s/15s with the release binaries rebuilt — language
+23,721 / 0 (back to baseline after the store fix; the run before it was 23,720 / 1),
+built-ins 23,657 / 0, annexB 1,086 / 1,086, intl402 3,205 / 0, every area 0 crash /
+0 hang; wasm at its README totals (core 64,594 / 0, JS-API 1,001 / 0); corpus 0
+mismatches.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

@@ -544,6 +544,7 @@ mod tests {
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             jit_evictions: std::cell::Cell::new(0),
+            ident_names: Vec::new(),
             has_loop: false,
             has_call_apply: false,
         }
@@ -710,7 +711,7 @@ mod tests {
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
-            clean_chain: false,
+            globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
             leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
@@ -1064,7 +1065,7 @@ mod tests {
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
-            clean_chain: false,
+            globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
             leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
@@ -1332,7 +1333,7 @@ mod tests {
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
-            clean_chain: false,
+            globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
             leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
@@ -1419,7 +1420,7 @@ mod tests {
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
-            clean_chain: false,
+            globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
             leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
@@ -1894,7 +1895,7 @@ mod tests {
         // primitive and the body cannot write it. Every soundness edge must
         // keep per-iteration semantics: a SHADOWING env (a closure created
         // inside a `with`, whose chain is not the global env — the
-        // `clean_chain` gate must miss so the shadowed value is read), an
+        // `globals_unshadowed` gate must miss so the shadowed value is read), an
         // object-valued global (per-iteration ToPrimitive), a global written
         // in the loop, an accessor global (the cell never warms), and a
         // counter-dependent RHS (only the read hoists).
@@ -1903,7 +1904,7 @@ mod tests {
         // generation and invalidates every value cell, so `mut`/`getter`
         // (which write globals) come last — before them the `gNum` cell is
         // warm, which is exactly what makes the shadowed read discriminating
-        // (a hoist that ignored `clean_chain` would read the global's 5).
+        // (a hoist that ignored `globals_unshadowed` would read the global's 5).
         let source = "var gNum = 5; var gStr = 'x'; var gObj = { valueOf: function () { return 2; } }; var gMut = 1; var gAcc = 0;\n\
                       Object.defineProperty(globalThis, 'gGetter', { get: function () { return ++gAcc; }, configurable: true });\n\
                       function warm(n) { var s = 0; for (var i = 0; i < n; i++) { s += gNum; } return s; }\n\
@@ -4585,6 +4586,125 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_member_store_to_a_global_refreshes_the_read_cell() {
+        // The compiled member-store fast path writes in place WITHOUT bumping
+        // the receiver's generation, and a global object is additionally read
+        // through the name-keyed global-value cell, which validates by that
+        // generation — so the store has to refresh that cell, or the read below
+        // serves the pre-write value. (`eval` bodies stay interpreted, so this
+        // is the interpreter's `LoadIdent` probing a cell a compiled store
+        // wrote; the same shape reaches a compiled reader — it is what
+        // `language/types/reference/get-value-prop-base-primitive-realm.js`
+        // caught across realms.)
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "globalThis.value = 1; \
+                     function read() { return eval('value'); } \
+                     function write(v) { for (var i = 0; i < 4; i++) { globalThis.value = v; } } \
+                     function run() { var a = read(); write(''); var check = globalThis.value; \
+                       var b = read(); \
+                       return (a === 1 ? 100 : 0) + (check === '' ? 10 : 0) \
+                              + (b === '' ? 1 : 0); } \
+                     run();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_number(),
+            Some(111.0),
+            "100 = pre-write read wrong, 10 = the write did not land, 1 = post-write read stale"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_nested_ident_read_is_not_served_from_a_shadowing_chain() {
+        // A DYNAMICALLY bound name in the chain is the hazard the per-name check
+        // exists for: `eval("var x = 5")` puts `x` into `outer`'s own env, which
+        // `inner`'s compile cannot see — so `inner` reads `x` as a `LoadIdent`,
+        // and serving it from one of the shared-by-name cells would return the
+        // GLOBAL 1 (warmed by `top`) instead of the injected 5. A gate that only
+        // checked the chain's shape (no `with`, reaches the global record) sees
+        // nothing wrong here.
+        //
+        // `run()` sequences the calls through LOCAL slots: a top-level
+        // `var b = top()` would write a global object slot and bump the
+        // generation, invalidating the cell the hazard needs to still be warm.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var x = 1; \
+                     function top() { var s = 0; for (var i = 0; i < 2; i++) { s += x; } return s; } \
+                     function outer() { eval('var x = 5'); \
+                       function inner() { var s = 0; for (var i = 0; i < 2; i++) { s += x; } return s; } \
+                       return inner(); } \
+                     function run() { var b = top(); var c = outer(); \
+                       return (b === 2 && c === 10) ? 1 : 0; } \
+                     run();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_number(),
+            Some(1.0),
+            "the eval-injected binding wins over the warmed global cell"
+        );
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_enclosing_declarations_are_captures_not_global_reads() {
+        // The static shape of the hazard above is not one: a name the wrapper
+        // DECLARES is compiled as a capture (a context slot) from the nested
+        // body, so it never becomes a `LoadIdent` and never consults the cell.
+        // Pinned so that if that ever changes, the cells cannot silently serve
+        // the global value instead.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var x = 1; \
+                     function top() { var s = 0; for (var i = 0; i < 2; i++) { s += x; } return s; } \
+                     function outer() { const x = 2; \
+                       function inner() { var s = 0; for (var i = 0; i < 2; i++) { s += x; } return s; } \
+                       return inner(); } \
+                     function run() { var a = outer(); var b = top(); var c = outer(); \
+                       return (a === 4 && b === 2 && c === 4) ? 1 : 0; } \
+                     run();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_number(),
+            Some(1.0),
+            "the wrapper's own binding wins over the warmed global cell"
+        );
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_nested_global_read_sees_a_callees_write() {
+        // A nested helper served from the cell must still observe a write to
+        // the global: the generation bump invalidates the cell mid-loop.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "var g = 1; \
+                     function bump() { g = 2; } \
+                     function outer() { \
+                       function inner() { var s = 0; \
+                         for (var i = 0; i < 3; i++) { if (i === 1) { bump(); } s += g; } \
+                         return s; } \
+                       return inner(); } \
+                     outer() === 5 ? 1 : 0;",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(1.0), "the callee's write is seen");
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_declarative_binding_invalidates_a_warmed_object_cell() {
         // `K` is first an OBJECT-record global (a plain property of the global
         // object), which warms the global-value cell; a LATER script declares
@@ -4640,8 +4760,8 @@ mod tests {
         // object shadows: its env chain contains a `with` scope, so the
         // compiled `LoadIdent` probe must be gated off (the cell for `x`
         // holds the global property's 1, not the with object's 2). The
-        // per-call `clean_chain` flag makes the probe miss to `load_ident`,
-        // which resolves through the with env.
+        // per-call `globals_unshadowed` flag makes the probe miss to
+        // `load_ident`, which resolves through the with env.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(

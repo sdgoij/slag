@@ -4195,9 +4195,9 @@ impl<'a> Lowerer<'a> {
                 // LICM: probe each invariant global's data cell; a hit with a
                 // non-object value stores it in the hidden slot, any miss
                 // jumps to the general per-iteration loop. An `env` read is
-                // only a global read when the body's env chain is exactly the
-                // global env (the `LoadIdent` fast-path gate), so gate the
-                // whole probe on the ctx's `clean_chain`.
+                // only a global read when the body's own reads are unshadowed
+                // (the `LoadIdent` fast-path gate), so gate the whole probe on
+                // the ctx's `globals_unshadowed`.
                 let miss = self.ensure_block(*target);
                 if *env {
                     let ctx = self.vm();
@@ -4205,7 +4205,9 @@ impl<'a> Lowerer<'a> {
                         types::I8,
                         MemFlagsData::new(),
                         ctx,
-                        Offset32::new(std::mem::offset_of!(JitCallContext, clean_chain) as i32),
+                        Offset32::new(
+                            std::mem::offset_of!(JitCallContext, globals_unshadowed) as i32
+                        ),
                     );
                     let clean_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, clean, 0);
                     let cont = self.builder.create_block();
@@ -5478,19 +5480,19 @@ impl<'a> Lowerer<'a> {
                 // — a name the scope analysis proved resolves at the global
                 // env). The compiled code probes the same direct-mapped
                 // global-value cell as `LoadGlobal`, gated on the ctx's
-                // `clean_chain` (the probe is sound only when the body's env
-                // chain is exactly the global env — any intermediate env
-                // could shadow a name the cell records), and falls back to
-                // the full `load_ident` resolve on a miss. `load_ident`
-                // warms the cell when it lands on a global object-record
-                // data property, so the second read of a hot loop hits the
+                // `globals_unshadowed` (a hit returns the GLOBAL binding's
+                // value, and the cell table is shared by name across bodies, so
+                // the body's own reads must not be shadowed by its chain), and
+                // falls back to the full `load_ident` resolve on a miss.
+                // `load_ident` warms the cell when it lands on the global
+                // environment record, so the second read of a hot loop hits the
                 // native load.
                 let ctx = self.vm();
                 let clean = self.builder.ins().load(
                     types::I8,
                     MemFlagsData::new(),
                     ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, clean_chain) as i32),
+                    Offset32::new(std::mem::offset_of!(JitCallContext, globals_unshadowed) as i32),
                 );
                 let global = self.builder.ins().load(
                     types::I64,

@@ -841,7 +841,7 @@ pub enum Step {
     /// loop-invariant; the non-object check keeps any later per-iteration
     /// coercion from re-entering user code. `env` reads are `BindingLoc::Env`
     /// names (resolved through the env chain) and additionally require the
-    /// body's chain to be exactly the global env (the ctx's `clean_chain`),
+    /// body's globals to be unshadowed (the ctx's `globals_unshadowed`),
     /// mirroring the `LoadIdent` fast path.
     HoistGlobalGuard {
         reads: Vec<(crux::AtomId, usize)>,
@@ -1680,6 +1680,14 @@ pub struct CompiledBody {
     /// recompiled on every frame once a program's working set exceeds the
     /// cache, and a small body compiles in ~0.4ms, which is a frame's budget.
     pub jit_evictions: std::cell::Cell<u32>,
+    /// The distinct names this body reads through the env chain
+    /// (`Step::LoadIdent`), in first-use order. [`Vm::global_reads_are_
+    /// unshadowed`] walks the body's chain once per run to check that none of
+    /// them is bound by an intervening record: a `LoadIdent` may be served
+    /// from the global-value cell, and that cell is shared BY NAME across
+    /// bodies, so the check has to be per name. Empty when the body reads no
+    /// global through the chain.
+    pub ident_names: Vec<crux::AtomId>,
     /// Cut 69: whether the body contains a loop (see [`body_has_loop`]).
     /// Loop bodies compile on first JIT use — they run once with many
     /// internal iterations, so a pure call-count threshold would never
@@ -2970,8 +2978,13 @@ pub struct Vm {
     /// global env (no intermediate envs), computed at run entry and valid
     /// only while the body adds no envs mid-run (`CompiledBody::env_constant`
     /// gates the `LoadIdent` fast path on it). Mirrors the JIT's
-    /// `JitCallContext::clean_chain`.
-    pub(crate) clean_chain: bool,
+    /// `JitCallContext::globals_unshadowed`.
+    /// Whether every name this body reads through the env chain resolves at
+    /// the global environment record for the whole run (`LoadIdent`'s cell
+    /// probe and the LICM guard gate on it). Computed once at run entry by
+    /// [`Vm::global_reads_are_unshadowed`]. Mirrors the JIT's
+    /// `JitCallContext::globals_unshadowed`.
+    pub(crate) globals_unshadowed: bool,
     /// The in-flight disposal of a scope's `using` resources at an
     /// async-disposal suspension: the VM suspends with `Suspension::Await`
     /// per async dispose, and `run_abrupt` resumes the driver.
@@ -3215,7 +3228,7 @@ impl Vm {
             env_stack: EnvStack::with_base(lexical_env),
             body_context: None,
             global: None,
-            clean_chain: false,
+            globals_unshadowed: false,
             completion: Value::Undefined,
             try_stack: Vec::new(),
             pending: Vec::new(),
@@ -3279,7 +3292,7 @@ impl Vm {
         self.env_stack.reset(lexical_env);
         self.body_context = None;
         self.global = None;
-        self.clean_chain = false;
+        self.globals_unshadowed = false;
         self.completion = Value::Undefined;
         self.try_stack.clear();
         self.pending.clear();
@@ -3693,6 +3706,50 @@ impl Vm {
             return None;
         }
         Some(cell.value)
+    }
+
+    /// Whether EVERY name of [`CompiledBody::ident_names`] resolves at the
+    /// global environment record from `env` — the precondition for serving a
+    /// body's `LoadIdent` reads from the global-value cell.
+    ///
+    /// The cell table is shared BY NAME across bodies, so the question is not
+    /// whether this body's chain is "clean" but whether the chain can shadow
+    /// any name the body reads: another body may have warmed the cell for the
+    /// name's GLOBAL binding, and a hit returns that value. One walk at run
+    /// entry answers it — a certified body creates no env of its own
+    /// (`env_constant`; `with`/`catch`/eval are scanner rejects), and no owner
+    /// body of a record in the chain can be running while this one is, so a
+    /// binding can only have appeared BEFORE this walk. An OBJECT record (a
+    /// `with` scope) is refused outright: its object can gain the property
+    /// later without moving the global's generation, which is all the cell's
+    /// validation reads.
+    pub(crate) fn global_reads_are_unshadowed(env: EnvRef, names: &[crux::AtomId]) -> bool {
+        if names.is_empty() {
+            return false;
+        }
+        // The common case: [[Environment]] IS the global record, so nothing can
+        // shadow a global read at all.
+        if matches!(&*env, EnvRecord::Global(_)) && env.outer().is_none() {
+            return true;
+        }
+        let mut current = env;
+        loop {
+            match &*current {
+                EnvRecord::Global(_) => return true,
+                EnvRecord::Object(_) => return false,
+                record => {
+                    for name in names {
+                        if record.has_binding(&crux::lookup(*name)).unwrap_or(true) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            match current.outer() {
+                Some(outer) => current = outer,
+                None => return false,
+            }
+        }
     }
 
     /// Read a declared top-level `var` directly off the global object: the
@@ -4627,6 +4684,27 @@ impl Vm {
         }
     }
 
+    /// An in-place VALUE write does not bump the receiver's generation (the L1c
+    /// discipline), and the name-keyed global-value cell is validated by exactly
+    /// that generation — so a write to a global object through a MEMBER store
+    /// would otherwise leave a global read (a compiled `LoadIdent`/`LoadGlobal`,
+    /// or the interpreter's mirror) serving the pre-write value. Refresh the
+    /// cell here, the way the compiled `StoreGlobal` does; the id compare keeps
+    /// an ordinary object's write at two compares. Structural changes
+    /// (define/delete/accessor conversion/map transition) bump through their own
+    /// paths and invalidate the cell normally.
+    pub(crate) fn refresh_global_read_cell(
+        agent: &mut Agent,
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+        value: Value,
+    ) {
+        let cell = &mut agent.global_value_cells[name as usize & (GLOBAL_CELLS - 1)];
+        if cell.name == name && cell.global_id == object.id() {
+            cell.value = value;
+        }
+    }
+
     /// The L1a warm-store fast path (a store-side cell mirroring the read
     /// cells, put_value's hot member-write path): a write to `base.name`
     /// whose cached (id, name, generation) matches stores directly into the
@@ -4697,6 +4775,7 @@ impl Vm {
             generation,
             value,
         };
+        Self::refresh_global_read_cell(agent, &object, name, value);
         true
     }
 
@@ -4749,6 +4828,7 @@ impl Vm {
             generation,
             value,
         };
+        Self::refresh_global_read_cell(agent, object, name, value);
         // Re-key the (id, name) cell for this object too, so the next store
         // to the SAME instance takes the cheaper identity probe (the value
         // write kept the generation, so the record is immediately valid).
@@ -4795,6 +4875,7 @@ impl Vm {
                     generation,
                     value,
                 };
+                Self::refresh_global_read_cell(agent, object, name, value);
                 return true;
             }
             return false;
@@ -4858,6 +4939,7 @@ impl Vm {
             generation,
             value,
         };
+        Self::refresh_global_read_cell(agent, object, name, value);
         let write_index = Self::member_write_cell_index(object.id(), name);
         agent.member_write_cells[write_index] = Some(MemberWriteCell {
             id: object.id(),
@@ -5772,19 +5854,17 @@ impl Vm {
         // catchable RangeError instead of overflowing the native stack (the
         // JIT side checks in `run_jit_body`).
         crate::stack::enter_js(agent)?;
-        // Cut 36 mirror: whether the running context's env chain is exactly
-        // the global env — a certified body's `LoadIdent` then resolves at
-        // the global env, so the read can serve the warmed global-value cell
-        // instead of walking the env chain per step (the `clean_chain` gate
-        // the JIT bakes into `JitCallContext`). Computed at run entry: only
-        // an `env_constant` body skips the per-step context sync, so the
-        // flag stays valid for the whole run there (the `LoadIdent` fast
-        // path gates on `body.env_constant`).
-        self.clean_chain = agent
+        // Cut 36 mirror: whether every name this body reads through the env
+        // chain resolves at the global env for the whole run — the read can
+        // then serve the warmed global-value cell instead of walking the env
+        // chain per step (the same flag the JIT bakes into `JitCallContext`).
+        // Computed at run entry: only an `env_constant` body skips the
+        // per-step context sync, so the flag stays valid for the whole run
+        // there (the `LoadIdent` fast path gates on `body.env_constant`).
+        self.globals_unshadowed = agent
             .running_context()
             .map(|context| {
-                let env = context.lexical_environment;
-                matches!(&*env, EnvRecord::Global(_)) && env.outer().is_none()
+                Self::global_reads_are_unshadowed(context.lexical_environment, &body.ident_names)
             })
             .unwrap_or(false);
         // GC-2: root this Vm and its compiled body for the run's duration —
@@ -5949,7 +6029,7 @@ impl Vm {
                     // global-object data property, so a hot loop's second read
                     // hits the native load).
                     if body.env_constant
-                        && self.clean_chain
+                        && self.globals_unshadowed
                         && let Some(value) = self.try_global_cell_read(agent, *name)
                     {
                         self.stack.push(value);
@@ -5959,7 +6039,7 @@ impl Vm {
                         crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
                     let value = crate::context::get_value(agent, &reference)?;
                     if body.env_constant
-                        && self.clean_chain
+                        && self.globals_unshadowed
                         && let crate::context::ReferenceBase::Environment(env) = &reference.base
                         && let EnvRecord::Global(_) = &**env
                     {
@@ -8213,9 +8293,9 @@ impl Vm {
                 Step::HoistGlobalGuard { reads, env, target } => {
                     // LICM: a once-per-loop global read guard — a data-cell hit
                     // with a non-object value is loop-invariant. An `Env` read
-                    // also needs the clean chain (the global env), exactly the
-                    // `LoadIdent` fast-path gate.
-                    let mut ok = !(*env) || self.clean_chain;
+                    // also needs the body's globals to be unshadowed, exactly
+                    // the `LoadIdent` fast-path gate.
+                    let mut ok = !(*env) || self.globals_unshadowed;
                     if ok {
                         for (name, hoist_slot) in reads {
                             match self.try_global_cell_read(agent, *name) {
@@ -12352,14 +12432,13 @@ impl Vm {
         // in place, so a mid-run mutation invalidates the value cells).
         let global = self.global_object(agent)?;
         // The compiled `LoadIdent` probe's env-chain gate (see
-        // `crate::jit::run_jit_body`): the probe is sound only when the
-        // body's env chain is exactly the global env — any intermediate env
-        // could shadow a name the global fast cell records. Leaf bodies
-        // never contain `LoadIdent` (`steps_are_leaf` excludes the
-        // reference machinery), so this is computed for uniformity only.
-        let clean_chain = {
+        // `crate::jit::run_jit_body`): a hit serves the global-value cell, so
+        // the body's reads must be unshadowed. Leaf bodies never contain
+        // `LoadIdent` (`steps_are_leaf` excludes the reference machinery), so
+        // this is computed for uniformity only.
+        let globals_unshadowed = {
             let current = agent.running_context()?.lexical_environment;
-            matches!(&*current, EnvRecord::Global(_)) && current.outer().is_none()
+            Vm::global_reads_are_unshadowed(current, &ir.ident_names)
         };
         // M10: a leaf body can contain a `CallApply` site (the step is not
         // call-excluded), so the compiled site needs the realm's intrinsic
@@ -12378,7 +12457,7 @@ impl Vm {
             global_value_cells: agent.global_value_cells.as_ptr() as *mut std::os::raw::c_void,
             member_value_cells: agent.member_value_cells.as_ptr() as *mut std::os::raw::c_void,
             member_map_cells: agent.member_map_cells.as_ptr() as *mut std::os::raw::c_void,
-            clean_chain,
+            globals_unshadowed,
             buf_end: (buf.as_ptr() as usize + std::mem::size_of_val(buf))
                 as *mut std::os::raw::c_void,
             leaf_epoch: 0,
@@ -16728,8 +16807,8 @@ impl Compiler {
         // loop never writes; a call could write it, but the purity scan forbids
         // calls). A `BindingLoc::Env` name is a dynamic resolve — hoistable only
         // when no env-changing step precedes the loop (`!env_changing`, checked
-        // as of this point in the body), so the entry-time `clean_chain` is
-        // still accurate when the guard runs.
+        // as of this point in the body), so the entry-time `globals_unshadowed`
+        // is still accurate when the guard runs.
         let mut prim_slots: Vec<usize> = Vec::new();
         let mut globals: Vec<(crux::AtomId, bool)> = Vec::new();
         for name in &scan.value_names {
@@ -20988,6 +21067,21 @@ pub(crate) fn body_has_call_apply(steps: &[Step]) -> bool {
         .any(|step| matches!(step, Step::CallApply { .. }))
 }
 
+/// The distinct names a body reads through the env chain (`Step::LoadIdent`),
+/// in first-use order: what [`Vm::global_reads_are_unshadowed`] has to check
+/// before the global-value cell may serve those reads.
+pub(crate) fn collect_ident_names(steps: &[Step]) -> Vec<crux::AtomId> {
+    let mut names: Vec<crux::AtomId> = Vec::new();
+    for step in steps {
+        if let Step::LoadIdent { name } = step
+            && !names.contains(name)
+        {
+            names.push(*name);
+        }
+    }
+    names
+}
+
 /// Cut 25: whether `step` is safe to run on the CALLER's Vm (a certified
 /// body whose every step allows it is a *leaf* — see [`CompiledBody::leaf`]).
 /// Every step that re-enters the VM with a fresh frame (calls/constructs),
@@ -22406,6 +22500,7 @@ pub fn compile_body(
     };
     let has_loop = body_has_loop(&compiler.steps);
     let has_call_apply = body_has_call_apply(&compiler.steps);
+    let ident_names = collect_ident_names(&compiler.steps);
     Ok((
         CompiledBody {
             steps: compiler.steps,
@@ -22421,6 +22516,7 @@ pub fn compile_body(
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             jit_evictions: std::cell::Cell::new(0),
+            ident_names,
             has_loop,
             has_call_apply,
         },
@@ -22484,6 +22580,7 @@ pub fn compile_statements(
     compiler.resolve();
     let has_loop = body_has_loop(&compiler.steps);
     let has_call_apply = body_has_call_apply(&compiler.steps);
+    let ident_names = collect_ident_names(&compiler.steps);
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
@@ -22500,6 +22597,7 @@ pub fn compile_statements(
         jit_info: std::cell::Cell::new(0),
         jit_calls: std::cell::Cell::new(0),
         jit_evictions: std::cell::Cell::new(0),
+        ident_names,
         has_loop,
         has_call_apply,
     })
@@ -24793,7 +24891,8 @@ struct MemberHoistPlan<'a> {
     prim_slots: Vec<usize>,
     exprs: Vec<&'a Expr>,
     /// Invariant global reads to hoist: `(name, env)` — `env` marks a
-    /// `BindingLoc::Env` name (a dynamic resolve, gated on `clean_chain`).
+    /// `BindingLoc::Env` name (a dynamic resolve, gated on
+    /// `globals_unshadowed`).
     globals: Vec<(crux::AtomId, bool)>,
 }
 

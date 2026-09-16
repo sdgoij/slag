@@ -37,7 +37,11 @@ build rather than the revision, which is itself the most actionable finding here
   bindings, nested loops and `continue` are all fine. Our scene hangs off `rl.*`
   and `TUNING`, so its kernels pay the resolve path on every read. **(b) landed
   2026-09-16** — a declarative read now hits the cell (52.5 ms → 2.5 ms in the
-  corpus); **(a) is open**, and it is the one the mod helpers pay.
+  corpus); **(a) landed 2026-09-16 too** — the gate is per name now, so a nested
+  helper reads a global at top-level speed (130 ms → 2.5 ms per 1M reads). The
+  freeze-into-a-captured-`const` workarounds below still pay (a context slot is
+  cheaper than any cell), but they are no longer the difference between 24 and
+  163 ns a read.
 - **Removing global reads from three hot bodies recovered 2.1–2.3 ms/frame**: the
   grass grid 2.88 → 1.78 ms (`shadow_grass` 0.53 → 0.36), the goat collision
   resolve 0.49 → 0.22 ms, and the birds mod (0.70 → 0.47–0.53 update, 0.68 →
@@ -285,9 +289,13 @@ value cell does not cover.**
 > is warmed for a declarative binding too (load-only, validated by a generation
 > the global environment bumps on every declarative mutation), which takes the
 > corpus row from 52.5 ms to 2.5 ms and closes the 21x gap. The nested-body half
-> (`clean_chain`) is still open and is the one this scene pays — see
-> `.notes/perf.md`'s 2026-09-16 entry for why it needs a per-name, per-run
-> verdict rather than a chain-shape flag.
+> (`clean_chain`) landed the same day: the probe's gate is now per name, walked
+> once per run against the body's `LoadIdent` names, so a mod helper's global
+> read costs what a top-level one does (130 ms → 2.5 ms per 1M reads). That
+> change also exposed and fixed a store-side gap — an in-place member write to a
+> global object does not bump the generation the read cell validates, so the
+> write now refreshes the cell directly. `.notes/perf.md`'s 2026-09-16 entries
+> have both, including the hazard that forced the per-name verdict.
 >
 > Re-measure before sizing the win: the rows above are from a pin that is not
 > `main`, built at cargo's default profile, and the `LoadIdent` cell probe is
@@ -581,16 +589,15 @@ compiles today. Two local gaps, both measured — one closed, one open:
   30.9x → 2.8x. No scene change needed (our `TUNING` is a mod-wrapper
   `const`, i.e. already a context slot), but every top-level binding in a
   bundled script now reads like a local. `.notes/perf.md` (2026-09-16).
-- **Open: the `clean_chain` gate**, which skips `LoadIdent`'s cell probe for
-  any body whose env is not the bare global record — i.e. every helper
-  nested inside a mod wrapper. Measured: **163 ns/iter vs ~24** for the same
-  body at top level. The declarative fix above does not help it (with
-  `clean_chain` false the probe is skipped entirely), and it is the half this
-  scene pays on `rl.*`/`Math` reads inside mod functions. It needs a
-  per-name, per-run verdict rather than a chain-shape flag — the cell table
-  is shared by name across bodies, so "this body's chain is closed" would let
-  a nested body read the global value of a name its own wrapper env binds.
-  `.notes/perf.md`'s 2026-09-16 entry has the hazard list.
+- **Landed (2026-09-16): the `clean_chain` gate**, which skipped
+  `LoadIdent`'s cell probe for any body whose env is not the bare global
+  record — i.e. every helper nested inside a mod wrapper, where §4b measured
+  **163 ns/iter vs ~24**. The gate is per name now (a once-per-run walk over
+  the names the body reads), so the same read measures 2.5 ms per 1M in the
+  corpus for both shapes. This is the half the scene paid on `rl.*`/`Math`
+  reads inside mod functions. One caveat to expect: the relaxation also had to
+  fix a store-side gap it exposed (an in-place member write to a global
+  left the read cell stale) — see `.notes/perf.md` (2026-09-16).
 2. **The calling-pattern dependence (§4b) — resolved (2026-09-16): it was the
 JIT cache.** A ~9 µs/call burst body costing ~226 µs/call once per frame was
 the cache recompiling what it had just evicted: the app's body set exceeds

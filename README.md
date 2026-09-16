@@ -375,48 +375,51 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 36.08x | 5.65x |
-| builtins | 5 | 15.09x | 5.99x |
-| calls | 6 | 22.15x | 4.91x |
-| control | 5 | 67.40x | 6.40x |
-| globals | 3 | 2.82x | 0.92x |
-| language | 3 | 14.26x | 7.75x |
-| objects | 7 | 44.94x | 3.08x |
-| strings | 5 | 24.14x | 6.15x |
-| **All** | **40** | **31.21x** | **5.09x** |
+| arrays | 6 | 30.72x | 5.83x |
+| builtins | 5 | 15.06x | 5.98x |
+| calls | 6 | 22.83x | 4.80x |
+| control | 5 | 67.99x | 6.32x |
+| globals | 4 | 2.07x | 0.83x |
+| language | 3 | 10.56x | 7.29x |
+| objects | 7 | 48.59x | 3.11x |
+| strings | 5 | 25.44x | 6.05x |
+| **All** | **41** | **30.34x** | **4.94x** |
 
-A sample of the per-workload rows (the command above prints all 40), ms per
+A sample of the per-workload rows (the command above prints all 41), ms per
 `bench()` call:
 
 | Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
 |---|---|---|---|---|---|---|
-| `arrays/for_of_dense.js` | 34.5 | 59.2 | 1.8 | 66.8 | 18.92x | 0.89x |
-| `arrays/typed_array.js` | 110.3 | 177.9 | 1.2 | 40.9 | 93.68x | 4.35x |
-| `builtins/json_roundtrip.js` | 78.9 | 82.4 | 13.7 | 16.1 | 5.75x | 5.13x |
-| `builtins/math_intrinsics.js` | 47.9 | 76.0 | 156.9 | 192.8 | 0.31x | 0.39x |
-| `calls/direct_leaf.js` | 10.5 | 86.3 | 1.3 | 38.6 | 8.29x | 2.24x |
-| `calls/recursive_fib.js` | 272.8 | 373.6 | 7.8 | 34.0 | 35.03x | 10.99x |
-| `control/generator_loop.js` | 77.6 | 88.7 | 2.5 | 9.5 | 31.19x | 9.37x |
-| `globals/declarative_read.js` | 2.5 | 17.0 | 0.6 | 12.5 | 4.21x | 1.35x |
-| `globals/hoisted_local.js` | 2.5 | 16.9 | 0.6 | 13.5 | 4.23x | 1.25x |
-| `globals/object_read.js` | 2.5 | 16.7 | 87.1 | 101.1 | 0.03x | 0.16x |
-| `objects/destructure.js` | 189.2 | 245.2 | 0.8 | 50.1 | 225.83x | 4.89x |
-| `objects/own_read.js` | 3.0 | 33.5 | 1.3 | 49.1 | 2.20x | 0.68x |
-| `objects/warm_store.js` | 50.6 | 105.9 | 2.5 | 54.0 | 20.56x | 1.96x |
-| `strings/char_ops.js` | 23.1 | 29.0 | 0.4 | 5.7 | 56.56x | 5.11x |
+| `arrays/for_of_dense.js` | 34.8 | 57.0 | 2.0 | 62.1 | 17.39x | 0.92x |
+| `arrays/typed_array.js` | 92.5 | 188.8 | 1.2 | 48.2 | 78.96x | 3.92x |
+| `builtins/json_roundtrip.js` | 77.4 | 83.9 | 17.9 | 15.7 | 4.33x | 5.33x |
+| `builtins/math_intrinsics.js` | 48.1 | 72.1 | 153.8 | 187.9 | 0.31x | 0.38x |
+| `calls/direct_leaf.js` | 10.3 | 85.2 | 1.1 | 37.9 | 9.02x | 2.25x |
+| `calls/recursive_fib.js` | 281.5 | 371.2 | 7.4 | 34.7 | 37.80x | 10.70x |
+| `control/generator_loop.js` | 79.6 | 89.4 | 2.4 | 9.4 | 33.18x | 9.49x |
+| `globals/declarative_read.js` | 2.5 | 18.2 | 0.6 | 12.6 | 4.09x | 1.45x |
+| `globals/hoisted_local.js` | 2.5 | 17.8 | 0.6 | 11.8 | 4.11x | 1.51x |
+| `globals/nested_read.js` | 2.5 | 18.3 | 88.3 | 104.1 | 0.03x | 0.18x |
+| `globals/object_read.js` | 2.4 | 18.1 | 83.3 | 97.5 | 0.03x | 0.19x |
+| `objects/destructure.js` | 191.7 | 251.3 | 0.8 | 48.8 | 246.63x | 5.16x |
+| `objects/own_read.js` | 3.0 | 32.7 | 1.3 | 49.1 | 2.35x | 0.67x |
+| `objects/warm_store.js` | 50.3 | 105.1 | 2.4 | 52.8 | 21.23x | 1.99x |
+| `strings/char_ops.js` | 24.0 | 28.6 | 0.4 | 5.6 | 64.32x | 5.11x |
 
-The `globals` trio is the one family that is a controlled experiment rather
+The `globals` family is the one family that is a controlled experiment rather
 than a workload: the same loop reading the same value as a top-level `const`
-(`declarative_read`), hoisted into a local first (`hoisted_local`), and read
-through the global object (`object_read`). All three now measure the same
-2.5 ms — the value cell serves the declarative binding like any other global,
-which closed a 21x gap: the read used to cost 52.5 ms because the cell was
-never warmed for the global env's declarative record. A declarative binding has
-no property slot, so its cell is load-only, and it stays valid because the
+(`declarative_read`), hoisted into a local first (`hoisted_local`), read through
+the global object (`object_read`), and read through the same global object from a
+helper nested inside another function (`nested_read` — the shape a mod's kernels
+have). All four now measure the same 2.5 ms. Two gaps are closed there: the cell
+was never warmed for the global env's declarative record (a top-level `const`
+cost 52.5 ms — 21x), and it was never *probed* from a body whose env chain was
+not the bare global record (a nested helper's global read cost 130.2 ms per 1M
+reads — 50x). A declarative cell is load-only, and both stay valid because the
 global environment bumps the global object's generation on every declarative
-mutation (a `let` write, a later script's declaration) — which is what the
-cell's validation reads in the first place. See `.notes/frame-cost-profile.md`
-§4b.
+mutation, and because an in-place member write to a global refreshes the cell
+(the in-place store deliberately does not bump). See
+`.notes/frame-cost-profile.md` §4b.
 
 Read the gaps as "where the work is", not as a verdict on the engine shape:
 the corpus's own README records the workloads V8 folds or scalar-evolves to a
