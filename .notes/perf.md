@@ -10240,20 +10240,42 @@ skinned vertex shader (`loadShaderFromMemory`) and routes each model through it
 with `setModelShader`; the shadow pass needs the same declaration, since it draws
 the same meshes through its own shader.
 
-Verification: the flag reaches cmake and raylib recompiles
-(`SUPPORT_GPU_SKINNING:BOOL=ON` in raylib-sys's `CMakeCache.txt`);
-`cargo test -p runtime --features raylib --lib` and
-`--features raylib,gpu-skinning --lib` both pass 766 / 0, the new assertion keyed
-to `cfg!(feature = "gpu-skinning")` so it means something in both; clippy
-`-D warnings` clean on the default workspace and on
-`-p cli --all-targets --features raylib,raygui,gpu-skinning`.
+A model that cannot be routed through such a shader — a mod's, or one whose
+shader failed to compile — gets the CPU pass back for itself:
+`rl.setModelCpuSkinning(model, true)` allocates the two anim buffers and seeds
+them from the bind pose exactly as a CPU-skinning build's loader would, so the
+model behaves like one loaded there from then on, and `false` frees them again.
+`false` is refused when the build has no GPU path to fall back on (with the
+switch off the bone attributes are never uploaded, so no shader could skin the
+mesh in the CPU pass's place), which is what keeps a model from being left
+unskinnable by accident. Meshes without bone data are skipped: raylib's deform
+pass wants weights and indices before it looks at the anim pair, so there is
+nothing to allocate for a mesh it would never deform.
+
+That hatch is the one part of this change a test can hold. The surface test
+builds a synthetic skinned mesh — bone data present, anim pair absent, which is
+the shape a `gpu-skinning` loader leaves behind — and asserts the seeded
+contents, the idempotence, the bone-data guard and the per-build answer on
+`false`; it needs no GL context because nothing is uploaded or deformed, and it
+was verified to fail with the seed stubbed to a null source (0.0 against the
+expected 1.0).
 
 No millisecond figure is claimed. The engine repo ships no skinned model asset,
 and both `LoadModel` (mesh upload needs a GL context) and `updateModelAnimation`
-(the CPU path calls `rlUpdateVertexBuffer`) need a live window, so there is no
-in-repo probe for either side of the switch. What is claimed is the mechanism,
-and that the loop this document charged for `bots`/`goat_pose` does not exist in
-a `gpu-skinning` build.
+(the CPU path calls `rlUpdateVertexBuffer`) need a live window, so no in-repo
+probe can observe the loader's or the deform pass's half of the switch. What is
+claimed is the mechanism, and that the loop this document charged for
+`bots`/`goat_pose` does not exist in a `gpu-skinning` build.
+
+Verification: the flag reaches cmake and raylib recompiles
+(`SUPPORT_GPU_SKINNING:BOOL=ON` in raylib-sys's `CMakeCache.txt`);
+`cargo test --locked --workspace` 4900 pass / 0 fail;
+`cargo test -p runtime --features raylib --lib` and
+`--features raylib,gpu-skinning --lib` both pass 766 / 0, with the new assertions
+keyed to `cfg!(feature = "gpu-skinning")` so they mean something in both; clippy
+`-D warnings` clean on the default workspace and on
+`-p cli --all-targets --features raylib,raygui,gpu-skinning`; `cargo fmt --all --
+--check` clean.
 
 ## Deferred milestones
 

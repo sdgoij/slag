@@ -372,6 +372,16 @@ fn int_arg(args: &[Value], index: usize, name: &str) -> Result<i32, JsError> {
     Ok(num_arg(args, index, name)? as i32)
 }
 
+/// A `true`/`false` argument, taken strictly. The rest of the surface refuses a
+/// value of the wrong kind rather than coercing it, and a switch that flipped on
+/// because a number or a string was passed would be worse than a `TypeError`.
+fn bool_arg(args: &[Value], index: usize, name: &str) -> Result<bool, JsError> {
+    match args.get(index).map(Value::kind) {
+        Some(ValueKind::Boolean(value)) => Ok(value),
+        _ => Err(expected(name, index, "a boolean")),
+    }
+}
+
 fn text_arg(args: &[Value], index: usize, name: &str) -> Result<CString, JsError> {
     match args.get(index).map(Value::kind) {
         Some(ValueKind::String(text)) => CString::new(text.to_string_lossy()).map_err(|_| {
@@ -1018,6 +1028,31 @@ fn mem_alloc_u16(values: &[f64]) -> *mut u16 {
     }
 }
 
+/// Allocate `count` `f32`s from raylib's allocator and fill them from `source`,
+/// or with zeroes when `source` is null. The loaders `RL_CALLOC` their anim
+/// buffers and then copy the bind pose in, so a mesh with no normals ends up
+/// with a zeroed buffer rather than whatever the allocator handed back.
+fn alloc_seeded_f32(source: *const f32, count: usize) -> Option<*mut f32> {
+    if count == 0 {
+        return None;
+    }
+    let bytes = alloc_bytes(count, std::mem::size_of::<f32>())?;
+    // SAFETY: `MemAlloc` returns a block of `bytes` bytes or null; the copy and
+    // the zero fill both stay inside it.
+    unsafe {
+        let pointer = raylib_sys::MemAlloc(bytes).cast::<f32>();
+        if pointer.is_null() {
+            return None;
+        }
+        if source.is_null() {
+            std::ptr::write_bytes(pointer, 0, count);
+        } else {
+            std::ptr::copy_nonoverlapping(source, pointer, count);
+        }
+        Some(pointer)
+    }
+}
+
 /// Build a model from raw vertex arrays.
 ///
 /// `vertices` is a required flat `[x, y, z, ...]` list. `indices` (a flat
@@ -1434,6 +1469,99 @@ fn update_model_animation(args: &[Value]) -> Result<Value, JsError> {
     // SAFETY: window-thread guard; the model and animation stay alive in the
     // registry, and this only rewrites the model's pose buffers.
     unsafe { raylib_sys::UpdateModelAnimation(model, animation, frame) };
+    Ok(Value::Undefined)
+}
+
+/// Hand one mesh to raylib's CPU deform pass, or take it back from it.
+///
+/// A mesh without bone weights or indices is left alone: `UpdateModelAnimationVertexBuffers`
+/// requires both, plus both anim buffers, before it will touch a mesh, so there
+/// is nothing to allocate for one it would never deform.
+fn set_mesh_cpu_skinning(mesh: &mut Mesh, enabled: bool) -> Result<(), JsError> {
+    if mesh.boneWeights.is_null() || mesh.boneIndices.is_null() || mesh.vertexCount <= 0 {
+        return Ok(());
+    }
+    if !enabled {
+        // SAFETY: each pointer is either null or a block from raylib's own
+        // allocator -- put there by this function below, since the loaders skip
+        // these buffers entirely in a GPU-skinning build -- and freeing null is
+        // a no-op.
+        unsafe {
+            raylib_sys::MemFree(mesh.animVertices.cast());
+            raylib_sys::MemFree(mesh.animNormals.cast());
+        }
+        mesh.animVertices = std::ptr::null_mut();
+        mesh.animNormals = std::ptr::null_mut();
+        return Ok(());
+    }
+    let count = mesh.vertexCount as usize * 3;
+    let out_of_memory = || {
+        JsError::new(
+            ErrorKind::RangeError,
+            "rl.setModelCpuSkinning: could not allocate the mesh's animation buffers".to_string(),
+        )
+    };
+    let mut allocated_vertices = false;
+    if mesh.animVertices.is_null() {
+        mesh.animVertices = alloc_seeded_f32(mesh.vertices, count).ok_or_else(out_of_memory)?;
+        allocated_vertices = true;
+    }
+    if mesh.animNormals.is_null() {
+        match alloc_seeded_f32(mesh.normals, count) {
+            Some(pointer) => mesh.animNormals = pointer,
+            // Put the mesh back the way it was: raylib needs both buffers, so
+            // half a pair would only be memory the deform pass never reads.
+            None => {
+                if allocated_vertices {
+                    // SAFETY: allocated by this function a moment ago.
+                    unsafe { raylib_sys::MemFree(mesh.animVertices.cast()) };
+                    mesh.animVertices = std::ptr::null_mut();
+                }
+                return Err(out_of_memory());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Give `model` back its CPU-skinning deformation buffers, or drop them.
+///
+/// A `gpu-skinning` build loads every skinned mesh without
+/// `mesh.animVertices`/`animNormals`, which is what lets `updateModelAnimation`
+/// skip the per-vertex deform pass -- but it also means the model is only drawn
+/// correctly through a shader that skins it. This is the per-model way back:
+/// `true` allocates the two buffers and seeds them from the bind pose exactly as
+/// a loader would in a CPU-skinning build, so from then on the model behaves
+/// like one loaded there, and `false` frees them again. Both are idempotent.
+///
+/// `false` is refused where raylib was not built with `SUPPORT_GPU_SKINNING`:
+/// without it the bone attributes are never uploaded, so no shader can take the
+/// CPU pass's place and the mesh would draw at its bind pose.
+///
+/// A model whose meshes cannot be allocated reports a `RangeError`; the meshes
+/// handled before it keep whatever state they reached, which each mesh owns
+/// independently anyway (raylib deforms them one at a time).
+fn set_model_cpu_skinning(args: &[Value]) -> Result<Value, JsError> {
+    let name = "setModelCpuSkinning";
+    let enabled = bool_arg(args, 1, name)?;
+    let model = model_arg(args, 0, name)?;
+    if !enabled && !cfg!(feature = "gpu-skinning") {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "rl.{name}: this build has no GPU skinning to fall back on; rebuild with the `gpu-skinning` feature"
+            ),
+        ));
+    }
+    if model.meshes.is_null() || model.meshCount <= 0 {
+        return Ok(Value::Undefined);
+    }
+    for index in 0..model.meshCount as usize {
+        // SAFETY: the registry owns `meshCount` meshes for as long as the model
+        // is loaded, and the window-thread guard keeps this the only writer.
+        let mesh = unsafe { &mut *model.meshes.add(index) };
+        set_mesh_cpu_skinning(mesh, enabled)?;
+    }
     Ok(Value::Undefined)
 }
 
@@ -3374,6 +3502,7 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
         ("modelAnimationFrameCount", 2, model_animation_frame_count),
         ("modelAnimationDuration", 2, model_animation_duration),
         ("updateModelAnimation", 3, update_model_animation),
+        ("setModelCpuSkinning", 2, set_model_cpu_skinning),
         ("modelBonePosition", 2, model_bone_position),
         ("modelBoneTransform", 2, model_bone_transform),
         ("loadShaderFromMemory", 2, load_shader_from_memory),
@@ -3812,6 +3941,7 @@ mod tests {
             "modelAnimationFrameCount",
             "modelAnimationDuration",
             "updateModelAnimation",
+            "setModelCpuSkinning",
             "modelBonePosition",
             "modelBoneTransform",
             "setModelShader",
@@ -3999,6 +4129,123 @@ mod tests {
             };
             assert!(error.contains("rl.guiSetState"), "{error}");
             assert!(error.contains("GUI_STATE"), "{error}");
+        }
+
+        // `setModelCpuSkinning` is the per-model way back to CPU skinning, and
+        // it is exercised against a synthetic skinned mesh: a loaded one needs
+        // `LoadModel` (mesh upload) and the deform pass needs
+        // `rlUpdateVertexBuffer`, both of which want a live GL context. The mesh
+        // carries what a `gpu-skinning` loader leaves behind -- bone data
+        // present, anim pair absent -- which is the shape the escape hatch is
+        // for. Nothing here uploads or deforms, so a GL context is not needed.
+        {
+            let vertices = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+            let normals = [0.0f32, 0.0, 1.0, 1.0, 0.0, 0.0];
+            let mut mesh: raylib_sys::Mesh = unsafe { std::mem::zeroed() };
+            mesh.vertexCount = 2;
+            mesh.vertices = super::alloc_seeded_f32(vertices.as_ptr(), vertices.len()).unwrap();
+            mesh.normals = super::alloc_seeded_f32(normals.as_ptr(), normals.len()).unwrap();
+            // SAFETY: raylib's allocator, since that is whose `MemFree` will
+            // release them below; raylib reads four bone influences per vertex.
+            mesh.boneIndices = unsafe { raylib_sys::MemAlloc(2 * 4).cast() };
+            mesh.boneWeights = unsafe { raylib_sys::MemAlloc(2 * 4 * 4).cast() };
+            assert!(!mesh.boneIndices.is_null() && !mesh.boneWeights.is_null());
+
+            let mut model: raylib_sys::Model = unsafe { std::mem::zeroed() };
+            model.meshCount = 1;
+            model.meshes = Box::into_raw(Box::new(mesh));
+            let meshes = model.meshes;
+            let handle = {
+                let mut registry = super::MODELS.lock().unwrap();
+                registry.push(super::ModelSlot {
+                    model,
+                    animations: std::ptr::null_mut(),
+                    animation_count: 0,
+                    loaded: true,
+                    original_shaders: Vec::new(),
+                });
+                registry.len() - 1
+            };
+
+            // The switch is a strict boolean and the handle is validated, in
+            // that order: a number is not a flag here.
+            for call in [
+                "rl.setModelCpuSkinning(0, 1)",
+                "rl.setModelCpuSkinning(0, undefined)",
+                "rl.setModelCpuSkinning(-1, true)",
+            ] {
+                let error = match context.eval(call) {
+                    Ok(_) => panic!("{call} must throw"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(error.contains("setModelCpuSkinning"), "{call}: {error}");
+            }
+
+            // A mesh raylib would never deform gets nothing: the deform pass
+            // wants bone weights and indices before it looks at the anim pair.
+            let weights = unsafe { (*meshes).boneWeights };
+            unsafe { (*meshes).boneWeights = std::ptr::null_mut() };
+            context
+                .eval(&format!("rl.setModelCpuSkinning({handle}, true)"))
+                .unwrap();
+            assert!(unsafe { (*meshes).animVertices.is_null() });
+            unsafe { (*meshes).boneWeights = weights };
+
+            // `true` seeds the pair from the bind pose, so an unanimated frame
+            // draws the mesh rather than zeroes -- the same thing a CPU-skinning
+            // build's loader would have left behind.
+            context
+                .eval(&format!("rl.setModelCpuSkinning({handle}, true)"))
+                .unwrap();
+            let seeded = unsafe { (*meshes).animVertices };
+            let seeded_normals = unsafe { (*meshes).animNormals };
+            assert!(!seeded.is_null() && !seeded_normals.is_null());
+            for (index, expected) in vertices.iter().enumerate() {
+                assert_eq!(unsafe { *seeded.add(index) }, *expected);
+            }
+            for (index, expected) in normals.iter().enumerate() {
+                assert_eq!(unsafe { *seeded_normals.add(index) }, *expected);
+            }
+            // Idempotent: a second `true` has nothing to allocate.
+            context
+                .eval(&format!("rl.setModelCpuSkinning({handle}, true)"))
+                .unwrap();
+            assert_eq!(unsafe { (*meshes).animVertices }, seeded);
+
+            let dropped = context.eval(&format!("rl.setModelCpuSkinning({handle}, false)"));
+            if cfg!(feature = "gpu-skinning") {
+                dropped.unwrap();
+                assert!(unsafe { (*meshes).animVertices.is_null() });
+                assert!(unsafe { (*meshes).animNormals.is_null() });
+            } else {
+                // Without the build switch there is no shader route to fall back
+                // on, so dropping the CPU buffers is refused rather than left to
+                // draw the bind pose silently.
+                let error = match dropped {
+                    Ok(_) => {
+                        panic!("setModelCpuSkinning(false) must be refused without GPU skinning")
+                    }
+                    Err(error) => error.to_string(),
+                };
+                assert!(error.contains("gpu-skinning"), "{error}");
+                assert!(!unsafe { (*meshes).animVertices.is_null() });
+            }
+
+            // Take the synthetic model back out. `unloadModel` would call
+            // `UnloadModel`, which unloads GL objects, so the test releases what
+            // it allocated itself and drops the slot instead.
+            super::MODELS.lock().unwrap().pop();
+            // SAFETY: each pointer is null or was allocated by this block, and
+            // the slot that owned the model has been removed.
+            unsafe {
+                raylib_sys::MemFree((*meshes).animVertices.cast());
+                raylib_sys::MemFree((*meshes).animNormals.cast());
+                raylib_sys::MemFree((*meshes).vertices.cast());
+                raylib_sys::MemFree((*meshes).normals.cast());
+                raylib_sys::MemFree((*meshes).boneIndices.cast());
+                raylib_sys::MemFree((*meshes).boneWeights.cast());
+                drop(Box::from_raw(meshes));
+            }
         }
     }
 }

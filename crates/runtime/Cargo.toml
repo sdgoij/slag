@@ -98,7 +98,8 @@ raygui = ["raylib", "raylib-sys/raygui"]
 # `boneMatrices`, `vertexBoneIndices` and `vertexBoneWeights` (see
 # `rl.setModelShader`); raylib's own default shader does not skin, so a model
 # left on it draws at its bind pose. `rl.GPU_SKINNING` reports which way this
-# build went.
+# build went, and `rl.setModelCpuSkinning(model, true)` hands the CPU pass back
+# to one model that cannot go through such a shader.
 gpu-skinning = ["raylib", "raylib-sys/SUPPORT_GPU_SKINNING"]
 
 [dev-dependencies]

@@ -194,7 +194,9 @@ attributes and leaves the per-vertex deform buffers unallocated, so
 shader does the skinning — route the model through one that declares
 `boneMatrices`, `vertexBoneIndices` and `vertexBoneWeights` (`setModelShader`),
 since raylib's default shader does not skin, and read `rl.GPU_SKINNING` to learn
-which way a build went. A script owns the whole render loop, exactly like a raylib C
+which way a build went. A model that cannot go through such a shader — a mod's,
+or one whose shader failed to compile — gets the CPU pass back for itself with
+`rl.setModelCpuSkinning(model, true)`. A script owns the whole render loop, exactly like a raylib C
 example — `while (!rl.windowShouldClose()) { rl.beginDrawing(); ...;
 rl.endDrawing(); }`. raylib's window state is bound to the thread that
 installed the module; calls from worker agents throw a clean `TypeError`

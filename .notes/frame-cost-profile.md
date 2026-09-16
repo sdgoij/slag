@@ -662,6 +662,17 @@ no sub-millisecond timer — see `.notes/perf.md` (2026-09-16).
    its bind pose. Memory falls too: no `animVertices`/`animNormals` per mesh, which
    is what forced one model per goat.
 
+   The switch is per *build*, so the escape hatch is per *model*:
+   `rl.setModelCpuSkinning(model, true)` allocates a model's anim buffers and
+   seeds them from the bind pose the way a CPU-skinning loader would, and `false`
+   frees them — refused when the build has no GPU path to fall back on, so a
+   model cannot be left unskinnable by accident. That is what a scene needs for a
+   model it cannot route through a skinned shader (a mod's, or one whose shader
+   failed to compile), and it is the one piece of this item a test can hold: the
+   surface test builds a synthetic skinned mesh and pins the seed contents, the
+   idempotence, the bone-data guard and the per-build answer on `false`, with no
+   GL context involved.
+
    What this does *not* ship is a number. `bots` (5.37–5.45) plus `goat_pose`
    (0.78–0.80) is the CPU-skinning cost by this document's own accounting, and
    the loop that produced it is gone in a `gpu-skinning` build — but the engine
