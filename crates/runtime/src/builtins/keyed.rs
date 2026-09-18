@@ -2813,6 +2813,77 @@ mod tests {
     }
 
     #[test]
+    fn weak_map_ephemeron_lifetime_under_minor() {
+        // A4: the GC-3 weak-table semantics under a *minor* collection — a
+        // young dead key's entry is dropped, and a live key's entry survives.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("globalThis.wm = new WeakMap();").unwrap();
+        agent
+            .run_script("var live = {}; wm.set(live, { tag: 'kept' }); globalThis.live = live;")
+            .unwrap();
+        agent.collect_minor_garbage_with(None);
+        let value = agent.run_script("wm.get(live).tag").unwrap();
+        assert!(matches!(value.kind(), ValueKind::String(s) if s.to_string_lossy() == "kept"));
+        let baseline = crux::heap::with_heap(|heap| heap.live_count());
+        agent
+            .run_script("var dead = {}; var payload = {}; wm.set(dead, payload);")
+            .unwrap();
+        let grown = crux::heap::with_heap(|heap| heap.live_count());
+        assert!(grown > baseline, "the dead key and payload should be live");
+        agent.collect_minor_garbage_with(None);
+        let after = crux::heap::with_heap(|heap| heap.live_count());
+        assert!(
+            after < grown,
+            "the young dead-key entry (key + value) must be swept by the minor"
+        );
+        let has = agent.run_script("wm.has(live)").unwrap();
+        assert!(matches!(has.kind(), ValueKind::Boolean(true)));
+    }
+
+    #[test]
+    fn an_old_weak_map_key_keeps_a_young_value_across_a_minor() {
+        // A4: a minor never sweeps the old generation, so an old key counts as
+        // marked for the ephemeron fixpoint and its young value must be
+        // promoted rather than swept. Reading mark bits alone (the major's
+        // rule) would call the old key unreachable and collect the value.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("globalThis.wm = new WeakMap(); globalThis.key = {};")
+            .unwrap();
+        // The major promotes the WeakMap, the key, and the global holder.
+        agent.collect_garbage();
+        // The value is young and reachable only through the old key's entry.
+        agent
+            .run_script("var fresh = { tag: 'kept' }; wm.set(key, fresh);")
+            .unwrap();
+        agent.collect_minor_garbage_with(None);
+        let value = agent.run_script("wm.get(key).tag").unwrap();
+        assert!(matches!(value.kind(), ValueKind::String(s) if s.to_string_lossy() == "kept"));
+    }
+
+    #[test]
+    fn weak_set_ephemeron_lifetime_under_minor() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("globalThis.ws = new WeakSet();").unwrap();
+        agent
+            .run_script("var live = {}; ws.add(live); globalThis.live = live;")
+            .unwrap();
+        agent.collect_minor_garbage_with(None);
+        let has = agent.run_script("ws.has(live)").unwrap();
+        assert!(matches!(has.kind(), ValueKind::Boolean(true)));
+        let baseline = crux::heap::with_heap(|heap| heap.live_count());
+        agent.run_script("var dead = {}; ws.add(dead);").unwrap();
+        let grown = crux::heap::with_heap(|heap| heap.live_count());
+        assert!(grown > baseline);
+        agent.collect_minor_garbage_with(None);
+        let after = crux::heap::with_heap(|heap| heap.live_count());
+        assert!(after < grown, "the young dead element must be swept");
+    }
+
+    #[test]
     fn map_get_or_insert_and_group_by() {
         assert_eq!(
             text(

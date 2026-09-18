@@ -3815,6 +3815,7 @@ impl Vm {
                     value: cell,
                 } = &mut property.kind
             {
+                crux::heap::write_barrier(&*global, value);
                 *cell = value;
                 // Mirror the JIT's global-value cell (Cut 36): a plain
                 // cached write does not bump the generation, so without the
@@ -3891,6 +3892,7 @@ impl Vm {
                     };
                     (new, old_numeric)
                 };
+                crux::heap::write_barrier(&*global, new);
                 *cell = new;
                 Self::record_global_cell(agent, name, new, &global, Some(slot));
                 return Ok(if prefix { new } else { result });
@@ -6244,7 +6246,7 @@ impl Vm {
                         *self.frame_get_mut(*slot) = value;
                     } else if let Some(index) = context_slot {
                         let env = self.context_chain_env(0)?;
-                        context_env(&env).set_slot(*index, value);
+                        env.set_slot(*index, value);
                     } else {
                         unreachable!(
                             "FunctionDeclInit without a binding slot (the scan allocated one)"
@@ -7809,7 +7811,7 @@ impl Vm {
                 Step::StorePerIteration { depth, index } => {
                     let value = self.pop();
                     let env = self.per_iteration_env(*depth)?;
-                    context_env(&env).set_slot(*index, value);
+                    env.set_slot(*index, value);
                 }
                 Step::UpdatePerIteration {
                     depth,
@@ -7825,7 +7827,7 @@ impl Vm {
                         )
                     })?;
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    context_env(&env).set_slot(*index, new);
+                    env.set_slot(*index, new);
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::EnterLoopEnv { kind, decls } => {
@@ -8439,12 +8441,12 @@ impl Vm {
                             "Assignment to constant variable".into(),
                         ));
                     }
-                    declarative.set_slot(*index, value);
+                    env.set_slot(*index, value);
                 }
                 Step::InitContextSlot { index } => {
                     let value = self.pop();
                     let env = self.context_chain_env(0)?;
-                    context_env(&env).set_slot(*index, value);
+                    env.set_slot(*index, value);
                 }
                 Step::UpdateContextSlot {
                     depth,
@@ -8469,7 +8471,7 @@ impl Vm {
                         ));
                     }
                     let (old_numeric, new) = update_value(agent, op, &old)?;
-                    declarative.set_slot(*index, new);
+                    env.set_slot(*index, new);
                     self.stack.push(if *prefix { new } else { old_numeric });
                 }
                 Step::CreateArguments { slot, mapped } => {

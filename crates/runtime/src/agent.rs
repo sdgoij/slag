@@ -961,8 +961,16 @@ pub struct Agent {
     /// GC-1 slice 3: collect at every safe point when set (the `--gc-stress`
     /// mode; .notes/gc-plan.md GC-2 hardens the root audit under it).
     pub gc_stress: Cell<bool>,
-    /// The live-box count after the last collection, for the growth
-    /// threshold that decides when a safe point collects.
+    /// A5: the young-cohort size that paces a minor collection at a safe point.
+    /// A `Cell` rather than the constant alone so `--nursery-threshold` and
+    /// `--nursery-stress` can tune it without a rebuild (the tuning cut's whole
+    /// point).
+    pub nursery_threshold: Cell<usize>,
+    /// The live-box count after the last *major* collection, for the growth
+    /// threshold that decides when a safe point collects. Minors deliberately
+    /// do not update it: it is the old generation's baseline (a minor promotes
+    /// its survivors, so a fresh baseline would let the old generation grow
+    /// without ever triggering the major that reclaims it).
     pub last_collected_live: Cell<usize>,
     /// Hot constructor property patterns (Cut 35 slice 30): function id →
     /// `(count, array)` of the property names that constructor body assigns
@@ -1003,6 +1011,12 @@ impl Drop for Agent {
         unregister_live_agent(self.signifier);
     }
 }
+
+/// A3/A5: the default young-cohort size that paces a minor collection at a safe
+/// point. Small enough that the cohort's reclamation trails allocation closely,
+/// large enough that a minor is not run for a handful of boxes. `--nursery-
+/// threshold` and `--nursery-stress` override it per agent.
+const DEFAULT_NURSERY_THRESHOLD: usize = 8192;
 
 impl Agent {
     pub fn new() -> Self {
@@ -1209,6 +1223,7 @@ impl Agent {
             realm_count: std::cell::Cell::new(0),
             function_realms: RefCell::new(std::collections::HashMap::new()),
             gc_stress: Cell::new(false),
+            nursery_threshold: Cell::new(DEFAULT_NURSERY_THRESHOLD),
             last_collected_live: Cell::new(0),
         }
     }
@@ -1861,6 +1876,20 @@ impl Agent {
     /// [`Agent::collect_garbage`] with an extra root: the fresh box of the
     /// allocation that triggered a `--gc-stress` collection (GC-2).
     pub fn collect_garbage_with(&self, extra: Option<GcAny>) {
+        self.collect_with(extra, false);
+    }
+
+    /// A3: a minor (young-generation) collection with an extra root. Only the
+    /// boxes allocated since the last collection are at risk, so its cost is
+    /// paced by the young cohort rather than the live set.
+    pub fn collect_minor_garbage_with(&self, extra: Option<GcAny>) {
+        self.collect_with(extra, true);
+    }
+
+    /// The shared collection driver: the roots, the weak-compaction hook, and
+    /// the abort conditions are identical for both generations; `minor` selects
+    /// the young-only collector and its bookkeeping.
+    fn collect_with(&self, extra: Option<GcAny>, minor: bool) {
         // GC-2: a native build in progress (the class element build holds
         // `build_roots`) — abort the sweep (retain everything) so its local
         // buffers cannot be swept.
@@ -1920,12 +1949,38 @@ impl Agent {
             &mut |_, _| {}
         };
         let swept = crux::heap::with_heap_mut(|heap| {
-            heap.collect_with_stack_compacting(&roots, has_weak, compact)
-                .len()
+            if minor {
+                heap.collect_minor_with_stack(&roots, compact).len()
+            } else {
+                heap.collect_with_stack_compacting(&roots, has_weak, compact)
+                    .len()
+            }
         });
-        self.last_collected_live
-            .set(crux::heap::with_heap(|heap| heap.live_count()));
-        crux::heap::note_collection(swept);
+        if minor {
+            // A minor reclassifies only its own cohort, so the major's growth
+            // baseline (the post-major live count) is deliberately untouched.
+            crux::heap::note_minor_collection(swept);
+        } else {
+            self.last_collected_live
+                .set(crux::heap::with_heap(|heap| heap.live_count()));
+            crux::heap::note_collection(swept);
+        }
+    }
+
+    /// A3 `--gc-verify`: after every minor collection, run a full precise mark
+    /// and assert that nothing it would sweep is reachable. Implied by
+    /// `--gc-stress`; exposed on its own for a normal-mode audit.
+    ///
+    /// It also turns the A2 write-barrier verifier on: a minor's correctness
+    /// rests on the remembered set being complete, and `--gc-stress` cannot
+    /// audit that in normal-mode operation (its per-allocation collection
+    /// promotes every fresh box, so a store into an old container rarely has a
+    /// young value to record).
+    pub fn set_gc_verify(&self, enabled: bool) {
+        crux::heap::set_verify_minor(enabled);
+        if enabled {
+            crux::heap::set_verify_barrier(true);
+        }
     }
 
     /// GC-4: whether any weak structure exists — the collector then runs a
@@ -2029,9 +2084,15 @@ impl Agent {
         }
     }
 
-    /// The safe-point collection trigger: collect when the heap has grown
-    /// past twice the post-collection live count (or every safe point in
-    /// `--gc-stress` mode).
+    /// The safe-point collection trigger (A3 splits it by generation, A5 makes
+    /// the levels independent): a minor collection is paced by the young cohort,
+    /// a major by the old generation having grown past twice the post-major live
+    /// count. Each level carries its own backoff, so a major that swept nothing
+    /// suppresses only majors and a minor that reclaimed nothing suppresses only
+    /// minors — a growing-live-set loop stops re-marking without stopping the
+    /// other level's reclamation. Under `--gc-stress` both run at every safe
+    /// point, so one sweep audits the barrier's old->young edges and the root
+    /// set together.
     pub(crate) fn maybe_collect(&mut self) {
         // Release the records of closures the collector swept since the
         // last trigger (their boxes died at the sweep; the records' traced
@@ -2041,9 +2102,15 @@ impl Agent {
         // or bound functions) are filtered out.
         self.reap_dead_functions();
         self.reap_dead_wrappers();
+        let young = crux::heap::with_heap(|heap| heap.young_count());
+        if self.gc_stress.get()
+            || (!crux::heap::minor_disabled() && young >= self.nursery_threshold.get())
+        {
+            self.collect_minor_garbage_with(None);
+        }
         let live = crux::heap::with_heap(|heap| heap.live_count());
         let threshold = self.last_collected_live.get().max(1024).saturating_mul(2);
-        if self.gc_stress.get() || live > threshold {
+        if self.gc_stress.get() || (!crux::heap::major_disabled() && live > threshold) {
             self.collect_garbage();
         }
     }
@@ -2095,8 +2162,20 @@ impl Agent {
 
     /// Toggle the `--gc-stress` mode: collect at every safe point instead of
     /// only on heap growth. Settable through `&Agent` (the cell).
+    ///
+    /// It also turns on the A2 write-barrier verifier: the stress net's whole
+    /// job is to catch a missed root, and a missed old->young edge is the
+    /// same class of bug (a young box swept out from under a live container),
+    /// so the two audits run together.
     pub fn set_gc_stress(&self, enabled: bool) {
         self.gc_stress.set(enabled);
+        // The profile default is on in debug builds; stress forces it on
+        // regardless (see `crux::heap::set_verify_barrier`).
+        crux::heap::set_verify_barrier(enabled || cfg!(debug_assertions));
+        // A3: `--gc-stress` also forces the minor collection's self-check on, so
+        // one stress sweep proves the barrier's old->young edges and the minor's
+        // generation rule at the same time.
+        crux::heap::set_verify_minor(enabled);
         if enabled {
             // GC-2: collect after *every* allocation. The collector finds
             // the current agent through the with_agent TLS window and roots
@@ -2111,6 +2190,37 @@ impl Agent {
             }));
         } else {
             crux::heap::disable_stress_collector();
+        }
+    }
+
+    /// A5 `--nursery-threshold N`: the young-cohort size that paces a minor
+    /// collection at a safe point. The tuning knob the cut exists for.
+    pub fn set_nursery_threshold(&self, threshold: usize) {
+        self.nursery_threshold.set(threshold.max(1));
+    }
+
+    /// A5 `--nursery-stress`: run a minor collection at **every safe point**
+    /// instead of every `--nursery-threshold` allocations, leaving the major on
+    /// its normal trigger.
+    ///
+    /// The plan's wording was "a minor on every allocation"; the safe point is
+    /// the useful cadence, because a per-allocation collector runs *before* the
+    /// store that would create the edge it exists to find: the fresh box is the
+    /// collection's own root, so it is promoted by its own allocation and the
+    /// store is old->old. Landing after a run of stores, the safe point is where
+    /// old->young edges actually get collected.
+    ///
+    /// It turns both verifiers on: a barrier gap is the failure this mode is
+    /// for.
+    pub fn set_nursery_stress(&self, enabled: bool) {
+        self.nursery_threshold.set(if enabled {
+            1
+        } else {
+            DEFAULT_NURSERY_THRESHOLD
+        });
+        if enabled {
+            crux::heap::set_verify_barrier(true);
+            crux::heap::set_verify_minor(true);
         }
     }
 }
@@ -2194,6 +2304,33 @@ mod tests {
         });
         agent.run_jobs().unwrap();
         assert_eq!(*order.borrow(), vec!["timed"]);
+    }
+
+    #[test]
+    fn a_minor_keeps_a_young_element_of_an_old_array() {
+        // A5.1: a growing old array is exactly the shape the dirty low-water
+        // mark exists for — the minor scans from the first appended element, and
+        // must still find the young element appended since the last collection.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("globalThis.a = []; for (var i = 0; i < 300; i++) { a.push({ i: i }); }")
+            .unwrap();
+        // Promote the array and its 300 elements.
+        agent.collect_garbage();
+        // A young element appended to the now-old array is reachable only
+        // through it, so only the remembered set's dirty range can find it.
+        agent
+            .run_script("var fresh = { tag: 'kept' }; a.push(fresh);")
+            .unwrap();
+        agent.collect_minor_garbage_with(None);
+        assert_eq!(
+            agent
+                .run_script("a[a.length - 1].tag === 'kept' && a[0].i === 0 && a.length === 301")
+                .unwrap(),
+            Value::Boolean(true),
+            "the young element survived the minor and the old elements are intact"
+        );
     }
 
     #[test]

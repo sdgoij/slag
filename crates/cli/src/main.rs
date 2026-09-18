@@ -35,6 +35,10 @@ struct Options {
     bench: bool,
     print_bytecode: bool,
     gc_stress: bool,
+    gc_verify: bool,
+    gc_trace: bool,
+    nursery_stress: bool,
+    nursery_threshold: Option<usize>,
     jsx: bool,
     stack_size: Option<u64>,
     max_old_space: Option<u64>,
@@ -97,6 +101,13 @@ fn parse(args: &[String]) -> Command {
                 options.max_old_space = args.get(index).and_then(|value| value.parse().ok());
             }
             "--gc-stress" => options.gc_stress = true,
+            "--gc-verify" => options.gc_verify = true,
+            "--gc-trace" => options.gc_trace = true,
+            "--nursery-stress" => options.nursery_stress = true,
+            "--nursery-threshold" => {
+                index += 1;
+                options.nursery_threshold = args.get(index).and_then(|value| value.parse().ok());
+            }
             flag if flag.starts_with("--harmony") => {}
             flag if flag.starts_with('-') && flag != "-" => {
                 eprintln!("slag: unknown flag {flag}");
@@ -152,7 +163,13 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --print-bytecode");
             eprintln!("  --stack-size N            (no-op)");
             eprintln!("  --max-old-space N         (no-op)");
-            eprintln!("  --gc-stress               collect at every safe point");
+            eprintln!("  --gc-stress               collect both generations at every safe point");
+            eprintln!("  --gc-verify               precise-mark check after every minor GC");
+            eprintln!("  --nursery-stress          a minor GC at every safe point (barrier audit)");
+            eprintln!(
+                "  --nursery-threshold N     young boxes that pace a minor GC (default 8192)"
+            );
+            eprintln!("  --gc-trace                per-collection GC telemetry + an exit summary");
             eprintln!("  --harmony-*               (no-op)");
             eprintln!();
             eprintln!("compiled features: {}", compiled_features());
@@ -176,6 +193,10 @@ fn run(command: Command) -> Result<(), u8> {
             if options.bench {
                 let mut context = Context::new().map_err(report)?;
                 context.set_gc_stress(options.gc_stress);
+                // `--gc-stress` already forces the minor audit on; the
+                // disjunction keeps `--gc-verify` from turning it back off.
+                context.set_gc_verify(options.gc_verify || options.gc_stress);
+                apply_nursery_options(&mut context, &options);
                 return run_benchmarks(&mut context);
             }
             repl(&options)
@@ -246,6 +267,10 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
     }
     let mut context = Context::new().map_err(report)?;
     context.set_gc_stress(options.gc_stress);
+    // `--gc-stress` already forces the minor audit on; the disjunction keeps
+    // `--gc-verify` from turning it back off.
+    context.set_gc_verify(options.gc_verify || options.gc_stress);
+    apply_nursery_options(&mut context, options);
     // The JIT is on by default when compiled; only `--jitless` turns it off.
     #[cfg(feature = "jit")]
     if !options.jitless {
@@ -277,6 +302,7 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
     } else {
         context.eval(source)
     };
+    finish_gc_trace();
     match result {
         // A script file's completion value is not printed (matching node et
         // al.); the REPL prints its own results.
@@ -353,6 +379,8 @@ fn dump_bytecode(source: &str) -> Result<(), u8> {
 fn repl(options: &Options) -> Result<(), u8> {
     let mut context = Context::new().map_err(report)?;
     context.set_gc_stress(options.gc_stress);
+    context.set_gc_verify(options.gc_verify || options.gc_stress);
+    apply_nursery_options(&mut context, options);
     if options.jsx {
         context.install_rlx().map_err(report)?;
     }
@@ -405,6 +433,7 @@ fn repl(options: &Options) -> Result<(), u8> {
             Err(error) => eprintln!("{}", render_error(&mut context, &error)),
         }
     }
+    finish_gc_trace();
     Ok(())
 }
 
@@ -476,6 +505,72 @@ fn input_complete(source: &str) -> bool {
         }
     }
     depth <= 0 && in_string.is_none() && !in_template && !block_comment
+}
+
+/// A5: apply the nursery and telemetry knobs. `--nursery-stress` sets the
+/// threshold to 1 (a minor at every safe point); an explicit
+/// `--nursery-threshold` then wins, so both flags together mean "minor as often
+/// as the threshold says".
+fn apply_nursery_options(context: &mut Context, options: &Options) {
+    context.set_nursery_stress(options.nursery_stress);
+    if let Some(threshold) = options.nursery_threshold {
+        context.set_nursery_threshold(threshold);
+    }
+    context.set_gc_trace(options.gc_trace);
+}
+
+/// A5 `--gc-trace`: the exit summary over every collection the run made. The
+/// per-collection lines already went to stderr; this aggregates them, and the
+/// `last_minor` line pairs the most recent minor's pause with the live set it
+/// ran against — the "pause independent of the live set" check reads that
+/// together with the live column of the per-collection lines.
+fn finish_gc_trace() {
+    if !crux::heap::gc_trace_enabled() {
+        return;
+    }
+    let records = crux::heap::take_gc_trace_records();
+    if records.is_empty() {
+        eprintln!("gc-trace\tsummary\tcollections=0");
+        return;
+    }
+    let (mut minors, mut majors) = (0usize, 0usize);
+    let (mut minor_pause, mut major_pause) = (0u64, 0u64);
+    let (mut minor_max, mut major_max) = (0u64, 0u64);
+    let mut swept = 0usize;
+    let mut last_minor = None;
+    for record in &records {
+        swept += record.swept;
+        if record.level == "minor" {
+            minors += 1;
+            minor_pause += record.pause_us;
+            minor_max = minor_max.max(record.pause_us);
+            last_minor = Some(*record);
+        } else {
+            majors += 1;
+            major_pause += record.pause_us;
+            major_max = major_max.max(record.pause_us);
+        }
+    }
+    eprintln!(
+        "gc-trace\tsummary\tcollections={}\tminors={}\tmajors={}\tswept={}",
+        records.len(),
+        minors,
+        majors,
+        swept,
+    );
+    eprintln!(
+        "gc-trace\tsummary\tminor_pause_us\tavg={}\tmax={}\tmajor_pause_us\tavg={}\tmax={}",
+        minor_pause / minors.max(1) as u64,
+        minor_max,
+        major_pause / majors.max(1) as u64,
+        major_max,
+    );
+    if let Some(last) = last_minor {
+        eprintln!(
+            "gc-trace\tsummary\tlast_minor\tlive={}\tyoung={}\tremembered={}\tpause_us={}",
+            last.live_before, last.young, last.remembered, last.pause_us,
+        );
+    }
 }
 
 /// Run the micro-benchmark suite: each snippet is evaluated once to warm up
@@ -550,6 +645,7 @@ fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
         let elapsed = start.elapsed();
         println!("{name:18} {elapsed:?} ok={timed_ok}");
     }
+    finish_gc_trace();
     Ok(())
 }
 
@@ -1020,6 +1116,48 @@ mod tests {
         assert!(render_error(&mut context, &thrown).starts_with("Error: boom"));
         let engine = context.eval("null.x").unwrap_err();
         assert!(render_error(&mut context, &engine).starts_with("TypeError:"));
+    }
+
+    #[test]
+    fn compiled_stores_into_a_promoted_container_record_the_barrier() {
+        // A2: the JIT's inline stores must not create an old->young edge
+        // without the write barrier. `--gc-stress` runs the collector after
+        // every allocation AND (since A2) the barrier verifier with it, so a
+        // compiled loop that keeps storing fresh values into a container the
+        // collector has already promoted panics here if the machine code
+        // skipped the barrier.
+        let mut context = Context::new().unwrap();
+        jit::install(context.agent_mut()).unwrap();
+        // No `--gc-stress` here: the barrier verifier is on by default in a
+        // debug build, and the loop allocates enough (a fresh string per
+        // append) that the runtime's own allocation-budget safe point
+        // collects mid-loop — which is what promotes the array while the
+        // compiled append keeps storing young strings into it.
+        //
+        // `emit_dense_array_append_inline`: `a[a.length] = ...` into an array
+        // promoted mid-loop. The stored value is a fresh string, so the store
+        // is an old->young edge once the collector has promoted the array.
+        context
+            .eval(
+                "var a = []; \
+                 function cycle(n) { \
+                   for (var k = 0; k < n; k++) { \
+                     if (a.length === 5000) { a.length = 0; } \
+                     a[a.length] = '' + k; \
+                   } \
+                 } \
+                 cycle(200000); if (a.length > 5000) { throw new Error('len ' + a.length); }",
+            )
+            .unwrap();
+        // `emit_deferred_hole_fill`: a constructor's pre-sized `this` filling
+        // its map-described fields, alongside allocations that promote it.
+        context
+            .eval(
+                "function C(x) { this.x = x; } var n = 0; \
+                 for (var i = 0; i < 400; i++) { var o = new C({ tag: i }); if (o.x.tag === i) { n++; } } \
+                 if (n !== 400) { throw new Error('n ' + n); }",
+            )
+            .unwrap();
     }
 
     #[test]

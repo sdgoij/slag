@@ -1,5 +1,13 @@
 # GC milestone: implementation plan
 
+**The collector below is superseded (2026-09-18).** The mark-sweep described
+here is now *generational*: a per-box young bit, a write barrier + remembered
+set, a minor collection paced by the young cohort, and per-level triggers that
+both engines share. The authoritative spec — design, the A0-A7 cut log, the
+locked measurements and the list of what did not pay — is
+**`.notes/nursery-gc-plan.md`**. This file stays as the record of how the
+mark-sweep itself was built (GC-0 … GC-5).
+
 This is the engineering spec for replacing the `Rc`-based ownership model
 with a garbage-collected heap (PLAN.md §4.3 step 2, Phase 18 item 2, and the
 deferred milestone in `.notes/perf.md`). The regression net is the same one

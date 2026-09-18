@@ -5598,6 +5598,124 @@ mod tests {
         );
     }
 
+    /// A6: the compiled safe point drives the nursery. The compiled loop's
+    /// allocations are garbage, so a minor reclaims them and stays enabled; the
+    /// nursery threshold is lowered so the minor level answers before the major's
+    /// growth trigger (live > 2x the post-major live count) does, which is the
+    /// routing `maybe_collect` performs for both engines.
+    ///
+    /// The cohort bound is the `JIT_GC_PROBE_INTERVAL` evidence: the machine code
+    /// polls the budget every 1024 iterations, so a compiled loop's cohort can
+    /// overshoot a threshold set below that interval but not run away — a cohort
+    /// near the loop's total allocation count would mean the compiled safe point
+    /// never reached the collector.
+    #[test]
+    fn installed_jit_compiled_loop_safe_point_runs_minors() {
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(runtime_helpers()).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        agent.set_nursery_threshold(512);
+        crux::heap::set_gc_trace(true);
+        let _ = crux::heap::take_gc_trace_records();
+        let value = agent
+            .run_script(
+                "var a = [];\n\
+                 var l = 0;\n\
+                 for (var i = 0; i < 200000; i++) { var o = { x: i }; a[l++] = i; }\n\
+                 a.length + a[0] + a[199999];",
+            )
+            .expect("runs");
+        let records = crux::heap::take_gc_trace_records();
+        crux::heap::set_gc_trace(false);
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+
+        // 200000 + 0 + 199999.
+        assert_eq!(value.as_number(), Some(399999.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+        let minors: Vec<_> = records.iter().filter(|r| r.level == "minor").collect();
+        assert!(
+            !minors.is_empty(),
+            "a compiled loop's safe point must run minors ({} collections)",
+            records.len()
+        );
+        let worst = minors.iter().map(|r| r.young).max().unwrap_or(0);
+        assert!(
+            worst < 20000,
+            "the compiled probe must pace the cohort (peaked at {worst} over 200k allocations)"
+        );
+    }
+
+    /// A6: a primitive append into a PROMOTED dense array still takes the inline
+    /// path. The write barrier is a no-op for a non-heap value, so the
+    /// ArraySlots box's age is irrelevant for a Number store — a container-only
+    /// young guard sent every append of an old array to the fallback (measured
+    /// 11ms -> 17ms per 1M appends, against 11ms for a young array).
+    ///
+    /// The fallback is the caller's legacy tail (the computed-member store's
+    /// `SetMemberComputed`), NOT the gate's `dense_array_append`: that helper
+    /// serves the growth case, which stays inline-eligible either way. So the
+    /// count of `set_member_computed` calls is the guard's signal — zero for
+    /// canonical appends of primitives, one per iteration if the guard bails on
+    /// the container's age.
+    ///
+    /// `collect_garbage` between the two scripts promotes the array (a major
+    /// clears the young bit on every survivor), so the guard's old branch is
+    /// what this pins.
+    #[test]
+    fn installed_jit_primitive_append_into_a_promoted_array_stays_inline() {
+        static SLOW_STORE_CALLS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_set_member_computed(
+            ctx: *mut c_void,
+            object: u64,
+            key: u64,
+            value: u64,
+        ) -> u64 {
+            SLOW_STORE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.set_member_computed)(ctx, object, key, value)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.set_member_computed = Some(counting_set_member_computed);
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        agent.run_script("var a = [];").expect("runs");
+        agent.collect_garbage();
+        let value = agent
+            .run_script(
+                "function fill(a, n) { var l = a.length; for (var i = 0; i < n; i++) { a[l++] = i; } return a.length; }\n\
+                 fill(a, 100000);",
+            )
+            .expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+
+        assert_eq!(value.as_number(), Some(100000.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+        let calls = SLOW_STORE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            calls, 0,
+            "primitive appends into a promoted array must stay inline \
+             ({calls} fell through to the computed-member store)"
+        );
+    }
+
     #[test]
     fn installed_jit_register_store_member_computed_takes_the_inline_append() {
         // The Phase C register-path append: `a[l++] = i` lowers to a

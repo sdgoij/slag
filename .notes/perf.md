@@ -603,10 +603,14 @@ attr-drift fork mechanism.
   concatenation nodes (see the string-rope milestone below); `concat` appends
   in O(1) once a string is large, and the flat form is materialized lazily
   and cached. Strings of ≤16 units live inline in the box (Cut 67).
-- **Memory**: a GC-managed arena heap — bump allocation + mark-sweep with
-  root tracing (incl. a conservative native-stack scan), ephemeron-aware
-  WeakMap/WeakSet, and `WeakRef`/`FinalizationRegistry` driven by the
-  heap; `--gc-stress` collects per allocation. See `.notes/gc-plan.md`.
+- **Memory**: a GC-managed arena heap — bump allocation + generational
+  mark-sweep: a per-box young bit, a write barrier + remembered set, a minor
+  collection paced by the young cohort beside the growth-triggered major, root
+  tracing (incl. a conservative native-stack scan), ephemeron-aware
+  WeakMap/WeakSet, and `WeakRef`/`FinalizationRegistry` driven by the heap;
+  `--gc-stress` collects per allocation. See `.notes/nursery-gc-plan.md` (the
+  generational spec, measurements and what did not pay); `.notes/gc-plan.md`
+  keeps the mark-sweep's own build history.
 
 ## Benchmark gate
 

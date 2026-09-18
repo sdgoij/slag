@@ -184,6 +184,11 @@ impl Map {
     /// Add a property descriptor, returning the assigned field offset.
     pub fn add_descriptor(&mut self, key: PropertyKey, _offset: usize, attrs: MapAttrs) -> usize {
         let field = self.descriptors.len();
+        // A symbol key is a heap edge: a young symbol added to an old map must
+        // be recorded (the map's trace visits its descriptor keys).
+        if let PropertyKey::Symbol(symbol) = &key {
+            crate::heap::write_barrier_handle(self, *symbol);
+        }
         self.descriptors.push((key, field, attrs));
         self.generation.set(self.generation.get().wrapping_add(1));
         field
@@ -201,17 +206,17 @@ impl Map {
             return *child;
         }
         // Create a back-pointer handle to *this* allocation (not a new box).
-        // GcBox header is mark(1) + padding(3) + size(4) = 8 bytes before data.
-        let header_offset: usize = 8;
-        let back = unsafe {
-            Handle::<Map>::from_box_ptr((&*self as *const Map as usize).wrapping_sub(header_offset))
-        };
+        // The offset must come from the box layout, never a literal.
+        let back = unsafe { Handle::<Map>::from_payload(self) };
         let mut child = Map::new(self.prototype, Some(back));
         // The child describes the parent's whole shape plus the new key
         // (`add_descriptor` assigns the next offset, so the parent's
         // descriptor count is the child's field offset for the new key).
         child.descriptors = self.descriptors.clone();
         child.add_descriptor(key.clone(), 0, attrs);
+        // The transition table stores a young child map in a possibly-old
+        // parent: an old->young edge the minor collector must know about.
+        crate::heap::write_barrier_handle(self, child);
         self.transitions.insert((key, attrs), child);
         child
     }
@@ -230,17 +235,17 @@ impl Map {
         if let Some(child) = self.transitions.get(&(key.clone(), attrs)) {
             return Some(*child);
         }
-        // GcBox header is mark(1) + padding(3) + size(4) = 8 bytes before data.
-        let header_offset: usize = 8;
-        let back = unsafe {
-            Handle::<Map>::from_box_ptr((&*self as *const Map as usize).wrapping_sub(header_offset))
-        };
+        // The offset must come from the box layout, never a literal.
+        let back = unsafe { Handle::<Map>::from_payload(self) };
         let mut child = Map::new(self.prototype, Some(back));
         // The child describes the parent's whole shape plus the new key
         // (`add_descriptor` assigns the next offset, so the parent's
         // descriptor count is the child's field offset for the new key).
         child.descriptors = self.descriptors.clone();
         child.add_descriptor(key.clone(), 0, attrs);
+        // The transition table stores a young child map in a possibly-old
+        // parent: an old->young edge the minor collector must know about.
+        crate::heap::write_barrier_handle(self, child);
         self.transitions.insert((key, attrs), child);
         Some(child)
     }
@@ -302,6 +307,25 @@ pub(crate) fn drop_unmarked_empty_maps() {
     });
 }
 
+/// A3: prune the cache after a *minor* collection — the young-generation
+/// counterpart of [`drop_unmarked_empty_maps`]. A minor marks only young boxes
+/// and sweeps only young boxes, so an old entry is alive by definition and
+/// must be kept (pruning on mark bits alone would drop every cached map the
+/// minor did not happen to reach). Only a young entry the mark did not reach is
+/// garbage: the cache is the sole owner of an empty map once its last live
+/// object dies, and the collector does not trace the cache, so a swept entry
+/// would dangle into every later object creation with that prototype.
+///
+/// Called with the minor's final mark bits, right before its sweep.
+pub(crate) fn drop_unmarked_young_empty_maps() {
+    EMPTY_MAP_CACHE.with(|cache| {
+        cache.borrow_mut().retain(|(_, map)| {
+            let map = map.as_any();
+            !map.is_young() || map.is_marked()
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +359,48 @@ mod tests {
         assert_eq!(offset, 0);
         assert_eq!(map.descriptor_count(), 1);
         assert_eq!(map.find(&key), Some(0));
+    }
+
+    #[test]
+    fn a_minor_prunes_a_cache_only_young_empty_map() {
+        // A3: the canonical empty-map cache is not traced, so a minor must
+        // prune the entry whose young box it sweeps — an unpruned entry would
+        // hand the swept box back to every later object creation with that
+        // prototype.
+        let cached = canonical_empty_map(None);
+        // Nothing roots the cached map: the cache is its only owner and is not
+        // a root, so the minor sweeps it.
+        let swept = crate::heap::with_heap_mut(|heap| heap.collect_minor(&[]));
+        assert!(
+            swept.contains(&cached.as_any().addr()),
+            "the cache-only young map is swept"
+        );
+        // The entry was pruned, so the next lookup yields a live map. Without
+        // the prune it hands back the swept handle, whose live bit the sweep
+        // cleared (no allocation happens in between, so no slot reuse can mask
+        // that).
+        let fresh = canonical_empty_map(None);
+        assert!(
+            fresh.as_any().is_live(),
+            "the pruned entry yields a live map"
+        );
+    }
+
+    #[test]
+    fn transition_back_pointer_targets_the_parent_box() {
+        // The child's `back_pointer` must resolve to the parent's BOX, not an
+        // interior address: the collector traces it, so a stale header offset
+        // hands the mark phase a bogus header (the A0 header grows 8 -> 16,
+        // which is what made this a crash rather than a leak).
+        let mut parent = Map::new_empty(None);
+        let child = parent
+            .get_or_create_child(PropertyKey::from_utf8("x"), MapAttrs::new(true, true, true))
+            .unwrap();
+        let back = child.back_pointer.expect("a forked child keeps its parent");
+        assert!(
+            back.ptr_eq(parent),
+            "the back-pointer must be the parent box"
+        );
     }
 
     #[test]

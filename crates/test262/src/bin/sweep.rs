@@ -150,7 +150,7 @@ fn single_main(area_token: &str, relative: &str, timeout: Duration) -> ExitCode 
         area,
         relative: relative.to_string(),
     };
-    let mut child = spawn_worker(std::slice::from_ref(&fixture), false, true);
+    let mut child = spawn_worker(std::slice::from_ref(&fixture), false, false, true);
     let stdout = child.stdout.take().expect("worker stdout");
     let reader = std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -179,6 +179,9 @@ fn worker_main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--gc-stress") {
         test262::harness::set_gc_stress(true);
+    }
+    if args.iter().any(|a| a == "--gc-verify") {
+        test262::harness::set_gc_verify(true);
     }
     if args.iter().any(|a| a == "--jitless") {
         test262::harness::set_jit(false);
@@ -236,6 +239,11 @@ struct Options {
     list: Option<std::path::PathBuf>,
     json: bool,
     gc_stress: bool,
+    gc_verify: bool,
+    /// Diagnostic: print the ordered fixture list with its batch boundaries and
+    /// exit, so a specific batch can be re-run in isolation (`--list` with its
+    /// 32 paths reproduces its contents and order exactly).
+    print_fixtures: bool,
     jit: bool,
     areas: Vec<Area>,
 }
@@ -258,6 +266,8 @@ options:
   --filter GLOB        only fixtures whose relative path matches (* and ?)
   --list FILE          only the fixtures listed in FILE (one relative path per line)
   --gc-stress          collect after every allocation (GC-2 root-audit net)
+  --gc-verify          precise-mark check after every minor GC (A3 net)
+  --print-fixtures     print the ordered fixture list with batch boundaries and exit
   --jitless            run every certified body through the interpreter (the JIT
                        is on by default)
   --json               emit a JSON report instead of the text report
@@ -288,6 +298,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         list: None,
         json: false,
         gc_stress: false,
+        gc_verify: false,
+        print_fixtures: false,
         // The JIT is the default; only `--jitless` turns it off.
         jit: true,
         areas: vec![Area::Language, Area::Builtins, Area::AnnexB],
@@ -348,6 +360,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             }
             "--json" => options.json = true,
             "--gc-stress" => options.gc_stress = true,
+            "--gc-verify" => options.gc_verify = true,
+            "--print-fixtures" => options.print_fixtures = true,
             "--jitless" => options.jit = false,
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -476,6 +490,15 @@ fn run_parent(args: &[String]) -> Result<u8, String> {
     if fixtures.is_empty() {
         return Err("no fixtures matched".into());
     }
+    if options.print_fixtures {
+        for (index, fixture) in fixtures.iter().enumerate() {
+            if index % options.batch == 0 {
+                println!("# batch {}", index / options.batch);
+            }
+            println!("{}\t{}", area_label(fixture.area), fixture.relative);
+        }
+        return Ok(0);
+    }
     let batches: Vec<Vec<Fixture>> = fixtures.chunks(options.batch).map(|c| c.to_vec()).collect();
     eprintln!(
         "test262-sweep: {} fixtures, {} batches, {} jobs, {}s batch timeout",
@@ -547,7 +570,7 @@ fn run_batch_inner(
     batch: &[Fixture],
     options: &std::sync::Arc<Options>,
 ) -> Vec<(String, SweepResult)> {
-    let mut child = spawn_worker(batch, options.gc_stress, options.jit);
+    let mut child = spawn_worker(batch, options.gc_stress, options.gc_verify, options.jit);
     let stdout = child.stdout.take().expect("worker stdout");
     let (line_tx, line_rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -618,6 +641,7 @@ fn run_single(fixture: &Fixture, options: &Options) -> SweepResult {
     let mut child = spawn_worker(
         std::slice::from_ref(fixture),
         options.gc_stress,
+        options.gc_verify,
         options.jit,
     );
     let stdout = child.stdout.take().expect("worker stdout");
@@ -661,7 +685,7 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> bool {
 }
 
 /// Spawn a worker child running exactly `batch`, described on its stdin.
-fn spawn_worker(batch: &[Fixture], gc_stress: bool, jit: bool) -> Child {
+fn spawn_worker(batch: &[Fixture], gc_stress: bool, gc_verify: bool, jit: bool) -> Child {
     let mut input = String::new();
     for fixture in batch {
         input.push_str(area_label(fixture.area));
@@ -677,6 +701,9 @@ fn spawn_worker(batch: &[Fixture], gc_stress: bool, jit: bool) -> Child {
         .stderr(Stdio::inherit());
     if gc_stress {
         command.arg("--gc-stress");
+    }
+    if gc_verify {
+        command.arg("--gc-verify");
     }
     if !jit {
         command.arg("--jitless");

@@ -2,20 +2,22 @@
 //! mark-sweep heap.
 //!
 //! Modeled on the `gc` crate: each traced object lives in a `GcBox<T>` that
-//! is individually heap-allocated, and the thread-local heap keeps a registry
-//! of every live box for the mark phase. `Gc<T>` derefs directly to its box's
+//! is individually heap-allocated. `Gc<T>` derefs directly to its box's
 //! payload (no arena lookup), so existing `handle.field` call sites survive
 //! the migration from `Handle<T> = Rc<T>`.
+//!
+//! A0 (.notes/nursery-gc-plan.md) removed the per-allocation `live` registry:
+//! the collector now enumerates boxes by walking the chunked bump arena, and
+//! `Gc::new` no longer pays a registry push. Every slot keeps a valid `size`
+//! (a swept slot's live bit is cleared, so the walk steps over it exactly),
+//! and every box header carries a per-type vtable, so the erased walk can
+//! trace and drop a box it only knows by address.
 //!
 //! Soundness invariant: **every live `Gc<T>` must be reachable from the roots
 //! passed to [`Heap::collect`]** (or from a conservative stack scan, which the
 //! arena refinement in GC-1 adds). A `Gc<T>` that is unmarked at sweep time
 //! is dropped while the handle still exists — a use-after-free. The
 //! `--gc-stress` mode (collect on every allocation) is the test net for this.
-//!
-//! Slice 1 is precise-roots only: callers pass the roots explicitly. The
-//! runtime migration (roots from agent tables, VM stacks, job closures) and
-//! the conservative native-stack scan land in the following GC-1 slices.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -28,49 +30,269 @@ use std::rc::Rc;
 /// must visit them in `trace`.
 pub trait Trace: 'static {
     fn trace(&self, visit: &mut dyn FnMut(GcAny));
+
+    /// Report that a young value was stored at slot `index` of this box (a
+    /// dense array's element buffer). The write barrier calls this on its
+    /// old-target path only, so a type whose slots are addressable can lower a
+    /// low-water mark and let [`Trace::trace_dirty`] visit just the slots
+    /// written since the last collection. The default does nothing: for a box
+    /// whose children are a handful of fields, tracing the box is already the
+    /// bound.
+    fn note_dirty_slot(&self, _index: u32) {}
+
+    /// Visit the children a *minor* collection must see. The default is the
+    /// full trace, which is always sound; a type that can bound its dirty slots
+    /// overrides it. A collector calls this instead of `trace` on an **old** box
+    /// — never on a young one, whose children may have been stored before it was
+    /// old (the barrier does not note a young target).
+    ///
+    /// A bound must be a superset of the box's young children, or a young value
+    /// goes unmarked and the minor sweeps it (`--gc-verify` is the net for
+    /// that).
+    fn trace_dirty(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.trace(visit);
+    }
 }
 
-/// An erased GC reference: the box pointer for any `Gc<T>`. Produced by
-/// `Gc<T>`'s `Trace` impl and consumed as a [`Heap::collect`] root.
+/// An erased GC reference: the header address of any `Gc<T>`. Produced by
+/// `Gc<T>`'s `Trace` impl and consumed as a [`Heap::collect`] root. Thin —
+/// the per-type vtable lives in the box header, so the arena walk can trace a
+/// box it only knows by address.
 #[derive(Clone, Copy)]
-pub struct GcAny(*mut GcBox<dyn Trace>);
+pub struct GcAny(*mut GcHeader);
 
 impl GcAny {
     /// The box base address (the identity used by the conservative stack
     /// scan and the weak-table compaction after a collection).
     pub fn addr(self) -> usize {
-        self.0 as *const u8 as usize
+        self.0 as usize
     }
 
     /// Whether the box's mark bit is set: reachable from the roots of the
     /// collection whose mark phase just finished. Read only between the mark
     /// and the sweep (unmarked boxes are dropped right after).
     pub(crate) fn is_marked(self) -> bool {
-        // SAFETY: `self` comes from a registered box (`Gc<T>`'s `Trace`); the
-        // mark bit is valid from the mark phase until the sweep resets it.
-        unsafe { (*self.0).mark.get() }
+        // SAFETY: `self` comes from a live box (`Gc<T>`'s `Trace`); the header
+        // is valid from the mark phase until the sweep resets it.
+        unsafe { (*self.0).is_marked() }
+    }
+
+    pub(crate) fn set_marked(self, marked: bool) {
+        // SAFETY: as `is_marked`.
+        unsafe { (*self.0).set_marked(marked) };
+    }
+
+    /// Whether the box is young (allocated since the last collection).
+    pub(crate) fn is_young(self) -> bool {
+        // SAFETY: `self` comes from a live box.
+        unsafe { (*self.0).is_young() }
+    }
+
+    /// Whether the box's slot is live. Read by the cache-prune regression test
+    /// (`map.rs`), which asserts a pruned entry yields a live map.
+    #[cfg(test)]
+    pub(crate) fn is_live(self) -> bool {
+        // SAFETY: `self` comes from a live box; the header outlives the payload
+        // as a free-list slot.
+        unsafe { (*self.0).is_live() }
+    }
+
+    /// Trace the box's outgoing edges.
+    ///
+    /// SAFETY: the box must be live (the rooting discipline).
+    pub(crate) unsafe fn trace(self, visit: &mut dyn FnMut(GcAny)) {
+        // SAFETY: the caller guarantees `self.0` is a live box header.
+        unsafe {
+            let header = &*self.0;
+            (header.vtable.trace)(header.data_ptr(self.0), visit);
+        }
+    }
+
+    /// Trace the children a minor collection must see (A5.1): the full set for
+    /// a type that does not bound its dirty slots, the slots written since the
+    /// last collection for one that does.
+    ///
+    /// SAFETY: as `trace`; additionally the box must be **old**, since a young
+    /// box's children may predate its promotion and its dirty mark would then
+    /// be empty.
+    pub(crate) unsafe fn trace_dirty(self, visit: &mut dyn FnMut(GcAny)) {
+        // SAFETY: as `trace`.
+        unsafe {
+            let header = &*self.0;
+            (header.vtable.trace_dirty)(header.data_ptr(self.0), visit);
+        }
+    }
+}
+
+/// A box's liveness: whether this arena slot currently holds a live box (the
+/// arena walk skips the cleared slots).
+const FLAG_LIVE: u32 = 1 << 0;
+/// The collector's mark.
+const FLAG_MARK: u32 = 1 << 1;
+/// The box's generation (A1): set at allocation, cleared when the box survives
+/// a collection. "Young" means allocated since the last collection; the young
+/// bit is authoritative (promotion is in place, so an address range cannot
+/// stand in for it).
+const FLAG_YOUNG: u32 = 1 << 2;
+/// The box is in the remembered set (A2): it is old and a young value was
+/// stored into it, so a minor collection must trace it. The bit is the
+/// set's dedup index (the barrier cannot afford a hash lookup per store).
+const FLAG_REMEMBERED: u32 = 1 << 3;
+
+/// The per-type entry points stored in every box header, so the arena walk
+/// can trace and drop a box it only knows by address.
+pub(crate) struct VTable {
+    trace: fn(*const u8, &mut dyn FnMut(GcAny)),
+    /// A5.1: [`Trace::trace_dirty`] — the minor's bounded trace for an old box.
+    trace_dirty: fn(*const u8, &mut dyn FnMut(GcAny)),
+    /// A5.1: [`Trace::note_dirty_slot`] — the barrier's slot report on the
+    /// old-target path.
+    note_dirty: fn(*const u8, u32),
+    drop: fn(*mut u8),
+    /// The payload's offset within its box — fixed by the header layout (see
+    /// [`GcHeader`]), so the walk reads it rather than assuming.
+    data_offset: u32,
+    /// The payload's type name, for diagnostics (the A2 barrier verifier names
+    /// the containers it finds an unrecorded young reference in). A function
+    /// pointer because `type_name` is not const-stable.
+    name: fn() -> &'static str,
+}
+
+/// [`VTable::name`]: the payload's type name.
+fn type_name_of<T>() -> &'static str {
+    std::any::type_name::<T>()
+}
+
+/// The header every box begins with. `repr(C)` and first in [`GcBox`], so a
+/// box address is also a header address.
+#[repr(C)]
+struct GcHeader {
+    flags: Cell<u32>,
+    /// The box's total arena footprint (header + data, rounded to
+    /// [`ARENA_GRANULARITY`]), written once at allocation. The arena walk
+    /// steps by it — including across swept slots.
+    size: u32,
+    vtable: &'static VTable,
+}
+
+impl GcHeader {
+    #[inline]
+    fn is_live(&self) -> bool {
+        self.flags.get() & FLAG_LIVE != 0
+    }
+
+    #[inline]
+    fn set_live(&self, live: bool) {
+        let flags = self.flags.get();
+        self.flags.set(if live {
+            flags | FLAG_LIVE
+        } else {
+            flags & !FLAG_LIVE
+        });
+    }
+
+    #[inline]
+    fn is_marked(&self) -> bool {
+        self.flags.get() & FLAG_MARK != 0
+    }
+
+    #[inline]
+    fn set_marked(&self, marked: bool) {
+        let flags = self.flags.get();
+        self.flags.set(if marked {
+            flags | FLAG_MARK
+        } else {
+            flags & !FLAG_MARK
+        });
+    }
+
+    /// Whether the box is young (allocated since the last collection).
+    ///
+    /// Read by the write barrier (A2), the debug young-drain check, and tests.
+    #[inline]
+    fn is_young(&self) -> bool {
+        self.flags.get() & FLAG_YOUNG != 0
+    }
+
+    #[inline]
+    fn is_remembered(&self) -> bool {
+        self.flags.get() & FLAG_REMEMBERED != 0
+    }
+
+    #[inline]
+    fn set_remembered(&self, remembered: bool) {
+        let flags = self.flags.get();
+        self.flags.set(if remembered {
+            flags | FLAG_REMEMBERED
+        } else {
+            flags & !FLAG_REMEMBERED
+        });
+    }
+
+    #[inline]
+    fn set_young(&self, young: bool) {
+        let flags = self.flags.get();
+        self.flags.set(if young {
+            flags | FLAG_YOUNG
+        } else {
+            flags & !FLAG_YOUNG
+        });
+    }
+
+    /// The address of the payload this header belongs to.
+    #[inline]
+    fn data_ptr(&self, base: *mut GcHeader) -> *mut u8 {
+        (base as *mut u8).wrapping_add(self.vtable.data_offset as usize)
     }
 }
 
 /// A cell in the GC heap. `T` is unsized only through `dyn Trace`; for a
-/// typed `Gc<T>` the box is sized. The header holds the mark bit and the
-/// box's rounded arena size (A5.1: the arena walk steps by it and the
-/// size-classed free list keys by it); `data` is the payload the handle
+/// typed `Gc<T>` the box is sized. The header (liveness flags, the box's
+/// rounded arena size, the type's vtable) precedes the payload the handle
 /// derefs to.
 #[repr(C)]
 struct GcBox<T: ?Sized + Trace> {
-    mark: Cell<bool>,
-    /// The box's total arena footprint (header + data, rounded to
-    /// [`ARENA_GRANULARITY`]), written once at allocation.
-    size: u32,
+    header: GcHeader,
     data: T,
 }
 
-/// The offset of a boxed value's data within its `GcBox` (the box header —
-/// `mark` + `size` — precedes the value): the compiled member-cell probe
-/// adds this to the NaN-boxing payload's box base to reach the `JsObject`.
-/// The header fields are fixed, so the offset is a stable ABI constant.
+impl<T: Trace> GcBox<T> {
+    /// The type's vtable: how the erased walk traces and drops this box.
+    const VTABLE: &'static VTable = &VTable {
+        trace: |data, visit| {
+            // SAFETY: `data` points at this box's `T` payload.
+            unsafe { (*data.cast::<T>()).trace(visit) }
+        },
+        trace_dirty: |data, visit| {
+            // SAFETY: as above.
+            unsafe { (*data.cast::<T>()).trace_dirty(visit) }
+        },
+        note_dirty: |data, index| {
+            // SAFETY: as above.
+            unsafe { (*data.cast::<T>()).note_dirty_slot(index) }
+        },
+        drop: |data| {
+            // SAFETY: `data` points at this box's `T` payload, dropped once
+            // by the sweep before the slot is reused.
+            unsafe { std::ptr::drop_in_place(data.cast::<T>()) }
+        },
+        data_offset: std::mem::offset_of!(GcBox<T>, data) as u32,
+        name: type_name_of::<T>,
+    };
+}
+
+/// The offset of a boxed value's data within its `GcBox` (the box header
+/// precedes the value): the compiled member-cell probe adds this to the
+/// NaN-boxing payload's box base to reach the `JsObject`. The header fields
+/// are fixed, so the offset is a stable ABI constant.
 pub const GCBOX_DATA_OFFSET: usize = std::mem::offset_of!(GcBox<crate::Value>, data);
+
+/// The `flags` bit meaning "allocated since the last collection" (A1), at the
+/// box's offset 0. The JIT reads it to decide whether an inline heap store
+/// needs the A2 write barrier: a young container cannot hold an old->young
+/// edge, so it stores inline; an old one bails to the helper, which runs the
+/// barrier.
+pub const GC_FLAG_YOUNG: u32 = FLAG_YOUNG;
 
 /// A heap handle: a `Copy` pointer into the GC heap. `!Send`/`!Sync` by the
 /// raw-pointer marker — a heap is agent-local (workers use separate agents).
@@ -115,7 +337,7 @@ impl<T: ?Sized + Trace> AsRef<T> for Gc<T> {
 impl<T: Trace> Gc<T> {
     /// The erased form, usable as a [`Heap::collect`] root.
     pub fn as_any(self) -> GcAny {
-        GcAny(self.ptr.as_ptr() as *mut GcBox<dyn Trace>)
+        GcAny(self.ptr.as_ptr() as *mut GcHeader)
     }
 
     /// Pointer identity, replacing `Rc::ptr_eq` for the migration.
@@ -125,9 +347,9 @@ impl<T: Trace> Gc<T> {
 }
 
 impl<T: Trace> Gc<T> {
-    /// Allocate a new box in the bump arena and register it. A5.1: replaces
-    /// the per-box `Box::new` malloc with a bump + size-classed free-list
-    /// reuse inside one heap borrow.
+    /// Allocate a new box in the bump arena. A5.1: replaces the per-box
+    /// `Box::new` malloc with a bump + size-classed free-list reuse inside
+    /// one heap borrow.
     pub fn new(value: T) -> Gc<T> {
         let size = round_up(size_of::<GcBox<T>>(), ARENA_GRANULARITY);
         let gc = with_heap_mut(|heap| {
@@ -137,12 +359,15 @@ impl<T: Trace> Gc<T> {
             // the box before any handle can see it.
             unsafe {
                 raw.write(GcBox {
-                    mark: Cell::new(false),
-                    size: size as u32,
+                    header: GcHeader {
+                        flags: Cell::new(FLAG_LIVE | FLAG_YOUNG),
+                        size: size as u32,
+                        vtable: GcBox::<T>::VTABLE,
+                    },
                     data: value,
                 });
             }
-            heap.register(raw as *mut GcBox<dyn Trace>);
+            heap.note_alloc(raw as usize);
             Gc {
                 ptr: unsafe { NonNull::new_unchecked(raw) },
                 _not_send_sync: std::marker::PhantomData,
@@ -171,11 +396,12 @@ impl<T: Trace> Gc<T> {
             // initializes the payload before any handle can see it.
             unsafe {
                 let boxed = &mut *raw;
-                boxed.mark = Cell::new(false);
-                boxed.size = size as u32;
+                boxed.header.flags = Cell::new(FLAG_LIVE | FLAG_YOUNG);
+                boxed.header.size = size as u32;
+                boxed.header.vtable = GcBox::<T>::VTABLE;
                 init(std::ptr::addr_of_mut!(boxed.data));
             }
-            heap.register(raw as *mut GcBox<dyn Trace>);
+            heap.note_alloc(raw as usize);
             Gc {
                 ptr: unsafe { NonNull::new_unchecked(raw) },
                 _not_send_sync: std::marker::PhantomData,
@@ -210,6 +436,22 @@ impl<T: Trace> Gc<T> {
                 _not_send_sync: std::marker::PhantomData,
             }
         }
+    }
+
+    /// The handle to the box that owns `payload` — a reference into a box's
+    /// payload, used to build a handle to `self` inside a method (e.g. a
+    /// `Map`'s back-pointer to its parent). The offset comes from *this*
+    /// type's layout, so it cannot drift when the header changes; never
+    /// hardcode it.
+    ///
+    /// SAFETY: `payload` must be the payload of a live box (a reference
+    /// obtained by dereferencing a live handle, not a stack or free value).
+    pub(crate) unsafe fn from_payload(payload: &T) -> Gc<T> {
+        let base =
+            (payload as *const T as usize).wrapping_sub(std::mem::offset_of!(GcBox<T>, data));
+        // SAFETY (caller): `payload` lives in a live box, so `base` is that
+        // box's address.
+        unsafe { Gc::from_box_ptr(base) }
     }
 }
 
@@ -392,6 +634,9 @@ struct ArenaChunk {
     /// Owns the chunk's memory (never read — boxes are addressed directly).
     #[allow(dead_code)]
     data: Box<[u8]>,
+    /// The first box slot (the buffer start, rounded to
+    /// [`ARENA_GRANULARITY`]); the arena walk starts here.
+    start: usize,
     /// The next allocation offset within the chunk.
     bump: usize,
     /// The last usable address (exclusive).
@@ -419,18 +664,34 @@ pub struct Heap {
     /// The bump arena backing every box. Boxes live at stable addresses
     /// inside these chunks.
     chunks: Vec<ArenaChunk>,
+    /// Chunk indices sorted by `start`, so the arena walk visits boxes in
+    /// ascending address order without sorting them per collection (the
+    /// conservative stack scan's list must be sorted). Refreshed by
+    /// `push_chunk`.
+    order: Vec<usize>,
     /// Reclaimed slots by rounded size class (see [`FREE_CLASSES`]): swept
     /// (dead) boxes are reused by `Gc::new` before the bump advances. Boxes
     /// are never freed individually — the arena keeps the memory, and slots
     /// cycle through the free list.
-    free: [Vec<*mut GcBox<dyn Trace>>; FREE_CLASSES],
-    live: Vec<*mut GcBox<dyn Trace>>,
-    /// Address range of the registered boxes, refreshed by the sweep (GC-5):
-    /// the stack scan pre-filter skips words outside it — most stack words
-    /// are not box addresses, and two compares are far cheaper than a
-    /// HashMap lookup per word.
-    live_min: usize,
-    live_max: usize,
+    free: [Vec<usize>; FREE_CLASSES],
+    /// Live boxes, maintained by allocation and the sweep. The growth
+    /// trigger (`Agent::maybe_collect`) and the leak harness read it.
+    live_boxes: usize,
+    /// The young cohort (A1): the boxes allocated since the last collection,
+    /// in allocation order. A minor collection (A3) enumerates young boxes
+    /// from here, so it costs O(young) rather than O(live); a box that
+    /// survives a collection is promoted in place and the list is drained.
+    young: Vec<usize>,
+    /// `[low, high)` spanning every chunk's allocated slots. Chunks are never
+    /// freed, so the bounds only widen; a chunk push updates them. Used as the
+    /// conservative stack scan's pre-filter and as the write barrier's
+    /// debug-only "is this a box address" check.
+    arena_low: usize,
+    arena_high: usize,
+    /// A5 `--gc-trace`: the stack words the current collection's conservative
+    /// scan examined (reset at the start of each collection, set by
+    /// [`Heap::scan_stack`]). A `Cell` because `scan_stack` borrows `&self`.
+    stack_words: Cell<usize>,
 }
 
 /// Round `n` up to the next multiple of `m` (a power of two).
@@ -491,11 +752,7 @@ impl FxHasher {
     }
 }
 
-type AddrMap = std::collections::HashMap<
-    usize,
-    *mut GcBox<dyn Trace>,
-    std::hash::BuildHasherDefault<FxHasher>,
->;
+type AddrMap = std::collections::HashMap<usize, GcAny, std::hash::BuildHasherDefault<FxHasher>>;
 
 type AddrSet = std::collections::HashSet<usize, std::hash::BuildHasherDefault<FxHasher>>;
 
@@ -510,9 +767,34 @@ thread_local! {
     /// GC-5: safe-point backoff — set to `u64::MAX` when a safe-point
     /// collection swept nothing (a growing live set, e.g. a concat rope,
     /// keeps every node reachable, so re-marking it each budget crossing is
-    /// pure overhead), disabling mid-loop collections until the next script
-    /// boundary; a collection that reclaimed garbage keeps them eager.
-    static BUDGET_BACKOFF: Cell<u64> = const { Cell::new(1) };
+    /// GC-5/A5: whether a major collection is suppressed at safe points. A
+    /// major that swept nothing is pure overhead for a growing live set (a
+    /// concat rope keeps every node reachable), so it is disabled until the
+    /// next script boundary — the same policy GC-5 had, but now applying to
+    /// the major level alone.
+    ///
+    /// The minor level is gated by its own flag, never by this one: a minor
+    /// costs O(young + remembered + the roots' fan-out) rather than O(live), and
+    /// its job is to keep the young cohort bounded, so the two levels back off
+    /// independently (see [`MINOR_DISABLED`]).
+    static MAJOR_DISABLED: Cell<bool> = const { Cell::new(false) };
+    /// A5: whether a minor collection is suppressed at safe points. Same policy
+    /// as the major, one level down: a minor whose cohort was entirely live
+    /// reclaimed nothing, so re-walking the roots and re-marking that cohort
+    /// every `nursery_threshold` allocations is pure overhead until the next
+    /// script boundary. The levels are independent by design — a backing-off
+    /// minor does not stall majors (their growth trigger still fires and their
+    /// sweep drains the cohort), and a backing-off major does not stall minors.
+    ///
+    /// This is what keeps the `string concat` row (a 100k-node rope, every node
+    /// reachable) off the minor path: without it the row pays a root walk every
+    /// 8192 allocations and measured ~20% slower.
+    static MINOR_DISABLED: Cell<bool> = const { Cell::new(false) };
+    /// A6: boxes the sweeps freed since the compiled safe point last asked (see
+    /// [`take_swept_since_check`]). Accumulated by both levels' bookkeeping, so
+    /// a sweep from any collection path — a compiled safe point, an interpreter
+    /// back edge, a job boundary, or a helper's nested call — is seen.
+    static SWEPT_SINCE_CHECK: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The allocation budget that paces safe-point collections (GC-5): after
@@ -523,35 +805,32 @@ thread_local! {
 /// single compare.
 const ALLOC_BUDGET: u64 = 1024;
 
-/// GC-5: the cheap safe-point check for loop back-edges. Returns true when
-/// enough allocations have happened since the last check (the caller then
-/// runs its collection trigger); the counter is reset either way. An empty
-/// sweep multiplies the budget by [`BUDGET_BACKOFF`] (see
-/// [`note_collection`]). `#[inline]` so the back-edge check is a TLS read +
-/// compare (cross-crate calls are not inlined otherwise).
+/// GC-5/A5: the cheap safe-point check for loop back-edges. Returns true when
+/// enough allocations have happened since the last check (the caller then runs
+/// its per-level trigger). The counter is reset either way. `#[inline]` so the
+/// back-edge check is a TLS read + compare (cross-crate calls are not inlined
+/// otherwise). The interval is a plain pacing counter: the *levels* decide what
+/// to do with the safe point (see [`major_disabled`]), so a backed-off major
+/// cannot starve a minor, and vice versa.
 #[inline]
 pub fn allocation_budget_exceeded() -> bool {
-    // Fast path: below the base budget the backoff cannot matter — one TLS
-    // read and out (the machinery rows never allocate, so this is the hot
-    // shape: counter is 0).
+    // Fast path: below the base budget — one TLS read and out (the machinery
+    // rows never allocate, so this is the hot shape: counter is 0).
     if ALLOC_SINCE_COLLECT.with(|count| count.get()) < ALLOC_BUDGET {
         return false;
     }
-    let budget = ALLOC_BUDGET.saturating_mul(BUDGET_BACKOFF.with(|backoff| backoff.get()));
-    let exceeded = ALLOC_SINCE_COLLECT.with(|count| count.get()) >= budget;
-    if exceeded {
-        ALLOC_SINCE_COLLECT.with(|count| count.set(0));
-    }
-    exceeded
+    ALLOC_SINCE_COLLECT.with(|count| count.set(0));
+    true
 }
 
-/// GC-5: reset the safe-point allocation budget (a script/job boundary —
-/// the budget counts allocations since the last trigger or collection, so
-/// it must not leak across scripts). Also re-enables mid-loop collections
-/// that an empty sweep disabled.
+/// GC-5/A5: reset the safe-point allocation budget (a script/job boundary —
+/// the budget counts allocations since the last trigger or collection, so it
+/// must not leak across scripts). Also re-enables the major level that an empty
+/// sweep disabled.
 pub fn reset_allocation_budget() {
     ALLOC_SINCE_COLLECT.with(|count| count.set(0));
-    BUDGET_BACKOFF.with(|backoff| backoff.set(1));
+    MAJOR_DISABLED.with(|disabled| disabled.set(false));
+    MINOR_DISABLED.with(|disabled| disabled.set(false));
 }
 
 /// GC-5: record a collection that ran (any path — a script/job boundary, a
@@ -562,16 +841,162 @@ pub fn reset_allocation_budget() {
 /// disabled until the next script boundary; reclamation keeps them eager.
 pub fn note_collection(swept: usize) {
     ALLOC_SINCE_COLLECT.with(|count| count.set(0));
-    BUDGET_BACKOFF.with(|backoff| {
-        if swept == 0 {
-            backoff.set(u64::MAX);
-        } else {
-            backoff.set(1);
-        }
-    });
+    MAJOR_DISABLED.with(|disabled| disabled.set(swept == 0));
+    SWEPT_SINCE_CHECK.with(|count| count.set(count.get() + swept));
 }
 
-// GC-2 `--gc-stress`: collect after every allocation. The collector runs
+/// A5: whether the major level is currently suppressed at safe points (an
+/// earlier major swept nothing — see [`note_collection`]). The caller must
+/// consult this before running a major; the minor level never is.
+pub fn major_disabled() -> bool {
+    MAJOR_DISABLED.with(|disabled| disabled.get())
+}
+
+/// A5: whether the minor level is currently suppressed at safe points (an
+/// earlier minor reclaimed nothing — see [`note_minor_collection`]).
+pub fn minor_disabled() -> bool {
+    MINOR_DISABLED.with(|disabled| disabled.get())
+}
+
+/// A5.1: the current collection interval's stamp (see [`COLLECTION_GEN`]). A type
+/// bounding its dirty slots stores it beside the bound; the collector reads it to
+/// tell a live mark from a stale one.
+pub fn collection_generation() -> u32 {
+    COLLECTION_GEN.with(|stamp| stamp.get())
+}
+
+/// A5.1: close the current interval. Called at the end of every collection
+/// (including the aborts, which promote every live box, so no box can hold a young
+/// child afterwards either).
+fn bump_collection_generation() {
+    COLLECTION_GEN.with(|stamp| stamp.set(stamp.get().wrapping_add(1)));
+}
+
+/// A3: record a minor collection. The pacing restarts so the next trigger is
+/// measured from here; the major level is left exactly as it was (a minor that
+/// reclaims nothing must not suppress a major). A minor that reclaimed nothing
+/// suppresses the *minor* level until the next script boundary, which is what
+/// keeps a growing-live-set loop (a concat rope) off the minor path.
+pub fn note_minor_collection(swept: usize) {
+    ALLOC_SINCE_COLLECT.with(|count| count.set(0));
+    MINOR_DISABLED.with(|disabled| disabled.set(swept == 0));
+    SWEPT_SINCE_CHECK.with(|count| count.set(count.get() + swept));
+}
+
+/// A6: the boxes the sweeps freed since the last call, resetting the counter.
+/// The compiled safe point flushes its cached call-site records only when this
+/// is non-zero — a record caches its callee by payload, so a freed box whose
+/// address a later allocation recycles could match it and apply a stale verdict.
+/// A collection that freed nothing cannot, and with the nursery pacing minors
+/// most budget crossings collect nothing, so the unconditional flush cost a
+/// re-probe per crossing for no reason.
+pub fn take_swept_since_check() -> usize {
+    SWEPT_SINCE_CHECK.with(|count| count.take())
+}
+
+/// A5 `--gc-trace`: one collection's counters, printed per collection and
+/// accumulated for the CLI's exit summary.
+#[derive(Clone, Copy, Debug)]
+pub struct GcTraceRecord {
+    /// `"minor"` or `"major"`.
+    pub level: &'static str,
+    pub pause_us: u64,
+    pub live_before: usize,
+    pub live_after: usize,
+    pub swept: usize,
+    /// The young cohort when the collection started.
+    pub young: usize,
+    /// The remembered set when the collection started — the barrier's recorded
+    /// old->young edges since the last collection.
+    pub remembered: usize,
+    /// Stack words the conservative scan examined.
+    pub stack_words: usize,
+}
+
+thread_local! {
+    /// A5 `--gc-trace`: one TLS read per collection when off.
+    static GC_TRACE: Cell<bool> = const { Cell::new(false) };
+    static GC_TRACE_RECORDS: RefCell<Vec<GcTraceRecord>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A5 `--gc-trace`: enable per-collection telemetry. Zero cost when off (the
+/// collectors read one TLS flag and exit).
+pub fn set_gc_trace(enabled: bool) {
+    GC_TRACE.with(|flag| flag.set(enabled));
+}
+
+/// A5: whether collection telemetry is enabled.
+pub fn gc_trace_enabled() -> bool {
+    GC_TRACE.with(|flag| flag.get())
+}
+
+/// A5 `--gc-trace`: take the accumulated records (the CLI's exit summary).
+pub fn take_gc_trace_records() -> Vec<GcTraceRecord> {
+    GC_TRACE_RECORDS.with(|records| std::mem::take(&mut *records.borrow_mut()))
+}
+
+/// A5 `--gc-trace`: print `record` and keep it for the exit summary.
+fn record_gc_trace(record: GcTraceRecord) {
+    eprintln!(
+        "gc-trace\t{}\tpause_us={}\tlive={}->{}\tswept={}\tyoung={}\tremembered={}\tstack_words={}",
+        record.level,
+        record.pause_us,
+        record.live_before,
+        record.live_after,
+        record.swept,
+        record.young,
+        record.remembered,
+        record.stack_words,
+    );
+    GC_TRACE_RECORDS.with(|records| records.borrow_mut().push(record));
+}
+
+/// The per-collection state A5's telemetry reports, captured before a
+/// collection so the record can be emitted after it.
+struct GcTraceStart {
+    started: std::time::Instant,
+    live_before: usize,
+    young: usize,
+    remembered: usize,
+}
+
+impl Heap {
+    /// A5: clear the per-collection scan counter. Called by each entry point
+    /// before it (maybe) scans the stack.
+    fn reset_trace_start(&self) {
+        self.stack_words.set(0);
+    }
+
+    /// A5: capture the pre-collection state, or `None` when tracing is off (the
+    /// only cost on the hot path is one TLS read).
+    fn trace_start(&self) -> Option<GcTraceStart> {
+        gc_trace_enabled().then(|| GcTraceStart {
+            started: std::time::Instant::now(),
+            live_before: self.live_boxes,
+            young: self.young.len(),
+            remembered: REMEMBERED.with(|set| set.borrow().len()),
+        })
+    }
+
+    /// A5: emit one collection's record.
+    fn trace_end(&self, level: &'static str, start: Option<GcTraceStart>, swept: usize) {
+        let Some(start) = start else {
+            return;
+        };
+        record_gc_trace(GcTraceRecord {
+            level,
+            pause_us: start.started.elapsed().as_micros() as u64,
+            live_before: start.live_before,
+            live_after: self.live_boxes,
+            swept,
+            young: start.young,
+            remembered: start.remembered,
+            stack_words: self.stack_words.get(),
+        });
+    }
+}
+
+/// GC-2 `--gc-stress`: collect after every allocation. The collector runs
 // from `Gc::new` with the just-created box as an extra root (it is not yet
 // reachable from any handle the caller holds). The runtime registers a
 // thread-local collector that finds the current agent and collects from its
@@ -592,6 +1017,26 @@ thread_local! {
     /// deferred: the mark phase promotes a value once its key is marked,
     /// iterating to a fixpoint. Valid only during one collection.
     static EPHEMERONS: RefCell<Vec<(GcAny, GcAny)>> = const { RefCell::new(Vec::new()) };
+    /// A2: the remembered set — the addresses of old boxes that may hold a
+    /// young reference. Deduplicated by the box's `FLAG_REMEMBERED` bit, so
+    /// the barrier needs no hash lookup; drained by every collection.
+    static REMEMBERED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// A2: whether the collector verifies the write barrier's exactness on
+    /// every collection (the barrier is only testable while the young bits
+    /// are still meaningful, so it runs before the sweep). On by default in
+    /// debug builds; the release sweep enables it explicitly.
+    static VERIFY_BARRIER: Cell<bool> = const { Cell::new(cfg!(debug_assertions)) };
+    /// A3: whether a minor collection verifies its own mark with a full
+    /// precise mark before sweeping (`--gc-verify`). Off by default: the
+    /// verification is O(live) per minor. On, a barrier or generation-rule gap
+    /// fails loudly instead of freeing a reachable box.
+    static VERIFY_MINOR: Cell<bool> = const { Cell::new(false) };
+    /// A5.1: the current collection interval's stamp. A type that bounds its
+    /// dirty slots stamps a mark with it, so a mark from a previous interval
+    /// reads as stale — and stale correctly means "no dirty slots", because
+    /// every box that survived the last collection had its young children
+    /// promoted. Bumped at the end of every collection, including the aborts.
+    static COLLECTION_GEN: Cell<u32> = const { Cell::new(1) };
 }
 
 /// Record that a traced `RefCell` was borrowed during marking; the sweep
@@ -606,6 +1051,145 @@ pub fn note_aborted_trace() {
 /// value once the key is marked, so a weak table never retains its key.
 pub fn note_ephemeron(key: GcAny, value: GcAny) {
     EPHEMERONS.with(|slot| slot.borrow_mut().push((key, value)));
+}
+
+/// Enable or disable the A2 write-barrier verifier (see [`VERIFY_BARRIER`]).
+/// The release sweep turns it on by flag; debug builds default it on.
+pub fn set_verify_barrier(enabled: bool) {
+    VERIFY_BARRIER.with(|flag| flag.set(enabled));
+}
+
+/// A2: whether the barrier verifier is enabled.
+pub fn verify_barrier_enabled() -> bool {
+    VERIFY_BARRIER.with(|flag| flag.get())
+}
+
+/// A3 `--gc-verify`: enable the minor collection's self-check (see
+/// [`VERIFY_MINOR`]).
+pub fn set_verify_minor(enabled: bool) {
+    VERIFY_MINOR.with(|flag| flag.set(enabled));
+}
+
+/// A3: whether the minor collection's self-check is enabled.
+pub fn verify_minor_enabled() -> bool {
+    VERIFY_MINOR.with(|flag| flag.get())
+}
+
+/// The write barrier (A2). Call after storing `value` into a field of the box
+/// that owns `target`.
+///
+/// It records the target when a young value is stored into an *old* box — the
+/// only kind of edge a young collection cannot recover on its own — so the
+/// collector can trace a handful of old boxes instead of the whole old
+/// generation. It imposes no ordering: a store into a young box (the common
+/// constructor case) exits on one load.
+///
+/// Precondition (the caller's rooting discipline): `target` is a reference
+/// into a live box's payload, never a stack temporary.
+pub fn write_barrier<T: Trace>(target: &T, value: crate::value::Value) {
+    let Some(child) = crate::value::Value::encoded_box_address(value.bits()) else {
+        return;
+    };
+    // `encoded_box_address` returns the box of a live heap value.
+    remember_if_young(barrier_target(target), GcAny(child as *mut GcHeader), None);
+}
+
+/// [`write_barrier`] for a store into a dense array's element `index` (A5.1).
+/// It does everything [`write_barrier`] does, and on the old-target path it also
+/// reports the slot to the box's type, so a minor can trace just the elements
+/// written since the last collection instead of the whole buffer. The slot
+/// report rides the branch that already has the box old — a young target cannot
+/// hold an old->young edge and exits before either.
+pub fn write_barrier_element<T: Trace>(target: &T, value: crate::value::Value, index: u64) {
+    let Some(child) = crate::value::Value::encoded_box_address(value.bits()) else {
+        return;
+    };
+    // A slot beyond `u32` would saturate the low-water mark upward and lose
+    // elements below it, so it degrades to 0 (trace the whole buffer) — sound,
+    // and unreachable for a dense buffer whose indices are bounded by its own
+    // length.
+    let index = if index > u32::MAX as u64 {
+        0
+    } else {
+        index as u32
+    };
+    remember_if_young(
+        barrier_target(target),
+        GcAny(child as *mut GcHeader),
+        Some(index),
+    );
+}
+
+/// [`write_barrier`] for a store of a GC handle — a `Gc<T>`/`Handle<T>` field
+/// (`Map::transitions`, `JsObject::prototype`, a captured environment) rather
+/// than a `Value`.
+pub fn write_barrier_handle<T: Trace, U: Trace>(target: &T, child: Gc<U>) {
+    remember_if_young(barrier_target(target), child.as_any(), None);
+}
+
+/// The box that owns `target`. The caller's rooting discipline guarantees
+/// `target` is a live box payload.
+#[inline]
+fn barrier_target<T: Trace>(target: &T) -> GcAny {
+    let addr = (target as *const T as usize).wrapping_sub(std::mem::offset_of!(GcBox<T>, data));
+    // A misused call site (a stack temporary) would compute a bogus box and
+    // read unrelated flags. Catch it in the test suite; the check is two
+    // compares and only in debug builds.
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        with_heap(|heap| heap.owns(addr)),
+        "the write barrier target must reference a live box payload"
+    );
+    // `addr` is a live box's header, per the precondition.
+    GcAny(addr as *mut GcHeader)
+}
+
+/// A5.1: whether `value` is a heap reference whose box is young. Read by the
+/// dirty-bound assertion (verify mode only).
+pub fn value_box_is_young(value: crate::value::Value) -> bool {
+    let Some(addr) = crate::value::Value::encoded_box_address(value.bits()) else {
+        return false;
+    };
+    // SAFETY: `encoded_box_address` yields the box of a live heap value.
+    unsafe { (*(addr as *mut GcHeader)).is_young() }
+}
+
+/// Record `target` when `child` is young and `target` is old, and report the
+/// dirty slot (A5.1) on that same path when the caller supplies one.
+#[inline]
+fn remember_if_young(target: GcAny, child: GcAny, dirty: Option<u32>) {
+    // SAFETY: both are live boxes (the rooting discipline).
+    unsafe {
+        let header = target.0;
+        // Fast path: a young target cannot hold an old->young edge, and the
+        // hot shape is a constructor populating `this` — one load and a
+        // not-taken branch.
+        if (*header).is_young() {
+            return;
+        }
+        if !(*child.0).is_young() {
+            return;
+        }
+        // A5.1: the low-water mark is noted here rather than at the call site so
+        // the hot young-target path above never pays for it, and so a site
+        // cannot report a slot without also recording the edge (the two are what
+        // a minor needs together).
+        if let Some(index) = dirty {
+            ((*header).vtable.note_dirty)((*header).data_ptr(target.0), index);
+        }
+        // The header bit is the dedup: an already-remembered box needs no
+        // second entry, and no collector state is touched here.
+        if !(*header).is_remembered() {
+            (*header).set_remembered(true);
+            REMEMBERED.with(|slot| slot.borrow_mut().push(target.addr()));
+        }
+    }
+}
+
+/// A2: whether any box is currently remembered (nothing is, immediately after
+/// a collection — the whole heap is old then).
+pub fn remembered_count() -> usize {
+    REMEMBERED.with(|slot| slot.borrow().len())
 }
 
 /// Enable the per-allocation stress collector. `collect` receives the fresh
@@ -637,6 +1221,29 @@ fn maybe_stress_collect(fresh: GcAny) {
     COLLECTING.with(|collecting| collecting.set(false));
 }
 
+/// Drain a young mark work list (A3): mark each young box once and push its
+/// young children. An old box in the list is skipped untouched — its young
+/// children are the remembered set's job, and the minor never sets an old mark
+/// bit.
+fn drain_young_work(work: &mut Vec<GcAny>) {
+    while let Some(any) = work.pop() {
+        // SAFETY: every `GcAny` in `work` is a live box (a root, a box the
+        // conservative scan or remembered set contributed, or a traced child);
+        // the mark bit breaks cycles.
+        unsafe {
+            if (*any.0).is_marked() || !(*any.0).is_young() {
+                continue;
+            }
+            (*any.0).set_marked(true);
+            any.trace(&mut |child| {
+                if (*child.0).is_young() {
+                    work.push(child);
+                }
+            });
+        }
+    }
+}
+
 /// Conservatively scan heap regions (the opaque job-closure boxes) for box
 /// addresses and encoded `Value` payloads, visiting every live box found
 /// (GC-2). A `Box<dyn FnOnce>` job closure holds its captured `Value`s as
@@ -646,11 +1253,10 @@ fn maybe_stress_collect(fresh: GcAny) {
 pub fn scan_regions(regions: &[(*const u8, usize)], visit: &mut dyn FnMut(GcAny)) {
     HEAP.with(|heap| {
         let heap = heap.borrow();
-        let by_addr: AddrMap = heap
-            .live
-            .iter()
-            .map(|ptr| (*ptr as *const u8 as usize, *ptr))
-            .collect();
+        let mut by_addr: AddrMap = AddrMap::default();
+        heap.for_each_live(|header| {
+            by_addr.insert(header as usize, GcAny(header));
+        });
         for (base, len) in regions {
             let mut addr = *base as usize;
             let end = addr + *len;
@@ -658,12 +1264,12 @@ pub fn scan_regions(regions: &[(*const u8, usize)], visit: &mut dyn FnMut(GcAny)
                 // SAFETY: the region is the live allocation of a queued or
                 // running job closure; reads are unaligned.
                 let word = unsafe { std::ptr::read_unaligned::<usize>(addr as *const usize) };
-                if let Some(&ptr) = by_addr.get(&word) {
-                    visit(GcAny(ptr));
+                if let Some(&any) = by_addr.get(&word) {
+                    visit(any);
                 } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
-                    && let Some(&ptr) = by_addr.get(&box_addr)
+                    && let Some(&any) = by_addr.get(&box_addr)
                 {
-                    visit(GcAny(ptr));
+                    visit(any);
                 }
                 addr += std::mem::size_of::<usize>();
             }
@@ -691,16 +1297,24 @@ impl Heap {
     pub const fn new() -> Heap {
         Heap {
             chunks: Vec::new(),
+            order: Vec::new(),
             free: [const { Vec::new() }; FREE_CLASSES],
-            live: Vec::new(),
-            live_min: 0,
-            live_max: 0,
+            live_boxes: 0,
+            young: Vec::new(),
+            arena_low: usize::MAX,
+            arena_high: 0,
+            stack_words: Cell::new(0),
         }
     }
 
-    /// Number of live boxes (for the leak-detection harness).
+    /// Number of live boxes (the growth trigger and the leak harness).
     pub fn live_count(&self) -> usize {
-        self.live.len()
+        self.live_boxes
+    }
+
+    /// Number of boxes allocated since the last collection (A1's cohort).
+    pub fn young_count(&self) -> usize {
+        self.young.len()
     }
 
     /// The number of arena chunks (A5.1): under size-classed churn the
@@ -722,6 +1336,14 @@ impl Heap {
     /// constructors round it once).
     fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
         debug_assert_eq!(size % ARENA_GRANULARITY, 0, "callers round the size");
+        // The arena walk recovers slots by stepping `size` from the chunk
+        // start, so an allocation may not insert padding. Every `GcBox<T>`
+        // alignment is at most 8, so `align_up` is a no-op on the granular-
+        // aligned bump pointer.
+        debug_assert!(
+            align <= ARENA_GRANULARITY,
+            "the arena walk assumes granularity-bounded alignment"
+        );
         // Size-classed free-list reuse first: a swept box of this exact
         // rounded size is the common hot shape — direct-indexed, no hash.
         if let Some(index) = free_index(size)
@@ -759,24 +1381,83 @@ impl Heap {
         // allocation's deallocation layout.
         let data: Box<[u8]> = unsafe { Box::from_raw(Box::into_raw(data) as *mut [u8]) };
         let raw = data.as_ptr() as usize;
-        let base = align_up(raw, ARENA_GRANULARITY);
+        let start = align_up(raw, ARENA_GRANULARITY);
         let end = raw + ARENA_CHUNK_SIZE;
+        let index = self.chunks.len();
         self.chunks.push(ArenaChunk {
             data,
-            bump: base,
+            start,
+            bump: start,
             end,
         });
+        self.arena_low = self.arena_low.min(start);
+        self.arena_high = self.arena_high.max(end);
+        // Keep `order` sorted by chunk base so the arena walk yields an
+        // ascending box list (the stack scan binary-searches it). Chunk
+        // pushes are rare (one per MiB), so the insert is not hot.
+        let position = self
+            .order
+            .binary_search_by_key(&start, |&i| self.chunks[i].start)
+            .unwrap_or_else(|position| position);
+        self.order.insert(position, index);
     }
 
-    fn register(&mut self, boxed: *mut GcBox<dyn Trace>) {
-        let addr = boxed as *const u8 as usize;
-        if addr < self.live_min {
-            self.live_min = addr;
+    /// Record a freshly allocated (young) box, which the collector cannot see
+    /// until it is rooted.
+    fn note_alloc(&mut self, addr: usize) {
+        self.live_boxes += 1;
+        self.young.push(addr);
+    }
+
+    /// Visit every live box in ascending address order. The arena walk
+    /// replaces the `live` registry (A0): every slot — live or swept — keeps
+    /// a valid `size`, so the walk steps exactly and the live bit filters.
+    fn for_each_live(&self, mut f: impl FnMut(*mut GcHeader)) {
+        for &index in &self.order {
+            let chunk = &self.chunks[index];
+            let mut addr = chunk.start;
+            while addr + size_of::<GcHeader>() <= chunk.bump {
+                // SAFETY: `addr` is a slot start inside this chunk's
+                // allocated range (`[start, bump)`), and every slot's header
+                // was written at allocation and survives the sweep.
+                let header = addr as *mut GcHeader;
+                let size = unsafe { (*header).size as usize };
+                debug_assert!(size >= size_of::<GcHeader>());
+                if unsafe { (*header).is_live() } {
+                    f(header);
+                }
+                addr += size;
+            }
         }
-        if addr > self.live_max {
-            self.live_max = addr;
+    }
+
+    /// The live boxes in ascending address order, for the conservative stack
+    /// scan's binary search. Built by the arena walk (already sorted), so no
+    /// per-collection sort is needed.
+    fn live_sorted(&self) -> Vec<GcAny> {
+        let mut live = Vec::with_capacity(self.live_boxes);
+        self.for_each_live(|header| live.push(GcAny(header)));
+        live
+    }
+
+    /// The address range spanned by the arena's allocated slots. A pre-filter
+    /// for the stack scan: most stack words are not box addresses, and two
+    /// compares beat a binary search per word. It may include dead slots and
+    /// inter-chunk gaps, so it never excludes a live box.
+    fn live_range(&self) -> (usize, usize) {
+        if self.arena_low == usize::MAX {
+            (0, 0)
+        } else {
+            (self.arena_low, self.arena_high)
         }
-        self.live.push(boxed);
+    }
+
+    /// Whether `addr` could be a box address in this heap (a superset: it may
+    /// also contain free slots and inter-chunk gaps). The write barrier's
+    /// debug-only misuse check.
+    #[cfg(debug_assertions)]
+    fn owns(&self, addr: usize) -> bool {
+        (self.arena_low..self.arena_high).contains(&addr)
     }
 
     /// Mark-sweep from `roots`. Reachable boxes are kept (and unmarked for the
@@ -786,7 +1467,11 @@ impl Heap {
     /// stack.
     pub fn collect(&mut self, roots: &[GcAny]) -> Vec<usize> {
         let work = roots.to_vec();
-        self.collect_from_work(work, roots, false, &mut |_, _| {})
+        self.reset_trace_start();
+        let trace = self.trace_start();
+        let swept = self.collect_from_work(work, roots, false, &mut |_, _| {});
+        self.trace_end("major", trace, swept.len());
+        swept
     }
 }
 
@@ -944,23 +1629,332 @@ impl Heap {
         precise: bool,
         compact: &mut CompactHook<'_>,
     ) -> Vec<usize> {
-        // Sort the live list by box address once, so the conservative scan
-        // resolves a stack word to its fat pointer by binary search — exact
-        // (a random word can never be mistaken for a box) and far cheaper
-        // than rebuilding an address HashMap every collection (A5.1b).
-        self.live
-            .sort_unstable_by_key(|ptr| *ptr as *const u8 as usize);
         // The scan starts at a local's address (this frame) and runs to the
         // stack top, covering every caller frame that may hold a handle.
         let stack_bottom_marker = 0usize;
         let sp = &stack_bottom_marker as *const usize as usize;
         let mut work: Vec<GcAny> = roots.to_vec();
+        self.reset_trace_start();
+        let trace = self.trace_start();
         if let Some((_low, high)) = stack_bounds()
             && high > sp
         {
-            self.scan_stack(sp, high, &self.live, &mut work);
+            // A0: the arena walk yields the live boxes already sorted by
+            // address (the stack scan binary-searches that list), so no
+            // per-collection sort is needed.
+            let live_sorted = self.live_sorted();
+            self.scan_stack(sp, high, &live_sorted, &mut work);
         }
-        self.collect_from_work(work, roots, precise, compact)
+        let swept = self.collect_from_work(work, roots, precise, compact);
+        self.trace_end("major", trace, swept.len());
+        swept
+    }
+
+    /// A3: a minor (young-generation) collection.
+    ///
+    /// Only the boxes allocated since the last collection are at risk, so only
+    /// they are swept; the old generation's mark bits are never touched. The
+    /// mark is seeded from the precise roots, the conservative stack scan
+    /// restricted to young boxes, and the remembered set — the old boxes the
+    /// write barrier recorded. A traced child that is old is not followed: its
+    /// young children are exactly what the remembered set holds. That rule is
+    /// what keeps the cost O(young + remembered + the roots' fan-out) rather
+    /// than O(live).
+    ///
+    /// An old box counts as marked for the ephemeron fixpoint (a minor never
+    /// sweeps it, so its weakly held value must survive). The boxes the mark did
+    /// not reach drive the weak compaction through `compact`, exactly like the
+    /// major's dead set — except that the set holds young boxes only, so a
+    /// `is_dead` test can never misfire on an old key or target.
+    pub fn collect_minor_with_stack(
+        &mut self,
+        roots: &[GcAny],
+        compact: &mut CompactHook<'_>,
+    ) -> Vec<usize> {
+        self.collect_minor_inner(roots, true, compact)
+    }
+
+    /// [`Heap::collect_minor_with_stack`] without the conservative stack scan:
+    /// the deterministic entry point ([`Heap::collect`]'s counterpart for A3).
+    pub fn collect_minor(&mut self, roots: &[GcAny]) -> Vec<usize> {
+        self.collect_minor_inner(roots, false, &mut |_, _| {})
+    }
+
+    fn collect_minor_inner(
+        &mut self,
+        roots: &[GcAny],
+        stack_scan: bool,
+        compact: &mut CompactHook<'_>,
+    ) -> Vec<usize> {
+        // The A2 invariant is exactly what a minor's correctness rests on, so
+        // it is audited here too (the verifier is O(live) and therefore only on
+        // in debug builds and `--gc-stress`).
+        self.verify_barrier();
+        self.reset_trace_start();
+        let trace = self.trace_start();
+        let mut work: Vec<GcAny> = Vec::new();
+        // A precise root that is young is marked; one that is old is only
+        // stepped through to reach its direct young children.
+        for &any in roots {
+            // SAFETY: every root is a live box.
+            unsafe { self.seed_minor(any, &mut work) };
+        }
+        // The conservative stack scan, restricted to young boxes: an old box on
+        // the stack contributes nothing on its own, and the young cohort is far
+        // shorter than the arena walk the major's scan binary-searches.
+        let probe = 0usize;
+        let sp = &probe as *const usize as usize;
+        if stack_scan
+            && let Some((_low, high)) = stack_bounds()
+            && high > sp
+        {
+            let mut young_sorted: Vec<GcAny> = self
+                .young
+                .iter()
+                .map(|&addr| GcAny(addr as *mut GcHeader))
+                .collect();
+            young_sorted.sort_unstable_by_key(|any| any.addr());
+            self.scan_stack(sp, high, &young_sorted, &mut work);
+        }
+        // The remembered set: the old boxes a young store reached. They are old,
+        // so they are stepped through but never marked — a young box's mark bit
+        // is the only kind this collection sets.
+        let remembered: Vec<usize> = REMEMBERED.with(|slot| slot.borrow().clone());
+        for addr in remembered {
+            // SAFETY: the remembered set holds live old boxes (the barrier
+            // recorded them, and every collection drains the set before one of
+            // its boxes can be freed).
+            unsafe { self.seed_minor(GcAny(addr as *mut GcHeader), &mut work) };
+        }
+        self.mark_young(&mut work);
+        // A traced `RefCell` was mutably borrowed mid-mark: the mark is
+        // incomplete, so nothing is swept. The young cohort and the remembered
+        // set both stay exactly as they were, and the next collection retries.
+        if ABORT_SWEEP.with(|abort| abort.replace(false)) {
+            for &addr in &self.young {
+                // SAFETY: the young list holds live boxes.
+                unsafe { (*(addr as *mut GcHeader)).set_marked(false) };
+            }
+            EPHEMERONS.with(|slot| slot.borrow_mut().clear());
+            bump_collection_generation();
+            compact(&[], &mut |_| {});
+            return Vec::new();
+        }
+        // The young boxes the mark did not reach, collected while they are
+        // still allocated: the compaction hook needs the would-be-swept
+        // addresses to drop the weak entries that name them.
+        let mut dead = self.dead_young();
+        dead.sort_unstable();
+        let mut retained: Vec<GcAny> = Vec::new();
+        compact(&dead, &mut |any| retained.push(any));
+        if !retained.is_empty() {
+            // A retained held value is reachable only from a pending cleanup
+            // job, so the sweep must keep it. A young one is marked; an old one
+            // needs nothing (it is not swept, and any later young store into it
+            // was barriered). An old box is never marked here: the minor sweep
+            // clears only young mark bits, so a stray old mark bit would survive
+            // into the next major and hide that box's children.
+            for any in retained {
+                // SAFETY: a retained box is live (the sweep has not run).
+                unsafe { self.seed_minor(any, &mut work) };
+            }
+            self.mark_young(&mut work);
+            dead = self.dead_young();
+            dead.sort_unstable();
+        }
+        // `--gc-verify`: a full precise mark from the same roots, asserting that
+        // nothing about to be swept is reachable. The ephemerons are still
+        // registered (they are cleared only below).
+        if verify_minor_enabled()
+            && let Some((container, child)) = self.minor_reachable_offender(roots, &dead)
+        {
+            EPHEMERONS.with(|slot| slot.borrow_mut().clear());
+            self.drain_remembered();
+            panic!(
+                "minor collection would sweep a reachable box: {container} -> {child} \
+                 ({} dead young box(es) of {} young)",
+                dead.len(),
+                self.young.len()
+            );
+        }
+        EPHEMERONS.with(|slot| slot.borrow_mut().clear());
+        // The caches that own GC handles the collector does not trace must be
+        // pruned while the mark bits are final: the major does it in
+        // `collect_from_work`, and a minor needs the young-only counterpart
+        // (an old cache entry is alive by definition here).
+        crate::map::drop_unmarked_young_empty_maps();
+        let mut swept = Vec::new();
+        for &addr in &self.young {
+            let header = addr as *mut GcHeader;
+            // SAFETY: the young list holds live boxes throughout the sweep; the
+            // walk clears the live bit before the payload is dropped. An
+            // unmarked young box has no live handle (the rooting discipline),
+            // so dropping its payload cannot dangle one.
+            unsafe {
+                if (*header).is_marked() {
+                    // A survivor: promote it in place.
+                    (*header).set_marked(false);
+                    (*header).set_young(false);
+                } else {
+                    (*header).set_live(false);
+                    (*header).set_marked(false);
+                    (*header).set_young(false);
+                    let size = (*header).size as usize;
+                    ((*header).vtable.drop)((*header).data_ptr(header));
+                    if let Some(class) = free_index(size) {
+                        self.free[class].push(addr);
+                    }
+                    swept.push(addr);
+                    self.live_boxes -= 1;
+                }
+            }
+        }
+        // Every young box is now promoted or dead, so every recorded old->young
+        // edge has become old->old and the set is stale.
+        self.young.clear();
+        self.drain_remembered();
+        self.debug_assert_young_drained();
+        self.verify_no_marks_left();
+        bump_collection_generation();
+        self.trace_end("minor", trace, swept.len());
+        swept
+    }
+
+    /// Push `any` when it is young; otherwise step through its direct children
+    /// and push the young ones, without marking `any`. An old box is never
+    /// marked by a minor collection (see [`Heap::collect_minor_with_stack`]).
+    ///
+    /// SAFETY: `any` must be a live box.
+    unsafe fn seed_minor(&self, any: GcAny, work: &mut Vec<GcAny>) {
+        // SAFETY: the caller guarantees `any` is a live box.
+        unsafe {
+            if (*any.0).is_young() {
+                work.push(any);
+            } else {
+                // A5.1: an old box's *young* children can only have come from a
+                // store the barrier saw (a store while it was young would have
+                // been traced when it was traced as a young box, and its child
+                // promoted with it), so the type may bound the scan to the slots
+                // written since the last collection.
+                any.trace_dirty(&mut |child| {
+                    if (*child.0).is_young() {
+                        work.push(child);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Mark the young boxes in `work` and follow their young children, then
+    /// resolve the ephemeron edges to a fixpoint. An old box counts as marked:
+    /// a minor never sweeps it, so a value it weakly holds must survive.
+    fn mark_young(&self, work: &mut Vec<GcAny>) {
+        drain_young_work(work);
+        loop {
+            let mut promoted = false;
+            let edges = EPHEMERONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+            for (key, value) in edges {
+                // SAFETY: the ephemerons were registered while tracing live
+                // boxes, so both ends are live for the duration of the mark.
+                let promote = unsafe {
+                    let key_reachable = (*key.0).is_marked() || !(*key.0).is_young();
+                    let value_reachable = (*value.0).is_marked() || !(*value.0).is_young();
+                    key_reachable && !value_reachable
+                };
+                if promote {
+                    // Push unmarked so the drain marks *and traces* it.
+                    work.push(value);
+                    promoted = true;
+                }
+                EPHEMERONS.with(|slot| slot.borrow_mut().push((key, value)));
+            }
+            if !promoted {
+                break;
+            }
+            drain_young_work(work);
+        }
+    }
+
+    /// The young boxes the current minor mark did not reach.
+    fn dead_young(&self) -> Vec<usize> {
+        let mut dead = Vec::new();
+        for &addr in &self.young {
+            // SAFETY: the young list holds live boxes.
+            if !unsafe { (*(addr as *mut GcHeader)).is_marked() } {
+                dead.push(addr);
+            }
+        }
+        dead
+    }
+
+    /// A3 `--gc-verify`: a full precise mark (young and old alike) from
+    /// `roots`, reporting the first box in `dead` that the mark reaches. `dead`
+    /// must have been built while those boxes are still allocated, so their
+    /// type names are readable.
+    ///
+    /// This is the net that turns a barrier or generation-rule gap into a loud
+    /// failure instead of a use-after-free at the next access.
+    fn minor_reachable_offender(
+        &self,
+        roots: &[GcAny],
+        dead: &[usize],
+    ) -> Option<(&'static str, &'static str)> {
+        if dead.is_empty() {
+            return None;
+        }
+        // Tracing a mutably-borrowed `RefCell` calls `note_aborted_trace`, so
+        // the verifier's own traversal must not abort the real collection.
+        let saved_abort = ABORT_SWEEP.with(|abort| abort.get());
+        let mut marked = AddrSet::default();
+        let mut parent_of: AddrMap = AddrMap::default();
+        let mut work: Vec<GcAny> = roots.to_vec();
+        loop {
+            while let Some(any) = work.pop() {
+                let addr = any.addr();
+                if !marked.insert(addr) {
+                    continue;
+                }
+                // SAFETY: `any` is a live box (a root or a traced child); the
+                // mark set breaks cycles.
+                unsafe {
+                    any.trace(&mut |child| {
+                        parent_of.entry(child.addr()).or_insert(any);
+                        work.push(child);
+                    });
+                }
+            }
+            let mut promoted = false;
+            let edges = EPHEMERONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+            for (key, value) in edges {
+                if marked.contains(&key.addr()) && !marked.contains(&value.addr()) {
+                    work.push(value);
+                    promoted = true;
+                }
+                EPHEMERONS.with(|slot| slot.borrow_mut().push((key, value)));
+            }
+            if !promoted {
+                break;
+            }
+        }
+        // An incomplete verifier mark would report false positives, so it is
+        // skipped: the aborted trace already forced the real sweep's abort.
+        let aborted = ABORT_SWEEP.with(|abort| abort.replace(saved_abort));
+        if aborted && !saved_abort {
+            return None;
+        }
+        for &addr in dead {
+            if marked.contains(&addr) {
+                // SAFETY: `addr` is a live box (the sweep has not run yet).
+                let child = unsafe { ((*(addr as *mut GcHeader)).vtable.name)() };
+                let container = parent_of
+                    .get(&addr)
+                    // SAFETY: the recorded parent is a live box.
+                    .map(|any| unsafe { ((*any.0).vtable.name)() })
+                    .unwrap_or("<root>");
+                return Some((container, child));
+            }
+        }
+        None
     }
 
     /// The mark phase shared by [`Heap::collect`] and
@@ -982,6 +1976,9 @@ impl Heap {
         precise: bool,
         compact: &mut CompactHook<'_>,
     ) -> Vec<usize> {
+        // A2: the barrier's exactness is only testable while the young bits
+        // still describe the pre-collection heap, so it runs first.
+        self.verify_barrier();
         // GC-4: precise dead set for the weak tables. Run before the
         // conservative mark so the compaction decides liveness from true
         // heap reachability (plus the ephemeron fixpoint), never from stale
@@ -995,10 +1992,10 @@ impl Heap {
                 if !marked.insert(addr) {
                     continue;
                 }
-                // SAFETY: `any` is a registered box (a precise root);
-                // the mark set breaks cycles.
+                // SAFETY: `any` is a live box (a precise root); the mark set
+                // breaks cycles.
                 unsafe {
-                    (*any.0).data.trace(&mut |child| pwork.push(child));
+                    any.trace(&mut |child| pwork.push(child));
                 }
             }
             loop {
@@ -1021,10 +2018,9 @@ impl Heap {
                     if !marked.insert(addr) {
                         continue;
                     }
-                    // SAFETY: as above; the promoted value is a
-                    // registered box.
+                    // SAFETY: as above; the promoted value is a live box.
                     unsafe {
-                        (*any.0).data.trace(&mut |child| pwork.push(child));
+                        any.trace(&mut |child| pwork.push(child));
                     }
                 }
             }
@@ -1032,17 +2028,16 @@ impl Heap {
         } else {
             None
         };
-        // SAFETY: every `GcAny` in `work` is a registered box (a root from a
-        // live `Gc<T>`'s `Trace` impl, or an address the scan looked up in
-        // the live set); the mark bit breaks cycles.
+        // SAFETY: every `GcAny` in `work` is a live box (a root from a live
+        // `Gc<T>`'s `Trace` impl, or a box the scan looked up in the arena);
+        // the mark bit breaks cycles.
         while let Some(any) = work.pop() {
             unsafe {
-                let ptr = any.0;
-                if (*ptr).mark.get() {
+                if any.is_marked() {
                     continue;
                 }
-                (*ptr).mark.set(true);
-                (*ptr).data.trace(&mut |child| work.push(child));
+                any.set_marked(true);
+                any.trace(&mut |child| work.push(child));
             }
         }
         // GC-3 ephemeron fixpoint: a weak-table value is reachable only
@@ -1054,8 +2049,8 @@ impl Heap {
             let mut promoted = false;
             let edges = EPHEMERONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
             for (key, value) in edges {
-                let key_marked = unsafe { (*key.0).mark.get() };
-                let value_marked = unsafe { (*value.0).mark.get() };
+                let key_marked = key.is_marked();
+                let value_marked = value.is_marked();
                 if key_marked && !value_marked {
                     // Push unmarked: the drain below marks *and traces* the
                     // promoted value (a pre-mark would make the drain skip
@@ -1070,12 +2065,11 @@ impl Heap {
             }
             while let Some(any) = work.pop() {
                 unsafe {
-                    let ptr = any.0;
-                    if (*ptr).mark.get() {
+                    if any.is_marked() {
                         continue;
                     }
-                    (*ptr).mark.set(true);
-                    (*ptr).data.trace(&mut |child| work.push(child));
+                    any.set_marked(true);
+                    any.trace(&mut |child| work.push(child));
                 }
             }
         }
@@ -1085,13 +2079,21 @@ impl Heap {
         // imprecise but safe. The next collection retries.
         let aborted = ABORT_SWEEP.with(|abort| abort.replace(false));
         if aborted {
-            for ptr in &self.live {
-                // SAFETY: entries are registered boxes; resetting the mark
-                // prepares for the next cycle.
+            // Reset the marks and promote every live box (the sweep is
+            // skipped, so nothing else is reclassified), keeping the young
+            // list drained. Retaining everything is imprecise but safe; the
+            // next collection retries.
+            self.for_each_live(|header| {
+                // SAFETY: `header` belongs to a live box.
                 unsafe {
-                    (**ptr).mark.set(false);
+                    (*header).set_marked(false);
+                    (*header).set_young(false);
                 }
-            }
+            });
+            self.young.clear();
+            self.debug_assert_young_drained();
+            self.drain_remembered();
+            bump_collection_generation();
             compact(&[], &mut |_| {});
             return Vec::new();
         }
@@ -1100,19 +2102,20 @@ impl Heap {
         // re-traced, and the ephemeron fixpoint re-runs (a retained
         // heldValue may itself be a weak key).
         let mut dead: Vec<usize> = Vec::new();
-        if let Some(precise_marked) = &precise_marked {
-            for ptr in &self.live {
-                let addr = *ptr as *const u8 as usize;
+        if let Some(precise_marked) = precise_marked.as_ref() {
+            self.for_each_live(|header| {
+                let addr = header as usize;
                 if !precise_marked.contains(&addr) {
                     dead.push(addr);
                 }
-            }
+            });
         } else {
-            for ptr in &self.live {
-                if !unsafe { (**ptr).mark.get() } {
-                    dead.push(*ptr as *const u8 as usize);
+            self.for_each_live(|header| {
+                // SAFETY: `header` belongs to a live box.
+                if !unsafe { (*header).is_marked() } {
+                    dead.push(header as usize);
                 }
-            }
+            });
         }
         dead.sort_unstable();
         let mut retained: Vec<GcAny> = Vec::new();
@@ -1121,12 +2124,11 @@ impl Heap {
             let mut work = vec![any];
             while let Some(any) = work.pop() {
                 unsafe {
-                    let ptr = any.0;
-                    if (*ptr).mark.get() {
+                    if any.is_marked() {
                         continue;
                     }
-                    (*ptr).mark.set(true);
-                    (*ptr).data.trace(&mut |child| work.push(child));
+                    any.set_marked(true);
+                    any.trace(&mut |child| work.push(child));
                 }
             }
             // Re-run the fixpoint for edges reachable from the retained box.
@@ -1134,7 +2136,7 @@ impl Heap {
                 let mut promoted = false;
                 let edges = EPHEMERONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
                 for (key, value) in edges {
-                    if unsafe { (*key.0).mark.get() } && !unsafe { (*value.0).mark.get() } {
+                    if key.is_marked() && !value.is_marked() {
                         // Push unmarked so the drain traces it (see the
                         // main fixpoint).
                         work.push(value);
@@ -1147,12 +2149,11 @@ impl Heap {
                 }
                 while let Some(any) = work.pop() {
                     unsafe {
-                        let ptr = any.0;
-                        if (*ptr).mark.get() {
+                        if any.is_marked() {
                             continue;
                         }
-                        (*ptr).mark.set(true);
-                        (*ptr).data.trace(&mut |child| work.push(child));
+                        any.set_marked(true);
+                        any.trace(&mut |child| work.push(child));
                     }
                 }
             }
@@ -1163,69 +2164,189 @@ impl Heap {
         // empty maps) while the mark bits are still final, so a box this
         // sweep drops is never handed out again.
         crate::map::drop_unmarked_empty_maps();
-        let mut keep = Vec::with_capacity(self.live.len());
+        // A0: sweep by walking the arena. Every slot — live or swept — keeps
+        // its rounded size, so the walk steps exactly; the live bit filters.
         let mut swept = Vec::new();
-        let mut new_min = usize::MAX;
-        let mut new_max = 0usize;
-        for ptr in self.live.drain(..) {
-            // SAFETY: every entry was registered by `Gc::new` and is a valid
-            // box; unmarked boxes have no live handles (the rooting
-            // discipline), so dropping them cannot dangle a handle.
-            unsafe {
-                if (*ptr).mark.get() {
-                    (*ptr).mark.set(false);
-                    let addr = ptr as *const u8 as usize;
-                    if addr < new_min {
-                        new_min = addr;
+        for index in 0..self.chunks.len() {
+            let (start, bump) = (self.chunks[index].start, self.chunks[index].bump);
+            let mut addr = start;
+            while addr + size_of::<GcHeader>() <= bump {
+                // SAFETY: `addr` is a slot start inside this chunk's allocated
+                // range; its header is valid. An unmarked live box has no live
+                // handle (the rooting discipline), so dropping its payload
+                // cannot dangle one.
+                let header = addr as *mut GcHeader;
+                unsafe {
+                    let size = (*header).size as usize;
+                    debug_assert!(size >= size_of::<GcHeader>());
+                    if (*header).is_live() {
+                        if (*header).is_marked() {
+                            // A survivor: clear the mark and promote it in
+                            // place (A1) — the young bit is what a minor
+                            // collection partitions on.
+                            (*header).set_marked(false);
+                            (*header).set_young(false);
+                        } else {
+                            // Dead: clear the live bit (the walk then skips the
+                            // slot) before the payload is dropped.
+                            (*header).set_live(false);
+                            ((*header).vtable.drop)((*header).data_ptr(header));
+                            // Reclaim the slot on the size-classed free list
+                            // (reused by a later `Gc::new` of the same size),
+                            // never freed to the allocator. Sizes beyond the
+                            // classes bump forever (rare; the arena grows).
+                            if let Some(class) = free_index(size) {
+                                self.free[class].push(addr);
+                            }
+                            swept.push(addr);
+                            self.live_boxes -= 1;
+                        }
                     }
-                    if addr > new_max {
-                        new_max = addr;
-                    }
-                    keep.push(ptr);
-                } else {
-                    swept.push(ptr as *const u8 as usize);
-                    // A5.1: the arena owns the slot memory, but the dead
-                    // box's payload must still be dropped (its Vecs,
-                    // HashMaps, and Arc buffers are heap allocations of
-                    // their own) before the slot is reused — otherwise
-                    // every swept box leaks its internals.
-                    std::ptr::drop_in_place(&mut (*ptr).data);
-                    // Reclaim the slot on the size-classed free list
-                    // (reused by a later `Gc::new` of the same size), never
-                    // freed to the allocator. Sizes beyond the classes bump
-                    // forever (rare; the arena grows for them).
-                    if let Some(index) = free_index((*ptr).size as usize) {
-                        self.free[index].push(ptr);
-                    }
+                    addr += size;
                 }
             }
         }
-        self.live = keep;
-        self.live_min = if new_min == usize::MAX { 0 } else { new_min };
-        self.live_max = new_max;
+        // A1: the collection reclassified every survivor, so the cohort is
+        // empty until the next allocation.
+        self.young.clear();
+        self.debug_assert_young_drained();
+        self.drain_remembered();
+        self.verify_no_marks_left();
+        bump_collection_generation();
         swept
+    }
+
+    /// A2: clear the remembered set. A full collection reclassifies the whole
+    /// heap — every surviving box is promoted to old and the young cohort is
+    /// drained — so no old->young edge survives it and the recorded addresses
+    /// are stale. The header bits are cleared too, so a slot later reused for
+    /// a young box never carries a stale entry (`Gc::new` rewrites the whole
+    /// flags word regardless).
+    fn drain_remembered(&self) {
+        REMEMBERED.with(|slot| {
+            let mut list = slot.borrow_mut();
+            for &addr in list.iter() {
+                // SAFETY: the address came from a live box; boxes are only
+                // freed inside a collection and the header outlives the
+                // payload as a free-list slot, so the flags write is in
+                // bounds.
+                unsafe { (*(addr as *mut GcHeader)).set_remembered(false) };
+            }
+            list.clear();
+        });
+    }
+
+    /// A2: verify the write barrier's completeness — every live *old* box that
+    /// holds a young reference must be in the remembered set. Runs before the
+    /// sweep, while the young bits still describe the pre-collection heap.
+    ///
+    /// Only a miss is fatal (A3 would sweep a reachable box). A remembered box
+    /// with no young child is imprecise — it costs one extra trace, never
+    /// correctness — and is counted, not asserted: unwinding a store that
+    /// overwrote a young value with a primitive would need a delete barrier.
+    fn verify_barrier(&self) {
+        if !verify_barrier_enabled() {
+            return;
+        }
+        // Tracing a mutably-borrowed `RefCell` calls `note_aborted_trace`, so
+        // the verifier's own traversal must not abort the real collection.
+        let saved_abort = ABORT_SWEEP.with(|abort| abort.get());
+        let mut misses = 0usize;
+        let mut imprecise = 0usize;
+        let mut offenders: Vec<(&'static str, &'static str)> = Vec::new();
+        self.for_each_live(|header| {
+            // SAFETY: `header` is a live box for the duration of the walk.
+            unsafe {
+                if (*header).is_young() {
+                    return;
+                }
+                let mut has_young_child = false;
+                let mut young_child = "";
+                GcAny(header).trace(&mut |child| {
+                    if (*child.0).is_young() {
+                        has_young_child = true;
+                        if young_child.is_empty() {
+                            young_child = ((*child.0).vtable.name)();
+                        }
+                    }
+                });
+                match ((*header).is_remembered(), has_young_child) {
+                    (false, true) => {
+                        misses += 1;
+                        if offenders.len() < 4 {
+                            offenders.push((((*header).vtable.name)(), young_child));
+                        }
+                    }
+                    (true, false) => imprecise += 1,
+                    _ => {}
+                }
+            }
+        });
+        ABORT_SWEEP.with(|abort| abort.set(saved_abort));
+        assert!(
+            misses == 0,
+            "write-barrier miss: {misses} old box(es) hold a young reference the barrier never \
+             recorded ({imprecise} imprecise entries); offenders: {offenders:?}"
+        );
+    }
+
+    /// A3: after a collection, no live box may carry a mark bit. A minor leaves
+    /// the old generation's mark bits alone, so a stray one would make the next
+    /// major skip that box — its children would then be swept while reachable,
+    /// which is invisible to the minor's own reachability check (that reads no
+    /// flags). Runs only when a verifier is enabled (it walks the arena).
+    fn verify_no_marks_left(&self) {
+        if !verify_minor_enabled() && !verify_barrier_enabled() {
+            return;
+        }
+        let mut stray: Option<(&'static str, bool)> = None;
+        self.for_each_live(|header| {
+            // SAFETY: `header` belongs to a live box.
+            unsafe {
+                if (*header).is_marked() && stray.is_none() {
+                    stray = Some((((*header).vtable.name)(), (*header).is_young()));
+                }
+            }
+        });
+        assert!(
+            stray.is_none(),
+            "a collection left a mark bit set: {stray:?} (type, is_young)"
+        );
+    }
+
+    /// A1 invariant: after a collection no live box is young and the cohort
+    /// list is empty. Debug-only (the check walks the arena); release relies
+    /// on the sweep's per-survivor promotion.
+    fn debug_assert_young_drained(&self) {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                self.young.is_empty(),
+                "the young cohort must be drained by every collection"
+            );
+            self.for_each_live(|header| {
+                // SAFETY: `header` belongs to a live box.
+                debug_assert!(
+                    !unsafe { (*header).is_young() },
+                    "a box that survived a collection must be promoted"
+                );
+            });
+        }
     }
 
     /// Scan every word in the current thread's live stack region
     /// `[sp, high)` and push boxes whose address appears there onto `work`.
-    /// `live_sorted` is the `live` list sorted by box address (A5.1b); a
-    /// membership test is a binary search, so a coincidental stack word can
-    /// only be marked when it is a real box (imprecise, never unsafe).
-    fn scan_stack(
-        &self,
-        sp: usize,
-        high: usize,
-        live_sorted: &[*mut GcBox<dyn Trace>],
-        work: &mut Vec<GcAny>,
-    ) {
-        // GC-5: most stack words are not box addresses — skip the search
-        // for words outside the live boxes' address range (tracked by
-        // register and refreshed by the sweep).
-        let live_low = self.live_min;
-        let live_high = self.live_max;
+    /// `live_sorted` is the arena's live boxes in ascending address order
+    /// (the walk yields it, A0); a membership test is a binary search, so a
+    /// coincidental stack word can only be marked when it is a real box
+    /// (imprecise, never unsafe).
+    fn scan_stack(&self, sp: usize, high: usize, live_sorted: &[GcAny], work: &mut Vec<GcAny>) {
+        // GC-5: most stack words are not box addresses — skip the search for
+        // words outside the arena's address range.
+        let (live_low, live_high) = self.live_range();
         let find = |addr: usize| {
             live_sorted
-                .binary_search_by_key(&addr, |ptr| *ptr as *const u8 as usize)
+                .binary_search_by_key(&addr, |any| any.addr())
                 .ok()
                 .map(|index| live_sorted[index])
         };
@@ -1234,31 +2355,33 @@ impl Heap {
         // by the live set no matter how wide the scanned region is.
         let mut seen: AddrSet = AddrSet::default();
         let mut addr = sp;
+        let mut words = 0usize;
         while addr < high {
             // SAFETY: `[sp, high)` is the current thread's committed stack
             // (platform stack_bounds guarantees readability); reads are
             // unaligned so the exact frame layout does not matter.
             let word = unsafe { std::ptr::read_unaligned::<usize>(addr as *const usize) };
             if (live_low..=live_high).contains(&word)
-                && let Some(ptr) = find(word)
+                && let Some(any) = find(word)
             {
-                // SAFETY: `ptr` is a registered, live box; the scan only
-                // pushes boxes already in the live set.
-                if seen.insert(ptr as *const u8 as usize) {
-                    work.push(GcAny(ptr));
+                // The scan only pushes boxes already in the live set.
+                if seen.insert(any.addr()) {
+                    work.push(any);
                 }
             } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
                 && (live_low..=live_high).contains(&box_addr)
-                && let Some(ptr) = find(box_addr)
+                && let Some(any) = find(box_addr)
             {
-                // SAFETY: `ptr` is a registered, live box decoded from a
-                // tagged Value; the scan only pushes boxes already live.
+                // A box decoded from a tagged Value; the scan only pushes
+                // boxes already live.
                 if seen.insert(box_addr) {
-                    work.push(GcAny(ptr));
+                    work.push(any);
                 }
             }
             addr += std::mem::size_of::<usize>();
+            words += 1;
         }
+        self.stack_words.set(words);
     }
 }
 
@@ -1374,13 +2497,236 @@ mod tests {
         with_heap_mut(|heap| heap.collect(&[a.as_any()]));
         with_heap_mut(|heap| heap.collect(&[a.as_any()]));
         assert_eq!(with_heap(|heap| heap.live_count()), start);
-        a.next.borrow_mut().replace(Gc::new(Node::default()));
+        let child = Gc::new(Node::default());
+        write_barrier_handle(&*a, child);
+        a.next.borrow_mut().replace(child);
         with_heap_mut(|heap| heap.collect(&[]));
         assert_eq!(
             with_heap(|heap| heap.live_count()),
             start - 1,
             "only the root survives"
         );
+        let _ = std::hint::black_box(a);
+    }
+
+    #[test]
+    fn barrier_records_an_old_to_young_edge() {
+        set_verify_barrier(true);
+        let a = Gc::new(Node::default());
+        // Promote `a` with it as the only root.
+        with_heap_mut(|heap| heap.collect(&[a.as_any()]));
+        // A young child stored into the now-old `a` must be recorded...
+        let child = Gc::new(Node::default());
+        write_barrier_handle(&*a, child);
+        assert_eq!(remembered_count(), 1);
+        // ...which satisfies the collection's own verifier, and the set is
+        // drained afterwards (a full collection leaves no young boxes).
+        with_heap_mut(|heap| heap.collect(&[a.as_any()]));
+        assert_eq!(remembered_count(), 0);
+        // SAFETY: `a` survived the collection.
+        unsafe { assert!(!(*a.as_any().0).is_remembered()) };
+        let _ = std::hint::black_box((a, child));
+    }
+
+    #[test]
+    #[should_panic(expected = "write-barrier miss")]
+    fn a_missing_barrier_is_detected() {
+        set_verify_barrier(true);
+        let a = Gc::new(Node::default());
+        with_heap_mut(|heap| heap.collect(&[a.as_any()]));
+        // A young child stored WITHOUT the barrier: the collector must catch
+        // it rather than sweep the child at the next collection.
+        let child = Gc::new(Node::default());
+        a.next.borrow_mut().replace(child);
+        with_heap_mut(|heap| heap.collect(&[a.as_any()]));
+    }
+
+    #[test]
+    fn boxes_are_born_young_and_promoted_in_place() {
+        let a = Gc::new(Node::default());
+        let doomed = Gc::new(Node::default());
+        // SAFETY: both handles are live boxes.
+        unsafe {
+            assert!((*a.as_any().0).is_young(), "a fresh box is young");
+            assert!((*doomed.as_any().0).is_young(), "a fresh box is young");
+        }
+        assert!(with_heap(|heap| heap.young_count()) >= 2);
+        // The collection promotes the rooted survivor in place, sweeps the
+        // unrooted box, and drains the cohort.
+        with_heap_mut(|heap| heap.collect(&[a.as_any()]));
+        // SAFETY: `a` survived the collection.
+        unsafe {
+            assert!(
+                !(*a.as_any().0).is_young(),
+                "a survivor is promoted in place"
+            );
+        }
+        assert_eq!(with_heap(|heap| heap.young_count()), 0);
+        // A fresh allocation starts the next cohort.
+        let fresh = Gc::new(Node::default());
+        // SAFETY: `fresh` is live.
+        unsafe { assert!((*fresh.as_any().0).is_young()) };
+        assert_eq!(with_heap(|heap| heap.young_count()), 1);
+        let _ = std::hint::black_box((a, fresh));
+    }
+
+    #[test]
+    fn minor_keeps_a_young_box_reached_through_the_remembered_set() {
+        let old = Gc::new(Node::default());
+        // Promote `old` (it is the only root).
+        with_heap_mut(|heap| heap.collect(&[old.as_any()]));
+        // A young child stored into the now-old box: the barrier records the
+        // edge, which is the only thing that can reach the child (the minor is
+        // given no precise root).
+        let child = Gc::new(Node::default());
+        write_barrier_handle(&*old, child);
+        old.next.borrow_mut().replace(child);
+        let swept = with_heap_mut(|heap| heap.collect_minor(&[]));
+        assert!(swept.is_empty(), "the recorded edge kept the child alive");
+        assert_eq!(with_heap(|heap| heap.young_count()), 0);
+        assert!(old.next.borrow().is_some());
+        let _ = std::hint::black_box((old, child, swept));
+    }
+
+    #[test]
+    fn minor_sweeps_an_unreachable_young_box() {
+        let live = Gc::new(Node::default());
+        with_heap_mut(|heap| heap.collect(&[live.as_any()]));
+        let doomed = Gc::new(Node::default());
+        let swept = with_heap_mut(|heap| heap.collect_minor(&[live.as_any()]));
+        assert_eq!(
+            swept,
+            vec![doomed.as_any().addr()],
+            "the unrooted young box is swept"
+        );
+        // The old generation is untouched.
+        assert_eq!(with_heap(|heap| heap.young_count()), 0);
+        let _ = std::hint::black_box((live, doomed));
+    }
+
+    #[test]
+    fn a_major_after_a_minor_still_traces_the_old_generation() {
+        let old = Gc::new(Node::default());
+        with_heap_mut(|heap| heap.collect(&[old.as_any()]));
+        let child = Gc::new(Node::default());
+        write_barrier_handle(&*old, child);
+        old.next.borrow_mut().replace(child);
+        // The minor promotes `child`. It must leave no old mark bit behind: the
+        // minor sweep clears only young marks, so a stray one would make the
+        // next major skip that box's children.
+        let swept = with_heap_mut(|heap| heap.collect_minor(&[]));
+        assert!(swept.is_empty());
+        let grandchild = Gc::new(Node::default());
+        write_barrier_handle(&*child, grandchild);
+        child.next.borrow_mut().replace(grandchild);
+        let swept = with_heap_mut(|heap| heap.collect(&[old.as_any()]));
+        assert!(
+            !swept.contains(&grandchild.as_any().addr()),
+            "the major must reach through the minor-promoted child"
+        );
+        let _ = std::hint::black_box((old, child, grandchild, swept));
+    }
+
+    #[test]
+    #[should_panic(expected = "minor collection would sweep a reachable box")]
+    fn minor_verify_detects_a_missing_barrier() {
+        // The A2 verifier catches the missing barrier first, and this test is
+        // about the minor's own net, so it is switched off.
+        set_verify_barrier(false);
+        set_verify_minor(true);
+        let root = Gc::new(Node::default());
+        with_heap_mut(|heap| heap.collect(&[root.as_any()]));
+        // An old->old edge: no barrier needed, and the major below reaches it.
+        let mid = Gc::new(Node::default());
+        root.next.borrow_mut().replace(mid);
+        with_heap_mut(|heap| heap.collect(&[root.as_any()]));
+        // The bug: an old->young store with no barrier, two hops from the root,
+        // so the minor's own mark cannot reach it (it stops at the old `mid`)
+        // while a full mark can.
+        let leaf = Gc::new(Node::default());
+        mid.next.borrow_mut().replace(leaf);
+        with_heap_mut(|heap| heap.collect_minor(&[root.as_any()]));
+    }
+
+    #[test]
+    fn a_minor_traces_only_an_old_arrays_dirty_slots() {
+        use crate::object::ArraySlots;
+        // A5.1: the low-water mark bounds what a minor scans. Fill the buffer so
+        // a full trace has plenty to visit, promote it, then append one young
+        // element and check both that the scan is bounded and that the young
+        // element survives it.
+        let undef = crate::value::Value::Undefined;
+        let mut elements = vec![undef; 8];
+        let old: Vec<Gc<crate::object::JsObject>> = (0..6)
+            .map(|_| crate::object::JsObject::ordinary_object_create(None))
+            .collect();
+        for (index, object) in old.iter().enumerate() {
+            elements[index] = crate::value::Value::Object(*object);
+        }
+        let slots = Gc::new(ArraySlots::new(elements, 8.0));
+        // Promote the array and its six elements.
+        with_heap_mut(|heap| heap.collect(&[slots.as_any()]));
+        let child = crate::object::JsObject::ordinary_object_create(None);
+        slots.elements_mut()[6] = crate::value::Value::Object(child);
+        write_barrier_element(&*slots, crate::value::Value::Object(child), 6);
+        // The bound is real: the dirty trace visits slot 6 onwards (slot 7 is a
+        // hole, so only the child), while the full trace visits every element.
+        let mut dirty_visits = 0;
+        // SAFETY: `slots` is a live old box.
+        unsafe { slots.as_any().trace_dirty(&mut |_| dirty_visits += 1) };
+        assert_eq!(
+            dirty_visits, 1,
+            "only the slots at or after the mark are visited"
+        );
+        let mut full_visits = 0;
+        // SAFETY: as above.
+        unsafe { slots.as_any().trace(&mut |_| full_visits += 1) };
+        assert_eq!(
+            full_visits, 7,
+            "the full trace visits every live element (six old + the young child)"
+        );
+        // And the bound is sound: the young element is reachable only through
+        // the old array, so the minor must mark (and promote) it.
+        let swept = with_heap_mut(|heap| heap.collect_minor(&[]));
+        assert!(swept.is_empty(), "the young element survived: {swept:?}");
+        assert!(child.as_any().is_live());
+    }
+
+    #[test]
+    fn arena_walk_multi_chunk_varied_sizes() {
+        #[derive(Default)]
+        struct Wide {
+            next: GcCell<Option<Gc<Node>>>,
+            /// Padding only: it widens the box so the loop spans several
+            /// arena chunks.
+            #[allow(dead_code)]
+            pad: [u64; 32],
+        }
+
+        impl Trace for Wide {
+            fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+                self.next.trace(visit);
+            }
+        }
+
+        for round in 0..8 {
+            let mut keep: Vec<Gc<Wide>> = Vec::new();
+            for i in 0..8000 {
+                let wide = Gc::new(Wide::default());
+                wide.next.borrow_mut().replace(Gc::new(Node::default()));
+                if i % 7 == 0 {
+                    keep.push(wide);
+                }
+            }
+            let roots: Vec<GcAny> = keep.iter().map(|wide| wide.as_any()).collect();
+            with_heap_mut(|heap| heap.collect_with_stack(&roots));
+            for wide in &keep {
+                assert!(
+                    wide.next.borrow().is_some(),
+                    "round {round}: dropped a root"
+                );
+            }
+        }
     }
 
     #[test]

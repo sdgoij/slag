@@ -636,4 +636,58 @@ mod tests {
         let value = agent.run_script("saw").unwrap();
         assert!(matches!(value.kind(), ValueKind::Null));
     }
+
+    #[test]
+    fn weak_ref_target_dies_after_minor_collection() {
+        // A4: a young target reachable only through the ref is swept by a
+        // minor, and its entry is cleared with it.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script("globalThis.w = new WeakRef({});").unwrap();
+        agent.collect_minor_garbage_with(None);
+        let value = agent.run_script("w.deref()").unwrap();
+        assert!(matches!(value.kind(), ValueKind::Undefined));
+    }
+
+    #[test]
+    fn weak_ref_keep_during_job_under_minor() {
+        // A4: the KeepDuringJob set is traced by a minor too, so a discarded
+        // deref keeps its young target across a minor in the same job window.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "(function () { let t = {}; globalThis.w = new WeakRef(t); w.deref(); })();",
+            )
+            .unwrap();
+        agent.collect_minor_garbage_with(None);
+        let value = agent.run_script("w.deref() instanceof Object").unwrap();
+        assert!(matches!(value.kind(), ValueKind::Boolean(true)));
+        // The minor promoted the kept target, so only a major reclaims it once
+        // the job window closes.
+        agent.enqueue_generic_job(None, |_| Ok(Value::Undefined));
+        agent.run_jobs().unwrap();
+        agent.collect_garbage();
+        let value = agent.run_script("w.deref() === undefined").unwrap();
+        assert!(matches!(value.kind(), ValueKind::Boolean(true)));
+    }
+
+    #[test]
+    fn finalization_registry_cleanup_job_runs_under_minor() {
+        // A4: a young target that dies in a minor collection enqueues its
+        // cleanup job, so the callback still fires with the held value.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "globalThis.saw = null; \
+                 globalThis.fr = new FinalizationRegistry(function (held) { saw = held; }); \
+                 fr.register({}, 'held');",
+            )
+            .unwrap();
+        agent.collect_minor_garbage_with(None);
+        agent.run_jobs().unwrap();
+        let value = agent.run_script("saw").unwrap();
+        assert!(matches!(value.kind(), ValueKind::String(s) if s.to_string_lossy() == "held"));
+    }
 }

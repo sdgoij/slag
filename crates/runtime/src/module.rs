@@ -409,6 +409,7 @@ pub(crate) fn module_source_object(
     let object = JsObject::ordinary_object_create(prototype);
     let value = Value::Object(object);
     agent.module_sources.insert(object.id(), *module);
+    crux::heap::write_barrier(&**module, value);
     module.module_source.replace(Some(value));
     Ok(value)
 }
@@ -461,6 +462,7 @@ pub fn host_resolve_imported_module(
     let text = String::from_utf8_lossy(&source.bytes).into_owned();
     let source_text = JsString::from_utf8(&text);
     let module = parse_module(agent, specifier, &source_text, attributes)?;
+    crux::heap::write_barrier_handle(&*realm, module);
     realm
         .loaded_modules
         .borrow_mut()
@@ -751,6 +753,7 @@ pub fn module_declaration_instantiation(
     // 16.2.1.6.1.2.1 step 4): the module env chains to the global env so
     // module bodies resolve realm globals (URIError, assert, …).
     let env = new_module_environment(Some(module.realm.global_env));
+    crux::heap::write_barrier_handle(&**module, env);
     module.environment.replace(Some(env));
 
     // spec 16.2.1.6.1.2.1 step 8: every requested module — including those
@@ -1354,6 +1357,7 @@ pub fn module_evaluation(
                         let root = imported;
                         for member in &agent.module_eval_stack[index..] {
                             if member.cycle_root.borrow().is_none() {
+                                crux::heap::write_barrier_handle(&**member, root);
                                 *member.cycle_root.borrow_mut() = Some(root);
                             }
                         }
@@ -1403,6 +1407,9 @@ pub fn module_evaluation(
         return Err(error);
     }
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor())?;
+    crux::heap::write_barrier(&**module, capability.promise);
+    crux::heap::write_barrier(&**module, capability.resolve);
+    crux::heap::write_barrier(&**module, capability.reject);
     module
         .top_level_capability
         .replace(Some(capability.clone()));
@@ -1439,6 +1446,7 @@ fn register_async_parent(
         (*dep.cycle_root.borrow()).unwrap_or(*dep)
     };
     target.async_parents.borrow_mut().push(*module);
+    crux::heap::write_barrier_handle(&*target, *module);
     *module.pending_async.borrow_mut() += 1;
     Ok(())
 }
@@ -1594,6 +1602,7 @@ pub(crate) fn finish_module_evaluation(
             notify_async_parents_fulfilled(agent, module)?;
         }
         Completion::Throw(value) => {
+            crux::heap::write_barrier(&**module, value);
             module.evaluation_error.replace(Some(value));
             crate::function::call(
                 agent,
@@ -1607,6 +1616,7 @@ pub(crate) fn finish_module_evaluation(
             let error = Value::String(Handle::new(JsString::from_utf8(
                 "Illegal control flow in a module body",
             )));
+            crux::heap::write_barrier(&**module, error);
             module.evaluation_error.replace(Some(error));
             crate::function::call(
                 agent,
@@ -1634,6 +1644,7 @@ fn propagate_module_error(
             continue;
         }
         parent.status.replace(ModuleStatus::Evaluated);
+        crux::heap::write_barrier(&*parent, error);
         parent.evaluation_error.replace(Some(error));
         let reject = parent
             .top_level_capability
@@ -1694,6 +1705,7 @@ pub fn module_namespace(
         return Ok(namespace);
     }
     let value = create_namespace(agent, module, false)?;
+    crux::heap::write_barrier(&**module, value);
     module.namespace.replace(Some(value));
     Ok(value)
 }
@@ -1709,6 +1721,7 @@ pub fn deferred_namespace(
         return Ok(namespace);
     }
     let value = create_namespace(agent, module, true)?;
+    crux::heap::write_barrier(&**module, value);
     module.deferred_namespace.replace(Some(value));
     Ok(value)
 }
@@ -2885,6 +2898,7 @@ pub fn import_meta(agent: &mut Agent) -> Result<Value, JsError> {
             .get("%Object.prototype%")
             .and_then(|value| crate::context::as_object(&value));
         let meta = Value::Object(JsObject::ordinary_object_create(proto));
+        crux::heap::write_barrier(&**module, meta);
         module.import_meta.replace(Some(meta));
         return Ok(meta);
     }

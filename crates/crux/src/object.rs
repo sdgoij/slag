@@ -574,6 +574,14 @@ pub struct ArraySlots {
     pub elem_ptr: Cell<*mut Value>,
     pub elem_len: Cell<usize>,
     pub elem_cap: Cell<usize>,
+    /// A5.1: the lowest element index a young value was stored at since the last
+    /// collection, stamped with that interval's generation (`u32::MAX`-free — a
+    /// mismatched stamp reads as "nothing dirty"). A minor collection traces
+    /// `dirty_from..elem_len` instead of the whole buffer, so an append-only
+    /// array costs O(appended) per minor rather than O(length). Staleness only
+    /// ever over-traces, never under-traces: the bound is the minimum over the
+    /// interval, so a stale (too low) value visits a superset.
+    pub dirty_from: Cell<(u32, u32)>,
 }
 
 impl ArraySlots {
@@ -588,6 +596,7 @@ impl ArraySlots {
             elem_ptr: Cell::new(elem_ptr),
             elem_len: Cell::new(elem_len),
             elem_cap: Cell::new(elem_cap),
+            dirty_from: Cell::new((0, 0)),
         }
     }
 
@@ -681,6 +690,52 @@ impl Trace for ArraySlots {
         // append's capacity gate keeps the pointer stable). Holes are not
         // heap references, so they trace as no-ops.
         for index in 0..len {
+            unsafe { (*ptr.add(index)).trace(visit) };
+        }
+    }
+
+    /// A5.1: record the element slot a young value landed in (the barrier's
+    /// old-target path). The stored index is the minimum over the interval, so
+    /// a minor can start there and be sure it covers every young element.
+    fn note_dirty_slot(&self, index: u32) {
+        let generation = crate::heap::collection_generation();
+        let (stored_generation, stored_index) = self.dirty_from.get();
+        if stored_generation != generation || index < stored_index {
+            self.dirty_from.set((generation, index));
+        }
+    }
+
+    /// A5.1: the minor's bounded trace — every element from the lowest dirty
+    /// index to the current end. An append-only array therefore costs its newly
+    /// appended elements, and a stale mark (or none) costs a full scan, which is
+    /// what the box-granular set did for every store anyway.
+    fn trace_dirty(&self, visit: &mut dyn FnMut(GcAny)) {
+        let (generation, from) = self.dirty_from.get();
+        let len = self.elem_len.get();
+        let ptr = self.elem_ptr.get();
+        // A5.1's own net: the bound must be a superset of this box's young
+        // elements, or a minor sweeps a reachable one. `--gc-verify` turns it
+        // on; it is O(below the mark) and therefore only for the verifier.
+        if crate::heap::verify_minor_enabled() {
+            for index in 0..(from as usize).min(len) {
+                // SAFETY: `index < len <= elem_len` is inside the live buffer.
+                let value = unsafe { *ptr.add(index) };
+                assert!(
+                    !crate::heap::value_box_is_young(value),
+                    "A5.1 dirty bound misses a young element at index {index} \
+                     (dirty_from={from}, len={len})"
+                );
+            }
+        }
+        if generation != crate::heap::collection_generation() {
+            return;
+        }
+        let from = from as usize;
+        if from >= len {
+            return;
+        }
+        // SAFETY: as `trace`; `from < len <= elem_len` is inside the live buffer.
+        for index in from..len {
             unsafe { (*ptr.add(index)).trace(visit) };
         }
     }
@@ -1160,6 +1215,7 @@ impl JsObject {
             None => return false,
         };
         if offset < INLINE_FIELDS {
+            crate::heap::write_barrier(self, value);
             self.in_fields[offset].set(value);
         }
         true
@@ -1199,6 +1255,7 @@ impl JsObject {
     pub fn map_add_property_cell(&self, key: PropertyKey, attrs: MapAttrs) -> Option<Handle<Map>> {
         let mut map = self.map.get()?;
         let child = map.get_or_create_child(key, attrs)?;
+        crate::heap::write_barrier_handle(self, child);
         self.map.set(Some(child));
         self.bump_generation();
         self.map.get()
@@ -1994,6 +2051,9 @@ impl JsObject {
             }
         }
         mark_prototype(proto.as_ref());
+        if let Some(proto) = proto {
+            crate::heap::write_barrier_handle(self, proto);
+        }
         self.prototype.set(proto);
         // A link reassignment can extend or replace the chain of every child
         // that cached a clean-chain verdict, and the new link may have had
@@ -2274,6 +2334,7 @@ impl JsObject {
                     ..
                 } = &mut property.kind
             {
+                crate::heap::write_barrier(self, value);
                 *slot_value = value;
                 self.bump_generation();
                 return Ok(Some(()));
@@ -2302,6 +2363,7 @@ impl JsObject {
         // maximum (2^32-1): the define machinery's ArraySetLength throws a
         // RangeError there, so fall back.
         if (index as f64) == length && index <= 0xFFFF_FFFE {
+            crate::heap::write_barrier(self, value);
             let mut props = self.properties.borrow_mut();
             let position = props.len();
             props.push((
@@ -2370,8 +2432,10 @@ impl JsObject {
                 if elements.len() <= index as usize {
                     elements.resize(index as usize + 1, Value::hole());
                 }
+                crate::heap::write_barrier_element(&**slots, value, index);
                 elements[index as usize] = value;
             } else {
+                crate::heap::write_barrier_element(&**slots, value, index);
                 elements[index as usize] = value;
             }
             self.bump_generation();
@@ -2401,12 +2465,14 @@ impl JsObject {
         // materializes the true length from the cell.
         let len = slots.elem_len.get();
         if index as usize == len && len < slots.elem_cap.get() {
+            crate::heap::write_barrier_element(&**slots, value, index);
             // SAFETY: the cursor is refreshed on every safe mutation of the
             // buffer, and `len < elem_cap` puts the slot inside the live
             // allocation. `Value` is `Copy`.
             unsafe { *slots.elem_ptr.get().add(len) = value };
             slots.elem_len.set(len + 1);
         } else {
+            crate::heap::write_barrier_element(&**slots, value, index);
             let mut elements = slots.elements_mut();
             // The buffer can be shorter than `length` — a length grow past the
             // buffer (`a.length = N` on a short array) leaves trailing holes —
@@ -2537,6 +2603,7 @@ impl JsObject {
         }
         for (i, element) in elements.iter().enumerate() {
             if !element.is_hole() {
+                crate::heap::write_barrier(self, *element);
                 rebuilt.push((
                     PropertyKey::from_index(i as u64),
                     Property::data(*element, true, true, true),
@@ -2937,6 +3004,7 @@ impl JsObject {
                 } = &mut props[position].1.kind
                 && *writable
             {
+                crate::heap::write_barrier(self, value);
                 *slot = value;
                 // Part B, B5.3: mirror the in-place value update into the
                 // inline field when the key is mapped — the map-based read
@@ -3012,6 +3080,7 @@ impl JsObject {
             } = &mut props[position].1.kind
             && *writable
         {
+            crate::heap::write_barrier(self, value);
             *cell = value;
             // Mirror the in-place value update into the inline field when
             // the key is mapped (Part B, B5.3) — the map read path serves
@@ -3076,6 +3145,7 @@ impl JsObject {
         if !*writable {
             return false;
         }
+        crate::heap::write_barrier(self, value);
         *cell = value;
         // Mirror the in-place value update into the inline field when the
         // key is mapped (Part B, B5.3) — the map read path serves from
@@ -3089,6 +3159,7 @@ impl JsObject {
             // map id (a mismatched or dropped map falls back to the scan).
             Some((map_id, field)) if field < INLINE_FIELDS => {
                 if self.map.get().is_some_and(|m| m.id() == map_id) {
+                    crate::heap::write_barrier(self, value);
                     self.in_fields[field].set(value);
                 } else {
                     let _ = self.map_set(key, value);
@@ -3150,6 +3221,7 @@ impl JsObject {
         {
             return false;
         }
+        crate::heap::write_barrier(self, value);
         self.in_fields[offset].set(value);
         true
     }
@@ -3507,11 +3579,13 @@ impl JsObject {
         for (i, value) in values.iter().enumerate() {
             match map.descriptor_at(i) {
                 Some((_, offset, _)) if offset == i => {
+                    crate::heap::write_barrier(self, *value);
                     self.in_fields[i].set(*value);
                 }
                 _ => return false,
             }
         }
+        crate::heap::write_barrier_handle(self, map);
         self.map.set(Some(map));
         self.props_deferred.set(true);
         true
@@ -3650,6 +3724,7 @@ impl JsObject {
         }
         let mut props = self.properties.borrow_mut();
         let position = props.len();
+        crate::heap::write_barrier(self, value);
         props.push((
             key.clone(),
             Property::data(value, writable, enumerable, configurable),
@@ -3680,6 +3755,17 @@ impl JsObject {
                 ErrorKind::TypeError,
                 "Cannot add private member to an object that already has it".into(),
             ));
+        }
+        // A private field/method value (or an accessor pair) is a heap edge.
+        match &element.kind {
+            PrivateElementKind::Field(value) | PrivateElementKind::Method(value) => {
+                crate::heap::write_barrier(self, *value);
+            }
+            PrivateElementKind::Accessor { get, set } => {
+                for value in [get, set].into_iter().flatten() {
+                    crate::heap::write_barrier(self, *value);
+                }
+            }
         }
         elements.push(element);
         Ok(())
@@ -4002,6 +4088,19 @@ pub(crate) fn is_compatible_property_descriptor(
 
 /// ValidateAndApplyPropertyDescriptor (spec 10.1.6.4). When `obj` is
 /// `Some`, the validated descriptor is applied to the stored property.
+/// A2: record the write barrier for every heap reference the `property` being
+/// stored into `target` holds — its data value, or an accessor pair.
+pub(crate) fn barrier_property(target: &JsObject, property: &Property) {
+    match &property.kind {
+        PropertyKind::Data { value, .. } => crate::heap::write_barrier(target, *value),
+        PropertyKind::Accessor { get, set } => {
+            for value in [get, set].into_iter().flatten() {
+                crate::heap::write_barrier(target, *value);
+            }
+        }
+    }
+}
+
 fn validate_and_apply(
     obj: Option<&JsObject>,
     key: &PropertyKey,
@@ -4022,6 +4121,7 @@ fn validate_and_apply(
         let Some(property) = Property::from_descriptor(&complete) else {
             return Ok(false);
         };
+        barrier_property(obj, &property);
         let mut props = obj.properties.borrow_mut();
         let position = props.len();
         props.push((key.clone(), property.clone()));
@@ -4140,6 +4240,7 @@ fn validate_and_apply(
     };
     if let Some(position) = position {
         let applied = next;
+        barrier_property(obj, &applied);
         props[position].1 = applied.clone();
         drop(props);
         // Part B, B5.3: a value update on a mapped key must mirror into the
@@ -4357,6 +4458,7 @@ fn dense_index_define(array: &JsObject, index: u64, value: Value) -> Option<bool
     if index as usize > elements_len + DENSE_HOLE_SPILL_CAP {
         return None;
     }
+    crate::heap::write_barrier_element(&**slots, value, index);
     let mut elements = slots.elements_mut();
     if elements.len() <= index as usize {
         elements.resize(index as usize + 1, Value::hole());

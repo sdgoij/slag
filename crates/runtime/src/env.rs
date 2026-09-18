@@ -120,6 +120,7 @@ impl EnvRecord {
     /// the per-iteration creators (they use `new_declarative_environment`)
     /// and falls back to the two-step form for totality.
     pub fn push_initialized_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {
+        crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => {
                 e.push_initialized_binding(name, value);
@@ -146,6 +147,7 @@ impl EnvRecord {
 
     /// spec 9.2.1.3 InitializeBinding.
     pub fn initialize_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {
+        crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => e.initialize_binding(name, value),
             EnvRecord::Object(e) => e.initialize_binding(name, value),
@@ -162,12 +164,29 @@ impl EnvRecord {
         value: Value,
         strict: bool,
     ) -> Result<(), JsError> {
+        crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => e.set_mutable_binding(name, value, strict),
             EnvRecord::Object(e) => e.set_mutable_binding(name, value, strict),
             EnvRecord::Function(e) => e.declarative.set_mutable_binding(name, value, strict),
             EnvRecord::Global(e) => e.set_mutable_binding(name, value, strict),
             EnvRecord::Module(e) => e.declarative.set_mutable_binding(name, value, strict),
+        }
+    }
+
+    /// Write a certified body's context slot at `index` — the compile-time
+    /// checks already enforce const and TDZ, so no validation here. The
+    /// barrier runs at the record level: the slot buffer is one variant of
+    /// this enum, so a target derived from the `DeclarativeEnv` payload would
+    /// name an interior address, not the box header.
+    pub fn set_slot(&self, index: usize, value: Value) {
+        crux::heap::write_barrier(self, value);
+        match self {
+            EnvRecord::Declarative(e) => e.set_slot(index, value),
+            EnvRecord::Function(e) => e.declarative.set_slot(index, value),
+            EnvRecord::Global(e) => e.declarative.set_slot(index, value),
+            EnvRecord::Module(e) => e.declarative.set_slot(index, value),
+            EnvRecord::Object(_) => {}
         }
     }
 
@@ -185,6 +204,8 @@ impl EnvRecord {
     /// AddDisposableResource (spec 9.3.1): push a `using` resource onto the
     /// environment's disposal stack.
     pub fn add_disposable_resource(&self, resource: DisposableResource) {
+        crux::heap::write_barrier(self, resource.value);
+        crux::heap::write_barrier(self, resource.method);
         match self {
             EnvRecord::Declarative(e) => e.add_disposable_resource(resource),
             EnvRecord::Function(e) => e.declarative.add_disposable_resource(resource),
@@ -289,6 +310,7 @@ impl EnvRecord {
 
     /// BindThisValue (spec 9.2.2.1) for Function Environment Records.
     pub fn bind_this_value(&self, value: Value) -> Result<(), JsError> {
+        crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Function(e) => e.bind_this_value(value),
             _ => Err(JsError::new(

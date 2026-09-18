@@ -767,7 +767,10 @@ pub fn shared_function_body(
         .current_realm()
         .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
         .unwrap_or(0);
-    let source_key = source.map(source_hash).unwrap_or(0);
+    let source_key = source
+        .map(source_hash)
+        .or_else(|| source_hash_at(agent, f.span))
+        .unwrap_or(0);
     let key = (
         f as *const syntax::ast::Function as usize,
         realm,
@@ -791,16 +794,41 @@ fn source_hash(source: &JsString) -> usize {
     fnv1a_units(source.as_slice())
 }
 
-/// `source_hash` over the running context's source slice at `span`, WITHOUT
-/// allocating the `JsString` `capture_source` builds (Cut 66): the body-site
-/// caches (`shared_arrow_body`) recompute the key on every closure, and the
-/// slice allocation dominated the per-closure cost.
-fn source_hash_at(agent: &Agent, span: crux::Span) -> Option<usize> {
-    let source = agent.running_context().ok()?.source.as_ref()?;
+/// The source text a span refers to: the innermost enclosing execution context
+/// that carries a source covering the span.
+///
+/// The running context's own source is the common case. The search widens
+/// outward because a *certified* body's context deliberately has none — the
+/// `ordinary_call` and `tail_prepare_ordinary` fast paths skip the `source`
+/// clone on the ground that a certified body reads only its lexical
+/// environment — and the source is not cosmetic: it decides
+/// FunctionBodyContainsUseStrict's raw-text check (a cooked-but-not-raw
+/// `'use strict'` is not a directive) and `Function.prototype.toString` for
+/// every closure the body creates. The script a node belongs to is the
+/// innermost frame whose source covers the span.
+fn enclosing_source(agent: &Agent, span: crux::Span) -> Option<&JsString> {
     let (start, end) = (span.start as usize, span.end as usize);
-    if start >= end || end > source.len() {
+    if start >= end {
         return None;
     }
+    agent
+        .execution_context_stack
+        .iter()
+        .rev()
+        .filter_map(|context| context.source.as_ref())
+        .find(|source| end <= source.len())
+}
+
+/// `source_hash` over the source slice at `span`, WITHOUT allocating the
+/// `JsString` `capture_source` builds (Cut 66): the body-site caches recompute
+/// the key on every closure, and the slice allocation dominated the
+/// per-closure cost. The resolution is `enclosing_source` — falling back to
+/// `None` would leave the cache key with only raw addresses (the AST node and
+/// the realm box), which recur across parses in one process: two same-span
+/// sites would then share one body and run the wrong code.
+fn source_hash_at(agent: &Agent, span: crux::Span) -> Option<usize> {
+    let (start, end) = (span.start as usize, span.end as usize);
+    let source = enclosing_source(agent, span)?;
     Some(fnv1a_units(&source.as_slice()[start..end]))
 }
 
@@ -923,9 +951,7 @@ pub fn shared_accessor_body(agent: &Agent, body: &Block) -> std::rc::Rc<Block> {
         .current_realm()
         .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
         .unwrap_or(0);
-    let source_key = capture_source(agent, body.span)
-        .map(|source| source_hash(&source))
-        .unwrap_or(0);
+    let source_key = source_hash_at(agent, body.span).unwrap_or(0);
     let key = (
         body as *const Block as usize,
         realm,
@@ -1272,16 +1298,13 @@ fn register_function(
 }
 
 /// The exact source slice of a definition (Function.prototype.toString),
-/// cut from the running context's source text using the definition's span.
-/// Returns `None` when no source is tracked (synthesized/native callables).
+/// cut from the source text the definition's span refers to (see
+/// [`enclosing_source`]). Returns `None` when no enclosing context carries a
+/// source covering the span (synthesized/native callables).
 pub(crate) fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString> {
-    let source = agent.running_context().ok()?.source.clone()?;
     let (start, end) = (span.start as usize, span.end as usize);
-    if start >= end || end > source.len() {
-        return None;
-    }
-    let slice = &source.as_slice()[start..end];
-    Some(JsString::from_utf16(slice))
+    let source = enclosing_source(agent, span)?;
+    Some(JsString::from_utf16(&source.as_slice()[start..end]))
 }
 
 /// OrdinaryFunctionCreate step: the [[Prototype]] intrinsic of a function's
@@ -4583,5 +4606,49 @@ mod tests {
             .unwrap(),
             Value::Boolean(true)
         );
+    }
+
+    #[test]
+    fn a_certified_bodys_closure_keeps_its_source() {
+        // A certified body runs under a context with no `source`: the
+        // `ordinary_call`/`tail_prepare_ordinary` fast paths skip the clone on
+        // the ground that a certified body reads only its lexical environment.
+        // `capture_source` is a reader they miss, so the resolution must widen
+        // to the enclosing script — without it every closure such a body
+        // creates loses its text and `Function.prototype.toString` returns the
+        // synthetic `[native code]` form.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "function make() { return function inner() { return 1; }; }\n\
+                 var f = make();\n\
+                 f() === 1 && f.toString() === 'function inner() { return 1; }';",
+            )
+            .unwrap();
+        assert_eq!(value, Value::Boolean(true));
+    }
+
+    #[test]
+    fn a_certified_bodys_escaped_directive_is_not_strict() {
+        // FunctionBodyContainsUseStrict needs the directive's raw source text: a
+        // literal whose raw text is an escape that cooks to `use strict` is NOT
+        // a Use Strict Directive (spec 14.1.1). `directive_is_use_strict` falls
+        // back to the cooked value when the source is unavailable, so a
+        // certified body used to see the escaped form as strict — the same
+        // missing-source root cause as the `toString` case, but a semantic one:
+        // strict flips `this`, `arguments` mapping and assignment errors.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "function makeRaw() { return (function () { 'use strict'; return this === undefined; })(); }\n\
+                 function makeEscaped() { return (function () { 'use str\\u0069ct'; return this === undefined; })(); }\n\
+                 var raw = makeRaw();\n\
+                 var escaped = makeEscaped();\n\
+                 raw === true && escaped === false;",
+            )
+            .unwrap();
+        assert_eq!(value, Value::Boolean(true));
     }
 }

@@ -1962,6 +1962,33 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Whether the GC box at `box_ptr` is young (A2): the `flags` word at the
+    /// box's offset 0 has the young bit set. An inline store into a young
+    /// container cannot create an old->young edge, so it needs no write
+    /// barrier and may stay in machine code.
+    fn box_ptr_is_young(&mut self, box_ptr: ClifValue) -> ClifValue {
+        let flags =
+            self.builder
+                .ins()
+                .load(types::I32, MemFlagsData::new(), box_ptr, Offset32::new(0));
+        let young = self
+            .builder
+            .ins()
+            .band_imm_u(flags, crux::heap::GC_FLAG_YOUNG as i64);
+        self.builder.ins().icmp_imm_u(IntCC::NotEqual, young, 0)
+    }
+
+    /// [`Self::box_ptr_is_young`] for the box behind a heap `Value` operand:
+    /// the box base is the NaN-boxing payload shifted up by the tag width.
+    fn value_box_is_young(&mut self, object: ClifValue) -> ClifValue {
+        let box_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let box_ptr = self.builder.ins().ishl_imm_u(box_ptr, 4);
+        self.box_ptr_is_young(box_ptr)
+    }
+
     /// The vector-free machine fill, shared by the step and register
     /// member-store paths (the register `StoreMemberName*` ops and the step
     /// `AssignMemberName` both route a shape-gate hit here). Entry: the
@@ -2190,6 +2217,11 @@ impl<'a> Lowerer<'a> {
         let gate = self.builder.use_var(gate_var);
         let deref_ok = self.builder.use_var(deref_var);
         let gate = self.builder.ins().band(gate, deref_ok);
+        // A2: an inline field store into an OLD receiver would need the write
+        // barrier; a young one cannot hold an old->young edge. Bail to the
+        // helper (which runs the barrier) for an old receiver.
+        let young = self.value_box_is_young(object);
+        let gate = self.builder.ins().band(gate, young);
         self.builder.ins().brif(gate, fill, &[], fallback, &[]);
         // The fill: write the field, bump the generation (the interpreter's
         // `define_fresh` fill bumps; the cells refreshed below are recorded
@@ -2513,6 +2545,24 @@ impl<'a> Lowerer<'a> {
         // `back` is `fcvt_from_uint(idx)` from the gate — reuse it instead of
         // re-converting the same index.
         let append_ok = self.builder.ins().fcmp(FloatCC::Equal, back, length);
+        // A2/A6: this store writes without the write barrier, which is sound
+        // exactly when the edge it could create cannot exist — only a *heap*
+        // value is an edge at all, and only into an *old* container. Testing the
+        // value's tag first keeps primitive appends inline whatever the array's
+        // age; a container-only guard sent every append to the helper once the
+        // array had been promoted (measured 17ms vs 11ms per 1M appends, vs 11ms
+        // for the same loop against a young array). The check lives here, not in
+        // the earlier gate: `slots_base` is only known to be non-null past the
+        // dense gate above (Cranelift evaluates the load eagerly, so testing it
+        // earlier would fault on a non-array receiver).
+        let value_tag = self.builder.ins().band_imm_u(value, crux::TAG_MASK as i64);
+        let value_not_heap =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::NotEqual, value_tag, crux::TAG_PREFIX as i64);
+        let slots_young = self.box_ptr_is_young(slots_base);
+        let keep_inline = self.builder.ins().bor(slots_young, value_not_heap);
+        let append_ok = self.builder.ins().band(append_ok, keep_inline);
         self.builder.ins().brif(append_ok, append, &[], legacy, &[]);
         self.builder.seal_block(len_check);
         // The inline append (Phase C). The gate has proved a dense Array with

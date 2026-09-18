@@ -2,7 +2,7 @@
 //! bootstrap pipeline (CreateIntrinsics, NewGlobalEnvironment,
 //! SetDefaultGlobalBindings).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -136,6 +136,11 @@ pub struct Intrinsics {
     /// (their wrappers are ordinary objects with no own properties, so a
     /// chain read with the primitive receiver is exact).
     primitive_prototypes: RefCell<[Option<Value>; PRIM_PROTO_COUNT]>,
+    /// The realm this table belongs to — a back-reference for the A2 write
+    /// barrier: a builtin installed lazily (first use) into an old realm is an
+    /// old->young edge. Deliberately not traced: the table lives inside its
+    /// realm, so this edge can never be the only path to anything.
+    owner: Cell<Option<Handle<Realm>>>,
 }
 
 /// The number of cached function-creation prototype intrinsics.
@@ -200,6 +205,21 @@ impl Trace for Intrinsics {
 }
 
 impl Intrinsics {
+    /// Record the realm this table is embedded in, so the write barrier can
+    /// name the box an intrinsic installation belongs to (A2).
+    pub fn set_owner(&self, realm: Handle<Realm>) {
+        self.owner.set(Some(realm));
+    }
+
+    /// The A2 write barrier for a store into one of the cached-value fields:
+    /// the table lives inside its realm box, so the owner back-reference is
+    /// the only way to name the box being written.
+    fn cache_barrier(&self, value: Value) {
+        if let Some(realm) = self.owner.get() {
+            crux::heap::write_barrier(&*realm, value);
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<Value> {
         self.entries.borrow().get(name).cloned()
     }
@@ -220,6 +240,7 @@ impl Intrinsics {
             return Some(*value);
         }
         let value = self.get("%Object.prototype%")?;
+        self.cache_barrier(value);
         *self.object_prototype.borrow_mut() = Some(value);
         Some(value)
     }
@@ -231,6 +252,7 @@ impl Intrinsics {
             return Some(*value);
         }
         let value = self.get("%Array.prototype%")?;
+        self.cache_barrier(value);
         *self.array_prototype.borrow_mut() = Some(value);
         Some(value)
     }
@@ -246,6 +268,7 @@ impl Intrinsics {
             return Some(value);
         }
         let value = self.get(name)?;
+        self.cache_barrier(value);
         self.function_prototypes.borrow_mut()[index] = Some(value);
         Some(value)
     }
@@ -257,6 +280,7 @@ impl Intrinsics {
             return Some(*value);
         }
         let value = self.get("%Function.prototype.apply%")?;
+        self.cache_barrier(value);
         *self.apply_builtin.borrow_mut() = Some(value);
         Some(value)
     }
@@ -268,6 +292,7 @@ impl Intrinsics {
             return Some(*value);
         }
         let value = self.get("%Function.prototype.call%")?;
+        self.cache_barrier(value);
         *self.call_builtin.borrow_mut() = Some(value);
         Some(value)
     }
@@ -279,6 +304,7 @@ impl Intrinsics {
             return Some(*value);
         }
         let value = self.get("%String.prototype%")?;
+        self.cache_barrier(value);
         *self.string_prototype.borrow_mut() = Some(value);
         Some(value)
     }
@@ -292,11 +318,13 @@ impl Intrinsics {
             return Some(value);
         }
         let value = self.get(name)?;
+        self.cache_barrier(value);
         self.primitive_prototypes.borrow_mut()[index] = Some(value);
         Some(value)
     }
 
     pub fn define(&self, name: &str, value: Value) {
+        self.cache_barrier(value);
         let key: Rc<str> = Rc::from(name);
         self.entries.borrow_mut().insert(Rc::clone(&key), value);
         if let Some(function) = value.as_function() {
@@ -390,6 +418,7 @@ pub fn initialize_host_defined_realm(agent: &Agent) -> Result<Handle<Realm>, JsE
         global_env,
         loaded_modules: RefCell::new(std::collections::HashMap::new()),
     });
+    realm.intrinsics.set_owner(realm);
     set_default_global_bindings(&realm)?;
     agent.realms.borrow_mut().push(realm);
     agent.realm_count.set(agent.realm_count.get() + 1);

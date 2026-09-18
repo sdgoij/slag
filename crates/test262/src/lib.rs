@@ -35,6 +35,7 @@ pub mod harness {
     // interpreter-only run.
     thread_local! {
         static GC_STRESS: Cell<bool> = const { Cell::new(false) };
+        static GC_VERIFY: Cell<bool> = const { Cell::new(false) };
         static JIT: Cell<bool> = const { Cell::new(true) };
     }
 
@@ -42,6 +43,15 @@ pub mod harness {
     /// agents (the `test262-sweep --gc-stress` gate, .notes/gc-plan.md GC-2).
     pub fn set_gc_stress(enabled: bool) {
         GC_STRESS.with(|stress| stress.set(enabled));
+    }
+
+    /// Enable the A3 `--gc-verify` minor-collection self-check for subsequent
+    /// fixture agents: after every minor collection, a full precise mark
+    /// asserts that nothing it is about to sweep is reachable. Unlike
+    /// `--gc-stress` it leaves the allocation pattern alone, so it audits the
+    /// minor's normal-mode trigger.
+    pub fn set_gc_verify(enabled: bool) {
+        GC_VERIFY.with(|verify| verify.set(enabled));
     }
 
     /// Set the Cranelift JIT mode for subsequent fixture agents. The JIT is
@@ -10933,6 +10943,7 @@ var $DONE = function (error) {
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
         agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
+        agent.set_gc_verify(GC_VERIFY.with(|verify| verify.get()));
         if JIT.with(|jit| jit.get()) {
             jit::install(&mut agent)?;
         }
@@ -11111,6 +11122,7 @@ var $DONE = function (error) {
             .initialize_host_defined_realm()
             .map_err(|e| e.message)?;
         agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
+        agent.set_gc_verify(GC_VERIFY.with(|verify| verify.get()));
         if JIT.with(|jit| jit.get()) {
             jit::install(&mut agent)?;
         }
@@ -12079,6 +12091,7 @@ var $DONE = function (error) {
             (|| -> Result<(), JsError> {
                 let mut agent = Agent::new();
                 agent.set_gc_stress(GC_STRESS.with(|stress| stress.get()));
+                agent.set_gc_verify(GC_VERIFY.with(|verify| verify.get()));
                 if JIT.with(|jit| jit.get()) {
                     jit::install(&mut agent)
                         .map_err(|message| JsError::new(ErrorKind::TypeError, message))?;

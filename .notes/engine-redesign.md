@@ -1,5 +1,12 @@
 # Engine redesign: bump-pointer generational GC + map-based object model
 
+**Part A is superseded (2026-09-18).** Only the bump arena + mark-sweep half of
+"bump-pointer generational GC" landed here (`.notes/gc-plan.md`); the
+generational half is **`.notes/nursery-gc-plan.md`** — young bit, write barrier
++ remembered set, minor collection paced by the young cohort, per-level
+triggers, JIT participation (A0-A7 landed). Part B (maps) is unaffected and its
+record below still stands.
+
 Engineering spec for the two structural levers identified by the construct
 churn / string concat measurements (Cut 35 slice 30-31, `.notes/gc-plan.md`
 GC-5 "remaining structural gap to V8: bump/semi-space allocation and

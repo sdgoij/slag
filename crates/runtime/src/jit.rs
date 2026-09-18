@@ -1307,11 +1307,12 @@ extern "C" fn tdz_error(ctx: *mut c_void) -> u64 {
 /// budget at every loop back edge); when enough boxes were allocated since
 /// the last check, run the real collection trigger. Can never set the
 /// pending error — a GC runs no user code (finalizer callbacks are queued
-/// as jobs). The leaf-call-cache records are cleared whenever the trigger
-/// fires: the sweep (or the dead-closure reap that rides on every trigger)
-/// can free a callee box whose address a later allocation recycles, and a
-/// record's payload match would then mistake the new object for the cached
-/// callee — clearing forces the next call site to re-probe.
+/// as jobs). The leaf-call-cache records are cleared when a sweep actually
+/// freed a box: a record matches its callee by payload, so a freed box whose
+/// address a later allocation recycles could match it and apply the cached
+/// verdict to the new object. A crossing that freed nothing — with the nursery
+/// pacing minors, most of them — keeps the verdicts, so an allocating compiled
+/// loop no longer re-probes its call sites on every budget crossing.
 extern "C" fn gc_safepoint(ctx: *mut c_void) -> u64 {
     if !crux::heap::allocation_budget_exceeded() {
         return 0;
@@ -1319,7 +1320,9 @@ extern "C" fn gc_safepoint(ctx: *mut c_void) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     agent.maybe_collect();
-    ctx.leaf_call_cache = [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES];
+    if crux::heap::take_swept_since_check() > 0 {
+        ctx.leaf_call_cache = [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES];
+    }
     0
 }
 
@@ -2160,7 +2163,7 @@ extern "C" fn store_context(ctx: *mut c_void, depth: u64, index: u64, value: u64
             ),
         );
     }
-    declarative.set_slot(index as usize, value);
+    env.set_slot(index as usize, value);
     value.bits()
 }
 
@@ -2276,7 +2279,7 @@ extern "C" fn create_function_decl(ctx: *mut c_void, step: u64) -> u64 {
             Ok(env) => env,
             Err(error) => return slow_error(ctx, error),
         };
-        crate::ir::context_env(&env).set_slot(*index, value);
+        env.set_slot(*index, value);
     } else {
         unreachable!("FunctionDeclInit without a binding slot (the scan allocated one)");
     }
@@ -4546,7 +4549,7 @@ extern "C" fn init_context(ctx: *mut c_void, index: u64, value: u64) -> u64 {
     let value = Value::from_bits(value);
     match vm.context_chain_env(0) {
         Ok(env) => {
-            crate::ir::context_env(&env).set_slot(index as usize, value);
+            env.set_slot(index as usize, value);
             value.bits()
         }
         Err(error) => slow_error(ctx, error),
@@ -4595,7 +4598,7 @@ extern "C" fn update_context(
         .unwrap_or(UpdateOp::Increment);
     match crate::ir::update_value(agent, &op, &old) {
         Ok((old_numeric, new)) => {
-            declarative.set_slot(index as usize, new);
+            env.set_slot(index as usize, new);
             (if prefix != 0 { new } else { old_numeric }).bits()
         }
         Err(error) => slow_error(ctx, error),
@@ -4626,7 +4629,7 @@ extern "C" fn store_per_iter(ctx: *mut c_void, depth: u64, index: u64, value: u6
     let value = Value::from_bits(value);
     match vm.per_iteration_env(depth as usize) {
         Ok(env) => {
-            crate::ir::context_env(&env).set_slot(index as usize, value);
+            env.set_slot(index as usize, value);
             value.bits()
         }
         Err(error) => slow_error(ctx, error),
@@ -4666,7 +4669,7 @@ extern "C" fn update_per_iter(
         .unwrap_or(UpdateOp::Increment);
     match crate::ir::update_value(agent, &op, &old) {
         Ok((old_numeric, new)) => {
-            declarative.set_slot(index as usize, new);
+            env.set_slot(index as usize, new);
             (if prefix != 0 { new } else { old_numeric }).bits()
         }
         Err(error) => slow_error(ctx, error),

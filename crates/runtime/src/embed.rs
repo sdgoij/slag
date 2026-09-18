@@ -293,6 +293,33 @@ impl Context {
         self.agent.set_gc_stress(enabled);
     }
 
+    /// Toggle `--gc-verify`: run a full precise mark after every minor
+    /// collection and fail loudly if anything it would sweep is reachable
+    /// (A3's self-check; `--gc-stress` implies it).
+    pub fn set_gc_verify(&mut self, enabled: bool) {
+        self.agent.set_gc_verify(enabled);
+    }
+
+    /// A5 `--nursery-threshold N`: the young-cohort size that paces a minor
+    /// collection at a safe point (nursery sizing).
+    pub fn set_nursery_threshold(&mut self, threshold: usize) {
+        self.agent.set_nursery_threshold(threshold);
+    }
+
+    /// A5 `--nursery-stress`: a minor collection at every safe point, the mode
+    /// that exercises the barrier's old->young edges (and turns both verifiers
+    /// on).
+    pub fn set_nursery_stress(&mut self, enabled: bool) {
+        self.agent.set_nursery_stress(enabled);
+    }
+
+    /// A5 `--gc-trace`: per-collection telemetry (level, pause, live/young/
+    /// remembered counts, swept) printed per collection and summarized at exit.
+    /// Zero cost when off.
+    pub fn set_gc_trace(&mut self, enabled: bool) {
+        crux::heap::set_gc_trace(enabled);
+    }
+
     /// The realm's global object.
     pub fn global(&self) -> Result<JsObject, JsError> {
         Ok(JsObject(self.agent.current_realm()?.global_object))
