@@ -194,9 +194,15 @@ pub const BUILDER_BUF_OFFSET: usize = std::mem::offset_of!(Builder, buf);
 pub const BUILDER_LEN_OFFSET: usize = std::mem::offset_of!(Builder, len);
 pub const BUILDER_CAP_OFFSET: usize = std::mem::offset_of!(Builder, cap);
 
-/// The offset of a `Vec`'s length field: std's `Vec` is ptr + cap + len (the
-/// field is private, so `offset_of!` cannot name it; the layout is structural
-/// and stable for the whole Rust 1.x line).
+/// The offsets of a `Vec`'s cursor: std's `Vec` is `cap + ptr + len` — the
+/// fields are private, so `offset_of!` cannot name them, and repr(Rust) is
+/// free to reorder them (the measured order is `cap`, `ptr`, `len`, NOT the
+/// declaration order). `VEC_LEN_OFFSET` has relied on `len` being last since
+/// Cut 68; `vec_cursor_offsets_match_the_compiled_paths` asserts all three so
+/// a toolchain that lays them out differently fails loudly instead of letting
+/// the compiled `EnterTry`/`Exit` write through a misread pointer.
+const VEC_PTR_OFFSET: usize = std::mem::size_of::<usize>();
+const VEC_CAP_OFFSET: usize = 0;
 const VEC_LEN_OFFSET: usize = 2 * std::mem::size_of::<usize>();
 
 /// Cut 68: the leaf-eligibility state field offsets the compiled leaf-cache
@@ -206,6 +212,14 @@ const VEC_LEN_OFFSET: usize = 2 * std::mem::size_of::<usize>();
 /// epoch instead of re-running the full `leaf_call_probe`. The jit crate
 /// cannot name the `pub(crate)` `Vm`/`Agent`/`EnvStack`, hence the constants.
 pub const VM_TRY_STACK_LEN_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_LEN_OFFSET;
+/// The compiled `EnterTry`/`Exit` fast paths push and pop a `TryFrame` in
+/// place, so they read the try stack's cursor and write a frame through it
+/// (see `emit_enter_try`/`emit_exit_try`), plus the two `Vm` fields a frame
+/// records at entry and the `ip` an exit leaves behind.
+pub const VM_TRY_STACK_PTR_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_PTR_OFFSET;
+pub const VM_TRY_STACK_CAP_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_CAP_OFFSET;
+pub const VM_LEXICAL_ENV_OFFSET: usize = std::mem::offset_of!(Vm, lexical_env);
+pub const VM_IP_OFFSET: usize = std::mem::offset_of!(Vm, ip);
 pub const VM_PENDING_LEN_OFFSET: usize = std::mem::offset_of!(Vm, pending) + VEC_LEN_OFFSET;
 pub const VM_FOR_OF_STACK_LEN_OFFSET: usize =
     std::mem::offset_of!(Vm, for_of_stack) + VEC_LEN_OFFSET;
@@ -5256,6 +5270,55 @@ mod tests {
     use super::*;
     use crux::handle::Handle;
     use crux::string::JsString;
+
+    /// The compiled `EnterTry`/`Exit` fast paths read a `Vec`'s cursor fields
+    /// (`VM_TRY_STACK_PTR_OFFSET`/`CAP_OFFSET`/`LEN_OFFSET`) from machine code.
+    /// Those are private fields of `Vec`, so nothing else checks these offsets:
+    /// a toolchain that lays `Vec` out differently must fail here rather than
+    /// let a compiled body write a `TryFrame` through a misread pointer.
+    #[test]
+    fn vec_cursor_offsets_match_the_compiled_paths() {
+        let mut frames: Vec<crate::ir::TryFrame> = Vec::with_capacity(7);
+        let words = unsafe {
+            std::slice::from_raw_parts(
+                &frames as *const Vec<crate::ir::TryFrame> as *const usize,
+                3,
+            )
+        };
+        assert_eq!(
+            words[VEC_CAP_OFFSET / std::mem::size_of::<usize>()],
+            7,
+            "capacity"
+        );
+        assert_eq!(
+            words[VEC_PTR_OFFSET / std::mem::size_of::<usize>()],
+            frames.as_ptr() as usize,
+            "data pointer"
+        );
+        assert_eq!(
+            words[VEC_LEN_OFFSET / std::mem::size_of::<usize>()],
+            0,
+            "length"
+        );
+        frames.push(crate::ir::TryFrame {
+            handler: 3,
+            saved_env: Handle::new(crate::env::EnvRecord::Declarative(
+                crate::env::DeclarativeEnv::new(None),
+            )),
+            env_depth: 1,
+        });
+        let words = unsafe {
+            std::slice::from_raw_parts(
+                &frames as *const Vec<crate::ir::TryFrame> as *const usize,
+                3,
+            )
+        };
+        assert_eq!(
+            words[VEC_LEN_OFFSET / std::mem::size_of::<usize>()],
+            1,
+            "length after push"
+        );
+    }
 
     #[test]
     fn the_slow_path_table_is_complete() {

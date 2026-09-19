@@ -11314,6 +11314,78 @@ re-measure, and the first three contain no `finally` at all. Binaries:
 `slag-tryfix.exe` (before) and `slag-finbreak.exe` (after); tooling
 `scratch/one-row-ab.sh` for the per-row re-measure.
 
+### LANDED (2026-09-19): the compiled `EnterTry`/`Exit` push and pop their own frames
+
+**What the residual was.** The env elision left `tryE` at 14.67 ns/iter against
+`add`'s 4.67, and an ablation that removed both helper calls *from the lowering*
+took it to 4.67 — the whole residual was the two FFI helper calls (the push and
+the pop), not the list/completion steps around them. So this slice is codegen:
+push the `TryFrame`, and pop it, in machine code.
+
+**Landed.** `emit_enter_try` stores the three frame fields through the try
+stack's cursor and bumps the length, falling back to the helper when the vector
+has no room, so the machine code only ever writes into existing capacity (the
+helper grows it). `emit_exit_try` inlines `control_transfer`'s `None` arm for a
+handler with no finally: pop, set `ip`, jump to `after`.
+
+Guards on the exit: the try stack holds exactly one frame (deeper means an
+enclosing try whose finally or catch may have to run) **and** that frame's
+`handler` is this Exit's. The identity check is not optional: a throw routed to
+its catch *removes* its own frame, so at the catch's own Exit the stack can hold
+only an outer frame — popping it would drop a live frame and skip its
+environment. A handler with a finally never takes the fast path. Both paths open
+with a `vm` null check for the scaffold's bare-context test harness (it runs
+compiled bodies with a null `vm` and helper doubles); those bodies take the
+helper path exactly as before. The exit's fast path bumps the leaf epoch like
+`emit_dispatch_call` does, so the leaf-verdict invalidation is unchanged.
+
+**Measured (paired, interleaved, min of 5).**
+
+| shape | before | after |
+|---|---|---|
+| `tryE` `try{}catch` loop, jit | 14.67 | **5.33** (-64%; `add` is 4.67) |
+| `tryA` `try{s+=1}catch`, jit | 16.67 | 7.33 |
+| `tryLet` `try{let q=1}catch`, jit | 18.00 | 8.00 |
+| `finEmpty` `try{}finally{}` loop | 25.33 | 24.00 (-5.3%) |
+| `add` (control) | 4.67 | 4.67 |
+
+`control/try_catch_loop.js` **22.789 -> 9.873ms** (-56.7%) on the paired
+isolated corpus — **95.596 -> 9.873ms (-89.7%)** across today's three slices.
+41 rows paired: **+0.0%** total. The only rows reading positive are noise:
+`completion-values` +1.8% at 6 reps — that row is interpreter-bound (its
+`--jitless` 290ms is *below* its jit 329ms, and its nested try never compiles) —
+and `hof_methods`, `push_pop`, `head-let` contain no `try` at all and flip sign
+between runs.
+
+**Two caveats, both pre-existing and both left on the guarded helper path:**
+
+- A `try`/`finally` loop still calls the exit helper (only -5%): a finally's exit
+  must push a pending control, not just pop. Inlining that needs the pending
+  vector's cursor and `PendingControl`'s size.
+- A **double-nested** try body does not compile at all — `JIT_DUMP_CLIF` shows 0
+  compiled bodies for that function on `slag-baseline.exe` too, so `nested` runs
+  interpreted at ~706 ns/iter where a single-level try now reaches 5.3. That is
+  the largest remaining try lever, and it is a coverage gap, not a lowering cost.
+
+**A layout trap found on the way.** These paths read the try stack's `Vec`
+cursor from machine code. `VEC_LEN_OFFSET` (Cut 68) already assumed `len` is last,
+which holds; the new `VEC_PTR_OFFSET`/`VEC_CAP_OFFSET` do **not** follow the order
+the old comment claimed — this toolchain lays `Vec` out as **cap, ptr, len**
+(measured), and the first cut segfaulted by writing through the capacity. The
+comment now states the measured order, and
+`vec_cursor_offsets_match_the_compiled_paths` asserts all three offsets against a
+real `Vec`, so a toolchain that reorders them fails loudly instead of corrupting
+memory.
+
+**Gates.** clippy `-D warnings` clean, fmt clean, `cargo test --workspace` 36/36
+suites 0 failed (778 in `-p runtime`, the new assertion among them); test262
+`language` 23721 / 0 fail / 3 skip, `built-ins` 23657 / 0 fail / 155 skip,
+`annexB` 1086 / 0 fail, `intl402` 3205 / 0 fail — all identical to baseline;
+`--gc-verify`/`--gc-stress`/`--nursery-stress` clean (the row holds ~10.2ms under
+all three); `scratch/iso/trydiff.js`, `finbreak.js` and `tryfin.js` are
+byte-identical to the previous binary in both engines. Binaries
+`slag-finbreak.exe` (before) and `slag-tryinline.exe` (after).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

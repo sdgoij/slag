@@ -38,7 +38,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
     ApplyKind, CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberMapCell,
-    MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step, is_compound_assign,
+    MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step, TryFrame, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
@@ -48,13 +48,22 @@ use runtime::jit::{
     TYPED_ARRAY_LENGTH_SENTINEL, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BUILDER_OFFSET,
     VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
     VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
-    VM_FOR_OF_STACK_LEN_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET,
+    VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
 
 use crate::helpers::{Helper, JitHelpers};
 use crate::{Compiled, ExecutableCode, JitEntry};
+
+/// A `TryFrame`'s size and field offsets: the compiled `EnterTry` writes one
+/// through the try stack's cursor (see `emit_enter_try`), and the compiled
+/// `Exit` reads its handler to tell this handler's frame from an outer one.
+const TRY_FRAME_SIZE: usize = std::mem::size_of::<TryFrame>();
+const TRY_FRAME_HANDLER_OFFSET: usize = std::mem::offset_of!(TryFrame, handler);
+const TRY_FRAME_SAVED_ENV_OFFSET: usize = std::mem::offset_of!(TryFrame, saved_env);
+const TRY_FRAME_ENV_DEPTH_OFFSET: usize = std::mem::offset_of!(TryFrame, env_depth);
 
 /// The native-code generation engine: a native `TargetIsa` plus reusable
 /// compilation contexts.
@@ -660,6 +669,12 @@ struct Lowerer<'a> {
     /// start) → handler index — the dispatch-only blocks whose code must
     /// reset the working-sp to the saved try-entry sp first.
     handler_entry_steps: std::collections::HashMap<usize, usize>,
+    /// The handler each `Exit` step closes, for the handlers whose exit the
+    /// compiled path can pop in place: an Exit step is the one its handler's
+    /// `try_end` (the try body's) or catch `end` (the catch's) names, and only
+    /// a handler with no finally has a trivial exit — anything else must run a
+    /// finally first, which is the helper's job.
+    exit_fast_handlers: std::collections::HashMap<usize, usize>,
     /// Cut 46: the working-stack base the body started with — the `sp_var`
     /// value at entry, saved so a self-tail-call back edge can reset the
     /// working stack to the fresh-run base before re-entering the body.
@@ -807,6 +822,18 @@ impl<'a> Lowerer<'a> {
                 handler_entry_steps.insert(finally, index);
             }
         }
+        // The `Exit` steps a handler's own region closes on (see the field):
+        // its try body's Exit and, when there is a catch, the catch's.
+        let mut exit_fast_handlers = std::collections::HashMap::new();
+        for (index, handler) in body.handlers.iter().enumerate() {
+            if handler.finally.is_some() {
+                continue;
+            }
+            exit_fast_handlers.insert(handler.try_end, index);
+            if let Some(catch) = handler.catch {
+                exit_fast_handlers.insert(catch.end, index);
+            }
+        }
         let entry_sp_var = builder.declare_var(types::I64);
         let vm_var = builder.declare_var(types::I64);
         let counter_var = builder.declare_var(types::F64);
@@ -924,6 +951,7 @@ impl<'a> Lowerer<'a> {
             sp_var,
             handler_sp_vars,
             handler_entry_steps,
+            exit_fast_handlers,
             entry_sp_var,
             vm_var,
             counter_var,
@@ -3277,6 +3305,140 @@ impl<'a> Lowerer<'a> {
         let res = self.emit_raw_call(sig, helper, args)?;
         self.bump_leaf_epoch();
         self.emit_dispatch(res);
+        Ok(())
+    }
+
+    /// A `Vm` field load, from the vm pointer machine code already holds.
+    fn load_vm(&mut self, vm: ClifValue, offset: usize) -> ClifValue {
+        self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm,
+            Offset32::new(offset as i32),
+        )
+    }
+
+    /// A `Vm` field store, from the vm pointer machine code already holds.
+    fn store_vm(&mut self, vm: ClifValue, offset: usize, value: ClifValue) {
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), value, vm, Offset32::new(offset as i32));
+    }
+
+    /// The compiled `EnterTry`: push the handler's `TryFrame` in machine code
+    /// when the try stack has room for it, falling back to the helper to grow
+    /// it. The push itself is three stores and a length bump — the helper call
+    /// around them (an indirect call through the ctx, plus the working-region
+    /// spill and reload at every call boundary) cost more than the push in a
+    /// hot loop's per-iteration `try`.
+    ///
+    /// Both try fast paths open with a `vm` null check for the scaffold's
+    /// bare-context test harness, which runs compiled bodies with a null `vm`
+    /// (its helper doubles never dereference it); such bodies take the helper
+    /// path exactly as before.
+    fn emit_enter_try(&mut self, handler: usize) -> Result<(), Unsupported> {
+        let vm = self.vm_ptr();
+        let has_vm = self.builder.ins().icmp_imm_u(IntCC::NotEqual, vm, 0);
+        let probe = self.builder.create_block();
+        let push = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        self.builder.ins().brif(has_vm, probe, &[], slow, &[]);
+        self.builder.switch_to_block(probe);
+        let len = self.load_vm(vm, VM_TRY_STACK_LEN_OFFSET);
+        let cap = self.load_vm(vm, VM_TRY_STACK_CAP_OFFSET);
+        let room = self.builder.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+        self.builder.ins().brif(room, push, &[], slow, &[]);
+        self.builder.switch_to_block(push);
+        let ptr = self.load_vm(vm, VM_TRY_STACK_PTR_OFFSET);
+        let size = self.builder.ins().iconst(types::I64, TRY_FRAME_SIZE as i64);
+        let offset = self.builder.ins().imul(len, size);
+        let frame = self.builder.ins().iadd(ptr, offset);
+        let handler_imm = self.builder.ins().iconst(types::I64, handler as i64);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            handler_imm,
+            frame,
+            Offset32::new(TRY_FRAME_HANDLER_OFFSET as i32),
+        );
+        let saved_env = self.load_vm(vm, VM_LEXICAL_ENV_OFFSET);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            saved_env,
+            frame,
+            Offset32::new(TRY_FRAME_SAVED_ENV_OFFSET as i32),
+        );
+        let env_depth = self.load_vm(vm, VM_ENV_STACK_LEN_OFFSET);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            env_depth,
+            frame,
+            Offset32::new(TRY_FRAME_ENV_DEPTH_OFFSET as i32),
+        );
+        let next = self.builder.ins().iadd_imm_s(len, 1);
+        self.store_vm(vm, VM_TRY_STACK_LEN_OFFSET, next);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.switch_to_block(slow);
+        let handler_imm = self.builder.ins().iconst(types::I64, handler as i64);
+        let _res = self.call_slow(self.sig_bool, Helper::EnterTry, &[handler_imm])?;
+        self.builder.ins().jump(merge, &[]);
+        self.builder.switch_to_block(merge);
+        Ok(())
+    }
+
+    /// The compiled `Exit` for a handler with no finally: a normal completion
+    /// that leaves it is `control_transfer`'s `None` arm, i.e. popping this
+    /// handler's frame and jumping to `after`. The machine code pops in place
+    /// when the try stack holds exactly that frame; everything else keeps the
+    /// helper, which scans — an enclosing try whose finally or catch must run
+    /// (the stack is deeper than one frame), or a frame an inner throw already
+    /// removed (the handler comparison fails).
+    fn emit_exit_try(
+        &mut self,
+        index: usize,
+        after: usize,
+        handler: usize,
+    ) -> Result<(), Unsupported> {
+        let vm = self.vm_ptr();
+        let has_vm = self.builder.ins().icmp_imm_u(IntCC::NotEqual, vm, 0);
+        let count = self.builder.create_block();
+        let top = self.builder.create_block();
+        let pop = self.builder.create_block();
+        let slow = self.builder.create_block();
+        self.builder.ins().brif(has_vm, count, &[], slow, &[]);
+        self.builder.switch_to_block(count);
+        let len = self.load_vm(vm, VM_TRY_STACK_LEN_OFFSET);
+        let single = self.builder.ins().icmp_imm_u(IntCC::Equal, len, 1);
+        self.builder.ins().brif(single, top, &[], slow, &[]);
+        self.builder.switch_to_block(top);
+        let ptr = self.load_vm(vm, VM_TRY_STACK_PTR_OFFSET);
+        let frame_handler = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(TRY_FRAME_HANDLER_OFFSET as i32),
+        );
+        let handler_imm = self.builder.ins().iconst(types::I64, handler as i64);
+        let ours = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, frame_handler, handler_imm);
+        self.builder.ins().brif(ours, pop, &[], slow, &[]);
+        self.builder.switch_to_block(pop);
+        let empty = self.builder.ins().iconst(types::I64, 0);
+        self.store_vm(vm, VM_TRY_STACK_LEN_OFFSET, empty);
+        let after_imm = self.builder.ins().iconst(types::I64, after as i64);
+        self.store_vm(vm, VM_IP_OFFSET, after_imm);
+        // Parity with the helper path, which dispatches through
+        // `emit_dispatch_call`: the mutation invalidates the leaf-call
+        // verdicts that require the try stack at rest.
+        self.bump_leaf_epoch();
+        let target = self.ensure_block(after);
+        self.builder.ins().jump(target, &[]);
+        self.builder.switch_to_block(slow);
+        let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+        let after_imm = self.builder.ins().iconst(types::I64, after as i64);
+        self.emit_dispatch_call(self.sig_update, Helper::ExitTry, &[ip, after_imm])?;
         Ok(())
     }
 
@@ -5703,15 +5865,17 @@ impl<'a> Lowerer<'a> {
                 // (see the reset at the handler-entry steps).
                 let sp = self.builder.use_var(self.sp_var);
                 self.builder.def_var(self.handler_sp_vars[*handler], sp);
-                let handler_imm = self.builder.ins().iconst(types::I64, *handler as i64);
-                let _res = self.call_slow(self.sig_bool, Helper::EnterTry, &[handler_imm])?;
+                self.emit_enter_try(*handler)?;
                 self.fall_through(index);
             }
-            Step::Exit { after } => {
-                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
-                let after_imm = self.builder.ins().iconst(types::I64, *after as i64);
-                self.emit_dispatch_call(self.sig_update, Helper::ExitTry, &[ip, after_imm])?;
-            }
+            Step::Exit { after } => match self.exit_fast_handlers.get(&index).copied() {
+                Some(handler) => self.emit_exit_try(index, *after, handler)?,
+                None => {
+                    let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                    let after_imm = self.builder.ins().iconst(types::I64, *after as i64);
+                    self.emit_dispatch_call(self.sig_update, Helper::ExitTry, &[ip, after_imm])?;
+                }
+            },
             Step::FinallyEnd => {
                 let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
                 self.emit_dispatch_call(self.sig_bool, Helper::FinallyEnd, &[ip])?;
