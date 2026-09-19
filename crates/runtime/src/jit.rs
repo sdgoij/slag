@@ -802,7 +802,7 @@ pub struct JitSlowPaths {
     pub enter_try: extern "C" fn(ctx: *mut c_void, handler: u64) -> u64,
     /// `Step::Exit` (Cut 55): run `control_transfer` with `Ctl::Normal`;
     /// returns the target step index to jump to.
-    pub exit_try: extern "C" fn(ctx: *mut c_void, ip: u64, after: u64) -> u64,
+    pub exit_try: extern "C" fn(ctx: *mut c_void, ip: u64, after: u64, handler: u64) -> u64,
     /// `Step::Return` in a try body (Cut 55): run `control_transfer` with
     /// `Ctl::Return`; a finally interception returns its step, a completed
     /// body signals `DISPATCH_DONE` with the value in `dispatch_value`.
@@ -3263,12 +3263,31 @@ extern "C" fn enter_try(ctx: *mut c_void, handler: u64) -> u64 {
     Value::Undefined.bits()
 }
 
-extern "C" fn exit_try(ctx: *mut c_void, ip: u64, after: u64) -> u64 {
+extern "C" fn exit_try(ctx: *mut c_void, ip: u64, after: u64, handler: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
     let body = unsafe { &*ctx.body };
     vm.ip = ip as usize;
+    // The common `try`/`finally` exit: this handler's frame is the only one on
+    // the stack, so the transfer leaves exactly it and the finally runs next —
+    // `control_transfer` would scan the stack, find the same frame and take the
+    // same arm, then route the result back through the dispatch chain.
+    let handler = handler as usize;
+    if vm.try_stack.len() == 1
+        && vm.try_stack[0].handler == handler
+        && let Some(finally) = body.handlers.get(handler).and_then(|h| h.finally)
+    {
+        let frame = vm.try_stack.remove(0);
+        vm.enter_finally(
+            frame,
+            finally,
+            &crate::ir::Ctl::Normal {
+                after: after as usize,
+            },
+        );
+        return finally as u64;
+    }
     let result = vm.control_transfer(
         agent,
         body,
@@ -3356,6 +3375,18 @@ extern "C" fn finally_end(ctx: *mut c_void, ip: u64) -> u64 {
             ),
         );
     };
+    // The common case: the finally's try was the only frame and it is gone, so
+    // re-applying a NORMAL control is the environment restore and the jump —
+    // `control_transfer` would scan an empty stack and do exactly that.
+    if vm.try_stack.is_empty()
+        && let crate::ir::PendingControl::Normal {
+            after, env, depth, ..
+        } = pending
+    {
+        vm.restore_env(env, depth);
+        vm.ip = after;
+        return after as u64;
+    }
     match pending {
         crate::ir::PendingControl::Normal {
             after, env, depth, ..

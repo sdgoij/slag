@@ -683,6 +683,10 @@ struct Lowerer<'a> {
     /// a handler with no finally has a trivial exit — anything else must run a
     /// finally first, which is the helper's job.
     exit_fast_handlers: std::collections::HashMap<usize, usize>,
+    /// The handler each `Exit` step closes, for every handler: the helper's
+    /// `try`/`finally` fast path takes it as an argument (an Exit outside a
+    /// handler's own table passes 0, which only makes that fast path miss).
+    exit_handlers: std::collections::HashMap<usize, usize>,
     /// Cut 46: the working-stack base the body started with — the `sp_var`
     /// value at entry, saved so a self-tail-call back edge can reset the
     /// working stack to the fresh-run base before re-entering the body.
@@ -832,16 +836,18 @@ impl<'a> Lowerer<'a> {
         }
         // The `Exit` steps a handler's own region closes on (see the field):
         // its try body's Exit and, when there is a catch, the catch's.
-        let mut exit_fast_handlers = std::collections::HashMap::new();
+        let mut exit_handlers = std::collections::HashMap::new();
         for (index, handler) in body.handlers.iter().enumerate() {
-            if handler.finally.is_some() {
-                continue;
-            }
-            exit_fast_handlers.insert(handler.try_end, index);
+            exit_handlers.insert(handler.try_end, index);
             if let Some(catch) = handler.catch {
-                exit_fast_handlers.insert(catch.end, index);
+                exit_handlers.insert(catch.end, index);
             }
         }
+        let exit_fast_handlers: std::collections::HashMap<usize, usize> = exit_handlers
+            .iter()
+            .filter(|(_, index)| body.handlers[**index].finally.is_none())
+            .map(|(&step, &index)| (step, index))
+            .collect();
         let entry_sp_var = builder.declare_var(types::I64);
         let vm_var = builder.declare_var(types::I64);
         let counter_var = builder.declare_var(types::F64);
@@ -960,6 +966,7 @@ impl<'a> Lowerer<'a> {
             handler_sp_vars,
             handler_entry_steps,
             exit_fast_handlers,
+            exit_handlers,
             entry_sp_var,
             vm_var,
             counter_var,
@@ -5879,9 +5886,18 @@ impl<'a> Lowerer<'a> {
             Step::Exit { after } => match self.exit_fast_handlers.get(&index).copied() {
                 Some(handler) => self.emit_exit_try(index, *after, handler)?,
                 None => {
+                    // A handler with a finally (or an Exit outside a handler's
+                    // table): the helper's own `try`/`finally` fast path needs
+                    // the handler index.
                     let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
                     let after_imm = self.builder.ins().iconst(types::I64, *after as i64);
-                    self.emit_dispatch_call(self.sig_update, Helper::ExitTry, &[ip, after_imm])?;
+                    let handler = self.exit_handlers.get(&index).copied().unwrap_or(0);
+                    let handler_imm = self.builder.ins().iconst(types::I64, handler as i64);
+                    self.emit_dispatch_call(
+                        self.sig_binary,
+                        Helper::ExitTry,
+                        &[ip, after_imm, handler_imm],
+                    )?;
                 }
             },
             Step::FinallyEnd => {

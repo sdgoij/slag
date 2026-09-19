@@ -669,7 +669,7 @@ pub struct JitHelpers {
     pub enter_block: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
     pub leave_block: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     pub enter_try: Option<extern "C" fn(vm: *mut c_void, handler: u64) -> u64>,
-    pub exit_try: Option<extern "C" fn(vm: *mut c_void, ip: u64, after: u64) -> u64>,
+    pub exit_try: Option<extern "C" fn(vm: *mut c_void, ip: u64, after: u64, handler: u64) -> u64>,
     pub return_control: Option<extern "C" fn(vm: *mut c_void, ip: u64, value: u64) -> u64>,
     pub break_control: Option<extern "C" fn(vm: *mut c_void, ip: u64, target: u64) -> u64>,
     pub continue_control: Option<extern "C" fn(vm: *mut c_void, ip: u64, target: u64) -> u64>,
@@ -1572,7 +1572,7 @@ pub extern "C" fn test_enter_try(_vm: *mut c_void, _handler: u64) -> u64 {
     Value::Number(85.0).bits()
 }
 
-pub extern "C" fn test_exit_try(_vm: *mut c_void, _ip: u64, _after: u64) -> u64 {
+pub extern "C" fn test_exit_try(_vm: *mut c_void, _ip: u64, _after: u64, _handler: u64) -> u64 {
     Value::Number(86.0).bits()
 }
 

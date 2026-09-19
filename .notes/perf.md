@@ -11458,6 +11458,44 @@ the env path — correct, just interpreted. Certifying them needs each scope's
 lexical names hoisted into the scope set at scope entry (a pre-pass over the
 block's statements), which is the natural next slice if these shapes show up hot.
 
+### LANDED (2026-09-19): the finally handlers' common exit and resume skip the scan
+
+The previous entry left `try`/`finally` loops on the helper path: `EnterTry` was
+inlined, but a handler *with* a finally went through `Helper::ExitTry`
+(`control_transfer` -> `find_finally_frame` -> the pending push -> the dispatch
+chain) and `Helper::FinallyEnd` (the pending pop -> `control_transfer` -> the same
+chain). Both helpers now special-case their common shape — no new machine code
+was needed, because the cost was the scan and the dispatch, not the call:
+
+- `exit_try` takes the Exit's handler index (a new argument, threaded from the
+  compiler's per-step handler table) and, when that handler's frame is the only
+  one on the try stack, removes it, enters the finally through the shared
+  `Vm::enter_finally` (extracted from `control_transfer`'s arm, so the two cannot
+  drift) and returns the finally's start step;
+- `finally_end` re-applies a NORMAL pending whose try stack is empty — the
+  environment restore and the jump.
+
+**Measured (paired, interleaved, min of 5):** `finEmpty` (`try{}finally{}` loop)
+25.33 -> **17.33**, `finBody` 26.67 -> **18.00** (-32%), `finBreakInner` (a break
+out of a loop inside a finally) 41.33 -> 35.33; the try/catch shapes are
+unchanged (`tryE` 6.67). 41 rows paired: **+0.4%** — no row contains `try` or
+`finally` at all, and the four reading positive (`construct_churn`, `proto_read`,
+`nested_loops`, `method_call`) flip sign at 6 reps.
+
+**Gates.** clippy `-D warnings` clean, fmt clean, `cargo test --workspace` 36/36
+suites; test262 `language` 23721 / `built-ins` 23657 / `annexB` 1086 / `intl402`
+3205, all 0 fail — identical to baseline; `--gc-verify`/`--gc-stress`/
+`--nursery-stress` clean; the try/scope differentials (`trydiff`, `finbreak`,
+`tryfin`, `scopeprobe`, `sibling`) byte-identical in both engines. Binaries
+`slag-scopefix.exe` (before) and `slag-fininline.exe` (after).
+
+**One non-reproducing hang, kept on the record.** The first `built-ins` run after
+this change reported 3 hangs (and exactly 3 fewer passes); two further runs at the
+same 15s deadline were clean at baseline (23657 / 0 fail / 0 crash / 0 hang), and
+no fixture was identifiable by then. Treated as this box's load sensitivity rather
+than dismissed: if it recurs, the shape to probe is a `finally` whose try is the
+only frame — the new fast path's guard.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

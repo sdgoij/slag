@@ -12999,6 +12999,59 @@ impl Vm {
         Ok(env)
     }
 
+    /// Enter `frame`'s `finally` for the deferred `ctl`: the frame is already
+    /// off the try stack, and the finally starts at `finally`.
+    ///
+    /// The pending re-applies the deferred control at the depth the transfer
+    /// has already unwound to: the compiled `leave_scopes` pops run before the
+    /// control-transfer step, so envs below the try (a loop body block the
+    /// `continue` exits) are gone. The finally body itself runs at the
+    /// try-entry environment (restored below), and a fresh throw (no
+    /// leave_scopes) keeps the try-entry depth — `min` picks the right one.
+    pub(crate) fn enter_finally(&mut self, frame: TryFrame, finally: usize, ctl: &Ctl) {
+        let handler = frame.handler;
+        let depth = self.env_stack.len().min(frame.env_depth);
+        let env = self
+            .env_stack
+            .get(depth.saturating_sub(1))
+            .cloned()
+            .unwrap_or(self.lexical_env);
+        self.pending.push(match ctl {
+            Ctl::Normal { after } => PendingControl::Normal {
+                after: *after,
+                env,
+                depth,
+                handler,
+            },
+            Ctl::Break { target } => PendingControl::Break {
+                target: *target,
+                env,
+                depth,
+                handler,
+            },
+            Ctl::Continue { target } => PendingControl::Continue {
+                target: *target,
+                env,
+                depth,
+                handler,
+            },
+            Ctl::Return { value } => PendingControl::Return {
+                value: *value,
+                env,
+                depth,
+                handler,
+            },
+            Ctl::Throw { value } => PendingControl::Throw {
+                value: *value,
+                env,
+                depth,
+                handler,
+            },
+        });
+        self.restore_env(frame.saved_env, frame.env_depth);
+        self.ip = finally;
+    }
+
     /// The control-transfer machinery: route through pending finallys, then
     /// apply the control.
     pub(crate) fn control_transfer(
@@ -13042,56 +13095,8 @@ impl Vm {
             let decision = self.find_finally_frame(body, &ctl);
             match decision {
                 Some((index, Some(finally))) => {
-                    let handler = self.try_stack[index].handler;
                     let frame = self.try_stack.remove(index);
-                    // The pending re-applies the deferred control at the
-                    // depth the transfer has already unwound to: the
-                    // compiled `leave_scopes` pops run before the
-                    // control-transfer step, so envs below the try (a loop
-                    // body block the `continue` exits) are gone. The finally
-                    // body itself runs at the try-entry environment (restored
-                    // below), and a fresh throw (no leave_scopes) keeps the
-                    // try-entry depth — `min` picks the right one.
-                    let depth = self.env_stack.len().min(frame.env_depth);
-                    let env = self
-                        .env_stack
-                        .get(depth.saturating_sub(1))
-                        .cloned()
-                        .unwrap_or(self.lexical_env);
-                    self.pending.push(match &ctl {
-                        Ctl::Normal { after } => PendingControl::Normal {
-                            after: *after,
-                            env,
-                            depth,
-                            handler,
-                        },
-                        Ctl::Break { target } => PendingControl::Break {
-                            target: *target,
-                            env,
-                            depth,
-                            handler,
-                        },
-                        Ctl::Continue { target } => PendingControl::Continue {
-                            target: *target,
-                            env,
-                            depth,
-                            handler,
-                        },
-                        Ctl::Return { value } => PendingControl::Return {
-                            value: *value,
-                            env,
-                            depth,
-                            handler,
-                        },
-                        Ctl::Throw { value } => PendingControl::Throw {
-                            value: *value,
-                            env,
-                            depth,
-                            handler,
-                        },
-                    });
-                    self.restore_env(frame.saved_env, frame.env_depth);
-                    self.ip = finally;
+                    self.enter_finally(frame, finally, &ctl);
                     return Ok(CtlResult::Continue);
                 }
                 Some((index, None)) => {
