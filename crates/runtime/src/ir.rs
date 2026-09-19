@@ -23774,7 +23774,10 @@ struct FastScopeScan {
     /// disjoint (a retired binding's scope is closed) — and a reference to a
     /// retired name from outside its scope must bail: the map would resolve it
     /// to that slot, which no longer holds the binding (or holds a later,
-    /// unrelated one).
+    /// unrelated one). The flag means "the slot exists and no live binding
+    /// owns it": a later declaration that takes the slot over clears it
+    /// ([`FastScopeScan::reclaim_slot`]), and closing a scope whose
+    /// declarations own it sets it again.
     retired: HashSet<crux::AtomId>,
     /// The block depths of the loop bodies currently being scanned: a
     /// lexical binding declared at or below one (a loop-body declaration)
@@ -23871,6 +23874,16 @@ impl FastScopeScan {
         if let Some(names) = self.block_names_stack.pop() {
             self.retired.extend(names);
         }
+    }
+
+    /// Take over the slot a retired same-name binding left behind: the flag is
+    /// only valid while the name's slot has no live owner, so a declaration
+    /// that reuses the slot must clear it. Leaving it set would let a *later*
+    /// same-name binding reuse a slot a live binding owns
+    /// (`{ let q = 1; } let q = 2; { let q = 3; }` — the block would share the
+    /// root binding's slot and clobber it).
+    fn reclaim_slot(&mut self, name: crux::AtomId) {
+        self.retired.remove(&name);
     }
 
     fn stmts(&mut self, stmts: &[Stmt], depth: usize) -> bool {
@@ -24175,6 +24188,7 @@ impl FastScopeScan {
                     // The head is scoped to the loop: a reference outside
                     // the open loop would leak the flat slot.
                     self.for_head_lexicals.insert(*name, depth);
+                    self.reclaim_slot(*name);
                     let mut head_names = HashSet::new();
                     head_names.insert(*name);
                     self.open_for_heads.push(head_names);
@@ -24256,6 +24270,7 @@ impl FastScopeScan {
                                 self.next_slot += 1;
                                 self.slots.insert(*name, slot);
                             }
+                            self.reclaim_slot(*name);
                         }
                         self.block_names_stack.push(HashSet::new());
                         if let Some(param) = &handler.param
@@ -24431,6 +24446,7 @@ impl FastScopeScan {
             {
                 self.loop_body_lexicals.insert(name);
             }
+            self.reclaim_slot(name);
         }
         // A captured binding lives in the capture context; a `var`
         // redeclaration reuses its existing slot/context binding.

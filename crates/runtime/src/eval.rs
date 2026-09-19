@@ -4893,6 +4893,67 @@ mod tests {
         );
     }
 
+    /// The retired flag means "the slot exists and no live binding owns it": a
+    /// declaration that takes a retired slot over clears it. That is what lets
+    /// a reference after the takeover resolve through the flat map (the root
+    /// `let` that reclaimed a block's slot), and it is also what keeps a later
+    /// same-name binding from reusing a slot a live binding owns.
+    #[test]
+    fn fast_path_retired_slot_is_reclaimed_by_its_new_owner() {
+        // A root `let` declared after a block that retired the same name: the
+        // declaration reuses the block's slot, and the references after it
+        // resolve to that slot instead of bailing the whole body.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "function f() { var s = 0; { let q = 1; s += q; } let q = 2; for (var i = 0; i < 3; i++) { s += q; } return s; }",
+            )
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.scope.is_some(),
+            "a reference to a reclaimed root lexical must keep the body certified"
+        );
+        assert_eq!(
+            run("function f() { var s = 0; { let q = 1; s += q; } let q = 2; for (var i = 0; i < 3; i++) { s += q; } return s; } f()")
+                .unwrap(),
+            Value::Number(7.0)
+        );
+
+        // A read between the retiring block and the root declaration is in the
+        // TDZ, and the reused slot still holds the block's value (the frame's
+        // uninitialized marker is armed once per frame, not per scope), so the
+        // body has to stay on the env path and throw.
+        assert_eq!(
+            run("function f() { { let q = 1; } try { q; } catch (e) { return e.name === 'ReferenceError'; } let q = 2; return false; } f()")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+
+        // A later block redeclaring the name must NOT take over the slot the
+        // root binding now owns: sharing it would clobber the live root value.
+        assert_eq!(
+            run("function g() { var r = ''; { let q = 1; r += q; } let q = 2; { let q = 3; r += q; } r += '/' + q; return r === '13/2'; } g()")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+
+        // The same guard for the two other reclaim sites: a for-head and a
+        // catch parameter that took over a retired slot are live inside their
+        // own scope, so a nested same-name block must not share the slot.
+        assert_eq!(
+            run("function h() { var r = ''; { let q = 'retired'; r += q; } for (let q = 0; q < 2; q++) { { let q = 'shadow'; } r += q; } return r === 'retired01'; } h()")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("function k() { var r = ''; { let q = 'retired'; r += q; } try { throw 'boom'; } catch (q) { r += q; } { let q = 'shadow'; r += q; } return r === 'retiredboomshadow'; } k()")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
     #[test]
     fn fast_path_for_of_in_heads_certify() {
         // A `var` for-of head certifies like a `For` head (Cut 3 gap item

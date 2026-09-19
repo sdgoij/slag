@@ -11496,6 +11496,82 @@ no fixture was identifiable by then. Treated as this box's load sensitivity rath
 than dismissed: if it recurs, the shape to probe is a `finally` whose try is the
 only frame — the new fast path's guard.
 
+### LANDED (2026-09-20): a reclaimed slot lets a reference resolve — the root-lexical-after-block cliff
+
+The reuse slice left the *hoisting half* refused: a reference to a retired name
+from outside its scope bails, so a body that declares a root `let` after a block
+retired the same name ran entirely interpreted. Per-iteration ns (1.5M-iteration
+loop, min-of-5, `scratch/iso/gapprobe.js`):
+
+| shape | ns/iter |
+|---|---|
+| sibling control (two `let q` blocks) | 7.33 |
+| `{ let q = 1; s += q } let q = 2; for (…) s += q` | **572.67** |
+| `catch (e)` shadowing a same-named parameter | **626.67** |
+| `catch (e)` shadowing a same-named `var` | **641.33** |
+
+**The intended fix is unsound.** Hoisting each scope's lexical names into a scope
+set at entry (the natural next slice the reuse entry proposed) lets a read before
+the declaration through — and the frame's uninitialized marker is armed **once
+per frame, not per scope**, so a read in that window of a *reused* slot returns
+the earlier binding's value instead of throwing. The first build certified
+`{ let q = 'block'; r = q; } try { r += q } catch (…) let q = 'root'` and printed
+`block/block/root` instead of `block/tdz:ReferenceError/root` (the probe case is
+kept as `rootTdzAfterBlock`).
+
+**The hoist also exposed a latent hole in the reuse rule.** `retired` was never
+cleared, so it meant "the name has a slot" rather than "the slot has no live
+owner": once a root `let` legitimately took a retired slot over, a *later*
+same-name block reused it again and clobbered the live binding. That is a real
+miscompile — the intermediate build printed `13/3` for
+`{ let q = 1; r += q } let q = 2; { let q = 3; r += q } r += '/' + q`, and
+`3` for the same shape without the middle read. It was only latent before
+because the reference guard bailed the body first; the guard does not cover a
+reference *inside* the second block.
+
+**Landed.** `retired` now means "the slot exists and no live binding owns it",
+and the three sites that take a retired slot over clear the flag
+(`FastScopeScan::reclaim_slot`): the lexical declaration, the lexical for-head,
+and the catch parameter. That cleared flag is exactly what lets the later
+reference resolve through the flat map — the root declaration is the name's live
+owner by then, so the mapping is right — and it is also what makes a *later*
+same-name binding bail instead of sharing the owner's slot. No hoisting sets, no
+compiler change: the reference guard is untouched, and the TDZ window stays
+closed because a reference before a takeover is scanned before it.
+
+**Measured after.** `rootAfterBlock` 572.67 -> **5.33** ns/iter (min-of-5:
+586.67/577.33/583.33/572.67/574.67 before, 5.33/6.67/7.33/5.33/6.00 after); the
+sibling control is unchanged at 7.33. The reuse slice's shapes are unchanged
+(catchprobe: `one` 7.33 -> 6.67, `seqSame` 9.33 -> 10.00, `nestSame` 18.00 ->
+17.33, `letTwice` 7.33 -> 7.33). 41 rows paired+isolated at 3 reps: **-0.3%**
+total. The two positive rows are noise — `builtins/object_keys.js` +6.3% and
+`control/for_in.js` +6.1% flip to -0.7% and +0.4% at 8 reps, and neither row
+contains a single `let`/`const`, so nothing this change can reach. The cliff
+shapes are not corpus rows, so this is a real-workload win, like the reuse slice
+before it.
+
+**Still refused (the shadowing half).** A catch parameter (or a block `let`)
+shadowing a *live* same-name outer binding still bails, and slot sharing cannot
+fix it: the shadowing binding's store clobbers a slot the outer binding still
+needs, and there is no re-arm — the certified frame has no save/restore. Making
+it certify needs a scratch frame slot plus a restore on every exit from the
+shadowing scope (normal and abrupt), i.e. real machinery, not a scan rule. The
+handoff's per-binding `live_bindings` sketch does not close it: it permits the
+reuse, and `shadowedCatchParam` reads the shadowed parameter *after* the catch,
+so the clobber is observable. Measured cost while it stays refused:
+`shadowedCatchParam` ~654, `shadowedCatchVar` ~651-813 ns/iter vs ~7 certified.
+No corpus row contains the shape.
+
+**Gates.** clippy `--workspace --all-targets -D warnings` clean, fmt clean,
+`cargo test --workspace` 36/36 suites (a new
+`fast_path_retired_slot_is_reclaimed_by_its_new_owner` covers the enabler and
+all three reclaim sites); test262 `language` 23721 / 0 fail / 3 skip,
+`built-ins` 23657 / 0 fail / 155 skip, `annexB` 1086 / 0 fail, `intl402` 3205 /
+0 fail — all identical to baseline; `--gc-verify`/`--gc-stress`/
+`--nursery-stress` clean on the probes. `scratch/iso/scopeprobe.js` (18 cases)
+ALL OK in both engines, `scratch/iso/reusewindow.js` and `headreclaim.js` correct
+in both. Binaries: `slag-fininline.exe` (before) and `slag-reclaim.exe` (after).
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
