@@ -11242,12 +11242,77 @@ was `undefined|TypeError|undefined`). Reusable: `scratch/iso/trycost2.js`,
 `scratch/iso/trydiff.js`, `scratch/iso/tryfin.js`; binaries
 `slag-envbase.exe` (before) and `slag-tryfix.exe` (after).
 
-**Pre-existing bug found, NOT fixed (unchanged by this change).**
+**Pre-existing bug found here, fixed in the next entry.**
 `try { throw x } finally { for (;;) { break } }` throws `SyntaxError: FinallyEnd
-without a pending control` in both binaries: `control_transfer`'s top pop takes
-the pending for any `Break`/`Continue`/`Return` even when the transfer stays
-*inside* the finally (where the finally still completes normally and the pending
-must survive). Verified pre-existing on `slag-envbase.exe`.
+without a pending control`: `control_transfer`'s top pop takes the pending for any
+`Break`/`Continue`/`Return` even when the transfer stays *inside* the finally
+(where the finally still completes normally and the pending must survive).
+Verified pre-existing on `slag-envbase.exe`.
+
+### LANDED (2026-09-19): a transfer only replaces a finally's pending control when it leaves the finally
+
+The retraction above was the tip of a two-part defect in `control_transfer`'s
+opening block, which every `Break`/`Continue`/`Return` inside a running finally
+reaches:
+
+1. **The pending was taken unconditionally**, so a `break`/`continue` of a loop
+   that lives *inside* the finally consumed the pending; the finally then
+   completed normally and `FinallyEnd` had nothing to apply —
+   `SyntaxError: FinallyEnd without a pending control`. Reproduced for a plain
+   inner loop (`t1`), a `continue` (`t2`), a labeled break (`t3`), and a break
+   out of a nested try/finally inside the loop (`t8`, `t9`); both engines.
+2. **It applied the control directly instead of continuing through the frames**,
+   so the finallys of frames the transfer *also* leaves never ran. That hit the
+   leaving case too: `try { try { throw x } finally { break outer } } finally
+   { .. }` skipped the OUTER finally (`finA|after` instead of `finA|finB|after`),
+   and the same for a `return` inside a loop inside a finally (`from-finally`
+   instead of `finB|from-finally`). Also pre-existing.
+
+**Fix.** The pending now records its owning `handler` (replacing the
+`try_depth` the previous slice added, which answered a narrower form of the same
+question), and `Handler` gains `finally_end` — set to the step after the
+finally's `FinallyEnd` — so a handler's finally is the step range
+`[finally, finally_end)`. `step_inside_finally(body, handler, at)` is that range
+test, and it now answers both places that ask "is this inside the running
+finally": the catch arm (`throw_machinery`, testing the catching frame's own
+`start`) and the opening block (testing the transfer's `target`). A transfer
+that does not leave the finally leaves the pending in place and falls through;
+spec 14.15.4 step 8's replacement happens only when it does, and then the
+opening block also **falls through to the frame loop** instead of returning, so
+finallys between the aborted one and the control's landing run first. `Return`
+and `Throw` always leave. The `eprintln`-free predicate is a `Vec::last()` on
+`pending`, i.e. one length check on the cold `Exit` path.
+
+**Behaviour (`scratch/iso/finbreak.js`, 10 cases, both engines; before -> after):**
+
+    t1 break-inner-loop      SyntaxError -> i0|after|caught p
+    t2 continue-inner-loop   SyntaxError -> i0|i2|after|caught p
+    t3 labeled-break-inner   SyntaxError -> j0|done|caught p
+    t4 break-leaves-outer    finA|after   -> finA|finB|after
+    t5 break-through-for-of  finA|closed1 -> finA|finB|closed1
+    t8 break-nested-finally  SyntaxError -> body0|fin0|body1|fin1|after|caught p
+    t9 continue-outer-loop   SyntaxError -> after|caught p
+    t10 return-in-inner-loop from-finally -> finB|from-finally
+
+`t6` (return in a finally) and `t7` (nested finally in a finally) unchanged. The
+32-case `scratch/iso/trydiff.js` differential against the previous binary differs
+on **exactly one** line — `break-in-finally-inner-loop` — in both engines.
+
+**Gates.** clippy `-D warnings` clean, fmt clean, `cargo test --workspace`
+36/36 suites 0 failed; test262 `language` 23721 pass / 0 fail / 3 skip,
+`built-ins` 23657 / 0 fail / 155 skip, `annexB` 1086 / 0 fail, `intl402` 3205 /
+0 fail — all identical to baseline; `--gc-verify`/`--gc-stress`/`--nursery-stress`
+clean on all 10 cases and on the try row.
+
+**Cost: none measurable.** Per-iteration ns, paired min-of-5: `finEmpty` (loop
+`try{}finally{}`) 26.00 -> 26.00 (+0.0%), `finBody` 28.00 -> 27.33 (-2.4%),
+`tryE`/`tryA`/`tryLet` flat, `add` flat. 41 rows paired+isolated: **+0.8%**,
+inside the documented noise floor; the four rows reading the largest positive
+deltas there (`head-let` +8.3%, `proto_read` +6.7%, `declarative_read` +7.9%,
+`construct_churn` +5.9%) flip to -1.3%, -23.1%, +10.1%, +0.8% on a 6-rep
+re-measure, and the first three contain no `finally` at all. Binaries:
+`slag-tryfix.exe` (before) and `slag-finbreak.exe` (after); tooling
+`scratch/one-row-ab.sh` for the per-row re-measure.
 
 ## Deferred milestones
 

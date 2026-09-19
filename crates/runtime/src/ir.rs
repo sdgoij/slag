@@ -1435,6 +1435,12 @@ pub struct Handler {
     pub try_end: usize,
     pub catch: Option<CatchHandler>,
     pub finally: Option<usize>,
+    /// The step after the finally's `FinallyEnd`, so the finally's own range is
+    /// `[finally, finally_end)`. A control transfer (or a catch) inside that
+    /// range is still inside the finally: it leaves the finally's evaluation
+    /// running, which then completes normally and still applies whatever
+    /// completion the finally was entered for.
+    pub finally_end: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1722,43 +1728,43 @@ impl Trace for TryFrame {
 
 /// A pending control transfer a `finally` finishes after it runs.
 ///
-/// `try_depth` is the `try_stack` length once the pending finally's frame was
-/// removed: a frame at or above that index was entered inside the finally.
-/// That is what tells a throw caught inside the finally (which must leave the
-/// pending for `FinallyEnd`) from one whose catch lies outside it (which
-/// replaces the pending, spec 14.15.4 step 8). The frame's `env_depth` cannot
-/// answer this — an env-free finally leaves both depths equal.
+/// `handler` is the handler whose finally owns the pending: a transfer (or a
+/// catch) whose target lies outside that finally leaves it and replaces the
+/// pending (spec 14.15.4 step 8), while one that stays inside lets the finally
+/// run on to its own normal completion, which still applies the pending. The
+/// question is a step range ([`Handler::finally_end`]), not an environment
+/// depth — an env-free finally leaves those equal.
 #[derive(Debug)]
 pub enum PendingControl {
     Normal {
         after: usize,
         env: EnvRef,
         depth: usize,
-        try_depth: usize,
+        handler: usize,
     },
     Break {
         target: usize,
         env: EnvRef,
         depth: usize,
-        try_depth: usize,
+        handler: usize,
     },
     Continue {
         target: usize,
         env: EnvRef,
         depth: usize,
-        try_depth: usize,
+        handler: usize,
     },
     Return {
         value: Value,
         env: EnvRef,
         depth: usize,
-        try_depth: usize,
+        handler: usize,
     },
     Throw {
         value: Value,
         env: EnvRef,
         depth: usize,
-        try_depth: usize,
+        handler: usize,
     },
 }
 
@@ -1789,16 +1795,30 @@ pub fn pending_env_depth(pending: &PendingControl) -> (EnvRef, usize) {
     }
 }
 
-/// The `try_stack` length at the pending's finally-frame removal — the base
-/// `throw_machinery` compares a catching frame's index against.
-pub fn pending_try_depth(pending: &PendingControl) -> usize {
+/// The handler whose finally owns the pending control — the finally whose
+/// step range decides whether a transfer stays inside it.
+pub fn pending_handler(pending: &PendingControl) -> usize {
     match pending {
-        PendingControl::Normal { try_depth, .. }
-        | PendingControl::Break { try_depth, .. }
-        | PendingControl::Continue { try_depth, .. }
-        | PendingControl::Return { try_depth, .. }
-        | PendingControl::Throw { try_depth, .. } => *try_depth,
+        PendingControl::Normal { handler, .. }
+        | PendingControl::Break { handler, .. }
+        | PendingControl::Continue { handler, .. }
+        | PendingControl::Return { handler, .. }
+        | PendingControl::Throw { handler, .. } => *handler,
     }
+}
+
+/// Whether step `at` lies inside handler `outer`'s finally range, i.e. whether
+/// a transfer to `at` (or a frame starting there) stays within that finally's
+/// evaluation.
+pub fn step_inside_finally(body: &CompiledBody, outer: usize, at: usize) -> bool {
+    body.handlers
+        .get(outer)
+        .and_then(|handler| {
+            handler
+                .finally
+                .map(|finally| (finally, handler.finally_end))
+        })
+        .is_some_and(|(finally, end)| finally <= at && at < end)
 }
 
 /// How the VM suspended, for the driver (generator/async machinery).
@@ -12989,55 +13009,41 @@ impl Vm {
     ) -> Result<CtlResult, JsError> {
         // An abrupt control transfer while a finally is running replaces the
         // pending control the finally was processing (spec 14.15.4 step 8: a
-        // `break`/`continue`/`return`/`throw` inside a finally overrides it)
-        // — the pending's environment is the restore target (it unwinds the
+        // `break`/`continue`/`return`/`throw` inside a finally overrides it) —
+        // the pending's environment is the restore target (it unwinds the
         // finally's own block envs), and the finally that held it already
-        // consumed its frame, so the new control applies directly. A NORMAL
-        // completion (an inner try's Exit inside the finally) leaves the
-        // pending for FinallyEnd.
-        if let Some(pending) = (matches!(
-            ctl,
-            Ctl::Break { .. } | Ctl::Continue { .. } | Ctl::Return { .. } | Ctl::Throw { .. }
-        ))
-        .then(|| self.pending.pop())
-        .flatten()
-        {
+        // consumed its frame. That holds only when the transfer LEAVES the
+        // finally: a `break`/`continue` of a loop that lives inside the finally
+        // lets the finally's own evaluation continue, so the finally still
+        // reaches `FinallyEnd` and still applies the pending. A NORMAL
+        // completion (an inner try's Exit inside the finally) never leaves it.
+        //
+        // Replacing the pending then falls through instead of applying the
+        // control directly: the transfer may also leave finallys that are still
+        // on the stack — inside the aborted finally (an inner try the transfer
+        // jumps out of) or outside it (an enclosing try) — and each must run
+        // first, which is the loop below.
+        let aborts_pending = self.pending.last().is_some_and(|pending| {
+            let handler = pending_handler(pending);
+            match &ctl {
+                Ctl::Normal { .. } => false,
+                Ctl::Break { target } | Ctl::Continue { target } => {
+                    !step_inside_finally(body, handler, *target)
+                }
+                Ctl::Return { .. } | Ctl::Throw { .. } => true,
+            }
+        });
+        if aborts_pending {
+            let pending = self.pending.pop().expect("checked by `aborts_pending`");
             let (env, depth) = pending_env_depth(&pending);
             self.restore_env(env, depth);
-            if let Ctl::Return { .. } = ctl {
-                self.close_for_of_return(agent)?;
-            } else if let Ctl::Throw { .. } = ctl {
-                self.close_for_of_throw(agent);
-            } else if let Ctl::Break { target } | Ctl::Continue { target } = ctl {
-                self.close_for_of_upto(agent, target)?;
-            }
-            return Ok(match ctl {
-                Ctl::Normal { after } => {
-                    self.ip = after;
-                    CtlResult::Continue
-                }
-                Ctl::Break { target } => {
-                    self.ip = target;
-                    CtlResult::Continue
-                }
-                Ctl::Continue { target } => {
-                    self.ip = target;
-                    CtlResult::Continue
-                }
-                Ctl::Return { value } => {
-                    CtlResult::Done(VmOutcome::Completed(Completion::Return(value)))
-                }
-                Ctl::Throw { value } => {
-                    CtlResult::Done(VmOutcome::Completed(Completion::Throw(value)))
-                }
-            });
         }
         loop {
             let decision = self.find_finally_frame(body, &ctl);
             match decision {
                 Some((index, Some(finally))) => {
+                    let handler = self.try_stack[index].handler;
                     let frame = self.try_stack.remove(index);
-                    let try_depth = self.try_stack.len();
                     // The pending re-applies the deferred control at the
                     // depth the transfer has already unwound to: the
                     // compiled `leave_scopes` pops run before the
@@ -13057,31 +13063,31 @@ impl Vm {
                             after: *after,
                             env,
                             depth,
-                            try_depth,
+                            handler,
                         },
                         Ctl::Break { target } => PendingControl::Break {
                             target: *target,
                             env,
                             depth,
-                            try_depth,
+                            handler,
                         },
                         Ctl::Continue { target } => PendingControl::Continue {
                             target: *target,
                             env,
                             depth,
-                            try_depth,
+                            handler,
                         },
                         Ctl::Return { value } => PendingControl::Return {
                             value: *value,
                             env,
                             depth,
-                            try_depth,
+                            handler,
                         },
                         Ctl::Throw { value } => PendingControl::Throw {
                             value: *value,
                             env,
                             depth,
-                            try_depth,
+                            handler,
                         },
                     });
                     self.restore_env(frame.saved_env, frame.env_depth);
@@ -13208,10 +13214,15 @@ impl Vm {
                     // replaces the pending (spec 14.15.4 step 8), restoring
                     // to the try-entry environment. A catch INSIDE the
                     // finally leaves the pending for FinallyEnd — the
-                    // catching frame sits at or above the try-stack length
-                    // the pending recorded when its own frame was removed.
+                    // catching frame's own try region starts within the
+                    // pending's finally range.
                     if let Some(pending) = self.pending.pop() {
-                        if index >= pending_try_depth(&pending) {
+                        let handler = pending_handler(&pending);
+                        let inside = body
+                            .handlers
+                            .get(self.try_stack[index].handler)
+                            .is_some_and(|frame| step_inside_finally(body, handler, frame.start));
+                        if inside {
                             self.pending.push(pending);
                         } else {
                             let (env, depth) = pending_env_depth(&pending);
@@ -13250,8 +13261,8 @@ impl Vm {
                     return Ok(CtlResult::Continue);
                 }
                 Some((index, ThrowAction::Finally)) => {
+                    let handler = self.try_stack[index].handler;
                     let frame = self.try_stack.remove(index);
-                    let try_depth = self.try_stack.len();
                     // Restore to the try-entry environment (the state when
                     // the finally started) so the finally's block envs unwind
                     // with the pending throw.
@@ -13261,7 +13272,7 @@ impl Vm {
                         value,
                         env,
                         depth,
-                        try_depth,
+                        handler,
                     });
                     self.restore_env(frame.saved_env, frame.env_depth);
                     let finally = body
@@ -18329,6 +18340,7 @@ impl Compiler {
             try_end: 0,
             catch: None,
             finally: None,
+            finally_end: 0,
         });
         let start = self.steps.len();
         self.handlers[handler_index].start = start;
@@ -18416,6 +18428,10 @@ impl Compiler {
             self.emit(Step::ListEnd);
             self.emit(Step::RestoreCompletion);
             self.emit(Step::FinallyEnd);
+            // The step after `FinallyEnd` closes the finally's own range: a
+            // transfer targeting a step in `[finally_start, here)` stays inside
+            // this finally (see `step_inside_finally`).
+            self.handlers[handler_index].finally_end = self.steps.len();
         }
         self.place(after_label);
         self.emit(Step::NormalizeCompletion);
