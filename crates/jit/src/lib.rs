@@ -514,6 +514,8 @@ mod tests {
             arity: 0,
             slots: Default::default(),
             tdz_store: vec![false; frame_size],
+            shadow_slots: Default::default(),
+            shadowed_catch_params: Default::default(),
             context_names: Vec::new(),
             context_tdz: Vec::new(),
             context_const: Vec::new(),

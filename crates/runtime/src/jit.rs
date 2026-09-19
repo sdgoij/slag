@@ -3504,10 +3504,12 @@ extern "C" fn catch_bind(ctx: *mut c_void, step: u64) -> u64 {
     vm.env_stack.push(body_env);
     // A certified body's catch parameter is a flat frame slot (the scope
     // scan allocates it): write the thrown value so the slot reads in the
-    // catch body see it.
+    // catch body see it. A parameter the scan left UNBOUND (it shadows a live
+    // same-name binding) is skipped: the slot belongs to the shadowed binding.
     if let Some(scope) = &body.scope
         && let Some(param) = param
         && let syntax::ast::BindingPattern::Ident(name) = param
+        && !scope.shadowed_catch_params.contains(name)
         && let Some(slot) = scope.slots.get(name)
     {
         *vm.frame_get_mut(*slot) = thrown;

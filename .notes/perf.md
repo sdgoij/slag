@@ -11572,6 +11572,94 @@ all three reclaim sites); test262 `language` 23721 / 0 fail / 3 skip,
 ALL OK in both engines, `scratch/iso/reusewindow.js` and `headreclaim.js` correct
 in both. Binaries: `slag-fininline.exe` (before) and `slag-reclaim.exe` (after).
 
+### LANDED (2026-09-20): an unreferenced shadowing binding is left unbound — the shadowing half minus the save/restore
+
+A binding that shadows a **live** same-name binding bailed the body, because the
+flat name→slot map cannot hold two live bindings of one name. Per-iteration ns
+(1.5M-iteration loop, min-of-5, `scratch/iso/gapprobe.js`):
+
+| shape | before | after |
+|---|---|---|
+| `catch (e)` shadowing a live parameter, body never reads it | 633.33 | **6.67** |
+| `catch (e)` shadowing a live `var`, ditto | 624.67 | **7.33** |
+| `{ let e = i; }` shadowing a live parameter, ditto | 866.00 | **4.67** |
+| sibling-block control | 7.33 | 7.33 |
+| the live half (the catch body reads the parameter) | 620.67 | 630.00 |
+
+**Why the per-binding rule from the last handoff cannot be used.** Sharing the
+shadowed binding's slot is only sound while the shadowing binding's store cannot
+clobber a value the shadowed binding still needs — and `shadowedCatchParam`
+reads the shared parameter *after* the catch, so the clobber is observable. The
+live half therefore needs a slot SAVE/RESTORE: save the slot at the shadowing
+scope's entry, restore it on every exit from that scope. The exits include
+`break`/`continue`/`return` and the handler-table `throw` route, which a
+`fast_block` scope does not currently contribute to `scope_count`, so this is
+real machinery in the try/control-transfer area — not a scan rule.
+
+**What landed instead: the unreferenced half.** A shadowing binding that nothing
+resolves to has no observable value, so it is left UNBOUND. It gets no slot of
+its own, and its initialization is routed away from the shadowed binding's slot —
+to a scratch frame slot for a lexical declaration (`ScopeInfo::shadow_slots`,
+keyed by the declarator's span), and nowhere at all for a catch parameter
+(`ScopeInfo::shadowed_catch_params`, which the interpreter's `CatchBind` arm and
+the JIT's `catch_bind` helper both skip). The shadowed binding keeps its slot and
+its value, so a read of it after the shadowing scope stays correct and nothing
+needs restoring.
+
+**Soundness.** The only way to observe a missing binding is a reference to its
+name. Every scope push pre-marks the names the scope's own lexical declarations
+would shadow (`FastScopeScan::open_scope`/`shadowed_by`), and any reference to a
+marked name anywhere inside that scope bails the body (`expr`'s `Ident` arm).
+That covers a pre-declaration TDZ read — per spec the name resolves to the
+shadowing binding there, and the frame's uninitialized marker covers only the
+pre-first-store window, so it must bail — and a reference in the declaration's
+own initializer (`{ let e = e; }`). The bail is what makes the elision sound: a
+declaration is only left unbound where nothing resolves to it, and a body that
+does resolve something keeps bailing exactly as before.
+
+**Still refused.** The live half (the shadowing binding is referenced) needs the
+save/restore above; a lexical `for`-head or a block function declaration that
+shadows a live binding is likewise untouched (a dead head or an Annex B block
+binding is not plausible). Measured: `liveShadowCatch` 620.67 -> 630.00 ns/iter,
+i.e. unchanged on the env path.
+
+**Annex B corners probed** (`scratch/iso/a1..a5.js`). A block function in a catch
+body whose name is the parameter is a SyntaxError in every build; a block
+function shadowing a live `let`/parameter suppresses its hoist and resolves to
+the block binding inside the block as before (`fn2`/`fn3`), and leaves the
+shadowed binding alone after it (`not-fn:param`) — byte-identical to the
+pre-change binary in all five.
+
+**Measured after.** The shapes above, min-of-5 (`--jitless` in parentheses, for
+the interpreter alone): `shadowedCatchParam` 633.33 -> 6.67 (640.00 -> 210.67),
+`shadowedCatchVar` 624.67 -> 7.33 (652.67 -> 212.67), `lexicalShadow` 866.00 ->
+4.67 (899.33 -> 52.67), the sibling control unchanged at 7.33 (72.67 -> 71.33)
+and the previous slice's `rootAfterBlock` unchanged at 4.67 (42.00 -> 40.67). 41
+rows paired+isolated at 3 reps: **-1.7%** total, none of
+it attributable — no corpus row contains a shadowing shape, and the three
+largest deltas (`compound_assign` -24.5%, `try/completion-values` -7.4%,
+`coercion_concat` -6.3%) flip to +4.2%/-1.5%/-4.9% at 8 reps, with the first and
+third rows containing no `let`/`const` at all.
+
+**Gates.** clippy `--workspace --all-targets -D warnings` clean, fmt clean,
+`cargo test --workspace` 36/36 suites (a new
+`fast_path_an_unreferenced_shadowing_binding_is_left_unbound` covers the lexical
+and catch elisions, the still-running initializer, the TDZ bail and the live
+case); test262 `language` 23721 / 0 fail / 3 skip, `built-ins` 23657 / 0 fail /
+155 skip, `annexB` 1086 / 0 fail, `intl402` 3205 / 0 fail — identical to
+baseline; `--gc-verify`/`--gc-stress`/`--nursery-stress` clean on
+`scopeprobe` (31 cases) and on a new `scratch/iso/shadowstress.js` (200
+iterations each of dead catch params, thrown catches, nested catches, dead
+lexical shadows and a shadowed `var`, 50 repeats). Binaries:
+`slag-reclaim.exe` (before) and `slag-shadow.exe` (after).
+
+**One non-reproducing hang, kept on the record.** The first `built-ins` run after
+this change reported 2 hangs and 2 fewer passes; two further runs at the same 15s
+deadline were clean at baseline (23657 / 0 fail / 155 skip / 0 crash / 0 hang).
+The recorded occurrence of the same shape (3 hangs) followed the finally-exit
+slice on this box, and this change does touch `CatchBind` — the targeted probe if
+it recurs is a certified catch whose parameter shadows a live binding.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is

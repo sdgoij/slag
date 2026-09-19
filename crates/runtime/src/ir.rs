@@ -1470,6 +1470,16 @@ pub struct ScopeInfo {
     /// Per-slot: `StoreLocal` must TDZ-check the current value (a `let`/
     /// `const` binding — the slice's params/`var`s are all false).
     pub tdz_store: Vec<bool>,
+    /// Keyed by a declarator's span: the scratch frame slot a SHADOWING
+    /// declaration's value goes to instead of the flat map's slot for its name.
+    /// The shadowing binding is left unbound (the scan drops it when nothing
+    /// resolves to it), so its initializer must not overwrite the live binding
+    /// the flat map still points at.
+    pub shadow_slots: HashMap<(u32, u32), usize>,
+    /// The catch parameters left unbound for the same reason: binding one would
+    /// clobber the shadowed binding's slot, so `CatchBind` — the interpreter's
+    /// arm and the JIT's `catch_bind` helper — skips the write.
+    pub shadowed_catch_params: HashSet<crux::AtomId>,
     /// Cut 3 continuation (closure capture): the body's captured bindings
     /// — read/written by closures the body creates — live in a per-call
     /// declarative environment (the capture context) instead of the frame,
@@ -7715,10 +7725,13 @@ impl Vm {
                     // slot (the scope scan allocates it; a captured or
                     // destructuring parameter keeps the body on the env path):
                     // write the thrown value so the slot reads in the catch
-                    // body see it.
+                    // body see it. A parameter the scan left UNBOUND (it
+                    // shadows a live same-name binding) is skipped: the slot
+                    // belongs to the shadowed binding.
                     if let Some(scope) = &body.scope
                         && let Some(param) = param
                         && let BindingPattern::Ident(name) = param
+                        && !scope.shadowed_catch_params.contains(name)
                         && let Some(slot) = scope.slots.get(name)
                     {
                         *self.frame_get_mut(*slot) = thrown;
@@ -16014,6 +16027,20 @@ impl Compiler {
                         if let BindingPattern::Ident(name) = &decl.pattern {
                             match self.binding(*name) {
                                 BindingLoc::Slot(slot) => {
+                                    // A shadowing declaration whose value is
+                                    // discarded into a scratch slot: its name is
+                                    // still the shadowed binding's in the flat
+                                    // map, so the store must not use that slot.
+                                    let slot = self
+                                        .scope
+                                        .as_ref()
+                                        .and_then(|scope| {
+                                            scope
+                                                .shadow_slots
+                                                .get(&(decl.span.start, decl.span.end))
+                                        })
+                                        .copied()
+                                        .unwrap_or(slot);
                                     self.begin_named_initializer(*name, init);
                                     self.compile_expr(init)?;
                                     self.emit(Step::InitLocal { slot });
@@ -23010,6 +23037,8 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         arity,
         slots: scan.slots,
         tdz_store: scan.tdz,
+        shadow_slots: scan.shadow_slots,
+        shadowed_catch_params: scan.shadowed_catch_params,
         context_names: scan.context_names,
         context_tdz: scan.context_tdz,
         context_const: scan.context_const,
@@ -23865,15 +23894,54 @@ struct FastScopeScan {
     /// head exprs and body are inside the loop's scope; the same depth
     /// after the loop is not).
     open_for_heads: Vec<HashSet<crux::AtomId>>,
+    /// In lockstep with `block_names_stack`: the names each open scope leaves
+    /// UNBOUND because a live binding of the same name owns the flat slot. A
+    /// reference to one from inside the scope would resolve through that map to
+    /// the shadowed binding's slot — reading its value where the spec reads the
+    /// shadowing binding (or throws on its TDZ) — so any such reference bails
+    /// the body. That bail is what makes the unbound shadowing binding sound:
+    /// a declaration is only left unbound when nothing resolves to it.
+    shadowed_names: Vec<HashSet<crux::AtomId>>,
+    /// The span of every shadowing declaration whose value is routed to a
+    /// scratch frame slot instead of the flat map's slot for its name
+    /// (the compiler's `ScopeInfo::shadow_slots`).
+    shadow_slots: HashMap<(u32, u32), usize>,
+    /// The catch parameters left unbound for the same reason: binding one would
+    /// clobber the shadowed binding's slot (the interpreter's `CatchBind` and
+    /// the JIT's `catch_bind` both skip the write).
+    shadowed_catch_params: HashSet<crux::AtomId>,
 }
 
 impl FastScopeScan {
+    /// Open a block scope, in lockstep: an empty declared-names set that grows
+    /// as the scope's declarations are scanned, and the names the scope's own
+    /// lexical declarations shadow — a live binding of the enclosing body
+    /// already owns the flat slot for each, so the declaration cannot have its
+    /// own and a reference to it inside the scope must bail.
+    fn open_scope(&mut self, stmts: &[Stmt]) {
+        let shadowed = self.shadowed_by(stmts);
+        self.block_names_stack.push(HashSet::new());
+        self.shadowed_names.push(shadowed);
+    }
+
+    /// The names a statement list's own lexical declarations shadow: each is a
+    /// name this body already owns a live slot for, which the flat
+    /// name→slot map cannot tell apart from the new binding.
+    fn shadowed_by(&self, stmts: &[Stmt]) -> HashSet<crux::AtomId> {
+        crate::script::top_level_lexically_declared_names(stmts)
+            .into_iter()
+            .map(|name| crux::intern_utf8(&name.to_string_lossy()))
+            .filter(|name| self.slots.contains_key(name) && !self.retired.contains(name))
+            .collect()
+    }
+
     /// Close the innermost block scope: its lexical bindings retire (their
     /// slots become reusable and references to them from here on bail).
     fn close_scope(&mut self) {
         if let Some(names) = self.block_names_stack.pop() {
             self.retired.extend(names);
         }
+        self.shadowed_names.pop();
     }
 
     /// Take over the slot a retired same-name binding left behind: the flag is
@@ -23893,7 +23961,7 @@ impl FastScopeScan {
     fn stmt(&mut self, stmt: &Stmt, depth: usize) -> bool {
         match &stmt.kind {
             StmtKind::Block(block) => {
-                self.block_names_stack.push(HashSet::new());
+                self.open_scope(&block.stmts);
                 let result = self.stmts(&block.stmts, depth + 1);
                 self.close_scope();
                 result
@@ -24228,7 +24296,7 @@ impl FastScopeScan {
                 finalizer,
             } => {
                 // The try block is a block scope at depth + 1.
-                self.block_names_stack.push(HashSet::new());
+                self.open_scope(&block.stmts);
                 let try_ok = self.stmts(&block.stmts, depth + 1);
                 self.close_scope();
                 // The catch binds its parameter in a scope of its own (the
@@ -24244,27 +24312,34 @@ impl FastScopeScan {
                 let catch_ok = match handler {
                     None => true,
                     Some(handler) => {
+                        let mut unbound_param: Option<crux::AtomId> = None;
                         if let Some(param) = &handler.param {
                             let BindingPattern::Ident(name) = param else {
                                 return false;
                             };
                             // A capture needs the env (its closure must see
-                            // the fresh binding); so does a name that is
-                            // still live — a second slot cannot be expressed
-                            // by the flat maps. A RETIRED non-TDZ slot is
+                            // the fresh binding). A RETIRED non-TDZ slot is
                             // reusable: the scopes are disjoint, and the
                             // parameter is written directly (no TDZ-checked
                             // store), so a reused slot must not be a
                             // `let`/`const` one.
                             let reusable = self.retired.contains(name)
                                 && self.slots.get(name).is_some_and(|&slot| !self.tdz[slot]);
-                            if self.captured.contains(name)
-                                || self.context_slots.contains_key(name)
-                                || (self.slots.contains_key(name) && !reusable)
+                            if self.captured.contains(name) || self.context_slots.contains_key(name)
                             {
                                 return false;
                             }
-                            if !reusable {
+                            if self.slots.contains_key(name) && !reusable {
+                                // The parameter shadows a LIVE frame binding of
+                                // the same name, which the flat map cannot hold
+                                // twice. The parameter is left UNBOUND — the
+                                // catch body never mentions it, or a reference
+                                // bails below — so the shadowed binding keeps
+                                // its slot and value (even a read of it after
+                                // the catch stays correct).
+                                unbound_param = Some(*name);
+                                self.shadowed_catch_params.insert(*name);
+                            } else if !reusable {
                                 let slot = self.next_slot;
                                 self.tdz.push(false);
                                 self.next_slot += 1;
@@ -24272,7 +24347,7 @@ impl FastScopeScan {
                             }
                             self.reclaim_slot(*name);
                         }
-                        self.block_names_stack.push(HashSet::new());
+                        self.open_scope(&handler.body.stmts);
                         if let Some(param) = &handler.param
                             && let BindingPattern::Ident(name) = param
                             && let Some(top) = self.block_names_stack.last_mut()
@@ -24282,13 +24357,24 @@ impl FastScopeScan {
                             // binding in the enclosing scope).
                             top.insert(*name);
                         }
+                        if let Some(name) = unbound_param
+                            && let Some(shadowed) = self.shadowed_names.last_mut()
+                        {
+                            shadowed.insert(name);
+                        }
                         let body_ok = self.stmts(&handler.body.stmts, depth + 2);
                         self.close_scope();
+                        if let Some(name) = unbound_param {
+                            // The elided parameter never owned the slot, so the
+                            // body's close must not retire the shadowed
+                            // binding's slot out from under its own references.
+                            self.reclaim_slot(name);
+                        }
                         body_ok
                     }
                 };
                 let finalizer_ok = finalizer.as_ref().is_none_or(|f| {
-                    self.block_names_stack.push(HashSet::new());
+                    self.open_scope(&f.stmts);
                     let ok = self.stmts(&f.stmts, depth + 1);
                     self.close_scope();
                     ok
@@ -24313,7 +24399,12 @@ impl FastScopeScan {
                 let tests_ok = cases
                     .iter()
                     .all(|case| case.test.as_ref().is_none_or(|t| self.expr(t, depth)));
+                let mut shadowed = HashSet::new();
+                for case in cases {
+                    shadowed.extend(self.shadowed_by(&case.consequent));
+                }
                 self.block_names_stack.push(HashSet::new());
+                self.shadowed_names.push(shadowed);
                 let body_ok = cases.iter().all(|case| {
                     // An Annex B block function declaration DIRECTLY in a
                     // case consequent needs the block-scope copy machinery
@@ -24337,7 +24428,13 @@ impl FastScopeScan {
     fn decls(&mut self, kind: &VarDeclKind, decls: &[VarDeclarator], depth: usize) -> bool {
         let lexical = *kind != VarDeclKind::Var;
         for decl in decls {
-            if !self.declare_pattern(&decl.pattern, lexical, *kind == VarDeclKind::Const, depth) {
+            if !self.declare_pattern(
+                &decl.pattern,
+                lexical,
+                *kind == VarDeclKind::Const,
+                depth,
+                Some(decl.span),
+            ) {
                 return false;
             }
             if let Some(init) = &decl.init
@@ -24355,17 +24452,21 @@ impl FastScopeScan {
     /// exactly as the `Ident`-pattern fast path does; defaults and computed
     /// keys scan as expressions. The certified path compiles the pattern to
     /// the primitive `Destructure*` steps with slot binds, so any pattern
-    /// shape (nested patterns, defaults, rest) certifies.
+    /// shape (nested patterns, defaults, rest) certifies. `span` is the
+    /// declarator's, and is only used to recognise a simple `Ident` pattern
+    /// whose value the compiler must route to a scratch slot (see
+    /// `declare_pattern_name`); a pattern binding passes `None`.
     fn declare_pattern(
         &mut self,
         pattern: &BindingPattern,
         lexical: bool,
         is_const: bool,
         depth: usize,
+        span: Option<crux::Span>,
     ) -> bool {
         match pattern {
             BindingPattern::Ident(name) => {
-                self.declare_pattern_name(*name, lexical, is_const, depth)
+                self.declare_pattern_name(*name, lexical, is_const, depth, span)
             }
             BindingPattern::Array(elements) => elements.iter().all(|element| match element {
                 ArrayBindingElement::Hole => true,
@@ -24395,7 +24496,7 @@ impl FastScopeScan {
         is_const: bool,
         depth: usize,
     ) -> bool {
-        self.declare_pattern(&element.pattern, lexical, is_const, depth)
+        self.declare_pattern(&element.pattern, lexical, is_const, depth, None)
             && element
                 .init
                 .as_ref()
@@ -24408,6 +24509,7 @@ impl FastScopeScan {
         lexical: bool,
         is_const: bool,
         depth: usize,
+        span: Option<crux::Span>,
     ) -> bool {
         if lexical {
             // A lexical binding must be unique *while live* (the flat slot
@@ -24420,10 +24522,30 @@ impl FastScopeScan {
             let reusable = self.retired.contains(&name)
                 && !self.captured.contains(&name)
                 && !self.context_slots.contains_key(&name);
-            if !reusable
-                && (self.slots.contains_key(&name) || self.context_slots.contains_key(&name))
-            {
-                return false;
+            let shadowing = !reusable
+                && (self.slots.contains_key(&name) || self.context_slots.contains_key(&name));
+            if shadowing {
+                // The declaration shadows a LIVE binding of the same name,
+                // which the flat map cannot hold twice. It is left UNBOUND when
+                // the scope pre-marked the name as shadowed (a simple `Ident`
+                // pattern with no capture): the initializer still runs, but its
+                // value goes to a scratch frame slot (`shadow_slots`) so the
+                // shadowed binding keeps its own. Nothing resolves to the
+                // unbound binding — the marker bails any reference to the name
+                // inside the scope, including one in the initializer.
+                let Some(span) = span.filter(|_| {
+                    self.shadowed_names
+                        .last()
+                        .is_some_and(|shadowed| shadowed.contains(&name))
+                        && !self.captured.contains(&name)
+                }) else {
+                    return false;
+                };
+                let slot = self.next_slot;
+                self.tdz.push(false);
+                self.next_slot += 1;
+                self.shadow_slots.insert((span.start, span.end), slot);
+                return true;
             }
             if is_const {
                 self.consts.insert(name);
@@ -24545,6 +24667,18 @@ impl FastScopeScan {
             // environment machinery. A lexical reference must sit inside
             // its declaring scope (equal or deeper block depth).
             ExprKind::Ident(name) => {
+                // A name an open scope left unbound resolves through the flat map
+                // to the live binding it shadows — reading that binding's value
+                // where the spec reads the shadowing one (or throws on its TDZ).
+                // The shadowing binding has no slot of its own to read, so the
+                // body bails.
+                if self
+                    .shadowed_names
+                    .iter()
+                    .any(|shadowed| shadowed.contains(name))
+                {
+                    return false;
+                }
                 let text = crux::lookup(*name);
                 if text == JsString::from_utf8("arguments") {
                     // Cut 3 continuation (unmapped slice): a strict
@@ -26410,6 +26544,8 @@ fn analyze_script_scope(
                 arity: 0,
                 slots: scan.slots,
                 tdz_store: scan.tdz,
+                shadow_slots: HashMap::new(),
+                shadowed_catch_params: HashSet::new(),
                 context_names: Vec::new(),
                 context_tdz: Vec::new(),
                 context_const: Vec::new(),

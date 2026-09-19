@@ -4954,6 +4954,70 @@ mod tests {
         );
     }
 
+    /// A binding that shadows a LIVE same-name binding is left unbound when
+    /// nothing resolves to it: the shadowed binding keeps its slot (and so its
+    /// value), while the shadowing declaration's initializer runs into a scratch
+    /// slot. A reference to the shadowing binding bails the body, which is what
+    /// keeps the elision sound.
+    #[test]
+    fn fast_path_an_unreferenced_shadowing_binding_is_left_unbound() {
+        // A dead block binding shadowing the parameter.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f(e) { var s = 0; for (var i = 0; i < 3; i++) { { let e = i; } s += 1; } return s + (e === undefined ? 0 : 1); }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.scope.is_some(),
+            "a dead shadowing block binding must keep the body certified"
+        );
+        assert_eq!(
+            run("function f(e) { var s = 0; for (var i = 0; i < 3; i++) { { let e = i; } s += 1; } return s + (e === undefined ? 0 : 1); } f('p')")
+                .unwrap(),
+            Value::Number(4.0)
+        );
+
+        // A catch parameter shadowing a live binding and never read: the same
+        // elision, and the shadowed binding is still readable after the catch.
+        agent
+            .run_script("function g(e) { var s = 0; for (var i = 0; i < 3; i++) { try { s += 1; } catch (e) { s += 2; } } return s + (e === undefined ? 0 : 1); }")
+            .unwrap();
+        let ir = compiled_body_of(&mut agent, "g");
+        assert!(
+            ir.scope.is_some(),
+            "a dead shadowing catch parameter must keep the body certified"
+        );
+        assert_eq!(
+            run("function g(e) { var s = 0; for (var i = 0; i < 3; i++) { try { s += 1; } catch (e) { s += 2; } } return s + (e === undefined ? 0 : 1); } g('p')")
+                .unwrap(),
+            Value::Number(4.0)
+        );
+
+        // The initializer still runs — only its value is discarded.
+        assert_eq!(
+            run("function h(e) { var n = 0; { let e = (n++, 'dropped'); } return e + ':' + n; } h('outer') === 'outer:1'")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+
+        // A TDZ read of the shadowing binding must not be resolved to the
+        // shadowed one: that body stays on the env path and throws.
+        assert_eq!(
+            run("function k() { { try { e; } catch (err) { return err.name === 'ReferenceError'; } let e = 'inner'; } return false; } k()")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+
+        // A shadowing binding that IS read needs the shadowed value and its own
+        // at once, which one flat slot cannot hold: the body bails, correctly.
+        assert_eq!(
+            run("function m(e) { var r = ''; try { throw 't'; } catch (e) { r = 'c:' + e; } return r + '/' + e; } m('outer') === 'c:t/outer'")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
     #[test]
     fn fast_path_for_of_in_heads_certify() {
         // A `var` for-of head certifies like a `For` head (Cut 3 gap item
