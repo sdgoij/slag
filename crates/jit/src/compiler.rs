@@ -94,7 +94,15 @@ impl JitEngine {
             Function::with_name_signature(UserFuncName::testcase("jit_body"), jit_sig(conv));
         let mut fctx = FunctionBuilderContext::new();
         let result = lower(body, helpers, &mut func, &mut fctx, &*self.isa, conv);
-        result.ok()?;
+        if let Err(reason) = &result {
+            // `Unsupported`'s payload is the bailing step's name; the caller
+            // only sees `None` (the body falls back to the interpreter), so the
+            // reason only surfaces under the debug switch.
+            if std::env::var("JIT_DUMP_CLIF").is_ok() {
+                eprintln!("jit bail: {reason:?} ({} steps)", body.steps.len());
+            }
+            return None;
+        }
         if std::env::var("JIT_DUMP_CLIF").is_ok() {
             eprintln!("{} \n", func.display());
         }

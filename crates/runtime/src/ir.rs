@@ -23749,10 +23749,10 @@ fn closure_expr_allows(
 }
 
 /// The frame layout under construction: the flat name→slot map (safe
-/// because a certified body declares every lexical binding exactly once and
-/// references it only inside its declaring scope), the per-slot TDZ marks,
-/// the `const` names (the frame has no const enforcement, so the scan
-/// rejects any reassignment), and each lexical binding's block depth.
+/// because a certified body declares every lexical name at most once while it
+/// is live and references it only inside its declaring scope), the per-slot TDZ
+/// marks, and the `const` names (the frame has no const enforcement, so the
+/// scan rejects any reassignment).
 #[derive(Default)]
 struct FastScopeScan {
     slots: HashMap<crux::AtomId, usize>,
@@ -23762,9 +23762,15 @@ struct FastScopeScan {
     /// check).
     tdz: Vec<bool>,
     consts: HashSet<crux::AtomId>,
-    /// The block depth each lexical binding was declared at: a reference
-    /// must sit at an equal or deeper depth (inside its scope).
-    declared_depth: HashMap<crux::AtomId, usize>,
+    /// The lexical names whose binding has been RETIRED (its declaring scope
+    /// closed). A retired name's frame slot is free for reuse — the flat
+    /// name→slot map is the codegen's only resolution, so a repeated name must
+    /// share one slot, which is sound exactly when the live ranges are
+    /// disjoint (a retired binding's scope is closed) — and a reference to a
+    /// retired name from outside its scope must bail: the map would resolve it
+    /// to that slot, which no longer holds the binding (or holds a later,
+    /// unrelated one).
+    retired: HashSet<crux::AtomId>,
     /// The block depths of the loop bodies currently being scanned: a
     /// lexical binding declared at or below one (a loop-body declaration)
     /// is fresh per iteration (spec 14.7.4.3 — the body block re-creates
@@ -23854,6 +23860,14 @@ struct FastScopeScan {
 }
 
 impl FastScopeScan {
+    /// Close the innermost block scope: its lexical bindings retire (their
+    /// slots become reusable and references to them from here on bail).
+    fn close_scope(&mut self) {
+        if let Some(names) = self.block_names_stack.pop() {
+            self.retired.extend(names);
+        }
+    }
+
     fn stmts(&mut self, stmts: &[Stmt], depth: usize) -> bool {
         stmts.iter().all(|stmt| self.stmt(stmt, depth))
     }
@@ -23863,7 +23877,7 @@ impl FastScopeScan {
             StmtKind::Block(block) => {
                 self.block_names_stack.push(HashSet::new());
                 let result = self.stmts(&block.stmts, depth + 1);
-                self.block_names_stack.pop();
+                self.close_scope();
                 result
             }
             StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => {
@@ -24127,13 +24141,17 @@ impl FastScopeScan {
                 };
                 let lexical = kind != VarDeclKind::Var;
                 if lexical {
-                    // A lexical head binding is scoped to the loop and must
-                    // be unique (the flat slot/context layout cannot tell
-                    // two scopes apart), mirroring `decls`.
-                    if self.slots.contains_key(name) || self.context_slots.contains_key(name) {
+                    // A lexical head binding is scoped to the loop: a
+                    // reference outside it (later, or in a sibling scope)
+                    // would leak the flat slot, and a binding still live
+                    // needs a second slot the flat maps cannot express.
+                    // A RETIRED binding's slot is reusable — its scope is
+                    // closed, so the live ranges are disjoint.
+                    if !self.retired.contains(name)
+                        && (self.slots.contains_key(name) || self.context_slots.contains_key(name))
+                    {
                         return false;
                     }
-                    self.declared_depth.insert(*name, depth);
                     if kind == VarDeclKind::Const {
                         self.consts.insert(*name);
                     }
@@ -24193,7 +24211,7 @@ impl FastScopeScan {
                 // The try block is a block scope at depth + 1.
                 self.block_names_stack.push(HashSet::new());
                 let try_ok = self.stmts(&block.stmts, depth + 1);
-                self.block_names_stack.pop();
+                self.close_scope();
                 // The catch binds its parameter in a scope of its own (the
                 // parameter env sits between the block env and the body env).
                 // A simple Ident parameter gets a flat slot, written by
@@ -24211,17 +24229,28 @@ impl FastScopeScan {
                             let BindingPattern::Ident(name) = param else {
                                 return false;
                             };
+                            // A capture needs the env (its closure must see
+                            // the fresh binding); so does a name that is
+                            // still live — a second slot cannot be expressed
+                            // by the flat maps. A RETIRED non-TDZ slot is
+                            // reusable: the scopes are disjoint, and the
+                            // parameter is written directly (no TDZ-checked
+                            // store), so a reused slot must not be a
+                            // `let`/`const` one.
+                            let reusable = self.retired.contains(name)
+                                && self.slots.get(name).is_some_and(|&slot| !self.tdz[slot]);
                             if self.captured.contains(name)
-                                || self.slots.contains_key(name)
                                 || self.context_slots.contains_key(name)
+                                || (self.slots.contains_key(name) && !reusable)
                             {
                                 return false;
                             }
-                            let slot = self.next_slot;
-                            self.tdz.push(false);
-                            self.next_slot += 1;
-                            self.slots.insert(*name, slot);
-                            self.declared_depth.insert(*name, depth + 2);
+                            if !reusable {
+                                let slot = self.next_slot;
+                                self.tdz.push(false);
+                                self.next_slot += 1;
+                                self.slots.insert(*name, slot);
+                            }
                         }
                         self.block_names_stack.push(HashSet::new());
                         if let Some(param) = &handler.param
@@ -24234,14 +24263,14 @@ impl FastScopeScan {
                             top.insert(*name);
                         }
                         let body_ok = self.stmts(&handler.body.stmts, depth + 2);
-                        self.block_names_stack.pop();
+                        self.close_scope();
                         body_ok
                     }
                 };
                 let finalizer_ok = finalizer.as_ref().is_none_or(|f| {
                     self.block_names_stack.push(HashSet::new());
                     let ok = self.stmts(&f.stmts, depth + 1);
-                    self.block_names_stack.pop();
+                    self.close_scope();
                     ok
                 });
                 try_ok && catch_ok && finalizer_ok
@@ -24278,7 +24307,7 @@ impl FastScopeScan {
                         .any(|stmt| matches!(stmt.kind, StmtKind::FunctionDecl(_)))
                         && self.stmts(&case.consequent, depth + 1)
                 });
-                self.block_names_stack.pop();
+                self.close_scope();
                 tests_ok && body_ok
             }
             StmtKind::UsingDecl { .. } | StmtKind::ClassDecl(_) | StmtKind::With { .. } => false,
@@ -24361,15 +24390,21 @@ impl FastScopeScan {
         depth: usize,
     ) -> bool {
         if lexical {
-            // A lexical binding must be unique (the flat slot maps
-            // cannot tell two scopes apart) and referenced only within
-            // its scope; the per-iteration freshness of a `for`-head
+            // A lexical binding must be unique *while live* (the flat slot
+            // maps cannot tell two scopes apart) and referenced only
+            // within its scope; the per-iteration freshness of a `for`-head
             // binding is unobservable without closures, which the scan
-            // rejects.
-            if self.slots.contains_key(&name) || self.context_slots.contains_key(&name) {
+            // rejects. A RETIRED binding's slot is exempt: its scope is
+            // closed, so the live ranges are disjoint and one slot serves
+            // both — which is what the map needs (one slot per name).
+            let reusable = self.retired.contains(&name)
+                && !self.captured.contains(&name)
+                && !self.context_slots.contains_key(&name);
+            if !reusable
+                && (self.slots.contains_key(&name) || self.context_slots.contains_key(&name))
+            {
                 return false;
             }
-            self.declared_depth.insert(name, depth);
             if is_const {
                 self.consts.insert(name);
             }
@@ -24511,9 +24546,21 @@ impl FastScopeScan {
                 {
                     return false;
                 }
-                self.declared_depth
-                    .get(name)
-                    .is_none_or(|&declared| depth >= declared)
+                // A retired binding (its scope closed) must not be reached
+                // from outside its scope: the flat slot map is final, so the
+                // codegen would resolve this reference to that slot — the
+                // binding is gone, or a later binding reused the slot. Reach
+                // is an enclosing open scope (`block_names_stack`), or an
+                // Annex B block function's live function-scoped binding (its
+                // own slot, B.3.3.3). A name that is not a body binding at
+                // all falls through as the env/global read it is.
+                let block_scoped_only = self
+                    .annex_b
+                    .iter()
+                    .all(|entry| entry.name != *name || entry.var_slot.is_none());
+                !self.retired.contains(name)
+                    || !block_scoped_only
+                    || self.block_names_stack.iter().any(|set| set.contains(name))
             }
             ExprKind::Paren(inner) => self.expr(inner, depth),
             ExprKind::Unary { operand, .. } => self.expr(operand, depth),

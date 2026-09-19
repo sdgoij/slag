@@ -11386,6 +11386,78 @@ all three); `scratch/iso/trydiff.js`, `finbreak.js` and `tryfin.js` are
 byte-identical to the previous binary in both engines. Binaries
 `slag-finbreak.exe` (before) and `slag-tryinline.exe` (after).
 
+### LANDED (2026-09-19): slot reuse for retired lexical bindings — the repeated-name certification cliff
+
+**The finding.** Chasing the previous entry's "a double-nested try body does not
+compile" came out much larger than a try gap: a body that **repeats a lexical
+name** anywhere — two `catch (e)` clauses, the classic "two try/catch in one
+function", or two sibling `let q` blocks or `for (let i...)` heads — was refused
+*certification*, so the whole body ran interpreted. Per-iteration ns (1.5M-iteration
+loop, min-of-3, `scratch/iso/catchprobe.js`):
+
+| shape | ns/iter |
+|---|---|
+| one `catch (e)` | 8.00 |
+| two sibling `catch (e)` | **810.67** |
+| two sibling `catch (e1)`/`catch (e2)` | 10.67 |
+| nested `catch (e)` inside `catch (e)` | **728.67** |
+| nested with distinct names | 18.67 |
+| two sibling `let q` blocks | **1208.67** |
+| the same loop, double-nested try (`tryfinloop.js nested`) | **684.00** -> 17.33 after |
+
+**Why.** `FastScopeScan`'s three lexical-declaration sites bailed when the name
+already held a slot ("the flat slot maps cannot tell two scopes apart"). That
+constraint is real — `ScopeInfo::slots` is name-keyed and the codegen resolves a
+name by `slot_of(name)`, so two *live* bindings of one name cannot be expressed —
+but it ignores that the repeated bindings are usually **disjoint in time**, and
+one slot serves both.
+
+**Landed.** A `retired` set records the lexical names whose declaring scope has
+closed (every `block_names_stack` pop retires that scope's names). A lexical
+declaration whose name is retired — and not captured (a closure outlives its
+scope, so a captured binding keeps its own context slot) — **reuses** the
+retired slot instead of bailing; the general lexical site, the for-head and the
+catch parameter share the rule, with the parameter additionally requiring a
+non-TDZ slot (it is written by a direct store, not a TDZ-checked one). A
+*reference* to a retired name from outside its scope now bails, because the flat
+map is final: the codegen would otherwise resolve it to that slot — the stale
+value, or a later binding that reused it. An Annex B block function is exempt
+from that bail (it also has a live function-scoped binding with its own slot,
+B.3.3.3), which `{ function g(){} } return g();` needs — and which the existing
+`fast_path_annex_b_block_functions` test caught on the first cut.
+
+**Measured after.** Two sibling `catch (e)` 810.67 -> 9.33, nested `catch (e)`s
+728.67 -> 18.00, two sibling `let q` blocks 1208.67 -> 7.33, the double-nested
+try 684.00 -> 17.33; single-catch and distinct-name shapes unchanged. 41 rows
+paired+isolated: **-1.0%** total, the only positive rows <= +3.5% and containing
+nothing this change can reach (`switch_dispatch` compiles the same single body
+before and after — layout noise). The cliff shapes are not corpus rows, so this
+is a real-workload win, like the closure-env edge before it.
+
+**A correctness hole fixed on the way.** A reference from a *sibling* scope
+(`{ let q = 1; r += q; } { r += q; }`) resolved to the retired binding's slot
+instead of throwing: `scratch/iso/sibling.js` printed `2`, now `ReferenceError`
+(the spec's answer) in both engines. The old guard was `block_depth >=
+declared_depth`, which cannot tell a sibling scope from the declaring one; the
+scope-set membership test replaces it. Also now correct instead of silently
+wrong: `{ let q = 1 } var q = 2;` (the `var` used to reuse the retired `let`'s
+slot).
+
+**Gates.** clippy `-D warnings` clean, fmt clean, `cargo test --workspace` 36/36
+suites; test262 `language` 23721 / 0 fail / 3 skip, `built-ins` 23657 / 0 fail /
+155 skip, `annexB` 1086 / 0 fail, `intl402` 3205 / 0 fail — all identical to
+baseline; `--gc-verify`/`--gc-stress`/`--nursery-stress` clean (the try row holds
+~10.5ms); `scratch/iso/scopeprobe.js` (12 scope/TDZ/capture/reuse cases) ALL OK
+in both engines; the try/finally differentials byte-identical. Binaries:
+`slag-tryinline.exe` (before) and `slag-scopefix.exe` (after).
+
+**Still refused (the hoisting half).** A reference *earlier in the same scope*
+than its declaration (a TDZ read, `{ use(q); let q = 1; }`) and a reference from
+an *enclosing* scope to a binding declared later in a nested block both bail to
+the env path — correct, just interpreted. Certifying them needs each scope's
+lexical names hoisted into the scope set at scope entry (a pre-pass over the
+block's statements), which is the natural next slice if these shapes show up hot.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
