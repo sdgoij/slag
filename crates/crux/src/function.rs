@@ -213,6 +213,15 @@ pub struct Function {
     /// A lock-free `Cell`: written once by `link_self_handle`, read on every
     /// `self_value` (the hot receiver path), and the handle is `Copy`.
     self_handle: Cell<Option<Handle<Function>>>,
+    /// [[Environment]], as an erased heap edge. The `runtime` crate holds the
+    /// typed handle in the per-function record, and the GC edge lives here so
+    /// the environment is reachable exactly while the closure is: a record is
+    /// an Agent root and outlives its closure by one collection (its id only
+    /// reaches the death queue at the sweep that frees the closure), so an
+    /// edge on the record kept every dead closure's environment - and its
+    /// source string - alive for that extra collection, promoting them to the
+    /// old generation where only a major could reclaim them.
+    environment: Cell<Option<crate::heap::GcAny>>,
 }
 
 impl Trace for Function {
@@ -222,6 +231,11 @@ impl Trace for Function {
         self.object.trace(visit);
         if let Some(name) = &self.name {
             name.trace(visit);
+        }
+        // [[Environment]]: the closure keeps its captured chain alive, so the
+        // edge is on the closure rather than on the record (see the field).
+        if let Some(environment) = self.environment.get() {
+            visit(environment);
         }
         // A bound function's target, bound `this`, and bound argument list
         // are Values — heap edges (GC-2; a swept target turned `extends`
@@ -274,6 +288,13 @@ impl Function {
         self.id
     }
 
+    /// Record the closure's [[Environment]] as this box's GC edge (see the
+    /// field's note). The runtime calls it once at registration, from the
+    /// record's `environment`.
+    pub fn set_environment_edge(&self, environment: Option<crate::heap::GcAny>) {
+        self.environment.set(environment);
+    }
+
     /// A bare ECMAScript function value: identity and name only, used until
     /// the Phase 7 evaluator fills in the callable body. The object starts
     /// with a null prototype.
@@ -296,6 +317,7 @@ impl Function {
             object: JsObject::ordinary_object_create(prototype),
             kind: FunctionKind::EcmaScript,
             self_handle: Cell::new(None),
+            environment: Cell::new(None),
         });
         function.self_handle.set(Some(function));
         function.object.function_self.set(Some(function));
@@ -332,6 +354,7 @@ impl Function {
                 construct,
             },
             self_handle: Cell::new(None),
+            environment: Cell::new(None),
         });
         Self::link_self_handle(&function);
         function.object.function_self.set(Some(function));
@@ -387,6 +410,7 @@ impl Function {
                 bound_args,
             },
             self_handle: Cell::new(None),
+            environment: Cell::new(None),
         });
         Self::link_self_handle(&function);
         function.object.function_self.set(Some(function));

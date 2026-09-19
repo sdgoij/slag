@@ -1104,6 +1104,187 @@ capturing-closure shapes). A/B binaries kept under `target/release/`:
 `slag-baseline.exe` (HEAD) and `slag-noef.exe` (this slice's other changes
 without the elision).
 
+### The closure-side `[[Environment]]` edge: the head-let row's retention (measured + landed 2026-09-19)
+
+**Where the corpus time actually is, measured first.** `for-in/head-let-fresh-binding-per-iteration.js`
+is both the largest absolute row (2315ms) and the gate's only confirmed
+pessimization. Decomposed with the corpus protocol itself (single-row isolated
+dir, min of 7, interleaved):
+
+| configuration | per bench() call |
+|---|---|
+| jit, default | 1734.8ms |
+| jit, minors suppressed (`--nursery-threshold 1e8`) | **933.0ms** |
+| jitless, default | 971.9ms |
+| jitless, minors suppressed | 974.0ms |
+
+So the entire 1.8x gap is minor collections - with them suppressed the compiled
+path lands on the interpreter's number - and the interpreter never runs one:
+`--gc-trace` shows jitless at **0 minors / 852 majors** (each major empties the
+cohort, so the minor threshold is never crossed) against jit's 196 minors at
+~3ms each. `--gc-trace`'s `pause_us` does not cover the root collection, so that
+was instrumented separately (`collect_with`): only **58us** on average, ~3464
+roots, map ~3121 records - not the cost.
+
+**Half the cohort survived every minor.** A survivor histogram (temporary probe,
+removed) on a 14784-box cohort:
+
+    survivors = { EnvRecord: 2688, JsString: 2025, JsObject: 73, Function: 9 }
+
+Disabling the conservative stack scan changed it by **nothing**, so the survivors
+are precise roots. The composition is the tell: the **records' own fields**
+(`environment` -> the EnvRecords, `source` -> the JsStrings) but *not* the
+closures (9 Functions). A record is an Agent root and traces only its own
+fields, so a closure that dies is swept - but its record outlives it by one
+collection, because a function id only reaches the crux death queue at the sweep
+that frees the box, and `reap_dead_functions` runs *before* the mark. So every
+record still present at the mark rooted its dead closure's environment, the
+environment survived, was promoted to the old generation, and only a major could
+reclaim it. Each body allocates ~3 per-iteration environments, so the old
+generation ballooned to **712110 live** between majors, and the majors that
+finally reclaimed it took **100ms** (`live=712110->5519 swept=706591`).
+
+**Landed: the GC edge moves onto the closure.** `crux::function::Function` gains
+an erased `environment: Cell<Option<GcAny>>` slot, traced by the function's own
+`trace`; the runtime sets it at registration from the record's `environment`.
+The environment is then reachable exactly while the closure is, so a dead
+closure's environment dies in the same collection - no promotion, no 700k-box
+old generation. `EcmaFunction::trace` no longer traces `environment` (the field
+stays: the call machinery reads it), and the realm-global-environment elision is
+kept at edge-set time, so a closure whose environment *is* the realm's
+`global_env` still adds no edge (otherwise the boxes would re-emit the shared
+root the record elision had just removed - measured as a +16% `fn3` regression
+before the elision was reapplied here). Both record-insert sites set the edge
+(`register_function` and the arrow path); the bare `Function::new` callers
+(`env.rs`, `job.rs`, the accessor fallbacks) carry no record, and the
+`LeafEntry.environment` root in the leaf cache still lags by one collection but
+is bounded by the cache size.
+
+| measurement | before | after |
+|---|---|---|
+| head-let row, jit (min of 6, interleaved) | 1708ms | **917ms** (**-46%**) |
+| head-let row, jit vs its own jitless | 1.8x slower | **0.93-1.0x** (parity) |
+| `for-in/head-let` gate ratio | 1.82x confirmed | **1.07x confirmed** |
+| corpus, 41 rows, paired + isolated, min of 3 | - | **-18.6%** total |
+| `fn3` / `glob3` (allocation shapes) | - | -7% / -2.5% |
+
+Other corpus movers: `object_keys` -26.8%, `template-literal/evaluation-order`
+-8.9%, `completion-values` -8.6%, `spread_assign` -6.6%, `switch_dispatch`
+-5.5%, `recursive_fib` -5.2%, `push_pop` -3.8%, `try_catch_loop` -3.4%. The
+rows that read positive in the batch run (`concat_loop` +22.5%, `method_call`
++8.9%, `slice_concat`, `apply_call`, `set_churn` +5.0%, `construct_churn`)
+all clear under interleaved re-measurement at min of 7-9 - `set_churn` reads
+-1.4%, and it (like `construct_churn`) creates no closures at all, so the change
+cannot add work there.
+
+**Verified:** clippy clean workspace-wide; `cargo test --workspace` 36/36 suites;
+`--gc-verify` and `--gc-stress` clean on the closure shapes and the capturing
+shapes; `language` (23724 total, 0 fail / 0 crash / 0 hang) and `built-ins`
+(23812, 0 fail / 0 crash / 0 hang) sweeps **identical** to the pre-change
+baseline. A/B binaries: `target/release/slag-envbase.exe` (the pre-change tree)
+and `target/release/slag-envfix.exe`.
+
+**Still open on this row:** the residual 1.07x is the *pacing* asymmetry, not
+retention - the compiled loop runs a minor every `JIT_GC_PROBE_INTERVAL` (1024)
+iterations while the interpreter reclaims through majors, so the two modes
+reclaim the same garbage with different collection shapes.
+
+### The pacing thread: the major backoff is falsified, and the sweep is where the time is (probed 2026-09-19)
+
+Following the residual to its cause, one probe at a time (all temporary, all
+removed):
+
+**1. The residual is real and small.** Min of 9, interleaved, on the row: jit
+1094.1ms vs jitless 1005.0ms = **1.089x** (the gate's 1.07x agrees). Not noise,
+but 9%, not the 80-120% the gate used to report.
+
+**2. FALSIFIED: the major backoff latch.** `--gc-trace` showed the old gen
+peaking at 46879 live while the first major swept 0 (`live=3487->3487 swept=0`)
+because the heap was still young at that moment - and that empty sweep latches
+`MAJOR_DISABLED` for the whole script, so nothing reclaims promoted garbage
+until a script boundary. Disabling the latch: majors 2 -> 9, peak live
+46879 -> **18274** (2.6x smaller old generation) - and the row reads **1621ms ->
+1690ms, 4% SLOWER** (min of 7, interleaved). More majors cost more than the
+smaller heap saves. The latch is doing its job; pace is not the lever.
+
+**3. The minor is 74% sweep.** Per-phase timing of a minor on this row (22481-box
+cohort):
+
+| phase | us |
+|---|---|
+| seed precise roots | 40 |
+| build + sort the cohort list (stack scan) | 210 |
+| stack word scan | 13 |
+| mark | 15 |
+| **sweep** | **1363** |
+
+The sweep is 69ns/box here against 17ns/box on the plain-object `fn3` shape, so
+the cost is the *composition* of this cohort (closures + environments).
+
+**4. The destructors are 57% of the sweep.** Skipping the payload `vtable.drop`
+call takes the sweep from 1363us to **591us** - 772us per minor, i.e. ~75ms per
+bench() call, **~7.5% of the row**, and the interpreter's majors pay the same
+per-box cost. The destructor work is Rust-side deallocation: a
+`DeclarativeEnv` holds `bindings: RefCell<Vec<(JsString, Binding)>>`, so each
+per-iteration environment mallocs its one binding and the sweep frees it; each
+body also drops a `fns` object, an `obj`, and three `Function` boxes (a TLS
+queue push each).
+
+**Next lever, quantified:** cut the per-object Rust allocation footprint (inline
+small storage for a declarative environment's bindings, so a 1-binding env lives
+inside its arena box). That is ~7.5% of this row and pays at *both* ends -
+allocation and sweep - so it is engine-wide GC cost, not a row-specific tax. The
+JIT does not index the bindings buffer by offset (`VM_ENV_STACK_LEN_OFFSET` is a
+`Vm` field; env access goes through runtime helpers and env-stack depth), so the
+container type is not load-bearing for compiled code. Smaller contained items
+in the same phase: the runtime only needs `swept.len()`, so the per-minor
+`swept` address Vec (180KB, rebuilt per collection) can go; the three
+`set_*` flag writes per box can be one read-modify-write; the free-list push is
+per box.
+
+### The environment-bindings pool: implemented, measured flat, REVERTED (2026-09-19)
+
+Acting on the "per-object allocation footprint" lead, a bounded TLS pool of
+cleared binding buffers (`DeclarativeEnv::new` takes one, `Drop` returns it) was
+implemented and measured. It removes the malloc/free pair per environment, which
+was the largest per-object Rust allocation in the common case.
+
+**First, the swept cohort by type** (temporary probe, removed) over a whole run
+(98 minors, ~2.17M boxes) on the head-let row:
+
+| type | swept | share |
+|---|---|---|
+| `crux::string::JsString` | 880206 | **40%** |
+| `runtime::env::EnvRecord` | 498630 | 23% |
+| `crux::object::JsObject` | 492847 | 22% |
+| `crux::function::Function` | 299119 | 14% |
+| `crux::map::Map` | 1 | ~0 |
+
+So the 772us of destructor cost is spread across four types, and the
+environment's share is 23% - ~178us of a minor, ~1.6% of the row.
+
+**Measured flat.** Five interleaved pairs, both metrics on the same runs:
+
+| metric, minima | poolbase | pool |
+|---|---|---|
+| row wall (ms) | 1012.8 | 1059.0 |
+| minor pause avg (us) | 2897 | 3002 |
+| minor pause avg (us), a single earlier run | 4514 | 3596 |
+
+The per-run scatter on the pause metric is +-30% (2897..5197 on the same
+binary), so the one run that read -20% was noise, and the two metrics disagree
+in sign across runs. The effect is below this box's resolution for a 23% share
+of the cohort, so the pool was reverted rather than carried as a TLS pool plus a
+`Drop` impl with no attributable gain.
+
+**Standing conclusion for this path.** The destructor cost is real and is the
+largest single item in a minor here (57% of the sweep), but it is *distributed*
+across four types - so capturing it means four separate allocation-reuse changes
+(strings' `Arc`/rope storage, objects' property storage, env bindings, the
+function death-queue push), each individually below the measurement floor, or an
+allocator-level fix. The `JsString` share (40%, ~9000 strings per minor, ~4.8 per
+body) is the largest and the next candidate if this path is reopened.
+
 ### Discipline additions for this arc
 
 - **A fold is not a gap.** Establish that V8 is doing the work before
@@ -10982,6 +11163,91 @@ keyed to `cfg!(feature = "gpu-skinning")` so they mean something in both; clippy
 `-D warnings` clean on the default workspace and on
 `-p cli --all-targets --features raylib,raygui,gpu-skinning`; `cargo fmt --all --
 --check` clean.
+
+### LANDED (2026-09-19): a `try` block's env is elided — `try_catch_loop` 95.6 -> 22.0ms (-77%)
+
+**The row.** `control/try_catch_loop.js` is a 1.5M-iteration loop whose body is
+`try { s += o.x } catch (e) { s += 1 }` with no throw ever, so the whole gap is
+per-iteration try scaffolding. Decomposed with the corpus-row protocol (single
+row isolated, one process per shape, min of 3, `scratch/iso/trycost2.js`):
+`empty` 4.00, `bare { }` 4.00, `add` 4.67, `tryE { try{}catch(e){s+=1} }` 74.0,
+`tryLet { try{ let q=1; s+=q }catch }` 210.7 ns/iter — i.e. an *empty* try cost
++65, and adding a `let` inside it cost another +137, while the same `let` in a
+plain block (`letIn`) cost +1.3.
+
+**Recon, by ablation (5 probe builds, all reverted).** Stubbing `exit_try`'s
+`control_transfer` (with the frame pop kept, so the stack stays balanced) and
+then removing both its helper call and `EnterTry`'s from codegen moved 74 -> 70
+-> 61 ns/iter: the try *machinery* was only ~13ns of ~70. Instrumented helper
+counters (`enter_try`/`exit_try`/`enter_block`/`leave_block`, 1M-call marks)
+showed exactly one call of each of the four per iteration — and none at all for
+`add`/`letIn`, i.e. the try path enters a block environment the plain path
+elides. `JIT_DUMP_CLIF` plus a step->block map (temporary `eprintln!` in
+`lower()`) confirmed `EnterBlock`/`LeaveBlock` here lower to `call_indirect`
+helper calls.
+
+**Root cause.** `compile_try` emitted `EnterBlock { decls: block_decls(..) }` /
+`LeaveBlock` unconditionally for the try and finally blocks, bypassing
+`compile_block_contents`'s Cut-3 elision (`fast_block`, "the per-iteration env
+allocation in hot loops disappears "). `new_declarative_environment` allocates a
+GC-handled `EnvRecord`, so an env-free `try { }` allocated *and* dropped a box
+every iteration, in both engines.
+
+**Landed.** `compile_try` now routes both the try block and the finalizer
+through `compile_block_contents`, so they get the same elision (and the same
+Annex B block-function handling) as any other block.
+
+**Second-order fix it forced.** `throw_machinery`'s catch arm decided "is this
+catch inside the finally" by comparing the catching frame's `env_depth` against
+the pending control's depth — a proxy that only held because the finally's env
+push made the inside-case strictly greater. With the env elided the depths are
+equal and the pending was consumed, so `try { throw } finally { try { throw }
+catch {} }` regressed to `SyntaxError: FinallyEnd without a pending control`
+(2 fixtures: `language/statements/try/S12.14_A7_T1.js`, `_T3.js`). The pending
+now records `try_depth` (the `try_stack` length once its finally frame was
+removed) and the test is `frame_index >= try_depth` — a frame entered inside the
+finally is exactly one at or above that length.
+
+**Measured (paired, interleaved, min of 4; `scratch/iso/trycost2.js`).**
+
+| shape | jit before | jit after | jitless before | jitless after |
+|---|---|---|---|---|
+| `add` | 4.67 | 4.67 (0.0%) | 44.00 | 44.67 (+1.5%) |
+| `tryE` | 71.33 | **14.67 (-79.4%)** | 287.33 | 213.33 (-25.8%) |
+| `tryA` | 72.00 | **16.67 (-76.8%)** | 330.00 | 243.33 (-26.3%) |
+| `tryLet` | 229.33 | **18.00 (-92.2%)** | 737.33 | 242.00 (-67.2%) |
+
+`control/try_catch_loop.js` 95.596 -> 22.044ms (**-76.9%**); the corpus's other
+try row, `language/statements/try/completion-values.js`, is flat (272.0 ->
+274.5, noise). 41 rows paired+isolated: **-18.5%** total (the closure-env-edge
+slice supplies the rest; both are uncommitted at this point). The only rows
+reading a positive delta (`coercion_concat`, `direct_leaf`, `math_intrinsics`,
+`apply_call`) contain **no `try`** — verified by grep, and re-measured to noise
+at 5-8 reps (-9.6%, -2.2%, +1.0%, -0.2%).
+
+**Residual.** `tryE` is still ~10ns/iter over `add`: the per-iteration `EnterTry`
+and `Exit` FFI helper calls (the pre-fix ablation priced them at ~13ns).
+Inlining the try push / the no-finally pop+ip-set is the remaining lever; the
+row's absolute gap to d8 is now dominated by the general loop floor (`noTry` is
+itself 4.67 ns/iter), not by try machinery.
+
+**Gates.** clippy workspace-wide clean; `cargo test --workspace` all suites
+green; `--gc-verify`/`--gc-stress`/`--nursery-stress` clean (the row stays
+22-30ms there, against 98ms unverified before the change); test262 `language`
+23721 pass / 0 fail / 3 skip, `built-ins` 23657 pass / 0 fail / 155 skip,
+`annexB` 1086 / 0 fail — all identical to baseline. A 32-case try/finally
+control-flow differential against `slag-envbase.exe` is identical except
+`annexb-fn-in-try`, which now matches Annex B (`function|h-called|function`,
+was `undefined|TypeError|undefined`). Reusable: `scratch/iso/trycost2.js`,
+`scratch/iso/trydiff.js`, `scratch/iso/tryfin.js`; binaries
+`slag-envbase.exe` (before) and `slag-tryfix.exe` (after).
+
+**Pre-existing bug found, NOT fixed (unchanged by this change).**
+`try { throw x } finally { for (;;) { break } }` throws `SyntaxError: FinallyEnd
+without a pending control` in both binaries: `control_transfer`'s top pop takes
+the pending for any `Break`/`Continue`/`Return` even when the transfer stays
+*inside* the finally (where the finally still completes normally and the pending
+must survive). Verified pre-existing on `slag-envbase.exe`.
 
 ## Deferred milestones
 

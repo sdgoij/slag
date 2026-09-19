@@ -3343,27 +3343,37 @@ extern "C" fn finally_end(ctx: *mut c_void, ip: u64) -> u64 {
         );
     };
     match pending {
-        crate::ir::PendingControl::Normal { after, env, depth } => {
+        crate::ir::PendingControl::Normal {
+            after, env, depth, ..
+        } => {
             vm.restore_env(env, depth);
             let result = vm.control_transfer(agent, body, crate::ir::Ctl::Normal { after });
             dispatch_result(ctx, vm, result)
         }
-        crate::ir::PendingControl::Break { target, env, depth } => {
+        crate::ir::PendingControl::Break {
+            target, env, depth, ..
+        } => {
             vm.restore_env(env, depth);
             let result = vm.control_transfer(agent, body, crate::ir::Ctl::Break { target });
             dispatch_result(ctx, vm, result)
         }
-        crate::ir::PendingControl::Continue { target, env, depth } => {
+        crate::ir::PendingControl::Continue {
+            target, env, depth, ..
+        } => {
             vm.restore_env(env, depth);
             let result = vm.control_transfer(agent, body, crate::ir::Ctl::Continue { target });
             dispatch_result(ctx, vm, result)
         }
-        crate::ir::PendingControl::Return { value, env, depth } => {
+        crate::ir::PendingControl::Return {
+            value, env, depth, ..
+        } => {
             vm.restore_env(env, depth);
             let result = vm.control_transfer(agent, body, crate::ir::Ctl::Return { value });
             dispatch_result(ctx, vm, result)
         }
-        crate::ir::PendingControl::Throw { value, env, depth } => {
+        crate::ir::PendingControl::Throw {
+            value, env, depth, ..
+        } => {
             vm.restore_env(env, depth);
             let result = vm.throw_machinery(agent, body, value);
             dispatch_result(ctx, vm, result)

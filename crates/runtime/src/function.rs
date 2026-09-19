@@ -239,11 +239,15 @@ impl Trace for EcmaFunction {
         // either. Both were emitted per record, and on the bootstrap realm
         // every record shares the same two boxes: ~3100 duplicated roots for
         // two addresses, which was ~99% of the agent's root list and the
-        // largest single cost in a minor's seed loop. A closure's own
-        // environment still needs its edge.
-        if !self.environment.ptr_eq(self.realm.global_env) {
-            self.environment.trace(visit);
-        }
+        // largest single cost in a minor's seed loop.
+        //
+        // `environment` is deliberately NOT traced: the closure box carries
+        // that edge (see `Function`'s `environment` field), which ties the
+        // environment's lifetime to the closure's. Tracing it here kept every
+        // dead closure's environment alive until the *next* collection - the
+        // record outlives its box by one sweep - which promoted those
+        // environments (and source strings) to the old generation, where only
+        // a major could reclaim them.
         self.home_object.trace(visit);
         self.fields.trace(visit);
         self.private_methods.trace(visit);
@@ -1239,6 +1243,17 @@ fn register_function(
         name.clone(),
         function_kind_prototype(&realm, kind.is_generator, kind.is_async),
     );
+    // The closure's [[Environment]] rides on the box as a GC edge (the record
+    // below keeps the typed handle for the call machinery). It is set before
+    // the compile, so a collection in that window - `Function::new` fires one
+    // under `--gc-stress` - already sees the environment through the box. A
+    // record whose [[Environment]] IS the realm's global environment needs no
+    // edge: `Agent::realms` roots the realm and `Realm::trace` walks its
+    // `global_env`, and the closure would otherwise re-emit one duplicate root
+    // per closure for that one shared box.
+    if !environment.ptr_eq(realm.global_env) {
+        function.set_environment_edge(Some(environment.as_any()));
+    }
     // The paired `this_writes` pattern is re-applied to each fresh
     // constructor record below (Cut 43: the compiled body is shared per
     // site, so the pattern is computed once and copied).
@@ -1557,6 +1572,11 @@ pub fn instantiate_arrow(
     // for async arrows), skipping the trailing set_prototype_of.
     let function =
         Function::new_with_prototype(None, function_kind_prototype(&realm, false, is_async));
+    // The closure's [[Environment]] rides on the box as its GC edge, exactly as
+    // in `register_function` (and with the same global-environment elision).
+    if !environment.ptr_eq(realm.global_env) {
+        function.set_environment_edge(Some(environment.as_any()));
+    }
     let entry = shared_compiled_body(agent, &data, body_key)?;
     let this_writes = entry.this_writes;
     data.set_compiled(entry.compiled);

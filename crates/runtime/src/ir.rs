@@ -1721,32 +1721,44 @@ impl Trace for TryFrame {
 }
 
 /// A pending control transfer a `finally` finishes after it runs.
+///
+/// `try_depth` is the `try_stack` length once the pending finally's frame was
+/// removed: a frame at or above that index was entered inside the finally.
+/// That is what tells a throw caught inside the finally (which must leave the
+/// pending for `FinallyEnd`) from one whose catch lies outside it (which
+/// replaces the pending, spec 14.15.4 step 8). The frame's `env_depth` cannot
+/// answer this — an env-free finally leaves both depths equal.
 #[derive(Debug)]
 pub enum PendingControl {
     Normal {
         after: usize,
         env: EnvRef,
         depth: usize,
+        try_depth: usize,
     },
     Break {
         target: usize,
         env: EnvRef,
         depth: usize,
+        try_depth: usize,
     },
     Continue {
         target: usize,
         env: EnvRef,
         depth: usize,
+        try_depth: usize,
     },
     Return {
         value: Value,
         env: EnvRef,
         depth: usize,
+        try_depth: usize,
     },
     Throw {
         value: Value,
         env: EnvRef,
         depth: usize,
+        try_depth: usize,
     },
 }
 
@@ -1774,6 +1786,18 @@ pub fn pending_env_depth(pending: &PendingControl) -> (EnvRef, usize) {
         | PendingControl::Continue { env, depth, .. }
         | PendingControl::Return { env, depth, .. }
         | PendingControl::Throw { env, depth, .. } => (*env, *depth),
+    }
+}
+
+/// The `try_stack` length at the pending's finally-frame removal — the base
+/// `throw_machinery` compares a catching frame's index against.
+pub fn pending_try_depth(pending: &PendingControl) -> usize {
+    match pending {
+        PendingControl::Normal { try_depth, .. }
+        | PendingControl::Break { try_depth, .. }
+        | PendingControl::Continue { try_depth, .. }
+        | PendingControl::Return { try_depth, .. }
+        | PendingControl::Throw { try_depth, .. } => *try_depth,
     }
 }
 
@@ -7688,23 +7712,33 @@ impl Vm {
                         )
                     })?;
                     let ctl = match pending {
-                        PendingControl::Normal { after, env, depth } => {
+                        PendingControl::Normal {
+                            after, env, depth, ..
+                        } => {
                             self.restore_env(env, depth);
                             Ctl::Normal { after }
                         }
-                        PendingControl::Break { target, env, depth } => {
+                        PendingControl::Break {
+                            target, env, depth, ..
+                        } => {
                             self.restore_env(env, depth);
                             Ctl::Break { target }
                         }
-                        PendingControl::Continue { target, env, depth } => {
+                        PendingControl::Continue {
+                            target, env, depth, ..
+                        } => {
                             self.restore_env(env, depth);
                             Ctl::Continue { target }
                         }
-                        PendingControl::Return { value, env, depth } => {
+                        PendingControl::Return {
+                            value, env, depth, ..
+                        } => {
                             self.restore_env(env, depth);
                             Ctl::Return { value }
                         }
-                        PendingControl::Throw { value, env, depth } => {
+                        PendingControl::Throw {
+                            value, env, depth, ..
+                        } => {
                             self.restore_env(env, depth);
                             // A pending throw applies through the throw
                             // machinery (a catch in the same body may cover
@@ -13003,6 +13037,7 @@ impl Vm {
             match decision {
                 Some((index, Some(finally))) => {
                     let frame = self.try_stack.remove(index);
+                    let try_depth = self.try_stack.len();
                     // The pending re-applies the deferred control at the
                     // depth the transfer has already unwound to: the
                     // compiled `leave_scopes` pops run before the
@@ -13022,26 +13057,31 @@ impl Vm {
                             after: *after,
                             env,
                             depth,
+                            try_depth,
                         },
                         Ctl::Break { target } => PendingControl::Break {
                             target: *target,
                             env,
                             depth,
+                            try_depth,
                         },
                         Ctl::Continue { target } => PendingControl::Continue {
                             target: *target,
                             env,
                             depth,
+                            try_depth,
                         },
                         Ctl::Return { value } => PendingControl::Return {
                             value: *value,
                             env,
                             depth,
+                            try_depth,
                         },
                         Ctl::Throw { value } => PendingControl::Throw {
                             value: *value,
                             env,
                             depth,
+                            try_depth,
                         },
                     });
                     self.restore_env(frame.saved_env, frame.env_depth);
@@ -13167,15 +13207,15 @@ impl Vm {
                     // pending control escapes that finally: the throw
                     // replaces the pending (spec 14.15.4 step 8), restoring
                     // to the try-entry environment. A catch INSIDE the
-                    // finally (its frame was entered above the finally's
-                    // restore depth) leaves the pending for FinallyEnd.
+                    // finally leaves the pending for FinallyEnd — the
+                    // catching frame sits at or above the try-stack length
+                    // the pending recorded when its own frame was removed.
                     if let Some(pending) = self.pending.pop() {
-                        let (_, pending_depth) = pending_env_depth(&pending);
-                        if self.try_stack[index].env_depth <= pending_depth {
+                        if index >= pending_try_depth(&pending) {
+                            self.pending.push(pending);
+                        } else {
                             let (env, depth) = pending_env_depth(&pending);
                             self.restore_env(env, depth);
-                        } else {
-                            self.pending.push(pending);
                         }
                     }
                     let handler_index = self.try_stack[index].handler;
@@ -13211,13 +13251,18 @@ impl Vm {
                 }
                 Some((index, ThrowAction::Finally)) => {
                     let frame = self.try_stack.remove(index);
+                    let try_depth = self.try_stack.len();
                     // Restore to the try-entry environment (the state when
                     // the finally started) so the finally's block envs unwind
                     // with the pending throw.
                     let env = frame.saved_env;
                     let depth = frame.env_depth;
-                    self.pending
-                        .push(PendingControl::Throw { value, env, depth });
+                    self.pending.push(PendingControl::Throw {
+                        value,
+                        env,
+                        depth,
+                        try_depth,
+                    });
                     self.restore_env(frame.saved_env, frame.env_depth);
                     let finally = body
                         .handlers
@@ -18292,21 +18337,15 @@ impl Compiler {
         });
         self.emit(Step::ResetCompletion);
         self.emit(Step::ListBegin);
-        self.emit(Step::EnterBlock {
-            decls: Self::block_decls(&block.stmts),
-        });
-        self.scope_count += 1;
         self.try_depth += 1;
         // A return in the try Block is never tail-safe: the enclosing
         // catch/finally must run after the call (and its handler coverage
         // would be lost by the frame replacement).
         let saved_safe = self.tail_safe_depth;
         self.tail_safe_depth = 0;
-        self.compile_statements(&block.stmts)?;
+        self.compile_block_contents(block)?;
         self.tail_safe_depth = saved_safe;
         self.try_depth -= 1;
-        self.scope_count -= 1;
-        self.emit(Step::LeaveBlock);
         self.emit(Step::ListEnd);
         let exit_index = self.steps.len();
         self.emit(Step::Exit { after: 0 });
@@ -18365,21 +18404,15 @@ impl Compiler {
             self.handlers[handler_index].finally = Some(finally_start);
             self.emit(Step::SaveCompletion);
             self.emit(Step::ListBegin);
-            self.emit(Step::EnterBlock {
-                decls: Self::block_decls(&finalizer.stmts),
-            });
-            self.scope_count += 1;
             self.try_depth += 1;
             // A return in the finally is tail-safe (it overrides the pending
             // control; the finally is already running) — provided no OUTER
             // try encloses it (checked by the `try_depth <= 1` gate).
             let saved_safe = self.tail_safe_depth;
             self.tail_safe_depth = self.try_depth;
-            self.compile_statements(&finalizer.stmts)?;
+            self.compile_block_contents(finalizer)?;
             self.tail_safe_depth = saved_safe;
             self.try_depth -= 1;
-            self.scope_count -= 1;
-            self.emit(Step::LeaveBlock);
             self.emit(Step::ListEnd);
             self.emit(Step::RestoreCompletion);
             self.emit(Step::FinallyEnd);
