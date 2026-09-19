@@ -26242,17 +26242,23 @@ fn expr_contains_call(expr: &Expr) -> bool {
 /// script qualifies only for direct global-object access (today's path —
 /// anything that could observe the global object mid-script). `None` when
 /// a construct could change binding resolution entirely (a `with`, a
-/// `try`/`catch` whose parameter shadows a same-named global, a `switch`
-/// with lexical cases, a `for-in`/`for-of`, or a direct `eval` call).
+/// `switch` with lexical cases, a `for-in`, a destructuring catch parameter,
+/// or a direct `eval` call), and for a `try`/`catch` whose catch parameter
+/// shares a declared top-level name — the handler's reference must resolve to
+/// the parameter, not to the global object.
 fn analyze_script_scope(
     stmts: &[Stmt],
 ) -> Option<(Option<ScriptSlots>, HashSet<String>, HashSet<crux::AtomId>)> {
-    if !script_scan_allows(stmts) {
-        return None;
-    }
     let mut names = Vec::new();
     for name in crate::script::top_level_var_declared_names(stmts) {
         names.push(crux::intern_utf8(&name.to_string_lossy()));
+    }
+    let mut catch_params = Vec::new();
+    if !script_scan_allows(stmts, &mut catch_params) {
+        return None;
+    }
+    if catch_params.iter().any(|param| names.contains(param)) {
+        return None;
     }
     let globals: HashSet<String> = names
         .iter()
@@ -26838,13 +26844,15 @@ fn acc_expr_safe(expr: &Expr, name: crux::AtomId, statement: bool) -> bool {
     }
 }
 
-fn script_scan_allows(stmts: &[Stmt]) -> bool {
-    stmts.iter().all(script_stmt_allows)
+fn script_scan_allows(stmts: &[Stmt], catch_params: &mut Vec<crux::AtomId>) -> bool {
+    stmts
+        .iter()
+        .all(|stmt| script_stmt_allows(stmt, catch_params))
 }
 
-fn script_stmt_allows(stmt: &Stmt) -> bool {
+fn script_stmt_allows(stmt: &Stmt, catch_params: &mut Vec<crux::AtomId>) -> bool {
     match &stmt.kind {
-        StmtKind::Block(block) => script_scan_allows(&block.stmts),
+        StmtKind::Block(block) => script_scan_allows(&block.stmts, catch_params),
         StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
         StmtKind::Expr(expr) => script_expr_allows(expr),
         StmtKind::VarDecl { kind, decls } => {
@@ -26859,11 +26867,13 @@ fn script_stmt_allows(stmt: &Stmt) -> bool {
             alternate,
         } => {
             script_expr_allows(test)
-                && script_stmt_allows(consequent)
-                && alternate.as_deref().is_none_or(script_stmt_allows)
+                && script_stmt_allows(consequent, catch_params)
+                && alternate
+                    .as_deref()
+                    .is_none_or(|stmt| script_stmt_allows(stmt, catch_params))
         }
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
-            script_expr_allows(test) && script_stmt_allows(body)
+            script_expr_allows(test) && script_stmt_allows(body, catch_params)
         }
         StmtKind::For {
             init,
@@ -26884,19 +26894,47 @@ fn script_stmt_allows(stmt: &Stmt) -> bool {
             init_ok
                 && test.as_ref().is_none_or(script_expr_allows)
                 && update.as_ref().is_none_or(script_expr_allows)
-                && script_stmt_allows(body)
+                && script_stmt_allows(body, catch_params)
         }
         StmtKind::Return(expr) => expr.as_ref().is_none_or(script_expr_allows),
         StmtKind::Throw(expr) => script_expr_allows(expr),
-        StmtKind::Labeled { body, .. } => script_stmt_allows(body),
+        StmtKind::Labeled { body, .. } => script_stmt_allows(body, catch_params),
         StmtKind::FunctionDecl(_) | StmtKind::ClassDecl(_) => true,
-        // `with` re-resolves every name against an object env; a `catch`
-        // parameter shadows a same-named global inside its handler; a
-        // `switch` case can hold lexical declarations; `for-in` heads have
-        // their own binding machinery; `using` is lexical. All fall back
-        // to the env path.
+        // A `try` is transparent to the fast path like any other block: its
+        // `var`s hoist to the script scope and its block envs hold no
+        // top-level name. The one resolution hazard is the catch PARAMETER,
+        // which `CatchBind` binds at runtime in its own env: a parameter name
+        // that is also a declared top-level name would resolve to the global
+        // object through the fast path instead of to the parameter, so the
+        // name is collected here and `analyze_script_scope` refuses the
+        // script. A destructuring parameter has no single name to compare and
+        // keeps the conservative refusal.
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            let mut ok = script_scan_allows(&block.stmts, catch_params);
+            if let Some(handler) = handler {
+                ok = ok
+                    && match &handler.param {
+                        None => true,
+                        Some(BindingPattern::Ident(name)) => {
+                            catch_params.push(*name);
+                            true
+                        }
+                        Some(BindingPattern::Object(_) | BindingPattern::Array(_)) => false,
+                    };
+                ok = ok && script_scan_allows(&handler.body.stmts, catch_params);
+            }
+            ok && finalizer
+                .as_ref()
+                .is_none_or(|block| script_scan_allows(&block.stmts, catch_params))
+        }
+        // `with` re-resolves every name against an object env; a `switch` case
+        // can hold lexical declarations; `for-in` heads have their own binding
+        // machinery; `using` is lexical. All fall back to the env path.
         StmtKind::With { .. }
-        | StmtKind::Try { .. }
         | StmtKind::Switch { .. }
         | StmtKind::ForIn { .. }
         | StmtKind::UsingDecl { .. } => false,
@@ -26918,7 +26956,7 @@ fn script_stmt_allows(stmt: &Stmt) -> bool {
                     ..
                 }
             ) && script_expr_allows(right)
-                && script_stmt_allows(body)
+                && script_stmt_allows(body, catch_params)
         }
     }
 }
