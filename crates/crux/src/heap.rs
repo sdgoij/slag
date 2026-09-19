@@ -692,6 +692,10 @@ pub struct Heap {
     /// scan examined (reset at the start of each collection, set by
     /// [`Heap::scan_stack`]). A `Cell` because `scan_stack` borrows `&self`.
     stack_words: Cell<usize>,
+    /// Scratch for the minor's stack scan: the cohort's addresses in ascending
+    /// order. Kept across collections so the scan does not allocate (and grow)
+    /// a fresh buffer on every minor.
+    young_sorted: Vec<usize>,
 }
 
 /// Round `n` up to the next multiple of `m` (a power of two).
@@ -1304,6 +1308,7 @@ impl Heap {
             arena_low: usize::MAX,
             arena_high: 0,
             stack_words: Cell::new(0),
+            young_sorted: Vec::new(),
         }
     }
 
@@ -1434,9 +1439,9 @@ impl Heap {
     /// The live boxes in ascending address order, for the conservative stack
     /// scan's binary search. Built by the arena walk (already sorted), so no
     /// per-collection sort is needed.
-    fn live_sorted(&self) -> Vec<GcAny> {
+    fn live_sorted(&self) -> Vec<usize> {
         let mut live = Vec::with_capacity(self.live_boxes);
-        self.for_each_live(|header| live.push(GcAny(header)));
+        self.for_each_live(|header| live.push(header as usize));
         live
     }
 
@@ -1666,24 +1671,30 @@ impl Heap {
     /// not reach drive the weak compaction through `compact`, exactly like the
     /// major's dead set — except that the set holds young boxes only, so a
     /// `is_dead` test can never misfire on an old key or target.
+    ///
+    /// `weak_present` says whether the caller's `compact` hook has any weak
+    /// structure to compact; when it does not (and no verifier is on) the dead
+    /// set has no reader and is not built.
     pub fn collect_minor_with_stack(
         &mut self,
         roots: &[GcAny],
+        weak_present: bool,
         compact: &mut CompactHook<'_>,
     ) -> Vec<usize> {
-        self.collect_minor_inner(roots, true, compact)
+        self.collect_minor_inner(roots, true, weak_present, compact)
     }
 
     /// [`Heap::collect_minor_with_stack`] without the conservative stack scan:
     /// the deterministic entry point ([`Heap::collect`]'s counterpart for A3).
     pub fn collect_minor(&mut self, roots: &[GcAny]) -> Vec<usize> {
-        self.collect_minor_inner(roots, false, &mut |_, _| {})
+        self.collect_minor_inner(roots, false, false, &mut |_, _| {})
     }
 
     fn collect_minor_inner(
         &mut self,
         roots: &[GcAny],
         stack_scan: bool,
+        weak_present: bool,
         compact: &mut CompactHook<'_>,
     ) -> Vec<usize> {
         // The A2 invariant is exactly what a minor's correctness rests on, so
@@ -1695,7 +1706,21 @@ impl Heap {
         let mut work: Vec<GcAny> = Vec::new();
         // A precise root that is young is marked; one that is old is only
         // stepped through to reach its direct young children.
+        //
+        // Seeding is idempotent for a YOUNG root — the mark bit dedups it —
+        // but not for an old one, because a minor may never set an old mark
+        // bit. The root list is one push per traced field per agent cache, so
+        // a box shared by many records (the realm, a shared environment)
+        // appears once per record, and every duplicate re-walks that box's
+        // whole child list. Measured 2026-09-19 on the closure shape: 6207
+        // roots over just 34 distinct addresses, with one old box carrying
+        // 980 children seeded 3087 times, i.e. ~3.0M child visits per minor.
+        // Dedup by address before seeding.
+        let mut seeded: AddrSet = AddrSet::default();
         for &any in roots {
+            if !seeded.insert(any.addr()) {
+                continue;
+            }
             // SAFETY: every root is a live box.
             unsafe { self.seed_minor(any, &mut work) };
         }
@@ -1708,19 +1733,23 @@ impl Heap {
             && let Some((_low, high)) = stack_bounds()
             && high > sp
         {
-            let mut young_sorted: Vec<GcAny> = self
-                .young
-                .iter()
-                .map(|&addr| GcAny(addr as *mut GcHeader))
-                .collect();
-            young_sorted.sort_unstable_by_key(|any| any.addr());
+            let mut young_sorted = std::mem::take(&mut self.young_sorted);
+            young_sorted.clear();
+            young_sorted.extend_from_slice(&self.young);
+            young_sorted.sort_unstable();
             self.scan_stack(sp, high, &young_sorted, &mut work);
+            self.young_sorted = young_sorted;
         }
         // The remembered set: the old boxes a young store reached. They are old,
         // so they are stepped through but never marked — a young box's mark bit
         // is the only kind this collection sets.
         let remembered: Vec<usize> = REMEMBERED.with(|slot| slot.borrow().clone());
         for addr in remembered {
+            // A remembered box is usually also a root, and `seeded` already
+            // holds it; only a genuinely new one is worth walking.
+            if !seeded.insert(addr) {
+                continue;
+            }
             // SAFETY: the remembered set holds live old boxes (the barrier
             // recorded them, and every collection drains the set before one of
             // its boxes can be freed).
@@ -1742,9 +1771,17 @@ impl Heap {
         }
         // The young boxes the mark did not reach, collected while they are
         // still allocated: the compaction hook needs the would-be-swept
-        // addresses to drop the weak entries that name them.
-        let mut dead = self.dead_young();
-        dead.sort_unstable();
+        // addresses to drop the weak entries that name them. With no weak
+        // structure to compact the set has no reader (the verifier re-marks
+        // independently), so it is skipped: gathering and sorting the whole
+        // cohort measured ~31% of a minor's pause on an allocation loop.
+        let mut dead = if weak_present || verify_minor_enabled() {
+            let mut dead = self.dead_young();
+            dead.sort_unstable();
+            dead
+        } else {
+            Vec::new()
+        };
         let mut retained: Vec<GcAny> = Vec::new();
         compact(&dead, &mut |any| retained.push(any));
         if !retained.is_empty() {
@@ -2336,19 +2373,20 @@ impl Heap {
 
     /// Scan every word in the current thread's live stack region
     /// `[sp, high)` and push boxes whose address appears there onto `work`.
-    /// `live_sorted` is the arena's live boxes in ascending address order
-    /// (the walk yields it, A0); a membership test is a binary search, so a
+    /// `sorted_addrs` is the address set the scan may resolve — the arena's
+    /// live boxes in ascending order for a major (the walk yields it, A0), the
+    /// cohort for a minor — so a membership test is a binary search and a
     /// coincidental stack word can only be marked when it is a real box
     /// (imprecise, never unsafe).
-    fn scan_stack(&self, sp: usize, high: usize, live_sorted: &[GcAny], work: &mut Vec<GcAny>) {
+    fn scan_stack(&self, sp: usize, high: usize, sorted_addrs: &[usize], work: &mut Vec<GcAny>) {
         // GC-5: most stack words are not box addresses — skip the search for
         // words outside the arena's address range.
         let (live_low, live_high) = self.live_range();
         let find = |addr: usize| {
-            live_sorted
-                .binary_search_by_key(&addr, |any| any.addr())
+            sorted_addrs
+                .binary_search(&addr)
                 .ok()
-                .map(|index| live_sorted[index])
+                .map(|index| GcAny(sorted_addrs[index] as *mut GcHeader))
         };
         // A box address can appear in many scanned words (every stored
         // reference to it); push each box once so the work list stays bounded
@@ -2364,7 +2402,7 @@ impl Heap {
             if (live_low..=live_high).contains(&word)
                 && let Some(any) = find(word)
             {
-                // The scan only pushes boxes already in the live set.
+                // The scan only pushes boxes already in the address set.
                 if seen.insert(any.addr()) {
                     work.push(any);
                 }

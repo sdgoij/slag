@@ -232,13 +232,23 @@ pub struct EcmaFunction {
 impl Trace for EcmaFunction {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.name.trace(visit);
-        self.environment.trace(visit);
+        // The realm box needs no edge here: `Agent::realms` holds every realm
+        // the agent ever created and is never popped, so the realm is always a
+        // root, and `Realm::trace` walks its `global_env`. A record whose
+        // [[Environment]] IS that global environment therefore adds no edge
+        // either. Both were emitted per record, and on the bootstrap realm
+        // every record shares the same two boxes: ~3100 duplicated roots for
+        // two addresses, which was ~99% of the agent's root list and the
+        // largest single cost in a minor's seed loop. A closure's own
+        // environment still needs its edge.
+        if !self.environment.ptr_eq(self.realm.global_env) {
+            self.environment.trace(visit);
+        }
         self.home_object.trace(visit);
         self.fields.trace(visit);
         self.private_methods.trace(visit);
         self.private_environment.trace(visit);
         self.super_constructor.trace(visit);
-        self.realm.trace(visit);
         self.source.trace(visit);
         self.declaring_module.trace(visit);
         // The compiled body embeds literal `Value`s (strings, bigints) in

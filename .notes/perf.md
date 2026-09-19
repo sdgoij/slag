@@ -8,11 +8,12 @@ This file is the single, self-contained performance record for the slag
 runtime (consolidated 2026-09-05 from the earlier plan, task-list, and
 scratch documents — everything those files said lives here now). Reading
 order: the failed-experiments register and the state/remaining sections
-below summarize the whole effort; the `## Benchmark gate` section is the
-dated journal of every landing and probe; the milestone sections near the
-end record the major rewrites (NaN-boxed values, shapes/IC, ropes, the
-bytecode VM, the GC); and the final section archives the two superseded
-planning documents verbatim for provenance.
+below summarize the whole effort; the `## Active plan` section carries the
+current arc's yardstick, slice status, and gates; the `## Benchmark gate`
+section is the dated journal of every landing and probe; the milestone
+sections near the end record the major rewrites (NaN-boxed values,
+shapes/IC, ropes, the bytecode VM, the GC); and the final section archives
+the two superseded planning documents verbatim for provenance.
 
 ## Failed experiments
 
@@ -422,6 +423,704 @@ remaining work is the storage decision below — start it only behind a
 probe showing a >4-key compiled read/write row (or a chain-read row) is
 hot enough to justify the migration.
 
+## Active plan — the V8/d8 yardstick and the JIT-pessimization closure (2026-09-19)
+
+The 2026-09-05 status sections above closed every item they tracked. This
+is the next arc, and it changes two things about how work is judged: the
+comparison target moves from the node bundle to a locally built `d8`, and
+the corpus gains an automated gate for the case where the JIT is *slower*
+than the interpreter.
+
+Slice status lives here; dated records land in the journal below.
+
+| # | slice | status |
+|---|---|---|
+| 0 | Instruments: gate, isolation, recheck, d8 runner, gap table, foldcheck | **landed** (2026-09-19) |
+| 1 | RE-SCOPED (2026-09-19): the JIT pessimization is nursery minors, not closure creation - **slice 1a landed: the retention premise was falsified (the growth is the major's 2x gate), and two unread per-minor passes were removed (-27..-37% minor pause, corpus -6.0% jit / -8.7% jitless)** | open |
+| 2 | The call path (non-leaf call, method/hof/apply) | open |
+| 3 | Strings (split/join, coercion concat, then the suspect rows) | open |
+| 4 | Control flow (switch dispatch, nested loops, inline try enter/exit) | open |
+| 5 | Iteration protocols (for-in, Map/Set churn, generators) | open |
+| 6 | Property storage end-state (>4-key compiled read/write) | gated on a probe |
+| — | d8 yardstick build | **done** (2026-09-19) |
+| — | Pristine `out/x64.perf` d8 config | open |
+| — | Six-column gap table (slag / d8 / node) | **done** (2026-09-19) |
+
+### The d8 yardstick — build record (2026-09-19)
+
+The vendored checkout was a plain `git clone`, so every DEPS-managed
+directory was absent and nothing could build: `build/`, `buildtools/`, and
+`third_party/{icu,zlib,abseil-cpp,simdutf,rust-toolchain,siso,cpython3,ninja}`.
+`gclient sync` populated them (~9 GB). The checkout itself is clean and
+pinned: V8 `15.6.0 (candidate)`, commit
+`39ee186bab5874357d6dda22594f4ebdd39f05e9` (2026-09-18), `git status` 0
+modified before and after.
+
+Layout: depot_tools at `C:\Users\T\depot_tools`; a `.gclient` root *outside*
+the repo at `C:\Users\T\v8build`, with a junction `v8build\v8` into
+`slag\v8` and `managed: False` so gclient never moves the v8 revision.
+
+Three Windows-specific traps, each of which cost a failed `gn gen`:
+
+- `DEPOT_TOOLS_WIN_TOOLCHAIN=0` is mandatory, or depot_tools demands
+  Google's hermetic toolchain instead of the local Visual Studio.
+- `GYP_MSVS_OVERRIDE_PATH` is the only working VS override.
+  `vs_toolchain.py`'s `GetVisualStudioVersion()` never reads
+  `GYP_MSVS_VERSION`, and walks `MSVS_VERSIONS` in order, so '2026'
+  precedes '2022' and the VS 18 install at
+  `Program Files\Microsoft Visual Studio\18` wins by default. That install
+  declares SDK `10.0.28000.0`, which is not present on this box.
+- Two local patches under `build/` (which V8's own `.gitignore` excludes, so
+  the git tree stays clean):
+  1. `build/toolchain/win/setup_toolchain.py` and `build/vs_toolchain.py`:
+     `SDK_VERSION` `10.0.28000.0` -> `10.0.26100.0`. The constants are
+     deliberately kept in sync across the two files.
+  2. `build/config/win/BUILD.gn`: `-DNTDDI_VERSION=NTDDI_WIN11_BR` ->
+     `NTDDI_WIN11_GE`. `NTDDI_WIN11_BR` exists only in SDK 28000's
+     `sdkddkver.h`; on 26100 it expands to 0, the guarded declarations
+     vanish, and every `partition_alloc` TU fails with `unknown type name
+     'FILE_INFO_BY_HANDLE_CLASS'`. `NTDDI_WIN11_GE` (0x0A000010) is the
+     highest macro 26100 defines.
+
+  Installing SDK 10.0.28000.0 would let both patches revert and restore an
+  upstream-exact build.
+
+Config: `is_debug=false v8_enable_disassembler=true
+v8_enable_object_print=true v8_enable_backtrace=true use_siso=false`
+(siso off to avoid RBE auth on a non-Google box). 2405 ninja steps, 0
+failures, `d8.exe` ~35 MB at `v8/out/x64.release/d8.exe`.
+
+Verified present, which is the point of having it: `--jitless`,
+`--allow-natives-syntax` (`%GetOptimizationStatus` returns 41 = optimized +
+turbofanned), `--print-opt-code` (a full 572-byte TurboFan dump for a
+three-line loop), and the d8 host primitives `read` / `load` / `print` /
+`performance.now()` (so the corpus runner can mirror `run_node.js` exactly).
+
+Caveat, recorded so no ratio is quoted from it: this config announces
+"V8 is running with developer-only features enabled", so it is an *analysis*
+build. `out/x64.perf` (disassembler and object printer off) is a
+prerequisite for any headline number.
+
+### The JIT-pessimization register (measured 2026-09-19)
+
+`scratch/corpus-ab.sh` (one process per family, four modes); the TSVs in
+`scratch/corpus-out/` were produced 2026-09-19 12:15, before the local
+try-gate commit. HEAD is now `8ec86f19` ("admit top-level `try` to the
+script fast path", `crates/runtime/src/ir.rs` only, one commit over
+`origin/main` at `58b52dd5` and unpushed), and that change alters which
+scripts certify, so **re-take the baseline before trusting slice 0's gate**.
+Rows where the compiled path is slower than `--jitless` on the same binary:
+
+| row | jit (ms) | jitless (ms) | ratio | disposition |
+|---|---|---|---|---|
+| `language/statements/try/completion-values.js` | 816.67 | 254.78 | 3.21 | **contaminated** - isolated 267 vs 265; the `language` family runs both hot rows in one process |
+| `language/statements/for-in/head-let-fresh-binding-per-iteration.js` | 2105.02 | 915.84 | 2.30 | **real**, reproduces isolated (2089 vs 900) |
+| `strings/search_slice.js` | 84.78 | 82.77 | 1.02 | noise |
+| `builtins/spread_assign.js` | 169.72 | 171.55 | 0.99 | noise |
+
+So the register holds exactly one confirmed pessimization, and the noise
+floor is ±2%: a `>1.05`-and-`>5ms` threshold catches the real row and
+ignores both noise rows.
+
+The cause is narrowed to **closure creation**, not the per-iteration
+binding env: `scratch/iso/closure-split.js` measures ~3.8µs per closure
+created in a compiled body against ~0.6µs interpreted, and the gap survives
+a closure that captures nothing (`noCapture`), so it is the creation path
+itself.
+
+### The V8 gap ranking (measured 2026-09-19)
+
+`tools/corpus/corpus-ab.sh` then `tools/corpus/gap.awk`; ratio = slag-jit ms /
+d8-jit ms, isolated rows, HEAD `8ec86f19`.
+
+**Retracted premise, same day.** This section first split the table into
+"suspect eliminated" and "real work" bands, on the reasoning that a row
+costing well under a nanosecond per iteration cannot be doing the work. That
+reasoning is wrong and the split is gone. A loop V8 unrolls or vectorizes runs
+at about a cycle per iteration - ~0.25-0.35ns at this clock - while still
+executing every iteration, so a sub-nanosecond per-iteration cost is not
+evidence of elimination. `tools/corpus/scalecheck.sh` then measured it
+directly: quadruple the work and the time quadruples too.
+
+**V8 eliminates none of these workloads**, `destructure`, `try_catch_loop` and
+`push_pop` included - the three the corpus README and the first version of
+this section called closed-form-folded. The consequence is that the whole
+ranking is real work: these gaps are genuine distance to a compiler doing the
+same iterations far better, not a measurement artifact to be dismissed.
+
+**Real work, grouped by shared mechanism** (the full target set; gaps moved
+from the earlier node-based ranking because d8 is the newer engine and its
+sub-millisecond rows carry a large relative error):
+
+| cluster | rows (gap vs d8) |
+|---|---|
+| Strings / text | `try_catch_loop` 333x, `destructure` 175x, `char_ops` 74x, `search_slice` 63x, `concat_loop` 15x, `coercion_concat` 13x, `split_join` 20x, `slice_concat` 19x |
+| Calls / closures | `method_call` 93x, `closure_capture` 64x, `for-in/head-let` 49x, `generator_loop` 37x, `recursive_fib` 35x, `map_churn` 29x, `hof_methods` 16x, `construct_churn` 16x, `apply_call` 4x |
+| Objects / properties | `typed_array` 84x, `many_objects_read` 38x, `index_loop` 31x, `compound_assign` 26x, `warm_store` 25x, `object_keys` 15x, `proto_read` 5x |
+| Control | `switch_dispatch` 38x, `nested_loops` 13x, `for_in` 35x |
+| Collections / iteration | `push_pop` 56x, `set_churn` 27x, `for_of_dense` 20x, `spread_assign` 7x |
+| Eval / template | `template-literal/evaluation-order` 15x, `try/completion-values` 11x, `json_roundtrip` 7x |
+
+Rows we win, for the record: `math_intrinsics` 0.35x, `nested_read` 0.03x,
+`object_read` 0.03x - the last two are V8 being ~30x slow on a global read
+loop, not us being fast.
+
+### Slices
+
+**Slice 0 - instruments.** `tools/corpus/jit-loss.awk` joins the two slag
+TSVs, prints every row with `sj/sl > 1.05` and `sj > 5 ms`, and exits
+non-zero, so a landed JIT regression fails a command instead of being found
+by hand. `tools/corpus/foldcheck.js` runs a workload at 1x and 4x
+amplification in node and d8 and marks a row `FOLDED` when the per-iteration
+cost is sub-nanosecond or the two Ns do not scale, with `--print-opt-code`
+as the tie-break. Promote the isolated probes into a per-workload runner so
+the `language` family stops sharing a heap, and record N per workload in the
+TSV.
+*Gate: reproduces the register above, exactly one unflagged pessimization.*
+
+**Slice 1 - closure creation.** The single confirmed pessimization, and the
+shared mechanism behind the calls cluster. Re-baseline first (the try-gate
+commit moved what certifies). Per-call identity hashing is already in the
+tree: `compiled_bodies` has been on
+`BuildHasherDefault<IdentityHasher>` since `d4741efc` (Cut 13,
+2026-08-22), so a note describing that change as "pending and unmeasured"
+was stale and the premise is closed. The work here is the attribution:
+instrument `register_function` (`crates/runtime/src/function.rs`) with an
+env-gated counter around each phase - struct init, `shared_compiled_body`,
+`Function::new_with_prototype`, `set_function_properties_batched`,
+`store_construct_patterns`, the `ecma_functions` insert - and test the
+nursery hypothesis (300k `Gc` allocations per `bench()` call; `--gc-trace`
+pause totals) to separate "creation is slow" from "allocation is slow".
+*Gate: `closure-split.js` `noCapture` <= 11500 ns/body; `for-in/head-let`
+ratio <= 1.0; slice 0 gate green.*
+
+**Slice 2 - the call path.** A non-leaf JS call is ~127 ns today
+(`recursive_fib`: 267 ms against node's 7.1). Probe the `call_slow` ->
+`try_jit_leaf` miss path with counters, then the execution-context push.
+*Gate: `recursive_fib` < 15x, `method_call` < 8x, `hof_methods` < 8x.*
+
+**Slice 3 - strings.** The two real string rows are `split_join` and
+`coercion_concat`; the 60x `search_slice` / `char_ops` rows stay suspect
+until slice 0 rules on them. Levers: per-iteration builtin round trips
+(`indexOf`/`slice`/`split`/`join`) and the `concat` form thresholds in
+`crates/crux/src/string.rs`.
+*Gate: `split_join` < 5x, `coercion_concat` < 5x.*
+
+**Slice 4 - control flow.** `switch_dispatch` 37.7x (compiled switch
+lowering), `nested_loops` 15.3x (remaining step-path fallbacks), then the
+inline `EnterTry`/`ExitTry`. The inline path is worth ~63 ns per iteration
+pair into an empty body, but `try_catch_loop` is a suspect row, so this is
+an *internal* win (real throwing code, the `try/completion-values` eval
+path), not a competitive one. It needs the seven `EnterTry` offset constants
+re-added plus a new `ExitTry` no-finally inline arm.
+*Gate: `switch_dispatch` < 10x; try enter/exit <= 10 ns/iter.*
+
+**Slice 5 - iteration protocols.** `for_in` 28.8x (after slice 1),
+`generator_loop` 31.1x, `set_churn` 25.7x, `spread_assign` 7.4x. The
+certified-iterator machinery (for-of/for-in/`AsyncForOf*`) already exists;
+reconcile the remaining slow for-in and the suspend/resume dispatch.
+*Gate: `for_in` < 8x, `generator_loop` < 8x.*
+
+**Slice 6 - property storage.** `many_objects_read`, `index_loop`,
+`warm_store`, `compound_assign`, `object_keys`. This is the L1c decision
+section's Option-2/3 branch and stays **gated behind a probe** showing a
+>4-key compiled read/write row where storage is the dominant cost; the
+2026-09-05 evidence says the 5th+ field define is not the bottleneck.
+
+### Slice 0 - instruments landed (2026-09-19)
+
+**Hygiene first.** The baseline was re-taken at HEAD `8ec86f19` with a
+release `slag.exe` built at 13:34. The 12:15 TSVs had been produced by an
+**11:39 binary**, i.e. before the try-gate commit - the freshness trap in its
+corpus form, where a stored baseline goes stale without looking stale.
+`corpus-ab.sh` now writes `manifest.txt` (date, HEAD, both binaries and their
+mtimes) beside the TSVs so that cannot recur silently.
+
+**The gate** (`tools/corpus/jit-loss.awk`, `tools/corpus/corpus-ab.sh`
+`--recheck`). Flags any slag row with `jit > 5ms` and `jit/jitless > 1.05`.
+Five self-tests cover every exit path. The first version **silently passed on
+a usage error** - awk runs its `END` block even after `exit` in `BEGIN`, so
+the empty read printed "clean" and overwrote the status; the failure is now
+latched and re-raised. A gate that can silently pass is worse than no gate.
+
+**Isolation** (`--isolate language`, one row per process; the CLI's
+`--corpus` needs a directory, so each row runs from a one-file scratch dir
+that preserves its sub-path, keeping the join key identical). This settled
+the two contested rows:
+
+| row | in-family | isolated | verdict |
+|---|---|---|---|
+| `try/completion-values` | 3.21x (816.7 vs 254.8) | **0.996x** (5 runs: jit 277.3-286.5, jitless 279.5-287.1) | the 3.21x was contamination, not a pessimization |
+| `for-in/head-let` | 2.30x | **2.22-2.46x** (jit 2237-2388, jitless 940-1077) | real, stable across every run |
+
+The same effect showed in d8: the try row read 74.3ms in-family and 37.4ms
+isolated, so the node/d8 columns were contaminated too.
+
+**Recheck.** A flagged row is now re-measured 3x per mode, isolated, and
+judged on the per-mode minima - because the try row read 0.996x isolated and
+1.15x inside one full driver run of the same binary. Without this the gate
+flaps on a row whose spread exceeds its margin, and a flapping gate is one
+people learn to ignore. After recheck the gate reports **one confirmed row**.
+
+**The d8 columns** (`tools/corpus/run_d8.js`, which mirrors `run_node.js`'s
+protocol and agrees with it on values; plus `tools/corpus/gap.awk` joining all
+six modes). The join carries a `tiergain` column - `d8_jitless / d8_jit`, how
+much V8's optimizing tier buys on that row. It was briefly read as a fold
+signal, which was **wrong**: a tight loop with a slow interpreter path and a
+fast compiled path shows a large value while still doing every iteration of
+its work. `tiergain` is a headroom signal, nothing more.
+
+**The fold question, settled by scaling** (`tools/corpus/scalecheck.sh`). Each
+row runs at N and at 4N, with `--jitless` as a control that cannot fold:
+
+| row | x4 jit | x4 jitless |
+|---|---|---|
+| `try_catch_loop` | 6.00 | 4.01 |
+| `destructure` | 4.11 | 3.98 |
+| `typed_array` | 3.93 | 3.83 |
+| `map_churn` | 3.98 | 3.79 |
+| `object_keys` | 3.95 | 3.77 |
+| `switch_dispatch` | 3.90 | 4.01 |
+| `recursive_fib` | 3.93 | 4.28 |
+| `for-in/head-let` | 3.97 | 4.19 |
+
+Everything scales, so **V8 eliminates nothing** and the large gaps are real
+work. `try_catch_loop` is the one outlier at 6.00; its per-iteration cost sits
+at ~0.33ns at both sizes, so it scales too and the superlinearity is in the
+small base measurement.
+
+**The machine-code prover** (`tools/corpus/foldcheck.sh` + `foldcheck.awk`).
+It forces a workload into TurboFan (`--allow-natives-syntax
+--print-opt-code`) and looks for a back edge in the compiled code, because a
+folded loop compiles to straight-line code and has none. **All 41 rows report
+LOOP**, which is exactly what exposed the `tiergain` misreading: the tool was
+right and the interpretation around it was wrong. A `FOLDED` verdict remains
+available for a row that really has been eliminated.
+
+**What this changed.** The "these rows are V8 artifacts, do not chase them"
+reading is retracted: `method_call` (93x), `many_objects_read`,
+`compound_assign`, `warm_store`, `index_loop`, `switch_dispatch`,
+`for_of_dense`, `push_pop`, `char_ops` and `closure_capture` are all real work,
+and the target set is the whole ranking rather than a filtered band. The
+sequencing guidance is unchanged at the top: `for-in/head-let` (49x, and the
+single confirmed JIT pessimization, already attributed to closure creation)
+remains the unambiguous first target.
+
+**Slice 0 is closed.** The instruments are the gate (`jit-loss.awk` plus the
+driver's recheck), per-row isolation, the d8 runner (`run_d8.js`), the
+six-column table (`gap.awk`), the machine-code prover (`foldcheck.js` +
+`foldcheck.awk` + `foldcheck.sh`), and the scaling prover (`scalecheck.sh`),
+all driven by `tools/corpus/corpus-ab.sh`.
+
+### Slice 1 - the premise collapses: it is the nursery, not closure creation (measured 2026-09-19)
+
+**The premise was that the compiled path pays more to CREATE a closure.**
+Every measurement below was taken one shape per process, on HEAD `8ec86f19`
+with the 13:34 binary; the earlier closure harnesses contravened that and had
+to be discarded (see the last paragraph).
+
+Marginal cost per closure, compiled vs interpreted (N=50000, ns/body):
+
+| body | jit | jitless | ratio |
+|---|---|---|---|
+| `c0` object + scalar store | 120 | 260 | 0.46 |
+| `c1` + 1 closure | 1160 | 900 | 1.29 |
+| `c3` + 3 closures | **12640** | **2220** | **5.69** |
+| `c3loop` one create site x3 | 14440 | 3740 | 3.86 |
+
+So one closure is nearly free to add (~1160 vs 900) and the blow-up needs
+THREE creates in a body - 5.7x, not the ~1.3x slope of the first create. That
+shape pointed at accumulating state, and the GC trace found it:
+
+| run (c3, N=50000) | minors | minor pause | major pause |
+|---|---|---|---|
+| jit | **49** | **287ms (avg 5.9ms, max 6.8ms)** | 0.4ms |
+| jitless | **0** | - | 23.6ms across 122 majors |
+
+The interpreted path **never triggers a minor at all**; the compiled path
+triggers 49 of them and each costs ~5.9ms - **15-30x a major** (200-450us),
+which is upside-down. The rows are constant in N (5000 -> 8580 ns/body across
+N=2000..50000), so this is a steady per-iteration cost, not heap growth.
+
+The decisive A/B, suppressing minors with `--nursery-threshold 100000000`:
+
+| c3, N=50000, jit | ns/body |
+|---|---|
+| minors on | **11420** |
+| minors suppressed | **2360** |
+| jitless (unchanged by the flag) | 2220 |
+
+**With minors suppressed the compiled path lands on the interpreter's number.**
+The whole 5.7x is minor-collection cost, and the closure create is innocent - the
+2026-09-08 probe's "architectural floor" conclusion about `register_function`
+was right; it was simply not where the pessimization lived.
+
+Two distinct defects are now visible and both are bounded:
+
+1. **Trigger asymmetry.** Minor collections fire from compiled code and never
+   from the interpreter for the same allocation volume. Either the compiled
+   allocation path bumps the nursery counter (or misses the major budget)
+   differently, or the level is chosen from state the JIT path leaves stale.
+   `collect_minor_inner` / `maybe_collect` / `note_alloc` and the JIT's
+   allocation helpers are the places to look.
+2. **Cost inversion.** A minor costs ~5.9ms against a ~0.4ms major. Scanning
+   ~13k young objects should be ~100us, so there is roughly a 50x factor to
+   account for inside the minor path (the sweep, `live_sorted`/free-list
+   insertion, or the weak-table pass are candidates - `remembered=0` and
+   `stack_words~6500` rule out the remembered set and the stack scan).
+
+Slice 1 is therefore re-scoped from "speed up closure creation" to "fix the
+nursery", and it now sits in the GC track where the client-side numbers are
+already pointing. It also explains more than the closure rows: any compiled
+body that allocates above the nursery threshold pays this.
+
+**Harness note (the trap that produced two wrong answers first).**
+`scratch/iso/closure-split.js`, `clo-slope.js` and `clo-sites.js` run all of
+their shapes in ONE process, so each shape inherits the heap the previous one
+left; `c3` read 429ms there against 59-632ms alone, and the first "superlinear
+in creates" reading was that artifact. Closure and GC probes must run one
+shape per process - the same rule the corpus needed. `scratch/iso/clo-one.js`
+takes `<shape> <N>` and runs exactly one shape.
+
+**Instrumentation: the cost is the mark phase, driven by a growing root set.**
+Measured with temporary instrumentation in `crates/crux/src/heap.rs` behind
+`SLAG_MINOR_STATS=1` (per-phase microseconds, `trace_dirty` box and child
+counts, the worst box's type name) — **removed after the measurement**, so the
+counts below are a record rather than a re-runnable mode; re-add it if the
+question reopens. On the c3 shape at N=50000:
+
+| minor | roots | live | verify_us | mark_us | sweep_us | dirty_boxes | dirty_visits | worst |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 6207 | 3186 | 0 | 399 | 323 | 0 | 0 | - |
+| 2 | 6237 | 3223 | 0 | 8611 | 691 | 6223 | 3,037,521 | `Realm` (980) |
+| 120 | 9092 | 7619 | 0 | 10501 | 511 | 9078 | 4,437,855 | `Realm` (980) |
+| 243 | 11028 | 12239 | 0 | 19220 | 714 | 11016 | 5,392,272 | `Realm` (980) |
+
+Three facts fall out:
+
+1. **The mark phase is the whole cost.** `verify_us` is 0 and `sweep_us` stays
+   ~0.5ms while `mark_us` runs 0.4ms -> 19.2ms. The sweep (the inline payload
+   drops) is not the problem, and neither is the stack scan.
+
+2. **The Agent's root list grows with the live set** (6207 -> 12064 as live
+   goes 3186 -> 12239). Every root is an old box, `seed_minor` seeds each
+   through `trace_dirty`, and `trace_dirty`'s DEFAULT is a full trace - so each
+   minor re-walks the retained graph: ~488 children per call, 3.0M -> 5.9M
+   visits. The design assumption recorded on `note_dirty_slot` ("for a box whose
+   children are a handful of fields, tracing the box is already the bound") does
+   not hold for the boxes actually present: the largest single one is a `Realm`
+   with 980 children.
+
+3. **The retention is JIT-specific, and it is the same defect.** The identical
+   workload interpreted holds live flat, 3186 -> 3201 across 600+ majors. Run
+   compiled, live climbs **+37 per minor, linearly**, to 12319 and beyond. The
+   compiled path roots roughly one box per 69 bodies that the interpreter never
+   roots; those entries are simultaneously the leak and the O(live) minor cost.
+
+**The cause is root-list duplication, not a cache.** The write-side cell tables
+turned out to be fixed-size direct-mapped arrays, several documented as
+"index-only - no trace edges", so none of them can root anything. Instrumenting
+the root list itself (temporary, since removed) showed the real shape:
+
+| collection | roots | distinct addresses | top duplicate counts | ecma_functions |
+|---|---|---|---|---|
+| 1 | 6207 | **34** | 3087, 3078, 4 | 3074 |
+| 120 | 9068 | 38 | 4516, 4507, 4 | 4503 |
+| 243 | 11042 | 36 | 5505, 5498, 2 | 5495 |
+
+**6207 roots over 34 distinct addresses.** `ecma_functions` pushes two roots per
+record, and for every record those two boxes are the same shared pair. Then
+`collect_minor_inner` seeded every root without dedup - idempotent for a YOUNG
+root (the mark bit dedups it) but NOT for an old one, since a minor may never set
+an old mark bit. So one old box carrying 980 children was re-traced 3087 times per
+minor: **3087 x 980 = 3,025,260 visits against 3,037,521 measured, a 0.4%
+match.** Minor #1 cost 779us because before it the realm was still young, so
+`seed_minor` pushed it to `work` instead of calling `trace_dirty` - which is
+exactly why the jump appeared after the first collection.
+
+**Fix landed: dedup the seed by address** (`crates/crux/src/heap.rs`,
+`collect_minor_inner`, plus the remembered-set loop). Semantics-preserving: a
+duplicate old seed pushes the same young children to `work`, and the mark bit
+dedups those anyway.
+
+| metric (c3, N=50000) | before | after |
+|---|---|---|
+| jit ns/body | 11420-12640 | **3280** |
+| jit / jitless | 5.69x | **1.73x** |
+| minor pause, avg | 5866us | **429us** |
+| minor pause, max | 6758us | **896us** |
+| gc share of a call | ~50% | ~13% |
+| `for-in/head-let` isolated, jit/jitless | 2.22x | **1.82x** |
+
+Minors are now cheaper than majors, which is the correct ordering, and the
+`for-in/head-let` row is 18% faster - but it does not clear the 1.05 gate.
+
+**Still open: the retention - now attributed.** *(SUPERSEDED - the retention
+reading in this block is wrong; `live` growth is the major's 2x growth-factor
+gate, and the majors do reclaim it. See the 2026-09-19 evening record below.)*
+`live` does not go flat; it
+climbs 3186 -> 12138 across 243 minors, while the interpreter holds 3186 -> 3201
+across 600+ majors, and `ecma_functions` grows 3074 -> 5495 with it. The dedup
+removed the COST of the growing root set, not the growth.
+
+Two measurements pin it, both one shape per process:
+
+| shape (N=50000) | first -> last live | verdict |
+|---|---|---|
+| `fn3` three NAMED closure stores | 3189 -> **12221** | grows |
+| `fn3bare` three closures held as locals, one boolean store | 3151 -> 3446 | flat |
+| `fn3arr` three closures as ARRAY elements | 3160 -> 5847 | grows ~1.9x |
+
+So **creating** closures does not retain - storing them does, and a named store
+leaks ~3.4x more than an element store. And the retained unit is uniform: every
+minor after the first promotes exactly 37 boxes, split
+`JsObject` 13 / `JsString` 12 / `Function` 12. That is one object + one function
++ one string per unit, ~12 units per minor, which is exactly an `ecma_functions`
+record chain:
+
+    record.environment (JsObject) -> the fresh object -> the closure (Function)
+    record.source      (JsString)
+
+**The mechanism is a cycle closed through a root.** The record traces its own
+closure's `[[Environment]]`, and that environment holds the fresh object, which
+holds the closure. So the closure is reachable from an Agent root, is never
+swept, never enqueues its id on the crux death queue - and `reap_dead_functions`,
+whose only input IS that queue, never removes the record. The record and its
+chain are retained forever, ~12 new ones per collection. Under `--jitless` the
+same workload is flat, so whatever records the per-call environment on this path
+is specific to the compiled store.
+
+**The fix direction is structural:** the record must not participate in its own
+key's reachability. Either move `[[Environment]]` (and `source`) into the
+`Function` box so the Agent map becomes index-only and reliably reapable from
+the death queue - the thin-closure refactor whose create-side ceiling the
+2026-09-08 probe measured at ~21% - or make the record hold that chain weakly.
+Anything that keeps the map entry rooting the closure will leak the entry.
+
+**Pending gate for the dedup fix:** `cargo test --workspace`, a `language` sweep
+at the 15s deadline, and a corpus re-run for the gate. Clippy is clean, no
+instrumentation remains, and the engine diff is the 19-line dedup fix.
+
+### GC minors - the retention premise is falsified; two thirds of a minor was unread work (measured + landed 2026-09-19)
+
+**Correction: there is no leak, and the leak was not engine-specific.** Three
+falsifiers, all one shape per process:
+
+1. `--gc-trace` on `fn3` shows the second major reclaiming the whole climb:
+   `live=9363->3218 swept=6145`. The monotone `live` growth between majors is
+   the growth gate in `maybe_collect` (`live > last_collected_live * 2`), which
+   is why majors are logarithmic in the run (2 per 250k allocations) - by
+   design, not a defect.
+2. The growth is **engine-independent** once the cadence is equal. At the
+   default threshold `--jitless` never crosses it in a short run (0 minors),
+   which is what made the interpreter look flat. Forcing the same cadence
+   (`--nursery-threshold 2000`) gives the same per-minor promotion in both
+   engines: `fn3` 25.3 (jit) vs 25.1 (jitless), `obj3` 9.32 vs 9.04.
+3. The conservative scan is exonerated: disabling it entirely (probe, since
+   removed) moved leak/minor from 25.30 to 25.01.
+
+Root attribution by re-marking one root at a time (probe, since removed) names
+the real mechanism: the surviving young boxes are reached from the **traced IC
+value cells** (`member_value_cells`, 16 slots) and the execution-context roots.
+A store warms a value cell with the value it wrote, so the box is genuinely live
+at that instant, survives the minor, is promoted - and the next major reclaims
+it. `fn3` shows 8 `Function` roots plus 8 `JsString`/9 `JsObject`, one cell each;
+`obj3` shows 9 cells and no functions, which is why it needed no `ecma_functions`
+story at all.
+
+**What was actually there: a minor spent two thirds of its pause on work with no
+reader.** Temporary `SLAG_GC_PHASES` instrumentation (removed) split a steady
+minor on `fn3`:
+
+| phase | us/minor |
+|---|---|
+| seed precise roots (10k entries, mostly the shared `ecma_functions` pair) | 49 |
+| build + sort the cohort list for the stack scan | **116** |
+| stack word scan | 12 |
+| mark | 2 |
+| build + sort the young dead set | **140** |
+| sweep | 173 |
+
+**Landed** (`crates/crux/src/heap.rs`, plus one argument at the call site in
+`crates/runtime/src/agent.rs`):
+
+1. **The young dead set is skipped when nothing reads it.** It exists only to
+   feed the weak-compaction hook (and the `--gc-verify` audit), and the runtime
+   already hands a no-op hook when `has_weak` is false. Gating on
+   `weak_present || verify_minor_enabled()` removes two full passes over the
+   cohort plus a 10k-element sort per minor.
+2. **The stack scan's cohort list is a reused `Heap` buffer sorted as integers**
+   (`extend_from_slice` + `sort_unstable`) instead of a fresh `Vec<GcAny>` of
+   10k entries sorted `by_key` through a closure every minor.
+3. `scan_stack` takes ascending **addresses** rather than `GcAny`, so both call
+   sites share it (`live_sorted` now returns `Vec<usize>`).
+
+A/B against a baseline binary built from the pre-change tree, min of 3 at
+N=100000, total GC pause (`--gc-trace` sum):
+
+| shape | baseline | after | delta |
+|---|---|---|---|
+| `fn3` | 207385us | 138442us | **-33.2%** |
+| `glob3` | 148638us | 95046us | **-36.1%** |
+| `obj3` | 52773us | 33054us | **-37.4%** |
+| `loc3` | 27680us | 20261us | **-26.8%** |
+| `num3` | 13352us | 9723us | **-27.2%** |
+
+Corpus, both slag modes, baseline binary vs landed (`--no-node --no-d8`; the
+gate's only confirmed row is the pre-existing `for-in/head-let` one, 1.82x ->
+1.80x):
+
+| mode | baseline | after | delta |
+|---|---|---|---|
+| jit | 5343.07ms | 5022.41ms | **-6.0%** |
+| jitless | 6757.68ms | 6171.63ms | **-8.7%** |
+
+Leading rows (`object_keys` -39%, `slice_concat` -35%, `json_roundtrip` -29%,
+`hof_methods` -23%, `method_call` -21%, `index_loop` -19%, `for_of_dense` -18%).
+No regressions: the five rows that read positive in the single-shot corpus run
+(`template-literal/evaluation-order`, `concat_loop`, `compound_assign`,
+`nested_loops`, `own_read`) all measure neutral-to-faster once isolated at
+min-of-5.
+
+**Rejected, with the evidence that killed them** (both probes since removed):
+
+- **An arena-walk branch for the cohort list** (filter `for_each_live` by the
+  young bit instead of sorting). Single runs looked like a win; min-of-3 at
+  N=100000 showed it neutral-to-worse: `fn3` 140237 -> 140205, `glob3`
+  90007 -> 93199, `obj3` 33024 -> 33441. The walk is O(all slots), not O(live),
+  so the `live_boxes <= young.len()` guard was the wrong proxy.
+- **A cohort-span pre-filter on the stack words** (skip the list build when no
+  word can name a cohort box). Always finds candidates: the JIT holds young box
+  pointers in registers at a safepoint, so the scan is load-bearing, and the
+  extra span pass showed up as +3.3% on `control/generator_loop.js`. Removing
+  the branch returned that row to -2%.
+
+**Gate:** clippy clean workspace-wide; `cargo test --workspace` all green;
+`--gc-verify` and `--gc-stress` clean on the GC shapes; corpus gate shows no new
+pessimization. The measurement binary `target/release/slag-baseline.exe` (the
+pre-change tree) is kept for future A/Bs.
+
+**Staging hazard.** The editor's auto-stage tooling staged the temporary probes
+into the index during this session. The worktree is clean (no probe remains);
+the index must be re-staged to match before any commit.
+
+### The `ecma_functions` root duplication (measured + landed 2026-09-19)
+
+**The map owned ~99% of the agent's root list, for two boxes.** A per-field probe
+in `EcmaFunction::trace` (temporary, removed) showed every one of the ~3100
+bootstrap records emitting exactly two visits, each naming a **single** shared
+address:
+
+    ef-probe  records=3082  environment(3082 visits, one address 0x137cbe4b2a0)
+                           realm(3082 visits, one address 0x137cbe4b350)
+
+Everything else - `name`, `source`, `ir`, `home_object`, `fields` - is empty for
+those records. So the trace walked ~3100 records x 11 fields to produce ~6200
+references to two boxes, which the collector then deduplicated by address.
+
+**Both edges are provably redundant, for different reasons:**
+
+- `realm`: `Agent::realms` is pushed by every realm constructor
+  (`initialize_host_defined_realm`, the only creator) and is *never* popped or
+  cleared, and `trace_roots` traces it - so every realm is a permanent root.
+- `environment`, when it IS the realm's `global_env`: `Realm::trace` walks
+  `global_env`, so the realm root already carries it. A closure's OWN
+  environment is a different box and keeps its edge.
+
+**Landed:** `EcmaFunction::trace` skips the `environment` visit when it is
+`ptr_eq` to `realm.global_env`, and drops the `realm` visit entirely. Measured
+effect on the map's own contribution: `roots=6200 -> roots=0`. Selectivity
+checked in both directions - a capturing-closure workload still emits one root
+per user closure (`roots = records - 2`), so only the shared pair is elided.
+
+**Supporting change (`realm.rs`):** the realm is now pushed into `Agent::realms`
+*before* `set_default_global_bindings` (which is pure Rust property definition,
+no evaluation), so the realm is a precise root for the whole bootstrap window
+instead of relying on the conservative stack scan. `realm_count` is bumped with
+the push, keeping the documented invariant that the two agree.
+
+| shape, N=100000, total GC pause | no-ef | ef | delta |
+|---|---|---|---|
+| `fn3` (3 closures/body) | 129511us | 100727us | **-22.2%** |
+| `glob3` (3 closures into a shared receiver) | 86828us | 75868us | **-12.6%** |
+| `obj3` (no closures) | 33797us | 32332us | -4.3% |
+| `loc3` | 19806us | 20146us | +1.7%（noise) |
+| `num3` | 10002us | 10160us | +1.6%（noise) |
+
+The two positive readings are noise: the change only *removes* visits, and the
+collector already deduplicated the addresses it stops emitting.
+
+Wall time, min of 5-7, N=200000:
+
+| shape | threshold | baseline | after | delta |
+|---|---|---|---|---|
+| `fn3` | forced 2000 | 3005 | 2615 | **-13.0%** |
+| `glob3` | forced 2000 | 2010 | 1795 | **-10.7%** |
+| `obj3` | forced 2000 | 465 | 435 | -6.5% |
+| `loc3` | forced 2000 | 370 | 360 | -2.7% |
+| `num3` | forced 2000 | 200 | 195 | -2.5% |
+| `fn3` | default | 2785 | 2700 | -3.1% |
+| `glob3` | default | 2210 | 2000 | **-9.5%** |
+| `obj3` | default | 540 | 530 | -1.9% |
+
+**Methodology corrections this slice forced:**
+
+1. **`--gc-trace`'s `pause_us` excludes root collection.** `Agent::collect_with`
+   builds the root vector (all `trace_roots` work) *before* calling into the
+   heap, and `trace_start`/`trace_end` bound only the heap-side collection. The
+   earlier phase breakdown and every pause total in this file therefore
+   *understate* the win from both this slice and the root-dedup slice - the wall
+   delta (-13% on `fn3`) is larger than the pause delta (-27%) implies.
+2. **The corpus numbers earlier in this entry are drift-prone.** The
+   `-6.0%` jit / `-8.7%` jitless block came from a single non-paired run of one
+   binary after the other, and a later run of the *same* binary pairs inflated
+   both modes by 20-40%. `scratch/paired-iso.sh` now runs the two binaries
+   interleaved, one process per row, judged on per-binary minima; over 41 rows
+   it reads **+1.8% total** with per-row swings of +-10-20% in both directions
+   on rows this change cannot affect. **The corpus is not GC-bound enough to
+   resolve this change on this box.**
+
+That is the honest end-to-end picture: collection cost is down ~30-50%, the GC
+is ~12-19% of an allocation-heavy shape, and the corpus rows sit near the noise
+floor. Further GC work can only move a row by a few percent; the remaining gap
+to V8 is in the JIT/property/call machinery, not here.
+
+**Remaining in the map, not attacked:** the trace still walks all ~3100 records
+x 11 fields even when every visit is elided - measured at 25-31us per
+collection. Cutting that needs a compact "records with heap edges" index kept
+in sync with the record mutation points (`set_compiled`, `build_class`,
+`register_function`), which is a bigger, riskier change than the elision.
+
+**Gate (2026-09-19, both sides rebuilt with `cargo build --release -p test262`):**
+
+| sweep | baseline | after |
+|---|---|---|
+| `language` | 23724 total, 23721 pass, 0 fail, 3 skip, 0 crash, 0 hang | **identical** |
+| `built-ins` | 23812 total, 23657 pass, 0 fail, 155 skip, 0 crash, 0 hang | **identical** |
+
+Clippy clean workspace-wide; `cargo test --workspace` all 36 suites green;
+`--gc-verify` and `--gc-stress` clean (including the bootstrap window and
+capturing-closure shapes). A/B binaries kept under `target/release/`:
+`slag-baseline.exe` (HEAD) and `slag-noef.exe` (this slice's other changes
+without the elision).
+
+### Discipline additions for this arc
+
+- **A fold is not a gap.** Establish that V8 is doing the work before
+  targeting a row; a sub-nanosecond per-iteration node time means the loop
+  was eliminated. Prove with `d8 --print-opt-code` / `--trace-opt` rather
+  than inferring from ns/iter alone.
+- **One workload per process** when the rows are large. The corpus runner is
+  per-family, and the `language` family is where that bit us.
+- **d8 freshness.** `d8.exe` comes from the V8 ninja build, not from cargo;
+  after touching anything under `out/x64.release`, confirm the relink. This
+  is the V8-side twin of the `slag-binary-freshness` trap.
+- **No ratios from the analysis build.** The current `d8` has the
+  disassembler and object printer on; build `out/x64.perf` before quoting a
+  number.
+- The rules in the next section (probe first, full gate before a landing,
+  both engines together, ±15% machine discipline) apply here unchanged.
+
 ## Working rules and measurement discipline
 
 - **Compliance is the constraint.** No perf landing proceeds without the
@@ -467,8 +1166,11 @@ hot enough to justify the migration.
 ## Reference model — why V8 is fast and what Slag mirrors
 
 The mechanism plan's design reference is the vendored V8 checkout: we
-borrow architecture, never code. The table maps each V8 mechanism to what
-it buys and to Slag's (current) analog:
+borrow architecture, never code. As of 2026-09-19 it also *builds* - `d8`
+at `v8/out/x64.release/d8.exe` is the primary yardstick, replacing node.
+The build record and the local `build/` patches are in `## Active plan`.
+The table maps each V8 mechanism to what it buys and to Slag's (current)
+analog:
 
 | V8 mechanism | What it buys | Slag's analog |
 |---|---|---|

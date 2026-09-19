@@ -1950,7 +1950,8 @@ impl Agent {
         };
         let swept = crux::heap::with_heap_mut(|heap| {
             if minor {
-                heap.collect_minor_with_stack(&roots, compact).len()
+                heap.collect_minor_with_stack(&roots, has_weak, compact)
+                    .len()
             } else {
                 heap.collect_with_stack_compacting(&roots, has_weak, compact)
                     .len()

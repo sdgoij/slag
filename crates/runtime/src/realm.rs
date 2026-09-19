@@ -418,10 +418,17 @@ pub fn initialize_host_defined_realm(agent: &Agent) -> Result<Handle<Realm>, JsE
         global_env,
         loaded_modules: RefCell::new(std::collections::HashMap::new()),
     });
-    realm.intrinsics.set_owner(realm);
-    set_default_global_bindings(&realm)?;
+    // Root the realm from the moment its box exists. `Agent::realms` is the
+    // realm's permanent root (it is only ever pushed, never popped or
+    // cleared), and the function records registered below no longer carry a
+    // `realm` edge of their own (see `EcmaFunction`'s trace) — so this push is
+    // what keeps the realm alive through `set_default_global_bindings` under an
+    // allocation-collecting build, instead of a Rust local surviving the
+    // conservative scan.
     agent.realms.borrow_mut().push(realm);
     agent.realm_count.set(agent.realm_count.get() + 1);
+    realm.intrinsics.set_owner(realm);
+    set_default_global_bindings(&realm)?;
     Ok(realm)
 }
 
