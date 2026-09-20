@@ -2107,12 +2107,49 @@ impl Agent {
         if self.gc_stress.get()
             || (!crux::heap::minor_disabled() && young >= self.nursery_threshold.get())
         {
+            self.clear_derived_caches();
             self.collect_minor_garbage_with(None);
         }
         let live = crux::heap::with_heap(|heap| heap.live_count());
         let threshold = self.last_collected_live.get().max(1024).saturating_mul(2);
         if self.gc_stress.get() || (!crux::heap::major_disabled() && live > threshold) {
+            self.clear_derived_caches();
             self.collect_garbage();
+        }
+    }
+
+    /// Drop the caches whose contents a live receiver already reaches before a
+    /// collection walks the roots.
+    ///
+    /// Each is keyed by a receiver the hit path validates by (id, generation),
+    /// and what it holds is derivable from that receiver: an own property's
+    /// value (the member-read and array-element cells) or a base's enumeration
+    /// (the for-in enum cache). Rooting the contents is therefore redundant —
+    /// and it retains what the receiver no longer reaches. That is what a
+    /// create-heavy loop paid for: every member-read cell held a per-iteration
+    /// closure and every for-in enum cell a dead per-iteration base with its
+    /// key strings, so a minor promoted them instead of sweeping them, and the
+    /// loop accumulated garbage until the next major (measured 2026-09-20 on
+    /// the captured-closure shape and the for-in head-let row: 53 and 260
+    /// promoted boxes per minor, and the per-body cost grew with the iteration
+    /// count where the interpreter's stayed flat — 1.15x at N=10k, 2.1x at
+    /// N=300k).
+    ///
+    /// Clearing is safe at this point because every handle in a cell has been
+    /// a root since the previous clear, so no sweep could have freed it, and
+    /// because a for-in loop in flight owns its own copy of the key list (the
+    /// Vm's `for_in_stack`, traced as an active run). The reads that follow
+    /// re-warm the caches through the full Get/enumerate paths, and the
+    /// warm-store front re-records the value cells, so nothing observes the
+    /// difference beyond one cold read per site per collection.
+    fn clear_derived_caches(&mut self) {
+        self.member_value_cells
+            .fill(crate::ir::MemberValueCell::empty());
+        for cell in self.array_element_value_cells.iter_mut() {
+            *cell = None;
+        }
+        for cell in self.for_in_cells.iter_mut() {
+            *cell = None;
         }
     }
 

@@ -11660,6 +11660,237 @@ The recorded occurrence of the same shape (3 hangs) followed the finally-exit
 slice on this box, and this change does touch `CatchBind` — the targeted probe if
 it recurs is a certified catch whose parameter shadows a live binding.
 
+### SCOPED (not started): the live half of shadowing — a slot save/restore, not a scan rule
+
+**The finding.** A binding that shadows a LIVE same-name binding **and is
+referenced** — `liveShadowCatch`: a catch parameter read in the catch body, with
+the shadowed parameter read after the catch — cannot be closed by a scan rule,
+and it cannot be closed by sharing the slot either: the shadowing binding's store
+clobbers a value the shadowed binding still needs. Two mechanisms can express it,
+and only one of them leaves name→slot resolution alone:
+
+- **Slot save/restore at the shadowing scope's boundaries.** The flat map keeps
+  one slot per name (the shadowing binding shares the shadowed binding's slot,
+  exactly like the retired-slot reuse), and the shadowed value is copied to a
+  scratch slot at the scope's entry and put back on every exit. Every existing
+  resolution and optimizer stays correct; the new work is the exit inventory.
+- **A scope-aware (span-keyed) slot override**: the shadowing binding gets its
+  own slot and each reference inside the scope is redirected. No runtime cost,
+  but it must make EVERY name→slot resolution scope-aware — ~20 `binding()` call
+  sites plus three AST-scanning optimizers (the LICM hoists, the fused loop
+  tests) that compare resolved slots by identity, and a missed site is a SILENT
+  wrong value (the compiler cannot fail loudly on a miss).
+
+Save/restore is the sound-by-construction choice: its failure mode is a missed
+exit path, and the exits are enumerable and probeable.
+
+**The exit inventory** the save/restore needs, and why the runtime is involved:
+
+- the shadowing scope's normal end, and the compiled `break`/`continue`/`return`
+  transfers (the compiler knows which shadow scopes lie between the site and the
+  target, and can emit the pops);
+- a `throw` — an IMPLICIT throw (a call, a member read, a coercion) has no compile
+  site, so the try frame has to record the shadow nesting at `EnterTry` and the
+  throw/finally routing restore to it (`throw_machinery`'s catch and finally arms,
+  and `enter_finally`);
+- one configuration needs care: a `finally` lying INSIDE the shadowing scope. The
+  finally body must still see the shadowing binding, but the transfer that reaches
+  it has left the scope — so the live form is refused when the scope contains a
+  try with a finalizer (a transfer leaving a shadow scope whose finallys are all
+  outside it is what the compiled pops handle).
+
+**Surface.** Two steps (`EnterShadow { slot, save }` / `LeaveShadow`), a `Vm`
+shadow stack cleared in `Vm::reset`, `TryFrame::shadow_depth` — whose machine-code
+writer is `crates/jit/src/compiler.rs`'s inlined `emit_enter_try`, through
+`offset_of!` — the four-file helper mirror for both steps, the scan's per-scope
+shadow records, and the compiler's emission at the scope arms and the transfer
+sites. ~400 lines across `ir.rs`, `jit.rs` (`runtime` and `jit`), `helpers.rs`, and
+`compiler.rs`, plus a probe per exit class.
+
+**What it would buy.** `liveShadowCatch` 648.67 ns/iter (env path) against the ~7
+that a certified body reaches — a projection, since nothing is implemented. No
+corpus row contains a shadowing shape, so (like the last two slices) this is
+coverage for real code rather than a row delta.
+
+### PROBE (2026-09-20): the JIT's closure-create inversion — the cost is in the shared instantiation core, not the helper
+
+The corpus is dominated by one row: `language/statements/for-in/head-let-
+fresh-binding-per-iteration.js` is **1010ms of the 4250ms total (23.8%)**, and its
+body creates three CAPTURED closures per call (100k calls). Its ablation
+(`scratch/iso/forin-ablation.js`) puts ~11.2us of the 14.8us body in those
+closures, and the same work costs ~6.1us in the interpreter.
+
+**The inversion is specific to closure creation** (`scratch/iso/clocapture.js`,
+100k, ns/body). Isolating create from call (all min-of-5):
+
+| shape | jit | jitless |
+|---|---|---|
+| `plainCalls` (no closures) | 1080 | 1440 |
+| `hoistedCall` (3 calls, no creates) | 1670 | 2000 |
+| `createOnly` / `noCapture` (3 creates) | 7010 / 4430 | 5230 / 3220 |
+| `outerCapture` (captures an outer `let`) | 4770 | 3610 |
+| `loopCapture` (captures the per-iteration `let`) | 7770 | 5050 |
+
+The JIT WINS on calls (hoistedCall -330) and on everything without a closure;
+it loses 1.4-1.6x as soon as one is created. `--jitless` therefore runs
+closure-heavy code faster than the default build.
+
+**What it is not.** No JIT bails: `JIT_DUMP_CLIF` shows compiled bodies for those
+functions (and no `jit bail` line). The JIT's `create_function`/`create_arrow`
+helpers (`crates/runtime/src/jit.rs`) are thin wrappers that call the SAME
+`instantiate_function_expression` the interpreter's arms call, with the same
+`outer_chain.clone()`/`per_iteration_chain.clone()` — so the FFI boundary and the
+clones are not the difference either.
+
+**Where it is.** Instrumenting the shared core `instantiate_function_with_source`
+itself (a temporary `Timer` + counters + the record map's peak length, stripped):
+identical call counts (2,400,022) but **~1.6-2x the per-call cost under the JIT
+(909 vs 552 ns)**, and every phase pays it — the same Rust code is uniformly
+slower, so the cost is not an extra operation but something the shared path READS.
+
+**The cause is GC retention, not the create path.** The JIT's caches hold strong
+references to the closures they cache (e.g. `SlotLeafCell`'s `callee` is kept
+"so its payload can never be reused while the cache entry exists"), so closures
+that die immediately in the interpreter stay alive under the JIT, and
+`Agent::ecma_functions` — one record per closure, never pruned — grows far beyond
+what the program needs. The decisive A/B makes the script OWN the closures
+(`retainedCapture` roots them in a script-level array, so both engines must keep
+them):
+
+| shape | jit | jitless | `ecma_functions` peak |
+|---|---|---|---|
+| `loopCapture` (closures die) | 10930 | 8080 | **10,835 / 1,051** |
+| `retainedCapture` (script roots them) | 15430 | **16950** | 210,050 / 209,770 |
+
+With the map pinned large in BOTH engines the gap closes and the JIT wins; with
+only the JIT pinning it, the JIT loses. The record map is probed by the shared
+path (the register insert, the per-iteration patch), so a ~10x larger map makes
+the whole instantiation path slower — and the cost grows with the closure count,
+which is why the per-call time scaled 705 -> 828 -> 949 ns over N = 2k/20k/200k
+while the interpreter stayed flat (530 -> 432 -> 409). `--jitless` therefore runs
+closure-heavy code faster than the default build, purely because it pins less.
+
+**Fix direction (not yet done).** Stop the JIT caches from PINNING closures: the
+"held for its drop side effect" strong `callee` exists only to make the payload
+identity compare exact, which a (id, generation) validation achieves without a
+root — or bound/prune the pinning so it cannot grow with the closure count.
+Whichever way, the payoff is the closure-heavy share of the corpus (the top row
+alone is 23.8%), and it may also show as a memory win.
+
+**A candidate fix, built, measured and REJECTED.** The instrumentation also
+exposed a provable redundancy: `instantiate_function_with_source` registered the
+record and then patched `per_iteration_chain` through a second keyed
+`ecma_functions` probe + move, per captured closure. Folding it into the record at
+the insert needed a `register_function` parameter (5 call sites) and — applied
+BEFORE the site's shared IR compile — silently changed what the compile sees; two
+unit tests caught it (`generator_closure_per_iteration`,
+`certified_body_global_read_fast_path_stays_spec_exact`). With the ordering
+preserved it measured `loopCapture` **-4.6%** (min-of-9 interleaved, inside the
+noise band) and the 23.8% row **-1.1%** (min-of-8 paired; an earlier -7.1% reading
+came from the wrong ordering). Not worth a 5-call-site signature change at that
+signal, so it was reverted.
+
+**RESOLVED (2026-09-20).** Landed in the entry below. The pin was not
+`SlotLeafCell`: it was the derived read caches (`member_value_cells`,
+`array_element_value_cells`, `for_in_cells`), which the young-root probe named
+directly.
+
+### LANDED (2026-09-20): the derived read caches stop rooting their contents — the closure-create inversion closes
+
+The retention diagnosis above named the wrong owner. A temporary probe that
+counted the YOUNG boxes each `Agent` trace field emits (`trace_roots` grouped
+per field, stripped) put the pin on the read-side caches, not on
+`SlotLeafCell`'s `callee`: on `clocapture.js` `member_value_cells` reported
+**12/12 — every one of its 16 cells held a young box at every collection** —
+and the JIT's per-minor promoted set was a constant 53 boxes (12 `Function` +
+12 `JsObject` + 12 `JsString` + 17 `EnvRecord`), i.e. a few bodies' worth of
+pinned state, re-pinned every minor and reclaimed only by the next major. On
+the corpus's 23.8% row the same probe showed 260 promoted boxes per minor =
+64 `JsObject` + 192 `JsString` + 3 `EnvRecord`: the 64-entry for-in enum
+cache, holding a fresh base and its 3 key strings per entry.
+
+Both are the same defect. A read cache keyed by a receiver and validated on
+the hit path by (id, generation) holds something the LIVE receiver already
+reaches — an own property's value for `member_value_cells`/
+`array_element_value_cells`, the enumeration for `ForInEnumCache` — so tracing
+it is redundant and it retains exactly what the receiver no longer reaches.
+The mechanism of the inversion: a creating loop's read cell pins a
+per-iteration closure, a minor PROMOTES it (so it survives the minor), its
+`ecma_functions` record survives with it, and the record map grows until the
+next major; the shared instantiation path probes that map per create, which is
+why the per-body cost grew with N while the interpreter's stayed flat.
+
+**The fix** (`Agent::clear_derived_caches`, called at both collection
+branches of `maybe_collect`, before the roots are gathered): drop the entries
+of `member_value_cells`, `array_element_value_cells` and `for_in_cells` at
+every collection. It is safe at that point because every handle in a cell has
+been a root since the previous clear, so no sweep could have freed it, and
+because a for-in loop in flight owns its own copy of the key list (`Vm::
+for_in_stack`, traced by `trace_active_vms`). The paths that follow re-warm the
+cells (the full Get / enumerate, or the warm-store front re-record), so the
+only cost is one cold read per site per collection. The cells keep their
+Trace impls and stay roots BETWEEN collections — the change removes the
+across-collection pin, not the cache.
+
+**Isolated shapes** (`scratch/iso/clocapture.js`, N=100k, min-of-5,
+interleaved, ns/body):
+
+| shape | base | fix |
+|---|---|---|
+| `plainCalls` (no creates) | 1220 | 1220 |
+| `hoistedCall` (no creates) | 1510 | 1520 |
+| `createOnly` | 6470 | **5060** |
+| `noCapture` | 4040 | **2820** |
+| `outerCapture` | 5400 | **3880** |
+| `loopCapture` | 9110 | **6320** |
+| `retainedCapture` (script roots them) | 13360 | 13300 |
+
+The signature is the point: the shapes that create NOTHING are untouched, the
+retained case (where the pin is not the problem, the script is) is neutral,
+and every creating shape drops ~2-3x more than the row total.
+
+**The N-scaling curve closes** (`loopCapture`, min-of-5 interleaved, ns/body):
+
+| N | base | fix |
+|---|---|---|
+| 30k | 7467 | **6167** (-17%) |
+| 100k | 8690 | **6270** (-28%) |
+| 300k | 11107 | **6433** (-42%) |
+
+Base grows with N (the retention curve), the fix is flat — so the defect was
+O(closure count), not a constant factor.
+
+**Corpus** (`scratch/paired-iso.sh`, 41 rows, 3 reps, per-binary minima):
+**4175.49 -> 3949.58 ms (-5.4%)**, top row
+`language/statements/for-in/head-let-fresh-binding-per-iteration`
+**-18.0%** (an 8-rep `one-row-ab.sh` run gives -13.7%, so the row sits in the
+-14..-18% band). Other gains: `object_keys` -8.5%, `destructure` -7.5%,
+`apply_call` -5.5%, `recursive_fib` -3.3%, `generator_loop` -2.6%,
+`typed_array` -2.4%, `json_roundtrip` -2.3%. The 3-rep readings that looked
+positive all evaporated at 8 reps (`compound_assign` +5.6% -> -0.6%,
+`concat_loop` +3.6% -> -3.5%, `slice_concat` +3.5% -> -1.2%,
+`closure_capture` +2.8% -> +0.7%, `map_churn` +2.3% -> -0.4%), which is the
+usual load band of this box.
+
+**GC-side** on the for-in row (`--gc-trace`, loaded box): live at the last
+minor **46879 -> 18361** (-61%), promoted per minor **260 -> 4**, majors 2 ->
+1, avg minor pause 2307 -> 2018 us. The live set stops growing with the
+iteration count instead of creeping +211 boxes per minor.
+
+**Not the pin, measured:** `slot_leaf_cells` emitted no young root in these
+shapes and `--jit-bench`'s per-row A/B is unusable at this load (two min-of-5
+runs flip the sign of the same row), so no per-row claim is made from it.
+Residual, bounded: 3 `EnvRecord` + 1 `JsString` promoted per minor, and the
+`SlotLeafCell.callee` strong ref (<=64 cells) kept for payload exactness —
+neither scales with the closure count, so neither is a lever here.
+
+**Gates.** `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace` 36 suites /
+4926 passed / 0 failed; sweeps at baseline — language 23721/0/3, built-ins
+23657/0/155, annexB 1086/0/0, intl402 3205/0/152; `--gc-verify`,
+`--nursery-stress` and `--gc-stress` clean on the closure shapes and on
+`for_in`, `compound_assign`, `slice_concat` and the top row.
+
 ## Deferred milestones
 
 Each milestone is deferred with its gate from PLAN Phase 18. A milestone is
