@@ -28,6 +28,15 @@ use crate::handle::Local;
 use crate::scope::PinScope;
 use crate::support::{BackingStore, Rawable, SharedRef, UniqueRef};
 
+/// How a host releases memory it lent to a backing store
+/// (`v8::BackingStoreDeleterCallback`).
+///
+/// The engine calls it with the same three things a host passed to
+/// [`ArrayBuffer::new_backing_store_from_ptr`]: the bytes, their length, and the
+/// host's own context pointer.
+pub type BackingStoreDeleterCallback =
+    unsafe extern "C" fn(data: *mut c_void, byte_length: usize, deleter_data: *mut c_void);
+
 /// What the agent records for one buffer object, as the store and the queries
 /// below report it.
 struct BufferFacts {
@@ -216,6 +225,50 @@ impl ArrayBuffer {
     /// answers with.
     pub fn new_backing_store_from_bytes<T: Rawable>(bytes: T) -> UniqueRef<BackingStore> {
         UniqueRef::new(BackingStore::from_bytes(bytes.as_bytes()))
+    }
+
+    /// A standalone store over memory the *host* owns, borrowed rather than
+    /// copied (`v8::ArrayBuffer::new_backing_store_from_ptr`).
+    ///
+    /// This is the aliasing constructor, and the difference from
+    /// [`new_backing_store_from_bytes`](Self::new_backing_store_from_bytes) is
+    /// the whole point of it: the host keeps the allocation, the engine reads and
+    /// writes it where it is, so a script writing through a buffer over this
+    /// store writes the host's memory and a host writing there is what the script
+    /// reads. `deleter_callback` is called with `deleter_data` when the last
+    /// reference to the store goes, which is where the host gets its memory back
+    /// — the same moment V8 calls it.
+    ///
+    /// A buffer over such a store is never resizable: the host's allocation is
+    /// what it is.
+    ///
+    /// # Safety
+    ///
+    /// `data_ptr` must point at `byte_length` bytes that stay readable and
+    /// writable until the deleter runs, must be sound to access as bytes, and
+    /// must be released by `deleter_callback` and nothing else for as long as the
+    /// store lives.
+    pub unsafe fn new_backing_store_from_ptr(
+        data_ptr: *mut c_void,
+        byte_length: usize,
+        deleter_callback: BackingStoreDeleterCallback,
+        deleter_data: *mut c_void,
+    ) -> UniqueRef<BackingStore> {
+        // The closure is built outside the `unsafe` block below so that its own
+        // `unsafe` call is the one it reads as: the deleter runs long after this
+        // function returns, and the block it needs is the call's, not this
+        // function's.
+        let release = move || {
+            // SAFETY: the caller promised this is the way to release the bytes,
+            // and this is the only call it gets.
+            unsafe { deleter_callback(data_ptr, byte_length, deleter_data) };
+        };
+        // SAFETY: the caller's contract — the bytes stay valid until `release`
+        // runs, and `release` is the one call that runs it.
+        let block = unsafe {
+            SharedBuffer::borrowed(data_ptr.cast::<u8>(), byte_length, Some(Box::new(release)))
+        };
+        UniqueRef::new(BackingStore::from_buffer(block, byte_length, false))
     }
 }
 
@@ -570,6 +623,112 @@ mod tests {
             eval(scope, "Atomics.store(new Uint8Array(sab), 1, 9)");
             assert_eq!(byte_of(&store, 1), 9);
         });
+    }
+
+    /// Host memory lent to a store is the buffer's storage in both directions: a
+    /// script's write lands in the host's allocation, and the host's write is what
+    /// a script reads. The deleter runs when the last holder goes — not while the
+    /// buffer still has it, and exactly once.
+    #[test]
+    fn a_buffer_over_host_memory_aliases_it() {
+        static FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        unsafe extern "C" fn release(
+            _data: *mut std::ffi::c_void,
+            _byte_length: usize,
+            _deleter_data: *mut std::ffi::c_void,
+        ) {
+            FREED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let mut host = vec![11u8, 22, 33, 44];
+        in_context!(scope, {
+            // SAFETY: `host` outlives the store, and `release` is the only thing
+            // that touches its allocation afterwards.
+            let store = unsafe {
+                ArrayBuffer::new_backing_store_from_ptr(
+                    host.as_mut_ptr().cast::<std::ffi::c_void>(),
+                    host.len(),
+                    release,
+                    std::ptr::null_mut(),
+                )
+            }
+            .make_shared();
+            let buffer = ArrayBuffer::with_backing_store(scope, &store);
+            bind(scope, "ab", buffer.cast::<Value>());
+            assert_eq!(eval_number(scope, "new Uint8Array(ab)[1]"), 22.0);
+
+            eval(scope, "new Uint8Array(ab)[1] = 99");
+            assert_eq!(host[1], 99, "the script wrote the host's memory");
+
+            host[0] = 77;
+            assert_eq!(
+                eval_number(scope, "new Uint8Array(ab)[0]"),
+                77.0,
+                "the host's write is what the script reads"
+            );
+            assert_eq!(buffer.byte_length(), 4);
+
+            // Dropping the store is not the end of the memory: the buffer holds
+            // the block, so the host is not told its bytes are free yet. *When*
+            // they are free is the isolate's lifetime, which
+            // `a_buffer_over_host_memory_releases_it_when_the_isolate_goes`
+            // measures — this macro's isolate outlives its body, so this test
+            // cannot see the release itself.
+            drop(store);
+            assert_eq!(FREED.load(std::sync::atomic::Ordering::SeqCst), 0);
+        });
+    }
+
+    /// When the host's memory comes back: the store holds the block, the buffer
+    /// holds the block, and the isolate holds the buffer — so the release is the
+    /// isolate going, and this measures exactly that.
+    #[test]
+    fn a_buffer_over_host_memory_releases_it_when_the_isolate_goes() {
+        static RELEASED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        unsafe extern "C" fn release(
+            _data: *mut std::ffi::c_void,
+            _byte_length: usize,
+            _deleter_data: *mut std::ffi::c_void,
+        ) {
+            RELEASED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let mut host = vec![1u8, 2, 3, 4];
+        {
+            let mut isolate = crate::Isolate::new(crate::CreateParams::default());
+            crate::scope!(let handle_scope, &mut isolate);
+            let context = crate::Context::new(handle_scope, Default::default());
+            let scope = &mut crate::ContextScope::new(handle_scope, context);
+
+            // SAFETY: `host` outlives the block, and `release` is the only thing
+            // that touches its allocation afterwards.
+            let store = unsafe {
+                ArrayBuffer::new_backing_store_from_ptr(
+                    host.as_mut_ptr().cast::<std::ffi::c_void>(),
+                    host.len(),
+                    release,
+                    std::ptr::null_mut(),
+                )
+            }
+            .make_shared();
+            let buffer = ArrayBuffer::with_backing_store(scope, &store);
+            bind(scope, "ab", buffer.cast::<Value>());
+            assert_eq!(eval_number(scope, "new Uint8Array(ab)[0]"), 1.0);
+
+            drop(store);
+            assert_eq!(
+                RELEASED.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the buffer still holds the host's memory"
+            );
+        }
+        assert_eq!(
+            RELEASED.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "and the host gets it back when the isolate goes"
+        );
     }
 
     fn byte_of(store: &BackingStore, index: usize) -> u8 {

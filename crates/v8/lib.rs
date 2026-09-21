@@ -63,6 +63,7 @@ mod template;
 mod test_support;
 mod value;
 
+pub use array_buffer::BackingStoreDeleterCallback;
 pub use context::ContextOptions;
 pub use data::*;
 pub use exception::Exception;
@@ -111,7 +112,8 @@ pub use serialize::{
 };
 pub use snapshot::{FunctionCodeHandling, StartupData};
 pub use support::{
-    BackingStore, DefaultTag, MapFnFrom, MapFnTo, SharedRef, UniquePtr, UniqueRef, UnitType,
+    BackingStore, DefaultTag, MapFnFrom, MapFnTo, Rawable, SharedRef, UniquePtr, UniqueRef,
+    UnitType,
 };
 
 use runtime::api;

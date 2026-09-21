@@ -554,6 +554,7 @@ number is the certified one.
 | after the primitive array (`PrimitiveArray::new`/`length`/`set`/`get`) and the two typed integer accessors it surfaced (`Uint32::value`, `Int32::value`) | **225** (see below) |
 | after the leftovers (the empty string and a one-byte const, `clear_all_slots`, `Promise::catch`, `get_property_names`, `has_pending_background_tasks`, and the `Global` raw-pointer pair) plus the continuation-value move it forced | **217** (see below) |
 | after the buffer-handing shapes (`ArrayBuffer::new_backing_store_from_bytes` and its `Rawable` widths, and `SharedArrayBuffer::with_backing_store`) | **213** (see below) |
+| after the host-memory store (`ArrayBuffer::new_backing_store_from_ptr`, the borrowed block the engine gained for it, and the `workers` shape that forced) | **209** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -1014,6 +1015,83 @@ mode, inverting the index filter, and stubbing `from_raw` each fail the assertio
 that guards them. The exception is the continuation-value test, whose content *is*
 the borrow shape: it fails to compile if the handle goes back to borrowing its
 scope.
+
+**The host-memory store — landed, 213 → 209, and the first engine change the
+bridge forced.** Four sites were `ArrayBuffer::new_backing_store_from_ptr`
+(`libs/core/runtime/jsruntime.rs:1792/1824/1855` and
+`libs/core/runtime/ops_rust_to_v8.rs:374`), the aliasing constructor: there, the
+host's bytes are read where they are and freed by `deleter_callback` when the
+store dies, and there is no way to fake it. A store that copied the bytes would
+answer a different address and, worse, would leave the host's allocation
+untouched by a script writing through a buffer over it — which is the one thing
+a host uses this constructor for. So the engine grew a block over memory it does
+not own: `SharedBuffer::borrowed(data, byte_length, deleter)`, whose accesses
+reach the host's allocation in both directions and whose deleter runs when the
+last clone goes. Three things made it more than a field.
+
+- **The state box already points at the right place.** `BlockState::data` is the
+  live byte base the JIT's inline element store reads through, and for a
+  borrowed block it is the host's address, set once because host memory does not
+  move. That is why the JIT inline needed no special case, and it is why `resize`
+  refuses rather than reallocating memory the host is still holding.
+- **The block's shape is one shape, not two.** The first cut put the borrowed
+  field behind `cfg(not(feature = "workers"))` — under `workers` a block is an
+  atomic word array, and a host's byte range is not one. That compiled in
+  isolation and left the *workspace* not type-checking: `crates/test262` enables
+  `runtime/workers`, feature unification puts it in the same graph, and
+  `crates/v8` then asked for a constructor that build had compiled out (one
+  `E0599`, `cannot find function borrowed`, with the workspace check failing on
+  it). The fix is the honest one rather than a `cfg` on the bridge: the borrowed
+  block exists in both builds, and what differs is what an *atomic* operation on
+  one does — an owned block under `workers` hands the operation to the machine,
+  a borrowed block takes the plain path it already took single-agent, because
+  the host's bytes are bytes. The dispatch is a shared early return in each
+  accessor (`byte_length`, `block_id`, `read`, `read_into`, `write`, `resize` and
+  the three `atomic_*`), so there is one body per operation and no second,
+  cfg'd copy to drift.
+- **`Send + Sync` for a borrowed block is stated, not implied.** Under `workers`
+  a `SharedBuffer` is moved to a worker thread
+  (`crates/runtime/src/workers.rs:22`), so the `Arc<BorrowedBlock>` needs the
+  bounds. They are `unsafe impl Send`/`Sync` with the reason written down: what a
+  host passes is a C function pointer and registration data, which is `Send` in
+  fact and cannot say so to the compiler — the same assertion
+  `deno/ext/ffi`'s `BackingStoreHolder` makes about the same shape. The
+  constructor's `# Safety` section and the block's doc comment both carry the
+  consequence: a host must not share a borrowed block between agents.
+
+The bridge's half is four lines (`crates/v8/array_buffer.rs`): the C deleter
+becomes the closure the block runs, so `deleter_callback(data_ptr, byte_length,
+`deleter_data`) fires exactly when V8 fires it.
+
+Measured: **213 → 209**, all of it `E0599` (126 → 122) and re-measured from
+`deno/` as 209. The regression this correction removed is not in that number and
+is why it is worth recording: `cargo check -p v8 -p test262` is the probe for the
+unified build, and it failed on the single `E0599` above until the shape was
+unified.
+
+Gates: `cargo test -p byteblock` **2 passed / 0 failed**, and the same **2
+passed** under `--features workers` — the borrowed tests are no longer `cfg`'d
+out of that build, which is where the new path is; `cargo test -p v8 --features
+simdutf` **152 passed / 0 failed**; `clippy --locked --workspace --all-targets --
+-D warnings` clean; `cargo test --locked --workspace` **5,086 passed / 0 failed /
+4 ignored** across 38 binaries with the crashing `v8` test filtered out (5,082
+before: the two `byteblock` borrowed tests were outside a workspace build and now
+run in one, and the two `v8` host-memory tests are this slice's). The borrowed
+path's guard was made to fail rather than argued: replacing the hoisted
+`atomic_load` branch with `return Ok(0)` fails
+`a_borrowed_block_is_the_hosts_bytes` in the `workers` build (`left: 0, right:
+5`) — which is what says that build takes the borrowed path and not the
+word-array one. The deleter counter in the second test is an `Arc<AtomicUsize>`
+for the same reason: under `workers` the block is `Send`, and a test whose
+dealter was an `Rc` would contradict the type it builds.
+
+`byteblock` is an engine crate every runner links, so the sweep battery re-ran
+rather than being argued, and every number is the certified one: test262 `all`
+**48,464 pass / 0 fail / 0 crash / 0 hang** of 48,622 (158 skip) — with none of
+the three `copyWithin` deadline hangs this time — `intl402` **3,205 / 0 / 0 / 0**
+of 3,357 (152 skip), the eight wasm core sweeps **64,594 checks / 0 fail / 0
+pending** (20,662 + 25,990 + 77 + 7,485 + 105 + 654 + 8,709 + 912), and the
+JS-API sweep **1,001 tests / 0 fail**.
 
 **The buffer-handing shapes — landed, 217 → 213, and the engine left alone.** Four
 sites were `ArrayBuffer::new_backing_store_from_bytes` (two) and
@@ -1503,6 +1581,25 @@ if that proves possible.
   reason. Left as an open decision (§12) because the host-facing function has three
   other callers — wasm memory, workers, and the test262 runner — and a change to it
   is a change to their behaviour.
+- **A store over the host's own memory is the shape a copy cannot stand in for,
+  so the engine grew it.** `ArrayBuffer::new_backing_store_from_ptr` is the
+  aliasing constructor: a host hands over a pointer and a C deleter, and the
+  point is that a script writing through a buffer over the store writes the
+  host's bytes. `new_backing_store_from_bytes` could be faked by reading the
+  bytes in, and the only cost was an address a host could not see; this one
+  cannot, because the host's allocation *is* the store. `SharedBuffer::borrowed`
+  is that block, and the decisions inside it are two. It is one shape in both
+  builds, with *plain* atomic operations rather than the machine atomics an owned
+  block gets under `workers` (the host's bytes are not a word array, and a host
+  must not share one between agents — stated in the constructor's `# Safety`
+  section), and it is declared `Send`/`Sync` under `workers` by assertion,
+  because a block travels to a worker thread and what a host passes (a C
+  function pointer plus its registration data) is `Send` in fact but cannot say
+  so to the compiler. The alternative — keeping the borrowed field behind
+  `cfg(not(feature = "workers"))` — was tried and is why this is recorded: it
+  compiled in isolation and left the workspace not type-checking, because
+  `crates/test262` turns `workers` on for the whole unified graph and
+  `crates/v8` then asked for a constructor that same build had compiled out.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
@@ -1517,8 +1614,10 @@ if that proves possible.
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots; (4) module resolver as a
 host trait, unbound scripts, code cache, script origins. Then, in the order the
-shim histogram implies: structured frames and termination, host memory, inspector
-and source maps, traced host objects, structured clone.
+shim histogram implies: structured frames and termination, host memory (partly
+landed — a store over memory the host owns is `SharedBuffer::borrowed`; the
+accounting half, externally allocated memory and backing-store shrink, is not),
+inspector and source maps, traced host objects, structured clone.
 
 Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks;
 (2) grow the surface from the items `deno_core` names, in call order — the name
@@ -1530,7 +1629,8 @@ property bounds to 364, the identity hashes to 351, the embedder-data slots to
 347, private names to 336, the method tail to 292, scheduling and exception
 control to 260, the isolate-level callback vocabulary to 242, the symbol surface
 to 233, the primitive array to 225, the leftovers to 217, the buffer-handing
-shapes to 213, and what is left is the method surface (126 `E0599`s: 72 where a
+shapes to 213, the host-memory store to 209, and what is left is the method
+surface (122 `E0599`s: 72 where a
 value handle is the receiver — the tag shape — 30 on a `Local<…>`, 20 associated
 items on a tag, 4 on another bridge type), the 78 `E0308`s the tag shape
 explains, the 4 names, and four stragglers (3 `E0515`, 1 `E0282`). Three

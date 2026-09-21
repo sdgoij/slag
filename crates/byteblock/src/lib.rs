@@ -42,6 +42,28 @@ fn out_of_bounds() -> OutOfBounds {
     OutOfBounds
 }
 
+/// What `op` makes of `old`: the operation table every non-atomic path shares —
+/// the single-agent paths, and a borrowed block's atomics under `workers` (the
+/// host's bytes are not the word array an owned block is there, so there is no
+/// machine atomic to hand the operation to).
+fn applied_op(op: AtomicOp, old: u64, operand: u64, expected: Option<u64>) -> u64 {
+    match op {
+        AtomicOp::Add => old.wrapping_add(operand),
+        AtomicOp::Sub => old.wrapping_sub(operand),
+        AtomicOp::And => old & operand,
+        AtomicOp::Or => old | operand,
+        AtomicOp::Xor => old ^ operand,
+        AtomicOp::Exchange => operand,
+        AtomicOp::CompareExchange => {
+            if old == expected.unwrap_or(0) {
+                operand
+            } else {
+                old
+            }
+        }
+    }
+}
+
 /// The shared per-buffer geometry every view reads live (all clones of a
 /// [`SharedBuffer`] reference one box): the byte base and the writable
 /// flags. One box keeps the JIT's inline element store (gap-close M5c)
@@ -134,6 +156,66 @@ type StateRc = Rc<BlockState>;
 #[cfg(feature = "workers")]
 type StateRc = std::sync::Arc<BlockState>;
 
+/// Memory the host owns, borrowed for as long as a block over it is alive.
+///
+/// The deleter runs when the last clone of the block goes — the same moment
+/// V8's `BackingStore` deleter runs — so the host gets its allocation back
+/// exactly when the JavaScript value that used it is gone. `None` is for memory
+/// the host means to keep, such as a `static`: there is then nothing to run.
+///
+/// The bytes are the host's allocation and not this crate's, so there is no
+/// storage to describe: the block is a pointer, a length and a way to release
+/// it, in both builds. What differs under `workers` is what an *atomic* operation
+/// on one does — an owned block there is a word array and hands the operation to
+/// the machine, while the host's memory is only bytes, so a borrowed block's
+/// atomics are plain accesses. A host must not share a borrowed block between
+/// agents for that reason.
+struct BorrowedBlock {
+    data: *mut u8,
+    byte_length: usize,
+    deleter: Option<Box<dyn FnOnce()>>,
+}
+
+/// Where a borrowed block is held: `Rc` single-agent, `Arc` under `workers`,
+/// because there the block itself travels to another agent's thread
+/// (`runtime::workers::spawn_worker` moves one) and so must be `Send + Sync`.
+#[cfg(not(feature = "workers"))]
+type BorrowedRc = Rc<BorrowedBlock>;
+#[cfg(feature = "workers")]
+type BorrowedRc = std::sync::Arc<BorrowedBlock>;
+
+// SAFETY: the host's bytes and its deleter do not become thread-safe by being
+// held here, and this is the contract the constructor's caller accepts: under
+// `workers` the block can be moved to the agent thread that uses it, so the
+// memory must be usable there and the deleter must tolerate running there. The
+// promise lives here rather than in a `Send` bound on the deleter because what a
+// host actually passes — a C function pointer and the `*mut c_void` data it was
+// registered with — is `Send` in fact and cannot say so to the compiler. V8's
+// own backing store makes the same assertion about the same shape.
+#[cfg(feature = "workers")]
+unsafe impl Send for BorrowedBlock {}
+// SAFETY: as `Send` above.
+#[cfg(feature = "workers")]
+unsafe impl Sync for BorrowedBlock {}
+
+impl std::fmt::Debug for BorrowedBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BorrowedBlock")
+            .field("data", &self.data)
+            .field("byte_length", &self.byte_length)
+            .field("deleter", &self.deleter.is_some())
+            .finish()
+    }
+}
+
+impl Drop for BorrowedBlock {
+    fn drop(&mut self) {
+        if let Some(deleter) = self.deleter.take() {
+            deleter();
+        }
+    }
+}
+
 /// The [[ArrayBufferData]] of an ArrayBuffer: a shared byte vector aliased
 /// by every TypedArray that views the buffer (spec 25.1.1).
 ///
@@ -151,6 +233,16 @@ pub struct SharedBuffer {
     block: std::sync::Arc<[std::sync::atomic::AtomicU64]>,
     #[cfg(feature = "workers")]
     byte_length: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The host's bytes, when this block borrows rather than owns them.
+    ///
+    /// `None` for every block the engine allocated, and `block` above is then
+    /// the storage. A borrowed block keeps `block` empty, because its bytes live
+    /// in the host's allocation: every access path through the block checks this
+    /// first and reads the host's memory directly. The address it holds is also
+    /// what [`BlockState::data`] points at, so the JIT's inline element store
+    /// (which reads the base through the state box) needs no special case —
+    /// borrowed memory does not move, so the base is stable by construction.
+    borrowed: Option<BorrowedRc>,
     /// The shared geometry box (see [`BlockState`]); every clone shares it
     /// (`Rc` single-agent, `Arc` under `workers`).
     state_rc: StateRc,
@@ -195,6 +287,7 @@ impl SharedBuffer {
             let state = &*state_rc as *const BlockState as usize;
             SharedBuffer {
                 block,
+                borrowed: None,
                 state_rc,
                 state,
             }
@@ -213,10 +306,74 @@ impl SharedBuffer {
             SharedBuffer {
                 block,
                 byte_length: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(byte_length)),
+                borrowed: None,
                 state_rc,
                 state,
             }
         }
+    }
+
+    /// A block over memory the host owns, borrowed rather than copied.
+    ///
+    /// The host keeps the allocation, so an access through this block is an
+    /// access through the host's bytes in both directions — which is what makes
+    /// this the constructor for handing memory the host also works with.
+    ///
+    /// The block owns nothing, so it cannot be resized: the host's allocation is
+    /// what it is, and `resize` refuses rather than reallocating memory the host
+    /// would still be holding.
+    ///
+    /// Under `workers` the block travels in an `Arc` like any other, but its
+    /// atomic operations stay plain accesses rather than machine atomics, and the
+    /// host must not share one of these blocks between agents: the storage here is
+    /// the host's byte range, not the word array an owned block is.
+    ///
+    /// # Safety
+    ///
+    /// `data` must point at `byte_length` bytes that stay readable and writable
+    /// for as long as any clone of this block lives, and that are sound to access
+    /// as bytes. `deleter` must be the right way to release them, and runs when
+    /// the last clone goes. In a `workers` build the last clone can be dropped on
+    /// another thread, so the memory and the deleter must be sound to use there.
+    pub unsafe fn borrowed(
+        data: *mut u8,
+        byte_length: usize,
+        deleter: Option<Box<dyn FnOnce()>>,
+    ) -> Self {
+        let borrowed = BorrowedRc::new(BorrowedBlock {
+            data,
+            byte_length,
+            deleter,
+        });
+        // The state box's base is the host's address, which borrowed memory does
+        // not move out of, so it is set once and never refreshed.
+        let state_rc = StateRc::new(BlockState::new(data as usize));
+        let state = &*state_rc as *const BlockState as usize;
+        #[cfg(not(feature = "workers"))]
+        let block = Rc::new(RefCell::new(Vec::new()));
+        // No words: the bytes are the host's, and every path that would read the
+        // block's storage checks `borrowed` first.
+        #[cfg(feature = "workers")]
+        let block = std::sync::Arc::from(Vec::new());
+        #[cfg(feature = "workers")]
+        let byte_length = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(byte_length));
+        SharedBuffer {
+            block,
+            #[cfg(feature = "workers")]
+            byte_length,
+            borrowed: Some(borrowed),
+            state_rc,
+            state,
+        }
+    }
+
+    /// Whether this block borrows the host's memory rather than owning its own.
+    ///
+    /// A host that hands memory over wants to know: the bytes are then shared
+    /// with whoever owns them, which is the point, and a buffer over this block
+    /// must not be assumed to have storage of its own.
+    pub fn is_borrowed(&self) -> bool {
+        self.borrowed.is_some()
     }
 
     /// Mark the owning buffer detached (mirrors the runtime's `BufferState`).
@@ -333,6 +490,9 @@ impl SharedBuffer {
     }
 
     pub fn byte_length(&self) -> usize {
+        if let Some(borrowed) = &self.borrowed {
+            return borrowed.byte_length;
+        }
         #[cfg(not(feature = "workers"))]
         {
             self.block.borrow().len()
@@ -346,6 +506,12 @@ impl SharedBuffer {
     /// A stable identity for the underlying byte block (the allocation
     /// address), used to key the Atomics wait registry.
     pub fn block_id(&self) -> usize {
+        if let Some(borrowed) = &self.borrowed {
+            // The identity of borrowed memory is the host's address: two blocks
+            // over one allocation are one block to the registry, as they are to
+            // everything else that addresses the bytes.
+            return borrowed.data as usize;
+        }
         #[cfg(not(feature = "workers"))]
         {
             Rc::as_ptr(&self.block) as usize
@@ -394,6 +560,18 @@ impl SharedBuffer {
     /// Copy `len` bytes out of the block at `offset` (a plain read; the
     /// caller synchronizes concurrent access).
     pub fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>, OutOfBounds> {
+        if let Some(borrowed) = &self.borrowed {
+            if offset + len > borrowed.byte_length {
+                return Err(out_of_bounds());
+            }
+            let mut out = vec![0u8; len];
+            // SAFETY: bounds-checked above, and the host promised the bytes
+            // stay valid for as long as this block lives.
+            unsafe {
+                std::ptr::copy_nonoverlapping(borrowed.data.add(offset), out.as_mut_ptr(), len);
+            }
+            return Ok(out);
+        }
         #[cfg(not(feature = "workers"))]
         {
             let data = self.block.borrow();
@@ -422,6 +600,21 @@ impl SharedBuffer {
     /// `Vec` would be pure churn). Errors like `read` when the range is out
     /// of bounds.
     pub fn read_into(&self, offset: usize, out: &mut [u8]) -> Result<(), OutOfBounds> {
+        if let Some(borrowed) = &self.borrowed {
+            if offset + out.len() > borrowed.byte_length {
+                return Err(out_of_bounds());
+            }
+            // SAFETY: bounds-checked above, and the host promised the bytes
+            // stay valid for as long as this block lives.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    borrowed.data.add(offset),
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+            }
+            return Ok(());
+        }
         #[cfg(not(feature = "workers"))]
         {
             let data = self.block.borrow();
@@ -446,6 +639,21 @@ impl SharedBuffer {
     /// Copy `bytes` into the block at `offset` (a plain write; the caller
     /// synchronizes concurrent access).
     pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), OutOfBounds> {
+        if let Some(borrowed) = &self.borrowed {
+            if offset + bytes.len() > borrowed.byte_length {
+                return Err(out_of_bounds());
+            }
+            // SAFETY: bounds-checked above, and the host promised the bytes
+            // stay writable for as long as this block lives.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    borrowed.data.add(offset),
+                    bytes.len(),
+                );
+            }
+            return Ok(());
+        }
         #[cfg(not(feature = "workers"))]
         {
             let mut data = self.block.borrow_mut();
@@ -475,6 +683,13 @@ impl SharedBuffer {
     /// clone — and zero-fills the newly exposed region on a grow. The
     /// single-agent path resizes the shared `Vec` in place.
     pub fn resize(&mut self, new_length: usize) -> Result<(), OutOfBounds> {
+        if self.borrowed.is_some() {
+            // Borrowed memory cannot grow: the allocation belongs to the host,
+            // which is still holding it. `OutOfBounds` is the only failure this
+            // signature can report, and the honest reading of it here is "that
+            // length is not inside a block this one can be".
+            return Err(out_of_bounds());
+        }
         #[cfg(not(feature = "workers"))]
         {
             self.block.borrow_mut().resize(new_length, 0);
@@ -507,8 +722,14 @@ impl SharedBuffer {
     }
 
     /// The first `size` bytes at `offset` as the native-order integer they
-    /// encode, read atomically under `workers` (plain under single-agent).
+    /// encode, read atomically under `workers` for a block the engine owns (plain
+    /// single-agent, and plain in either build for a borrowed block — the host's
+    /// bytes are not this crate's word array).
     pub fn atomic_load(&self, offset: usize, size: usize) -> Result<u64, OutOfBounds> {
+        if self.borrowed.is_some() {
+            let bytes = self.read(offset, size)?;
+            return raw_from_bytes(&bytes);
+        }
         #[cfg(feature = "workers")]
         {
             if offset + size > self.byte_length() {
@@ -534,8 +755,12 @@ impl SharedBuffer {
     }
 
     /// Store `value` (the native-order integer encoding of the first `size`
-    /// bytes) at `offset`, atomically under `workers`.
+    /// bytes) at `offset`, atomically under `workers` for a block the engine owns
+    /// and as a plain write for a borrowed one.
     pub fn atomic_store(&self, offset: usize, size: usize, value: u64) -> Result<(), OutOfBounds> {
+        if self.borrowed.is_some() {
+            return self.write(offset, &bytes_from_raw(value, size)?);
+        }
         #[cfg(feature = "workers")]
         {
             if offset + size > self.byte_length() {
@@ -563,7 +788,8 @@ impl SharedBuffer {
 
     /// The atomic read-modify-write of `op` on the `size`-byte integer at
     /// `offset`, returning the old value. `expected` is the compare value for
-    /// `CompareExchange`. Real atomics under `workers`; a plain RMW otherwise.
+    /// `CompareExchange`. Real atomics under `workers` for a block the engine
+    /// owns; a plain RMW in every other case.
     pub fn atomic_rmw(
         &self,
         op: AtomicOp,
@@ -572,6 +798,17 @@ impl SharedBuffer {
         operand: u64,
         expected: Option<u64>,
     ) -> Result<u64, OutOfBounds> {
+        if self.borrowed.is_some() {
+            // The same read-modify-write, one step removed: `read` and `write`
+            // reach the host's bytes, so the compound operation does not need a
+            // path of its own through them.
+            let mut bytes = self.read(offset, size)?;
+            let old = raw_from_bytes(&bytes)?;
+            let next = applied_op(op, old, operand, expected);
+            bytes.copy_from_slice(&bytes_from_raw(next, size)?);
+            self.write(offset, &bytes)?;
+            return Ok(old);
+        }
         #[cfg(feature = "workers")]
         {
             if offset + size > self.byte_length() {
@@ -698,21 +935,7 @@ impl SharedBuffer {
                 return Err(out_of_bounds());
             };
             let old = raw_from_bytes(slot)?;
-            let next = match op {
-                AtomicOp::Add => old.wrapping_add(operand),
-                AtomicOp::Sub => old.wrapping_sub(operand),
-                AtomicOp::And => old & operand,
-                AtomicOp::Or => old | operand,
-                AtomicOp::Xor => old ^ operand,
-                AtomicOp::Exchange => operand,
-                AtomicOp::CompareExchange => {
-                    if old == expected.unwrap_or(0) {
-                        operand
-                    } else {
-                        old
-                    }
-                }
-            };
+            let next = applied_op(op, old, operand, expected);
             if next != old {
                 slot.copy_from_slice(&bytes_from_raw(next, size)?);
             }
@@ -729,7 +952,6 @@ impl SharedBuffer {
     }
 }
 /// The native-order integer the first `size` bytes encode.
-#[cfg(not(feature = "workers"))]
 fn raw_from_bytes(bytes: &[u8]) -> Result<u64, OutOfBounds> {
     match bytes.len() {
         1 => Ok(bytes[0] as u64),
@@ -743,11 +965,103 @@ fn raw_from_bytes(bytes: &[u8]) -> Result<u64, OutOfBounds> {
 }
 
 /// The first `size` bytes of the native-order integer `raw`.
-#[cfg(not(feature = "workers"))]
 fn bytes_from_raw(raw: u64, size: usize) -> Result<Vec<u8>, OutOfBounds> {
     let all = raw.to_ne_bytes();
     match size {
         1 | 2 | 4 | 8 => Ok(all[..size].to_vec()),
         _ => Err(out_of_bounds()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A borrowed block *is* the host's bytes: a write through it is a write to
+    /// the host's allocation and the other way round, which is the whole reason
+    /// for the constructor. The state box points at the host's memory too, which
+    /// is what the JIT's inline element store reads.
+    #[test]
+    fn a_borrowed_block_is_the_hosts_bytes() {
+        let mut host = vec![1u8, 2, 3, 4];
+        // SAFETY: the host's `Vec` outlives the block, which is the contract.
+        let mut block = unsafe { SharedBuffer::borrowed(host.as_mut_ptr(), host.len(), None) };
+
+        assert!(block.is_borrowed());
+        assert_eq!(block.byte_length(), 4);
+        assert_eq!(block.data_ptr(), host.as_mut_ptr());
+        assert_eq!(block.read(0, 2).unwrap(), vec![1, 2]);
+
+        block.write(1, &[9, 9]).unwrap();
+        assert_eq!(
+            host,
+            vec![1, 9, 9, 4],
+            "the write landed in the host's bytes"
+        );
+        host[3] = 8;
+        assert_eq!(
+            block.read(3, 1).unwrap(),
+            vec![8],
+            "and the host's write is read back"
+        );
+
+        // Bounds are the block's, and a refusal leaves the host's memory alone.
+        assert!(block.read(3, 2).is_err());
+        assert!(block.write(3, &[0, 0]).is_err());
+        assert_eq!(host, vec![1, 9, 9, 8]);
+
+        // A clone is the same memory, and the single-agent atomics go through it.
+        let clone = block.clone();
+        assert_eq!(
+            clone.block_id(),
+            block.block_id(),
+            "one allocation, one identity"
+        );
+        block.atomic_store(0, 1, 5).unwrap();
+        assert_eq!(block.atomic_load(0, 1).unwrap(), 5);
+        assert_eq!(block.atomic_rmw(AtomicOp::Add, 0, 1, 2, None).unwrap(), 5);
+        assert_eq!(host[0], 7);
+
+        // Growing is refused: the allocation is the host's.
+        assert!(block.resize(8).is_err());
+        assert_eq!(block.byte_length(), 4);
+    }
+
+    /// The deleter is the host's way of getting its memory back, and it runs when
+    /// the last clone of the block goes — not before, and exactly once. The counter
+    /// is a shared atomic rather than an `Rc` because under `workers` a block is
+    /// `Send` and its deleter may run on another thread; a test whose deleter
+    /// contradicted that would be lying about the type it builds.
+    #[test]
+    fn a_borrowed_block_releases_its_memory_once() {
+        let mut host = vec![0u8; 2];
+        let freed = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&freed);
+        // SAFETY: as above; the deleter is the only thing that touches `host`'s
+        // allocation, and it runs after every clone is gone.
+        let block = unsafe {
+            SharedBuffer::borrowed(
+                host.as_mut_ptr(),
+                host.len(),
+                Some(Box::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+        };
+        let clone = block.clone();
+
+        drop(block);
+        assert_eq!(
+            freed.load(Ordering::SeqCst),
+            0,
+            "a live clone keeps the host's memory"
+        );
+        drop(clone);
+        assert_eq!(
+            freed.load(Ordering::SeqCst),
+            1,
+            "the last clone releases it, once"
+        );
     }
 }
