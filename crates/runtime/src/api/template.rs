@@ -147,6 +147,14 @@ impl FunctionTemplate {
         self.length.set(length.max(0) as u32);
     }
 
+    /// The host callback this template dispatches to, for a caller that needs
+    /// the function rather than the template — the bridge's accessor
+    /// properties take their getter and setter as function *templates*, and the
+    /// call is what a template's callback is.
+    pub fn callback(&self) -> Option<Rc<FunctionCallback>> {
+        self.callback.borrow().clone()
+    }
+
     /// Say whether the function this template makes may be constructed
     /// (`ConstructorBehavior::Allow` there).
     pub fn set_constructible(&self, constructible: bool) {
@@ -300,16 +308,48 @@ enum TemplateProperty {
     Data {
         name: JsString,
         value: Value,
+        attributes: PropertyAttributes,
     },
     Accessor {
         name: JsString,
         getter: Rc<FunctionCallback>,
         setter: Option<Rc<FunctionCallback>>,
+        attributes: PropertyAttributes,
     },
     SubTemplate {
         name: JsString,
         template: Rc<ObjectTemplate>,
     },
+}
+
+/// The attributes a template's properties are created with
+/// (v8::PropertyAttribute).
+///
+/// The defaults are the crate's `None` — writable, enumerable, configurable —
+/// and the negative flags are how the crate spells the other three, so this
+/// carries the same three decisions under their own names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PropertyAttributes {
+    /// `PropertyAttribute::READ_ONLY`: instances get it non-writable.
+    pub read_only: bool,
+    /// `PropertyAttribute::DONT_ENUM`: it does not show up in a key walk.
+    pub dont_enum: bool,
+    /// `PropertyAttribute::DONT_DELETE`: deleting it is refused.
+    pub dont_delete: bool,
+}
+
+impl PropertyAttributes {
+    fn writable(self) -> bool {
+        !self.read_only
+    }
+
+    fn enumerable(self) -> bool {
+        !self.dont_enum
+    }
+
+    fn configurable(self) -> bool {
+        !self.dont_delete
+    }
 }
 
 impl ObjectTemplate {
@@ -328,9 +368,16 @@ impl ObjectTemplate {
 
     /// Define a data property (v8::ObjectTemplate::Set).
     pub fn set(&self, name: &str, value: Local) {
+        self.set_with_attributes(name, value, PropertyAttributes::default());
+    }
+
+    /// Define a data property with attributes (v8::ObjectTemplate::Set's third
+    /// argument, which is where a host's `DONT_ENUM | READ_ONLY` goes).
+    pub fn set_with_attributes(&self, name: &str, value: Local, attributes: PropertyAttributes) {
         self.properties.borrow_mut().push(TemplateProperty::Data {
             name: JsString::from_utf8(name),
             value: value.into_value(),
+            attributes,
         });
     }
 
@@ -354,12 +401,39 @@ impl ObjectTemplate {
         getter: FunctionCallback,
         setter: Option<FunctionCallback>,
     ) {
+        self.set_accessor_with_attributes(name, getter, setter, PropertyAttributes::default());
+    }
+
+    /// Define an accessor property with attributes
+    /// (v8::ObjectTemplate::SetAccessor's attribute argument).
+    pub fn set_accessor_with_attributes(
+        &self,
+        name: &str,
+        getter: FunctionCallback,
+        setter: Option<FunctionCallback>,
+        attributes: PropertyAttributes,
+    ) {
+        self.set_accessor_rc(name, Rc::new(getter), setter.map(Rc::new), attributes);
+    }
+
+    /// The same over callbacks the caller already holds shared, which is the
+    /// shape an accessor built from two *function templates* arrives in: their
+    /// callback is the template's own, and cloning the `Rc` is the whole
+    /// conversion.
+    pub fn set_accessor_rc(
+        &self,
+        name: &str,
+        getter: Rc<FunctionCallback>,
+        setter: Option<Rc<FunctionCallback>>,
+        attributes: PropertyAttributes,
+    ) {
         self.properties
             .borrow_mut()
             .push(TemplateProperty::Accessor {
                 name: JsString::from_utf8(name),
-                getter: Rc::new(getter),
-                setter: setter.map(Rc::new),
+                getter,
+                setter,
+                attributes,
             });
     }
 
@@ -391,14 +465,18 @@ impl ObjectTemplate {
             .and_then(|value| crate::context::as_object(&value));
         for property in self.properties.borrow().iter() {
             match property {
-                TemplateProperty::Data { name, value } => {
+                TemplateProperty::Data {
+                    name,
+                    value,
+                    attributes,
+                } => {
                     target.define_property_or_throw(
                         name,
                         &PropertyDescriptor {
                             value: Some(*value),
-                            writable: Some(true),
-                            enumerable: Some(true),
-                            configurable: Some(true),
+                            writable: Some(attributes.writable()),
+                            enumerable: Some(attributes.enumerable()),
+                            configurable: Some(attributes.configurable()),
                             get: None,
                             set: None,
                         },
@@ -408,6 +486,7 @@ impl ObjectTemplate {
                     name,
                     getter,
                     setter,
+                    attributes,
                 } => {
                     let get = host_function(
                         self.isolate,
@@ -440,8 +519,8 @@ impl ObjectTemplate {
                             writable: None,
                             get: Some(Value::Function(get)),
                             set,
-                            enumerable: Some(true),
-                            configurable: Some(true),
+                            enumerable: Some(attributes.enumerable()),
+                            configurable: Some(attributes.configurable()),
                         },
                     )?;
                 }

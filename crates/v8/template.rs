@@ -11,11 +11,12 @@ use std::rc::Rc;
 use runtime::api;
 
 use crate::data::{
-    Data, External, Function, FunctionTemplate, Name, ObjectTemplate, String, Value,
+    Data, External, Function, FunctionTemplate, Name, Object, ObjectTemplate, String, Value,
 };
 use crate::fast_api::CFunction;
 use crate::function::{FunctionBuilder, FunctionCallback, FunctionCallbackInfo, SideEffectType};
 use crate::handle::{Global, Local, LocalHandle};
+use crate::property::PropertyAttribute;
 use crate::scope::PinScope;
 use crate::support::MapFnTo;
 
@@ -194,9 +195,8 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
     /// (v8::ObjectTemplate::Set, which is `Template::Set` in the crate we stand
     /// in for).
     ///
-    /// The property is a plain data property with the crate's defaults
-    /// (writable, enumerable, configurable); the attributes overload is absent
-    /// until a host asks for it.
+    /// The property is a plain data property: writable, enumerable and
+    /// configurable ([`set_with_attr`](Self::set_with_attr) is the other three).
     ///
     /// # Panics
     ///
@@ -205,12 +205,70 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
     /// gives this method no channel to report that on, so the alternative to
     /// this panic is a property that silently does not exist.
     pub fn set(&self, key: Local<'_, Name>, value: Local<'_, Data>) {
-        let Some(name) = key.engine().as_string() else {
-            panic!(
-                "bridge: a template property key must be a string (the engine's templates are string-keyed)"
-            );
+        self.set_with_attr(key, value, PropertyAttribute::NONE);
+    }
+
+    /// The same with the attributes the host asked for
+    /// (`v8::ObjectTemplate::Set`'s third argument).
+    pub fn set_with_attr(
+        &self,
+        key: Local<'_, Name>,
+        value: Local<'_, Data>,
+        attr: PropertyAttribute,
+    ) {
+        let name = template_key_name(&key);
+        self.object_template()
+            .set_with_attributes(&name, *value.engine(), engine_attributes(attr));
+    }
+
+    /// Define an accessor property whose getter and setter are the functions two
+    /// *function templates* make (`v8::ObjectTemplate::SetAccessorProperty`).
+    ///
+    /// There the getter and setter are `FunctionTemplate`s and what a call
+    /// reaches is the template's own callback, which is what this engine's
+    /// accessor property takes — so the pair travels rather than being rewrapped.
+    ///
+    /// # Panics
+    ///
+    /// If `key` is not a string (as [`set`](Self::set)), and if both `getter`
+    /// and `setter` are `None`, which is the crate's own assertion: an accessor
+    /// with neither half could only throw on every access.
+    pub fn set_accessor_property(
+        &self,
+        key: Local<'_, Name>,
+        getter: Option<Local<'_, FunctionTemplate>>,
+        setter: Option<Local<'_, FunctionTemplate>>,
+        attr: PropertyAttribute,
+    ) {
+        assert!(
+            getter.is_some() || setter.is_some(),
+            "bridge: an accessor property needs a getter or a setter"
+        );
+        let name = template_key_name(&key);
+        let callback = |template: &Local<'_, FunctionTemplate>| {
+            template
+                .template_rc()
+                .callback()
+                .expect("bridge: a template made from a builder has a callback")
         };
-        self.object_template().set(&name, *value.engine());
+        let getter = getter.map(|template| callback(&template));
+        let setter = setter.map(|template| callback(&template));
+        // The crate refuses an accessor with neither half, so at least one is
+        // here and it can fill the getter slot.
+        let getter = getter.or_else(|| setter.clone()).expect("accessor");
+        self.object_template()
+            .set_accessor_rc(&name, getter, setter, engine_attributes(attr));
+    }
+
+    /// Create an instance in the scope's realm
+    /// (`v8::ObjectTemplate::NewInstance`).
+    ///
+    /// `None` when the realm cannot produce one, which is where a pending
+    /// exception would be.
+    pub fn new_instance(&self, scope: &PinScope<'s, '_, ()>) -> Option<Local<'s, Object>> {
+        let realm = crate::realm_of(scope);
+        let value = self.object_template().new_instance(&realm).ok()?;
+        Some(Local::from_engine(value))
     }
 
     fn object_template(&self) -> &api::ObjectTemplate {
@@ -219,6 +277,25 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
         // ownership of, and the isolate outlives every handle on it.
         unsafe { &*(pointer as *const api::ObjectTemplate) }
     }
+}
+
+/// The crate's property attributes as the engine's three flags: they name the
+/// same three decisions, and the crate spells two of them negatively.
+fn engine_attributes(attr: PropertyAttribute) -> api::PropertyAttributes {
+    api::PropertyAttributes {
+        read_only: attr.has(PropertyAttribute::READ_ONLY),
+        dont_enum: attr.has(PropertyAttribute::DONT_ENUM),
+        dont_delete: attr.has(PropertyAttribute::DONT_DELETE),
+    }
+}
+
+/// The engine's templates are string-keyed and the crate gives a method that
+/// takes a key no channel to report otherwise, so this is where that is said
+/// out loud instead of becoming a property that silently does not exist.
+fn template_key_name(key: &Local<'_, Name>) -> std::string::String {
+    key.engine().as_string().unwrap_or_else(|| {
+        panic!("bridge: a template property key must be a string (the engine's templates are string-keyed)")
+    })
 }
 
 /// Store an engine object template on the isolate and hand back the handle that
@@ -342,6 +419,107 @@ mod tests {
             let function: Local<'_, Function> = template.get_function(scope).expect("function");
             bind(scope, "fast_sum", function.cast::<Value>());
             assert_eq!(eval_number(scope, "fast_sum(2, 3)"), 5.0);
+        });
+    }
+
+    /// An instance made from an object template carries what the host put
+    /// there, and a property the host asked for attributes on is created with
+    /// them: `DONT_ENUM` keeps it out of a key walk, `READ_ONLY` is the
+    /// descriptor's `writable`.
+    #[test]
+    fn an_object_template_installs_its_properties_with_their_attributes() {
+        in_context!(scope, {
+            let template = ObjectTemplate::new(scope);
+            let visible: Local<'_, Name> = String::new(scope, "visible").expect("string").into();
+            template.set(visible, Number::new(scope, 1.0).cast::<Data>());
+            let hidden: Local<'_, Name> = String::new(scope, "hidden").expect("string").into();
+            template.set_with_attr(
+                hidden,
+                Number::new(scope, 2.0).cast::<Data>(),
+                PropertyAttribute::DONT_ENUM | PropertyAttribute::READ_ONLY,
+            );
+
+            let instance = template.new_instance(scope).expect("instance");
+            bind(scope, "instance", instance.cast::<Value>());
+            assert_eq!(eval_number(scope, "instance.visible"), 1.0);
+            assert_eq!(
+                eval_number(scope, "instance.hidden"),
+                2.0,
+                "a non-enumerable property is still readable"
+            );
+            assert_eq!(
+                eval_number(scope, "Object.keys(instance).length"),
+                1.0,
+                "DONT_ENUM keeps it out of a key walk"
+            );
+            assert_eq!(
+                eval_number(
+                    scope,
+                    "Object.getOwnPropertyDescriptor(instance, 'hidden').writable ? 1 : 0"
+                ),
+                0.0,
+                "READ_ONLY is the descriptor's writable, and it is false"
+            );
+            assert_eq!(
+                eval_number(
+                    scope,
+                    "Object.getOwnPropertyDescriptor(instance, 'hidden').enumerable ? 1 : 0"
+                ),
+                0.0
+            );
+            assert_eq!(
+                eval_number(
+                    scope,
+                    "Object.getOwnPropertyDescriptor(instance, 'visible').writable ? 1 : 0"
+                ),
+                1.0,
+                "and a property with no attributes keeps the crate's defaults"
+            );
+        });
+    }
+
+    /// The answer a getter template's callback gives.
+    fn forty_two(_scope: &mut PinScope<'_, '_>, _args: FunctionCallbackArguments, rv: ReturnValue) {
+        let number = crate::Number::new(_scope, 42.0);
+        rv.set(number.into());
+    }
+
+    /// A setter that accepts whatever it is given.
+    fn accept(_scope: &mut PinScope<'_, '_>, _args: FunctionCallbackArguments, rv: ReturnValue) {
+        let undefined = crate::undefined(_scope);
+        rv.set(undefined.into());
+    }
+
+    /// An accessor property installed from two function *templates*: reading it
+    /// runs the getter template's callback and writing runs the setter's, which
+    /// is how a host registers a property that is backed by an op.
+    #[test]
+    fn an_accessor_property_runs_the_callbacks_of_its_templates() {
+        in_context!(scope, {
+            let template = ObjectTemplate::new(scope);
+            let key: Local<'_, Name> = String::new(scope, "answer").expect("string").into();
+            let getter = FunctionTemplate::new(scope, forty_two);
+            let setter = FunctionTemplate::new(scope, accept);
+            template.set_accessor_property(
+                key,
+                Some(getter),
+                Some(setter),
+                PropertyAttribute::NONE,
+            );
+
+            let instance = template.new_instance(scope).expect("instance");
+            bind(scope, "instance", instance.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "instance.answer"),
+                42.0,
+                "the getter template's callback is what a read runs"
+            );
+            // The setter runs and answers undefined, so the assignment is
+            // accepted rather than throwing, and the getter still stands.
+            assert_eq!(
+                eval_number(scope, "instance.answer = 7, instance.answer"),
+                42.0
+            );
         });
     }
 

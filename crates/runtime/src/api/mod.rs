@@ -37,7 +37,8 @@ pub use object::{Array, Object};
 pub use promise::Promise;
 pub use script::Script;
 pub use template::{
-    FunctionCallback, FunctionCallbackInfo, FunctionTemplate, ObjectTemplate, ReturnValue,
+    FunctionCallback, FunctionCallbackInfo, FunctionTemplate, ObjectTemplate, PropertyAttributes,
+    ReturnValue,
 };
 pub use try_catch::{Exception, TryCatch};
 

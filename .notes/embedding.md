@@ -557,6 +557,7 @@ number is the certified one.
 | after the host-memory store (`ArrayBuffer::new_backing_store_from_ptr`, the borrowed block the engine gained for it, and the `workers` shape that forced) | **209** (see below) |
 | after the tag shape (`Local<'s, T>: Deref<Target = T>`, the tag receiver chain, and the `LocalHandle` the methods sit on until they move) | **62** (see below) |
 | after the template surface a host fills in (the prototype and instance templates, `ObjectTemplate::{new, set}`, the two `String` conversions and `build_fast`) | **56** (see below) |
+| after the attribute-carrying half of the template cluster (`PropertyAttributes` in the engine, `ObjectTemplate::{set_with_attr, set_accessor_property, new_instance}`) | **52** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -1017,6 +1018,51 @@ mode, inverting the index filter, and stubbing `from_raw` each fail the assertio
 that guards them. The exception is the continuation-value test, whose content *is*
 the borrow shape: it fails to compile if the handle goes back to borrowing its
 scope.
+
+**The attribute-carrying half of the template cluster — landed, 56 → 52, and the
+first engine change since the borrowed block.** Four sites: `ObjectTemplate::set_with_attr`
+(`error.rs:2119`), `new_instance` (`cppgc.rs:59`, `error.rs:2155`) and
+`set_accessor_property` (`bindings.rs:897`). Three of them needed the engine to
+carry something it did not, which is the change to
+`crates/runtime/src/api/template.rs`:
+
+- **A template property carries its attributes.** `TemplateProperty::{Data,
+  Accessor}` gained them and `apply` maps them onto the descriptor (`writable =
+  !read_only`, `enumerable = !dont_enum`, `configurable = !dont_delete`).
+  `PropertyAttributes` is the API type — the crate's `PropertyAttribute` said in
+  the engine's own vocabulary, since the crate spells two of the three
+  negatively. `ObjectTemplate::{set_with_attributes, set_accessor_with_attributes}`
+  are the new entry points and the existing `set`/`set_accessor` delegate with the
+  defaults, so no call site changed.
+- **An accessor property can be built from two function templates.**
+  `ObjectTemplate::set_accessor_rc` takes the callbacks *shared* rather than
+  boxed, which is the shape two templates arrive in — their callback is the
+  template's own — so the bridge passes the `Rc` along. Unwrapping it, which the
+  first cut of this did, cannot work: the template is still holding one.
+- **`FunctionTemplate::callback`** exposes that callback, and is why the accessor
+  path needs no re-wrapping at all.
+
+The bridge half is three methods on `LocalHandle<ObjectTemplate>`, plus the
+attribute translation. The crate's `SetAccessorProperty` takes an `Option` for each
+half and asserts that one is present; that assertion is reproduced, and the engine
+is handed whichever half exists in the getter slot.
+
+Measured: **56 → 52**, `E0599` 47 → 43.
+
+Two new tests, one of them made to fail: an instance's properties with attributes
+(a `DONT_ENUM | READ_ONLY` property is out of `Object.keys` and `writable: false`
+in its own descriptor, while a plain one keeps the crate's defaults — ignoring the
+attributes in `apply` reports `Object.keys(instance).length` as 2 where the test
+wants 1), and an accessor property whose read runs the getter template's callback.
+
+Gates: `cargo test -p v8 --features simdutf` **159 passed / 0 failed** with the
+crashing test skipped, `clippy --locked --workspace --all-targets -- -D warnings`
+clean, and `cargo test --locked --workspace` **5,094 passed / 0 failed / 4 ignored**
+across 38 binaries. `crates/runtime` changed this time, so the sweep question was
+asked rather than assumed: the change is inside `runtime::api`, no runner names
+`runtime::api` at all (`grep` over `test262`, `wasmtest`, `wasm` and `cli`), and
+only `runtime` and `crates/v8` name the methods — the same check, and the same
+conclusion, §7 records for the microtask-policy change.
 
 **The template surface a host fills in — landed, 62 → 56, ten sites fixed and four
 revealed.** Ten of the errors were methods the engine already backs, so this was
@@ -1525,14 +1571,16 @@ if that proves possible.
   the two failure modes are not symmetric: a carried hint costs an optimization
   the host never had, while a carried *property* — `length`, say — would be a
   wrong answer.
-- **The engine's templates are string-keyed, and the two places that shows are
-  stated rather than hidden.** `ObjectTemplate::set` panics on a symbol key — the
-  crate's `Template::Set` takes a `Name` and this engine's template properties are
-  `JsString`-named, so the alternatives were a silent no-op or a panic — and the
-  attributes overload (`set_with_attr`) and `new_instance` are absent until a host
-  asks, which the next slice does. `is_onebyte` is the third: the crate's answer
-  is a representation hint and this one is exact, which is a refinement of the
-  same promise and is documented where a host would read it.
+- **The engine's templates are string-keyed, and where that shows is stated
+  rather than hidden.** `ObjectTemplate::set` and `set_with_attr` panic on a
+  symbol key: the crate's `Template::Set` takes a `Name` and this engine's
+  template properties are `JsString`-named, so the alternatives were a silent
+  no-op or a panic. The attributes half of the cluster has since landed — an
+  engine `PropertyAttributes` that a template property carries into the descriptor
+  of every instance it makes — and what is still absent is the half that is not
+  about *instances*: `FunctionTemplate::{set, inherit}` and a static accessor
+  property need the engine to install a property on the function itself and to
+  relate two templates, which is the next slice.
 - **The value serializer's wire format is this bridge's own.** The crate we
   stand in for serializes into a format that is internal to V8 — 16 versions of
   history in 2,993 lines of C++ — and matching those bytes buys exactly one
@@ -1740,12 +1788,12 @@ property bounds to 364, the identity hashes to 351, the embedder-data slots to
 control to 260, the isolate-level callback vocabulary to 242, the symbol surface
 to 233, the primitive array to 225, the leftovers to 217, the buffer-handing
 shapes to 213, the host-memory store to 209, the tag shape to 62, the template
-surface to 56, and what is left
-is the method surface (47 `E0599`s, all of them named methods and subsystems: the
-message and stack-trace surface, synthetic modules, wasm streaming, code cache,
-source offsets, the extras binding object, and the half of the template cluster
-that needs attributes, static properties and `new_instance`), the 4 names, and
-four stragglers (3 `E0515`, 1 `E0282`). Three
+surface to 56, the attribute-carrying half of the template cluster to 52, and what
+is left is the method surface (43 `E0599`s, all of them named methods and
+subsystems: the message and stack-trace surface, synthetic modules, wasm
+streaming, code cache, source offsets, the extras binding object, and the static
+half of the template cluster), the 4 names, and four stragglers (3 `E0515`,
+1 `E0282`). Three
 surveyed-and-left items sit outside those counts' reach — `get_constructor_name`
 (needs V8's map), `get_extras_binding_object` (needs an engine-side extras
 object) and `get_heap_statistics` (needs byte accounting in `crux::heap`) — and
