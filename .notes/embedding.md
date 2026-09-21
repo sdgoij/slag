@@ -551,6 +551,7 @@ number is the certified one.
 | after the scheduling and exception-control methods (`Isolate::perform_microtask_checkpoint` and `TryCatch::rethrow`) | **260** (see below) |
 | after the isolate-level callback vocabulary (the promise-reject, prepare-stack-trace, `import.meta`, dynamic-import, phase-import and wasm-async-resolve callbacks, the near-heap-limit pair, `set_idle`, `set_bool`, `set_promise_hooks`, and `AsMut<Isolate>`) | **242** (see below) |
 | after the symbol surface (`Symbol::for_key` and the eleven well-known accessors) | **233** (see below) |
+| after the primitive array (`PrimitiveArray::new`/`length`/`set`/`get`) and the two typed integer accessors it surfaced (`Uint32::value`, `Int32::value`) | **225** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -925,6 +926,35 @@ clean at crate and workspace scope, and `cargo test --locked --workspace`
 `crates/v8` only, so no sweep is implicated. Both tests were made to fail:
 replacing the registry lookup with a fresh symbol fails the first, and minting a
 fresh "well-known" symbol fails the second.
+
+**The primitive array — landed, 233 → 225, and two width gaps behind it.** Eight
+sites were `PrimitiveArray::new` (four), `length` (two) and `get` (two), plus the
+`set` calls that were masked behind those. The engine has no primitive array, so
+what a host writes is the JavaScript array the bridge built for it — the decision
+`FixedArray` already records, and a close one, because V8's `PrimitiveArray` is
+itself an `Array` subclass. The shape is the crate's exactly, read off
+`deno_core`'s call sites and the reference's `primitive_array.rs` rather than
+recalled: `new`, `length`, `set` returning nothing, and `get` answering a
+`Primitive` rather than an `Option`.
+
+Landing it surfaced two real gaps, both in the typed-integer accessors: the bridge
+had `Integer::value() -> i64` and no `Uint32::value`/`Int32::value`, so deno's
+`Uint32::value()` resolved through the deref chain to the *signed 64-bit* read and
+`Some(int.value())` stopped being a `u32`. The width is the whole of what those
+accessors carry here — the engine has one number kind — so they came with the
+slice: a `Uint32` read that answered like `Integer` gives a wrong answer for any
+value above `i32::MAX`, and the test asserts exactly that case.
+
+Measured: **233 → 225**. The eight `E0599`s closed, the two `E0308`s the typed
+reads surfaced closed with them, and the kinds are back where they were before
+this step (`E0599` 146 → 138, `E0308` 78, names 4).
+
+Gates: `cargo test -p v8 --features simdutf` **140 passed / 0 failed**, `clippy`
+clean at crate and workspace scope, and `cargo test --locked --workspace`
+**5,072 passed / 0 failed / 4 ignored** with the crashing `v8` test skipped.
+`crates/v8` only, so no sweep is implicated. All three new tests were made to
+fail: dropping the requested length, no-opping `set`, and truncating the `u32`
+read each fail the assertion guarding it.
 
 **The method tail — landed, 336 → 292, one real bug found, and a pointer shape
 corrected.** Forty-three sites were methods a host calls by name that the bridge
@@ -1339,6 +1369,14 @@ if that proves possible.
   offering the name over the one registry would be a promise it could not keep —
   a script could then find an API symbol. Recorded with `Symbol::new` and
   `Symbol::description`, which are absent until a call site asks.
+- **A primitive array is a JavaScript array here, and the divergence is smaller
+  than it looks.** V8's `PrimitiveArray` is a C++ heap object that is itself an
+  `Array` subclass, so writing one as the array the bridge builds for the host is
+  close in behaviour and exact in shape: a length, integer-indexed writes, and
+  reads that answer *undefined* for a slot nothing wrote. Its slots start
+  *undefined* rather than uninitialized, which a host cannot tell apart either
+  way, and the value is never a property of anything, so the walks that could see
+  it do not.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
@@ -1365,10 +1403,11 @@ first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
 347, private names to 336, the method tail to 292, scheduling and exception
 control to 260, the isolate-level callback vocabulary to 242, the symbol surface
-to 233, and what is left is the method surface (146 `E0599`s: 72 where a value
-handle is the receiver — the tag shape — 41 on a `Local<…>`, 29 associated items
-on a tag, 4 on another bridge type), the 78 `E0308`s the tag shape explains, the 4
-names, and four stragglers (3 `E0515`, 1 `E0282`);
+to 233, the primitive array to 225, and what is left is the method surface (138
+`E0599`s: 72 where a value handle is the receiver — the tag shape — 37 on a
+`Local<…>`, 25 associated items on a tag, 4 on another bridge type), the 78
+`E0308`s the tag shape explains, the 4 names, and four stragglers (3 `E0515`, 1
+`E0282`);
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then
@@ -1398,3 +1437,11 @@ delete.
    while the vocabulary is identical).
 4. **`jsc`'s fate** — kept for now (§2); whether it grows the missing typed-array
    predicates or is left alone is undecided.
+5. **`Array::new` ignores its length** — found while building the primitive array,
+   recorded rather than fixed because it changes observable behaviour of an
+   existing method and no error catches it. The bridge's `Array::new(scope,
+   length)` documents "a new array of `length` holes" and builds an empty one, so
+   a host that asks for three elements and reads `length` gets zero;
+   `deno_core` writes every slot it asked for, which is why it never notices. The
+   fix is a holey array of that length — `length` is a property the engine
+   writes — and it needs a decision, not a drive-by.

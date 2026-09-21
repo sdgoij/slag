@@ -42,6 +42,7 @@ pub mod json;
 mod module;
 mod object;
 mod platform;
+mod primitive_array;
 mod primitives;
 mod private;
 mod promise;

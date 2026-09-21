@@ -8,7 +8,7 @@ use crux::string::JsString;
 use crux::value::ValueKind;
 use runtime::api;
 
-use crate::data::{Boolean, Integer, Number, Primitive, String, Symbol};
+use crate::data::{Boolean, Int32, Integer, Number, Primitive, String, Symbol, Uint32};
 use crate::handle::Local;
 use crate::scope::PinScope;
 
@@ -116,6 +116,25 @@ impl<'s> Local<'s, Integer> {
     /// The value (`v8::Integer::Value`).
     pub fn value(&self) -> i64 {
         self.engine().as_number().map_or(0, |n| n as i64)
+    }
+}
+
+impl<'s> Local<'s, Uint32> {
+    /// The value as an unsigned 32-bit integer (`v8::Uint32::Value`).
+    ///
+    /// The width is the whole of this accessor: the engine has one number kind,
+    /// so `Integer::value` (`i64`) and this differ only in the conversion they
+    /// promise — which is what a host keys a property descriptor's arithmetic on.
+    pub fn value(&self) -> u32 {
+        self.engine().as_number().map_or(0, |n| n as u32)
+    }
+}
+
+impl<'s> Local<'s, Int32> {
+    /// The value as a signed 32-bit integer (`v8::Int32::Value`), for the same
+    /// reason as [`Uint32::value`](Local::value).
+    pub fn value(&self) -> i32 {
+        self.engine().as_number().map_or(0, |n| n as i32)
     }
 }
 
@@ -798,6 +817,26 @@ mod tests {
                 eval_number(scope, "instanceKey === Symbol.hasInstance ? 1 : 0"),
                 1.0
             );
+        });
+    }
+
+    /// The width is the whole of what the typed integer accessors carry: the
+    /// engine has one number kind, so a `Uint32` that read through `Integer`
+    /// would answer a value above `i32::MAX` the same way a signed read does.
+    #[test]
+    fn the_typed_integer_accessors_are_the_width_they_name() {
+        in_context!(scope, {
+            let wide = eval(scope, "4294967295");
+            let wide: Local<'_, Uint32> = Local::try_from(wide).expect("uint32");
+            assert_eq!(wide.value(), u32::MAX);
+
+            let narrow = eval(scope, "-5");
+            let narrow: Local<'_, Int32> = Local::try_from(narrow).expect("int32");
+            assert_eq!(narrow.value(), -5);
+
+            let integer = eval(scope, "4294967295");
+            let integer: Local<'_, Integer> = Local::try_from(integer).expect("integer");
+            assert_eq!(integer.value(), 4_294_967_295_i64);
         });
     }
 
