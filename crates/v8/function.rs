@@ -299,6 +299,12 @@ impl<'s, T> ReturnValue<'s, T> {
         unsafe { &*self.info }.get_return_value().set_null();
     }
 
+    /// Set the call's result to a boolean (`v8::ReturnValue::SetBool`).
+    pub fn set_bool(&self, value: bool) {
+        // SAFETY: as `set`.
+        unsafe { &*self.info }.get_return_value().set_boolean(value);
+    }
+
     /// Set the call's result to an `i32` (`v8::ReturnValue::SetInt32`).
     ///
     /// The engine has one number kind, so the width is the crate's way of

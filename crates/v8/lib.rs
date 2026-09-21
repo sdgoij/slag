@@ -71,7 +71,12 @@ pub use function::{
     FunctionCallbackInfo, FunctionCallbackInfoParts, ReturnValue, SideEffectType,
 };
 pub use handle::{Global, Handle, Local, MaybeLocal};
-pub use isolate::{CreateParams, Isolate, IsolateHandle, OwnedIsolate, UnsafeRawIsolatePtr};
+pub use isolate::{
+    CreateParams, HostImportModuleDynamicallyCallback,
+    HostImportModuleWithPhaseDynamicallyCallback, HostInitializeImportMetaObjectCallback, Isolate,
+    IsolateHandle, NearHeapLimitCallback, OwnedIsolate, PrepareStackTraceCallback,
+    PromiseRejectCallback, UnsafeRawIsolatePtr, WasmAsyncResolvePromiseCallback, WasmAsyncSuccess,
+};
 pub use json::{parse as json_parse, stringify as json_stringify};
 pub use module::{ModuleImportPhase, ModuleStatus};
 pub use platform::{
@@ -79,7 +84,7 @@ pub use platform::{
     new_single_threaded_default_platform, new_unprotected_default_platform,
 };
 pub use primitives::{NewStringType, OneByteConst, WriteFlags, latin1_to_utf8, null, undefined};
-pub use promise::{PromiseRejectEvent, PromiseState};
+pub use promise::{PromiseRejectEvent, PromiseRejectMessage, PromiseState};
 pub use property::*;
 pub use property_descriptor::PropertyDescriptor;
 

@@ -3,6 +3,7 @@
 //! v8::Promise::Resolver).
 
 use std::cell::RefCell;
+use std::marker::PhantomData;
 
 use runtime::api;
 use runtime::promise::ResolverData;
@@ -119,6 +120,73 @@ impl<'s> Local<'s, Promise> {
                 None
             }
         }
+    }
+}
+
+/// What a rejection callback is handed (v8::PromiseRejectMessage).
+///
+/// One deliberate difference from the crate we stand in for: there it wraps a
+/// pointer to V8's own struct, and here it carries the engine's values, because
+/// nothing crosses an ABI on the way to the callback. `get_promise`, `get_event`
+/// and `get_value` answer the same three things either way.
+///
+/// The event is one of the four [`PromiseRejectEvent`] variants, but only two can
+/// arrive: the engine reports a rejection that has no handler and a handler
+/// arriving for one that was already reported, and has no event for the two
+/// "already settled" cases.
+pub struct PromiseRejectMessage<'msg> {
+    isolate: crate::Isolate,
+    promise: crux::value::Value,
+    event: PromiseRejectEvent,
+    value: Option<crux::value::Value>,
+    marker: PhantomData<&'msg ()>,
+}
+
+impl<'msg> PromiseRejectMessage<'msg> {
+    pub(crate) fn new(
+        isolate: crate::Isolate,
+        promise: crux::value::Value,
+        event: PromiseRejectEvent,
+        value: Option<crux::value::Value>,
+    ) -> Self {
+        Self {
+            isolate,
+            promise,
+            event,
+            value,
+            marker: PhantomData,
+        }
+    }
+
+    /// The isolate the rejection happened on, which is what a callback scope is
+    /// opened from.
+    pub(crate) fn isolate(&self) -> crate::Isolate {
+        self.isolate
+    }
+
+    /// The rejected promise (v8::PromiseRejectMessage::GetPromise).
+    pub fn get_promise(&self) -> Local<'msg, Promise> {
+        Local::from_engine(api::Local::from(self.promise))
+    }
+
+    /// Why the callback ran (v8::PromiseRejectMessage::GetEvent).
+    pub fn get_event(&self) -> PromiseRejectEvent {
+        self.event
+    }
+
+    /// The rejection value, when the engine had one in hand
+    /// (v8::PromiseRejectMessage::GetValue).
+    pub fn get_value(&self) -> Option<Local<'msg, Value>> {
+        self.value
+            .map(|value| Local::from_engine(api::Local::from(value)))
+    }
+}
+
+impl std::fmt::Debug for PromiseRejectMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromiseRejectMessage")
+            .field("event", &self.event)
+            .finish_non_exhaustive()
     }
 }
 

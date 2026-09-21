@@ -20,8 +20,9 @@ use std::pin::Pin;
 use runtime::api;
 
 use crate::Isolate;
-use crate::data::{Context, Data, DataError, Value};
+use crate::data::{Context, Data, DataError, Function, Value};
 use crate::handle::Local;
+use crate::promise::PromiseRejectMessage;
 use crate::store;
 
 /// A scope pinned to its storage: `PinnedRef<'s, HandleScope<'i, C>>` is what a
@@ -185,6 +186,25 @@ impl<'p, 'i> PinnedRef<'p, HandleScope<'i, Context>> {
     /// `v8::HandleScope::GetCurrentContext`.
     pub fn get_current_context(&self) -> Local<'p, Context> {
         Local::from_payload(crate::handle::Payload::Context(self.realm()))
+    }
+
+    /// The hooks the engine would run around a promise's settlement
+    /// (v8::HandleScope::SetPromiseHooks).
+    ///
+    /// Accepted and not run: the engine fires no host hook when a promise is
+    /// created or settled, and has nothing to run these through. A host that
+    /// installs them gets the behaviour of one that does not, and that is what
+    /// this comment is here for — the alternative shapes (refusing, or running a
+    /// hook the engine cannot place) are worse than an accepted no-op, because
+    /// neither can be discovered from the call site.
+    pub fn set_promise_hooks(
+        &self,
+        init_hook: Option<Local<Function>>,
+        before_hook: Option<Local<Function>>,
+        after_hook: Option<Local<Function>>,
+        resolve_hook: Option<Local<Function>>,
+    ) {
+        let _ = (init_hook, before_hook, after_hook, resolve_hook);
     }
 }
 
@@ -540,6 +560,12 @@ impl GetIsolate for Local<'_, Context> {
     }
 }
 
+impl GetIsolate for PromiseRejectMessage<'_> {
+    fn get_isolate_ptr(&self) -> Isolate {
+        self.isolate()
+    }
+}
+
 impl GetIsolate for crate::fast_api::FastApiCallbackOptions<'_> {
     fn get_isolate_ptr(&self) -> Isolate {
         self.isolate
@@ -608,6 +634,17 @@ impl<'s> NewCallbackScope<'s> for &'s crate::function::FunctionCallbackInfo {
     fn make_new_scope(me: Self) -> Self::NewScope {
         // The call's realm is the one entered on this thread: the engine made
         // it current before it called in.
+        callback_scope_from(me.get_isolate_ptr(), crate::realm::current())
+    }
+}
+
+impl<'s> NewCallbackScope<'s> for &'s PromiseRejectMessage<'s> {
+    type NewScope = CallbackScope<'s>;
+
+    fn make_new_scope(me: Self) -> Self::NewScope {
+        // A rejection is reported while the realm it happened in is entered —
+        // the engine reports it from inside a promise operation — so the scope
+        // takes that realm, as the other context-less callbacks do.
         callback_scope_from(me.get_isolate_ptr(), crate::realm::current())
     }
 }

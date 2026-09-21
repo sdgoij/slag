@@ -549,6 +549,7 @@ number is the certified one.
 | after private names (`Private::for_api`, the private read and write, and the cast to one) | **336** (see below) |
 | after the method tail a host calls by name (`Global::open`, the typed `ReturnValue` setters, `Function::builder`, the promise resolver, and the pointer-shaped isolate slots) | **292** (see below) |
 | after the scheduling and exception-control methods (`Isolate::perform_microtask_checkpoint` and `TryCatch::rethrow`) | **260** (see below) |
+| after the isolate-level callback vocabulary (the promise-reject, prepare-stack-trace, `import.meta`, dynamic-import, phase-import and wasm-async-resolve callbacks, the near-heap-limit pair, `set_idle`, `set_bool`, `set_promise_hooks`, and `AsMut<Isolate>`) | **242** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -821,6 +822,78 @@ the crashing test skipped), `clippy` clean at crate and workspace scope, and
 Both new tests were made to fail: removing the rethrow call from `rethrow` fails
 the first, and a checkpoint that does not run the queue fails the second.
 
+**The isolate-level callback vocabulary — landed, 260 → 242, and exactly one of
+them fires.** Eight `OwnedIsolate` `E0599`s, the near-heap-limit pair, and four
+stragglers that were method-level rather than shape-level. Most of the step is
+vocabulary — a host passes a *callback type*, so the types had to exist before the
+methods could — and every entry needed the tier decision §9 states, because "the
+engine has the event" is true of one of them:
+
+- **`set_promise_reject_callback` — implemented, engine-backed.** The engine
+  already reports a promise rejected with no handler, and a handler arriving for
+  a rejection it has already reported, through
+  `HostHooks::promise_rejection_tracker`. The bridge installs its own
+  implementation of that seam on the isolate's agent (`PromiseRejectHooks`,
+  `crates/v8/isolate.rs`), which maps the engine's two events onto
+  `PromiseRejectEvent` and calls the host. The seam is *one* trait for every
+  host-defined operation, so the bridge owns it for the isolate — and an isolate
+  whose host never calls this keeps the engine's defaults, which is what having
+  no hooks at all does. Two divergences, both in the doc comment: the engine
+  reports a rejection as it happens where V8 waits for the microtask checkpoint,
+  and the rejection value is present only when the engine had it in hand.
+- **The other seven — accepted, recorded, not fired.**
+  `set_prepare_stack_trace_callback`, `set_host_initialize_import_meta_object_callback`,
+  `set_host_import_module_dynamically_callback` (and its phase twin),
+  `set_wasm_async_resolve_promise_callback`,
+  `add`/`remove_near_heap_limit_callback`, `set_idle`, and
+  `set_capture_stack_trace_for_uncaught_exceptions`, each with a doc comment
+  saying what the engine does instead: it builds error stacks itself (script-level
+  `Error.prepareStackTrace` is what replaces them), builds `import.meta` at load,
+  resolves a dynamic import from the modules the host registered (`crate::module`'s
+  header), compiles wasm synchronously, and neither enforces a heap limit nor
+  profiles. A host that needs one of these to fire needs the subsystem behind it,
+  not the name.
+- **`HandleScope::set_promise_hooks` — accepted, not run**, for the same reason:
+  nothing in the engine fires a host hook when a promise is created or settled.
+- **`ReturnValue::set_bool`** was a gap rather than a shape, and
+  **`AsMut<Isolate> for OwnedIsolate`** (and for `Isolate`) is what makes
+  `manually_drop.as_mut()` resolve — how deno's allocator reaches its isolate.
+
+Two shapes diverge deliberately and are recorded in §9: `PromiseRejectMessage`
+carries the engine's values instead of a pointer to V8's own struct, and
+`PrepareStackTraceCallback` is the *host function's* shape rather than the C
+pointer whose return value travels through the platform's ABI.
+
+**The streaming callback is deliberately not in this step.** Its argument type
+(`WasmStreaming<false>`) and the setter it is passed to
+(`set_wasm_streaming_callback`, `runtime/setup.rs`'s last error) both need the
+streaming subsystem: `crates/wasm` decodes a whole binary, and what is missing is
+the byte-at-a-time API and the promise it resolves. Declaring a hollow
+`WasmStreaming` here would move errors rather than close them — four method
+`E0599`s in `ops_builtin{,_v8}.rs` in place of two names — so it goes with the
+wasm tail, where item 2 of the survey already put it.
+
+Measured: **260 → 242**; `E0599` **169 → 155**, names **8 → 4** (the two
+`WasmStreaming` sites, `SyntheticModuleEvaluationSteps` and
+`CompiledWasmModule`), `E0308` 78 unchanged, and the four stragglers (3 `E0515`,
+1 `E0282`) unchanged. Every `OwnedIsolate` site but the streaming one is closed
+(11 → 1), and `runtime/setup.rs`, which held eight of them, is down to that one.
+
+The 155 `E0599`s now split by receiver: **72** where a *value handle* is the
+receiver (`&Value` 53, `&String` 7, `&BigInt` 6, `&Number` 2, and four singles) —
+the tag shape §9 records as open — **41** on a `Local<…>`, **38** associated
+items on a tag or type name (`Symbol` 9, `ArrayBuffer` 6, `PrimitiveArray` 4,
+`Exception` 3, and the rest), and **4** on another bridge type (`PinnedRef` 2,
+`OwnedIsolate` 1, `FunctionBuilder` 1).
+
+Gates: `cargo test -p v8 --features simdutf` **135 passed / 0 failed**, `clippy`
+clean at crate and workspace scope, and `cargo test --locked --workspace`
+**5,067 passed / 0 failed / 4 ignored** across 38 binaries with the crashing
+`v8` test skipped. `crates/v8` only — no suite in this workspace links it (the
+engine crates do not depend on it; checked in their manifests, not assumed) — so
+no sweep is implicated. The firing test was made to fail: with the `host_hooks`
+install removed it reports an empty event list.
+
 **The method tail — landed, 336 → 292, one real bug found, and a pointer shape
 corrected.** Forty-three sites were methods a host calls by name that the bridge
 did not have at all:
@@ -1018,21 +1091,21 @@ has a second occurrence with the values, in a crate this pass cannot reach
    and the `Global<Context>` that note predicted turned out to be unnecessary
    (the delegate is handed the walk's scope directly, so the stored realm is
    never read).
-2. **The wasm tail (5 sites) — surveyed, and two of the three need engine work.**
-   `WasmAsyncSuccess` (2) is an enum and nothing else, but it appears in the
-   signature of the async-resolve hook `deno_core` installs, which the engine has
-   no counterpart for. `WasmStreaming` (2) needs the streaming decoder —
-   `crates/wasm` decodes binaries, so what is missing is the byte-at-a-time API
-   and the promise it resolves — and `CompiledWasmModule` (1) needs a module
-   handle the bridge can hold. None of the three is a name to declare.
-3. **The stragglers (3) — one of them is not a name either.** `PromiseRejectMessage`
-   (1) is a struct, but its only use is the argument of the callback
-   `set_promise_reject_callback` installs, and the engine has no promise-reject
-   hook; that missing method is currently *masked* by the unresolved type, so
-   fixing the name will surface it. `NearHeapLimitCallback` (1) is a callback for
-   a heap limit the engine does not enforce. `SyntheticModuleEvaluationSteps` (1)
-   is a callback for synthetic modules, which the engine does not have (its
-   JSON/text/bytes modules are source-text modules with a synthetic body).
+2. **The wasm tail (now 3 sites + its setter) — surveyed, and two of the three
+   need engine work.** `WasmAsyncSuccess` **landed** with the callback vocabulary
+   above (an enum, and the async-resolve hook's argument). `WasmStreaming` (2)
+   needs the streaming decoder — `crates/wasm` decodes binaries, so what is
+   missing is the byte-at-a-time API and the promise it resolves — and
+   `CompiledWasmModule` (1) needs a module handle the bridge can hold. Neither is
+   a name to declare, and `set_wasm_streaming_callback` waits with them:
+   `runtime/setup.rs` is otherwise closed, and its last error is that call.
+3. **The stragglers (3 → 1).** `PromiseRejectMessage` (1) **landed**, and it
+   turned out to be a name the engine *can* back: the method it was hiding,
+   `set_promise_reject_callback`, is now the one isolate callback that fires.
+   `NearHeapLimitCallback` (1) **landed** as an accepted-and-not-fired shape.
+   `SyntheticModuleEvaluationSteps` (1) is still a callback for synthetic
+   modules, which the engine does not have (its JSON/text/bytes modules are
+   source-text modules with a synthetic body).
 4. **The rest of `v8::Module`** — method-level, so invisible in today's count:
    `get_module_requests` (a `FixedArray` of `ModuleRequest`, which needs a `Data`
    downcast the bridge has no exact predicate for yet), `is_graph_async`,
@@ -1189,6 +1262,41 @@ if that proves possible.
   aborts the process on most full-binary runs (it passes in isolation, so the
   interaction is with earlier tests in the same process). It predates the
   serializer and is not fixed here; §7 carries the evidence.
+- **The engine fires one of the isolate-level callbacks, and each of the others
+  says so where a host would look for its effect.** `set_promise_reject_callback`
+  is implemented over `HostHooks::promise_rejection_tracker`, which is the engine
+  reporting exactly the two events a rejection callback can act on. The rest —
+  prepare-stack-trace, `import.meta`, dynamic import, wasm async resolve,
+  near-heap-limit, `set_idle`, capture-stack-trace — are accepted and recorded as
+  not fired, because the engine has no such event: it builds error stacks itself,
+  builds `import.meta` at load, resolves a dynamic import from the modules the
+  host registered, compiles wasm synchronously, and neither enforces a heap limit
+  nor profiles. The rejected alternative is the one the inspector note already
+  gives: a callback that is never called and never says so is indistinguishable
+  from a bridge bug. So each carries a doc comment naming what the engine does
+  instead, and the two things a host *can* act on — refusing to compile, or a
+  wrong answer — are both avoided: this is the "carried hint" side of the line,
+  not the "carried property" side.
+- **A rejection message carries values, not a pointer.** `PromiseRejectMessage`
+  is `[usize; 3]` in the crate we stand in for — a pointer to V8's own struct —
+  and here it holds the engine's promise, reason and event. `get_promise`,
+  `get_event` and `get_value` answer the same three things, and the callback scope
+  deno opens from `&message` resolves through the same `NewCallbackScope` the
+  other context-less callbacks use. The crate's two extra events
+  (`PromiseRejectAfterResolved`, `PromiseResolveAfterResolved`) exist in the enum
+  and cannot arrive: the engine has no event for them.
+- **The prepare-stack-trace callback is typed as the host's function, not as the
+  C pointer.** There, the value comes back through the platform's calling
+  convention — a hidden return pointer on Windows, a register elsewhere — which
+  exists only so a `MaybeLocal` can cross C. Nothing crosses C here, so the type
+  is the host function's shape and the `MapFnTo` bound is the one the crate's own
+  call sites satisfy (`for<'a> Fn(&mut PinScope<'s, 'a>, …)`).
+- **Claiming the host-hook seam is a decision, not a side effect.** The seam is a
+  single trait per isolate, so installing a rejection callback replaces whatever
+  was there. Nothing else in this bridge sets it, and an isolate whose host never
+  calls `set_promise_reject_callback` keeps the defaults — but a later hook the
+  engine grows joins `PromiseRejectHooks` rather than reaching for the seam
+  again, and that is why the type exists rather than an inline `Box`.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
@@ -1208,14 +1316,17 @@ and source maps, traced host objects, structured clone.
 
 Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks;
 (2) grow the surface from the items `deno_core` names, in call order — the name
-frontier is closed (8 left, the wasm tail) and the serializer is landed, so this
+frontier is nearly closed (4 left: `WasmStreaming` twice, `CompiledWasmModule` and
+`SyntheticModuleEvaluationSteps`) and the serializer is landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
 first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
 347, private names to 336, the method tail to 292, scheduling and exception
-control to 260, and what is left is the method surface (169 `E0599`s: 41 on a
-`Local<…>`, 106 on a tag, 22 on another bridge type), the 78 `E0308`s the tag
-shape explains, the 8 names, and four stragglers (3 `E0515`, 1 `E0282`);
+control to 260, the isolate-level callback vocabulary to 242, and what is left is
+the method surface (155 `E0599`s: 72 where a value handle is the receiver — the
+tag shape — 41 on a `Local<…>`, 38 associated items on a tag, 4 on another bridge
+type), the 78 `E0308`s the tag shape explains, the 4 names, and four stragglers
+(3 `E0515`, 1 `E0282`);
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then

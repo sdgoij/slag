@@ -13,10 +13,12 @@ use crux::string::JsString;
 use runtime::api;
 
 use crate::cppgc::Heap;
-use crate::data::{Context, Data, Value};
+use crate::data::{Array, Context, Data, FixedArray, Promise, PromiseResolver, Value};
 use crate::handle::{Global, Local};
+use crate::promise::{PromiseRejectEvent, PromiseRejectMessage};
+use crate::scope::PinScope;
 use crate::snapshot::{FunctionCodeHandling, SnapshotCreator, StartupData};
-use crate::support::UniqueRef;
+use crate::support::{MapFnFrom, MapFnTo, UniqueRef, UnitType};
 
 /// Create parameters (`v8::CreateParams`).
 ///
@@ -147,6 +149,144 @@ const _: () = assert!(std::mem::offset_of!(IsolateInner, engine) == 0);
 /// The callback an interrupt request would run (v8::InterruptCallback).
 pub type InterruptCallback =
     unsafe extern "C" fn(isolate: UnsafeRawIsolatePtr, data: *mut std::ffi::c_void);
+
+/// The callback a promise rejection runs
+/// (v8::Isolate::SetPromiseRejectCallback).
+///
+/// This is the one host hook of the isolate-level set the engine fires: it
+/// reports a promise rejected with no handler, and a handler arriving for one it
+/// already reported, through `HostPromiseRejectionTracker`. See
+/// [`Isolate::set_promise_reject_callback`].
+///
+/// `extern "C"` here and in the three types below is the crate we stand in
+/// for's shape, not a boundary this bridge has: a handle is `Rc`-backed and so
+/// not FFI-safe, and the warning that says so is about a function pointer that is
+/// only ever called from Rust.
+#[allow(improper_ctypes_definitions)]
+pub type PromiseRejectCallback = unsafe extern "C" fn(PromiseRejectMessage);
+
+/// The callback an error's `stack` property would run
+/// (v8::Isolate::SetPrepareStackTraceCallback).
+///
+/// Shaped after the *host function* rather than after the crate we stand in
+/// for's C pointer: there the value travels back through the platform's calling
+/// convention — a hidden return pointer on Windows, a register elsewhere — and
+/// nothing crosses an ABI here, so the convention has nothing to carry.
+pub type PrepareStackTraceCallback<'s> =
+    fn(&mut PinScope<'s, '_>, Local<'s, Value>, Local<'s, Array>) -> Local<'s, Value>;
+
+/// The callback `import.meta` would run the first time it is read
+/// (v8::Isolate::SetHostInitializeImportMetaObjectCallback).
+#[allow(improper_ctypes_definitions)] // as `PromiseRejectCallback` says.
+pub type HostInitializeImportMetaObjectCallback =
+    unsafe extern "C" fn(Local<Context>, Local<crate::data::Module>, Local<crate::data::Object>);
+
+/// The callback a dynamic `import()` would run
+/// (v8::Isolate::SetHostImportModuleDynamicallyCallback).
+///
+/// A trait rather than a function pointer, as there: the host's function is
+/// generic over the scope's and the isolate's lifetimes, so the bound a caller
+/// has to satisfy is higher-ranked.
+pub trait HostImportModuleDynamicallyCallback:
+    UnitType
+    + for<'s, 'i> FnOnce(
+        &mut PinScope<'s, 'i>,
+        Local<'s, Data>,
+        Local<'s, Value>,
+        Local<'s, crate::data::String>,
+        Local<'s, FixedArray>,
+    ) -> Option<Local<'s, Promise>>
+{
+}
+
+impl<F> HostImportModuleDynamicallyCallback for F where
+    F: UnitType
+        + for<'s, 'i> FnOnce(
+            &mut PinScope<'s, 'i>,
+            Local<'s, Data>,
+            Local<'s, Value>,
+            Local<'s, crate::data::String>,
+            Local<'s, FixedArray>,
+        ) -> Option<Local<'s, Promise>>
+{
+}
+
+/// The same, for `import source`
+/// (v8::Isolate::SetHostImportModuleWithPhaseDynamicallyCallback).
+pub trait HostImportModuleWithPhaseDynamicallyCallback:
+    UnitType
+    + for<'s, 'i> FnOnce(
+        &mut PinScope<'s, 'i>,
+        Local<'s, Data>,
+        Local<'s, Value>,
+        Local<'s, crate::data::String>,
+        crate::ModuleImportPhase,
+        Local<'s, FixedArray>,
+    ) -> Option<Local<'s, Promise>>
+{
+}
+
+impl<F> HostImportModuleWithPhaseDynamicallyCallback for F where
+    F: UnitType
+        + for<'s, 'i> FnOnce(
+            &mut PinScope<'s, 'i>,
+            Local<'s, Data>,
+            Local<'s, Value>,
+            Local<'s, crate::data::String>,
+            crate::ModuleImportPhase,
+            Local<'s, FixedArray>,
+        ) -> Option<Local<'s, Promise>>
+{
+}
+
+/// Whether an asynchronous WebAssembly compilation succeeded
+/// (v8::WasmAsyncSuccess).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum WasmAsyncSuccess {
+    Success,
+    Fail,
+}
+
+/// The callback an asynchronous WebAssembly compilation would settle
+/// (v8::Isolate::SetWasmAsyncResolvePromiseCallback).
+#[allow(improper_ctypes_definitions)] // as `PromiseRejectCallback` says.
+pub type WasmAsyncResolvePromiseCallback = unsafe extern "C" fn(
+    UnsafeRawIsolatePtr,
+    Local<Context>,
+    Local<PromiseResolver>,
+    Local<Value>,
+    WasmAsyncSuccess,
+);
+
+/// The callback a heap that is close to its limit would run
+/// (v8::Isolate::AddNearHeapLimitCallback).
+pub type NearHeapLimitCallback = unsafe extern "C" fn(
+    data: *mut std::ffi::c_void,
+    current_heap_limit: usize,
+    initial_heap_limit: usize,
+) -> usize;
+
+impl<'s, F> MapFnFrom<F> for PrepareStackTraceCallback<'s>
+where
+    F: UnitType
+        + for<'a> Fn(&mut PinScope<'s, 'a>, Local<'s, Value>, Local<'s, Array>) -> Local<'s, Value>,
+{
+    fn mapping() -> Self {
+        // The callback is accepted and never run, so there is nothing to fold a
+        // host function into: this is the shape the bound asks for, and calling
+        // it is the one thing the bridge does not do.
+        fn never<'s, 'a>(
+            _scope: &mut PinScope<'s, 'a>,
+            _error: Local<'s, Value>,
+            _sites: Local<'s, Array>,
+        ) -> Local<'s, Value> {
+            unreachable!("the bridge does not run the prepare-stack-trace callback")
+        }
+
+        never
+    }
+}
 
 /// A reference to an isolate that another thread may keep
 /// (v8::IsolateHandle).
@@ -668,6 +808,148 @@ impl Isolate {
             .any(|template| Rc::as_ptr(template) as *mut c_void == pointer)
     }
 
+    /// Tells the engine to capture a stack trace when an exception goes
+    /// uncaught
+    /// (v8::Isolate::SetCaptureStackTraceForUncaughtExceptions).
+    ///
+    /// Accepted and carried no further: the trace has nowhere to go here. The
+    /// crate we stand in for hands it to the listener registered by
+    /// `add_message_listener`, which this bridge has no producer for, so a host
+    /// sees the same thing whether it asks for traces or not.
+    pub fn set_capture_stack_trace_for_uncaught_exceptions(
+        &mut self,
+        capture: bool,
+        frame_limit: i32,
+    ) {
+        let _ = (capture, frame_limit);
+    }
+
+    /// Send promise rejections to `callback`
+    /// (v8::Isolate::SetPromiseRejectCallback).
+    ///
+    /// This is the one isolate-level callback the engine fires, because it has
+    /// the event: `HostPromiseRejectionTracker` reports a promise rejected with
+    /// no handler, and a handler attached to a rejection it has already
+    /// reported. Setting one claims the isolate's host-hook seam for it — the
+    /// seam is one trait for every host-defined operation, so this bridge owns
+    /// it for the isolate and an isolate whose host never calls this keeps the
+    /// defaults.
+    ///
+    /// Two things the callback sees differently from V8's:
+    ///
+    /// - The engine reports a rejection as it happens, where V8 waits for the
+    ///   microtask checkpoint. A host that tracks unhandled rejections still
+    ///   sees each one, and still sees the matching "handler arrived" event.
+    /// - The rejection value is present only when the engine had it in hand;
+    ///   V8 always has it.
+    pub fn set_promise_reject_callback(&mut self, callback: PromiseRejectCallback) {
+        self.engine_mut().agent().host_hooks = Some(Box::new(PromiseRejectHooks { callback }));
+    }
+
+    /// The callback an error's `stack` property would run
+    /// (v8::Isolate::SetPrepareStackTraceCallback).
+    ///
+    /// Accepted and not run: the engine builds an error's stack itself, with no
+    /// host hook in the path, so script-level `Error.prepareStackTrace` is the
+    /// only thing that replaces it here.
+    pub fn set_prepare_stack_trace_callback<'s>(
+        &mut self,
+        callback: impl MapFnTo<PrepareStackTraceCallback<'s>>,
+    ) {
+        let _ = callback;
+    }
+
+    /// The callback a module's first read of `import.meta` would run
+    /// (v8::Isolate::SetHostInitializeImportMetaObjectCallback).
+    ///
+    /// Accepted and not run: the engine builds `import.meta` when it loads a
+    /// module, so there is no seam for a host to fill.
+    pub fn set_host_initialize_import_meta_object_callback(
+        &mut self,
+        callback: HostInitializeImportMetaObjectCallback,
+    ) {
+        let _ = callback;
+    }
+
+    /// The callback a dynamic `import()` would run
+    /// (v8::Isolate::SetHostImportModuleDynamicallyCallback).
+    ///
+    /// Accepted and not run, and this one is worth reading twice: the engine
+    /// resolves a dynamic import itself, from the modules the host registered
+    /// with it, so a host's loader is reached by *registration* rather than by
+    /// this callback. The header of this bridge's `module` module is where that
+    /// is spelled out.
+    pub fn set_host_import_module_dynamically_callback(
+        &mut self,
+        callback: impl HostImportModuleDynamicallyCallback,
+    ) {
+        let _ = callback;
+    }
+
+    /// The same for `import source` and `import defer`
+    /// (v8::Isolate::SetHostImportModuleWithPhaseDynamicallyCallback).
+    ///
+    /// Accepted and not run, for the reason above.
+    pub fn set_host_import_module_with_phase_dynamically_callback(
+        &mut self,
+        callback: impl HostImportModuleWithPhaseDynamicallyCallback,
+    ) {
+        let _ = callback;
+    }
+
+    /// The callback an asynchronous WebAssembly compilation would settle
+    /// (v8::Isolate::SetWasmAsyncResolvePromiseCallback).
+    ///
+    /// Accepted and not run: `WebAssembly.compile` is synchronous here, so
+    /// there is no asynchronous compilation whose promise would need resolving —
+    /// and no `WasmStreaming` type either, which is the same gap seen from the
+    /// other side.
+    pub fn set_wasm_async_resolve_promise_callback(
+        &mut self,
+        callback: WasmAsyncResolvePromiseCallback,
+    ) {
+        let _ = callback;
+    }
+
+    /// The callback a heap close to its limit would run
+    /// (v8::Isolate::AddNearHeapLimitCallback).
+    ///
+    /// Accepted and not run: nothing runs out of heap here — the engine grows
+    /// its heap rather than enforcing a limit — so there is no moment at which
+    /// this could fire. The host's pointer is dropped with the rest.
+    pub fn add_near_heap_limit_callback(
+        &mut self,
+        callback: NearHeapLimitCallback,
+        data: *mut c_void,
+    ) {
+        let _ = (callback, data);
+    }
+
+    /// Withdraw a heap-limit callback and restore the limit
+    /// (v8::Isolate::RemoveNearHeapLimitCallback).
+    ///
+    /// Accepted and not run, for the reason above: there is no registered
+    /// callback to withdraw and no limit to restore.
+    pub fn remove_near_heap_limit_callback(
+        &mut self,
+        callback: NearHeapLimitCallback,
+        heap_limit: usize,
+    ) {
+        let _ = (callback, heap_limit);
+    }
+
+    /// Tell the engine that the isolate is about to wait for work
+    /// (v8::Isolate::SetIdle).
+    ///
+    /// Accepted and not acted on: this is the CPU profiler's attribution hint,
+    /// and the engine has no profiler for it to reach — see
+    /// [`inspector`](crate::inspector) for what exists in that area and what
+    /// does not. A host's event loop calls it on every turn, and calling it here
+    /// costs that branch and nothing else.
+    pub fn set_idle(&mut self, is_idle: bool) {
+        let _ = is_idle;
+    }
+
     fn inner(&self) -> &IsolateInner {
         // SAFETY: the handle only exists for a live inner, which the
         // `OwnedIsolate` that made it keeps alive.
@@ -682,6 +964,48 @@ impl Isolate {
     fn slots_mut(&mut self) -> &mut HashMap<TypeId, Box<dyn Any>> {
         // SAFETY: as `get_slot` — the caller's contract covers a live borrow.
         unsafe { &mut *self.inner_mut().slots.get() }
+    }
+}
+
+/// The isolate's implementation of the engine's host-hook seam, which routes
+/// the one event this bridge is the producer for: a promise rejection.
+///
+/// The seam is a single trait for every host-defined operation the engine has,
+/// so this type is the bridge's whole implementation of it and a later hook the
+/// engine grows joins it here. The methods not written below keep the engine's
+/// defaults, which is exactly what an isolate with no hooks at all gets.
+#[derive(Debug)]
+struct PromiseRejectHooks {
+    callback: PromiseRejectCallback,
+}
+
+impl runtime::HostHooks for PromiseRejectHooks {
+    fn promise_rejection_tracker(
+        &self,
+        promise: &crux::value::Value,
+        reason: Option<&crux::value::Value>,
+        operation: bool,
+    ) -> Result<(), crux::error::JsError> {
+        // A rejection is reported from inside an engine operation, so the
+        // isolate running it is the one the message belongs to; outside one
+        // there is neither an isolate nor a rejection.
+        let Some(engine) = api::Isolate::get_current() else {
+            return Ok(());
+        };
+        // SAFETY: the engine isolate is the first field of `IsolateInner` — the
+        // assertion that keeps it there is next to the type — so the pointer the
+        // engine hands back names the bridge's own isolate.
+        let isolate = unsafe { Isolate::from_engine_ptr(engine) };
+        let event = if operation {
+            PromiseRejectEvent::PromiseHandlerAddedAfterReject
+        } else {
+            PromiseRejectEvent::PromiseRejectWithNoHandler
+        };
+        let message = PromiseRejectMessage::new(isolate, *promise, event, reason.copied());
+        // SAFETY: the host installed this callback to be called with a
+        // rejection, and this is that call, on the thread owning the isolate.
+        unsafe { (self.callback)(message) };
+        Ok(())
     }
 }
 
@@ -708,6 +1032,18 @@ impl Deref for OwnedIsolate {
 impl DerefMut for OwnedIsolate {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.handle
+    }
+}
+
+impl AsMut<Isolate> for OwnedIsolate {
+    fn as_mut(&mut self) -> &mut Isolate {
+        self
+    }
+}
+
+impl AsMut<Isolate> for Isolate {
+    fn as_mut(&mut self) -> &mut Isolate {
+        self
     }
 }
 
@@ -768,6 +1104,131 @@ mod tests {
         let handle = isolate.thread_safe_handle();
         assert!(!handle.request_interrupt(on_interrupt, std::ptr::null_mut()));
         assert!(!CALLED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The one host callback of the isolate-level set that the engine fires: a
+    /// promise rejected with no handler reaches it, and so does a handler
+    /// attached to that rejection afterwards.
+    #[test]
+    fn a_rejected_promise_reaches_the_host_callback() {
+        thread_local! {
+            static EVENTS: std::cell::RefCell<Vec<(PromiseRejectEvent, bool)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        #[allow(improper_ctypes_definitions)] // as the callback type says.
+        unsafe extern "C" fn record(message: PromiseRejectMessage) {
+            EVENTS.with(|events| {
+                events
+                    .borrow_mut()
+                    .push((message.get_event(), message.get_value().is_some()));
+            });
+        }
+
+        crate::test_support::in_context!(scope, {
+            scope.set_promise_reject_callback(record);
+            crate::test_support::eval(
+                scope,
+                "const rejected = Promise.reject(new Error('boom'));\n\
+                 rejected.catch(function () {});",
+            );
+        });
+
+        EVENTS.with(|events| {
+            assert_eq!(
+                events.borrow().as_slice(),
+                &[
+                    (PromiseRejectEvent::PromiseRejectWithNoHandler, true),
+                    (PromiseRejectEvent::PromiseHandlerAddedAfterReject, true),
+                ],
+                "the rejection and the late handler are both reported, in order"
+            );
+        });
+    }
+
+    /// The isolate-level callbacks the engine never fires are still *shaped* like
+    /// a host's functions, which is the whole of their contract here: the host's
+    /// callback compiles, and nothing beyond that is promised.
+    #[test]
+    fn the_recorded_setters_accept_a_hosts_callbacks() {
+        #[allow(improper_ctypes_definitions)] // as the callback type says.
+        extern "C" fn initialize_import_meta(
+            _context: Local<Context>,
+            _module: Local<crate::data::Module>,
+            _meta: Local<crate::data::Object>,
+        ) {
+        }
+
+        fn dynamic_import<'s, 'i>(
+            _scope: &mut PinScope<'s, 'i>,
+            _options: Local<'s, Data>,
+            _resource_name: Local<'s, Value>,
+            _specifier: Local<'s, crate::data::String>,
+            _attributes: Local<'s, FixedArray>,
+        ) -> Option<Local<'s, Promise>> {
+            None
+        }
+
+        fn import_with_phase<'s, 'i>(
+            _scope: &mut PinScope<'s, 'i>,
+            _options: Local<'s, Data>,
+            _resource_name: Local<'s, Value>,
+            _specifier: Local<'s, crate::data::String>,
+            _phase: crate::ModuleImportPhase,
+            _attributes: Local<'s, FixedArray>,
+        ) -> Option<Local<'s, Promise>> {
+            None
+        }
+
+        fn prepare_stack_trace<'s, 'i>(
+            _scope: &mut PinScope<'s, 'i>,
+            error: Local<'s, Value>,
+            _sites: Local<'s, Array>,
+        ) -> Local<'s, Value> {
+            error
+        }
+
+        #[allow(improper_ctypes_definitions)] // as the callback type says.
+        extern "C" fn async_resolve(
+            _isolate: UnsafeRawIsolatePtr,
+            _context: Local<Context>,
+            _resolver: Local<PromiseResolver>,
+            _result: Local<Value>,
+            _success: WasmAsyncSuccess,
+        ) {
+        }
+
+        extern "C" fn heap_limit(
+            _data: *mut std::ffi::c_void,
+            current_heap_limit: usize,
+            _initial_heap_limit: usize,
+        ) -> usize {
+            current_heap_limit
+        }
+
+        let isolate = &mut Isolate::new(CreateParams::default());
+        isolate.set_capture_stack_trace_for_uncaught_exceptions(true, 10);
+        isolate.set_prepare_stack_trace_callback(prepare_stack_trace);
+        isolate.set_host_initialize_import_meta_object_callback(initialize_import_meta);
+        isolate.set_host_import_module_dynamically_callback(dynamic_import);
+        isolate.set_host_import_module_with_phase_dynamically_callback(import_with_phase);
+        isolate.set_wasm_async_resolve_promise_callback(async_resolve);
+        isolate.add_near_heap_limit_callback(heap_limit, std::ptr::null_mut());
+        isolate.remove_near_heap_limit_callback(heap_limit, 0);
+        isolate.set_idle(true);
+    }
+
+    /// The promise hooks take a scope as their receiver in the crate we stand in
+    /// for — a host calls them on the scope it is running in, not on the isolate
+    /// — and a host that installs them keeps running.
+    #[test]
+    fn the_promise_hooks_are_accepted_from_a_scope() {
+        crate::test_support::in_context!(scope, {
+            let hook = crate::test_support::eval(scope, "(function () {})");
+            let hook = Local::<crate::data::Function>::try_from(hook).expect("a function");
+            scope.set_promise_hooks(Some(hook), Some(hook), Some(hook), Some(hook));
+            assert_eq!(crate::test_support::eval_number(scope, "1 + 1"), 2.0);
+        });
     }
 
     /// A checkpoint runs what is queued, which under the explicit policy is the
