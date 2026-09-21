@@ -127,6 +127,11 @@ pub(crate) struct SnapshotCreator {
     /// blob. Held persistently, because the blob is what reads it back and the
     /// collector has to keep it until then.
     attached: HashMap<usize, Vec<Global<Data>>>,
+    /// The host's external-reference table, which `create_blob` writes a host
+    /// pointer as an index into. The host supplies it here and rebuilds it for
+    /// every load, which is the whole point of an index: an address is a
+    /// property of the process, not of the data.
+    externals: Vec<crate::ExternalReference>,
 }
 
 impl SnapshotCreator {
@@ -155,13 +160,21 @@ impl SnapshotCreator {
         params: Option<crate::CreateParams>,
     ) -> OwnedIsolate {
         let mut params = params.unwrap_or_default();
+        let mut externals = Vec::new();
         if let Some(external_references) = external_references {
+            externals = external_references.clone().into_owned();
             params = params.external_references(external_references);
         }
         if let Some(snapshot_blob) = existing_snapshot_blob {
             params = params.snapshot_blob(snapshot_blob);
         }
-        Isolate::with_snapshot_creator(params, Self::default())
+        Isolate::with_snapshot_creator(
+            params,
+            SnapshotCreator {
+                externals,
+                ..SnapshotCreator::default()
+            },
+        )
     }
 
     /// Record the context a deserialized isolate would start in
@@ -243,7 +256,7 @@ impl SnapshotCreator {
             let slot = position + 1;
             slots.push((slot, self.contexts[position], self.items_of(slot)));
         }
-        match api::Context::write_snapshot(&slots) {
+        match api::Context::write_snapshot(&slots, &addresses(&self.externals)) {
             Ok(bytes) => StartupData::new(bytes),
             Err(error) => {
                 panic!("v8::SnapshotCreator::create_blob: the engine cannot carry {error} yet")
@@ -264,6 +277,19 @@ impl SnapshotCreator {
 /// language value at all.
 fn engine_value(global: &Global<Data>) -> Option<api::Local> {
     global.payload_value().as_value_opt().copied()
+}
+
+/// The addresses a table holds, in the form the engine's snapshot operations
+/// take them.
+///
+/// Every field of the union is one pointer — the type owns a test that says so —
+/// so reading the pointer field is reading the entry the host filled in,
+/// whatever kind of pointer it was.
+fn addresses(references: &[crate::ExternalReference]) -> Vec<*mut std::ffi::c_void> {
+    references
+        .iter()
+        .map(|entry| unsafe { entry.pointer })
+        .collect()
 }
 
 /// A context's identity: its global object, which is the identity this bridge
@@ -311,10 +337,23 @@ impl SnapshotRestore {
     /// engine values, and the realm to make them in is the one the restored
     /// context was created with — which does not exist until the host asks for
     /// the context.
+    /// # Panics
+    ///
+    /// Panics when the blob's header checked out but its body cannot be read
+    /// for this context: the host's external-reference table does not match the
+    /// one the blob was written against, or the blob is not the one its header
+    /// claims. That is a host contract violation rather than a value a host can
+    /// act on, and the crate we stand in for's own loader checks in the same
+    /// situation — where answering `None` would send the host down its "boot
+    /// from source" branch with no way to learn why.
     fn restore(&mut self, isolate: &Isolate, context: api::Context, slot: usize) -> bool {
-        let items = match context.read_snapshot(self.blob.bytes(), slot) {
+        let table = addresses(isolate.externals());
+        let items = match context.read_snapshot(self.blob.bytes(), slot, &table) {
             Ok(Some(items)) => items,
-            Ok(None) | Err(_) => return false,
+            Ok(None) => return false,
+            Err(error) => panic!(
+                "v8::Context::FromSnapshot: the snapshot could not be read for context {slot}: {error}"
+            ),
         };
         let mut held = Vec::with_capacity(items.len());
         for item in items {
@@ -682,6 +721,99 @@ mod tests {
     fn a_creator_without_a_context_refuses() {
         let isolate = Isolate::snapshot_creator(None, None);
         let _ = isolate.create_blob(FunctionCodeHandling::Keep);
+    }
+
+    /// A host pointer round trips through the host's table: the creator writes
+    /// the index, and the restored isolate resolves it against the table it was
+    /// built with — the addresses are the process's, not the blob's.
+    #[test]
+    fn a_host_pointer_round_trips_through_the_table() {
+        let pointer = 0x5150usize as *mut std::ffi::c_void;
+        let other = 0x8888usize as *mut std::ffi::c_void;
+        let mut isolate = Isolate::snapshot_creator(Some(references(&[other, pointer])), None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let external = crate::External::new(scope, pointer);
+            let value: Local<Value> = external.into();
+            scope.add_context_data(context, value);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        // The same table, rebuilt for this load, which is the host's contract.
+        let mut isolate = Isolate::new(
+            crate::CreateParams::default()
+                .snapshot_blob(blob)
+                .external_references(references(&[other, pointer])),
+        );
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let back = scope
+            .get_context_data_from_snapshot_once::<crate::External>(0)
+            .expect("the external");
+        assert_eq!(back.value(), pointer);
+    }
+
+    /// A pointer the creator's table does not have ends the build rather than
+    /// writing an index nothing would resolve.
+    #[test]
+    #[should_panic(expected = "external-reference table")]
+    fn a_host_pointer_not_in_the_creators_table_ends_the_build() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let external = crate::External::new(scope, 0x1234usize as *mut std::ffi::c_void);
+            let value: Local<Value> = external.into();
+            scope.add_context_data(context, value);
+        }
+        let _ = isolate.create_blob(FunctionCodeHandling::Keep);
+    }
+
+    /// A blob whose header checked out but whose body cannot be read for the
+    /// table this isolate has is a host contract violation, and says so rather
+    /// than sending the host down its "boot from source" branch.
+    #[test]
+    #[should_panic(expected = "could not be read for context")]
+    fn a_table_the_blob_does_not_match_ends_the_restore() {
+        let pointer = 0x4242usize as *mut std::ffi::c_void;
+        let mut isolate = Isolate::snapshot_creator(Some(references(&[pointer])), None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let external = crate::External::new(scope, pointer);
+            let value: Local<Value> = external.into();
+            scope.add_context_data(context, value);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        // Loaded with a table that never had the address the blob names.
+        let mut isolate = Isolate::new(crate::CreateParams::default().snapshot_blob(blob));
+        let _ = restored_context(&mut isolate, 0);
+    }
+
+    /// The table form of the reference list a creator or an isolate takes.
+    fn references(
+        pointers: &[*mut std::ffi::c_void],
+    ) -> std::borrow::Cow<'static, [crate::ExternalReference]> {
+        std::borrow::Cow::Owned(
+            pointers
+                .iter()
+                .map(|pointer| crate::ExternalReference { pointer: *pointer })
+                .collect(),
+        )
     }
 
     /// The creator-only methods still refuse on an isolate that is not one.

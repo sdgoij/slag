@@ -22,10 +22,11 @@
 //!
 //! What it does not carry yet ends the walk with [`Unsupported`], which names
 //! the value it refused: a function body, a proxy, a typed array, a module
-//! namespace, a host object, an `External`, an array with a hole, an indexed
-//! accessor, an array whose `length` is not an index. Each entry is a subsystem
-//! to carry, and the walk refuses rather than writing something a restore would
-//! read back wrong.
+//! namespace, a host object, an array with a hole, an indexed accessor, an array
+//! whose `length` is not an index, and a host pointer the host's
+//! external-reference table does not have. Each entry is a subsystem to carry,
+//! and the walk refuses rather than writing something a restore would read back
+//! wrong.
 //!
 //! Version 1. The format is ours to version, and its compatibility surface is
 //! the *names* it writes: an intrinsic name and a well-known symbol name have to
@@ -89,6 +90,7 @@ const REC_SYMBOL: u8 = 9;
 const REC_INTRINSIC: u8 = 10;
 const REC_OBJECT: u8 = 11;
 const REC_ARRAY: u8 = 12;
+const REC_EXTERNAL: u8 = 13;
 
 const FLAG_ENUMERABLE: u8 = 1;
 const FLAG_CONFIGURABLE: u8 = 2;
@@ -157,6 +159,10 @@ pub enum DecodeError {
     Truncated,
     /// A record tag this version does not write.
     BadTag(u8),
+    /// A blob names an intrinsic the reading realm does not have.
+    UnknownIntrinsic(String),
+    /// A blob names an entry the host's external-reference table does not have.
+    ExternalIndexOutOfRange { index: usize, count: usize },
 }
 
 impl std::fmt::Display for DecodeError {
@@ -181,6 +187,16 @@ impl std::fmt::Display for DecodeError {
             ),
             Self::Truncated => write!(f, "snapshot ends in the middle of a field"),
             Self::BadTag(tag) => write!(f, "snapshot record tag {tag} is not one of this format's"),
+            Self::UnknownIntrinsic(name) => {
+                write!(
+                    f,
+                    "snapshot names the intrinsic {name}, which this realm has not"
+                )
+            }
+            Self::ExternalIndexOutOfRange { index, count } => write!(
+                f,
+                "snapshot names external reference {index}, the host's table has {count}"
+            ),
         }
     }
 }
@@ -232,6 +248,8 @@ enum Record {
     SymbolRegistry(Vec<u16>),
     Symbol(Option<Vec<u16>>),
     Intrinsic(String),
+    /// A host pointer, by its index in the host's external-reference table.
+    External(u32),
     Object {
         proto: u32,
         extensible: bool,
@@ -279,8 +297,16 @@ pub struct Slot<'a> {
 ///
 /// `agent` answers the `Symbol.for` registry, whose symbols have an identity
 /// beyond one blob; every other question the walk asks is asked of the realm the
-/// value belongs to.
-pub fn encode_slots(agent: &Agent, slots: &[Slot<'_>]) -> Result<Vec<u8>, Unsupported> {
+/// value belongs to. `externals` is the host's external-reference table: a
+/// snapshot cannot hold a function or data address, because an address is a
+/// property of the process that loads the blob rather than of the data, so a
+/// host pointer is written as its *index* into that table and the host rebuilds
+/// the table for every load.
+pub fn encode_slots(
+    agent: &Agent,
+    slots: &[Slot<'_>],
+    externals: &[usize],
+) -> Result<Vec<u8>, Unsupported> {
     let mut objects: Vec<(Value, Handle<Realm>)> = Vec::new();
     let mut serials: HashMap<Identity, u32> = HashMap::new();
     let mut table: Vec<(usize, Vec<u32>)> = Vec::with_capacity(slots.len());
@@ -290,6 +316,7 @@ pub fn encode_slots(agent: &Agent, slots: &[Slot<'_>]) -> Result<Vec<u8>, Unsupp
             items.push(visit(
                 agent,
                 &slot.realm,
+                externals,
                 *item,
                 &mut objects,
                 &mut serials,
@@ -308,7 +335,7 @@ pub fn encode_slots(agent: &Agent, slots: &[Slot<'_>]) -> Result<Vec<u8>, Unsupp
     }
     write_u32(&mut body, objects.len() as u32);
     for (value, realm) in &objects {
-        write_record(agent, realm, *value, &serials, &mut body)?;
+        write_record(agent, realm, externals, *value, &serials, &mut body)?;
     }
 
     let mut blob = Vec::with_capacity(HEADER_LEN + body.len() + MAGIC.len());
@@ -324,10 +351,11 @@ pub fn encode_slots(agent: &Agent, slots: &[Slot<'_>]) -> Result<Vec<u8>, Unsupp
     Ok(blob)
 }
 
-/// Write one value, at slot 0's index 0.
+/// Write one value, at slot 0's index 0, against an empty external-reference
+/// table.
 ///
-/// The single-value form of [`encode_slots`], for a host or a test with one
-/// value to carry rather than a context table.
+/// A convenience for a caller with one value to carry and no host pointers in
+/// it; the table form is [`encode_slots`].
 pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u8>, Unsupported> {
     let items = [root];
     encode_slots(
@@ -337,6 +365,7 @@ pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u
             realm: *realm,
             items: &items,
         }],
+        &[],
     )
 }
 
@@ -346,12 +375,15 @@ pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u
 /// context its own build never recorded rather than a blob that is wrong.
 /// Materializing in `realm` is what makes an intrinsic reference meaningful: the
 /// name a blob carries resolves against the realm being restored into, not the
-/// realm that wrote it.
+/// realm that wrote it. `externals` is the host's table, rebuilt for this load:
+/// the index a blob wrote is resolved against it, and an index it does not have
+/// is refused rather than read past the end.
 pub fn decode_slot(
     agent: &Agent,
     realm: &Handle<Realm>,
     bytes: &[u8],
     slot: usize,
+    externals: &[usize],
 ) -> Result<Option<Vec<Value>>, DecodeError> {
     let (body_len, context_count) = header(bytes)?;
     let mut body = Reader::new(&bytes[HEADER_LEN..HEADER_LEN + body_len]);
@@ -389,13 +421,14 @@ pub fn decode_slot(
     let mut builder = Builder {
         agent,
         realm,
+        externals,
         records: &records,
         made: vec![None; records.len()],
         pins: Vec::new(),
     };
     let mut values = Vec::with_capacity(items.len());
     for serial in items {
-        values.push(builder.materialize(serial).ok_or(DecodeError::Truncated)?);
+        values.push(builder.materialize(serial)?);
     }
     Ok(Some(values))
 }
@@ -404,7 +437,7 @@ pub fn decode_slot(
 ///
 /// The single-value form of [`decode_slot`], matching [`encode`].
 pub fn decode(agent: &Agent, realm: &Handle<Realm>, bytes: &[u8]) -> Result<Value, DecodeError> {
-    decode_slot(agent, realm, bytes, 0)?
+    decode_slot(agent, realm, bytes, 0, &[])?
         .and_then(|items| items.first().copied())
         .ok_or(DecodeError::Truncated)
 }
@@ -544,10 +577,14 @@ impl<'a> Reader<'a> {
 /// A value the walk has seen is answered by its existing serial, which is what
 /// makes a graph a graph rather than a tree. Each record remembers the realm its
 /// value was first reached through, because that is the realm whose intrinsics
-/// recognize it — the name a reference is written as.
+/// recognize it — the name a reference is written as. `externals` is the host's
+/// table, consulted for a host pointer: one the table does not have is refused
+/// here, where the walk names what it cannot carry, rather than at emit time
+/// where the record is already being written.
 fn visit(
     agent: &Agent,
     realm: &Handle<Realm>,
+    externals: &[usize],
     value: Value,
     objects: &mut Vec<(Value, Handle<Realm>)>,
     serials: &mut HashMap<Identity, u32>,
@@ -563,8 +600,11 @@ fn visit(
     match value.kind() {
         ValueKind::Object(object) => {
             if realm.intrinsics.name_of_value(&value).is_none() {
+                if let ObjectKind::External(pointer) = &object.kind {
+                    external_index(externals, *pointer)?;
+                }
                 for child in children(&object)? {
-                    visit(agent, realm, child, objects, serials)?;
+                    visit(agent, realm, externals, child, objects, serials)?;
                 }
             }
         }
@@ -582,6 +622,21 @@ fn visit(
         | ValueKind::Symbol(_) => {}
     }
     Ok(serial)
+}
+
+/// The index a host pointer has in the external-reference table.
+///
+/// The refusal names the pointer, not the index: a host that reads the message
+/// has to add the pointer to its table, and it has no index to look up yet.
+fn external_index(externals: &[usize], pointer: usize) -> Result<u32, Unsupported> {
+    externals
+        .iter()
+        .position(|entry| *entry == pointer)
+        .map(|index| index as u32)
+        .ok_or(Unsupported::new(
+            "a host pointer",
+            "the pointer is not in the external-reference table",
+        ))
 }
 
 /// Why a callable was not carried, as precisely as the walk can tell.
@@ -610,11 +665,13 @@ fn uncarried_callable(agent: &Agent, realm: &Handle<Realm>, value: &Value) -> Un
 ///
 /// An Array's elements are its values too, and its `length` is neither an
 /// element nor an ordinary property, so the two exotics are asked the question
-/// their kind makes meaningful. Every other exotic kind is refused here rather
-/// than walked: its own state is not in `properties`, so writing it as the
-/// ordinary object its shape would suggest would produce an object that is not
-/// the one that was written — a proxy without its traps, a typed array without
-/// its buffer, a `String` object without its string.
+/// their kind makes meaningful. A host pointer has no children: what it names is
+/// the host's, written as an index into the table the host supplies. Every
+/// *other* exotic kind is refused here rather than walked: its own state is not
+/// in `properties`, so writing it as the ordinary object its shape would suggest
+/// would produce an object that is not the one that was written — a proxy
+/// without its traps, a typed array without its buffer, a `String` object
+/// without its string.
 fn children(object: &Handle<JsObject>) -> Result<Vec<Value>, Unsupported> {
     let mut children = Vec::new();
     if let Some(prototype) = object
@@ -689,12 +746,7 @@ fn children(object: &Handle<JsObject>) -> Result<Vec<Value>, Unsupported> {
                 "a callable exotic is not carried yet",
             ));
         }
-        ObjectKind::External(_) => {
-            return Err(Unsupported::new(
-                "a host pointer",
-                "an external reference is not carried yet",
-            ));
-        }
+        ObjectKind::External(_) => {}
         ObjectKind::Host(_) => {
             return Err(Unsupported::new(
                 "a host object",
@@ -786,6 +838,7 @@ fn array_length(array: &Handle<JsObject>) -> Result<u32, Unsupported> {
 fn write_record(
     agent: &Agent,
     realm: &Handle<Realm>,
+    externals: &[usize],
     value: Value,
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
@@ -828,7 +881,14 @@ fn write_record(
             None if matches!(&object.kind, ObjectKind::Array(_)) => {
                 write_array(realm, object, serials, body)?
             }
-            None => write_object(realm, object, serials, body)?,
+            None => {
+                if let ObjectKind::External(pointer) = &object.kind {
+                    body.push(REC_EXTERNAL);
+                    write_u32(body, external_index(externals, *pointer)?);
+                } else {
+                    write_object(realm, object, serials, body)?;
+                }
+            }
         },
     }
     Ok(())
@@ -1017,6 +1077,12 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             reader.units().ok_or(DecodeError::Truncated)?,
         )),
         REC_BIGINT => Ok(Record::BigInt(reader.text().ok_or(DecodeError::Truncated)?)),
+        REC_INTRINSIC => Ok(Record::Intrinsic(
+            reader.text().ok_or(DecodeError::Truncated)?,
+        )),
+        REC_EXTERNAL => Ok(Record::External(
+            reader.u32().ok_or(DecodeError::Truncated)?,
+        )),
         REC_SYMBOL_WELL_KNOWN => Ok(Record::SymbolWellKnown(
             reader.u16().ok_or(DecodeError::Truncated)?,
         )),
@@ -1032,9 +1098,6 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 )))
             }
         }
-        REC_INTRINSIC => Ok(Record::Intrinsic(
-            reader.text().ok_or(DecodeError::Truncated)?,
-        )),
         REC_OBJECT => {
             let proto = reader.u32().ok_or(DecodeError::Truncated)?;
             let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
@@ -1083,6 +1146,9 @@ fn read_properties(reader: &mut Reader<'_>) -> Result<Vec<StoredProperty>, Decod
 struct Builder<'a> {
     agent: &'a Agent,
     realm: &'a Handle<Realm>,
+    /// The host's external-reference table, which a host pointer record is
+    /// resolved against.
+    externals: &'a [usize],
     records: &'a [Record],
     made: Vec<Option<Built>>,
     /// Every value the build has made, kept alive for the build: the walk
@@ -1112,19 +1178,20 @@ impl Built {
 }
 
 impl Builder<'_> {
-    fn materialize(&mut self, serial: u32) -> Option<Value> {
-        self.object(serial).map(|built| built.value())
+    fn materialize(&mut self, serial: u32) -> Result<Value, DecodeError> {
+        Ok(self.object(serial)?.value())
     }
 
-    fn object(&mut self, serial: u32) -> Option<Built> {
+    /// The value a serial names, made on first ask.
+    fn object(&mut self, serial: u32) -> Result<Built, DecodeError> {
         if serial == NO_REF {
-            return None;
+            return Err(DecodeError::Truncated);
         }
         let index = serial as usize;
         if let Some(made) = self.made.get(index).and_then(|made| made.as_ref()) {
-            return Some(*made);
+            return Ok(*made);
         }
-        let built = match self.records.get(index)? {
+        let built = match self.records.get(index).ok_or(DecodeError::Truncated)? {
             Record::Undefined => Built::Value(Value::Undefined),
             Record::Null => Built::Value(Value::Null),
             Record::Boolean(value) => Built::Value(Value::Boolean(*value)),
@@ -1132,35 +1199,52 @@ impl Builder<'_> {
             Record::String(units) => {
                 Built::Value(Value::String(Handle::new(JsString::from_utf16(units))))
             }
-            Record::BigInt(text) => Built::Value(Value::BigInt(Handle::new(BigInt::parse_str(
-                text,
-                BIGINT_RADIX,
-            )?))),
+            Record::BigInt(text) => Built::Value(Value::BigInt(Handle::new(
+                BigInt::parse_str(text, BIGINT_RADIX).ok_or(DecodeError::Truncated)?,
+            ))),
             Record::SymbolWellKnown(name) => {
-                let name = symbol::WELL_KNOWN_SYMBOLS.get(*name as usize)?;
+                let name = symbol::WELL_KNOWN_SYMBOLS
+                    .get(*name as usize)
+                    .ok_or(DecodeError::Truncated)?;
                 Built::Value(Value::Symbol(symbol::well_known(name)))
             }
-            Record::SymbolRegistry(key) => Built::Value(Value::Symbol(self.registry_symbol(key)?)),
+            Record::SymbolRegistry(key) => Built::Value(Value::Symbol(self.registry_symbol(key))),
             Record::Symbol(description) => {
                 let description = description
                     .as_ref()
                     .map(|units| JsString::from_utf16(units));
                 Built::Value(Value::Symbol(Handle::new(Symbol::new(description))))
             }
-            Record::Intrinsic(name) => Built::Value(self.realm.intrinsics.get(name)?),
+            Record::Intrinsic(name) => Built::Value(
+                self.realm
+                    .intrinsics
+                    .get(name)
+                    .ok_or_else(|| DecodeError::UnknownIntrinsic(name.clone()))?,
+            ),
+            Record::External(index) => {
+                let pointer = *self.externals.get(*index as usize).ok_or(
+                    DecodeError::ExternalIndexOutOfRange {
+                        index: *index as usize,
+                        count: self.externals.len(),
+                    },
+                )?;
+                Built::Value(Value::Object(JsObject::external_object_create(
+                    pointer, None,
+                )))
+            }
             Record::Object {
                 proto,
                 extensible,
                 properties,
             } => {
-                let prototype = self.prototype(*proto);
+                let prototype = self.prototype(*proto)?;
                 let object = JsObject::ordinary_object_create(prototype);
                 object.extensible.set(*extensible);
                 // The shell is recorded before the properties are defined, so a
                 // property that refers back to this object resolves to it
                 // rather than restarting the build.
-                self.remember(index, Built::Object(object))?;
-                define_properties(self, object, properties);
+                self.remember(index, Built::Object(object));
+                define_properties(self, object, properties)?;
                 Built::Object(object)
             }
             Record::Array {
@@ -1170,60 +1254,60 @@ impl Builder<'_> {
                 elements,
                 extras,
             } => {
-                let prototype = self.prototype(*proto);
-                let array = JsObject::array_create(prototype, *length as f64).ok()?;
+                let prototype = self.prototype(*proto)?;
+                let array = JsObject::array_create(prototype, *length as f64)
+                    .map_err(|_| DecodeError::Truncated)?;
                 array.extensible.set(*extensible);
-                self.remember(index, Built::Object(array))?;
+                self.remember(index, Built::Object(array));
                 for (position, element) in elements.iter().enumerate() {
                     let value = self.materialize(*element)?;
                     array
                         .create_data_property_index(position as u64, value)
-                        .ok()?;
+                        .map_err(|_| DecodeError::Truncated)?;
                 }
-                define_properties(self, array, extras);
+                define_properties(self, array, extras)?;
                 Built::Object(array)
             }
         };
         if self.made[index].is_none() {
-            self.remember(index, built)?;
+            self.remember(index, built);
         }
-        Some(built)
+        Ok(built)
     }
 
-    fn prototype(&mut self, serial: u32) -> Option<Handle<JsObject>> {
+    fn prototype(&mut self, serial: u32) -> Result<Option<Handle<JsObject>>, DecodeError> {
         if serial == NO_REF {
-            return None;
+            return Ok(None);
         }
-        match self.object(serial)? {
+        Ok(match self.object(serial)? {
             Built::Object(object) => Some(object),
             // An intrinsic's record materializes as a value, not as a built
             // object, because a prototype is not always one: `%Object.prototype%`
             // arrives this way and is exactly the case the format exists for.
             Built::Value(value) => value.as_object(),
-        }
+        })
     }
 
     /// A `Symbol.for` symbol: the registry's own, made when the reading agent
     /// has not seen the key.
-    fn registry_symbol(&self, key: &[u16]) -> Option<Handle<Symbol>> {
+    fn registry_symbol(&self, key: &[u16]) -> Handle<Symbol> {
         let key = JsString::from_utf16(key);
         let mut registry = self.agent.global_symbol_registry.borrow_mut();
         if let Some((_, symbol)) = registry.iter().find(|(entry, _)| *entry == key) {
-            return Some(Handle::new(symbol.clone()));
+            return Handle::new(symbol.clone());
         }
         let symbol = Handle::new(Symbol::new(Some(key.clone())));
         registry.push((key, (*symbol).clone()));
-        Some(symbol)
+        symbol
     }
 
-    fn remember(&mut self, index: usize, built: Built) -> Option<Built> {
+    fn remember(&mut self, index: usize, built: Built) {
         let pin = match &built {
             Built::Value(value) => crux::heap::pin(*value),
             Built::Object(object) => crux::heap::pin_handle(*object),
         };
         self.pins.push(pin);
         self.made[index] = Some(built);
-        Some(built)
     }
 }
 
@@ -1234,20 +1318,16 @@ fn define_properties(
     builder: &mut Builder<'_>,
     object: Handle<JsObject>,
     properties: &[StoredProperty],
-) {
+) -> Result<(), DecodeError> {
     for property in properties {
-        let Some(value) = builder.materialize(property.key) else {
-            return;
-        };
-        let Some(key) = property_key(&value) else {
-            return;
-        };
+        let value = builder.materialize(property.key)?;
+        let key = property_key(&value).ok_or(DecodeError::Truncated)?;
         let accessor = property.flags & FLAG_ACCESSOR != 0;
         let descriptor = PropertyDescriptor {
             value: if accessor {
                 None
             } else {
-                builder.materialize(property.first)
+                Some(builder.materialize(property.first)?)
             },
             writable: if accessor {
                 None
@@ -1255,20 +1335,23 @@ fn define_properties(
                 Some(property.flags & FLAG_WRITABLE != 0)
             },
             get: if accessor {
-                builder.materialize(property.first)
+                Some(builder.materialize(property.first)?)
             } else {
                 None
             },
             set: if accessor {
-                builder.materialize(property.second)
+                Some(builder.materialize(property.second)?)
             } else {
                 None
             },
             enumerable: Some(property.flags & FLAG_ENUMERABLE != 0),
             configurable: Some(property.flags & FLAG_CONFIGURABLE != 0),
         };
-        let _ = object.define_property_key(&key, &descriptor);
+        object
+            .define_property_key(&key, &descriptor)
+            .map_err(|_| DecodeError::Truncated)?;
     }
+    Ok(())
 }
 
 /// The property key a decoded value names: the writer only writes a string or a
@@ -1651,10 +1734,10 @@ mod tests {
                 items: &second,
             },
         ];
-        let blob = encode_slots(agent_of(&isolate), &slots).expect("a blob");
+        let blob = encode_slots(agent_of(&isolate), &slots, &[]).expect("a blob");
 
         let read = |slot| {
-            decode_slot(agent_of(&isolate), &realm, &blob, slot).expect("a blob of this tree")
+            decode_slot(agent_of(&isolate), &realm, &blob, slot, &[]).expect("a blob of this tree")
         };
         let zero = read(0).expect("slot 0");
         assert_eq!(zero.len(), 2);
@@ -1690,9 +1773,9 @@ mod tests {
             realm: *second.realm(),
             items: &items,
         }];
-        let blob = encode_slots(agent_of(&isolate), &slots).expect("a blob");
+        let blob = encode_slots(agent_of(&isolate), &slots, &[]).expect("a blob");
 
-        let back = decode_slot(agent_of(&isolate), second.realm(), &blob, 1)
+        let back = decode_slot(agent_of(&isolate), second.realm(), &blob, 1, &[])
             .expect("a blob of this tree")
             .expect("slot 1");
         assert_eq!(
@@ -1726,8 +1809,129 @@ mod tests {
             realm: *first.realm(),
             items: &items,
         }];
-        let error = encode_slots(agent_of(&isolate), &slots).expect_err("refused");
+        let error = encode_slots(agent_of(&isolate), &slots, &[]).expect_err("refused");
         assert_eq!(error.type_name, "a value from another realm");
+    }
+
+    /// A host pointer round trips through the host's table: the blob holds the
+    /// index, and the address is the one the table has now — which is why the
+    /// table is a compatibility surface rather than part of the data.
+    #[test]
+    fn a_host_pointer_round_trips_through_the_table() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let pointer = 0x5A5A_0000usize as *mut std::ffi::c_void;
+        let other = 0x1234usize as *mut std::ffi::c_void;
+        let external = api::External::new(&mut isolate, pointer)
+            .expect("an external")
+            .as_value()
+            .into_value();
+        // Nested rather than a root, so the record is reached through a property
+        // as well as written as the root of its own slot.
+        let object = JsObject::ordinary_object_create(None);
+        object
+            .create_data_property(&JsString::from_utf8("host"), external)
+            .expect("define");
+        let items = [Value::Object(object), external];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+        let table = [0x9999usize, pointer as usize, other as usize];
+        let blob = encode_slots(agent_of(&isolate), &slots, &table).expect("a blob");
+
+        let back = decode_slot(agent_of(&isolate), &realm, &blob, 0, &table)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        let held = back[0].as_object().expect("an object");
+        assert_eq!(
+            api::External::from(back[1]).value(),
+            pointer,
+            "the item came back as the pointer the table has"
+        );
+        let nested = held
+            .get_own_property(&JsString::from_utf8("host"))
+            .expect("read")
+            .and_then(|property| property.value())
+            .expect("the property");
+        assert_eq!(
+            api::External::from(nested).value(),
+            pointer,
+            "and so did the one reached through a property"
+        );
+        let _ = context;
+    }
+
+    /// A pointer the host's table does not have is refused where the walk can
+    /// name it, rather than written as an index nothing would resolve.
+    #[test]
+    fn a_host_pointer_not_in_the_table_is_refused_by_name() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let external = api::External::new(&mut isolate, 0x11usize as *mut std::ffi::c_void)
+            .expect("an external")
+            .as_value()
+            .into_value();
+        let items = [external];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+        let error = encode_slots(agent_of(&isolate), &slots, &[]).expect_err("refused");
+        assert_eq!(error.type_name, "a host pointer");
+        assert!(error.detail.contains("external-reference table"));
+        let _ = context;
+    }
+
+    /// A blob names an index the table it is loaded against does not have, which
+    /// is a read past the end rather than a value to answer with — and the index
+    /// is what is resolved, not the position of the value in the graph.
+    #[test]
+    fn an_index_the_table_does_not_have_is_refused_at_restore() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let first = 0x1111usize;
+        let pointer = 0x77usize;
+        let other = 0x99usize;
+        let external = api::External::new(&mut isolate, pointer as *mut std::ffi::c_void)
+            .expect("an external")
+            .as_value()
+            .into_value();
+        let items = [external];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+        // The pointer sits at index 1 of a two-entry table, so an index that was
+        // ignored would resolve to the wrong entry rather than to nothing.
+        let blob = encode_slots(agent_of(&isolate), &slots, &[first, pointer]).expect("a blob");
+
+        assert_eq!(
+            decode_slot(agent_of(&isolate), &realm, &blob, 0, &[]),
+            Err(DecodeError::ExternalIndexOutOfRange { index: 1, count: 0 })
+        );
+        assert_eq!(
+            decode_slot(agent_of(&isolate), &realm, &blob, 0, &[first]),
+            Err(DecodeError::ExternalIndexOutOfRange { index: 1, count: 1 })
+        );
+        // And the host's table is what an index resolves against, entry by
+        // entry, which is the contract: the blob carries the index, never the
+        // address.
+        let back = decode_slot(agent_of(&isolate), &realm, &blob, 0, &[first, other])
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        assert_eq!(
+            api::External::from(back[0]).value() as usize,
+            other,
+            "the address is the table's entry at that index, not the blob's"
+        );
+        let _ = context;
     }
 
     #[test]

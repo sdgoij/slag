@@ -12,6 +12,7 @@ use crux::handle::Handle;
 use crux::string::JsString;
 use runtime::api;
 
+use crate::ExternalReference;
 use crate::cppgc::Heap;
 use crate::data::{Array, Context, Data, FixedArray, Object, Promise, PromiseResolver, Value};
 use crate::handle::{Global, Local, Payload};
@@ -31,10 +32,11 @@ use crate::wasm::WasmStreaming;
 ///   (see [`StartupData`](crate::StartupData)), and booted from source when it
 ///   is not — which is the answer `is_valid` gives the host before it hands one
 ///   over.
-/// - `external_references` index into that blob; nothing in this format carries
-///   an index yet, so the table is held and indexed by nothing. It is the one
-///   compatibility surface a snapshot has from its first version, and this is
-///   where it will be honored.
+/// - `external_references` is the table a blob's indices resolve against, and a
+///   restored isolate keeps it for that (see
+///   [`ExternalReference`](crate::ExternalReference)): an address belongs to the
+///   process, so a snapshot names an index and the host rebuilds the table for
+///   every load.
 ///
 /// Everything else there configures V8's heap, its allocator or its sandbox,
 /// none of which Slag exposed as an embedding setting. The one setting besides
@@ -165,6 +167,10 @@ pub struct IsolateInner {
     /// which is every isolate that was not handed a valid blob, since a blob
     /// that is not one of this engine's is not consumed.
     pub(crate) restore: RefCell<Option<SnapshotRestore>>,
+    /// The host's external-reference table: the addresses a snapshot may name by
+    /// index instead of holding. The host rebuilds it for every load, which is
+    /// why it is the host's argument rather than part of a blob.
+    pub(crate) externals: Vec<ExternalReference>,
     /// The host's promise-rejection callback
     /// (`v8::Isolate::SetPromiseRejectCallback`), once it installed one.
     ///
@@ -497,6 +503,10 @@ impl Isolate {
         let restore = params
             .snapshot_blob
             .and_then(crate::snapshot::SnapshotRestore::new);
+        let externals = params
+            .external_references
+            .map(|refs| refs.into_owned())
+            .unwrap_or_default();
         let mut inner = Box::new(IsolateInner {
             engine,
             context: RefCell::new(None),
@@ -512,6 +522,7 @@ impl Isolate {
             object_templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
             restore: RefCell::new(restore),
+            externals,
             promise_reject: None,
             wasm_streaming: None,
         });
@@ -529,6 +540,12 @@ impl Isolate {
 
     pub(crate) fn put_restore(&mut self, restore: SnapshotRestore) {
         *self.inner_mut().restore.borrow_mut() = Some(restore);
+    }
+
+    /// The external-reference table this isolate was built with: the addresses a
+    /// blob's indices resolve against.
+    pub(crate) fn externals(&self) -> &[ExternalReference] {
+        &self.inner().externals
     }
 
     /// The handle for the state at `ptr`.

@@ -73,11 +73,15 @@ impl Context {
     /// The slots are the host's own numbering, in the crate we stand in for's
     /// convention: the default context is 0 and the contexts added after it are
     /// 1, 2, ... Each slot is written against the realm of the context it
-    /// names, because a value's builtins are its own realm's. A value a slot's
-    /// realm cannot name is an error naming it — see
+    /// names, because a value's builtins are its own realm's. `externals` is the
+    /// host's external-reference table — the addresses a snapshot may name by
+    /// index instead of holding — and a host pointer that is not in it is an
+    /// error naming that rather than a blob that cannot be loaded. A value a
+    /// slot's realm cannot name is an error naming it too — see
     /// [`crate::snapshot::Unsupported`].
     pub fn write_snapshot(
         slots: &[(usize, Context, Vec<Local>)],
+        externals: &[*mut std::ffi::c_void],
     ) -> Result<Vec<u8>, crate::snapshot::Unsupported> {
         let Some((_, first, _)) = slots.first() else {
             return Err(crate::snapshot::Unsupported::empty_table());
@@ -103,7 +107,8 @@ impl Context {
                     items,
                 })
                 .collect();
-            crate::snapshot::encode_slots(agent, &engine_slots)
+            let table: Vec<usize> = externals.iter().map(|pointer| *pointer as usize).collect();
+            crate::snapshot::encode_slots(agent, &engine_slots, &table)
         })
     }
 
@@ -111,14 +116,18 @@ impl Context {
     ///
     /// `None` when the blob names no such slot. The values are persistent
     /// handles: they are rooted from the moment they exist, so a host does not
-    /// have to pin them itself, and dropping one releases it.
+    /// have to pin them itself, and dropping one releases it. `externals` is the
+    /// host's table, rebuilt for this load; an index it does not have is an
+    /// error rather than a read past the end.
     pub fn read_snapshot(
         &self,
         bytes: &[u8],
         slot: usize,
+        externals: &[*mut std::ffi::c_void],
     ) -> Result<Option<Vec<Global>>, crate::snapshot::DecodeError> {
         self.with_agent(|agent| {
-            let items = crate::snapshot::decode_slot(agent, &self.realm, bytes, slot)?;
+            let table: Vec<usize> = externals.iter().map(|pointer| *pointer as usize).collect();
+            let items = crate::snapshot::decode_slot(agent, &self.realm, bytes, slot, &table)?;
             Ok(items.map(|items| {
                 items
                     .into_iter()
