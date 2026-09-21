@@ -24,6 +24,7 @@ mod module;
 mod object;
 mod promise;
 mod script;
+mod stack_trace;
 mod template;
 mod try_catch;
 #[cfg(feature = "wasm")]
@@ -40,6 +41,7 @@ pub use module::{
 pub use object::{Array, Object};
 pub use promise::Promise;
 pub use script::Script;
+pub use stack_trace::StackFrame;
 pub use template::{
     FunctionCallback, FunctionCallbackInfo, FunctionTemplate, ObjectTemplate, PropertyAttributes,
     ReturnValue,

@@ -55,6 +55,13 @@ pub enum Payload {
     ModuleRequests {
         module: api::Module,
     },
+    /// One frame of a stack-trace capture (`v8::StackFrame`). A frame is not a
+    /// value: it is a position in a capture, so a handle names the capture's
+    /// object and where in it.
+    StackFrame {
+        trace: api::Local,
+        index: u32,
+    },
 }
 
 impl Payload {
@@ -73,7 +80,16 @@ impl Payload {
             | Self::Module(_)
             | Self::Script { .. }
             | Self::ModuleRequest { .. }
-            | Self::ModuleRequests { .. } => None,
+            | Self::ModuleRequests { .. }
+            | Self::StackFrame { .. } => None,
+        }
+    }
+
+    /// The capture and the position in it a stack-frame handle names.
+    pub(crate) fn as_stack_frame(&self) -> Option<(api::Local, u32)> {
+        match self {
+            Self::StackFrame { trace, index } => Some((*trace, *index)),
+            _ => None,
         }
     }
 
@@ -133,6 +149,7 @@ impl fmt::Debug for Payload {
                 write!(f, "Payload::ModuleRequest({index})")
             }
             Self::ModuleRequests { module: _ } => f.write_str("Payload::ModuleRequests(..)"),
+            Self::StackFrame { trace: _, index } => write!(f, "Payload::StackFrame({index})"),
         }
     }
 }
@@ -450,7 +467,8 @@ pub(crate) fn identity_hash(payload: &Payload) -> NonZeroI32 {
         Payload::Context(_)
         | Payload::Script { .. }
         | Payload::ModuleRequest { .. }
-        | Payload::ModuleRequests { .. } => {
+        | Payload::ModuleRequests { .. }
+        | Payload::StackFrame { .. } => {
             panic!("bridge bug: a handle with no identity was hashed")
         }
     }
@@ -498,6 +516,16 @@ fn payload_eq(left: &Payload, right: &Payload) -> bool {
                 index: bi,
             },
         ) => am == bm && ai == bi,
+        (
+            Payload::StackFrame {
+                trace: at,
+                index: ai,
+            },
+            Payload::StackFrame {
+                trace: bt,
+                index: bi,
+            },
+        ) => at == bt && ai == bi,
         (
             Payload::Script {
                 slot: a,
@@ -604,7 +632,8 @@ impl<T> Global<T> {
             Payload::Context(_)
             | Payload::Script { .. }
             | Payload::ModuleRequest { .. }
-            | Payload::ModuleRequests { .. } => None,
+            | Payload::ModuleRequests { .. }
+            | Payload::StackFrame { .. } => None,
         };
         let script = payload.as_script_source();
         Self {
@@ -627,7 +656,8 @@ impl<T> Global<T> {
             | Payload::Module(_)
             | Payload::Script { .. }
             | Payload::ModuleRequest { .. }
-            | Payload::ModuleRequests { .. } => false,
+            | Payload::ModuleRequests { .. }
+            | Payload::StackFrame { .. } => false,
         }
     }
 
@@ -716,7 +746,8 @@ impl<T> Clone for Global<T> {
                 Payload::Context(_)
                 | Payload::Script { .. }
                 | Payload::ModuleRequest { .. }
-                | Payload::ModuleRequests { .. } => None,
+                | Payload::ModuleRequests { .. }
+                | Payload::StackFrame { .. } => None,
             },
             script: self.script.clone(),
             marker: PhantomData,

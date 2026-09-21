@@ -58,6 +58,7 @@ mod serialize;
 #[cfg(feature = "simdutf")]
 pub mod simdutf;
 mod snapshot;
+mod stack_trace;
 mod store;
 mod support;
 mod template;

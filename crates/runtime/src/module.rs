@@ -80,6 +80,12 @@ pub struct SourceTextModule {
     pub code: Module,
     /// The exact source text, for `Function.prototype.toString`.
     pub source: JsString,
+    /// The name the code was compiled under — the host's `ScriptOrigin`
+    /// resource name, or the specifier a host-provided source was resolved
+    /// under — recorded for the same reason V8's `Script` records one: a stack
+    /// frame reports the name of the code it is running. `None` until a caller
+    /// that knows one says so.
+    pub name: Option<JsString>,
     /// The module kind (JavaScript/JSON/text/bytes) selected at resolution
     /// by the import attributes.
     pub(crate) kind: ModuleKind,
@@ -146,6 +152,7 @@ impl Trace for SourceTextModule {
         // are heap edges. `code` is the parsed AST (plain data) — its
         // strings are parse-produced flats with no heap edges.
         self.source.trace(visit);
+        self.name.trace(visit);
         for request in &self.requested_modules {
             request.specifier.trace(visit);
             for (key, value) in &request.attributes {
@@ -277,9 +284,13 @@ struct ModuleRecords {
 /// Parse a module source into a Source Text Module Record. The module kind
 /// comes from the requested import attributes (`type: json|text|bytes|js`),
 /// falling back to the `.json` extension for attribute-less imports.
+///
+/// `name` is what a stack frame reports for code in this module — the host's
+/// name for it, which is not always the specifier it was resolved under.
 pub fn parse_module(
     agent: &mut Agent,
     specifier: &JsString,
+    name: Option<&JsString>,
     source: &JsString,
     attributes: &[(AttributeKey, JsString)],
 ) -> Result<Handle<SourceTextModule>, JsError> {
@@ -346,6 +357,7 @@ pub fn parse_module(
         realm,
         code,
         source: source.clone(),
+        name: name.cloned(),
         kind,
         status: RefCell::new(ModuleStatus::Unlinked),
         environment: RefCell::new(None),
@@ -437,6 +449,7 @@ pub fn synthetic_module_create(
         // what `module_has_tla` and the other AST readers see of it.
         code: parser::parse_module("")?,
         source: JsString::from_utf8(""),
+        name: Some(name.clone()),
         kind: ModuleKind::Js,
         status: RefCell::new(ModuleStatus::Unlinked),
         environment: RefCell::new(None),
@@ -622,7 +635,7 @@ pub fn host_resolve_imported_module(
         })?;
     let text = String::from_utf8_lossy(&source.bytes).into_owned();
     let source_text = JsString::from_utf8(&text);
-    let module = parse_module(agent, specifier, &source_text, attributes)?;
+    let module = parse_module(agent, specifier, Some(specifier), &source_text, attributes)?;
     crux::heap::write_barrier_handle(&*realm, module);
     realm
         .loaded_modules

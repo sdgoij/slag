@@ -136,6 +136,7 @@ tags! {
     Script,
     Message,
     StackTrace,
+    StackFrame,
 }
 
 /// The inheritance between tags, expressed on the handle the tag derefs into.

@@ -251,7 +251,8 @@ pub fn compile_module2<'s>(
     _no_cache_reason: NoCacheReason,
 ) -> Option<Local<'s, Module>> {
     let realm = crate::realm_of(scope);
-    match api::Module::compile(&realm, "", &source.text) {
+    let name = source.origin.name.clone();
+    match api::Module::compile_with_name(&realm, "", name.as_deref(), &source.text) {
         Ok(module) => Some(Local::from_module(module)),
         Err(error) => {
             crate::throw_at(scope, &error, &source.text, &source.origin);

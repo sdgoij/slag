@@ -101,10 +101,28 @@ impl Module {
     /// Parse `source` as a module in `context`'s realm
     /// (v8::ScriptCompiler::CompileModule).
     pub fn compile(context: &Context, specifier: &str, source: &str) -> Result<Self, JsError> {
+        Self::compile_with_name(context, specifier, None, source)
+    }
+
+    /// The same, with the name a stack frame reports for this module's code
+    /// — the host's own resource name, which a module's specifier is not
+    /// always (a host may compile a module for a URL and resolve it under
+    /// whatever name it chose).
+    ///
+    /// `None` in [`compile`](Self::compile), which leaves the frames the module
+    /// runs unnamed.
+    pub fn compile_with_name(
+        context: &Context,
+        specifier: &str,
+        name: Option<&str>,
+        source: &str,
+    ) -> Result<Self, JsError> {
         let specifier = JsString::from_utf8(specifier);
+        let name = name.map(JsString::from_utf8);
         let source = JsString::from_utf8(source);
         context.with_agent(|agent| {
-            module::parse_module(agent, &specifier, &source, &[]).map(|module| Self { module })
+            module::parse_module(agent, &specifier, name.as_ref(), &source, &[])
+                .map(|module| Self { module })
         })
     }
 

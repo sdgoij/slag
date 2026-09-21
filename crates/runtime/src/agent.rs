@@ -777,6 +777,14 @@ pub struct Agent {
     /// identity (read by the `%Error.prototype.stack%` accessor; the property
     /// itself is not an own data property, spec 20.5.3.4).
     pub error_stack: std::collections::HashMap<u64, crux::string::JsString>,
+    /// The frames of each host stack-trace capture (v8::StackTrace), keyed by
+    /// the *box address* of the object the capture handed back — that object
+    /// exists so the entry has a liveness, and the collector's compaction hook
+    /// drops entries whose object is dead (`compact_weak_tables`). A leak-free
+    /// version of what `error_stack` above does with an identity key, and the
+    /// reason the key is an address rather than an id.
+    pub stack_traces:
+        std::cell::RefCell<std::collections::HashMap<usize, Vec<crate::api::StackFrame>>>,
     /// The compiled module of `WebAssembly.Module` instances, keyed by object
     /// identity (JS-API spec: the [[Module]] internal slot; Wave 2 of Cut 10).
     #[cfg(feature = "wasm")]
@@ -1170,6 +1178,7 @@ impl Agent {
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
             error_stack: std::collections::HashMap::new(),
+            stack_traces: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm")]
             wasm_modules: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
@@ -2006,6 +2015,10 @@ impl Agent {
             || !self.weak_set_data.is_empty()
             || !self.finalization_registries.is_empty()
             || self
+                .stack_traces
+                .try_borrow()
+                .is_ok_and(|traces| !traces.is_empty())
+            || self
                 .weak_ref_targets
                 .try_borrow()
                 .is_ok_and(|targets| !targets.is_empty())
@@ -2026,6 +2039,13 @@ impl Agent {
         // membership test is a binary search — the SipHash HashSet of every
         // dead address was measurable per collection.
         let is_dead = |addr: usize| dead.binary_search(&addr).is_ok();
+        // A stack-trace capture is held under the box address of the object it
+        // hands back, so a capture the host stopped holding is dropped here —
+        // the hook runs between the mark and the sweep, while the dead boxes are
+        // still allocated and their addresses cannot yet have been reused.
+        self.stack_traces
+            .borrow_mut()
+            .retain(|address, _| !is_dead(*address));
         for cell in self.weak_map_data.values() {
             let mut data = cell.borrow_mut();
             data.retain(|entry| match entry {

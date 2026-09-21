@@ -11154,6 +11154,7 @@ var $DONE = function (error) {
         let parsed = runtime::module::parse_module(
             &mut agent,
             &JsString::from_utf8(entry_key),
+            None,
             &JsString::from_utf8(body),
             &[],
         )
@@ -11507,7 +11508,7 @@ var $DONE = function (error) {
         // on this). Only a successful parse reveals the transitive imports.
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let Ok(module) =
-            runtime::module::parse_module(agent, &key, &JsString::from_utf8(&text), &[])
+            runtime::module::parse_module(agent, &key, None, &JsString::from_utf8(&text), &[])
         else {
             return Ok(());
         };

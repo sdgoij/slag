@@ -567,6 +567,7 @@ number is the certified one.
 | after the compiled-module surface (the engine's wasm API exposed: `api::WasmModuleObject`, `api::CompiledWasmModule`, and the bridge's `WasmModuleObject` over them) | **15** (see below) |
 | after the streaming half (the engine's `HostHooks` wasm-streaming pair, `api::WasmStreaming`, and the bridge's `Isolate::set_wasm_streaming_callback` / `WasmStreaming`) | **12** (see below) |
 | after the unbound scripts and the code cache (`UnboundScript`/`UnboundModuleScript`, `create_code_cache` on the script, the module script and a function, `get_source_mapping_url`) | **6** (see below) |
+| after the stack-trace frames (`StackTrace::current_stack_trace` and the frame accessors, over the engine's execution contexts) | **4** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -587,7 +588,7 @@ error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
 
 That was the shape of the frontier then. It is no longer: with no names left, the
-6 errors now are 5 `E0599`s (methods and the subsystems they name) and 1 `E0282`,
+4 errors now are 3 `E0599`s (methods and the subsystems they name) and 1 `E0282`,
 so the count is a *method-level* metric now, as §10 says — and each step's own
 record below names which code classes moved rather than only the total.
 
@@ -2116,11 +2117,12 @@ fail / 0 crash / 0 hang, 152 skip; the eight wasm core suites **64,594 checks / 
 fail / 0 pending**; the JS-API sweep **1,001 tests / 0 fail**. Every number is the
 certified one.
 
-The wasm tail is closed. What is left of the bridge's frontier is the method
+The wasm tail is closed. What was left of the bridge's frontier then was the
+method
 surface: 5 `E0599`s (`Module::evaluate_for_import_defer`,
 `Module::get_stalled_top_level_await_message`, `StackTrace::current_stack_trace`
-twice, and `HandleScope::get_heap_statistics`), and the one `E0282` nothing has
-explained yet.
+twice, and `HandleScope::get_heap_statistics`), and the one `E0282` nothing had
+explained.
 
 **The unbound scripts and the code cache — landed, 12 → 6, and the one that made
 `None` unavailable.** Six
@@ -2207,9 +2209,106 @@ changed, so the battery ran and every number is the certified one: test262 `all`
 core suites **64,594 checks / 0 fail / 0 pending**; the JS-API sweep **1,001 tests
 / 0 fail**.
 
-What is left is 5 `E0599`s and the `E0282`: the stack-trace frames (both
-sites, the plan's named next engine item), `get_heap_statistics`, the stalled
-`await` report, and import-defer's evaluation entry point.
+What is left is 4 errors and the `E0282`: the stalled `await` report,
+import-defer's evaluation entry point, `get_heap_statistics`, and the one `E0282`
+nothing has explained yet.
+
+**The stack-trace frames — landed, 6 → 4, and the step that measured the plan
+wrong.** Two sites (`ops_builtin_v8.rs:1518`, `modules/import_graph.rs:164`), and
+§10 had called this the next engine item with a survey that split it in two: the
+*execution-context frame accessor* and the *per-activation source positions*.
+The first half is what landed — but the survey's premise was wrong, and the
+measurement is the most important thing in this record.
+
+**The engine has no call stack, and `execution_context_stack` is not one.**
+The plan assumed that stack *is* the activations a trace would report. It is the
+spec's execution-context stack, and the engine does **not** push a context per
+call: an ordinary call runs its body on the VM's own environment stack, and a
+context is pushed where the spec needs one — a script, a module, eval, an async
+or generator resumption — and, on the call paths that need it, for a body that
+reads a spec-only component. Measured with a probe over five shapes of the same
+call, the deciding case being a sloppy `arguments` (which is exactly where the
+engine says it pushes one, `crates/runtime/src/function.rs:2271-2278`):
+
+| source | frames reported |
+|---|---|
+| `function inner() { return capture(); } inner();` | `["-@-"]` |
+| the same, called indirectly as `(0, inner)()` | `["-@-"]` |
+| the same, with `inner(a) { if (a) return arguments; … }` | `["inner@-", "-@-"]` |
+| `const inner = () => capture(); inner();` | `["-@-"]` |
+| `function a() { return b(); } function b() { return capture(); } a();` | `["-@-"]` |
+
+The probe is now the bridge's test (`a_capture_reports_the_engines_contexts_not_the_call_stack`),
+which asserts those two shapes so the difference cannot rot silently. What it
+means for a host, and why the surface still shipped: a trace here answers "which
+code am I in" exactly — the script or module a frame belongs to is what it names
+— and answers "how did I get here" only as far as the engine keeps activations.
+Closing that gap means the VM's own interpreter and JIT frames, which is a
+performance-sensitive engine feature rather than a bridge change, and it is what
+§10's "structured frames" item now means.
+
+**What landed, engine side (named in §9's ledger as item 12 before it was
+written):**
+
+- `SourceTextModule` gains `name: Option<JsString>`, set at parse time —
+  `parse_module` takes it, `host_resolve_imported_module` passes the specifier it
+  resolved the source under, and a new `api::Module::compile_with_name` threads
+  the host's own `ScriptOrigin` name, which the bridge's `compile_module2` had in
+  hand and was discarding (it passed `""`). Three call sites in this workspace
+  name it now (`crates/test262` passes `None`, and the test262 fixture key is not
+  a name a frame should report). A *classic script* still has no name: naming one
+  means threading a name through the eval path (`Context::eval` →
+  `Agent::run_script` → `parse_script`), which every runner uses, and no site in
+  the frontier asks for it. Recorded as an open item rather than half-threaded.
+- `Agent::stack_traces` holds each capture's frames under the **box address of
+  the object the capture mints**, and `Agent::compact_weak_tables` prunes a dead
+  key — the one place in this workspace where an identity-keyed table is
+  *bounded* rather than growing forever (§12 item 7 is that same problem for the
+  bridge's position table, still open). The hook runs between the mark and the
+  sweep, so a dead address cannot yet have been reused, and the dead set is the
+  *precise* one, so a stale stack word cannot keep a capture alive: the test that
+  checks the pruning depends on both facts.
+- `api::Isolate::{capture_stack, captured_frame_count, captured_frame}` over a
+  new `api::StackFrame`.
+
+**What is deliberately absent, as the tier rather than as a gap:** line and
+column are 0 (V8's `Message::kNoLineNumberInfo`/`kNoColumnInfo`) because
+positions are the survey's *other* half and nothing records them per activation;
+`is_eval`, `is_constructor` and `is_wasm` are `false` because an execution
+context does not record them (eval code even inherits its caller's
+script-or-module, so it cannot be told apart by that either); and
+`is_user_javascript` is `true` because the engine's Rust builtins never push a
+context and it classifies no script as native. §9 states each.
+
+Bridge side: `crates/v8/stack_trace.rs` with `StackTrace::current_stack_trace`
+(the crate's static, so it is an inherent `impl` on the tag) and the frame
+accessors `deno_core` names — `get_frame_count`, `get_frame`,
+`is_user_javascript`, `get_line_number`, `get_column`, `get_script_name`,
+`is_eval`, plus `get_function_name`, `get_script_id`,
+`get_script_name_or_source_url`, `is_constructor` and `is_wasm` because leaving
+half a frame's accessors out would be a worse shape than answering them — and a
+`Payload::StackFrame { trace, index }` variant, the shape `ModuleRequest` already
+had. A frame handle is a *position in a capture*, so reading one whose capture
+the collector reaped answers the no-information value rather than a stale frame.
+
+Measured: **6 → 4** (`E0599` 5 → 3; the `E0282` untouched), and nothing was
+unmasked behind it — every accessor `deno_core` names on a frame exists. Six new
+tests, each verified by mutating the code it guards: including the bootstrap
+context as a frame fails all three bridge tests; answering `None` for every
+script name fails the module test; refusing to prune fails the collection test;
+and removing the zero-limit refusal fails that one.
+
+Gates: `cargo test -p v8 --features simdutf` **198 passed / 0 failed** (3 of them
+this step), `cargo test -p runtime --lib` **790 passed / 0 failed**,
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean,
+`cargo test --locked --workspace -- --skip
+the_data_a_built_function_carries_survives_a_collection` **5,140 passed / 0
+failed / 4 ignored across 38 binaries**. `crates/runtime` *and*
+`crates/test262` changed (the `parse_module` signature reaches the runner), so the
+whole battery ran and every number is the certified one: test262 `all` 48,622 —
+48,464 pass, **0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205
+pass, 0 fail / 0 crash / 0 hang, 152 skip; the eight wasm core suites **64,594
+checks / 0 fail / 0 pending**; the JS-API sweep **1,001 tests / 0 fail**.
 
 ## 8. Parked: the C++ face
 
@@ -2678,6 +2777,70 @@ if that proves possible.
   guard the six mutations that would silently break them, and the engine's two
   exposures changed no behaviour (the battery ran anyway and reproduced every
   certified number).
+12. **The stack-trace frames — the plan's named next engine item, and its survey
+  splits it in two.** `StackTrace::current_stack_trace` (2 sites:
+  `libs/core/ops_builtin_v8.rs:1518`, `libs/core/modules/import_graph.rs:164`) needs
+a frame view of the running stack. §7's survey already split the subsystem: the
+*frame accessor* over the execution contexts the engine keeps, and the
+*per-activation source positions* every `StackFrame` line number would need. This
+  item is the first half; the second is left open and unchanged by it.
+
+  **What the engine has.** `Agent::execution_context_stack` holds one
+  `ExecutionContext` per activation, innermost last: `function` (the closure, so
+  a name when it has one), `script_or_module` (a `ScriptRecord` or a
+  `SourceTextModule`), `realm`, and the running `source` text. What it does *not*
+  have is a name for the code — a `ScriptRecord` has never recorded one, and a
+  module record drops the specifier `parse_module` receives.
+
+  **Engine change, named — one field, one table, one hook:**
+  - `SourceTextModule` gains `name: Option<JsString>`, set at parse time:
+    `parse_module` takes it as a parameter, `host_resolve_imported_module` passes
+    the specifier it resolved the source under (a host-provided source is named
+    by the name the host gave it), and `api::Module::compile_with_name` threads
+    the host's own `ScriptOrigin` name — which is what the bridge's
+    `compile_module2` has in hand and was discarding (it passed `""`).
+    A *classic script* frame still has no name: naming one means threading a name
+    through the eval path (`Context::eval` → `Agent::run_script` →
+    `parse_script`), which every runner uses, and no site in the frontier asks for
+    it — `deno_core`'s own code and user code are modules, whose frames are named.
+    Recorded as an open item rather than half-threaded.
+  - `Agent` gains `stack_traces: HashMap<usize, Vec<api::StackFrame>>`, keyed by
+    the *box address* of the trace object the capture hands back — an ordinary
+    object that exists so the entries have a liveness at all (the shape
+    `wasm_modules` uses, keyed by the module object's id) — and
+    `Agent::compact_weak_tables` prunes dead keys, which is what makes this table
+    bounded where `error_stack`/`error_data` are not (§12 item 7).
+  - `api::Isolate` gains `capture_stack(limit)`, `captured_frame_count(trace)` and
+    `captured_frame(trace, index) -> Option<StackFrame>`, over a new
+    `api::StackFrame` (function name, script name, line, column, and the four
+    flags).
+
+  **What is deliberately absent, and why the tier is honest rather than thin:**
+  line and column are 0 — V8's own `Message::kNoLineNumberInfo` /
+  `kNoColumnInfo` — because positions are the *other* half of the survey and the
+  engine records none per activation; `is_eval`, `is_constructor` and `is_wasm`
+  are `false` because nothing in an execution context records them (a direct
+  eval's context inherits its caller's `script_or_module`, and the activation's
+  `new.target` is not kept); and `is_user_javascript` is `true` for every frame,
+  because the engine's Rust builtins never push a context at all — a frame here
+  exists only for code the engine is running as JS. §9 states each.
+
+  The bridge half: `crates/v8/stack_trace.rs`, with `StackTrace::current_stack_trace`
+  and the frame accessors `deno_core` names (`get_frame_count`, `get_frame`,
+  `is_user_javascript`, `get_line_number`, `get_column`, `get_script_name`,
+  `is_eval`), a `Payload::StackFrame { trace, index }` variant (the shape
+  `ModuleRequest` already has), and a script-name lookup that the engine test
+  drives end to end.
+
+  **Landed, 6 → 4, and the survey's premise was wrong.** The measurement is in
+  §7 and it is the part worth reading: `execution_context_stack` is the spec's
+  *execution context* stack, and the engine does not push a context per call, so
+  a trace reports activations (script, module, eval, async/generator resumption,
+  and the calls whose bodies need a spec context) rather than a call chain. The
+  frame accessor shipped because "which code am I in" is answered exactly by it;
+  "how did I get here" needs the VM's own frames, which is a
+  performance-sensitive engine feature and is what §10's *structured frames* item
+  now means.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -2739,6 +2902,39 @@ if that proves possible.
   whole-line one that V8's *scanner* would reject as string content would be read
   as a comment. The first is the cost of having no lexer; the second is why the
   rule is line-anchored rather than a plain search.
+- **A stack trace reports the engine's execution contexts, which is a subset of
+  V8's call stack.** The engine pushes a spec execution context where the spec
+  needs one (a script, a module, eval, an async or generator resumption) and, on
+  the call paths that need it, for a body that reads a spec-only component — a
+  sloppy `arguments` is the measured case — while an ordinary call runs on the
+  VM's own environment stack with no context at all. So
+  `StackTrace::current_stack_trace` answers the activations the engine tracks,
+  innermost first, and *not* one frame per call: the numbers are in §7. A host
+  asking "which code am I in" gets a true answer; a host asking "how did I get
+  here" gets a subset, and closing that gap needs the VM's frames. V8 would not
+  answer either question with a subset, which is why this is a divergence rather
+  than a tier.
+- **Three frame flags answer `false` and one answers `true` for every frame.**
+  `is_eval`, `is_constructor` and `is_wasm` are `false` because an execution
+  context does not record them — eval code even inherits its caller's script or
+  module, so nothing separates the two — and the activation's `new.target` is not
+  kept. `is_user_javascript` is `true` because the engine's Rust builtins never
+  push a context and it classifies no script as native, so every frame a host can
+  see really is running JavaScript. Each is stated in the accessor's own
+  documentation as well, because a host reads the flag and acts on it.
+- **A frame's line and column are V8's "no information" values.**
+  `Message::kNoLineNumberInfo` and `kNoColumnInfo` are both 0, and both are 0 for
+  every frame here: the engine records a position where an *error* is made, not
+  where a frame is running. That is the same gap `Message`'s runtime location has,
+  and the plan's survey already split it off from this work as the per-activation
+  source positions (§10).
+- **A module's `name` is the host's name for it, and a classic script has none.**
+  A stack frame reports the name of the code it runs, and the only place a name
+  can live is the record: `SourceTextModule::name` is set when the module is
+  parsed (from a parameter `api::Module::compile_with_name` threads, or the
+  specifier a host-provided source was resolved under), while a script parsed by
+  `parse_script` carries none — threading one would touch the eval path every
+  runner uses, and no site in the frontier needs it.
 
 ## 10. Build order
 
@@ -2750,13 +2946,15 @@ engine still owes there is the *code cache*: serializing its compiled program, s
 that the bytes a host stores are worth storing; §7's record and the ledger's item
 11 state why the bridge hands out the source text meanwhile). Then, in the order
 the
-shim histogram implies: structured frames and termination — **now the next engine
-item**, and the survey in §7 splits it into the execution-context frame accessor
-(no positions) and the per-activation source positions that `Message`'s runtime
-location and every `StackFrame` line number need; the compile-time half of a
-message's position landed as bridge work
-(`crates/v8/position.rs`, §7), and what is left for the engine is the
-*per-activation* half a runtime error would need — then host memory (partly
+shim histogram implies: **structured frames and termination** — the frame
+accessor landed (§7, and the ledger's item 12), while what a *stack trace* still
+needs is the VM's own frames: the engine's execution contexts are not a call
+stack (measured in §7), so a per-call view means recording activations in the
+interpreter and the JIT, and the per-activation source positions that every
+`StackFrame` line number needs went with it; the compile-time half of a message's
+position landed as bridge work (`crates/v8/position.rs`, §7), and what is left
+for the engine is the *per-activation* half a runtime error would need — then host
+memory (partly
 landed — a store over memory the host owns is `SharedBuffer::borrowed`; the
 accounting half, externally allocated memory and backing-store shrink, is not),
 synthetic modules (host-filled records with a host evaluation callback, §12 item
@@ -2782,11 +2980,11 @@ half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
 `Message` surface and `Exception::create_message` (piece 2 of the stack-trace
 split) to 37, the module structure surface to 25, the synthetic-module surface to
 21, the callback scope's lifetime to 19, the compiled-module surface to 15, the
-streaming half to 12, the unbound scripts and the code cache to 6, and
+streaming half to 12, the unbound scripts and the code cache to 6, the
+stack-trace frames to 4, and
 what is left is the method
-surface (5 `E0599`s, all of them named methods and subsystems: the stack-trace
-frames twice, the stalled `await` report, import-defer's evaluation entry point,
-and `get_heap_statistics`), and one straggler (1 `E0282`).
+surface (3 `E0599`s: the stalled `await` report, import-defer's evaluation entry
+point, and `get_heap_statistics`), and one straggler (1 `E0282`).
 The two that the suite had surveyed as needing engine work have landed since,
 `get_constructor_name` and `get_extras_binding_object`, and they turned out to
 need a walk of the prototype chain and a per-context object rather than V8's map
