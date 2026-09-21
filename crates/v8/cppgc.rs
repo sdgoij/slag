@@ -63,7 +63,7 @@ use crux::value::Value as EngineValue;
 use runtime::api;
 
 use crate::data::Object;
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::platform::Platform;
 use crate::support::{SharedRef, UniqueRef};
 
@@ -906,7 +906,7 @@ impl Object {
     }
 }
 
-impl<'s> Local<'s, Object> {
+impl<'s> LocalHandle<'s, Object> {
     /// Whether this wrapper carries an object wrapped by [`Object::wrap`]
     /// (`v8::Object::is_api_wrapper`).
     ///

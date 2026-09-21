@@ -24,7 +24,7 @@ use crate::data::{
     Float64Array, Int8Array, Int16Array, Int32Array, SharedArrayBuffer, Uint8Array,
     Uint8ClampedArray, Uint16Array, Uint32Array, Value,
 };
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 use crate::support::{BackingStore, Rawable, SharedRef, UniqueRef};
 
@@ -272,7 +272,7 @@ impl ArrayBuffer {
     }
 }
 
-impl<'s> Local<'s, ArrayBuffer> {
+impl<'s> LocalHandle<'s, ArrayBuffer> {
     /// The byte length (`v8::ArrayBuffer::byte_length`): zero once detached.
     pub fn byte_length(&self) -> usize {
         buffer_facts(self.engine()).map_or(0, |facts| facts.byte_length)
@@ -358,7 +358,7 @@ impl SharedArrayBuffer {
     }
 }
 
-impl<'s> Local<'s, SharedArrayBuffer> {
+impl<'s> LocalHandle<'s, SharedArrayBuffer> {
     /// A shared reference to the bytes
     /// (`v8::SharedArrayBuffer::get_backing_store`).
     ///
@@ -372,7 +372,7 @@ impl<'s> Local<'s, SharedArrayBuffer> {
     }
 }
 
-impl<'s> Local<'s, ArrayBufferView> {
+impl<'s> LocalHandle<'s, ArrayBufferView> {
     /// The buffer the view looks into (`v8::ArrayBufferView::buffer`).
     pub fn buffer<'a>(&self, _scope: &PinScope<'a, '_>) -> Option<Local<'a, ArrayBuffer>> {
         let object = view_facts(self.engine())?.buffer_object.as_object()?;

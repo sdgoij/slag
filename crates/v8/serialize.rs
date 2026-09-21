@@ -1162,13 +1162,13 @@ impl<'a> ValueDeserializerHeap<'a> {
         let length_key = name_of(scope, "length")?;
         let length_value = Local::<Value>::from(Number::new(scope, f64::from(length)));
         let length_descriptor = PropertyDescriptor::new_from_value_writable(length_value, true);
-        self.define(scope, &array, length_key, &length_descriptor)?;
+        self.define(scope, &array.into(), length_key, &length_descriptor)?;
         for index in 0..length {
             let Some(element) = self.read_element(scope)? else {
                 continue;
             };
             let key = name_of(scope, &index.to_string())?;
-            self.define(scope, &array, key, &data_property(local_of(element)))?;
+            self.define(scope, &array.into(), key, &data_property(local_of(element)))?;
         }
         Some(value)
     }

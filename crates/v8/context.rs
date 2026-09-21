@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use runtime::api;
 
 use crate::data::{Context, Object, ObjectTemplate};
-use crate::handle::{Local, Payload};
+use crate::handle::{Local, LocalHandle, Payload};
 use crate::scope::PinScope;
 
 /// Options for [`Context::new`] (`v8::ContextOptions`).
@@ -40,7 +40,7 @@ impl Context {
     }
 }
 
-impl<'s> Local<'s, Context> {
+impl<'s> LocalHandle<'s, Context> {
     /// The context's global object (`v8::Context::Global`).
     pub fn global(&self, _scope: &PinScope<'s, '_, ()>) -> Local<'s, Object> {
         Local::from_engine(self.context().global())

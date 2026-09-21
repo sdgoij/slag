@@ -5,7 +5,7 @@ use crux::value::{Value, ValueKind};
 use runtime::api;
 
 use crate::data::BigInt;
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 
 impl BigInt {
@@ -44,7 +44,7 @@ impl BigInt {
     }
 }
 
-impl<'s> Local<'s, BigInt> {
+impl<'s> LocalHandle<'s, BigInt> {
     /// The value as an `i64`, and whether that was lossless
     /// (`v8::BigInt::Int64Value`); one that does not fit comes back wrapped
     /// modulo 2^64.

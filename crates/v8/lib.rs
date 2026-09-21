@@ -199,6 +199,36 @@ mod tests {
         assert!(!array.is_number());
     }
 
+    /// A tag *reference* is a receiver, which is the shape the crate we stand in
+    /// for has and the one the host's conversions are written against: they call
+    /// methods on `&v8::Value` and reinterpret a `&v8::Value` as a `&v8::String`
+    /// once the predicate agrees (`deno/libs/core/runtime/ops.rs:265-278`). Both
+    /// work here because a tag's address is the handle's own payload.
+    #[test]
+    fn a_tag_reference_is_a_receiver() {
+        with_value("'a string'", |value| {
+            let reference: &Value = value;
+            // The address check is the runtime half of this test: if the tag
+            // carried anything but the handle's payload, these two would differ
+            // and the reads below would be reading some other value.
+            assert!(
+                std::ptr::eq(reference.payload(), value.payload()),
+                "a tag reference names the handle's own payload"
+            );
+
+            assert!(reference.is_string());
+
+            // SAFETY: the predicate above is the check the reinterpretation
+            // needs and it just passed — the same contract the host relies on.
+            let text: &crate::data::String = unsafe { std::mem::transmute(reference) };
+            // `length` is `String`'s own; `type_repr` is declared on `Value`,
+            // four tags up, so this is also the inherited lookup through a tag
+            // reference.
+            assert_eq!(text.length(), 8);
+            assert_eq!(text.type_repr(), "string");
+        });
+    }
+
     /// A lone surrogate is an ordinary code unit to the engine, and the string
     /// API has to report it as one. A UTF-8 round trip anywhere in the path
     /// would substitute U+FFFD and lose it, which is the failure this pins.

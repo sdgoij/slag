@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use runtime::api;
 
 use crate::data::External;
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 
 impl External {
@@ -16,7 +16,7 @@ impl External {
     }
 }
 
-impl<'s> Local<'s, External> {
+impl<'s> LocalHandle<'s, External> {
     /// The wrapped pointer (`v8::External::Value`), null for a value that is
     /// not an external.
     pub fn value(&self) -> *mut c_void {

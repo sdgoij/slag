@@ -12,7 +12,7 @@ use runtime::api;
 
 use crate::data::{External, Function, FunctionTemplate, String, Value};
 use crate::function::{FunctionBuilder, FunctionCallback, FunctionCallbackInfo, SideEffectType};
-use crate::handle::{Global, Local};
+use crate::handle::{Global, Local, LocalHandle};
 use crate::scope::PinScope;
 use crate::support::MapFnTo;
 
@@ -102,7 +102,7 @@ impl<'s> FunctionBuilder<'s, FunctionTemplate> {
     }
 }
 
-impl<'s> Local<'s, FunctionTemplate> {
+impl<'s> LocalHandle<'s, FunctionTemplate> {
     /// The template's `name`, and the name a `new` instance is printed under
     /// (v8::FunctionTemplate::SetClassName).
     pub fn set_class_name(&self, name: Local<'_, String>) {

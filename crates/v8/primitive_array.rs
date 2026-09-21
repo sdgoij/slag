@@ -15,7 +15,7 @@
 use runtime::api;
 
 use crate::data::{Array, Primitive, PrimitiveArray, Value};
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 
 impl PrimitiveArray {
@@ -43,7 +43,7 @@ impl PrimitiveArray {
     }
 }
 
-impl<'s> Local<'s, PrimitiveArray> {
+impl<'s> LocalHandle<'s, PrimitiveArray> {
     /// The number of slots (v8::PrimitiveArray::Length).
     pub fn length(&self) -> usize {
         let realm = crate::realm_current();

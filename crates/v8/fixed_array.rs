@@ -11,18 +11,18 @@
 use runtime::api;
 
 use crate::data::{Data, FixedArray, Value};
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 
-impl<'s> Local<'s, FixedArray> {
+impl<'s> LocalHandle<'s, FixedArray> {
     /// The number of elements (v8::FixedArray::Length).
-    pub fn length(self) -> usize {
+    pub fn length(&self) -> usize {
         let realm = crate::realm_current();
         api::Array::length(&realm, self.engine()).unwrap_or(0.0) as usize
     }
 
     /// The element at `index` (v8::FixedArray::Get), or `None` past the end.
-    pub fn get(self, scope: &PinScope<'s, '_>, index: usize) -> Option<Local<'s, Data>> {
+    pub fn get(&self, scope: &PinScope<'s, '_>, index: usize) -> Option<Local<'s, Data>> {
         let realm = crate::realm_of(scope);
         api::Array::get(&realm, self.engine(), index as u32)
             .ok()

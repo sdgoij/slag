@@ -9,7 +9,7 @@ use runtime::api;
 use runtime::promise::ResolverData;
 
 use crate::data::{Function, Promise, PromiseResolver, Value};
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 
 /// A promise's state (v8::PromiseState).
@@ -34,7 +34,7 @@ pub enum PromiseRejectEvent {
     PromiseResolveAfterResolved,
 }
 
-impl<'s> Local<'s, Promise> {
+impl<'s> LocalHandle<'s, Promise> {
     /// The promise's state (v8::Promise::State).
     pub fn state(&self) -> PromiseState {
         let realm = crate::realm_current();
@@ -248,7 +248,7 @@ impl PromiseResolver {
     }
 }
 
-impl<'s> Local<'s, PromiseResolver> {
+impl<'s> LocalHandle<'s, PromiseResolver> {
     /// The promise this resolver settles (v8::Promise::Resolver::GetPromise).
     pub fn get_promise<'a>(&self, _scope: &PinScope<'a, '_>) -> Local<'a, Promise> {
         let promise = self.resolver_data(|data| data.borrow().promise);

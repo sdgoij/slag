@@ -27,16 +27,38 @@ use runtime::Agent;
 use runtime::api;
 use runtime::function::EcmaFunction;
 
-use crate::handle::{Global, Local, Payload};
+use crate::handle::{Global, Local, LocalHandle, Payload};
 
 /// Every tag in the API. Zero-sized by design: a tag selects methods and
 /// comparison/cast impls, and holds nothing.
+///
+/// A tag reference is also a receiver, which is the shape the crate we stand in
+/// for has: a `&v8::Value` resolves to the same methods a `Local<Value>` has. A
+/// tag is zero-sized here rather than a pointer, so the reference carries the
+/// address of the handle it came from and derefs into that handle's methods
+/// ([`LocalHandle`]); in the crate we stand in for the address is the V8 object
+/// and the methods are on the tag itself.
 macro_rules! tags {
     ($($(#[$attr:meta])* $name:ident),* $(,)?) => {
         $(
             $(#[$attr])*
             #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
             pub struct $name(());
+
+            impl Deref for $name {
+                type Target = LocalHandle<'static, $name>;
+
+                fn deref(&self) -> &Self::Target {
+                    // SAFETY: a `&$name` is only ever made by a handle's deref or
+                    // by one of these, so the address is a live payload — and a
+                    // tag is zero-sized, so nothing of the tag's own is read.
+                    unsafe {
+                        &*(self as *const Self)
+                            .cast::<u8>()
+                            .cast::<LocalHandle<'static, $name>>()
+                    }
+                }
+            }
         )*
     };
 }
@@ -116,11 +138,17 @@ tags! {
     StackTrace,
 }
 
+/// The inheritance between tags, expressed on the handle the tag derefs into.
+///
+/// The crate we stand in for spells each of these as a `Deref` between the tags
+/// themselves; with the tags zero-sized, the chain runs between the handles they
+/// deref into instead, so `local_string.a_name_method()` resolves exactly as it
+/// does there. Every edge below is a `impl_deref!` in that crate.
 macro_rules! derefs_to {
     ($($sub:ident => $base:ident),* $(,)?) => {
         $(
-            impl<'s> Deref for Local<'s, $sub> {
-                type Target = Local<'s, $base>;
+            impl<'s> Deref for LocalHandle<'s, $sub> {
+                type Target = LocalHandle<'s, $base>;
 
                 fn deref(&self) -> &Self::Target {
                     self.cast_ref()
@@ -1064,6 +1092,14 @@ macro_rules! identity_hashes {
 impl<'s, T> Local<'s, T> {
     /// The identity hash of the thing this handle names, for the tagged impls
     /// above; a crate-private door onto [`identity_hash`](crate::handle::identity_hash).
+    pub(crate) fn identity_hash(&self) -> NonZeroI32 {
+        crate::handle::identity_hash(self.payload())
+    }
+}
+
+impl<'s, T> LocalHandle<'s, T> {
+    /// As [`Local::identity_hash`], for the bodies that run on the handle the
+    /// tag derefs into.
     pub(crate) fn identity_hash(&self) -> NonZeroI32 {
         crate::handle::identity_hash(self.payload())
     }

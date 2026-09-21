@@ -30,7 +30,7 @@ use crux::error::JsError;
 use runtime::api;
 
 use crate::data::{Context, FixedArray, Module, Object, String as JsString, Value};
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::primitives::undefined;
 use crate::scope::PinScope;
 use crate::support::{MapFnFrom, MapFnTo, UnitType};
@@ -133,15 +133,15 @@ where
     (F::get())(context, specifier, attributes, referrer)
 }
 
-impl<'s> Local<'s, Module> {
+impl<'s> LocalHandle<'s, Module> {
     /// The record's identity hash (v8::Module::GetIdentityHash), for a host that
     /// keys a table by module.
-    pub fn get_identity_hash(self) -> NonZeroI32 {
+    pub fn get_identity_hash(&self) -> NonZeroI32 {
         self.module().get_identity_hash()
     }
 
     /// The module's current status (v8::Module::GetStatus).
-    pub fn get_status(self) -> ModuleStatus {
+    pub fn get_status(&self) -> ModuleStatus {
         self.module().status()
     }
 
@@ -151,7 +151,7 @@ impl<'s> Local<'s, Module> {
     /// The crate we stand in for returns an empty handle for a module that has
     /// not failed, which its own callers unwrap; *undefined* is the honest value
     /// for the same case here.
-    pub fn get_exception(self) -> Local<'s, Value> {
+    pub fn get_exception(&self) -> Local<'s, Value> {
         match self.module().exception() {
             Some(value) => Local::from_engine(value),
             None => undefined(&()).into(),
@@ -162,7 +162,7 @@ impl<'s> Local<'s, Module> {
     ///
     /// The crate we stand in for takes no scope here because it has the current
     /// one on the stack; the bridge reads the entered context instead.
-    pub fn get_module_namespace(self) -> Local<'s, Value> {
+    pub fn get_module_namespace(&self) -> Local<'s, Value> {
         let realm = crate::realm_current();
         match self.module().namespace(&realm) {
             Ok(value) => Local::from_engine(value),
@@ -180,7 +180,7 @@ impl<'s> Local<'s, Module> {
     /// means linking failed, with the exception pending: the host's own if it
     /// refused a request, the engine's otherwise.
     pub fn instantiate_module<'s2, 'i>(
-        self,
+        &self,
         scope: &PinScope<'s2, 'i>,
         callback: impl MapFnTo<ResolveModuleCallback<'s2>>,
     ) -> Option<bool> {
@@ -190,7 +190,7 @@ impl<'s> Local<'s, Module> {
     /// Link the module, taking the source callback a host passes as well
     /// (v8::Module::InstantiateModule with a source resolver).
     pub fn instantiate_module2<'s2, 'i>(
-        self,
+        &self,
         scope: &PinScope<'s2, 'i>,
         callback: impl MapFnTo<ResolveModuleCallback<'s2>>,
         source_callback: impl MapFnTo<ResolveSourceCallback<'s2>>,
@@ -208,7 +208,7 @@ impl<'s> Local<'s, Module> {
     /// which is exactly what the crate we stand in for hands back, so the value
     /// is that promise. `None` means the module could not be evaluated at all
     /// and a pending exception was set.
-    pub fn evaluate(self, scope: &PinScope<'s, '_>) -> Option<Local<'s, Value>> {
+    pub fn evaluate(&self, scope: &PinScope<'s, '_>) -> Option<Local<'s, Value>> {
         let realm = scope.get_current_context().context();
         match self.module().evaluate(&realm) {
             Ok(value) => Some(Local::from_engine(value)),
@@ -224,21 +224,21 @@ impl<'s> Local<'s, Module> {
     ///
     /// Every module the engine compiles is one, so this is `true` — stated
     /// rather than assumed because a host branches on it.
-    pub fn is_source_text_module(self) -> bool {
+    pub fn is_source_text_module(&self) -> bool {
         let _ = self;
         true
     }
 
     /// Whether this module is a synthetic module
     /// (v8::Module::IsSyntheticModule).
-    pub fn is_synthetic_module(self) -> bool {
+    pub fn is_synthetic_module(&self) -> bool {
         let _ = self;
         false
     }
 
     /// Resolve every request in the graph, then link.
     fn instantiate<'s2, 'i>(
-        self,
+        &self,
         scope: &PinScope<'s2, 'i>,
         resolve: ResolveModuleCallback<'s2>,
     ) -> Option<bool> {
@@ -267,7 +267,7 @@ impl<'s> Local<'s, Module> {
     /// Every request edge is asked about, as the crate we stand in for asks
     /// about every edge; each module is walked once, so a cycle terminates.
     fn resolve_graph<'s2>(
-        self,
+        &self,
         scope: &PinScope<'s2, '_>,
         realm: &api::Context,
         resolve: ResolveModuleCallback<'s2>,

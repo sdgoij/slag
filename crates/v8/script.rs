@@ -3,7 +3,7 @@
 use runtime::api;
 
 use crate::data::{Data, Script, String, Value};
-use crate::handle::{Local, Payload};
+use crate::handle::{Local, LocalHandle, Payload};
 use crate::scope::PinScope;
 
 /// Where a script came from (`v8::ScriptOrigin`).
@@ -88,7 +88,7 @@ impl Script {
     }
 }
 
-impl<'s> Local<'s, Script> {
+impl<'s> LocalHandle<'s, Script> {
     /// Evaluate the script (`v8::Script::Run`).
     pub fn run<'a>(&self, scope: &PinScope<'a, '_>) -> Option<Local<'a, Value>> {
         let realm = crate::realm_of(scope);

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroI32;
+use std::ops::Deref;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -108,15 +109,105 @@ type Tag<'s, T> = PhantomData<(&'s (), fn() -> T)>;
 
 /// A scoped handle over a language value (`v8::Local`).
 ///
-/// The tag `T` decides which methods are in scope: method availability comes
-/// from the `Deref` chain in [`data`](crate::data), which stands in for the C++
-/// inheritance the crate we stand in for relies on.
+/// The tag `T` decides which methods are in scope, and — as in the crate we
+/// stand in for — a tag *reference* is a receiver: `Local<'s, T>` derefs to `T`,
+/// which derefs into the [`LocalHandle`] carrying the methods. That chain is what
+/// makes `&v8::Value` callable, and the address it hands out is the handle's own
+/// payload, so a `&T` and the `Local` it came from name the same thing.
 ///
-/// A handle is `Copy`, as it is in the crate we stand in for: its payload is a
-/// value or a context, both plain data, or a reference into the script table.
+/// A handle is `Copy`, as it is in the crate we stand in for.
+#[repr(C)]
 pub struct Local<'s, T> {
     payload: Payload,
     marker: Tag<'s, T>,
+}
+
+/// Where a [`Local`]'s methods live, reachable from the tag it points at.
+///
+/// The crate we stand in for puts the methods on the tag itself, and the tag is
+/// a pointer there; here a tag is zero-sized and has to deref somewhere, so this
+/// is the somewhere. `T: Deref<Target = LocalHandle<'static, T>>` puts a `&T`
+/// back on exactly the methods a `Local` had, and the inheritance edges
+/// (`derefs_to!` in [`data`](crate::data)) move here with them, which keeps the
+/// shape's *reachability* while the methods migrate onto the tags themselves.
+///
+/// It is scaffolding and is deleted with the last of those moves. Until then it
+/// is the one deliberate difference from the crate we stand in for: a host that
+/// names a method by UFCS on a tag, or implements a trait *for* a tag, sees it
+/// (§9). Layout is [`Local`]'s, which is what lets a tag reference be read as one.
+#[repr(C)]
+pub struct LocalHandle<'s, T> {
+    payload: Payload,
+    marker: Tag<'s, T>,
+}
+
+impl<'s, T> LocalHandle<'s, T> {
+    pub(crate) fn payload(&self) -> &Payload {
+        &self.payload
+    }
+
+    pub(crate) fn engine(&self) -> &api::Local {
+        self.payload.as_value()
+    }
+
+    pub(crate) fn context(&self) -> api::Context {
+        self.payload.as_context()
+    }
+
+    pub(crate) fn module(&self) -> api::Module {
+        self.payload.as_module()
+    }
+
+    pub(crate) fn script_source(&self) -> Rc<str> {
+        match self.payload {
+            Payload::Script { slot, generation } => crate::store::source(slot, generation)
+                .expect("bridge bug: a Script handle outlived its handle scope"),
+            _ => panic!("bridge bug: a non-Script handle read as a Script"),
+        }
+    }
+
+    /// Retag in place: the payload is untouched, so this is a rebuild, not a
+    /// reinterpretation. By reference, because the payload is `Copy` and the
+    /// handle the tag derefs into is not — the crate we stand in for's tags are
+    /// mostly not `Copy` either, which is why a `to_*` method taking `&self` is
+    /// its shape and not a lint about the receiver.
+    pub(crate) fn retag<U>(&self) -> Local<'s, U> {
+        Local::from_payload(self.payload)
+    }
+
+    /// The same handle under another tag, by reference.
+    ///
+    /// # Safety
+    ///
+    /// Sound because `T` appears only in `PhantomData`: every `LocalHandle<'s,
+    /// T>` has the same layout whatever `T` is.
+    pub(crate) fn cast_ref<U>(&self) -> &LocalHandle<'s, U> {
+        // SAFETY: as documented above — layout does not depend on the tag.
+        unsafe { &*(self as *const Self).cast::<LocalHandle<'s, U>>() }
+    }
+}
+
+impl<T> fmt::Debug for LocalHandle<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.payload, f)
+    }
+}
+
+/// The tag a handle points at.
+///
+/// The address is the handle's payload, and a tag is zero-sized, so this
+/// reference carries the address and nothing else: it never reaches the tag's
+/// (empty) bytes, and the tag's own deref turns it back into the
+/// [`LocalHandle`] whose methods it names.
+impl<T> Deref for Local<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: every `&T` a host can hold is made here or by the tag-to-tag
+        // derefs, so the address is a live `Local`'s payload, which outlives the
+        // borrow this reference is tied to.
+        unsafe { &*(&self.payload as *const Payload as *const T) }
+    }
 }
 
 impl<'s, T> Local<'s, T> {
@@ -162,15 +253,6 @@ impl<'s, T> Local<'s, T> {
     /// The record behind a `Module` handle.
     pub(crate) fn module(&self) -> api::Module {
         self.payload.as_module()
-    }
-
-    /// The source behind a `Script` handle.
-    pub(crate) fn script_source(&self) -> Rc<str> {
-        match self.payload {
-            Payload::Script { slot, generation } => crate::store::source(slot, generation)
-                .expect("bridge bug: a Script handle outlived its handle scope"),
-            _ => panic!("bridge bug: a non-Script handle read as a Script"),
-        }
     }
 
     /// Retag the handle, with no check that the payload is of the new tag.
@@ -239,19 +321,6 @@ impl<'s, T> Local<'s, T> {
     {
         // SAFETY: the caller's contract.
         unsafe { O::extend_lifetime_unchecked_from(self) }
-    }
-
-    /// The same handle under another tag, by reference.
-    ///
-    /// # Safety
-    ///
-    /// Sound because `T` appears only in `PhantomData`, so every
-    /// `Local<'s, T>` has the same layout regardless of `T`. It is unsafe only
-    /// because it produces a shared reference to the reinterpreted value; the
-    /// caller must not use it as a tag whose payload variant differs.
-    pub(crate) fn cast_ref<U>(&self) -> &Local<'s, U> {
-        // SAFETY: as documented above — layout does not depend on the tag.
-        unsafe { &*(self as *const Self).cast::<Local<'s, U>>() }
     }
 
     /// The engine value behind the handle, as a `Value`.

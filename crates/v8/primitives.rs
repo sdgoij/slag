@@ -9,7 +9,7 @@ use crux::value::ValueKind;
 use runtime::api;
 
 use crate::data::{Boolean, Int32, Integer, Number, Primitive, String, Symbol, Uint32};
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 
 /// `v8::null`.
@@ -81,7 +81,7 @@ impl Boolean {
     }
 }
 
-impl<'s> Local<'s, Boolean> {
+impl<'s> LocalHandle<'s, Boolean> {
     pub fn value(&self) -> bool {
         self.engine().as_boolean().unwrap_or(false)
     }
@@ -93,7 +93,7 @@ impl Number {
     }
 }
 
-impl<'s> Local<'s, Number> {
+impl<'s> LocalHandle<'s, Number> {
     /// The value as a double (`v8::Number::Value`).
     pub fn value(&self) -> f64 {
         self.engine().as_number().unwrap_or(f64::NAN)
@@ -112,14 +112,14 @@ impl Integer {
     }
 }
 
-impl<'s> Local<'s, Integer> {
+impl<'s> LocalHandle<'s, Integer> {
     /// The value (`v8::Integer::Value`).
     pub fn value(&self) -> i64 {
         self.engine().as_number().map_or(0, |n| n as i64)
     }
 }
 
-impl<'s> Local<'s, Uint32> {
+impl<'s> LocalHandle<'s, Uint32> {
     /// The value as an unsigned 32-bit integer (`v8::Uint32::Value`).
     ///
     /// The width is the whole of this accessor: the engine has one number kind,
@@ -130,7 +130,7 @@ impl<'s> Local<'s, Uint32> {
     }
 }
 
-impl<'s> Local<'s, Int32> {
+impl<'s> LocalHandle<'s, Int32> {
     /// The value as a signed 32-bit integer (`v8::Int32::Value`), for the same
     /// reason as [`Uint32::value`](Local::value).
     pub fn value(&self) -> i32 {
@@ -250,7 +250,7 @@ impl String {
     }
 }
 
-impl<'s> Local<'s, String> {
+impl<'s> LocalHandle<'s, String> {
     /// The raw UTF-16 code units behind the string.
     ///
     /// Read from the engine's `JsString`, which stores code units exactly — a

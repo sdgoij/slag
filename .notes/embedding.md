@@ -555,6 +555,7 @@ number is the certified one.
 | after the leftovers (the empty string and a one-byte const, `clear_all_slots`, `Promise::catch`, `get_property_names`, `has_pending_background_tasks`, and the `Global` raw-pointer pair) plus the continuation-value move it forced | **217** (see below) |
 | after the buffer-handing shapes (`ArrayBuffer::new_backing_store_from_bytes` and its `Rawable` widths, and `SharedArrayBuffer::with_backing_store`) | **213** (see below) |
 | after the host-memory store (`ArrayBuffer::new_backing_store_from_ptr`, the borrowed block the engine gained for it, and the `workers` shape that forced) | **209** (see below) |
+| after the tag shape (`Local<'s, T>: Deref<Target = T>`, the tag receiver chain, and the `LocalHandle` the methods sit on until they move) | **62** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -1015,6 +1016,56 @@ mode, inverting the index filter, and stubbing `from_raw` each fail the assertio
 that guards them. The exception is the continuation-value test, whose content *is*
 the borrow shape: it fails to compile if the handle goes back to borrowing its
 scope.
+
+**The tag shape — landed, 209 → 62, and the three decisions it forced.** `Local<'s, T>`
+is now `#[repr(C)] { payload, marker }` with `Deref<Target = T>`, so a tag
+*reference* is a receiver: a `&v8::Value` calls the methods a
+`v8::Local<v8::Value>` has, and the reference the deref hands out is the handle's
+own payload — which is what lets the host reinterpret it (`&v8::Value` →
+`&v8::String` after `is_string`, `libs/core/runtime/ops.rs:265-278`) and read
+through the result.
+
+- **Where the methods live.** Rust allows one `Deref` per type and `Local`'s is
+  now `Target = T`, which leaves the inheritance chain and the 175 methods that
+  hung off it nowhere to sit. They moved to `LocalHandle<'s, T>` — the same
+  `#[repr(C)]` layout, carrying today's methods and today's `derefs_to!` edges —
+  and each tag derefs into it (`T: Deref<Target = LocalHandle<'static, T>>`), so a
+  `&T` reaches exactly what a `Local` reaches. That was a rename of 27 impl
+  blocks across 15 files plus the deref table, not a rewrite: **the bodies are
+  unchanged**, because the accessors they read moved with them. It is
+  scaffolding — the end state is the crate's, methods on the tags, `LocalHandle`
+  gone — and with it in place those moves are now incremental, file by file.
+- **The receiver is `&self` and the type the methods live on is not `Copy`.**
+  Thirteen methods took `self` by value (`Module`'s accessors, `FixedArray`'s two)
+  because a `Local` is `Copy`; on the tag they take `&self`, which is the crate's
+  shape and the permissive direction for callers. `LocalHandle` is deliberately
+  *not* `Copy`: the crate's tags mostly are not, and a `Copy` receiver is what
+  makes `-D warnings` fire on all twelve `to_*` methods taking `&self`.
+- **Two call sites lost a coercion and gained the crate's own conversion.**
+  `&array` where `&Local<Object>` was wanted used to work by deref coercion
+  through the old `Local`-to-`Local` chain; `.into()` is what that call is in the
+  crate we stand in for, and the `impl_from!` table already had it.
+
+Measured: **209 → 62**, and the change is exactly the shape's part of it — all 78
+`E0308`s are gone and `E0599` falls 122 → 53. What remains is 53 named methods and
+subsystems (the message and stack-trace surface, synthetic modules, wasm
+streaming, code cache, source offsets, the extras binding object), the 4 names,
+and four stragglers (3 `E0515`, 1 `E0282`).
+
+Gates: `cargo test -p v8 --features simdutf` **153 passed / 0 failed** (one new),
+`clippy --locked --workspace --all-targets -- -D warnings` clean, and
+`cargo test --locked --workspace` **5,087 passed / 0 failed / 4 ignored** across 38
+binaries with the crashing `v8` test filtered out. No engine crate changed —
+`git status` names `crates/v8` only — so no sweep is implicated.
+
+The new test is `tests::a_tag_reference_is_a_receiver`: it takes a `&v8::Value`
+from a handle, asserts the payload behind it is the handle's own (pointer
+equality — that is the runtime half), then reinterprets it as a `&v8::String` the
+way the host does and reads one `String` method and one declared four tags up.
+Its guard is partly a *compile*-time one, and honestly so: removing the deref
+stops it compiling, and the payload's address is the design, so the mutation that
+would move it is not one that can be staged soundly (a `static` payload is not
+`Sync`, and a shifted address is UB).
 
 **The host-memory store — landed, 213 → 209, and the first engine change the
 bridge forced.** Four sites were `ArrayBuffer::new_backing_store_from_ptr`
@@ -1479,19 +1530,18 @@ if that proves possible.
   engine work rather than bridge work, and is the thing to do if a host ever
   needs V8's strength here; recorded now so the weakness is a decision rather
   than a surprise.
-- **The tag shape blocks a quarter of the remaining `deno_core` surface, and
-  the decision is open.** `deno_core` calls methods on `&v8::Value` and
-  `&v8::String` and transmutes between them (`libs/core/runtime/ops.rs:273`,
-  `convert.rs:211`), which needs `Local<'s, T>: Deref<Target = T>` over
-  pointer-carrying tags — the crate we stand in for's shape. This bridge's tags
-  are zero-sized and its methods live on `Local`, which is why 153 of the 617
-  errors behind the last names cannot be closed by adding methods. Rust allows
-  one `Deref` per type, so the two shapes cannot both be had: either the deref
-  chain moves onto the tags and the methods move with it (a rewrite of the
-  bridge's handle layer and its ~800 methods, and the only path to `deno_core`
-  compiling unmodified), or the deref-to-tag stays absent and those call sites
-  are the difference a porting host must absorb. Recorded with the numbers and
-  left unresolved rather than decided mid-flight by an agent.
+- **The tag shape is the operator's call, and it landed as the crate we stand in
+  for has it.** `deno_core` calls methods on `&v8::Value` and `&v8::String` and
+  transmutes between them (`libs/core/runtime/ops.rs:273`, `convert.rs:211`),
+  which needs `Local<'s, T>: Deref<Target = T>` over the tags. Rust allows one
+  `Deref` per type, so the deref chain could not stay on `Local`: it is now
+  `Target = T`, and the tags deref into `LocalHandle<'s, T>`, which carries the
+  methods and the inheritance edges until they move onto the tags themselves.
+  **The tier this states:** reachability is the crate's (`&v8::Value` calls what a
+  `v8::Local<v8::Value>` calls, and the reinterpretations the host writes work);
+  what is not yet is UFCS on a tag and a trait implemented *for* a tag, and both
+  follow from the same per-file moves. Entry price and payoff, measured: 209 → 62
+  `deno_core` errors, with the 78 `E0308`s gone entirely.
 - **A pre-existing crash in the v8 test binary is recorded, not hidden.**
   `function::tests::the_data_a_built_function_carries_survives_a_collection`
   aborts the process on most full-binary runs (it passes in isolation, so the
@@ -1629,15 +1679,19 @@ property bounds to 364, the identity hashes to 351, the embedder-data slots to
 347, private names to 336, the method tail to 292, scheduling and exception
 control to 260, the isolate-level callback vocabulary to 242, the symbol surface
 to 233, the primitive array to 225, the leftovers to 217, the buffer-handing
-shapes to 213, the host-memory store to 209, and what is left is the method
-surface (122 `E0599`s: 72 where a
-value handle is the receiver — the tag shape — 30 on a `Local<…>`, 20 associated
-items on a tag, 4 on another bridge type), the 78 `E0308`s the tag shape
-explains, the 4 names, and four stragglers (3 `E0515`, 1 `E0282`). Three
+shapes to 213, the host-memory store to 209, the tag shape to 62, and what is left
+is the method surface (53 `E0599`s, all of them named methods and subsystems: the
+message and stack-trace surface, synthetic modules, wasm streaming, code cache,
+source offsets, the extras binding object), the 4 names, and four stragglers
+(3 `E0515`, 1 `E0282`). Three
 surveyed-and-left items sit outside those counts' reach — `get_constructor_name`
 (needs V8's map), `get_extras_binding_object` (needs an engine-side extras
 object) and `get_heap_statistics` (needs byte accounting in `crux::heap`) — and
-everything else needs the tag shape or an engine capability;
+everything else needs the tag shape or an engine capability; with the shape
+landed, the tag-shape column is closed — the remaining 53 are methods to write
+and the subsystems they name; and the shape's own tail is (a) the methods moving
+from `LocalHandle` onto the tags, file by file, then (b) deleting `LocalHandle`
+and its deref table, which is when the tier §9 states stops being a tier;
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then

@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use runtime::api;
 
 use crate::data::{Context, Function, FunctionTemplate, Object, Value};
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::isolate::{Isolate, UnsafeRawIsolatePtr};
 use crate::scope::PinScope;
 use crate::support::{MapFnFrom, MapFnTo, UnitType};
@@ -39,7 +39,7 @@ pub enum SideEffectType {
 /// callback mapped from a Rust function reads.
 pub type FunctionCallback = unsafe extern "C" fn(*const FunctionCallbackInfo);
 
-impl<'s> Local<'s, Function> {
+impl<'s> LocalHandle<'s, Function> {
     /// Call the function (`v8::Function::Call`). A failure leaves the thrown
     /// value as the pending exception, which is what the crate we stand in for
     /// reports the same way.

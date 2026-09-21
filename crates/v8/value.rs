@@ -5,12 +5,12 @@
 //! `TryFrom` cast and the corresponding `is_*` cannot disagree.
 
 use crate::data::{self as predicates, BigInt, Boolean, Integer, Number, Object, String, Value};
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 
 use runtime::api;
 
-impl<'s> Local<'s, Value> {
+impl<'s> LocalHandle<'s, Value> {
     pub fn is_undefined(&self) -> bool {
         self.engine().is_undefined()
     }

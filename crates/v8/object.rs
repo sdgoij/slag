@@ -13,7 +13,7 @@ use runtime::api;
 use slag::objects::{ensure_deferred_namespace_evaluation, materialize_pending_prototype_value};
 
 use crate::data::{Array, Map, Name, Object, Private, Proxy, Set, Value};
-use crate::handle::Local;
+use crate::handle::{Local, LocalHandle};
 use crate::property::{
     GetPropertyNamesArgs, IndexFilter, KeyCollectionMode, KeyConversionMode, PropertyAttribute,
     PropertyFilter,
@@ -81,7 +81,7 @@ impl Object {
     }
 }
 
-impl<'s> Local<'s, Object> {
+impl<'s> LocalHandle<'s, Object> {
     /// [[Get]] a property by a private name (`v8::Object::GetPrivate`).
     ///
     /// A private name is a symbol here — see [`private`](crate::private) — so
@@ -367,7 +367,7 @@ impl<'s> Local<'s, Object> {
         let mut objects = vec![object];
         if args.mode == KeyCollectionMode::IncludePrototypes {
             let realm = crate::realm_of(scope);
-            let mut current: Local<'_, Object> = *self;
+            let mut current: Local<'_, Object> = self.retag();
             loop {
                 let prototype = match api::Object::get_prototype(&realm, current.engine()) {
                     Ok(prototype) => prototype,
@@ -563,7 +563,7 @@ impl Array {
     }
 }
 
-impl<'s> Local<'s, Array> {
+impl<'s> LocalHandle<'s, Array> {
     /// The array's `length` (`v8::Array::Length`).
     pub fn length(&self) -> u32 {
         let realm = crate::realm_current();
@@ -571,7 +571,7 @@ impl<'s> Local<'s, Array> {
     }
 }
 
-impl<'s> Local<'s, Proxy> {
+impl<'s> LocalHandle<'s, Proxy> {
     /// The proxy's target (`v8::Proxy::GetTarget`).
     ///
     /// A revoked proxy has none. The crate we stand in for's wrapper aborts on
@@ -607,7 +607,7 @@ fn panic_proxy_slot(what: &str) -> Local<'static, Value> {
     panic!("bridge: Proxy::{what} on a proxy with no target or handler")
 }
 
-impl<'s> Local<'s, Map> {
+impl<'s> LocalHandle<'s, Map> {
     /// The map's entries as one flat array — key, value, key, value
     /// (`v8::Map::as_array`), in insertion order, with deleted keys left out.
     pub fn as_array<'a>(&self, scope: &PinScope<'a, '_>) -> Local<'a, Array> {
@@ -626,7 +626,7 @@ impl<'s> Local<'s, Map> {
     }
 }
 
-impl<'s> Local<'s, Set> {
+impl<'s> LocalHandle<'s, Set> {
     /// The set's elements as one flat array — each element as both its key and
     /// its value (`v8::Set::as_array`), in insertion order, with deleted
     /// elements left out.
