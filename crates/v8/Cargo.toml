@@ -1,0 +1,25 @@
+[package]
+name = "v8"
+# The version of the crate this stands in for, so a consumer pinning
+# `v8 = "150.4.0"` resolves to this one. Deliberately not the workspace version.
+version = "150.4.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+runtime = { path = "../runtime", default-features = false }
+crux = { path = "../crux" }
+
+# Mirrors the feature surface the crate we stand in for declares, so a
+# consumer's passthroughs (`features = ["simdutf"]`, `v8_use_custom_libcxx`, the
+# `v8_enable_*` set) still resolve. None of them change how Slag builds.
+[features]
+default = ["use_custom_libcxx"]
+use_custom_libcxx = []
+simdutf = []
+v8_enable_pointer_compression = []
+v8_enable_sandbox = ["v8_enable_pointer_compression"]
+v8_enable_v8_checks = []

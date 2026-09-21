@@ -15,6 +15,7 @@ members = [
     "crates/slag",
     "crates/ffi",
     "crates/jsc",
+    "crates/v8",
     "crates/cli",
     "crates/test262",
 ]
