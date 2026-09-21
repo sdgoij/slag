@@ -20,6 +20,7 @@ use crate::promise::{PromiseRejectEvent, PromiseRejectMessage};
 use crate::scope::PinScope;
 use crate::snapshot::{FunctionCodeHandling, SnapshotCreator, StartupData};
 use crate::support::{MapFnFrom, MapFnTo, UniqueRef, UnitType};
+use crate::wasm::WasmStreaming;
 
 /// Create parameters (`v8::CreateParams`).
 ///
@@ -154,6 +155,18 @@ pub struct IsolateInner {
     /// serializing. `None` for every isolate that is not, which is what makes
     /// the creator-only methods refuse on those.
     pub(crate) snapshot_creator: Option<SnapshotCreator>,
+    /// The host's promise-rejection callback
+    /// (`v8::Isolate::SetPromiseRejectCallback`), once it installed one.
+    ///
+    /// Held on the isolate rather than inside the host-hook seam's struct because
+    /// the seam is one `HostHooks` implementation for every callback a host
+    /// installs, and installing one must not drop another; the seam reads each
+    /// back by finding the isolate it was installed on. See
+    /// [`Isolate::install_hooks`].
+    promise_reject: Option<PromiseRejectCallback>,
+    /// The host's streaming-compilation callback
+    /// (`v8::Isolate::SetWasmStreamingCallback`), once it installed one.
+    wasm_streaming: Option<StreamingCallback>,
 }
 
 const _: () = assert!(std::mem::offset_of!(IsolateInner, engine) == 0);
@@ -165,17 +178,42 @@ pub type InterruptCallback =
 /// The callback a promise rejection runs
 /// (v8::Isolate::SetPromiseRejectCallback).
 ///
-/// This is the one host hook of the isolate-level set the engine fires: it
-/// reports a promise rejected with no handler, and a handler arriving for one it
-/// already reported, through `HostPromiseRejectionTracker`. See
-/// [`Isolate::set_promise_reject_callback`].
-///
 /// `extern "C"` here and in the three types below is the crate we stand in
 /// for's shape, not a boundary this bridge has: a handle is `Rc`-backed and so
 /// not FFI-safe, and the warning that says so is about a function pointer that is
 /// only ever called from Rust.
 #[allow(improper_ctypes_definitions)]
 pub type PromiseRejectCallback = unsafe extern "C" fn(PromiseRejectMessage);
+
+/// The host's streaming-compilation callback
+/// (v8::Isolate::SetWasmStreamingCallback), stored on the isolate that installed
+/// it.
+///
+/// The bound is higher-ranked rather than the crate's `MapFnTo` spelling for the
+/// same reason a synthetic module's steps are: the engine calls this from a job,
+/// where no scope of the host's is open, so the handles it hands over are made at
+/// the call. See [`host_streaming_callback`].
+type StreamingCallback =
+    for<'a, 'b, 'c> fn(&'c mut PinScope<'a, 'b>, Local<'a, Value>, WasmStreaming<false>);
+
+/// The function the engine's hook seam calls for a streaming compile: the host's
+/// callback, reached through its type.
+///
+/// A mapped function pointer names the scope's lifetime and cannot be stored past
+/// it; this fn item is lifetime-parameterized instead, and its parameters share
+/// the lifetime of the source handle — the one the host's callback is required to
+/// give the scope as well, so the call below satisfies that requirement by
+/// construction rather than by inference.
+fn host_streaming_callback<'a, 'i, 's, F>(
+    scope: &'s mut PinScope<'a, 'i>,
+    source: Local<'a, Value>,
+    streaming: WasmStreaming<false>,
+) where
+    F: UnitType
+        + for<'x, 'y, 'z> Fn(&'z mut PinScope<'x, 'y>, Local<'x, Value>, WasmStreaming<false>),
+{
+    (F::get())(scope, source, streaming)
+}
 
 /// The callback an error's `stack` property would run
 /// (v8::Isolate::SetPrepareStackTraceCallback).
@@ -457,6 +495,8 @@ impl Isolate {
             positions: RefCell::new(HashMap::new()),
             object_templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
+            promise_reject: None,
+            wasm_streaming: None,
         });
         // SAFETY: the box's allocation is where the state lives and it outlives
         // every handle to it — `OwnedIsolate` keeps it alive.
@@ -939,7 +979,29 @@ impl Isolate {
     /// - The rejection value is present only when the engine had it in hand;
     ///   V8 always has it.
     pub fn set_promise_reject_callback(&mut self, callback: PromiseRejectCallback) {
-        self.engine_mut().agent().host_hooks = Some(Box::new(PromiseRejectHooks { callback }));
+        self.inner_mut().promise_reject = Some(callback);
+        self.install_hooks();
+    }
+
+    /// Embedder injection point for `WebAssembly.compileStreaming(source)`
+    /// (v8::Isolate::SetWasmStreamingCallback).
+    ///
+    /// The callback receives the value the source argument resolved to and the
+    /// stream to feed; the stream outlives the call and is what settles the
+    /// promise `compileStreaming` answered. See `crate::wasm`.
+    ///
+    /// Where the crate we stand in for installs this on the engine directly, the
+    /// engine here takes it as a host hook and asks whether one is installed
+    /// before it answers `compileStreaming` at all. Installing one is what makes
+    /// that method exist (`runtime::host::has_wasm_streaming_callback`), and an
+    /// isolate whose host never calls this keeps the engine's default refusal.
+    pub fn set_wasm_streaming_callback<F>(&mut self, _: F)
+    where
+        F: UnitType
+            + for<'a, 'b, 'c> Fn(&'c mut PinScope<'a, 'b>, Local<'a, Value>, WasmStreaming<false>),
+    {
+        self.inner_mut().wasm_streaming = Some(host_streaming_callback::<F>);
+        self.install_hooks();
     }
 
     /// The callback an error's `stack` property would run
@@ -1057,25 +1119,41 @@ impl Isolate {
         unsafe { self.0.as_mut() }
     }
 
+    /// Make the engine's host-hook seam this bridge's.
+    ///
+    /// One `HostHooks` implementation serves every host-defined operation, so
+    /// both callbacks a host can install go through here, and neither may
+    /// replace the other: the hooks struct is stateless, reading each callback
+    /// off the isolate that owns it, so replacing the seam is what installing
+    /// the second of them looks like. This isolate is one the bridge made, and
+    /// the bridge is the only thing that sets its hooks.
+    fn install_hooks(&mut self) {
+        self.engine_mut().agent().host_hooks = Some(Box::new(BridgeHooks));
+    }
+
     fn slots_mut(&mut self) -> &mut HashMap<TypeId, Box<dyn Any>> {
         // SAFETY: as `get_slot` — the caller's contract covers a live borrow.
         unsafe { &mut *self.inner_mut().slots.get() }
     }
 }
 
-/// The isolate's implementation of the engine's host-hook seam, which routes
-/// the one event this bridge is the producer for: a promise rejection.
+/// The isolate's implementation of the engine's host-hook seam: the events this
+/// bridge is the producer for.
 ///
 /// The seam is a single trait for every host-defined operation the engine has,
 /// so this type is the bridge's whole implementation of it and a later hook the
 /// engine grows joins it here. The methods not written below keep the engine's
 /// defaults, which is exactly what an isolate with no hooks at all gets.
+///
+/// It carries no state: each callback a host installs is stored on the isolate it
+/// was installed on, and this reads it back by finding that isolate at call time
+/// (`api::Isolate::get_current`). That is what lets a host install the
+/// promise-rejection callback and the streaming callback in either order without
+/// one replacing the other — see [`Isolate::install_hooks`].
 #[derive(Debug)]
-struct PromiseRejectHooks {
-    callback: PromiseRejectCallback,
-}
+struct BridgeHooks;
 
-impl runtime::HostHooks for PromiseRejectHooks {
+impl runtime::HostHooks for BridgeHooks {
     fn promise_rejection_tracker(
         &self,
         promise: &crux::value::Value,
@@ -1092,6 +1170,9 @@ impl runtime::HostHooks for PromiseRejectHooks {
         // assertion that keeps it there is next to the type — so the pointer the
         // engine hands back names the bridge's own isolate.
         let isolate = unsafe { Isolate::from_engine_ptr(engine) };
+        let Some(callback) = isolate.inner().promise_reject else {
+            return Ok(());
+        };
         let event = if operation {
             PromiseRejectEvent::PromiseHandlerAddedAfterReject
         } else {
@@ -1100,7 +1181,48 @@ impl runtime::HostHooks for PromiseRejectHooks {
         let message = PromiseRejectMessage::new(isolate, *promise, event, reason.copied());
         // SAFETY: the host installed this callback to be called with a
         // rejection, and this is that call, on the thread owning the isolate.
-        unsafe { (self.callback)(message) };
+        unsafe { (callback)(message) };
+        Ok(())
+    }
+
+    fn has_wasm_streaming_callback(&self) -> bool {
+        // SAFETY: as `promise_rejection_tracker` — the engine hands back the
+        // isolate whose agent is running, and that address is the bridge's.
+        match api::Isolate::get_current() {
+            Some(engine) => {
+                let isolate = unsafe { Isolate::from_engine_ptr(engine) };
+                isolate.inner().wasm_streaming.is_some()
+            }
+            None => false,
+        }
+    }
+
+    fn wasm_streaming(
+        &self,
+        source: &crux::value::Value,
+        streaming: &api::WasmStreaming,
+    ) -> Result<(), crux::error::JsError> {
+        let Some(engine) = api::Isolate::get_current() else {
+            return Ok(());
+        };
+        // SAFETY: as above.
+        let isolate = unsafe { Isolate::from_engine_ptr(engine) };
+        // The realm the engine is running in — it calls this from a job, and a
+        // realm is in reach for the whole of an isolate's life (one context per
+        // isolate, its bootstrap execution context never popped).
+        let Some(context) = isolate.current_context() else {
+            return Err(crux::error::JsError::new(
+                crux::ErrorKind::TypeError,
+                "a streaming compile needs a realm in reach".into(),
+            ));
+        };
+        let context_local = Local::<Context>::from_payload(Payload::Context(context));
+        crate::callback_scope!(unsafe scope, context_local);
+        let Some(callback) = isolate.inner().wasm_streaming.as_ref() else {
+            return Ok(());
+        };
+        let source = Local::<Value>::from_engine(api::Local::from(*source));
+        callback(scope, source, WasmStreaming(streaming.clone()));
         Ok(())
     }
 }
@@ -1167,6 +1289,7 @@ impl OwnedIsolate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::promise::PromiseState;
 
     /// The termination requests answer, and the answer is that nothing was
     /// requested: the engine cannot stop a running execution.
@@ -1239,6 +1362,101 @@ mod tests {
                 ],
                 "the rejection and the late handler are both reported, in order"
             );
+        });
+    }
+
+    /// A host callback that streams one module for every source it is handed —
+    /// the last step of the fetch loop a browser or Deno runs, reduced to it.
+    ///
+    /// A fn item rather than a closure because that is the shape a host installs
+    /// (`UnitType`), and its lifetimes are spelled as Deno spells its own
+    /// callback's: the source handle and the scope's first parameter share one
+    /// lifetime, which is what the installed callback type requires of them.
+    fn host_streams_a_module<'a>(
+        _scope: &mut PinScope<'a, '_>,
+        _source: Local<'a, Value>,
+        mut streaming: WasmStreaming<false>,
+    ) {
+        streaming.on_bytes_received(&crate::test_support::EXPORTS_A_MEMORY);
+        streaming.set_url("app.wasm");
+        streaming.finish();
+    }
+
+    /// A host that installs a streaming callback can leave the fetching to its
+    /// own code and still get V8's shape: the engine answers the promise at once,
+    /// the source resolves on a later turn, and the callback's stream is what
+    /// settles the promise — with the module its bytes compiled to.
+    #[test]
+    fn a_host_streaming_callback_settles_compile_streaming() {
+        crate::test_support::in_context!(scope, {
+            scope.set_wasm_streaming_callback(host_streams_a_module);
+            let promise = Local::<Promise>::try_from(crate::test_support::eval(
+                scope,
+                "WebAssembly.compileStreaming({ url: 'app.wasm' })",
+            ))
+            .expect("a promise");
+            assert_eq!(
+                promise.state(),
+                PromiseState::Pending,
+                "the source has not resolved yet"
+            );
+
+            scope.run_microtasks().expect("microtasks");
+            assert_eq!(promise.state(), PromiseState::Fulfilled);
+
+            // The resolution is read through the engine's own accessor: the
+            // bridge's cast table only widens a module object to `Object` and
+            // `Value`, which is all a host's own code ever asks for.
+            let compiled = api::WasmModuleObject::get_compiled_module(
+                &crate::realm_current(),
+                promise.result(scope).engine(),
+            )
+            .expect("the resolution is a module object");
+            assert_eq!(
+                compiled.module().exports[0].name,
+                "m",
+                "the module the host streamed, not some other one"
+            );
+        });
+    }
+
+    /// The isolate's callbacks share one host-hook implementation, so installing
+    /// the second of them must not drop the first, in either direction. Both are
+    /// exercised after both installs, in the order a host makes them.
+    #[test]
+    fn installing_one_isolate_callback_keeps_the_other() {
+        thread_local! {
+            static REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+
+        #[allow(improper_ctypes_definitions)] // as the callback type says.
+        unsafe extern "C" fn record(_message: PromiseRejectMessage) {
+            REJECTED.with(|seen| seen.set(true));
+        }
+
+        crate::test_support::in_context!(scope, {
+            scope.set_promise_reject_callback(record);
+            scope.set_wasm_streaming_callback(host_streams_a_module);
+
+            let promise = Local::<Promise>::try_from(crate::test_support::eval(
+                scope,
+                "WebAssembly.compileStreaming({ url: 'app.wasm' })",
+            ))
+            .expect("a promise");
+            crate::test_support::eval(scope, "Promise.reject(new Error('boom'));");
+            scope.run_microtasks().expect("microtasks");
+            assert_eq!(
+                promise.state(),
+                PromiseState::Fulfilled,
+                "the streaming callback installed second still runs"
+            );
+        });
+
+        REJECTED.with(|seen| {
+            assert!(
+                seen.get(),
+                "the rejection callback installed first still runs"
+            )
         });
     }
 

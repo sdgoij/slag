@@ -118,7 +118,7 @@ pub use support::{
     BackingStore, DefaultTag, MapFnFrom, MapFnTo, Rawable, SharedRef, UniquePtr, UniqueRef,
     UnitType,
 };
-pub use wasm::CompiledWasmModule;
+pub use wasm::{CompiledWasmModule, WasmStreaming};
 
 use runtime::api;
 

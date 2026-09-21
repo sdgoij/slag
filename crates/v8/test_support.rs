@@ -32,6 +32,15 @@ pub(crate) fn eval_number(scope: &PinScope<'_, '_>, source: &str) -> f64 {
         .value()
 }
 
+/// Magic and version, a memory section with one one-page memory, and an export
+/// section exporting it as `m` — the smallest module that says something a lossy
+/// round trip can lose.
+pub(crate) const EXPORTS_A_MEMORY: [u8; 20] = [
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // \0asm, version 1
+    0x05, 0x03, 0x01, 0x00, 0x01, // memory: one, min 1 page
+    0x07, 0x05, 0x01, 0x01, b'm', 0x02, 0x00, // export "m" as memory 0
+];
+
 /// Bind `value` on the realm's global object, which is how a host hands a value
 /// to a script.
 pub(crate) fn bind(scope: &PinScope<'_, '_>, name: &str, value: Local<'_, Value>) {

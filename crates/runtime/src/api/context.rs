@@ -44,6 +44,15 @@ impl Context {
         self.isolate
     }
 
+    /// The context for a realm the engine already made.
+    ///
+    /// The caller's contract: `isolate` is live and owns `realm`. Builtins that
+    /// need to hand a host a context-shaped handle use this rather than
+    /// `Context::new`, which would make a second realm.
+    pub(crate) fn from_realm(isolate: *mut Isolate, realm: Handle<Realm>) -> Self {
+        Self { isolate, realm }
+    }
+
     /// The realm's global object.
     pub fn global(&self) -> Local {
         Local(Value::Object(self.realm.global_object))

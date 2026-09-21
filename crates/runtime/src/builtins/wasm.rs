@@ -14,6 +14,7 @@ use crux::convert::{to_boolean, to_int32, to_number, to_string as value_to_strin
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::{JsObject, ObjectKind};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -394,6 +395,13 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     define_method(
         &namespace,
         realm,
+        "compileStreaming",
+        "%WebAssembly.compileStreaming%",
+        1,
+    )?;
+    define_method(
+        &namespace,
+        realm,
         "instantiate",
         "%WebAssembly.instantiate%",
         1,
@@ -531,6 +539,11 @@ pub fn dispatch_call(
     if let Some(&(instance, index)) = agent.wasm_exports.get(&export_id) {
         return Some(invoke_export(agent, args, instance, index));
     }
+    // The two handlers `WebAssembly.compileStreaming` attached to its source
+    // promise, by identity, consumed here because each runs once.
+    if let Some(handler) = agent.wasm_streaming_handlers.remove(&export_id) {
+        return Some(run_streaming_handler(agent, handler, args));
+    }
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
     if intrinsics.get("%WebAssembly.validate%").as_ref() == Some(callee) {
@@ -551,6 +564,9 @@ pub fn dispatch_call(
     }
     if intrinsics.get("%WebAssembly.compile%").as_ref() == Some(callee) {
         return Some(wasm_compile(agent, args));
+    }
+    if intrinsics.get("%WebAssembly.compileStreaming%").as_ref() == Some(callee) {
+        return Some(wasm_compile_streaming(agent, args));
     }
     if intrinsics.get("%WebAssembly.instantiate%").as_ref() == Some(callee) {
         return Some(wasm_instantiate(agent, args));
@@ -1921,6 +1937,110 @@ fn wasm_compile(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         let proto = module_proto(agent)?;
         compile_module_bytes(agent, &bytes, Some(proto))
     })
+}
+
+/// One of the two handlers `WebAssembly.compileStreaming` attaches to the source
+/// promise, with the stream it settles. [`is_reject`](Self::is_reject) tells the
+/// rejection side (which aborts the stream with the source's failure) from the
+/// fulfilment side (which hands the source to the host's streaming hook).
+#[derive(Debug)]
+pub struct StreamingHandler {
+    pub streaming: crate::api::WasmStreaming,
+    pub is_reject: bool,
+}
+
+impl Trace for StreamingHandler {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.streaming.trace(visit);
+    }
+}
+
+/// `WebAssembly.compileStreaming(source, options)` (JS-API spec 4.1.3), in V8's
+/// own shape: the promise is made here, the source is resolved with
+/// `Promise.resolve`, and the reactions hand what it resolved to the host's
+/// streaming hook — or abort the stream with the reason it failed with, which
+/// rejects this promise with that reason.
+///
+/// The engine has no fetch of its own, so a stream needs a host that can read the
+/// source: a host without a streaming hook is refused here rather than handed a
+/// promise nothing could settle. V8 requires such a hook too (and checks it),
+/// which is the same requirement reported instead of crashed on.
+fn wasm_compile_streaming(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    if !crate::host::has_wasm_streaming_callback(agent) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "WebAssembly.compileStreaming needs a host streaming hook, and this host has none"
+                .into(),
+        ));
+    }
+    let realm = agent.current_realm()?;
+    let promise_ctor = realm
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
+    let isolate = crate::api::Isolate::get_current()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no isolate to compile in".into()))?;
+    let streaming = crate::api::WasmStreaming::new(
+        crate::api::Context::from_realm(isolate, realm),
+        &capability,
+    );
+    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    let source_promise = crate::promise::promise_resolve(agent, &promise_ctor, source)?;
+    let on_fulfilled = make_streaming_handler(agent, &streaming, false)?;
+    let on_rejected = make_streaming_handler(agent, &streaming, true)?;
+    crate::promise::perform_promise_then(
+        agent,
+        &source_promise,
+        Some(on_fulfilled),
+        Some(on_rejected),
+        None,
+    )?;
+    Ok(streaming.promise())
+}
+
+/// A Rust-backed builtin for one side of the streaming chain, registered by
+/// identity so [`dispatch_call`] can reach the stream it settles.
+fn make_streaming_handler(
+    agent: &mut Agent,
+    streaming: &crate::api::WasmStreaming,
+    is_reject: bool,
+) -> Result<Value, JsError> {
+    let function = Function::create_builtin(
+        Some(JsString::from_utf8("")),
+        1,
+        Box::new(|_, _| {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "a streaming handler must be called through the agent".into(),
+            ))
+        }),
+        None,
+        None,
+    )?;
+    agent.wasm_streaming_handlers.insert(
+        function.id(),
+        std::rc::Rc::new(StreamingHandler {
+            streaming: streaming.clone(),
+            is_reject,
+        }),
+    );
+    Ok(Value::Function(function))
+}
+
+/// Run one side of the streaming chain.
+fn run_streaming_handler(
+    agent: &mut Agent,
+    handler: std::rc::Rc<StreamingHandler>,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    if handler.is_reject {
+        handler.streaming.abort(Some(crate::api::Local(value)))?;
+    } else {
+        crate::host::wasm_streaming(agent, &value, &handler.streaming)?;
+    }
+    Ok(Value::Undefined)
 }
 
 /// `WebAssembly.instantiate(moduleOrBytes, imports)` (JS-API spec 4.1.4): for

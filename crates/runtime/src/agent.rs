@@ -553,6 +553,14 @@ pub struct Agent {
     /// function identity.
     pub async_resume:
         std::collections::HashMap<u64, std::rc::Rc<crate::async_await::ResumeHandler>>,
+    /// The two handlers `WebAssembly.compileStreaming` attaches to the source
+    /// promise, keyed by function identity: a Rust-backed builtin carries no
+    /// data of its own, so the stream it settles is found here. An entry is
+    /// consumed when the handler runs, which is why the stream roots its own
+    /// values (see `api::WasmStreaming`).
+    #[cfg(feature = "wasm")]
+    pub wasm_streaming_handlers:
+        std::collections::HashMap<u64, std::rc::Rc<crate::builtins::wasm::StreamingHandler>>,
     /// The AsyncFromSyncIterator methods, keyed by function identity.
     pub async_from_sync:
         std::collections::HashMap<u64, std::rc::Rc<crate::async_await::AsyncFromSyncEntry>>,
@@ -1107,6 +1115,8 @@ impl Agent {
             promise_compound: std::collections::HashMap::new(),
             promise_finally: std::collections::HashMap::new(),
             async_resume: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm")]
+            wasm_streaming_handlers: std::collections::HashMap::new(),
             async_from_sync: std::collections::HashMap::new(),
             async_from_sync_continuations: std::collections::HashMap::new(),
             generators: std::collections::HashMap::new(),
@@ -1650,6 +1660,8 @@ impl Agent {
         self.promise_compound.trace(visit);
         self.promise_finally.trace(visit);
         self.async_resume.trace(visit);
+        #[cfg(feature = "wasm")]
+        self.wasm_streaming_handlers.trace(visit);
         self.async_from_sync.trace(visit);
         self.async_from_sync_continuations.trace(visit);
         self.generators.trace(visit);

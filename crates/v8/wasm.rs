@@ -20,7 +20,7 @@
 
 use runtime::api;
 
-use crate::data::WasmModuleObject;
+use crate::data::{Value, WasmModuleObject};
 use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 
@@ -94,21 +94,79 @@ impl<'s> LocalHandle<'s, WasmModuleObject> {
     }
 }
 
+/// A streaming compilation in flight (`v8::WasmStreaming`).
+///
+/// The crate we stand in for spells this as a shared pointer with a const
+/// parameter selecting the cached-module-bytes protocol; here it is the engine's
+/// stream handle, and the parameter stays because a host's own code names the
+/// type with it. What that parameter selects there —
+/// `set_has_compiled_module_bytes` and the caching callback `finish` takes on
+/// `WasmStreaming<true>` — is absent here rather than wrong: this engine has no
+/// compiled-module cache to hand bytes back to.
+///
+/// It is moved rather than copied, as there: a host takes it out of the callback
+/// it was handed and gives it to whatever reads the source, and dropping it
+/// without finishing leaves the promise unsettled (nothing can feed the stream
+/// any more), which is what V8's own last `shared_ptr` dropping amounts to.
+pub struct WasmStreaming<const HAS_COMPILED_MODULE_BYTES: bool>(pub(crate) api::WasmStreaming);
+
+impl<const HAS_COMPILED_MODULE_BYTES: bool> WasmStreaming<HAS_COMPILED_MODULE_BYTES> {
+    /// Pass a new chunk of bytes to the compilation
+    /// (v8::WasmStreaming::OnBytesReceived).
+    pub fn on_bytes_received(&mut self, data: &[u8]) {
+        self.0.on_bytes_received(data);
+    }
+
+    /// Set the UTF-8 encoded source URL for the compilation
+    /// (v8::WasmStreaming::SetUrl). Must be called before `finish`.
+    ///
+    /// Recorded and nothing else, as the engine's own documentation says: a
+    /// module here carries no URL, so a host's URL describes the module it is
+    /// streaming without anywhere to attach to yet.
+    pub fn set_url(&mut self, url: &str) {
+        self.0.set_url(url);
+    }
+
+    /// Abort streaming compilation (v8::WasmStreaming::Abort): the promise is
+    /// rejected with `exception`, or left unsettled when there is none — V8's
+    /// own behaviour for a stream nobody will finish.
+    ///
+    /// An engine refusal aborts the caller rather than being reported, because
+    /// there is nowhere to report it: the crate we stand in for's `abort`
+    /// answers nothing either, and the one way this can fail — a stream whose
+    /// realm is already gone — is a bridge bug rather than a host's mistake.
+    pub fn abort(self, exception: Option<Local<'_, Value>>) {
+        if let Err(error) = self.0.abort(exception.map(|value| value.into_engine())) {
+            panic!("bridge: aborting a wasm stream failed: {error}");
+        }
+    }
+}
+
+impl WasmStreaming<false> {
+    /// Finish the stream (v8::WasmStreaming::Finish): what was received is
+    /// compiled and the promise settles with the module — or with the
+    /// `CompileError` its bytes deserved.
+    ///
+    /// Must not be called after `abort`; a call that lands after the stream was
+    /// settled either way does nothing.
+    ///
+    /// An engine refusal aborts the caller for the same reason `abort`'s does:
+    /// the crate we stand in for's `finish` answers nothing, and a failure here
+    /// means the stream's realm is gone, which no host can bring about while it
+    /// holds the stream.
+    pub fn finish(self) {
+        if let Err(error) = self.0.finish() {
+            panic!("bridge: finishing a wasm stream failed: {error}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::{Object, String as JsString};
     use crate::handle::Local as BridgeLocal;
-    use crate::test_support::{eval, in_context};
-
-    /// Magic and version, a memory section with one one-page memory, and an
-    /// export section exporting it as `m` — the smallest module that says
-    /// something a round trip can lose.
-    const EXPORTS_A_MEMORY: [u8; 20] = [
-        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // \0asm, version 1
-        0x05, 0x03, 0x01, 0x00, 0x01, // memory: one, min 1 page
-        0x07, 0x05, 0x01, 0x01, b'm', 0x02, 0x00, // export "m" as memory 0
-    ];
+    use crate::test_support::{EXPORTS_A_MEMORY, eval, in_context};
 
     /// A compiled module is the decoded module itself, so it survives leaving
     /// the object it came from — the property a host's store needs when it moves

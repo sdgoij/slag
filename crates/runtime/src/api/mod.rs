@@ -46,7 +46,7 @@ pub use template::{
 };
 pub use try_catch::{Exception, TryCatch};
 #[cfg(feature = "wasm")]
-pub use wasm::{CompiledWasmModule, WasmModuleObject};
+pub use wasm::{CompiledWasmModule, WasmModuleObject, WasmStreaming};
 
 use std::cell::RefCell;
 use std::collections::HashMap;

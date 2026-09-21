@@ -565,6 +565,7 @@ number is the certified one.
 | after the synthetic-module surface (the record kind the engine gained, its export writes, its evaluation steps, and the `SyntheticModuleEvaluationSteps` re-export) | **21** (see below) |
 | after the callback scope's lifetime (the two `E0515`s) | **19** (see below) |
 | after the compiled-module surface (the engine's wasm API exposed: `api::WasmModuleObject`, `api::CompiledWasmModule`, and the bridge's `WasmModuleObject` over them) | **15** (see below) |
+| after the streaming half (the engine's `HostHooks` wasm-streaming pair, `api::WasmStreaming`, and the bridge's `Isolate::set_wasm_streaming_callback` / `WasmStreaming`) | **12** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -584,11 +585,10 @@ sites, all of them names, and the count fell by exactly 16; `FunctionBuilder` wa
 error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
 
-That was the shape of the frontier then. It is no longer: with two names left,
-the 15 errors are 12 `E0599`s (methods and the subsystems they name), 2
-`E0425`s and 1 `E0282`, so the count is a *method-level* metric now,
-as §10 says — and each step's own record below names which code classes moved
-rather than only the total.
+That was the shape of the frontier then. It is no longer: with no names left, the
+12 errors are 11 `E0599`s (methods and the subsystems they name) and 1 `E0282`,
+so the count is a *method-level* metric now, as §10 says — and each step's own
+record below names which code classes moved rather than only the total.
 
 **The serializer — landed, and the count stopped being a progress metric.**
 `crates/v8/serialize.rs` carries `ValueSerializer`/`ValueDeserializer`, the two
@@ -2024,9 +2024,103 @@ is invoked as `wasmtest run --strict waspec/test/core/*.wast`. A doubled slash �
 globs into the subdirectories as well and reports 20,736 pass with 2 "fails" that
 are the same suites reached twice.
 
-**What is left of the wasm tail** is streaming: `WasmStreaming<false>` twice and
-`set_wasm_streaming_callback`, the second half of §12 item 10, and the one that
-needs the engine to grow a host-driven path.
+**The streaming half — landed, 15 → 12, and the last wasm name is gone.** Three
+sites, all one subsystem: `WasmStreamingResource` (`libs/core/ops_builtin.rs:263`,
+whose `RefCell<v8::WasmStreaming<false>>` is what `op_pipe` writes chunks into),
+the isolate-wide callback (`ops_builtin_v8.rs:1414`), and its installation at
+`runtime/setup.rs:302`. What V8 does is fixed (`v8/src/wasm/wasm-js.cc:889-911`):
+`compileStreaming` makes a resolver, resolves the source on a later turn, and
+hands the embedder the resolved value together with a `WasmStreaming` it feeds
+and finishes; V8 `DCHECK_NOT_NULL`s there, because its `WebAssembly` namespace is
+always installed.
+
+Engine side this is a host-driven path rather than a new decoder, and it is the
+first hook that had to *ask permission*: `HostHooks` gained
+`has_wasm_streaming_callback` and `wasm_streaming`
+(`crates/runtime/src/host.rs`), `WebAssembly.compileStreaming` routes through
+them, and an isolate whose host installed neither refuses the call with a
+`TypeError` instead of answering a promise nothing could settle. The two handlers
+that chain builds — the resolve and the reject side V8's
+`StartAsyncCompilationWithResolver` attaches the same way — are reached by their
+own function identity through a table on the agent, the shape `async_await`'s
+resume handlers already use. The record is
+`api::WasmStreaming` (`crates/runtime/src/api/wasm.rs`): accumulated bytes, the
+url, the promise capability and a settled flag, with the three promise values
+**pinned** for as long as a host holds the stream — nothing in the engine points
+at them, since the two handlers that do are single-use and die with the source
+promise's reactions. `finish` decodes then and settles the promise; `abort`
+rejects it, or leaves it unsettled when given no value — V8's own behaviour, and
+the one that matters for a browser tab being refreshed (`wasm-js.cc:87`).
+
+Bridge side, the surface is `crate::wasm::WasmStreaming<const bool>` (upstream's
+const parameter is kept because a host's own code names the type with it; what
+`true` selects — `set_has_compiled_module_bytes` and the caching callback `finish`
+takes — is absent here rather than wrong, because this engine has no
+compiled-module cache to hand bytes back to), and
+`Isolate::set_wasm_streaming_callback<F>`, whose bounds are upstream's exactly
+(`F: UnitType + for<'a,'b,'c> Fn(&'c mut PinScope<'a,'b>, Local<'a, Value>,
+WasmStreaming<false>)`). The plan expected an `IsolateWasmStreamingCallback` alias
+to mirror; **there is none upstream** — v150.4.0 takes the host's function as a
+bare generic — so the bridge has none either, and the first `deno_core` check with
+this in place resolved all three sites at once.
+
+Three findings worth more than the code:
+
+- **The installed callback's parameters must share one lifetime**, and that is not
+  a style choice. The type being satisfied is higher-ranked
+  (`for<'a,'b,'c> Fn(&'c mut PinScope<'a,'b>, Local<'a, Value>, …)`), so a fn item
+  whose scope and source lifetimes are independently elided is *universally*
+  quantified over both and cannot be proven to satisfy it (`argument requires that
+  '1 must outlive '2`, with `&mut` invariance over the scope's type parameter
+  making the two unprovable rather than merely awkward). Deno's own callback
+  spells it the way the bound requires — `wasm_streaming_callback<'a>(scope: &mut
+  v8::PinScope<'a, '_>, arg: v8::Local<'a, v8::Value>, …)` — and the bridge's
+  trampoline shares that parameter, which is what lets the fn item coerce to the
+  stored fn pointer.
+- **Two isolate callbacks, one hook implementation, so neither may displace the
+  other.** The seam is a single `HostHooks` implementation, and the
+  promise-rejection callback used to live *in* the bridge's hooks struct — which
+  would have meant that a host installing a streaming callback dropped it. The
+  struct is stateless now and each callback is stored on the isolate that
+  installed it, read back at call time; `install_hooks` is the one place that
+  claims the seam.
+- **`finish`/`abort` abort the caller on an engine refusal.** There is no channel
+  to report through — the crate we stand in for's versions answer `()` — and the
+  one way either can fail, a stream whose realm is already gone, is a bridge bug
+  rather than a host's mistake. Stated in both methods rather than left to be
+  discovered.
+
+Measured: **15 → 12** (`E0599` 12 → 11, `E0425` 2 → 0; the `E0282` is untouched
+and is not this subsystem's). Two bridge tests, each verified by mutating the code
+it guards. `a_host_streaming_callback_settles_compile_streaming` streams the same
+hand-built 20-byte module the compiled-module slice uses and asserts the promise
+is `Pending` before the microtask drain and `Fulfilled` after, with
+`exports[0].name == "m"`; making `BridgeHooks::wasm_streaming` return before
+calling the host's callback fails it (`left: Pending, right: Fulfilled`).
+`installing_one_isolate_callback_keeps_the_other` installs both callbacks, in the
+order a host makes them, and exercises both halves afterwards; making
+`install_hooks` clear `promise_reject` fails it ("the rejection callback installed
+first still runs"), which is the second finding above as a test.
+
+Gates: `cargo test -p v8 --features simdutf` **189 passed / 0 failed** (2 of them
+this step; the known crasher passed on this run rather than being filtered),
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean (one
+`clone_on_copy` the new test code had to answer for), `cargo test --locked
+--workspace -- --skip the_data_a_built_function_carries_survives_a_collection`
+**5,128 passed / 0 failed / 4 ignored across 38 binaries**. `crates/runtime`
+changed again, and in the `WebAssembly` namespace the JS-API sweep exercises, so
+the battery ran rather than being argued: test262 `all` 48,622 fixtures — 48,464
+pass, **0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 0
+fail / 0 crash / 0 hang, 152 skip; the eight wasm core suites **64,594 checks / 0
+fail / 0 pending**; the JS-API sweep **1,001 tests / 0 fail**. Every number is the
+certified one.
+
+The wasm tail is closed. What is left of the bridge's frontier is the method
+surface: 11 `E0599`s (`Function::create_code_cache` twice,
+`Script::get_unbound_script` twice, `Module::get_unbound_module_script` twice,
+`Module::evaluate_for_import_defer`, `Module::get_stalled_top_level_await_message`,
+`StackTrace::current_stack_trace` twice, and `HandleScope::get_heap_statistics`),
+and the one `E0282` nothing has explained yet.
 
 ## 8. Parked: the C++ face
 
@@ -2352,9 +2446,9 @@ if that proves possible.
   report a throw that way, and V8 records `isolate->exception()` as the module's
   error), and `create_synthetic_module` aborts on an engine refusal, which that
   shape has no channel to report.
-10. **The wasm tail — surveyed and split into two slices before either is
-  started.** Seven of the remaining 19 errors are this one subsystem, and they
-  are two capabilities rather than one.
+10. **The wasm tail — both slices landed, and this item is closed.**
+  Seven of the then-remaining 19 errors were this one subsystem, and they were two
+  capabilities rather than one; both are in §7 with their findings.
 
   - **The compiled module (4 sites: `libs/core/modules/map/wasm.rs:48`,
     `libs/core/ops_builtin_v8.rs:704` and `:799`, and
@@ -2372,28 +2466,37 @@ if that proves possible.
     answer is the *Module object* (prototype and all), not a bare record.
     Existing behaviour is untouched: the api module is additive.
   - **Streaming (3 sites: `ops_builtin.rs:263`, `ops_builtin_v8.rs:1414`,
-    `runtime/setup.rs:302`), and this one needs the engine to grow the hook.**
-    `Isolate::set_wasm_streaming_callback`, the `WasmStreaming<false>` handle,
-    and `WebAssembly.compileStreaming`. V8's shape is fixed
+    `runtime/setup.rs:302`) — landed.** It needed the engine to grow the hook, as
+    the survey predicted, and it needed two things the survey did not name: the
+    engine's `HostHooks` pair answering *whether* a host streams at all (so an
+    isolate without one refuses the call instead of answering a promise nothing
+    settles), and an `install_hooks` that keeps the two isolate callbacks from
+    displacing each other — the promise-rejection callback had been stored in the
+    bridge's hook struct, so the streaming install would have dropped it. The
+    upstream alias the plan expected (`IsolateWasmStreamingCallback`) does not
+    exist in v150.4.0. See §7 for the rest. The survey behind the slice, and what
+    it was right about:
+
+    `Isolate::set_wasm_streaming_callback`, the `WasmStreaming<false>` handle, and
+    `WebAssembly.compileStreaming`. V8's shape is fixed
     (`v8/src/wasm/wasm-js.cc:889-911`): `compileStreaming` makes the resolver,
     then `Promise.resolve(source).then(compile_callback, reject_callback)`, and
     the embedder's callback is handed the resolved response together with a
     `WasmStreaming` it feeds and `finish()`es; V8 compiles into it as bytes
-    arrive and `DCHECK_NOT_NULL`s that a callback was installed. This engine has
-    no `compileStreaming` at all (its `WebAssembly` namespace defines `validate`
-    and `compile`), so what is missing is the *host-driven* path, not a decoder.
-    **Engine change, named:** a per-isolate `wasm_streaming_callback` (the shape
-    `set_promise_reject_callback` already has), an `api::WasmStreaming` record
-    (accumulated bytes, a promise capability, the url, a settled state) with
+    arrive and `DCHECK_NOT_NULL`s that a callback was installed. This engine had
+    no `compileStreaming` at all (its `WebAssembly` namespace defined `validate`
+    and `compile`), so what was missing was the *host-driven* path, not a decoder
+    — as built: an `api::WasmStreaming` record (accumulated bytes, a promise
+    capability, the url, a settled state) with
     `on_bytes_received`/`set_url`/`finish`/`abort`, and
     `WebAssembly.compileStreaming` in the engine's JS-API, routing through the
     hook when one is installed and otherwise throwing a `TypeError` (V8
-    `DCHECK`s there — a divergence for §9 to state rather than to pretend
-    about). Decoding happens at `finish`, not as bytes arrive: the same module
-    and the same promise, without V8's compile-as-it-arrives, which is what this
-    engine's decoder can honestly offer and is not observable through the API.
-    This slice changes the `WebAssembly` namespace, so the wasm JS-API sweep is
-    implicated and gets re-run.
+    `DCHECK`s there — the divergence §9 states rather than pretends about).
+    Decoding happens at `finish`, not as bytes arrive: the same module and the
+    same promise, without V8's compile-as-it-arrives, which is what this engine's
+    decoder can honestly offer and is not observable through the API. The slice
+    changed the `WebAssembly` namespace, so the wasm JS-API sweep was re-run:
+    **1,001 tests / 0 fail** (§7).
 
   **Deliberately not in either slice, with the reason:**
   `CompiledWasmModule::get_wire_bytes_ref` and `source_url` (this engine decodes
@@ -2467,6 +2570,18 @@ if that proves possible.
   keeps none, so `get_wire_bytes_ref` and `source_url` have no answer and are
   missing rather than wrong. Retaining the bytes would cost a copy per `Module`
   object through every wasm sweep, and nothing in the frontier asks for them.
+- **`WebAssembly.compileStreaming` exists only when the host installed a streaming
+  callback, and says so with a `TypeError`.** V8 requires an embedder hook for the
+  method and `DCHECK`s that one is there
+  (`v8/src/wasm/wasm-js.cc:889`), which in a release build is a crash inside the
+  engine and in this one is an exception a host can read: an isolate whose host
+  installed neither `set_wasm_streaming_callback` nor
+  `set_promise_reject_callback` keeps the engine's default hook, and
+  `has_wasm_streaming_callback` answering `false` is what refuses the call. The
+  other half of the divergence is inside the same method: bytes accumulate and are
+  decoded at `WasmStreaming::finish`, not as they arrive. A host sees the same
+  module and the same promise — the compile-as-it-streams is what is missing, and
+  it is not observable through the API.
 
 ## 10. Build order
 
@@ -2484,14 +2599,14 @@ landed — a store over memory the host owns is `SharedBuffer::borrowed`; the
 accounting half, externally allocated memory and backing-store shrink, is not),
 synthetic modules (host-filled records with a host evaluation callback, §12 item
 9 — **landed**; the engine's JSON/text/bytes shortcut is why it had none until
-then), the wasm tail (§12 item 10 — two slices, surveyed before either started:
-the compiled module is an exposure, streaming is a new isolate hook), inspector
-and
+then), the wasm tail (§12 item 10 — **both slices landed**: the compiled module
+was an exposure, streaming was a new isolate hook), inspector and
 source maps, traced host objects, structured clone.
 
 Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks;
 (2) grow the surface from the items `deno_core` names, in call order — the name
-frontier is nearly closed (2 left: `WasmStreaming`, twice) and the serializer is
+frontier is closed (the last two, `WasmStreaming`, resolved with the streaming
+half) and the serializer is
 landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
 first pass through them took it to 374, the cast closure to 369, the scope and
@@ -2504,13 +2619,13 @@ surface to 56, the attribute-carrying half of the template cluster to 52, the st
 half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
 `Message` surface and `Exception::create_message` (piece 2 of the stack-trace
 split) to 37, the module structure surface to 25, the synthetic-module surface to
-21, the callback scope's lifetime to 19, the compiled-module surface to 15, and
+21, the callback scope's lifetime to 19, the compiled-module surface to 15, the
+streaming half to 12, and
 what is left is the method
-surface (12 `E0599`s, all of them named methods and subsystems: wasm streaming
-and the module-object round trip, code cache, unbound scripts, import-defer's
-evaluation entry point, the stalled-top-level-await report, the frames of a stack
-trace, and `get_heap_statistics`), the 2 names, and one
-straggler (1 `E0282`).
+surface (11 `E0599`s, all of them named methods and subsystems: code cache,
+unbound scripts, import-defer's evaluation entry point, the
+stalled-top-level-await report, the frames of a stack trace, and
+`get_heap_statistics`), and one straggler (1 `E0282`).
 The two that the suite had surveyed as needing engine work have landed since,
 `get_constructor_name` and `get_extras_binding_object`, and they turned out to
 need a walk of the prototype chain and a per-context object rather than V8's map

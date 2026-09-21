@@ -58,6 +58,36 @@ pub trait HostHooks: std::fmt::Debug {
             "HostCreateWorker is not implemented by this host".into(),
         ))
     }
+
+    /// Whether this host handles streaming compilation at all, i.e. whether
+    /// [`wasm_streaming`](Self::wasm_streaming) will take a stream.
+    ///
+    /// `WebAssembly.compileStreaming` needs an embedder that can fetch and feed
+    /// bytes — V8 requires one to be installed and checks it — so an engine that
+    /// is asked without one refuses the call rather than answering a promise
+    /// nothing will ever settle. The default refuses.
+    fn has_wasm_streaming_callback(&self) -> bool {
+        false
+    }
+
+    /// The host's streaming hook (`v8::Isolate::SetWasmStreamingCallback`):
+    /// called once the source `WebAssembly.compileStreaming` was given has
+    /// resolved, with that value and the stream to feed. Finishing the stream
+    /// settles the promise the caller got; aborting it rejects that promise.
+    ///
+    /// The default refuses, which [`has_wasm_streaming_callback`]
+    /// (Self::has_wasm_streaming_callback) is what answers for a host that has
+    /// not installed one.
+    fn wasm_streaming(
+        &self,
+        _source: &crux::value::Value,
+        _streaming: &crate::api::WasmStreaming,
+    ) -> Result<(), JsError> {
+        Err(JsError::new(
+            crux::ErrorKind::TypeError,
+            "WebAssembly.compileStreaming is not implemented by this host".into(),
+        ))
+    }
 }
 
 /// HostPromiseRejectionTracker dispatch: the agent's hooks if present, else
@@ -71,6 +101,32 @@ pub fn promise_rejection_tracker(
     match &agent.host_hooks {
         Some(hooks) => hooks.promise_rejection_tracker(promise, reason, operation),
         None => Ok(()),
+    }
+}
+
+/// Whether the agent's hooks handle streaming compilation (see
+/// [`HostHooks::has_wasm_streaming_callback`]).
+pub fn has_wasm_streaming_callback(agent: &crate::agent::Agent) -> bool {
+    match &agent.host_hooks {
+        Some(hooks) => hooks.has_wasm_streaming_callback(),
+        None => false,
+    }
+}
+
+/// The streaming hook dispatch: hand `source` and `streaming` to the agent's
+/// hooks. Called once the source `WebAssembly.compileStreaming` was given has
+/// resolved.
+pub fn wasm_streaming(
+    agent: &crate::agent::Agent,
+    source: &crux::value::Value,
+    streaming: &crate::api::WasmStreaming,
+) -> Result<(), JsError> {
+    match &agent.host_hooks {
+        Some(hooks) => hooks.wasm_streaming(source, streaming),
+        None => Err(JsError::new(
+            crux::ErrorKind::TypeError,
+            "WebAssembly.compileStreaming needs a host streaming hook".into(),
+        )),
     }
 }
 
