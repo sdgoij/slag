@@ -33,9 +33,16 @@ impl Object {
     }
 
     /// [[Get]] a named property (spec 7.3.1).
+    ///
+    /// Routed through the runtime's [[Get]] rather than the object's own
+    /// property map: a module namespace's exports are read through its module
+    /// environment, so the map read answers the placeholder instead.
     pub fn get(context: &Context, object: &Local, key: &str) -> Result<Local, JsError> {
-        let object = Self::handle(object)?;
-        context.with_agent(|_| Ok(Local(object.get(&JsString::from_utf8(key))?)))
+        let base = Value::Object(Self::handle(object)?);
+        let key = crux::property::PropertyKey::from_js_string(&JsString::from_utf8(key));
+        context.with_agent(|agent| {
+            crate::context::get_property_key(agent, &base, &key, base).map(Local)
+        })
     }
 
     /// [[Set]] a named property (spec 7.3.3); `throw` selects the silent /
@@ -48,9 +55,7 @@ impl Object {
         throw: bool,
     ) -> Result<bool, JsError> {
         let object = Self::handle(object)?;
-        context.with_agent(|_| {
-            object.set(&JsString::from_utf8(key), value.clone().into_value(), throw)
-        })
+        context.with_agent(|_| object.set(&JsString::from_utf8(key), value.into_value(), throw))
     }
 
     /// [[HasProperty]] (spec 7.3.10): walks the prototype chain.
@@ -81,7 +86,7 @@ impl Object {
             object.define_property_or_throw(
                 &JsString::from_utf8(key),
                 &PropertyDescriptor {
-                    value: Some(value.clone().into_value()),
+                    value: Some(value.into_value()),
                     writable: Some(writable),
                     enumerable: Some(enumerable),
                     configurable: Some(configurable),
@@ -134,7 +139,7 @@ impl Array {
     pub fn new(context: &Context, elements: &[Local]) -> Result<Local, JsError> {
         let values: Vec<Value> = elements
             .iter()
-            .map(|element| element.clone().into_value())
+            .map(|element| element.into_value())
             .collect();
         context.with_agent(|agent| {
             crate::builtins::array::array_from_values(agent, &values).map(Local)

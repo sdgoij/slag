@@ -11158,8 +11158,12 @@ var $DONE = function (error) {
             &[],
         )
         .map_err(|e| e.message)?;
-        for (specifier, _, _) in &parsed.requested_modules {
-            register_module_recursive(&mut agent, fixture_dir, &specifier.to_string_lossy())?;
+        for request in &parsed.requested_modules {
+            register_module_recursive(
+                &mut agent,
+                fixture_dir,
+                &request.specifier.to_string_lossy(),
+            )?;
         }
         register_fixture_modules(&mut agent, fixture_dir, body)?;
         let entry = runtime::module::host_resolve_imported_module(
@@ -11176,21 +11180,17 @@ var $DONE = function (error) {
         // of the fixture's own source, which has no imports and needs no
         // cycle alias — and must not be preempted by the JS entry record
         // (`import-attributes/text-self.js`).
-        let self_is_synthetic =
-            parsed
-                .requested_modules
-                .iter()
-                .any(|(specifier, attributes, _)| {
-                    specifier.to_string_lossy() == fixture_specifier
-                        && attributes.iter().any(|(key, value)| {
-                            let key_text = match key {
-                                syntax::AttributeKey::Ident(atom) => crux::lookup(*atom),
-                                syntax::AttributeKey::Str(text) => text.clone(),
-                            };
-                            key_text.to_string_lossy() == "type"
-                                && matches!(value.to_string_lossy().as_str(), "text" | "bytes")
-                        })
-                });
+        let self_is_synthetic = parsed.requested_modules.iter().any(|request| {
+            request.specifier.to_string_lossy() == fixture_specifier
+                && request.attributes.iter().any(|(key, value)| {
+                    let key_text = match key {
+                        syntax::AttributeKey::Ident(atom) => crux::lookup(*atom),
+                        syntax::AttributeKey::Str(text) => text.clone(),
+                    };
+                    key_text.to_string_lossy() == "type"
+                        && matches!(value.to_string_lossy().as_str(), "text" | "bytes")
+                })
+        });
         if !fixture_specifier.is_empty() && !self_is_synthetic {
             let realm = agent.current_realm().map_err(|e| e.message)?;
             realm
@@ -11511,8 +11511,8 @@ var $DONE = function (error) {
         else {
             return Ok(());
         };
-        for (dep, _, _) in &module.requested_modules {
-            register_module_recursive(agent, &next_dir, &dep.to_string_lossy())?;
+        for request in &module.requested_modules {
+            register_module_recursive(agent, &next_dir, &request.specifier.to_string_lossy())?;
         }
         Ok(())
     }

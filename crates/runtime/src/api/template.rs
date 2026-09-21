@@ -2,6 +2,7 @@
 //! v8::ObjectTemplate), the callback info they receive, and the return-value
 //! slot.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -116,6 +117,12 @@ pub struct FunctionTemplate {
     pub(crate) class_name: RefCell<Option<JsString>>,
     pub(crate) instance_template: RefCell<Option<Rc<ObjectTemplate>>>,
     pub(crate) prototype_template: RefCell<Option<Rc<ObjectTemplate>>>,
+    /// The `length` of the function this template makes, which is an own
+    /// property of the function and therefore observable.
+    length: Cell<u32>,
+    /// Whether the function this template makes can be constructed. A
+    /// non-constructible one has no [[Construct]], so `new` on it throws.
+    constructible: Cell<bool>,
 }
 
 impl FunctionTemplate {
@@ -126,7 +133,24 @@ impl FunctionTemplate {
             class_name: RefCell::new(None),
             instance_template: RefCell::new(None),
             prototype_template: RefCell::new(None),
+            length: Cell::new(0),
+            constructible: Cell::new(true),
         })
+    }
+
+    /// Set the `length` of the function this template makes
+    /// (v8::FunctionTemplate::SetLength).
+    ///
+    /// A negative length has no meaning as a property value and is taken as
+    /// zero, which is the default.
+    pub fn set_length(&self, length: i32) {
+        self.length.set(length.max(0) as u32);
+    }
+
+    /// Say whether the function this template makes may be constructed
+    /// (`ConstructorBehavior::Allow` there).
+    pub fn set_constructible(&self, constructible: bool) {
+        self.constructible.set(constructible);
     }
 
     /// The isolate this template was created on.
@@ -227,8 +251,20 @@ impl FunctionTemplate {
             }
         });
 
-        let function =
-            Function::create_builtin(name.clone(), 0, call, Some(construct), function_prototype)?;
+        // A template that is not constructible contributes no construct half, so
+        // the function it makes has no [[Construct]] and `new` on it throws.
+        let construct = if self.constructible.get() {
+            Some(construct)
+        } else {
+            None
+        };
+        let function = Function::create_builtin(
+            name.clone(),
+            self.length.get() as u64,
+            call,
+            construct,
+            function_prototype,
+        )?;
 
         // The constructor's `.prototype`: an ordinary object with
         // %Object.prototype% as its prototype, populated from the

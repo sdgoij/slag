@@ -1,7 +1,5 @@
 //! Contexts: the realm a scope operates on (`v8::Context`).
 
-use std::rc::Rc;
-
 use runtime::api;
 
 use crate::data::{Context, Object, ObjectTemplate};
@@ -27,16 +25,15 @@ impl Context {
         scope: &PinScope<'s, '_, ()>,
         _options: ContextOptions<'_>,
     ) -> Local<'s, Context> {
-        // SAFETY: the scope's pointer came from the `&mut` borrow that created
-        // it and the owning isolate outlives every scope made from it.
-        let isolate = unsafe { &mut *scope.isolate_ptr().as_ptr() };
+        let mut isolate = scope.isolate_ptr();
         let context = api::Context::new(isolate.engine_mut())
             .expect("bridge: creating a realm cannot fail outside OOM");
-        let context = Rc::new(context);
-        isolate.set_current_context(Some(context.clone()));
+        // The engine's isolate owns the realm, so this handle only names it;
+        // recording it here is what lets a scope-less operation find it.
+        isolate.set_current_context(Some(context));
         // The engine makes the new realm current on its isolate; mirror that
         // here so operations with no scope to read it from can find it.
-        crate::realm::enter(context.clone());
+        crate::realm::enter(context);
         Local::from_payload(Payload::Context(context))
     }
 }

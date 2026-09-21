@@ -20,7 +20,10 @@ use std::ops::Deref;
 
 use crux::object::ObjectKind;
 use crux::typed_array::ElementType;
+use crux::value::ValueKind;
+use runtime::Agent;
 use runtime::api;
+use runtime::function::EcmaFunction;
 
 use crate::handle::{Local, Payload};
 
@@ -108,6 +111,7 @@ tags! {
     // Not part of the `Data` hierarchy in the crate we stand in for.
     Script,
     Message,
+    StackTrace,
 }
 
 macro_rules! derefs_to {
@@ -219,7 +223,10 @@ pub(crate) trait TagCheck {
 
 impl TagCheck for Data {
     fn check(payload: &Payload) -> bool {
-        matches!(payload, Payload::Value(_) | Payload::Context(_))
+        matches!(
+            payload,
+            Payload::Value(_) | Payload::Context(_) | Payload::Module(_)
+        )
     }
 }
 
@@ -236,7 +243,7 @@ impl TagCheck for Context {
 }
 
 macro_rules! tag_checks {
-    ($($tag:ident => $check:expr),* $(,)?) => {
+    ($($tag:ident => $check:path),* $(,)?) => {
         $(
             impl TagCheck for $tag {
                 fn check(payload: &Payload) -> bool {
@@ -248,35 +255,248 @@ macro_rules! tag_checks {
 }
 
 tag_checks! {
-    Primitive => |v: &api::Local| !v.is_object(),
-    Name => |v: &api::Local| v.is_string() || v.is_symbol(),
-    String => |v: &api::Local| v.is_string(),
-    Symbol => |v: &api::Local| v.is_symbol(),
-    Number => |v: &api::Local| v.is_number(),
-    Integer => |v: &api::Local| is_int32(v) || is_uint32(v),
-    Int32 => |v: &api::Local| is_int32(v),
-    Uint32 => |v: &api::Local| is_uint32(v),
-    BigInt => |v: &api::Local| v.is_bigint(),
-    Boolean => |v: &api::Local| v.is_boolean(),
-    External => |v: &api::Local| object_matches(v, |k| matches!(k, ObjectKind::External(_))),
-    Object => |v: &api::Local| v.is_object(),
-    Array => |v: &api::Local| object_matches(v, |k| matches!(k, ObjectKind::Array(_))),
-    Function => |v: &api::Local| v.is_function(),
-    Proxy => |v: &api::Local| object_matches(v, |k| matches!(k, ObjectKind::Proxy(_))),
-    StringObject => |v: &api::Local| object_matches(v, |k| matches!(k, ObjectKind::String(_))),
-    TypedArray => |v: &api::Local| object_matches(v, |k| matches!(k, ObjectKind::IntegerIndexed(_))),
-    Int8Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Int8)),
-    Uint8Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Uint8)),
-    Uint8ClampedArray => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Uint8Clamped)),
-    Int16Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Int16)),
-    Uint16Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Uint16)),
-    Int32Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Int32)),
-    Uint32Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Uint32)),
-    Float16Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Float16)),
-    Float32Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Float32)),
-    Float64Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::Float64)),
-    BigInt64Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::BigInt64)),
-    BigUint64Array => |v: &api::Local| typed_array_where(v, |t| matches!(t, ElementType::BigUint64)),
+    Primitive => is_primitive,
+    Name => is_name,
+    String => is_string,
+    Symbol => is_symbol,
+    Number => is_number,
+    Integer => is_integer,
+    Int32 => is_int32,
+    Uint32 => is_uint32,
+    BigInt => is_big_int,
+    Boolean => is_boolean,
+    External => is_external,
+    Object => is_object,
+    Array => is_array,
+    Function => is_function,
+    Proxy => is_proxy,
+    StringObject => is_string_object,
+    TypedArray => is_typed_array,
+    Int8Array => is_int8_array,
+    Uint8Array => is_uint8_array,
+    Uint8ClampedArray => is_uint8_clamped_array,
+    Int16Array => is_int16_array,
+    Uint16Array => is_uint16_array,
+    Int32Array => is_int32_array,
+    Uint32Array => is_uint32_array,
+    Float16Array => is_float16_array,
+    Float32Array => is_float32_array,
+    Float64Array => is_float64_array,
+    BigInt64Array => is_big_int64_array,
+    BigUint64Array => is_big_uint64_array,
+}
+
+// The brands the engine keeps no internal tag for. It does keep a table of
+// them, one entry per instance keyed by object identity, which answers the
+// stricter question the crate we stand in for asks: an object merely handed a
+// foreign prototype is not a `Map`, and a walk of its chain would say it is.
+tag_checks! {
+    ArrayBuffer => is_array_buffer,
+    SharedArrayBuffer => is_shared_array_buffer,
+    DataView => is_data_view,
+    ArrayBufferView => is_array_buffer_view,
+    Map => is_map,
+    Set => is_set,
+    Date => is_date,
+    RegExp => is_reg_exp,
+    Promise => is_promise,
+    BigIntObject => is_big_int_object,
+    BooleanObject => is_boolean_object,
+    NumberObject => is_number_object,
+    SymbolObject => is_symbol_object,
+}
+
+// The predicates below are what both callers share: the cast tables above, and
+// the public `Value` surface in [`crate::value`]. They are named after the
+// methods of the crate we stand in for and take its handle, since that is what
+// both have in hand.
+
+/// Not an object.
+pub(crate) fn is_primitive(value: &api::Local) -> bool {
+    !is_object(value)
+}
+
+/// A string or a symbol.
+pub(crate) fn is_name(value: &api::Local) -> bool {
+    is_string(value) || is_symbol(value)
+}
+
+pub(crate) fn is_string(value: &api::Local) -> bool {
+    value.is_string()
+}
+
+pub(crate) fn is_symbol(value: &api::Local) -> bool {
+    value.is_symbol()
+}
+
+pub(crate) fn is_number(value: &api::Local) -> bool {
+    value.is_number()
+}
+
+/// An integer in `i32` or `u32` range.
+pub(crate) fn is_integer(value: &api::Local) -> bool {
+    is_int32(value) || is_uint32(value)
+}
+
+pub(crate) fn is_big_int(value: &api::Local) -> bool {
+    value.is_bigint()
+}
+
+pub(crate) fn is_boolean(value: &api::Local) -> bool {
+    value.is_boolean()
+}
+
+/// A receiver (`v8::Value::IsObject`), so a function counts: in the crate we
+/// stand in for this is `IsJSReceiver`, and a function is one. The engine's own
+/// `Value::is_object` is narrower — it asks about the tag — which is why this
+/// does not delegate to it.
+pub(crate) fn is_object(value: &api::Local) -> bool {
+    matches!(
+        value.value().kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    )
+}
+
+pub(crate) fn is_function(value: &api::Local) -> bool {
+    value.is_function()
+}
+
+pub(crate) fn is_external(value: &api::Local) -> bool {
+    object_matches(value, |kind| matches!(kind, ObjectKind::External(_)))
+}
+
+pub(crate) fn is_array(value: &api::Local) -> bool {
+    object_matches(value, |kind| matches!(kind, ObjectKind::Array(_)))
+}
+
+pub(crate) fn is_proxy(value: &api::Local) -> bool {
+    object_matches(value, |kind| matches!(kind, ObjectKind::Proxy(_)))
+}
+
+/// A `String` object, not a string primitive.
+pub(crate) fn is_string_object(value: &api::Local) -> bool {
+    object_matches(value, |kind| matches!(kind, ObjectKind::String(_)))
+}
+
+/// An arguments object (spec 10.4.4).
+pub(crate) fn is_arguments_object(value: &api::Local) -> bool {
+    object_matches(value, |kind| matches!(kind, ObjectKind::Arguments(_)))
+}
+
+/// A module namespace object (spec 10.4.6).
+pub(crate) fn is_module_namespace_object(value: &api::Local) -> bool {
+    object_matches(value, |kind| matches!(kind, ObjectKind::ModuleNamespace(_)))
+}
+
+pub(crate) fn is_typed_array(value: &api::Local) -> bool {
+    object_matches(value, |kind| matches!(kind, ObjectKind::IntegerIndexed(_)))
+}
+
+/// A view over an array buffer: a typed array, or a `DataView`.
+pub(crate) fn is_array_buffer_view(value: &api::Local) -> bool {
+    is_typed_array(value) || is_data_view(value)
+}
+
+/// A generator instance. The engine keys each one's suspended state by object
+/// identity, so that table is what marks it out; async generators have a table
+/// of their own, and are not generator objects in the crate we stand in for
+/// either.
+pub(crate) fn is_generator_object(value: &api::Local) -> bool {
+    in_table(value, |agent, id| agent.generators.contains_key(&id))
+}
+
+/// A native error. The engine's notion is `[[ErrorData]]`, which is the one the
+/// crate we stand in for uses here: an instance of a subclass of `Error`
+/// answers true, while an object merely given `Error.prototype` answers false.
+pub(crate) fn is_native_error(value: &api::Local) -> bool {
+    in_table(value, |agent, id| agent.error_data.contains(&id))
+}
+
+/// One predicate per brand the agent records as a table of instances keyed by
+/// object identity.
+macro_rules! table_predicates {
+    ($($name:ident => $table:ident),* $(,)?) => {
+        $(
+            pub(crate) fn $name(value: &api::Local) -> bool {
+                in_table(value, |agent, id| agent.$table.contains_key(&id))
+            }
+        )*
+    };
+}
+
+table_predicates! {
+    is_data_view => dataview_data,
+    is_map => map_data,
+    is_set => set_data,
+    is_weak_map => weak_map_data,
+    is_weak_set => weak_set_data,
+    is_map_iterator => map_iter_data,
+    is_set_iterator => set_iter_data,
+    is_date => date_data,
+    is_reg_exp => regexp_data,
+    is_promise => promises,
+    is_boolean_object => boolean_data,
+    is_number_object => number_data,
+    is_symbol_object => symbol_data,
+    is_big_int_object => bigint_data,
+}
+
+/// The two buffer kinds share one table, so the `SharedArrayBuffer` flag in the
+/// entry is what separates them.
+pub(crate) fn is_array_buffer(value: &api::Local) -> bool {
+    in_table(value, |agent, id| {
+        agent
+            .buffer_data
+            .get(&id)
+            .is_some_and(|state| !state.borrow().is_shared)
+    })
+}
+
+pub(crate) fn is_shared_array_buffer(value: &api::Local) -> bool {
+    in_table(value, |agent, id| {
+        agent
+            .buffer_data
+            .get(&id)
+            .is_some_and(|state| state.borrow().is_shared)
+    })
+}
+
+/// Whether the function's own record answers `question`. The kind is a property
+/// of the function, not of its prototype chain — which is why a bound function
+/// an async one was bound into answers false here, as it does in the crate we
+/// stand in for.
+fn function_record(value: &api::Local, question: impl Fn(&EcmaFunction) -> bool) -> bool {
+    let Some(function) = value.value().as_function() else {
+        return false;
+    };
+    let id = function.id();
+    ask(|agent| agent.ecma_functions.get(&id).is_some_and(&question)).unwrap_or(false)
+}
+
+pub(crate) fn is_async_function(value: &api::Local) -> bool {
+    // An async generator function is neither kind here, which is also how the
+    // crate we stand in for reads it.
+    function_record(value, |data| data.is_async && !data.is_generator)
+}
+
+pub(crate) fn is_generator_function(value: &api::Local) -> bool {
+    function_record(value, |data| data.is_generator && !data.is_async)
+}
+
+/// Whether one of the agent's identity-keyed tables holds the object the value
+/// names.
+fn in_table(value: &api::Local, holds: impl Fn(&Agent, u64) -> bool) -> bool {
+    let Some(object) = value.value().as_object() else {
+        return false;
+    };
+    let id = object.id();
+    ask(|agent| holds(agent, id)).unwrap_or(false)
+}
+
+/// Run `question` against the agent, when a context is entered. With none there
+/// is no agent to ask, and every table question answers false.
+fn ask<T>(question: impl FnOnce(&mut Agent) -> T) -> Option<T> {
+    crate::realm::with_agent(question)
 }
 
 /// Whether the value is an ordinary object whose internal kind satisfies
@@ -297,81 +517,44 @@ fn typed_array_where(value: &api::Local, predicate: impl Fn(ElementType) -> bool
     })
 }
 
-// Brands the engine keeps no internal tag for, read off the prototype chain
-// instead. The engine does register the intrinsic prototypes these compare
-// against, so the names below are the ones it actually has.
-tag_checks! {
-    ArrayBuffer => |v: &api::Local| inherits_intrinsic(v, "%ArrayBuffer.prototype%"),
-    SharedArrayBuffer => |v: &api::Local| inherits_intrinsic(v, "%SharedArrayBuffer.prototype%"),
-    DataView => |v: &api::Local| inherits_intrinsic(v, "%DataView.prototype%"),
-    ArrayBufferView => |v: &api::Local| is_array_buffer_view(v),
-    Map => |v: &api::Local| inherits_intrinsic(v, "%Map.prototype%"),
-    Set => |v: &api::Local| inherits_intrinsic(v, "%Set.prototype%"),
-    Date => |v: &api::Local| inherits_intrinsic(v, "%Date.prototype%"),
-    RegExp => |v: &api::Local| inherits_intrinsic(v, "%RegExp.prototype%"),
-    Promise => |v: &api::Local| inherits_intrinsic(v, "%Promise.prototype%"),
-    BigIntObject => |v: &api::Local| inherits_intrinsic(v, "%BigInt.prototype%"),
-    BooleanObject => |v: &api::Local| inherits_intrinsic(v, "%Boolean.prototype%"),
-    NumberObject => |v: &api::Local| inherits_intrinsic(v, "%Number.prototype%"),
-    SymbolObject => |v: &api::Local| inherits_intrinsic(v, "%Symbol.prototype%"),
-}
-
-/// A view over an array buffer: a typed array, or a `DataView`.
-fn is_array_buffer_view(value: &api::Local) -> bool {
-    object_matches(value, |kind| matches!(kind, ObjectKind::IntegerIndexed(_)))
-        || inherits_intrinsic(value, "%DataView.prototype%")
-}
-
-/// Whether the value is an object whose prototype chain reaches the intrinsic
-/// prototype `name` (for example `%ArrayBuffer.prototype%`).
-///
-/// The engine exposes no brand tags to this crate, so the brand is discovered
-/// the way a script would: walk `[[Prototype]]` to the root and compare. That
-/// is spoofable — an object can be handed a foreign prototype — and it is not
-/// cheap, since every step is a property operation. Both are acceptable while
-/// the boundary is being proven; a brand the engine knows is the durable fix.
-fn inherits_intrinsic(value: &api::Local, name: &str) -> bool {
-    let Some(realm) = crate::realm::current() else {
-        return false;
-    };
-    let Some(brand) = realm.intrinsic(name) else {
-        return false;
-    };
-    let Some(object) = value.value().as_object() else {
-        return false;
-    };
-    let mut current = crux::value::Value::Object(object);
-    // The chain is finite and acyclic by construction; the bound guards only
-    // against that changing.
-    for _ in 0..64 {
-        let local = api::Local::from(current);
-        let Ok(prototype) = api::Object::get_prototype(&realm, &local) else {
-            return false;
-        };
-        let prototype = *prototype.value();
-        if prototype == brand {
-            return true;
-        }
-        if prototype.is_null() {
-            return false;
-        }
-        current = prototype;
-    }
-    false
-}
-
 /// Whether the value is a number that is an integer in `i32` range.
-fn is_int32(value: &api::Local) -> bool {
+pub(crate) fn is_int32(value: &api::Local) -> bool {
     value
         .as_number()
         .is_some_and(|n| n.fract() == 0.0 && (-2147483648.0..=2147483647.0).contains(&n))
 }
 
 /// Whether the value is a number that is an integer in `u32` range.
-fn is_uint32(value: &api::Local) -> bool {
+pub(crate) fn is_uint32(value: &api::Local) -> bool {
     value
         .as_number()
         .is_some_and(|n| n.fract() == 0.0 && (0.0..=4294967295.0).contains(&n))
+}
+
+/// The typed-array predicates, one per element type.
+macro_rules! typed_array_predicates {
+    ($($name:ident => $element:ident),* $(,)?) => {
+        $(
+            pub(crate) fn $name(value: &api::Local) -> bool {
+                typed_array_where(value, |kind| matches!(kind, ElementType::$element))
+            }
+        )*
+    };
+}
+
+typed_array_predicates! {
+    is_int8_array => Int8,
+    is_uint8_array => Uint8,
+    is_uint8_clamped_array => Uint8Clamped,
+    is_int16_array => Int16,
+    is_uint16_array => Uint16,
+    is_int32_array => Int32,
+    is_uint32_array => Uint32,
+    is_float16_array => Float16,
+    is_float32_array => Float32,
+    is_float64_array => Float64,
+    is_big_int64_array => BigInt64,
+    is_big_uint64_array => BigUint64,
 }
 
 macro_rules! impl_from {
@@ -749,7 +932,6 @@ impl DataError {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn no_data<E: 'static>() -> Self {
         Self::NoData {
             expected: type_name::<E>(),

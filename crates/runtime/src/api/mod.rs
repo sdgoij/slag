@@ -1,8 +1,8 @@
 //! The V8-shaped embedding API: isolates, contexts, handles, templates,
 //! exceptions, and host functions.
 //!
-//! This is the Rust foundation the C/C++ drop-in surfaces (`crates/jsc`,
-//! `crates/v8`) build on. It mirrors the shape of the V8 embedder API —
+//! This is the Rust foundation the drop-in `v8` crate (`crates/v8`) builds on,
+//! through which a host that embeds Slag takes its V8-shaped surface. It mirrors the shape of the V8 embedder API —
 //! an [`Isolate`] owns the heap/execution state, a [`Context`] is a realm on
 //! an isolate, [`Local`]/[`Global`] are handles, [`FunctionTemplate`]/
 //! [`ObjectTemplate`] create host functions and objects, and
@@ -19,6 +19,8 @@ mod context;
 mod external;
 mod handle;
 mod json;
+mod microtask;
+mod module;
 mod object;
 mod promise;
 mod script;
@@ -29,6 +31,8 @@ pub use context::{Context, ContextScope};
 pub use external::External;
 pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal};
 pub use json::Json;
+pub use microtask::MicrotasksPolicy;
+pub use module::{Module, ModuleImportPhase, ModuleRequest, ModuleStatus};
 pub use object::{Array, Object};
 pub use promise::Promise;
 pub use script::Script;
@@ -58,6 +62,14 @@ pub struct Isolate {
     pub(crate) agent: Agent,
     pub(crate) pending_exception: RefCell<Option<Value>>,
     pub(crate) data: RefCell<HashMap<u32, usize>>,
+    /// When the queues drain without the host asking (v8::Isolate's
+    /// SetMicrotasksPolicy). `Explicit` is the engine's own behaviour: nothing
+    /// drains a job unless the host asks.
+    pub(crate) microtasks_policy: std::cell::Cell<crate::api::MicrotasksPolicy>,
+    /// How many embedder entries are on the stack. A re-entrant entry — a host
+    /// callback calling back in — must not drain mid-callback, which is why the
+    /// policy's `Auto` drains only when this reaches zero.
+    pub(crate) entry_depth: std::cell::Cell<u32>,
 }
 
 impl Isolate {
@@ -73,7 +85,25 @@ impl Isolate {
             agent: Agent::new(),
             pending_exception: RefCell::new(None),
             data: RefCell::new(HashMap::new()),
+            microtasks_policy: std::cell::Cell::new(crate::api::MicrotasksPolicy::Explicit),
+            entry_depth: std::cell::Cell::new(0),
         })
+    }
+
+    /// When the job queues drain without the host asking
+    /// (v8::Isolate::GetMicrotasksPolicy).
+    pub fn get_microtasks_policy(&self) -> crate::api::MicrotasksPolicy {
+        self.microtasks_policy.get()
+    }
+
+    /// Set when the job queues drain without the host asking
+    /// (v8::Isolate::SetMicrotasksPolicy).
+    ///
+    /// The crate we stand in for defaults to `Auto`; this engine defaults to
+    /// `Explicit`, which is what it has always done, so that a host inherits no
+    /// draining it did not ask for. A host that wants `Auto` says so.
+    pub fn set_microtasks_policy(&mut self, policy: crate::api::MicrotasksPolicy) {
+        self.microtasks_policy.set(policy);
     }
 
     /// The underlying agent (advanced use; the spec state lives here).
@@ -252,6 +282,61 @@ mod tests {
                 .as_deref(),
             Some("sum")
         );
+    }
+
+    /// The number a global holds, or `None` when it is not one.
+    fn read_number(context: &Context, name: &str) -> Option<f64> {
+        Object::get(context, &context.global(), name)
+            .ok()
+            .and_then(|value| value.as_number())
+    }
+
+    /// `Explicit` leaves the queues to the host, which is the engine's default.
+    #[test]
+    fn explicit_leaves_the_queues_to_the_host() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        context
+            .try_eval("Promise.resolve().then(() => { globalThis.ran = 1; })")
+            .expect("eval");
+        assert_eq!(read_number(&context, "ran"), None);
+        context.run_microtasks().expect("drain");
+        assert_eq!(read_number(&context, "ran"), Some(1.0));
+    }
+
+    /// `Auto` drains when the *outermost* entry returns: a callback that calls
+    /// back into the engine raises the depth, so no job runs under a callback
+    /// that is still on the stack.
+    #[test]
+    fn auto_drains_at_the_outer_entry_only() {
+        let mut isolate = isolate();
+        isolate.set_microtasks_policy(MicrotasksPolicy::Auto);
+        let context = context(&mut isolate);
+
+        let still_queued = Rc::new(Cell::new(false));
+        let observed = still_queued.clone();
+        let nested = context;
+        let template = FunctionTemplate::new(
+            &mut isolate,
+            Box::new(move |info| {
+                nested
+                    .try_eval("Promise.resolve().then(() => { globalThis.ran = 1; })")
+                    .expect("nested eval");
+                // SAFETY: a call is on the stack, so the isolate is alive.
+                let agent = unsafe { &*nested.isolate() };
+                observed.set(!unsafe { &*agent.agent_ptr() }.job_queues_empty());
+                info.get_return_value().set_undefined();
+            }),
+        );
+        let function = template.get_function(&context).expect("function");
+        Object::set(&context, &context.global(), "probe", &function, true).expect("set");
+
+        context.eval("probe()").to_local_checked();
+        assert!(
+            still_queued.get(),
+            "the callback's own entry drained the queues under it"
+        );
+        assert_eq!(read_number(&context, "ran"), Some(1.0));
     }
 
     #[test]

@@ -135,9 +135,9 @@ impl Trace for SourceTextModule {
         // are heap edges. `code` is the parsed AST (plain data) — its
         // strings are parse-produced flats with no heap edges.
         self.source.trace(visit);
-        for (specifier, attributes, _) in &self.requested_modules {
-            specifier.trace(visit);
-            for (key, value) in attributes {
+        for request in &self.requested_modules {
+            request.specifier.trace(visit);
+            for (key, value) in &request.attributes {
                 if let AttributeKey::Str(name) = key {
                     name.trace(visit);
                 }
@@ -239,8 +239,20 @@ impl Agent {
 /// entries can be populated without interior mutability. Each request carries
 /// its phase (the plain `import`, or the source/deferred phases of
 /// `import source`/`import defer`).
-/// A module request: (specifier, import attributes, import phase).
-pub type ModuleRequest = (JsString, Vec<(AttributeKey, JsString)>, ImportPhase);
+/// A module request (spec 16.2.1.17): one specifier a module imports or
+/// re-exports, with the attributes and phase that selected it, in source order.
+///
+/// `span` is the requesting declaration's, not the specifier's: the AST
+/// records a span for the declaration and the specifier carries none, so an
+/// offset reported for a request points at the `import`/`export` that asked for
+/// it.
+#[derive(Debug, Clone)]
+pub struct ModuleRequest {
+    pub specifier: JsString,
+    pub attributes: Vec<(AttributeKey, JsString)>,
+    pub phase: ImportPhase,
+    pub span: crux::span::Span,
+}
 /// An import entry: (specifier, entry, import phase).
 pub type ModuleImport = (JsString, ImportEntry, ImportPhase);
 struct ModuleRecords {
@@ -379,7 +391,8 @@ fn module_kind(
     }
 }
 
-fn key_string(key: &AttributeKey) -> String {
+/// The text of an import-attribute key, for the host-facing request view.
+pub(crate) fn key_string(key: &AttributeKey) -> String {
     match key {
         AttributeKey::Ident(atom) => crux::lookup(*atom).to_string_lossy(),
         AttributeKey::Str(text) => text.to_string_lossy(),
@@ -483,11 +496,12 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                 for entry in &import.entries {
                     import_entries.push((import.specifier.clone(), entry.clone(), import.phase));
                 }
-                requested_modules.push((
-                    import.specifier.clone(),
-                    import.attributes.clone(),
-                    import.phase,
-                ));
+                requested_modules.push(ModuleRequest {
+                    specifier: import.specifier.clone(),
+                    attributes: import.attributes.clone(),
+                    phase: import.phase,
+                    span: import.span,
+                });
             }
             ModuleItem::Export(export) => match export {
                 ExportDecl::Named { specifiers, .. } => {
@@ -588,7 +602,7 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                     namespace,
                     specifier,
                     attributes,
-                    ..
+                    span,
                 } => {
                     if let Some(namespace) = namespace {
                         // `export * as ns from ...`: a local namespace binding
@@ -629,11 +643,12 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                             });
                         }
                     }
-                    requested_modules.push((
-                        specifier.clone(),
-                        attributes.clone(),
-                        ImportPhase::Import,
-                    ));
+                    requested_modules.push(ModuleRequest {
+                        specifier: specifier.clone(),
+                        attributes: attributes.clone(),
+                        phase: ImportPhase::Import,
+                        span: *span,
+                    });
                 }
                 ExportDecl::Declaration(stmt) => {
                     for name in declared_names(&stmt.kind) {
@@ -767,8 +782,9 @@ pub fn module_declaration_instantiation(
     // (`source-phase-import/import-source.js`).
     let requested = module.requested_modules.clone();
     let mut resolved: Vec<Handle<SourceTextModule>> = Vec::with_capacity(requested.len());
-    for (specifier, attributes, _) in &requested {
-        let imported = host_resolve_imported_module(agent, specifier, attributes)?;
+    for request in &requested {
+        let imported =
+            host_resolve_imported_module(agent, &request.specifier, &request.attributes)?;
         resolved.push(imported);
     }
     for imported in &resolved {
@@ -1310,7 +1326,9 @@ pub fn module_evaluation(
         // (InnerModuleEvaluation step 12 + GatherAsynchronousTransitiveDependencies):
         // `import defer` of a top-level-await module runs that module's
         // async evaluation.
-        for (specifier, _, phase) in dependencies {
+        for request in dependencies {
+            let specifier = request.specifier;
+            let phase = request.phase;
             let imported = host_resolve_imported_module(agent, &specifier, &[])?;
             if phase == ImportPhase::Defer {
                 let async_deps =
@@ -2191,8 +2209,8 @@ fn module_sync_ready(
         return Ok(false);
     }
     let requested = module.requested_modules.clone();
-    for (specifier, _, _) in &requested {
-        let imported = host_resolve_imported_module(agent, specifier, &[])?;
+    for request in &requested {
+        let imported = host_resolve_imported_module(agent, &request.specifier, &[])?;
         if !module_sync_ready(agent, &imported, seen)? {
             return Ok(false);
         }
@@ -2202,7 +2220,10 @@ fn module_sync_ready(
 
 /// [[HasTLA]] (spec 16.2.1.5.1): whether the module's top-level code contains
 /// a top-level `await` (outside any function body).
-fn module_has_tla(agent: &Agent, module: &Handle<SourceTextModule>) -> Result<bool, JsError> {
+pub(crate) fn module_has_tla(
+    agent: &Agent,
+    module: &Handle<SourceTextModule>,
+) -> Result<bool, JsError> {
     let _ = agent;
     let stmts = module_statements(module);
     Ok(stmts.iter().any(stmt_has_top_level_await))
@@ -2478,8 +2499,8 @@ fn gather_async_transitive_dependencies(
         return Ok(result);
     }
     let requested = module.requested_modules.clone();
-    for (specifier, _, _) in &requested {
-        let imported = host_resolve_imported_module(agent, specifier, &[])?;
+    for request in &requested {
+        let imported = host_resolve_imported_module(agent, &request.specifier, &[])?;
         let additional = gather_async_transitive_dependencies(agent, &imported, seen)?;
         for m in additional {
             if !result.iter().any(|existing| Handle::ptr_eq(*existing, m)) {

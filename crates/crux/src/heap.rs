@@ -1346,6 +1346,15 @@ pub fn pin(value: crate::value::Value) -> Pin {
     Pin { any }
 }
 
+/// Keep the box `handle` names, and everything it reaches, alive until the
+/// returned pin is dropped — the handle form of [`pin`], for a rooted object
+/// that no language value names (a module record).
+pub fn pin_handle<T: Trace>(handle: crate::handle::Handle<T>) -> Pin {
+    let any = handle.as_any();
+    PINNED.with(|pinned| pinned.borrow_mut().push(any));
+    Pin { any: Some(any) }
+}
+
 /// The precise roots for a collection: the caller's, plus every pin.
 ///
 /// Every collection entry point seeds its mark through this, so a pin cannot be

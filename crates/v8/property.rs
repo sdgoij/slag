@@ -9,6 +9,42 @@
 
 use std::ops::{BitOr, BitOrAssign};
 
+/// The attributes a property is defined with (v8::PropertyAttribute).
+#[repr(C)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Default)]
+pub struct PropertyAttribute(u32);
+
+impl PropertyAttribute {
+    /// No attribute: writable, enumerable and configurable.
+    pub const NONE: Self = Self(0);
+    pub const READ_ONLY: Self = Self(1 << 0);
+    pub const DONT_ENUM: Self = Self(1 << 1);
+    pub const DONT_DELETE: Self = Self(1 << 2);
+
+    /// Whether every attribute in `that` is set here.
+    pub fn has(&self, that: Self) -> bool {
+        let Self(lhs) = self;
+        let Self(rhs) = that;
+        lhs & rhs == rhs
+    }
+}
+
+impl BitOr for PropertyAttribute {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        let Self(rhs) = rhs;
+        let Self(lhs) = self;
+        Self(lhs | rhs)
+    }
+}
+
+impl BitOrAssign for PropertyAttribute {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs;
+    }
+}
+
 /// A mask selecting which properties an enumeration returns
 /// (`v8::PropertyFilter`).
 #[repr(C)]

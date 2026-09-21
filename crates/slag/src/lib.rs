@@ -19,6 +19,11 @@ pub use runtime::dump;
 pub use runtime::embed::{Context, FunctionCall, HostCallbacks, HostFn, JsObject, JsValue};
 pub use runtime::embed::{OutputFn, RandomFn};
 
+/// The V8-shaped Rust surface — [`Isolate`](api::Isolate), [`Context`](api::Context),
+/// [`Local`](api::Local), [`Module`](api::Module) and the rest — re-exported so a
+/// host porting from the `v8` crate depends on this crate alone.
+pub use runtime::api;
+
 pub mod buffers;
 pub mod objects;
 
@@ -45,6 +50,26 @@ mod tests {
         let mut context = Context::new().unwrap();
         let value = context.eval("1 + 2").unwrap();
         assert_eq!(value.as_number(), Some(3.0));
+    }
+
+    /// The V8-shaped surface, module loading included, is reachable from the
+    /// embedding entrypoint alone — a host depends on `slag`, not `runtime`.
+    #[test]
+    fn the_v8_shaped_surface_is_reachable_through_the_facade() {
+        use crate::api::{Isolate, Module, Object};
+        let mut isolate = Isolate::new();
+        let context = crate::api::Context::new(&mut isolate).expect("context");
+        let module = Module::compile(&context, "m", "export const x = 41;").expect("compile");
+        module.register(&context, "m").expect("register");
+        module.instantiate(&context).expect("instantiate");
+        module.evaluate(&context).expect("evaluate");
+        let namespace = module.namespace(&context).expect("namespace");
+        assert_eq!(
+            Object::get(&context, &namespace, "x")
+                .expect("get")
+                .as_number(),
+            Some(41.0)
+        );
     }
 
     #[cfg(feature = "jit")]

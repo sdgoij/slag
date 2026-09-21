@@ -1,7 +1,8 @@
 //! Primitive values and their constructors (`v8::Primitive`, `v8::String`,
 //! `v8::Number`, `v8::Boolean`).
 
-use std::ops::{BitOr, BitOrAssign};
+use std::mem::MaybeUninit;
+use std::ops::{BitOr, BitOrAssign, Deref};
 
 use crux::string::JsString;
 use crux::value::ValueKind;
@@ -100,22 +101,21 @@ impl<'s> Local<'s, Number> {
 }
 
 impl Integer {
+    /// An `i32` as an integer (`v8::Integer::New`).
     pub fn new<'s, R>(_scope: &R, value: i32) -> Local<'s, Integer> {
         Local::from_engine(api::Local::number(f64::from(value)))
     }
 
-    pub fn new_from_i32<'s, R>(scope: &R, value: i32) -> Local<'s, Integer> {
-        Self::new(scope, value)
-    }
-
-    pub fn new_from_u32<'s, R>(_scope: &R, value: u32) -> Local<'s, Integer> {
+    /// A `u32` as an integer (`v8::Integer::NewFromUnsigned`).
+    pub fn new_from_unsigned<'s, R>(_scope: &R, value: u32) -> Local<'s, Integer> {
         Local::from_engine(api::Local::number(f64::from(value)))
     }
 }
 
 impl<'s> Local<'s, Integer> {
-    pub fn value(&self) -> f64 {
-        self.engine().as_number().unwrap_or(f64::NAN)
+    /// The value (`v8::Integer::Value`).
+    pub fn value(&self) -> i64 {
+        self.engine().as_number().map_or(0, |n| n as i64)
     }
 }
 
@@ -123,6 +123,46 @@ impl String {
     /// A new string from UTF-8 (`v8::String::NewFromUtf8`).
     pub fn new<'s>(scope: &PinScope<'s, '_, ()>, value: &str) -> Option<Local<'s, String>> {
         Self::new_from_utf8(scope, value.as_bytes(), NewStringType::Normal)
+    }
+
+    /// A static one-byte string resource, checked at compile time
+    /// (v8::String::CreateExternalOneByteConst).
+    ///
+    /// The checks are the crate we stand in for's: ASCII only, and within the
+    /// length a `String` can hold.
+    pub const fn create_external_onebyte_const(buffer: &'static [u8]) -> OneByteConst {
+        assert!(buffer.is_ascii() && buffer.len() <= (1 << 29) - 24);
+        OneByteConst {
+            data: buffer.as_ptr(),
+            length: buffer.len(),
+        }
+    }
+
+    /// As [`create_external_onebyte_const`](Self::create_external_onebyte_const),
+    /// without the checks.
+    ///
+    /// # Safety
+    ///
+    /// The buffer must be ASCII and within the length a `String` can hold.
+    pub const unsafe fn create_external_onebyte_const_unchecked(
+        buffer: &'static [u8],
+    ) -> OneByteConst {
+        OneByteConst {
+            data: buffer.as_ptr(),
+            length: buffer.len(),
+        }
+    }
+
+    /// A string over a static one-byte buffer
+    /// (`v8::String::NewExternalOneByteStatic`).
+    ///
+    /// The buffer is read as Latin-1, one code unit per byte, as it is there.
+    pub fn new_external_onebyte_static<'s>(
+        _scope: &PinScope<'s, '_, ()>,
+        buffer: &'static [u8],
+    ) -> Option<Local<'s, String>> {
+        let units: Vec<u16> = buffer.iter().copied().map(u16::from).collect();
+        Some(Self::from_code_units(&units))
     }
 
     /// A new string from UTF-8 bytes (`v8::String::NewFromUtf8`).
@@ -147,8 +187,24 @@ impl String {
         units: &[u16],
         _ty: NewStringType,
     ) -> Option<Local<'s, String>> {
-        Some(Local::from_engine(api::Local::from(
-            crux::value::Value::String(crux::handle::Handle::new(JsString::from_utf16(units))),
+        Some(Self::from_code_units(units))
+    }
+
+    /// A new string from one-byte (Latin-1) characters
+    /// (`v8::String::NewFromOneByte`): each byte is one code unit, so `0xE9` is
+    /// `é` and not the first byte of a UTF-8 sequence.
+    pub fn new_from_one_byte<'s>(
+        _scope: &PinScope<'s, '_, ()>,
+        bytes: &[u8],
+        _ty: NewStringType,
+    ) -> Option<Local<'s, String>> {
+        let units: Vec<u16> = bytes.iter().copied().map(u16::from).collect();
+        Some(Self::from_code_units(&units))
+    }
+
+    fn from_code_units<'s>(units: &[u16]) -> Local<'s, String> {
+        Local::from_engine(api::Local::from(crux::value::Value::String(
+            crux::handle::Handle::new(JsString::from_utf16(units)),
         )))
     }
 }
@@ -195,5 +251,575 @@ impl<'s> Local<'s, String> {
     /// two, which is what callers of this method expect.
     pub fn length(&self) -> usize {
         self.code_units().len()
+    }
+
+    /// Whether every code unit fits in one byte, i.e. the string is ISO-8859-1
+    /// (`v8::String::ContainsOnlyOneByte`).
+    pub fn contains_only_onebyte(&self) -> bool {
+        self.code_units()
+            .iter()
+            .all(|&unit| unit <= u16::from(u8::MAX))
+    }
+
+    /// The byte count of the UTF-8 encoding (`v8::String::Utf8Length`).
+    ///
+    /// A lone surrogate counts three bytes, which is what the encoding writes
+    /// for one whether or not invalid sequences are replaced.
+    pub fn utf8_length(&self, _scope: &crate::Isolate) -> usize {
+        let mut total = 0;
+        let mut previous = None;
+        for unit in self.code_units() {
+            total += encoded_length(unit, previous);
+            previous = Some(unit);
+        }
+        total
+    }
+
+    /// Copies the string's code units into `buffer`, starting at `offset`
+    /// (`v8::String::Write`).
+    ///
+    /// `kNullTerminate` needs a buffer with room for the terminator; one
+    /// without the room gets the units and no terminator, where the crate we
+    /// stand in for would write past the end of it.
+    pub fn write_v2(
+        &self,
+        _scope: &crate::Isolate,
+        offset: u32,
+        buffer: &mut [u16],
+        flags: WriteFlags,
+    ) {
+        let units = self.code_units();
+        let start = (offset as usize).min(units.len());
+        let copied = buffer.len().min(units.len() - start);
+        buffer[..copied].copy_from_slice(&units[start..start + copied]);
+        if flags.contains(WriteFlags::kNullTerminate) && copied < buffer.len() {
+            buffer[copied] = 0;
+        }
+    }
+
+    /// Copies the string's code units into `buffer` as one byte each
+    /// (`v8::String::WriteOneByte`).
+    ///
+    /// A unit above `0xFF` is narrowed to its low byte rather than escaped or
+    /// refused, which is what the crate we stand in for writes; a caller that
+    /// cares asks [`contains_only_onebyte`](Self::contains_only_onebyte) first.
+    pub fn write_one_byte_v2(
+        &self,
+        _scope: &crate::Isolate,
+        offset: u32,
+        buffer: &mut [u8],
+        flags: WriteFlags,
+    ) {
+        let units = self.code_units();
+        let start = (offset as usize).min(units.len());
+        let copied = buffer.len().min(units.len() - start);
+        for (slot, unit) in buffer[..copied].iter_mut().zip(&units[start..]) {
+            *slot = *unit as u8;
+        }
+        if flags.contains(WriteFlags::kNullTerminate) && copied < buffer.len() {
+            buffer[copied] = 0;
+        }
+    }
+
+    /// [`write_one_byte_v2`](Self::write_one_byte_v2) into a buffer that is not
+    /// initialized yet, which is how a host fills a `Vec`'s spare capacity
+    /// (`v8::String::WriteOneByte` over uninitialized memory).
+    pub fn write_one_byte_uninit_v2(
+        &self,
+        _scope: &crate::Isolate,
+        offset: u32,
+        buffer: &mut [MaybeUninit<u8>],
+        flags: WriteFlags,
+    ) {
+        let units = self.code_units();
+        let start = (offset as usize).min(units.len());
+        let copied = buffer.len().min(units.len() - start);
+        for (slot, unit) in buffer[..copied].iter_mut().zip(&units[start..]) {
+            slot.write(*unit as u8);
+        }
+        if flags.contains(WriteFlags::kNullTerminate) && copied < buffer.len() {
+            buffer[copied].write(0);
+        }
+    }
+
+    /// The string as UTF-8 (`v8::String::WriteUtf8`), stopping before a
+    /// character that does not fit and reporting how many code units that
+    /// covered.
+    ///
+    /// `kReplaceInvalidUtf8` is what makes the output valid UTF-8: without it a
+    /// lone surrogate is written as its own three-byte sequence, which is the
+    /// only faithful answer and not a valid encoding of anything. The returned
+    /// byte count includes the terminator when one was asked for and written.
+    pub fn write_utf8_uninit_v2(
+        &self,
+        _scope: &crate::Isolate,
+        buffer: &mut [MaybeUninit<u8>],
+        flags: WriteFlags,
+        processed_characters_return: Option<&mut usize>,
+    ) -> usize {
+        let (written, processed) = encode_utf8(
+            &self.code_units(),
+            buffer,
+            flags.contains(WriteFlags::kReplaceInvalidUtf8),
+            flags.contains(WriteFlags::kNullTerminate),
+        );
+        if let Some(processed_return) = processed_characters_return {
+            *processed_return = processed;
+        }
+        written
+    }
+}
+
+/// Whether `unit` is the trail of a surrogate pair whose lead is `previous`
+/// (`unibrow::Utf16::IsSurrogatePair`).
+fn is_surrogate_pair(previous: Option<u16>, unit: u16) -> bool {
+    previous
+        .is_some_and(|lead| (0xD800..0xDC00).contains(&lead) && (0xDC00..0xE000).contains(&unit))
+}
+
+fn is_surrogate(unit: u16) -> bool {
+    (0xD800..0xE000).contains(&unit)
+}
+
+/// The UTF-8 byte count of one code unit, given the one before it
+/// (`unibrow::Utf8::Length`): the trail of a pair adds the one byte the pair
+/// had left to count, and a lone surrogate counts as much as any three-byte
+/// character.
+fn encoded_length(unit: u16, previous: Option<u16>) -> usize {
+    if unit <= 0x7F || is_surrogate_pair(previous, unit) {
+        1
+    } else if unit <= 0x7FF {
+        2
+    } else {
+        3
+    }
+}
+
+/// The UTF-8 bytes of a code point, and how many of them there are. A lone
+/// surrogate goes through the three-byte path unchanged, which is the encoding
+/// the crate we stand in for writes for one.
+fn utf8_bytes(point: u32) -> ([u8; 4], usize) {
+    if point <= 0x7F {
+        ([point as u8, 0, 0, 0], 1)
+    } else if point <= 0x7FF {
+        (
+            [0xC0 | (point >> 6) as u8, 0x80 | (point & 0x3F) as u8, 0, 0],
+            2,
+        )
+    } else if point <= 0xFFFF {
+        (
+            [
+                0xE0 | (point >> 12) as u8,
+                0x80 | ((point >> 6) & 0x3F) as u8,
+                0x80 | (point & 0x3F) as u8,
+                0,
+            ],
+            3,
+        )
+    } else {
+        (
+            [
+                0xF0 | (point >> 18) as u8,
+                0x80 | ((point >> 12) & 0x3F) as u8,
+                0x80 | ((point >> 6) & 0x3F) as u8,
+                0x80 | (point & 0x3F) as u8,
+            ],
+            4,
+        )
+    }
+}
+
+/// The code point a surrogate pair stands for (`Utf16::CombineSurrogatePair`).
+fn combined_point(lead: u16, trail: u16) -> u32 {
+    0x1_0000 + ((u32::from(lead) - 0xD800) << 10) + (u32::from(trail) - 0xDC00)
+}
+
+/// Writes one code point as UTF-8 at `at`, returning its byte count.
+fn write_codepoint(buffer: &mut [MaybeUninit<u8>], at: usize, point: u32) -> usize {
+    let (bytes, length) = utf8_bytes(point);
+    for (slot, byte) in buffer[at..at + length].iter_mut().zip(bytes) {
+        slot.write(byte);
+    }
+    length
+}
+
+/// The UTF-8 encoding of `units` (`unibrow::Utf8::Encode`), which stops before
+/// a character that does not fit rather than write part of one. Returns the
+/// bytes written — a terminator included when one was asked for — and the code
+/// units that covered.
+///
+/// A surrogate pair takes two steps, as there: the lead reserves the three
+/// bytes of an unmatched surrogate that the trail's iteration then rewrites as
+/// the pair's four.
+fn encode_utf8(
+    units: &[u16],
+    buffer: &mut [MaybeUninit<u8>],
+    replace_invalid: bool,
+    null_terminate: bool,
+) -> (usize, usize) {
+    let content_capacity = buffer.len().saturating_sub(usize::from(null_terminate));
+    let mut written = 0;
+    let mut read = 0;
+    let mut previous = None;
+    while read < units.len() {
+        let unit = units[read];
+        if content_capacity - written < encoded_length(unit, previous) {
+            if is_surrogate_pair(previous, unit) {
+                // Half a pair fits and the whole one does not: give back the
+                // bytes the lead reserved and leave the trail unread.
+                written -= 3;
+                read -= 1;
+            }
+            break;
+        }
+        if units
+            .get(read + 1)
+            .is_some_and(|&next| is_surrogate_pair(Some(unit), next))
+        {
+            written += 3;
+        } else if let Some(lead) = previous.filter(|&lead| is_surrogate_pair(Some(lead), unit)) {
+            write_codepoint(buffer, written - 3, combined_point(lead, unit));
+            written += 1;
+        } else {
+            let point = if replace_invalid && is_surrogate(unit) {
+                0xFFFD
+            } else {
+                u32::from(unit)
+            };
+            written += write_codepoint(buffer, written, point);
+        }
+        previous = Some(unit);
+        read += 1;
+    }
+    if null_terminate && written < buffer.len() {
+        buffer[written].write(0);
+        written += 1;
+    }
+    (written, read)
+}
+
+/// A string resource fixed at compile time (v8::OneByteConst).
+///
+/// The crate we stand in for gives this a C++ vtable so the engine can read the
+/// resource lazily. There is no C++ here, so it carries the bytes and their
+/// length, which is all any accessor reads.
+#[derive(Clone, Copy, Debug)]
+pub struct OneByteConst {
+    data: *const u8,
+    length: usize,
+}
+
+// SAFETY: `data` points into a `&'static` buffer that is never written, so
+// sharing the resource between threads shares immutable bytes.
+unsafe impl Sync for OneByteConst {}
+
+// SAFETY: as `Sync`.
+unsafe impl Send for OneByteConst {}
+
+impl OneByteConst {
+    /// The bytes as a string, with no allocation.
+    pub const fn as_str(&self) -> &str {
+        if self.length == 0 {
+            ""
+        } else {
+            // SAFETY: the constructor checked that the bytes are ASCII.
+            unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.data, self.length))
+            }
+        }
+    }
+}
+
+impl AsRef<str> for OneByteConst {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<[u8]> for OneByteConst {
+    fn as_ref(&self) -> &[u8] {
+        self.as_str().as_bytes()
+    }
+}
+
+impl Deref for OneByteConst {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Transcode Latin-1 to UTF-8, returning the bytes written
+/// (`v8::latin1_to_utf8`).
+///
+/// This is the one free function a host calls straight out of the crate we
+/// stand in for's string module: a host holding Latin-1 — a byte-oriented op's
+/// buffer, a `OneByteConst` — asks for its UTF-8 rendering without going
+/// through a JS string.
+///
+/// # Safety
+///
+/// - `inbuf` must point to at least `input_length` readable bytes.
+/// - `outbuf` must point to at least `2 * input_length` writable bytes: every
+///   byte above ASCII becomes two.
+pub unsafe fn latin1_to_utf8(input_length: usize, inbuf: *const u8, outbuf: *mut u8) -> usize {
+    // SAFETY: the caller's contract on both buffers.
+    let input = unsafe { std::slice::from_raw_parts(inbuf, input_length) };
+    let mut written = 0;
+    for &byte in input {
+        if byte.is_ascii() {
+            // SAFETY: as above — an ASCII byte needs one of the two bytes the
+            // caller promised per input byte.
+            unsafe { *outbuf.add(written) = byte };
+            written += 1;
+        } else {
+            // SAFETY: as above — a Latin-1 byte above ASCII is two bytes of
+            // UTF-8 (110xxxxx 10xxxxxx).
+            unsafe {
+                *outbuf.add(written) = (byte >> 6) | 0b1100_0000;
+                *outbuf.add(written + 1) = (byte & 0b0011_1111) | 0b1000_0000;
+            }
+            written += 2;
+        }
+    }
+    written
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NewStringType;
+    use crate::test_support::{eval, in_context};
+
+    /// The string a script evaluates to.
+    fn eval_string<'s>(scope: &crate::PinScope<'s, '_>, source: &str) -> Local<'s, String> {
+        Local::<String>::try_from(eval(scope, source)).expect("string")
+    }
+
+    fn uninit_buffer(len: usize) -> Vec<MaybeUninit<u8>> {
+        vec![MaybeUninit::uninit(); len]
+    }
+
+    /// The bytes a write reported as written.
+    fn written_bytes(buffer: &[MaybeUninit<u8>], written: usize) -> Vec<u8> {
+        buffer[..written]
+            .iter()
+            .map(|byte| *unsafe { byte.assume_init_ref() })
+            .collect()
+    }
+
+    #[test]
+    fn the_lengths_agree_with_the_encoding() {
+        in_context!(scope, {
+            assert_eq!(eval_string(scope, "'abc'").length(), 3);
+            assert_eq!(
+                eval_string(scope, "'\\u{1D11E}'").length(),
+                2,
+                "an astral character is two code units"
+            );
+
+            assert_eq!(eval_string(scope, "'abc'").utf8_length(scope), 3);
+            assert_eq!(eval_string(scope, "'\\u{E9}'").utf8_length(scope), 2);
+            assert_eq!(eval_string(scope, "'\\u{20AC}'").utf8_length(scope), 3);
+            assert_eq!(eval_string(scope, "'\\u{1D11E}'").utf8_length(scope), 4);
+            assert_eq!(
+                eval_string(scope, "'\\u{D800}'").utf8_length(scope),
+                3,
+                "a lone surrogate is three bytes, which is what is written for it"
+            );
+        });
+    }
+
+    #[test]
+    fn a_string_is_one_byte_when_every_unit_is() {
+        in_context!(scope, {
+            assert!(eval_string(scope, "'abc'").contains_only_onebyte());
+            assert!(eval_string(scope, "'\\u{E9}'").contains_only_onebyte());
+            assert!(!eval_string(scope, "'\\u{20AC}'").contains_only_onebyte());
+        });
+    }
+
+    #[test]
+    fn write_v2_copies_code_units_from_an_offset() {
+        in_context!(scope, {
+            let text = eval_string(scope, "'abc'");
+            let mut buffer = [0xFFFFu16; 3];
+            text.write_v2(scope, 1, &mut buffer, WriteFlags::empty());
+            assert_eq!(buffer, [0x62, 0x63, 0xFFFF]);
+        });
+    }
+
+    #[test]
+    fn write_v2_terminates_only_where_a_terminator_fits() {
+        in_context!(scope, {
+            let text = eval_string(scope, "'abc'");
+            let mut roomy = [0xFFFFu16; 4];
+            text.write_v2(scope, 0, &mut roomy, WriteFlags::kNullTerminate);
+            assert_eq!(roomy, [0x61, 0x62, 0x63, 0]);
+
+            let mut exact = [0xFFFFu16; 3];
+            text.write_v2(scope, 0, &mut exact, WriteFlags::kNullTerminate);
+            assert_eq!(
+                exact,
+                [0x61, 0x62, 0x63],
+                "a buffer with no room for a terminator gets no terminator"
+            );
+        });
+    }
+
+    #[test]
+    fn write_one_byte_v2_narrows_to_the_low_byte() {
+        in_context!(scope, {
+            let text = eval_string(scope, "'a\\u{20AC}'");
+            let mut buffer = [0u8; 4];
+            text.write_one_byte_v2(scope, 0, &mut buffer, WriteFlags::empty());
+            assert_eq!(buffer, [0x61, 0xAC, 0, 0]);
+        });
+    }
+
+    #[test]
+    fn the_uninitialized_writes_fill_what_they_report() {
+        in_context!(scope, {
+            let text = eval_string(scope, "'ab'");
+            let mut buffer = uninit_buffer(4);
+            text.write_one_byte_uninit_v2(scope, 0, &mut buffer, WriteFlags::empty());
+            assert_eq!(written_bytes(&buffer, 2), [0x61, 0x62]);
+
+            let mut bytes = uninit_buffer(3);
+            let written =
+                text.write_utf8_uninit_v2(scope, &mut bytes, WriteFlags::kNullTerminate, None);
+            assert_eq!(written, 3, "the count includes the terminator");
+            assert_eq!(written_bytes(&bytes, written), [0x61, 0x62, 0]);
+        });
+    }
+
+    #[test]
+    fn utf8_replaces_a_lone_surrogate_only_when_asked() {
+        in_context!(scope, {
+            let text = eval_string(scope, "'\\u{D800}A'");
+            let mut buffer = uninit_buffer(8);
+            let mut processed = 0;
+            let written = text.write_utf8_uninit_v2(
+                scope,
+                &mut buffer,
+                WriteFlags::kReplaceInvalidUtf8,
+                Some(&mut processed),
+            );
+            assert_eq!((written, processed), (4, 2));
+            assert_eq!(
+                written_bytes(&buffer, written),
+                [0xEF, 0xBF, 0xBD, 0x41],
+                "U+FFFD"
+            );
+
+            let written = text.write_utf8_uninit_v2(scope, &mut buffer, WriteFlags::empty(), None);
+            assert_eq!(written, 4);
+            assert_eq!(
+                written_bytes(&buffer, written),
+                [0xED, 0xA0, 0x80, 0x41],
+                "the surrogate's own three bytes, which is not valid UTF-8"
+            );
+        });
+    }
+
+    #[test]
+    fn utf8_writes_a_pair_as_one_character() {
+        in_context!(scope, {
+            let text = eval_string(scope, "'\\u{1D11E}'");
+            let mut buffer = uninit_buffer(4);
+            let mut processed = 0;
+            let written = text.write_utf8_uninit_v2(
+                scope,
+                &mut buffer,
+                WriteFlags::empty(),
+                Some(&mut processed),
+            );
+            assert_eq!((written, processed), (4, 2));
+            assert_eq!(written_bytes(&buffer, written), [0xF0, 0x9D, 0x84, 0x9E]);
+        });
+    }
+
+    #[test]
+    fn utf8_stops_before_a_character_that_does_not_fit() {
+        in_context!(scope, {
+            let text = eval_string(scope, "'\\u{20AC}'");
+            let mut buffer = uninit_buffer(2);
+            let mut processed = 0;
+            let written = text.write_utf8_uninit_v2(
+                scope,
+                &mut buffer,
+                WriteFlags::empty(),
+                Some(&mut processed),
+            );
+            assert_eq!((written, processed), (0, 0));
+
+            let mut buffer = uninit_buffer(3);
+            let written = text.write_utf8_uninit_v2(scope, &mut buffer, WriteFlags::empty(), None);
+            assert_eq!(written, 3);
+            assert_eq!(written_bytes(&buffer, written), [0xE2, 0x82, 0xAC]);
+        });
+    }
+
+    /// Three bytes is room for the lead of a pair and not for the character,
+    /// and half a character is not one — the same answer the crate we stand in
+    /// for gives.
+    #[test]
+    fn utf8_does_not_write_half_a_pair() {
+        in_context!(scope, {
+            let text = eval_string(scope, "'\\u{1D11E}'");
+            let mut buffer = uninit_buffer(3);
+            let mut processed = 0;
+            let written = text.write_utf8_uninit_v2(
+                scope,
+                &mut buffer,
+                WriteFlags::empty(),
+                Some(&mut processed),
+            );
+            assert_eq!((written, processed), (0, 0));
+        });
+    }
+
+    #[test]
+    fn a_string_can_be_built_from_latin1_bytes() {
+        in_context!(scope, {
+            let text = String::new_from_one_byte(scope, &[0x61, 0xE9], NewStringType::Normal)
+                .expect("string");
+            assert_eq!(text.to_utf16(), [0x61, 0xE9]);
+            assert_eq!(text.utf8_length(scope), 3);
+        });
+    }
+}
+
+#[cfg(test)]
+mod onebyte_const_tests {
+    use super::*;
+    use crate::test_support::{eval, in_context};
+
+    static GREETING: OneByteConst = String::create_external_onebyte_const(b"hello");
+
+    /// A static resource is readable without a scope, and the string built over
+    /// it carries the same bytes.
+    #[test]
+    fn a_static_string_resource_is_readable_and_becomes_a_string() {
+        assert_eq!(GREETING.as_str(), "hello");
+        assert_eq!(<OneByteConst as AsRef<[u8]>>::as_ref(&GREETING), b"hello");
+        assert_eq!(&*GREETING, "hello");
+
+        in_context!(scope, {
+            let text =
+                String::new_external_onebyte_static(scope, GREETING.as_ref()).expect("string");
+            assert_eq!(text.to_rust_string_lossy(scope), "hello");
+            // Latin-1, one code unit per byte, so `0xE9` is one unit.
+            let latin1 =
+                String::new_external_onebyte_static(scope, b"\xE9".as_slice()).expect("string");
+            assert_eq!(latin1.to_utf16(), [0xE9]);
+            assert_eq!(
+                Local::<crate::data::Number>::try_from(eval(scope, "'hello'.length"))
+                    .expect("number")
+                    .value(),
+                text.to_utf16().len() as f64
+            );
+        });
     }
 }

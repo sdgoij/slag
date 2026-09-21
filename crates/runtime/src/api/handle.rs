@@ -8,11 +8,12 @@ use crux::value::Value;
 
 /// A scoped handle over a language value (v8::Local).
 ///
-/// `crux` values are `Rc`-backed, so a `Local` is valid for as long as it
-/// exists: no GC rooting and no handle-scope discipline. [`HandleScope`] and
+/// A `Local` is a value, not a pointer into a scope-owned region: it copies
+/// freely, it is valid for as long as the value it names is rooted, and it
+/// needs no handle-scope discipline. [`HandleScope`] and
 /// [`EscapableHandleScope`] exist so V8-idiom code compiles unchanged; they
 /// are markers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Local(pub(crate) Value);
 
 impl Local {
@@ -194,6 +195,14 @@ pub enum MaybeLocal {
     Nothing,
 }
 
+impl Clone for MaybeLocal {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Copy for MaybeLocal {}
+
 impl MaybeLocal {
     pub fn is_empty(&self) -> bool {
         matches!(self, MaybeLocal::Nothing)
@@ -201,7 +210,7 @@ impl MaybeLocal {
 
     pub fn to_local(&self) -> Option<Local> {
         match self {
-            MaybeLocal::Some(local) => Some(local.clone()),
+            MaybeLocal::Some(local) => Some(*local),
             MaybeLocal::Nothing => None,
         }
     }
@@ -216,8 +225,9 @@ impl MaybeLocal {
     }
 }
 
-/// RAII marker grouping a set of local handles. Advisory under `Rc`; kept so
-/// V8-idiom code compiles unchanged.
+/// RAII marker grouping a set of local handles. A [`Local`] is a value, so
+/// nothing here needs a region to stay valid; the type exists so V8-idiom code
+/// compiles unchanged.
 #[derive(Debug, Default)]
 pub struct HandleScope(());
 
@@ -228,7 +238,8 @@ impl HandleScope {
 }
 
 /// RAII marker that can promote one inner `Local` to the enclosing scope
-/// (v8::EscapableHandleScope). Under `Rc` the promotion is a clone.
+/// (v8::EscapableHandleScope). Nothing has to be promoted — every `Local`
+/// outlives the scope that made it — so this is the identity.
 #[derive(Debug, Default)]
 pub struct EscapableHandleScope(());
 

@@ -12,6 +12,14 @@ path = "lib.rs"
 [dependencies]
 runtime = { path = "../runtime", default-features = false }
 crux = { path = "../crux" }
+# For `fast_api::Flags`, which the crate we stand in for spells as a bitflags
+# type; it is already in the workspace's lock, so this adds no new download.
+bitflags = "2"
+# The host-facing engine entry points come through the embedding API rather
+# than from `runtime` directly. Its `wasm` feature is off, as it is here: a
+# host that needs WebAssembly turns it on, which is also what brings the wasm
+# brand tables this bridge's predicates ask about.
+slag = { path = "../slag", default-features = false }
 
 # Mirrors the feature surface the crate we stand in for declares, so a
 # consumer's passthroughs (`features = ["simdutf"]`, `v8_use_custom_libcxx`, the

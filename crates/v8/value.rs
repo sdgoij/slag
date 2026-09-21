@@ -1,10 +1,14 @@
 //! The `Value` surface: predicates and conversions (`v8::Value`).
+//!
+//! Every predicate that asks what a value *is* delegates to [`predicates`],
+//! which is also what the tag casts in [`crate::data`] check against, so a
+//! `TryFrom` cast and the corresponding `is_*` cannot disagree.
 
-use runtime::api;
-
-use crate::data::{String, Value};
+use crate::data::{self as predicates, String, Value};
 use crate::handle::Local;
 use crate::scope::PinScope;
+
+use runtime::api;
 
 impl<'s> Local<'s, Value> {
     pub fn is_undefined(&self) -> bool {
@@ -27,12 +31,9 @@ impl<'s> Local<'s, Value> {
         self.engine().as_boolean() == Some(false)
     }
 
-    pub fn is_boolean(&self) -> bool {
-        self.engine().is_boolean()
-    }
-
-    pub fn is_number(&self) -> bool {
-        self.engine().is_number()
+    /// A string or a symbol, which is what `v8::Name` names.
+    pub fn is_name(&self) -> bool {
+        predicates::is_name(self.engine())
     }
 
     pub fn is_string(&self) -> bool {
@@ -43,21 +44,145 @@ impl<'s> Local<'s, Value> {
         self.engine().is_symbol()
     }
 
-    /// A string or a symbol, which is what `v8::Name` names.
-    pub fn is_name(&self) -> bool {
-        self.is_string() || self.is_symbol()
+    pub fn is_function(&self) -> bool {
+        self.engine().is_function()
+    }
+
+    pub fn is_array(&self) -> bool {
+        predicates::is_array(self.engine())
+    }
+
+    pub fn is_object(&self) -> bool {
+        predicates::is_object(self.engine())
     }
 
     pub fn is_big_int(&self) -> bool {
         self.engine().is_bigint()
     }
 
-    pub fn is_object(&self) -> bool {
-        self.engine().is_object()
+    pub fn is_boolean(&self) -> bool {
+        self.engine().is_boolean()
     }
 
-    pub fn is_function(&self) -> bool {
-        self.engine().is_function()
+    pub fn is_number(&self) -> bool {
+        self.engine().is_number()
+    }
+
+    pub fn is_external(&self) -> bool {
+        predicates::is_external(self.engine())
+    }
+
+    pub fn is_int32(&self) -> bool {
+        predicates::is_int32(self.engine())
+    }
+
+    pub fn is_uint32(&self) -> bool {
+        predicates::is_uint32(self.engine())
+    }
+
+    pub fn is_date(&self) -> bool {
+        predicates::is_date(self.engine())
+    }
+
+    pub fn is_arguments_object(&self) -> bool {
+        predicates::is_arguments_object(self.engine())
+    }
+
+    pub fn is_big_int_object(&self) -> bool {
+        predicates::is_big_int_object(self.engine())
+    }
+
+    pub fn is_boolean_object(&self) -> bool {
+        predicates::is_boolean_object(self.engine())
+    }
+
+    pub fn is_number_object(&self) -> bool {
+        predicates::is_number_object(self.engine())
+    }
+
+    /// A `String` object, not a string primitive.
+    pub fn is_string_object(&self) -> bool {
+        predicates::is_string_object(self.engine())
+    }
+
+    pub fn is_symbol_object(&self) -> bool {
+        predicates::is_symbol_object(self.engine())
+    }
+
+    pub fn is_native_error(&self) -> bool {
+        predicates::is_native_error(self.engine())
+    }
+
+    pub fn is_reg_exp(&self) -> bool {
+        predicates::is_reg_exp(self.engine())
+    }
+
+    pub fn is_async_function(&self) -> bool {
+        predicates::is_async_function(self.engine())
+    }
+
+    pub fn is_generator_function(&self) -> bool {
+        predicates::is_generator_function(self.engine())
+    }
+
+    pub fn is_promise(&self) -> bool {
+        predicates::is_promise(self.engine())
+    }
+
+    pub fn is_map(&self) -> bool {
+        predicates::is_map(self.engine())
+    }
+
+    pub fn is_set(&self) -> bool {
+        predicates::is_set(self.engine())
+    }
+
+    pub fn is_map_iterator(&self) -> bool {
+        predicates::is_map_iterator(self.engine())
+    }
+
+    pub fn is_set_iterator(&self) -> bool {
+        predicates::is_set_iterator(self.engine())
+    }
+
+    pub fn is_generator_object(&self) -> bool {
+        predicates::is_generator_object(self.engine())
+    }
+
+    pub fn is_weak_map(&self) -> bool {
+        predicates::is_weak_map(self.engine())
+    }
+
+    pub fn is_weak_set(&self) -> bool {
+        predicates::is_weak_set(self.engine())
+    }
+
+    pub fn is_array_buffer(&self) -> bool {
+        predicates::is_array_buffer(self.engine())
+    }
+
+    pub fn is_array_buffer_view(&self) -> bool {
+        predicates::is_array_buffer_view(self.engine())
+    }
+
+    pub fn is_typed_array(&self) -> bool {
+        predicates::is_typed_array(self.engine())
+    }
+
+    pub fn is_data_view(&self) -> bool {
+        predicates::is_data_view(self.engine())
+    }
+
+    pub fn is_shared_array_buffer(&self) -> bool {
+        predicates::is_shared_array_buffer(self.engine())
+    }
+
+    pub fn is_proxy(&self) -> bool {
+        predicates::is_proxy(self.engine())
+    }
+
+    pub fn is_module_namespace_object(&self) -> bool {
+        predicates::is_module_namespace_object(self.engine())
     }
 
     pub fn is_constructor(&self) -> bool {
@@ -74,9 +199,95 @@ impl<'s> Local<'s, Value> {
         self.strict_equals(other)
     }
 
+    /// A name for the type of this value, for error messages: the chain the
+    /// crate we stand in for uses, without the two wasm brands, which the
+    /// engine's tables only carry when it is built with wasm.
+    pub fn type_repr(&self) -> &'static str {
+        let value = self.engine();
+        if predicates::is_module_namespace_object(value) {
+            "Module"
+        } else if predicates::is_proxy(value) {
+            "Proxy"
+        } else if predicates::is_shared_array_buffer(value) {
+            "SharedArrayBuffer"
+        } else if predicates::is_data_view(value) {
+            "DataView"
+        } else if predicates::is_big_uint64_array(value) {
+            "BigUint64Array"
+        } else if predicates::is_big_int64_array(value) {
+            "BigInt64Array"
+        } else if predicates::is_float64_array(value) {
+            "Float64Array"
+        } else if predicates::is_float32_array(value) {
+            "Float32Array"
+        } else if predicates::is_int32_array(value) {
+            "Int32Array"
+        } else if predicates::is_uint32_array(value) {
+            "Uint32Array"
+        } else if predicates::is_int16_array(value) {
+            "Int16Array"
+        } else if predicates::is_uint16_array(value) {
+            "Uint16Array"
+        } else if predicates::is_int8_array(value) {
+            "Int8Array"
+        } else if predicates::is_uint8_clamped_array(value) {
+            "Uint8ClampedArray"
+        } else if predicates::is_uint8_array(value) {
+            "Uint8Array"
+        } else if predicates::is_typed_array(value) {
+            "TypedArray"
+        } else if predicates::is_array_buffer_view(value) {
+            "ArrayBufferView"
+        } else if predicates::is_array_buffer(value) {
+            "ArrayBuffer"
+        } else if predicates::is_weak_set(value) {
+            "WeakSet"
+        } else if predicates::is_weak_map(value) {
+            "WeakMap"
+        } else if predicates::is_set_iterator(value) {
+            "Set Iterator"
+        } else if predicates::is_map_iterator(value) {
+            "Map Iterator"
+        } else if predicates::is_set(value) {
+            "Set"
+        } else if predicates::is_map(value) {
+            "Map"
+        } else if predicates::is_promise(value) {
+            "Promise"
+        } else if predicates::is_generator_function(value) {
+            "Generator function"
+        } else if predicates::is_async_function(value) {
+            "Async function"
+        } else if predicates::is_reg_exp(value) {
+            "RegExp"
+        } else if predicates::is_date(value) {
+            "Date"
+        } else if predicates::is_number(value) {
+            "Number"
+        } else if predicates::is_boolean(value) {
+            "Boolean"
+        } else if predicates::is_big_int(value) {
+            "bigint"
+        } else if predicates::is_array(value) {
+            "array"
+        } else if predicates::is_function(value) {
+            "function"
+        } else if predicates::is_symbol(value) {
+            "symbol"
+        } else if predicates::is_string(value) {
+            "string"
+        } else if value.is_null() {
+            "null"
+        } else if value.is_undefined() {
+            "undefined"
+        } else {
+            "unknown"
+        }
+    }
+
     /// ToString (spec 7.1.17). A failing conversion leaves a pending exception.
     pub fn to_string<'a>(&self, scope: &PinScope<'a, '_>) -> Option<Local<'a, String>> {
-        let value = self.engine().clone();
+        let value = *self.engine();
         let realm = crate::realm_of(scope);
         match realm.with_agent(|agent| runtime::context::to_string(agent, value.value())) {
             Ok(text) => Some(Local::from_engine(api::Local::from(

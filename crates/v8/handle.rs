@@ -12,21 +12,33 @@ use crate::scope::PinScope;
 ///
 /// The `T` in `Local<'s, T>` is a zero-sized tag whose only job is to select
 /// methods and impls, so the payload cannot live in the tag — it lives here,
-/// and `T` decides how it is read. There are two variants because the engine
-/// has two kinds of thing a handle can name: a language value, and the realm a
-/// `Local<Context>` names.
+/// and `T` decides how it is read. The engine has four kinds of thing a handle
+/// can name: a language value, the realm a `Local<Context>` names, the module
+/// record a `Local<Module>` names, and the compiled script a `Local<Script>`
+/// names.
+///
+/// Every variant is `Copy`, which is what lets [`Local`] be: a value, a context
+/// and a module are plain data, and a script is a reference into the table its
+/// text lives in ([`crate::store`]).
 ///
 /// This is public only because [`Handle`] is; nothing outside the crate should
 /// name it.
 #[doc(hidden)]
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum Payload {
     Value(api::Local),
-    Context(Rc<api::Context>),
+    Context(api::Context),
+    /// A module record. The record is not a language value, so it has no
+    /// encoded form a `Value` payload could hold; a handle names the box
+    /// directly, and a persistent one has to pin it.
+    Module(api::Module),
     /// A compiled script, held as its source. The engine parses at compile time
     /// and evaluates at run time, so there is no compiled-script object to
-    /// point at.
-    Script(Rc<str>),
+    /// point at — only text, in this thread's script table.
+    Script {
+        slot: usize,
+        generation: u32,
+    },
 }
 
 impl Payload {
@@ -41,21 +53,33 @@ impl Payload {
     pub(crate) fn as_value_opt(&self) -> Option<&api::Local> {
         match self {
             Self::Value(value) => Some(value),
-            Self::Context(_) | Self::Script(_) => None,
+            Self::Context(_) | Self::Module(_) | Self::Script { .. } => None,
         }
     }
 
-    pub(crate) fn as_context(&self) -> &Rc<api::Context> {
+    pub(crate) fn as_context(&self) -> api::Context {
         match self {
-            Self::Context(context) => context,
+            Self::Context(context) => *context,
             _ => panic!("bridge bug: a non-Context handle read as a Context"),
         }
     }
 
-    pub(crate) fn as_script(&self) -> &Rc<str> {
+    pub(crate) fn as_module(&self) -> api::Module {
         match self {
-            Self::Script(source) => source,
-            _ => panic!("bridge bug: a non-Script handle read as a Script"),
+            Self::Module(module) => *module,
+            _ => panic!("bridge bug: a non-Module handle read as a Module"),
+        }
+    }
+
+    /// The text behind a `Script` payload, for a persistent handle that has to
+    /// own it: a scoped reference dies with its scope.
+    pub(crate) fn as_script_source(&self) -> Option<Rc<str>> {
+        match self {
+            Self::Script { slot, generation } => Some(
+                crate::store::source(*slot, *generation)
+                    .expect("bridge bug: a Script handle outlived its handle scope"),
+            ),
+            _ => None,
         }
     }
 }
@@ -65,7 +89,10 @@ impl fmt::Debug for Payload {
         match self {
             Self::Value(value) => write!(f, "Payload::Value({value:?})"),
             Self::Context(_) => f.write_str("Payload::Context(..)"),
-            Self::Script(source) => write!(f, "Payload::Script({source:?})"),
+            Self::Module(_) => f.write_str("Payload::Module(..)"),
+            Self::Script { slot, generation } => {
+                write!(f, "Payload::Script({slot}, {generation})")
+            }
         }
     }
 }
@@ -81,6 +108,9 @@ type Tag<'s, T> = PhantomData<(&'s (), fn() -> T)>;
 /// The tag `T` decides which methods are in scope: method availability comes
 /// from the `Deref` chain in [`data`](crate::data), which stands in for the C++
 /// inheritance the crate we stand in for relies on.
+///
+/// A handle is `Copy`, as it is in the crate we stand in for: its payload is a
+/// value or a context, both plain data, or a reference into the script table.
 pub struct Local<'s, T> {
     payload: Payload,
     marker: Tag<'s, T>,
@@ -101,6 +131,11 @@ impl<'s, T> Local<'s, T> {
         Self::from_payload(Payload::Value(value))
     }
 
+    /// Wrap an engine module record under the `Module` tag.
+    pub(crate) fn from_module(module: api::Module) -> Self {
+        Self::from_payload(Payload::Module(module))
+    }
+
     /// Construct a handle from an existing persistent handle (`v8::Local::New`).
     pub fn new<'i, H: Handle<Data = T>>(_scope: &PinScope<'s, 'i, ()>, handle: H) -> Local<'s, T> {
         Self::from_payload(handle.into_payload())
@@ -117,13 +152,22 @@ impl<'s, T> Local<'s, T> {
     }
 
     /// The realm behind a `Context` handle.
-    pub(crate) fn context(&self) -> &Rc<api::Context> {
+    pub(crate) fn context(&self) -> api::Context {
         self.payload.as_context()
     }
 
+    /// The record behind a `Module` handle.
+    pub(crate) fn module(&self) -> api::Module {
+        self.payload.as_module()
+    }
+
     /// The source behind a `Script` handle.
-    pub(crate) fn script_source(&self) -> &Rc<str> {
-        self.payload.as_script()
+    pub(crate) fn script_source(&self) -> Rc<str> {
+        match self.payload {
+            Payload::Script { slot, generation } => crate::store::source(slot, generation)
+                .expect("bridge bug: a Script handle outlived its handle scope"),
+            _ => panic!("bridge bug: a non-Script handle read as a Script"),
+        }
     }
 
     /// Retag the handle.
@@ -133,6 +177,22 @@ impl<'s, T> Local<'s, T> {
     pub(crate) fn cast<U>(self) -> Local<'s, U> {
         let Self { payload, .. } = self;
         Local::from_payload(payload)
+    }
+
+    /// Widen the handle's lifetime (v8::Local::extend_lifetime_unchecked).
+    ///
+    /// # Safety
+    ///
+    /// A handle is plain data, so nothing here can enforce that what it names
+    /// outlives `'o`: the caller must know it does — which is what a host
+    /// holding a persistent handle and a scope at once does know.
+    #[inline(always)]
+    pub unsafe fn extend_lifetime_unchecked<'o, O>(self) -> O
+    where
+        O: ExtendLifetime<'s, T, Input = Self>,
+    {
+        // SAFETY: the caller's contract.
+        unsafe { O::extend_lifetime_unchecked_from(self) }
     }
 
     /// The same handle under another tag, by reference.
@@ -159,9 +219,11 @@ impl<'s, T> Local<'s, T> {
 
 impl<T> Clone for Local<'_, T> {
     fn clone(&self) -> Self {
-        Self::from_payload(self.payload.clone())
+        *self
     }
 }
+
+impl<T> Copy for Local<'_, T> {}
 
 impl<T> fmt::Debug for Local<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -169,13 +231,60 @@ impl<T> fmt::Debug for Local<'_, T> {
     }
 }
 
+mod extend_sealed {
+    pub trait Sealed {}
+}
+
+/// What a handle can be widened into
+/// (v8's `ExtendLifetime`).
+///
+/// The output lifetime is a type parameter rather than a lifetime parameter
+/// because a lifetime here would be late-bound, and a caller that knows which
+/// lifetime it wants has to be able to say so — the same reason the crate we
+/// stand in for gives.
+pub trait ExtendLifetime<'s, T>: extend_sealed::Sealed {
+    type Input;
+
+    /// # Safety
+    ///
+    /// The caller must keep whatever the handle names alive for as long as the
+    /// returned handle's lifetime claims.
+    unsafe fn extend_lifetime_unchecked_from(value: Self::Input) -> Self;
+}
+
+impl<T> extend_sealed::Sealed for Local<'_, T> {}
+
+impl<'o, 's, T> ExtendLifetime<'s, T> for Local<'o, T> {
+    type Input = Local<'s, T>;
+
+    unsafe fn extend_lifetime_unchecked_from(value: Local<'s, T>) -> Self {
+        // The lifetime is a type-level marker over a payload that is already
+        // plain data, so widening it rebuilds the handle and nothing else.
+        Local::from_payload(value.payload)
+    }
+}
+
 impl<T> PartialEq for Local<'_, T> {
     fn eq(&self, other: &Self) -> bool {
         match (&self.payload, &other.payload) {
             (Payload::Value(a), Payload::Value(b)) => a == b,
-            // One context per isolate: equal payloads are equal realms.
-            (Payload::Context(a), Payload::Context(b)) => Rc::ptr_eq(a, b),
-            (Payload::Script(a), Payload::Script(b)) => a == b,
+            // A copy of the same context names the same realm on the same
+            // isolate; its global object identifies it, since the realm table
+            // is private to the engine.
+            (Payload::Context(a), Payload::Context(b)) => {
+                a.isolate() == b.isolate() && a.global() == b.global()
+            }
+            (Payload::Module(a), Payload::Module(b)) => a == b,
+            (
+                Payload::Script {
+                    slot: a,
+                    generation: ag,
+                },
+                Payload::Script {
+                    slot: b,
+                    generation: bg,
+                },
+            ) => a == b && ag == bg,
             _ => false,
         }
     }
@@ -194,7 +303,7 @@ impl<'s, T> MaybeLocal<'s, T> {
     }
 
     pub fn to_local(&self) -> Option<Local<'s, T>> {
-        self.0.clone()
+        self.0
     }
 
     /// The handle, panicking when the operation failed — the crate we stand in
@@ -211,9 +320,11 @@ impl<'s, T> MaybeLocal<'s, T> {
 
 impl<'s, T> Clone for MaybeLocal<'s, T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        *self
     }
 }
+
+impl<T> Copy for MaybeLocal<'_, T> {}
 
 impl<'s, T> From<Local<'s, T>> for MaybeLocal<'s, T> {
     fn from(local: Local<'s, T>) -> Self {
@@ -246,6 +357,12 @@ pub struct Global<T> {
     /// Held only for its `Drop`; releasing the pin is the whole of its API.
     #[allow(dead_code)]
     pin: Option<crux::heap::Pin>,
+    /// A script's text, owned.
+    ///
+    /// A scoped reference dies with the region its handle scope opened, so a
+    /// handle that outlives that scope has to keep the text itself and hand it
+    /// back to the scope it is read in. `None` for every other payload.
+    script: Option<Rc<str>>,
     marker: PhantomData<fn() -> T>,
 }
 
@@ -256,12 +373,17 @@ impl<T> Global<T> {
     }
 
     fn from_payload(payload: Payload) -> Self {
-        let pin = payload
-            .as_value_opt()
-            .map(|value| crux::heap::pin(*value.value()));
+        // A script's source is owned; a module's box is pinned instead.
+        let pin = match &payload {
+            Payload::Value(value) => Some(crux::heap::pin(*value.value())),
+            Payload::Module(module) => Some(module.pin()),
+            Payload::Context(_) | Payload::Script { .. } => None,
+        };
+        let script = payload.as_script_source();
         Self {
             payload,
             pin,
+            script,
             marker: PhantomData,
         }
     }
@@ -274,13 +396,28 @@ impl<T> Global<T> {
     pub fn is_empty(&self) -> bool {
         match &self.payload {
             Payload::Value(value) => value.is_undefined(),
-            Payload::Context(_) | Payload::Script(_) => false,
+            Payload::Context(_) | Payload::Module(_) | Payload::Script { .. } => false,
         }
     }
 
     /// The scoped handle for this persistent one.
     pub fn get<'s>(&self, _scope: &PinScope<'s, '_, ()>) -> Local<'s, T> {
-        Local::from_payload(self.payload.clone())
+        match &self.script {
+            Some(source) => {
+                let (slot, generation) = crate::store::store(source.clone());
+                Local::from_payload(Payload::Script { slot, generation })
+            }
+            None => Local::from_payload(self.payload),
+        }
+    }
+
+    /// The handle this persistent one holds, with no scope to pass.
+    ///
+    /// [`get`](Self::get) takes a scope because the crate we stand in for needs
+    /// one to rebuild a handle; the bridge's handles are already scope-free, so
+    /// this is for the isolate's own storage, which has no scope in hand.
+    pub(crate) fn handle(&self) -> Local<'_, T> {
+        Local::from_payload(self.payload)
     }
 
     pub fn reset(&mut self) {
@@ -290,7 +427,16 @@ impl<T> Global<T> {
 
 impl<T> Clone for Global<T> {
     fn clone(&self) -> Self {
-        Self::from_payload(self.payload.clone())
+        Self {
+            payload: self.payload,
+            pin: match &self.payload {
+                Payload::Value(value) => Some(crux::heap::pin(*value.value())),
+                Payload::Module(module) => Some(module.pin()),
+                Payload::Context(_) | Payload::Script { .. } => None,
+            },
+            script: self.script.clone(),
+            marker: PhantomData,
+        }
     }
 }
 
@@ -329,7 +475,7 @@ impl<T> Handle for &Local<'_, T> {
     type Data = T;
 
     fn into_payload(self) -> Payload {
-        self.payload.clone()
+        self.payload
     }
 }
 
@@ -345,6 +491,6 @@ impl<T> Handle for &Global<T> {
     type Data = T;
 
     fn into_payload(self) -> Payload {
-        self.payload.clone()
+        self.payload
     }
 }

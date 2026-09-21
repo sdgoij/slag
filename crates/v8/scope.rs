@@ -16,14 +16,13 @@
 use std::marker::{PhantomData, PhantomPinned};
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
-use std::ptr::NonNull;
-use std::rc::Rc;
 
 use runtime::api;
 
 use crate::Isolate;
-use crate::data::Context;
+use crate::data::{Context, Data, DataError, Value};
 use crate::handle::Local;
+use crate::store;
 
 /// A scope pinned to its storage: `PinnedRef<'s, HandleScope<'i, C>>` is what a
 /// host's `scope` binding is.
@@ -98,21 +97,28 @@ impl<'p, T> PinnedRef<'p, T> {
 /// as the crate we stand in for does.
 #[repr(C)]
 pub struct HandleScope<'i, C = Context> {
-    isolate: NonNull<Isolate>,
+    isolate: Isolate,
     /// The realm this scope operates on. Empty for `C = ()`.
-    context: Option<Rc<api::Context>>,
+    context: Option<api::Context>,
     marker: PhantomData<&'i mut C>,
     _pinned: PhantomPinned,
 }
 
 impl<'i, C> HandleScope<'i, C> {
-    fn new_in(isolate: NonNull<Isolate>, context: Option<Rc<api::Context>>) -> Self {
+    fn new_in(isolate: Isolate, context: Option<api::Context>) -> Self {
+        store::open_region();
         Self {
             isolate,
             context,
             marker: PhantomData,
             _pinned: PhantomPinned,
         }
+    }
+}
+
+impl<C> Drop for HandleScope<'_, C> {
+    fn drop(&mut self) {
+        store::close_region();
     }
 }
 
@@ -134,7 +140,7 @@ impl<'s> NewHandleScope<'s> for Isolate {
 
     fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
         let context = me.current_context();
-        HandleScope::new_in(NonNull::from(me), context)
+        HandleScope::new_in(*me, context)
     }
 }
 
@@ -143,7 +149,7 @@ impl<'s> NewHandleScope<'s> for crate::OwnedIsolate {
 
     fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
         let context = me.current_context();
-        HandleScope::new_in(NonNull::from(&mut **me), context)
+        HandleScope::new_in(**me, context)
     }
 }
 
@@ -151,7 +157,7 @@ impl<'s, 'p: 's, C> NewHandleScope<'s> for PinnedRef<'_, HandleScope<'p, C>> {
     type NewScope = HandleScope<'s, C>;
 
     fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
-        HandleScope::new_in(me.0.isolate, me.0.context.clone())
+        HandleScope::new_in(me.0.isolate, me.0.context)
     }
 }
 
@@ -163,23 +169,87 @@ impl<'s> HandleScope<'s> {
 }
 
 impl<'p, 'i, C> PinnedRef<'p, HandleScope<'i, C>> {
-    pub(crate) fn isolate_ptr(&self) -> NonNull<Isolate> {
+    pub(crate) fn isolate_ptr(&self) -> Isolate {
         self.0.isolate
     }
 }
 
 impl<'p, 'i> PinnedRef<'p, HandleScope<'i, Context>> {
     /// The realm this scope operates on.
-    pub(crate) fn realm(&self) -> &Rc<api::Context> {
+    pub(crate) fn realm(&self) -> api::Context {
         self.0
             .context
-            .as_ref()
             .expect("bridge bug: handle scope without an entered context")
     }
 
     /// `v8::HandleScope::GetCurrentContext`.
     pub fn get_current_context(&self) -> Local<'p, Context> {
-        Local::from_payload(crate::handle::Payload::Context(self.realm().clone()))
+        Local::from_payload(crate::handle::Payload::Context(self.realm()))
+    }
+}
+
+impl<'p, 'i, C> PinnedRef<'p, HandleScope<'i, C>> {
+    /// The data a snapshot carried for the isolate at `index`
+    /// (v8::HandleScope::GetIsolateDataFromSnapshotOnce).
+    ///
+    /// Always [`DataError::NoData`], and truthfully so: there is no snapshot to
+    /// read from, because Slag has no snapshot format (see
+    /// [`StartupData`](crate::StartupData)). The crate we stand in for answers
+    /// this for the *second* read of an index; here it is every read, which is
+    /// the same statement about a snapshot that was never made.
+    pub fn get_isolate_data_from_snapshot_once<T>(
+        &self,
+        index: usize,
+    ) -> Result<Local<'p, T>, DataError>
+    where
+        T: 'static,
+        for<'l> <Local<'l, Data> as TryInto<Local<'l, T>>>::Error: get_data_sealed::ToDataError,
+        for<'l> Local<'l, Data>: TryInto<Local<'l, T>>,
+    {
+        let _ = index;
+        Err(DataError::no_data::<T>())
+    }
+
+    /// The data a snapshot carried for the context at `index`
+    /// (v8::HandleScope::GetContextDataFromSnapshotOnce).
+    ///
+    /// Always [`DataError::NoData`], for the same reason as
+    /// [`get_isolate_data_from_snapshot_once`](Self::get_isolate_data_from_snapshot_once).
+    pub fn get_context_data_from_snapshot_once<T>(
+        &self,
+        index: usize,
+    ) -> Result<Local<'p, T>, DataError>
+    where
+        T: 'static,
+        for<'l> <Local<'l, Data> as TryInto<Local<'l, T>>>::Error: get_data_sealed::ToDataError,
+        for<'l> Local<'l, Data>: TryInto<Local<'l, T>>,
+    {
+        let _ = index;
+        Err(DataError::no_data::<T>())
+    }
+}
+
+/// Seals what a failed cast can be converted into, so the bounds above name a
+/// trait no host can implement — the same seal the crate we stand in for
+/// carries, for the same reason.
+mod get_data_sealed {
+    use crate::DataError;
+    use std::convert::Infallible;
+
+    pub trait ToDataError {
+        fn to_data_error(self) -> DataError;
+    }
+
+    impl ToDataError for DataError {
+        fn to_data_error(self) -> DataError {
+            self
+        }
+    }
+
+    impl ToDataError for Infallible {
+        fn to_data_error(self) -> DataError {
+            unreachable!("an infallible cast cannot fail")
+        }
     }
 }
 
@@ -188,9 +258,9 @@ impl<'p, 'i> PinnedRef<'p, HandleScope<'i, Context>> {
 // ---------------------------------------------------------------------------
 
 fn cast_pinned_ref<'a, 'p, I, O>(pinned: &'a PinnedRef<'p, I>) -> &'a PinnedRef<'p, O> {
-    // SAFETY: every scope type stores its fields in the same order and differs
-    // only in phantom type parameters, so the two `PinnedRef`s have the same
-    // layout.
+    // SAFETY: the scope types that cast into each other store the scope they
+    // wrap first and differ otherwise only in phantom type parameters, so the
+    // two `PinnedRef`s name the same address with the same contents.
     unsafe { &*(pinned as *const PinnedRef<'p, I> as *const PinnedRef<'p, O>) }
 }
 
@@ -217,17 +287,16 @@ impl Deref for PinnedRef<'_, HandleScope<'_, ()>> {
     type Target = Isolate;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: the scope holds a live pointer to an isolate it does not own;
-        // the isolate outlives every scope made from it.
-        unsafe { self.0.isolate.as_ref() }
+        &self.0.isolate
     }
 }
 
 impl DerefMut for PinnedRef<'_, HandleScope<'_, ()>> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: as above. Scopes are stack-nested, so at most one is live.
-        let mut isolate = self.0.isolate;
-        unsafe { isolate.as_mut() }
+        // SAFETY: the isolate handle is not structurally pinned — it is a
+        // copyable pointer — so projecting it out of the pinned scope is fine.
+        let scope = unsafe { self.0.as_mut().get_unchecked_mut() };
+        &mut scope.isolate
     }
 }
 
@@ -272,7 +341,7 @@ pub struct ContextScope<'borrow, 'scope, P: ScopeInit> {
     scope: &'borrow mut PinnedRef<'scope, P>,
     /// What the thread's entered realm was before this scope, restored when it
     /// ends so nesting behaves like a stack.
-    previous: Option<Rc<api::Context>>,
+    previous: Option<api::Context>,
     _pinned: PhantomPinned,
 }
 
@@ -290,7 +359,7 @@ impl<'borrow, 'scope, 'i> ContextScope<'borrow, 'scope, HandleScope<'i, Context>
     where
         'scope: 'borrow,
     {
-        let realm = context.context().clone();
+        let realm = context.context();
         // SAFETY: `C` appears only in `PhantomData`, so the two `PinnedRef`s
         // have the same layout; the scope is re-read as context-bearing below.
         let scope: &'borrow mut PinnedRef<'scope, HandleScope<'i, Context>> =
@@ -298,10 +367,10 @@ impl<'borrow, 'scope, 'i> ContextScope<'borrow, 'scope, HandleScope<'i, Context>
         // SAFETY: the projection only writes a field in place — nothing is
         // moved, so the scope stays pinned where its storage put it.
         let inner = unsafe { scope.0.as_mut().get_unchecked_mut() };
-        inner.context = Some(realm.clone());
+        inner.context = Some(realm);
         // SAFETY: the scope holds a live pointer to the isolate it was made
         // from, which outlives the scope.
-        unsafe { inner.isolate.as_ref() }.set_current_context(inner.context.clone());
+        inner.isolate.set_current_context(inner.context);
         let previous = crate::realm::enter(realm);
         ScopeStorage::new(Self {
             scope,
@@ -344,22 +413,550 @@ pub struct CallbackScope<'i, C = Context> {
     inner: HandleScope<'i, C>,
 }
 
+impl<'s> CallbackScope<'s> {
+    /// Open a callback scope (v8::CallbackScope::new).
+    ///
+    /// # Safety
+    ///
+    /// The crate we stand in for marks this unsafe because the scope it opens
+    /// lives in the callback's stack frame. Slag's scopes keep no such frame
+    /// state, so the signature is reproduced for the shapes, not for a hazard.
+    #[allow(clippy::new_ret_no_self)]
+    pub unsafe fn new<P: NewCallbackScope<'s>>(param: P) -> ScopeStorage<P::NewScope> {
+        ScopeStorage::new(P::make_new_scope(param))
+    }
+}
+
 impl<'i, C> ScopeInit for CallbackScope<'i, C> {
     fn init_stack(me: Pin<&mut Self>) -> Pin<&mut Self> {
         me
     }
 }
 
-impl<'p, 'i> Deref for PinnedRef<'p, CallbackScope<'i, Context>> {
-    type Target = PinnedRef<'p, HandleScope<'i, Context>>;
+impl<'p, 'i, C> Deref for PinnedRef<'p, CallbackScope<'i, C>> {
+    type Target = PinnedRef<'p, HandleScope<'i, C>>;
 
     fn deref(&self) -> &Self::Target {
         cast_pinned_ref(self)
     }
 }
 
-impl<'p, 'i> DerefMut for PinnedRef<'p, CallbackScope<'i, Context>> {
+impl<'p, 'i, C> DerefMut for PinnedRef<'p, CallbackScope<'i, C>> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         cast_pinned_ref_mut(self)
+    }
+}
+
+/// The isolate behind anything a scope can be opened from.
+///
+/// The crate we stand in for names this trait and uses it as the bound that
+/// lets a scope be opened from a context, a callback's info or an isolate. It
+/// answers with the handle, which is a pointer, so the name matches there.
+pub trait GetIsolate {
+    fn get_isolate_ptr(&self) -> Isolate;
+}
+
+// The engine isolate is the first field of `IsolateInner`, so an engine pointer
+// and the handle that wraps it are the same address. That is what lets a
+// `Local<Context>` — which carries an engine context, not a bridge isolate —
+// answer this trait at all.
+const _: () = assert!(std::mem::offset_of!(crate::isolate::IsolateInner, engine) == 0);
+
+fn bridge_isolate(engine: *mut api::Isolate) -> Isolate {
+    // SAFETY: the engine isolate lives inside the inner, which is where the
+    // handle points; see the assertion above.
+    unsafe { Isolate::from_inner_ptr(engine.cast()) }
+}
+
+impl GetIsolate for Isolate {
+    fn get_isolate_ptr(&self) -> Isolate {
+        *self
+    }
+}
+
+impl GetIsolate for crate::OwnedIsolate {
+    fn get_isolate_ptr(&self) -> Isolate {
+        (**self).get_isolate_ptr()
+    }
+}
+
+impl<T: GetIsolate + ?Sized> GetIsolate for &T {
+    fn get_isolate_ptr(&self) -> Isolate {
+        (**self).get_isolate_ptr()
+    }
+}
+
+impl<T: GetIsolate + ?Sized> GetIsolate for &mut T {
+    fn get_isolate_ptr(&self) -> Isolate {
+        (**self).get_isolate_ptr()
+    }
+}
+
+impl<T: GetIsolate> GetIsolate for PinnedRef<'_, T> {
+    fn get_isolate_ptr(&self) -> Isolate {
+        self.0.as_ref().get_isolate_ptr()
+    }
+}
+
+impl<C> GetIsolate for HandleScope<'_, C> {
+    fn get_isolate_ptr(&self) -> Isolate {
+        self.isolate
+    }
+}
+
+impl<C> GetIsolate for CallbackScope<'_, C> {
+    fn get_isolate_ptr(&self) -> Isolate {
+        self.inner.isolate
+    }
+}
+
+impl<P: GetIsolate + ScopeInit> GetIsolate for ContextScope<'_, '_, P> {
+    fn get_isolate_ptr(&self) -> Isolate {
+        self.scope.get_isolate_ptr()
+    }
+}
+
+impl<C> GetIsolate for EscapableHandleScope<'_, '_, C> {
+    fn get_isolate_ptr(&self) -> Isolate {
+        self.inner.isolate
+    }
+}
+
+impl<P: GetIsolate> GetIsolate for TryCatch<'_, '_, P> {
+    fn get_isolate_ptr(&self) -> Isolate {
+        self.scope.get_isolate_ptr()
+    }
+}
+
+impl GetIsolate for Local<'_, Context> {
+    fn get_isolate_ptr(&self) -> Isolate {
+        bridge_isolate(self.context().isolate())
+    }
+}
+
+impl GetIsolate for crate::fast_api::FastApiCallbackOptions<'_> {
+    fn get_isolate_ptr(&self) -> Isolate {
+        self.isolate
+    }
+}
+
+impl GetIsolate for crate::function::FunctionCallbackInfo {
+    fn get_isolate_ptr(&self) -> Isolate {
+        self.isolate()
+    }
+}
+
+/// A scope a callback scope can be opened from (v8::CallbackScope::new).
+pub trait NewCallbackScope<'s>: Sized + GetIsolate {
+    type NewScope: ScopeInit;
+
+    fn make_new_scope(me: Self) -> Self::NewScope;
+}
+
+fn callback_scope_from<'s, C>(
+    isolate: Isolate,
+    context: Option<api::Context>,
+) -> CallbackScope<'s, C> {
+    CallbackScope {
+        inner: HandleScope::new_in(isolate, context),
+    }
+}
+
+impl<'s> NewCallbackScope<'s> for &'s mut Isolate {
+    type NewScope = CallbackScope<'s, ()>;
+
+    fn make_new_scope(me: Self) -> Self::NewScope {
+        callback_scope_from(me.get_isolate_ptr(), None)
+    }
+}
+
+impl<'s> NewCallbackScope<'s> for &'s mut crate::OwnedIsolate {
+    type NewScope = CallbackScope<'s, ()>;
+
+    fn make_new_scope(me: Self) -> Self::NewScope {
+        callback_scope_from(me.get_isolate_ptr(), None)
+    }
+}
+
+impl<'s> NewCallbackScope<'s> for Local<'s, Context> {
+    type NewScope = CallbackScope<'s>;
+
+    fn make_new_scope(me: Self) -> Self::NewScope {
+        callback_scope_from(me.get_isolate_ptr(), Some(me.context()))
+    }
+}
+
+impl<'s> NewCallbackScope<'s> for &'s crate::fast_api::FastApiCallbackOptions<'s> {
+    type NewScope = CallbackScope<'s>;
+
+    fn make_new_scope(me: Self) -> Self::NewScope {
+        // A fast call has no context of its own, so the scope takes the one
+        // entered on this thread — which is the realm its op was called from.
+        callback_scope_from(me.get_isolate_ptr(), crate::realm::current())
+    }
+}
+
+impl<'s> NewCallbackScope<'s> for &'s crate::function::FunctionCallbackInfo {
+    type NewScope = CallbackScope<'s>;
+
+    fn make_new_scope(me: Self) -> Self::NewScope {
+        // The call's realm is the one entered on this thread: the engine made
+        // it current before it called in.
+        callback_scope_from(me.get_isolate_ptr(), crate::realm::current())
+    }
+}
+
+/// A scope a `TryCatch` can be opened from (v8::TryCatch::new).
+pub trait NewTryCatch<'scope>: GetIsolate {
+    type NewScope: ScopeInit;
+
+    fn make_new_scope(me: &'scope mut Self) -> Self::NewScope;
+}
+
+impl<'scope, 'obj: 'scope, 'i, C> NewTryCatch<'scope> for PinnedRef<'obj, HandleScope<'i, C>> {
+    type NewScope = TryCatch<'scope, 'obj, HandleScope<'i, C>>;
+
+    fn make_new_scope(me: &'scope mut Self) -> Self::NewScope {
+        TryCatch {
+            scope: me,
+            catch: None,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
+/// An external exception handler (v8::TryCatch).
+///
+/// Slag keeps one pending exception on its isolate, so this scope observes that
+/// slot rather than opening a region of its own: opening it takes aside
+/// whatever was already pending, and closing it swallows what it caught. The
+/// engine's [`api::TryCatch`] holds that state; what is added here is the scope
+/// chain a host dereferences through.
+#[repr(C)]
+pub struct TryCatch<'scope, 'obj, P> {
+    scope: &'scope mut PinnedRef<'obj, P>,
+    catch: Option<api::TryCatch>,
+    _pinned: PhantomPinned,
+}
+
+impl<'scope, P: NewTryCatch<'scope>> TryCatch<'scope, '_, P> {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(param: &'scope mut P) -> ScopeStorage<P::NewScope> {
+        ScopeStorage::new(P::make_new_scope(param))
+    }
+}
+
+impl<P: GetIsolate> ScopeInit for TryCatch<'_, '_, P> {
+    fn init_stack(me: Pin<&mut Self>) -> Pin<&mut Self> {
+        // SAFETY: the projection writes a field in place — nothing moves, so
+        // the scope stays pinned where its storage put it — and it runs once,
+        // before anything can have borrowed the scope.
+        let me = unsafe { me.get_unchecked_mut() };
+        let mut isolate = me.scope.get_isolate_ptr();
+        me.catch = Some(api::TryCatch::new(isolate.engine_mut()));
+        // SAFETY: as above.
+        unsafe { Pin::new_unchecked(me) }
+    }
+}
+
+impl<'p, 'obj, P> PinnedRef<'p, TryCatch<'_, 'obj, P>> {
+    /// Whether an exception was caught (v8::TryCatch::HasCaught).
+    pub fn has_caught(&self) -> bool {
+        self.catch().has_caught()
+    }
+
+    /// Whether the caught exception is an execution termination
+    /// (v8::TryCatch::HasTerminated).
+    ///
+    /// Slag cannot terminate an execution, so nothing can have terminated one
+    /// and this answers `false`.
+    pub fn has_terminated(&self) -> bool {
+        false
+    }
+
+    /// The caught exception (v8::TryCatch::Exception).
+    pub fn exception(&self) -> Option<Local<'obj, Value>> {
+        self.catch().exception().map(Local::from_engine)
+    }
+
+    /// Clear the caught exception (v8::TryCatch::Reset).
+    pub fn reset(&mut self) {
+        self.catch_mut().reset();
+    }
+
+    fn catch(&self) -> &api::TryCatch {
+        self.0
+            .catch
+            .as_ref()
+            .expect("bridge bug: a TryCatch scope read before its storage was initialized")
+    }
+
+    fn catch_mut(&mut self) -> &mut api::TryCatch {
+        // SAFETY: the field is borrowed in place; nothing moves.
+        unsafe { self.0.as_mut().get_unchecked_mut() }
+            .catch
+            .as_mut()
+            .expect("bridge bug: a TryCatch scope read before its storage was initialized")
+    }
+}
+
+impl<'p, 'obj, P> Deref for PinnedRef<'p, TryCatch<'_, 'obj, P>> {
+    type Target = PinnedRef<'obj, P>;
+
+    fn deref(&self) -> &Self::Target {
+        // The try-catch was opened from this scope, so a borrow of the
+        // try-catch is a borrow of it.
+        &*self.0.scope
+    }
+}
+
+impl<'p, 'obj, P> DerefMut for PinnedRef<'p, TryCatch<'_, 'obj, P>> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: the projection reaches the scope the try-catch was opened
+        // from, borrowed mutably for as long as the try-catch exists; nothing
+        // is moved.
+        let try_catch = unsafe { self.0.as_mut().get_unchecked_mut() };
+        &mut *try_catch.scope
+    }
+}
+
+/// A scope an escapable handle scope can be opened from.
+pub trait NewEscapableHandleScope<'s> {
+    type NewScope: ScopeInit;
+
+    fn make_new_scope(me: &'s mut Self) -> Self::NewScope;
+}
+
+/// A handle scope one handle can escape from (v8::EscapableHandleScope).
+///
+/// Nothing has to be promoted here: a [`Local`] is a value that outlives the
+/// scope that made it, so [/escape](PinnedRef::escape) only widens a lifetime
+/// and this scope exists so host code that escapes a handle compiles.
+#[repr(C)]
+pub struct EscapableHandleScope<'s, 'esc, C = Context> {
+    inner: HandleScope<'s, C>,
+    marker: PhantomData<&'esc mut C>,
+    _pinned: PhantomPinned,
+}
+
+impl<'s, 'esc, C> EscapableHandleScope<'s, 'esc, C> {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new<P: NewEscapableHandleScope<'s>>(scope: &'s mut P) -> ScopeStorage<P::NewScope> {
+        ScopeStorage::new(P::make_new_scope(scope))
+    }
+}
+
+impl<C> ScopeInit for EscapableHandleScope<'_, '_, C> {
+    fn init_stack(me: Pin<&mut Self>) -> Pin<&mut Self> {
+        me
+    }
+}
+
+impl<'s> NewEscapableHandleScope<'s> for Isolate {
+    type NewScope = EscapableHandleScope<'s, 's, ()>;
+
+    fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
+        let context = me.current_context();
+        EscapableHandleScope {
+            inner: HandleScope::new_in(*me, context),
+            marker: PhantomData,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
+impl<'s, 'obj: 's, 'i, C> NewEscapableHandleScope<'s> for PinnedRef<'obj, HandleScope<'i, C>> {
+    type NewScope = EscapableHandleScope<'s, 'obj, C>;
+
+    fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
+        EscapableHandleScope {
+            inner: HandleScope::new_in(me.0.isolate, me.0.context),
+            marker: PhantomData,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
+impl<'p, 's, 'esc, C> Deref for PinnedRef<'p, EscapableHandleScope<'s, 'esc, C>> {
+    type Target = PinnedRef<'p, HandleScope<'s, C>>;
+
+    fn deref(&self) -> &Self::Target {
+        cast_pinned_ref(self)
+    }
+}
+
+impl<'p, 's, 'esc, C> DerefMut for PinnedRef<'p, EscapableHandleScope<'s, 'esc, C>> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        cast_pinned_ref_mut(self)
+    }
+}
+
+impl<'p, 's, 'esc, C> PinnedRef<'p, EscapableHandleScope<'s, 'esc, C>> {
+    /// Promote a handle to the enclosing scope
+    /// (v8::EscapableHandleScope::Escape).
+    pub fn escape<T>(&mut self, value: Local<'_, T>) -> Local<'esc, T> {
+        Local::from_payload(*value.payload())
+    }
+}
+
+/// A scope inside which JavaScript may run
+/// (v8::AllowJavascriptExecutionScope).
+///
+/// The crate we stand in for pairs this with a *disallow* scope that stops
+/// scripts running while a host is inside native code, and this one is what
+/// re-permits them. The engine has no such gate — nothing in it refuses to run
+/// a script — so there is nothing to restore, and the scope exists so host code
+/// that brackets native work with it compiles and reads the same.
+pub struct AllowJavascriptExecutionScope<'s, 'obj, P> {
+    scope: &'s mut PinnedRef<'obj, P>,
+    _pinned: PhantomPinned,
+}
+
+impl<'s, P: NewAllowJavascriptExecutionScope<'s>> AllowJavascriptExecutionScope<'s, '_, P> {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(param: &'s mut P) -> ScopeStorage<P::NewScope> {
+        ScopeStorage::new(P::make_new_scope(param))
+    }
+}
+
+/// What a scope hands a [`AllowJavascriptExecutionScope`]: the crate we stand in
+/// for has the same trait, so a host's own scope types can be wrapped.
+pub trait NewAllowJavascriptExecutionScope<'s> {
+    type NewScope: ScopeInit;
+
+    fn make_new_scope(me: &'s mut Self) -> Self::NewScope;
+}
+
+impl<'s, 'obj: 's, P> NewAllowJavascriptExecutionScope<'s> for PinnedRef<'obj, P> {
+    type NewScope = AllowJavascriptExecutionScope<'s, 'obj, P>;
+
+    fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
+        AllowJavascriptExecutionScope {
+            scope: me,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
+impl<P> ScopeInit for AllowJavascriptExecutionScope<'_, '_, P> {
+    fn init_stack(me: Pin<&mut Self>) -> Pin<&mut Self> {
+        me
+    }
+}
+
+impl<'p, 's, 'obj, P> Deref for PinnedRef<'p, AllowJavascriptExecutionScope<'s, 'obj, P>> {
+    type Target = PinnedRef<'obj, P>;
+
+    fn deref(&self) -> &Self::Target {
+        // The wrapped scope is a reference field, so this is a reborrow rather
+        // than the layout cast the other scope derefs use.
+        self.0.scope
+    }
+}
+
+impl<'p, 's, 'obj, P> DerefMut for PinnedRef<'p, AllowJavascriptExecutionScope<'s, 'obj, P>> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: the wrapped scope is behind a reference, which is not
+        // structurally pinned, so projecting it out of the pinned scope is
+        // fine — the same reasoning as the isolate handle's projection.
+        let scope = unsafe { self.0.as_mut().get_unchecked_mut() };
+        scope.scope
+    }
+}
+
+/// Makes a `TryCatch` and binds `&mut PinnedRef<TryCatch<..>>` to the given
+/// name: `v8::tc_scope!(let scope, scope)`.
+#[macro_export]
+macro_rules! tc_scope {
+    ($scope:ident, $param:expr $(,)?) => {
+        let mut $scope = $crate::TryCatch::new($param);
+        let mut $scope = {
+            let scope_pinned = unsafe { ::std::pin::Pin::new_unchecked(&mut $scope) };
+            scope_pinned.init()
+        };
+        let $scope = &mut $scope;
+    };
+    (let $scope:ident, $param:expr $(,)?) => {
+        $crate::tc_scope!($scope, $param);
+    };
+}
+
+/// Opens a callback scope and binds `&mut PinnedRef<CallbackScope<..>>` to the
+/// given name: `v8::callback_scope!(unsafe scope, context)`.
+#[macro_export]
+macro_rules! callback_scope {
+    (unsafe $scope:ident, $param:expr $(,)?) => {
+        #[allow(clippy::macro_metavars_in_unsafe)]
+        let mut $scope = {
+            let param = $param;
+            unsafe { $crate::CallbackScope::new(param) }
+        };
+        let mut $scope = {
+            let scope_pinned = unsafe { ::std::pin::Pin::new_unchecked(&mut $scope) };
+            scope_pinned.init()
+        };
+        let $scope = &mut $scope;
+    };
+    (unsafe let $scope:ident, $param:expr $(,)?) => {
+        $crate::callback_scope!(unsafe $scope, $param);
+    };
+}
+
+/// Opens an escapable handle scope and binds `&mut PinnedRef<EscapableHandleScope>`
+/// to the given name: `v8::escapable_handle_scope!(let scope, scope)`.
+#[macro_export]
+macro_rules! escapable_handle_scope {
+    ($scope:ident, $param:expr $(,)?) => {
+        let mut $scope = $crate::EscapableHandleScope::new($param);
+        let mut $scope = {
+            let scope_pinned = unsafe { ::std::pin::Pin::new_unchecked(&mut $scope) };
+            scope_pinned.init()
+        };
+        let $scope = &mut $scope;
+    };
+    (let $scope:ident, $param:expr $(,)?) => {
+        $crate::escapable_handle_scope!($scope, $param);
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::DataError;
+
+    /// The pattern a host writes: pin the scope, init it, and hand it wherever a
+    /// scope goes. It wraps the scope it was made from rather than replacing it,
+    /// so everything reachable through the outer one stays reachable.
+    #[test]
+    fn an_allow_scope_is_the_scope_it_wraps() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_scope, isolate);
+        let scope: &mut crate::PinScope<'_, '_, ()> = handle_scope;
+
+        let allow = std::pin::pin!(crate::AllowJavascriptExecutionScope::new(scope));
+        let scope = &mut allow.init();
+        let text = crate::String::new(scope, "'bracketed'").expect("string");
+        assert_eq!(text.to_rust_string_lossy(scope), "'bracketed'");
+    }
+
+    /// The snapshot restore side answers for a snapshot that was never made, and
+    /// says so through the error channel the shape has rather than a panic.
+    #[test]
+    fn reading_snapshot_data_reports_that_there_is_none() {
+        crate::test_support::in_context!(scope, {
+            match scope.get_context_data_from_snapshot_once::<crate::data::Data>(0) {
+                Err(DataError::NoData { expected }) => assert!(expected.contains("Data")),
+                other => panic!("expected no data, got {other:?}"),
+            }
+            assert!(matches!(
+                scope.get_isolate_data_from_snapshot_once::<crate::data::Data>(3),
+                Err(DataError::NoData { .. })
+            ));
+            // The cast bound is part of the shape: asking for a narrower tag is
+            // what a host does when it attached one.
+            assert!(matches!(
+                scope.get_context_data_from_snapshot_once::<crate::data::Object>(0),
+                Err(DataError::NoData { .. })
+            ));
+        });
     }
 }

@@ -1,10 +1,21 @@
 # Host objects and L2: traced host state, finalizers, weak handles
 
-Design decision, approved and largely landed: **slices 1-3 have shipped** (see
-§6); slice 4 (weak handles) is not started. L2 is the ladder level where
-"the host owns objects JS retains, and those objects reference JS values"
-(`.notes/embedding.md` §3). Nothing below is implemented; this note is the
-proposal plus the evidence it rests on.
+**Status correction (2026-09-21): none of this is in the tree.** This note
+formerly opened by saying slices 1-3 had shipped, and its §6 described them in
+the past tense with named tests. All of it was written, reviewed, and reverted,
+and the tree says so:
+`grep -rn 'host_object_retain\|host_object_release\|run_finalizers\|request_finalize\|PENDING_FINALIZERS\|HostObject\|a_host_objects_retained_edge_roots_its_value' crates/`
+returns nothing, `ObjectKind::Host` is still `Rc<dyn HostOps>`
+(`crates/crux/src/object.rs:469`), and `HostOps` still has no `trace` and no
+`finalize`. `.notes/embedding.md` §5's L2 row and §4's acceptance test carried the
+same false claim and are corrected the same way.
+
+What is below is therefore a *design*: the problem (§1), what L2 has to provide
+(§2), the options (§3), the design of the chosen one (§4), the acceptance criteria
+(§5) and the slices (§6). Read every "landed" in §6 as "designed and specified".
+
+L2 is the ladder level where "the host owns objects JS retains, and those objects
+reference JS values" (`.notes/embedding.md` §5).
 
 ## 1. The problem
 
@@ -178,9 +189,12 @@ handle), the way the L1 pin tests do, or the conservative scan will mask the bug
 5. Later, optional: cppgc-shaped names (`Traced`/`Member`/`Visitor`/
    `initialize_process`) as sugar over 3-4.
 
-### Slices 2-3 — landed: edges and finalization
+### Slices 2-3 — designed; reverted, not in the tree
 
-*(Slice 1's own account follows below; it shipped first.)*
+*(Slice 1's own account follows below; it was the first of the three.)*
+
+**Not in the tree** — see the status correction at the top. What follows is what
+the slices were specified to do.
 
 **Edges.** `ObjectKind::Host` now carries a `HostObject` — the behaviour plus an
 `Rc<RefCell<Vec<Value>>>` edge list — and `Trace for ObjectKind` visits it, so a
@@ -201,24 +215,23 @@ still gets its finalizers after every outermost call.
 
 **The trap worth remembering: there are two sweep paths.** The major in
 `collect_from_work` and the minor in `collect_minor_inner` each have their own
-drop loop. The first cut hooked only the major, and the runtime test caught it —
-the finalizer never ran under `--gc-stress`. Both call the vtable hook now.
-Anything the sweep must do per dead box has to be added in both places, or it
-silently works in one collection mode and not the other.
+drop loop. Hooking only the major is the mistake to avoid: the finalizer would
+silently run in one collection mode and not the other. Anything the sweep must do
+per dead box has to be added in both places.
 
-Finalization is deferred rather than run in the sweep because the sweep is
+Finalization has to be deferred rather than run in the sweep, because the sweep is
 mid-collection with the heap borrowed and a finalizer may allocate or run JS —
 and `--gc-stress` collects per allocation, so re-entering would be immediate.
 
-**Coverage.** `crux`'s `a_host_objects_retained_edge_roots_its_value` (precise:
-the collector's own liveness flag, deterministic `collect(&[])`) and
+**Coverage it would need.** `crux`'s `a_host_objects_retained_edge_roots_its_value`
+(precise: the collector's own liveness flag, deterministic `collect(&[])`) and
 `a_swept_host_object_captures_its_finalizer`; `runtime`'s
 `a_swept_host_object_finalizes_through_the_isolate` (end-to-end through
-`Isolate::run_finalizers`). Two masking traps surfaced while writing that last
-test, and both are now designed around: the object must be created *and released
-inside a returned frame* (otherwise stale stack words root it), and a trivial
-`({})` eval does not necessarily trigger a *sweeping* collection — nursery
-stress plus a 200-iteration allocation loop does.
+`Isolate::run_finalizers`). Two masking traps to design around when writing the
+last one: the object must be created *and released inside a returned frame*
+(otherwise stale stack words root it), and a trivial `({})` eval does not
+necessarily trigger a *sweeping* collection — nursery stress plus a 200-iteration
+allocation loop does.
 
 `jsc` keeps its release-driven finalize timing for now: it is the retired C
 surface and its compat test asserts the old behaviour, so wiring it to
@@ -230,26 +243,20 @@ surface and its compat test asserts the old behaviour, so wiring it to
 weak machinery (`Agent::weak_ref_targets`, `heap::note_ephemeron`) and the GC-4
 rule that the dead set comes from the *precise* mark. Not started.
 
-### Slice 1 — landed, with the defect demonstrated
+### Slice 1 — designed; reverted, not in the tree
 
-The `ffi` tables are now registered as a root source: `crux::heap` gained
-`register_root_source`/`registered_root_source_count` (a per-thread list of
-`fn(&mut dyn FnMut(GcAny))`), the collector's three entry points visit it through
-`with_engine_roots` alongside the L1 pins, and `ffi::tables::retain_value` /
-`retain_string` register once per thread. Both tables are traced, because a bare
-`JsString` can hold arena handles (`ConsString`/`Rope`/`Sliced` — `impl Trace for
-JsString`), so a retained `JSStringRef` to a rope was equally exposed.
+The slice registers the `ffi` tables as a root source so a value a host holds
+through them is marked rather than swept. **Not in the tree**: `crux::heap` has
+`pin`/`pinned_roots` and nothing else, and `crux::heap::pin` is called from
+`runtime`'s `api::Global` and `api::Module` only (`grep -rn 'heap::pin' crates/`).
 
-**The defect is now demonstrated, not inferred.** With the registration removed
-(a mutation check), `a_retained_value_survives_a_collection` fails with the
-aliasing exactly as predicted: the retained ref resolves to the *churn* object
-that reused the swept slot (`left: 2, right: 1` — the retained object's id was 1).
-With the registration in place the ref keeps its identity across a collection.
-
-The mechanism itself is covered precisely (with the collector's own liveness
-flag) in `crux`'s `a_registered_root_source_keeps_its_boxes_alive`; the `ffi`
-test is the end-to-end one and shares the weaker slot-reuse detector with the L1
-notes rather than the flag.
+**The defect it would demonstrate.** Removing the registration is the mutation
+check: `a_retained_value_survives_a_collection` would fail with the aliasing §1(a)
+predicts — the retained ref resolving to whatever object reused the swept slot.
+The mechanism itself is covered precisely (with the collector's own liveness flag)
+in `crux`'s `a_registered_root_source_keeps_its_boxes_alive`; the `ffi` test is
+the end-to-end one and shares the weaker slot-reuse detector with the L1 notes
+rather than the flag.
 
 Re-certified after the change (`crux::heap` is in the sweep graph, so unlike the
 façade work this required a re-sweep): test262 48,464 + 3,205 = **51,669 pass of

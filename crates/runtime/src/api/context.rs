@@ -18,6 +18,10 @@ use super::handle::{Local, MaybeLocal};
 /// The context holds a raw pointer to its isolate; the caller must not keep
 /// a conflicting `&mut Isolate` alive while the context is in use (the same
 /// borrow convention as the `crux::function::with_agent` TLS window).
+///
+/// Both fields are plain data, so the handle copies freely. It does not own
+/// the realm: the isolate's agent does, for as long as the isolate lives.
+#[derive(Clone, Copy)]
 pub struct Context {
     isolate: *mut Isolate,
     realm: Handle<Realm>,
@@ -62,6 +66,36 @@ impl Context {
         crux::function::with_agent(agent as *mut (), || body(unsafe { &mut *agent }))
     }
 
+    /// Run `body` as one embedder entry.
+    ///
+    /// The depth is what makes `MicrotasksPolicy::Auto` mean "after the
+    /// outermost entry": a host callback that calls back in raises it, so the
+    /// queues cannot drain out from under the callback that is running. When
+    /// the outermost entry returns and the policy is `Auto`, they drain — and a
+    /// job that throws becomes the isolate's pending exception, where the crate
+    /// we stand in for swallows it (the difference is a host's, and it is a
+    /// rarer one: it can only be seen by asking).
+    fn entered<T>(
+        &self,
+        body: impl FnOnce(&mut Agent) -> Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        let isolate = unsafe { &*self.isolate };
+        let depth = isolate.entry_depth.get() + 1;
+        isolate.entry_depth.set(depth);
+        let result = self.with_agent(body);
+        isolate.entry_depth.set(depth - 1);
+        if depth == 1
+            && isolate.get_microtasks_policy() == crate::api::MicrotasksPolicy::Auto
+            && let Err(error) = self.with_agent(|agent| agent.run_jobs())
+        {
+            let thrown = self
+                .with_agent(|agent| crate::builtins::error::to_throwable(agent, &error))
+                .unwrap_or(Value::Undefined);
+            isolate.set_pending_exception(thrown);
+        }
+        result
+    }
+
     /// Evaluate a Script; on failure the thrown value becomes the pending
     /// exception and the result is `Nothing` (v8::Script::Run semantics).
     pub fn eval(&self, source: &str) -> MaybeLocal {
@@ -77,7 +111,7 @@ impl Context {
     /// Evaluate a Script, returning the engine error directly instead of
     /// setting a pending exception.
     pub fn try_eval(&self, source: &str) -> Result<Local, JsError> {
-        self.with_agent(|agent| {
+        self.entered(|agent| {
             let value = agent.run_script(source)?;
             Ok(Local(value))
         })
@@ -102,10 +136,10 @@ impl Context {
         this: &Local,
         args: &[Local],
     ) -> Result<Local, JsError> {
-        let values: Vec<Value> = args.iter().map(|arg| arg.clone().into_value()).collect();
-        self.with_agent(|agent| {
+        let values: Vec<Value> = args.iter().map(|arg| arg.into_value()).collect();
+        self.entered(|agent| {
             let result =
-                crate::function::call(agent, function.value(), this.clone().into_value(), &values)?;
+                crate::function::call(agent, function.value(), this.into_value(), &values)?;
             Ok(Local(result))
         })
     }
@@ -124,8 +158,8 @@ impl Context {
 
     /// Construct an object, returning the engine error directly.
     pub fn try_construct(&self, constructor: &Local, args: &[Local]) -> Result<Local, JsError> {
-        let values: Vec<Value> = args.iter().map(|arg| arg.clone().into_value()).collect();
-        self.with_agent(|agent| {
+        let values: Vec<Value> = args.iter().map(|arg| arg.into_value()).collect();
+        self.entered(|agent| {
             let result = crate::function::construct(
                 agent,
                 constructor.value(),
