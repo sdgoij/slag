@@ -13,7 +13,7 @@ use crux::string::JsString;
 use runtime::api;
 
 use crate::cppgc::Heap;
-use crate::data::{Array, Context, Data, FixedArray, Promise, PromiseResolver, Value};
+use crate::data::{Array, Context, Data, FixedArray, Object, Promise, PromiseResolver, Value};
 use crate::handle::{Global, Local, Payload};
 use crate::promise::{PromiseRejectEvent, PromiseRejectMessage};
 use crate::scope::PinScope;
@@ -138,6 +138,10 @@ pub struct IsolateInner {
     /// which is later than the collector would reap an unused template, and
     /// never earlier.
     templates: RefCell<Vec<Rc<api::FunctionTemplate>>>,
+    /// The extras binding object a context asked for, held the way a template is:
+    /// the isolate owns it, because a handle to it outlives the scope it was made
+    /// in.
+    extras_bindings: RefCell<std::collections::HashMap<u64, Global<Object>>>,
     /// The object templates the host created on this isolate, held the same way
     /// and for the same reason as the function templates above.
     object_templates: RefCell<Vec<Rc<api::ObjectTemplate>>>,
@@ -444,6 +448,7 @@ impl Isolate {
             resolver_rejects: RefCell::new(HashMap::new()),
             cpp_heap,
             templates: RefCell::new(Vec::new()),
+            extras_bindings: RefCell::new(std::collections::HashMap::new()),
             object_templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
         });
@@ -835,6 +840,24 @@ impl Isolate {
     /// kinds are then told apart by which list holds it.
     pub(crate) fn add_object_template(&self, template: Rc<api::ObjectTemplate>) {
         self.inner().object_templates.borrow_mut().push(template);
+    }
+
+    /// The extras binding object a context was given, if its host asked for one
+    /// (`v8::Context::GetExtrasBindingObject`).
+    pub(crate) fn extras_binding(&self, context: u64) -> Option<api::Local> {
+        self.inner()
+            .extras_bindings
+            .borrow()
+            .get(&context)
+            .map(|held| *held.handle().engine())
+    }
+
+    /// Remember a context's extras binding object, pinned on this isolate.
+    pub(crate) fn set_extras_binding(&self, context: u64, value: Local<'_, Object>) {
+        self.inner()
+            .extras_bindings
+            .borrow_mut()
+            .insert(context, Global::new(self, value));
     }
 
     /// Whether the isolate has background work pending

@@ -4,15 +4,7 @@
 use std::collections::HashSet;
 use std::num::NonZeroI32;
 
-use crux::handle::Handle;
-use crux::object::{JsObject, ObjectKind, PropertyKind};
-use crux::property::{PropertyDescriptor, PropertyKey};
-use crux::value::Value as EngineValue;
-use crux::value::ValueKind;
-use runtime::api;
-use slag::objects::{ensure_deferred_namespace_evaluation, materialize_pending_prototype_value};
-
-use crate::data::{Array, Map, Name, Object, Private, Proxy, Set, Value};
+use crate::data::{Array, Map, Name, Object, Private, Proxy, Set, String, Value};
 use crate::handle::{Local, LocalHandle};
 use crate::property::{
     GetPropertyNamesArgs, IndexFilter, KeyCollectionMode, KeyConversionMode, PropertyAttribute,
@@ -20,6 +12,13 @@ use crate::property::{
 };
 use crate::property_descriptor::PropertyDescriptor as V8PropertyDescriptor;
 use crate::scope::PinScope;
+use crux::handle::Handle;
+use crux::object::{JsObject, ObjectKind, PropertyKind};
+use crux::property::{PropertyDescriptor, PropertyKey};
+use crux::value::Value as EngineValue;
+use crux::value::ValueKind;
+use runtime::api;
+use slag::objects::{ensure_deferred_namespace_evaluation, materialize_pending_prototype_value};
 
 /// A descriptor that defines a new own data property with every attribute set,
 /// which is `CreateDataProperty` (spec 7.3.5) — every attribute, so nothing a
@@ -142,6 +141,47 @@ impl<'s> LocalHandle<'s, Object> {
     /// a table keyed by this agrees with `==`.
     pub fn get_identity_hash(&self) -> NonZeroI32 {
         self.identity_hash()
+    }
+
+    /// The object's constructor name (`v8::Object::GetConstructorName`).
+    ///
+    /// The crate answers from the object's map — the constructor it was
+    /// instantiated with — reads `Symbol.toStringTag` from the prototype chain as
+    /// its other source, and falls back to the string "Object". This walks the
+    /// chain for the same answers: the nearest own `constructor` whose `name` is
+    /// neither empty nor "Object", then "Object" itself.
+    ///
+    /// Two divergences from the crate, both recorded in `.notes/embedding.md`
+    /// §9. A map remembers the constructor an object was *made* with, while this
+    /// reads the property as it is now, so a reassigned
+    /// `prototype.constructor` shows up here and not there. And
+    /// `Symbol.toStringTag` is not consulted, because the property reads this
+    /// bridge can make are name-keyed: an iterator answers "Iterator" here — the
+    /// name its prototype chain carries — where V8's tag makes it "Map Iterator"
+    /// or "Array Iterator" by kind.
+    pub fn get_constructor_name(&self) -> Local<'_, String> {
+        let realm = crate::realm_current();
+        let mut current: Local<'_, Object> = self.retag();
+        loop {
+            let constructor = api::Object::get(&realm, current.engine(), "constructor").ok();
+            if let Some(name) = constructor
+                .as_ref()
+                .and_then(|c| constructor_name(&realm, c))
+            {
+                return name;
+            }
+            match api::Object::get_prototype(&realm, current.engine()) {
+                Ok(prototype) if prototype.value().is_object() => {
+                    current = Local::<Object>::from_engine(prototype).retag();
+                }
+                _ => break,
+            }
+        }
+        // The crate's own fallback, for an object whose chain names no
+        // constructor: the string "Object".
+        Local::from_engine(api::Local::from(EngineValue::String(Handle::new(
+            crux::string::JsString::from_utf8("Object"),
+        ))))
     }
 
     /// [[Get]] a property (`v8::Object::Get`).
@@ -669,6 +709,24 @@ fn entries_array<'a>(scope: &PinScope<'a, '_>, values: Vec<EngineValue>) -> Loca
     Array::new_with_elements(scope, &locals)
 }
 
+/// The name of a constructor the prototype chain named, when it is one the crate
+/// we stand in for would report: a function whose `name` is neither empty nor
+/// "Object" — V8's own helper skips both and keeps walking.
+fn constructor_name<'s>(
+    realm: &api::Context,
+    constructor: &api::Local,
+) -> Option<Local<'s, String>> {
+    if !constructor.value().is_function() {
+        return None;
+    }
+    let name = api::Object::get(realm, constructor, "name").ok()?;
+    let text = name.as_string()?;
+    if text.is_empty() || text == "Object" {
+        return None;
+    }
+    Some(Local::from_engine(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +739,38 @@ mod tests {
     /// The number a handle holds.
     fn number_of(value: Local<'_, Value>) -> f64 {
         Local::<Number>::try_from(value).expect("number").value()
+    }
+
+    /// The name a constructor gives an object, read the way the crate reads it:
+    /// the nearest `constructor` on the prototype chain, with the string
+    /// "Object" as the fallback. The last case is the documented divergence — V8
+    /// names an iterator by its `Symbol.toStringTag` ("Map Iterator"), while
+    /// this bridge, whose property reads are name-keyed, reads the name the
+    /// engine's iterator prototypes carry ("Iterator").
+    #[test]
+    fn the_constructor_name_comes_from_the_prototype_chain() {
+        in_context!(scope, {
+            for (source, expected) in [
+                ("({})", "Object"),
+                ("[]", "Array"),
+                ("new Map()", "Map"),
+                ("/x/", "RegExp"),
+                ("new Date()", "Date"),
+                ("(function () {})", "Function"),
+                ("Object.create(null)", "Object"),
+                ("class Foo {}; new Foo()", "Foo"),
+                ("new Map().entries()", "Iterator"),
+            ] {
+                let value = eval(scope, source);
+                let object = Local::<Object>::try_from(value)
+                    .unwrap_or_else(|_| panic!("{source} is not an object"));
+                assert_eq!(
+                    object.get_constructor_name().to_rust_string_lossy(scope),
+                    expected,
+                    "{source}"
+                );
+            }
+        });
     }
 
     /// The text a handle holds.

@@ -559,6 +559,7 @@ number is the certified one.
 | after the template surface a host fills in (the prototype and instance templates, `ObjectTemplate::{new, set}`, the two `String` conversions and `build_fast`) | **56** (see below) |
 | after the attribute-carrying half of the template cluster (`PropertyAttributes` in the engine, `ObjectTemplate::{set_with_attr, set_accessor_property, new_instance}`) | **52** (see below) |
 | after the static half of the template cluster (`FunctionTemplate::{set, inherit}`, the per-realm materialization memo, and `set_internal_field_count`) | **49** (see below) |
+| after the three stragglers a `Context` and an `Object` answer (`get_constructor_name`, `get_extras_binding_object`, `Context::from_snapshot`) | **44** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -1019,6 +1020,52 @@ mode, inverting the index filter, and stubbing `from_raw` each fail the assertio
 that guards them. The exception is the continuation-value test, whose content *is*
 the borrow shape: it fails to compile if the handle goes back to borrowing its
 scope.
+
+**The three stragglers a `Context` and an `Object` answer — landed, 49 → 44, all bridge.**
+Five sites: `Object::get_constructor_name` (`ops_builtin_v8.rs:1342`),
+`Context::get_extras_binding_object` (`bindings.rs:372`, `ops_builtin_v8.rs:1607`)
+and `Context::from_snapshot` (`jsruntime.rs:2844`, `:2845`). No engine change: the
+first two had the pieces already and the third is a refusal.
+
+- **`get_constructor_name` reads the chain.** The crate answers from the object's
+  *map* — the constructor it was instantiated with — with `Symbol.toStringTag` as
+  the other source and the string "Object" as the fallback. Here the prototype
+  chain is walked for the nearest own `constructor` whose `name` is neither empty
+  nor "Object", then "Object" — V8's own helper skips both of those and keeps
+  walking, so the cases line up: `[]` → "Array", `new Map()` → "Map", a class
+  instance → the class name, `Object.create(null)` → "Object". Two divergences,
+  both recorded in §9: a map remembers the constructor an object was *made* with
+  while this reads the property as it is now, and `Symbol.toStringTag` is not
+  consulted because the property reads this bridge can make are name-keyed. The
+  second is visible in the test, and it is smaller than it looked:
+  `new Map().entries()` answers "Iterator" — the name the engine's iterator
+  prototypes carry — where V8's tag answers "Map Iterator".
+- **The extras binding object is a per-context object the isolate owns.** There,
+  V8 makes one per context and fills it from the embedder's snapshot (the host
+  reads `console` out of it); here it is created on the first ask and left empty,
+  because this bridge cannot run a snapshot — so what the host's bootstrap puts in
+  it is what it holds, and the host is the one that knows. It is the same object on
+  every ask, keyed by the context identity the embedder-data slots already use and
+  pinned like a template.
+- **`from_snapshot` is `None`, and the tier is the entry point.** The crate's
+  `Option` is the channel, and this bridge cannot create a snapshot (§9's
+  `create_blob` note says why), so there is no blob whose contexts could be
+  restored: a host that booted without one takes its own other branch, and one
+  that asks is told rather than handed a context that is not the one its blob
+  names.
+
+Measured: **49 → 44**, `E0599` 40 → 35. Three new tests — the name table above
+(including the iterator divergence, asserted on purpose), the extras object being
+one object per context that starts empty and keeps what the host puts there, and
+`from_snapshot` answering `None`. Both test expectations were wrong first time and
+the engine was right: the iterator case answers "Iterator" rather than "Object",
+and an empty object's absent name reads back *undefined* rather than as no read at
+all.
+
+Gates: `cargo test -p v8 --features simdutf` **164 passed / 0 failed**,
+`clippy --locked --workspace --all-targets -- -D warnings` clean, and
+`cargo test --locked --workspace` **5,098 passed / 0 failed / 4 ignored** across 38
+binaries. `crates/v8` only, so no sweep is implicated.
 
 **The static half of the template cluster — landed, 52 → 49, and the engine change it
 needed is the interesting part.** Three sites: `FunctionTemplate::set` (a static
@@ -1595,6 +1642,17 @@ if that proves possible.
   engine has no flag surface; a host that needs a flag's effect must not depend
   on it. `set_flags_from_command_line` consumes nothing, so a host sees all of
   its own arguments on the returned list.
+- **`get_constructor_name` is the map's answer only in the cases where the
+  property chain agrees with it, and the difference is stated where a host would
+  read it.** V8 reads the constructor the object's *map* was made with and the
+  `Symbol.toStringTag` on its chain; this walk reads the nearest own
+  `constructor` as it is now, and cannot read the tag at all — the property reads
+  the bridge can make are name-keyed. The consequence is small and pinned by a
+  test: an iterator answers "Iterator" rather than "Map Iterator", and a script
+  that reassigns `Foo.prototype.constructor` moves the answer here where V8's
+  map would hold the original. Landing the tag half means a symbol-keyed read on
+  the engine's template/object API, which is a named follow-up rather than a
+  guess.
 - **A snapshot cannot be created, and saying so is the implementation.**
   `create_blob` aborts with the reason; `StartupData::is_valid()` answers
   `false`; `SetDefaultContext`/`AddContext`/`AddContextData` record what a blob
@@ -1849,18 +1907,20 @@ control to 260, the isolate-level callback vocabulary to 242, the symbol surface
 to 233, the primitive array to 225, the leftovers to 217, the buffer-handing
 shapes to 213, the host-memory store to 209, the tag shape to 62, the template
 surface to 56, the attribute-carrying half of the template cluster to 52, the static
-half of it to 49, and what
-is left is the method surface (40 `E0599`s, all of them named methods and
+half of it to 49, the stragglers a `Context` and an `Object` answer to 44, and what
+is left is the method surface (35 `E0599`s, all of them named methods and
 subsystems: the message and stack-trace surface, synthetic modules, wasm
-streaming, code cache, source offsets, the extras binding object, and the internal
-fields a `ContextOptions` global template names), the 4 names, and four stragglers
-(3 `E0515`, 1 `E0282`). Three
-surveyed-and-left items sit outside those counts' reach — `get_constructor_name`
-(needs V8's map), `get_extras_binding_object` (needs an engine-side extras
-object) and `get_heap_statistics` (needs byte accounting in `crux::heap`) — and
-everything else needs the tag shape or an engine capability; with the shape
-landed, the tag-shape column is closed — the remaining 53 are methods to write
-and the subsystems they name; and the shape's own tail is (a) the methods moving
+streaming, code cache, source offsets, and the internal fields a `ContextOptions`
+global template names), the 4 names, and four stragglers (3 `E0515`, 1 `E0282`).
+One surveyed-and-left item sits outside those counts' reach —
+`get_heap_statistics` (needs byte accounting in `crux::heap`) — and the other two
+that the suite had surveyed have landed since, `get_constructor_name` and
+`get_extras_binding_object`, which turned out to need a walk of the prototype
+chain and a per-context object rather than V8's map and an engine-side extras
+object. Everything else needs the tag shape or an engine capability; with the
+shape
+landed, the tag-shape column is closed — what remains is methods to write and the
+subsystems they name; and the shape's own tail is (a) the methods moving
 from `LocalHandle` onto the tags, file by file, then (b) deleting `LocalHandle`
 and its deref table, which is when the tier §9 states stops being a tier;
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
