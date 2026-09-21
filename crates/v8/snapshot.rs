@@ -176,11 +176,6 @@ impl SnapshotCreator {
     /// The index is slot 1 for the first context added, as in V8: slot 0 is the
     /// default context whether or not one was set, and the host this stands in
     /// for reads its realm back out of slot 1.
-    ///
-    /// Attaching data to one of these refuses — see
-    /// [`add_context_data`](Self::add_context_data): a blob here carries the
-    /// default context's data, because an isolate in this engine has one realm
-    /// and a second context shadows it.
     pub(crate) fn add_context(&mut self, context: api::Context) -> usize {
         self.contexts.push(context);
         self.contexts.len()
@@ -191,18 +186,14 @@ impl SnapshotCreator {
     ///
     /// # Panics
     ///
-    /// Panics when `context` is not this snapshot's default context. V8
-    /// carries every context's data; this bridge carries the default context's,
-    /// because the engine's api gives an isolate one realm and a second
-    /// `Context::new` shadows it — so a second realm's objects are built in the
-    /// wrong realm and a blob of them would be wrong rather than partial. That
-    /// is a named gap, not a silent one: a host that attaches to another
-    /// context hears about it where it attaches. Panics too when the isolate
+    /// Panics when `context` is not one this snapshot carries — the statement
+    /// V8's own check makes: data attached to a context a blob does not name
+    /// would have nowhere to be read back out of. Panics too when the isolate
     /// did not come from `Isolate::snapshot_creator`.
     pub(crate) fn add_context_data(&mut self, context: api::Context, data: Global<Data>) -> usize {
         let slot = self.slot_of(context).unwrap_or_else(|| {
             panic!(
-                "v8::Isolate::AddContextData: this bridge carries the default context's data, not another context's (an isolate here has one realm)"
+                "v8::Isolate::AddContextData: the context is not one this snapshot carries: call set_default_context or add_context for it first"
             )
         });
         let items = self.attached.entry(slot).or_default();
@@ -210,20 +201,29 @@ impl SnapshotCreator {
         items.len() - 1
     }
 
-    /// The slot a context's data is carried in, if this snapshot carries it.
+    /// The slot a context's data is carried in, if this snapshot carries it:
+    /// slot 0 for the default context, then the ones added after it.
     fn slot_of(&self, context: api::Context) -> Option<usize> {
         let key = context_identity(context);
-        self.default_context
-            .filter(|default| context_identity(*default) == key)
-            .map(|_| 0)
+        if self
+            .default_context
+            .is_some_and(|default| context_identity(default) == key)
+        {
+            return Some(0);
+        }
+        self.contexts
+            .iter()
+            .position(|added| context_identity(*added) == key)
+            .map(|position| position + 1)
     }
 
     /// Write the blob.
     ///
-    /// The graph is rooted at the context table: one item list per context
-    /// slot, holding the data that context was attached. A value the engine
-    /// cannot carry ends this with a panic naming it — see the module docs for
-    /// why that is the loudest message this signature allows.
+    /// The graph is the context table: the default context's attached data at
+    /// slot 0, then each context added after it at the index `add_context`
+    /// answered. A value the engine cannot carry ends this with a panic naming
+    /// it — see the module docs for why that is the loudest message this
+    /// signature allows.
     pub(crate) fn create_blob(
         &mut self,
         function_code_handling: FunctionCodeHandling,
@@ -231,28 +231,32 @@ impl SnapshotCreator {
         // Neither mode carries compiled code yet, because nothing carries a
         // function body at all, and a blob is therefore the same either way.
         let _ = function_code_handling;
-        let context = self
-            .default_context
-            .or_else(|| self.contexts.first().copied())
-            .expect(
-                "v8::SnapshotCreator::create_blob: a snapshot carries what a context holds, so the creator needs one",
-            );
-        // One slot: the default context's data. A context added after it has
-        // no slot of its own, because attaching data to one refuses (see
-        // `add_context_data`) — the blob names what it carries rather than
-        // naming an empty list for a context whose own data was never taken.
-        let slots: Vec<Vec<api::Local>> = vec![
-            self.attached
-                .get(&0)
-                .map(|items| items.iter().filter_map(engine_value).collect())
-                .unwrap_or_default(),
-        ];
-        match context.write_snapshot(&slots) {
+        assert!(
+            self.default_context.is_some() || !self.contexts.is_empty(),
+            "v8::SnapshotCreator::create_blob: a snapshot carries what a context holds, so the creator needs one"
+        );
+        let mut slots: Vec<(usize, api::Context, Vec<api::Local>)> = Vec::new();
+        if let Some(default) = self.default_context {
+            slots.push((0, default, self.items_of(0)));
+        }
+        for position in 0..self.contexts.len() {
+            let slot = position + 1;
+            slots.push((slot, self.contexts[position], self.items_of(slot)));
+        }
+        match api::Context::write_snapshot(&slots) {
             Ok(bytes) => StartupData::new(bytes),
             Err(error) => {
                 panic!("v8::SnapshotCreator::create_blob: the engine cannot carry {error} yet")
             }
         }
+    }
+
+    /// The engine values attached to one slot, in the order they were attached.
+    fn items_of(&self, slot: usize) -> Vec<api::Local> {
+        self.attached
+            .get(&slot)
+            .map(|items| items.iter().filter_map(engine_value).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -279,11 +283,10 @@ pub(crate) fn context_identity(context: api::Context) -> u64 {
 /// decoding makes engine values, and there is no realm to make them in until
 /// [`Context::from_snapshot`](crate::Context::from_snapshot) has created one.
 pub(crate) struct SnapshotRestore {
-    /// The blob as the host handed it over, once its header checked out.
+    /// The blob as the host handed it over, once its header checked out. Kept
+    /// rather than decoded: decoding makes values in a realm, and a realm exists
+    /// only once a context asks for its data.
     blob: StartupData,
-    /// The decoded root — one item list per context slot — held persistently so
-    /// the items stay alive while the host reads them out one at a time.
-    root: Option<Global<Data>>,
     /// Each restored context's items, by the context's identity, taken as they
     /// are read: that is the crate's `...FromSnapshotOnce` contract, and the
     /// second read of an index is an error there too.
@@ -297,56 +300,28 @@ impl SnapshotRestore {
     pub(crate) fn new(blob: StartupData) -> Option<Self> {
         format::is_valid(blob.bytes()).then(|| Self {
             blob,
-            root: None,
             items: HashMap::new(),
         })
     }
 
-    /// Decode the blob into `context`'s realm, once.
-    fn decode(&mut self, isolate: &Isolate, context: api::Context) -> bool {
-        if self.root.is_some() {
-            return true;
-        }
-        let Ok(root) = context.read_snapshot(self.blob.bytes()) else {
-            return false;
-        };
-        let handle: Local<'_, Data> = Local::from_payload(Payload::Value(root));
-        self.root = Some(Global::new(isolate, handle));
-        true
-    }
-
     /// Root the items of the context at `slot`, answering whether the blob
     /// names that slot at all.
+    ///
+    /// The decode happens here rather than at isolate creation because it makes
+    /// engine values, and the realm to make them in is the one the restored
+    /// context was created with — which does not exist until the host asks for
+    /// the context.
     fn restore(&mut self, isolate: &Isolate, context: api::Context, slot: usize) -> bool {
-        if !self.decode(isolate, context) {
-            return false;
-        }
-        let engine = context;
-        let Some(root) = self.root.as_ref().and_then(engine_value) else {
-            return false;
+        let items = match context.read_snapshot(self.blob.bytes(), slot) {
+            Ok(Some(items)) => items,
+            Ok(None) | Err(_) => return false,
         };
-        let slots = api::Array::length(&engine, &root).unwrap_or(0.0) as usize;
-        if slot >= slots {
-            return false;
+        let mut held = Vec::with_capacity(items.len());
+        for item in items {
+            let handle: Local<'_, Data> = Local::from_payload(Payload::Value(item.get()));
+            held.push(Some(Global::new(isolate, handle)));
         }
-        let Ok(element) = api::Array::get(&engine, &root, slot as u32) else {
-            return false;
-        };
-        // A slot the creator never recorded reads back as `undefined`, which is
-        // "the blob names no such context" rather than "that context was empty".
-        if element.value().is_undefined() {
-            return false;
-        }
-        let count = api::Array::length(&engine, &element).unwrap_or(0.0) as usize;
-        let mut items = Vec::with_capacity(count);
-        for index in 0..count {
-            let Ok(item) = api::Array::get(&engine, &element, index as u32) else {
-                return false;
-            };
-            let handle: Local<'_, Data> = Local::from_payload(Payload::Value(item));
-            items.push(Some(Global::new(isolate, handle)));
-        }
-        self.items.insert(context_identity(context), items);
+        self.items.insert(context_identity(context), held);
         true
     }
 
@@ -592,10 +567,10 @@ mod tests {
         let _ = isolate.create_blob(FunctionCodeHandling::Keep);
     }
 
-    /// The slot convention is V8's — the first added context is slot 1 — and
-    /// the default context's data is what a blob carries today.
+    /// The slot convention is V8's — the first added context is slot 1 — and a
+    /// blob names every context the creator recorded, empty ones included.
     #[test]
-    fn an_added_context_gets_slot_one_and_the_blob_names_only_the_default() {
+    fn an_added_context_gets_slot_one() {
         let mut isolate = Isolate::snapshot_creator(None, None);
         {
             crate::scope!(let scope, &mut isolate);
@@ -612,17 +587,71 @@ mod tests {
 
         let mut isolate = isolate_from(blob);
         assert_eq!(data(&mut isolate, 1), vec![Some(1.0)]);
+        // The added context was recorded, so its slot is named: what it holds is
+        // nothing, which is not the same as the blob not naming it.
+        assert!(restored_context(&mut isolate, 1).is_some());
         assert!(
-            restored_context(&mut isolate, 1).is_none(),
-            "the blob names the default context, not the one added after it"
+            restored_context(&mut isolate, 2).is_none(),
+            "a slot no context was recorded for"
         );
     }
 
-    /// Data attached to a context a blob does not carry is refused where the
-    /// host attaches it, which is where it can act on the refusal.
+    /// Data attached to a context the creator added comes back at that
+    /// context's slot, in its own realm. This is the shape `deno_core` builds: an
+    /// empty default context at slot 0 and its bootstrapped realm at slot 1,
+    /// with everything it attached on the realm.
     #[test]
-    #[should_panic(expected = "one realm")]
-    fn data_for_another_context_is_refused() {
+    fn an_added_context_carries_its_own_data() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let default = Context::new(scope, Default::default());
+            let added = Context::new(scope, Default::default());
+            scope.set_default_context(default);
+            assert_eq!(scope.add_context(added), 1);
+            let zero: Local<Value> = Number::new(scope, 0.0).into();
+            scope.add_context_data(default, zero);
+            // A value built in the added context's realm, which is what a host's
+            // bootstrap leaves behind there.
+            let scope = &mut crate::ContextScope::new(scope, added);
+            let object = crate::test_support::eval(scope, "({ n: 7 })");
+            scope.add_context_data(added, object);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob.clone());
+        assert_eq!(
+            data(&mut isolate, 1),
+            vec![Some(0.0)],
+            "slot 0 is the default context's own data"
+        );
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 1).expect("the blob names slot 1");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let object = scope
+            .get_context_data_from_snapshot_once::<Object>(0)
+            .expect("the added context's object");
+        let key = crate::test_support::eval(scope, "'n'");
+        let n = object.get(scope, key).expect("the property");
+        assert_eq!(
+            Local::<Number>::try_from(n)
+                .ok()
+                .map(|number| number.value()),
+            Some(7.0),
+            "the object came back with what it held"
+        );
+    }
+
+    /// Data attached to a context the snapshot does not carry is refused where
+    /// the host attaches it, which is where it can act on the refusal.
+    #[test]
+    #[should_panic(expected = "not one this snapshot carries")]
+    fn data_for_an_unrecorded_context_is_refused() {
         let mut isolate = Isolate::snapshot_creator(None, None);
         crate::scope!(let scope, &mut isolate);
         let context = Context::new(scope, Default::default());
@@ -633,10 +662,11 @@ mod tests {
         scope.add_context_data(stranger, number);
     }
 
-    /// A context no default was set for is not one the blob carries either.
+    /// A context no default was set for and no `add_context` recorded is not one
+    /// the blob carries either, and says so the same way.
     #[test]
-    #[should_panic(expected = "one realm")]
-    fn data_without_a_default_context_is_refused() {
+    #[should_panic(expected = "not one this snapshot carries")]
+    fn data_without_a_recorded_context_is_refused() {
         let mut isolate = Isolate::snapshot_creator(None, None);
         crate::scope!(let scope, &mut isolate);
         let context = Context::new(scope, Default::default());

@@ -32,6 +32,23 @@
 //! mean the same thing in the tree that reads a blob as in the tree that wrote
 //! it. A blob therefore carries the format version and the word size it was
 //! written with, and a reader refuses any other.
+//!
+//! # The context table
+//!
+//! A blob holds one table of contexts, each with the index a host gave it —
+//! `deno_core`'s is the crate we stand in for's: the default context is 0 and
+//! the ones added after it are 1, 2, ... — and each context's items are
+//! **written and read against its own realm**. That is not a detail: a realm's
+//! objects carry that realm's builtins as their prototypes, so a value has to be
+//! recognized by the realm it belongs to, and materialized in the realm that is
+//! restoring it. Two realms' `%Array.prototype%` are two objects with one name,
+//! which is why the name is what a blob writes and the realm is what resolves
+//! it: one record serves both slots, and each restore gives it that realm's own.
+//!
+//! A value *shared* between two contexts comes back as one value per context,
+//! because a restore makes values one slot at a time. A host that needs one
+//! object in both realms has a cross-realm reference, which V8's own snapshot
+//! would carry and this format does not claim to yet.
 
 use std::collections::HashMap;
 
@@ -55,7 +72,7 @@ pub const MAGIC: &[u8; 8] = b"SLAGSNP\0";
 pub const FORMAT_VERSION: u32 = 1;
 
 /// magic (8) + version (4) + word size (1) + endianness (1) + reserved (2) +
-/// body length (4) + root serial (4).
+/// body length (4) + context count (4).
 const HEADER_LEN: usize = 24;
 
 const ENDIAN_LITTLE: u8 = 1;
@@ -102,6 +119,16 @@ pub struct Unsupported {
 impl Unsupported {
     const fn new(type_name: &'static str, detail: &'static str) -> Self {
         Self { type_name, detail }
+    }
+
+    /// The refusal for an empty context table: a blob with no contexts names
+    /// nothing, so it is a caller bug rather than a value the format cannot
+    /// carry.
+    pub(crate) const fn empty_table() -> Self {
+        Self::new(
+            "the context table",
+            "a snapshot carries the data of at least one context",
+        )
     }
 }
 
@@ -228,19 +255,59 @@ struct StoredProperty {
     second: u32,
 }
 
-/// Write `root` and everything it reaches as a snapshot blob.
+/// One context's slot in a blob: the index the host gave it, the realm its
+/// values were built in, and the values themselves.
 ///
-/// `agent` and `realm` are what the walk asks its two identity questions of: a
-/// realm names the intrinsics it rebuilt, and the agent holds the `Symbol.for`
-/// registry, whose symbols have an identity beyond one blob.
-pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u8>, Unsupported> {
-    let mut objects: Vec<Value> = Vec::new();
+/// The realm is not a hint. A value's builtins are its own realm's, so the walk
+/// recognizes an intrinsic — and so writes a reference to it as a name — only
+/// through the realm the value belongs to. A slot whose realm is not the one its
+/// values were built in fails the walk rather than writing references that
+/// resolve to another realm's builtins.
+pub struct Slot<'a> {
+    /// The index the host gave this context (the crate we stand in for's
+    /// convention: the default context is 0, the ones added after it are 1, 2,
+    /// ...).
+    pub index: usize,
+    /// The realm the slot's values belong to.
+    pub realm: Handle<Realm>,
+    /// The values the host attached to that context, in the order it attached
+    /// them: the indices a restore hands them back under.
+    pub items: &'a [Value],
+}
+
+/// Write the data a host attached to each context, as one blob.
+///
+/// `agent` answers the `Symbol.for` registry, whose symbols have an identity
+/// beyond one blob; every other question the walk asks is asked of the realm the
+/// value belongs to.
+pub fn encode_slots(agent: &Agent, slots: &[Slot<'_>]) -> Result<Vec<u8>, Unsupported> {
+    let mut objects: Vec<(Value, Handle<Realm>)> = Vec::new();
     let mut serials: HashMap<Identity, u32> = HashMap::new();
-    let root_serial = visit(realm, root, &mut objects, &mut serials)?;
+    let mut table: Vec<(usize, Vec<u32>)> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let mut items = Vec::with_capacity(slot.items.len());
+        for item in slot.items {
+            items.push(visit(
+                agent,
+                &slot.realm,
+                *item,
+                &mut objects,
+                &mut serials,
+            )?);
+        }
+        table.push((slot.index, items));
+    }
 
     let mut body = Vec::new();
+    for (index, items) in &table {
+        write_u32(&mut body, *index as u32);
+        write_u32(&mut body, items.len() as u32);
+        for item in items {
+            write_u32(&mut body, *item);
+        }
+    }
     write_u32(&mut body, objects.len() as u32);
-    for value in &objects {
+    for (value, realm) in &objects {
         write_record(agent, realm, *value, &serials, &mut body)?;
     }
 
@@ -251,61 +318,63 @@ pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u
     blob.push(ENDIAN_LITTLE);
     blob.extend_from_slice(&[0, 0]);
     write_u32(&mut blob, body.len() as u32);
-    write_u32(&mut blob, root_serial);
+    write_u32(&mut blob, table.len() as u32);
     blob.extend_from_slice(&body);
     blob.extend_from_slice(MAGIC);
     Ok(blob)
 }
 
-/// Write the data a host attached to each context slot.
+/// Write one value, at slot 0's index 0.
 ///
-/// The slots are the blob's context table, in V8's convention: slot 0 is the
-/// default context, and the ones after it are the contexts added after it. The
-/// table is built here rather than by the caller because it belongs to the
-/// realm the blob is taken from: an array made through an isolate's *current*
-/// realm would carry that realm's `%Array.prototype%` even when the context
-/// being written is another one, and the walk below would then descend into the
-/// wrong realm's builtins.
-pub fn encode_slots(
-    agent: &Agent,
-    realm: &Handle<Realm>,
-    slots: &[Vec<Value>],
-) -> Result<Vec<u8>, Unsupported> {
-    let prototype = realm
-        .intrinsics
-        .array_prototype()
-        .and_then(|value| value.as_object());
-    let root = JsObject::array_create(prototype, slots.len() as f64)
-        .map_err(|_| Unsupported::new("the context table", "an array could not be made"))?;
-    // The root is pinned while the table is filled: the inner arrays are alive
-    // as handles on the stack, but the root is reached only through this local,
-    // and a `--gc-stress` collection inside the loop would sweep it otherwise.
-    let _root_pin = crux::heap::pin_handle(root);
-    for (index, slot) in slots.iter().enumerate() {
-        let items = JsObject::array_create(prototype, slot.len() as f64)
-            .map_err(|_| Unsupported::new("the context table", "an item list could not be made"))?;
-        for (position, value) in slot.iter().enumerate() {
-            items
-                .create_data_property_index(position as u64, *value)
-                .map_err(|_| {
-                    Unsupported::new("the context table", "an item could not be listed")
-                })?;
-        }
-        root.create_data_property_index(index as u64, Value::Object(items))
-            .map_err(|_| Unsupported::new("the context table", "a slot could not be listed"))?;
-    }
-    encode(agent, realm, Value::Object(root))
+/// The single-value form of [`encode_slots`], for a host or a test with one
+/// value to carry rather than a context table.
+pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u8>, Unsupported> {
+    let items = [root];
+    encode_slots(
+        agent,
+        &[Slot {
+            index: 0,
+            realm: *realm,
+            items: &items,
+        }],
+    )
 }
 
-/// Read a blob, answering the value it was rooted at.
+/// Read the data a blob carried for one context slot, made in `realm`.
 ///
-/// The values are made in `realm`, which is what makes an intrinsic reference
-/// meaningful: the name a blob carries resolves against the realm that is being
-/// restored into, not the realm that wrote it.
-pub fn decode(agent: &Agent, realm: &Handle<Realm>, bytes: &[u8]) -> Result<Value, DecodeError> {
-    let (body_len, root) = header(bytes)?;
-
+/// Answers `None` when the blob names no such slot, which is a host asking for a
+/// context its own build never recorded rather than a blob that is wrong.
+/// Materializing in `realm` is what makes an intrinsic reference meaningful: the
+/// name a blob carries resolves against the realm being restored into, not the
+/// realm that wrote it.
+pub fn decode_slot(
+    agent: &Agent,
+    realm: &Handle<Realm>,
+    bytes: &[u8],
+    slot: usize,
+) -> Result<Option<Vec<Value>>, DecodeError> {
+    let (body_len, context_count) = header(bytes)?;
     let mut body = Reader::new(&bytes[HEADER_LEN..HEADER_LEN + body_len]);
+
+    let mut wanted: Option<Vec<u32>> = None;
+    for _ in 0..context_count {
+        let index = body.u32().ok_or(DecodeError::Truncated)? as usize;
+        let count = body.u32().ok_or(DecodeError::Truncated)? as usize;
+        if count > body.bytes.len() {
+            return Err(DecodeError::Truncated);
+        }
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            items.push(body.u32().ok_or(DecodeError::Truncated)?);
+        }
+        if index == slot {
+            wanted = Some(items);
+        }
+    }
+    let Some(items) = wanted else {
+        return Ok(None);
+    };
+
     let count = body.u32().ok_or(DecodeError::Truncated)? as usize;
     // One record is at least one byte, so a count larger than the body is a
     // blob that was cut short rather than a graph with many empty records.
@@ -324,7 +393,20 @@ pub fn decode(agent: &Agent, realm: &Handle<Realm>, bytes: &[u8]) -> Result<Valu
         made: vec![None; records.len()],
         pins: Vec::new(),
     };
-    builder.materialize(root).ok_or(DecodeError::Truncated)
+    let mut values = Vec::with_capacity(items.len());
+    for serial in items {
+        values.push(builder.materialize(serial).ok_or(DecodeError::Truncated)?);
+    }
+    Ok(Some(values))
+}
+
+/// Read a blob, answering the value at slot 0's index 0.
+///
+/// The single-value form of [`decode_slot`], matching [`encode`].
+pub fn decode(agent: &Agent, realm: &Handle<Realm>, bytes: &[u8]) -> Result<Value, DecodeError> {
+    decode_slot(agent, realm, bytes, 0)?
+        .and_then(|items| items.first().copied())
+        .ok_or(DecodeError::Truncated)
 }
 
 /// Whether `bytes` is a blob of this format, this version and this build's
@@ -338,9 +420,9 @@ pub fn is_valid(bytes: &[u8]) -> bool {
     header(bytes).is_ok()
 }
 
-/// Read and check the header, answering the body's length and the root's
-/// serial.
-fn header(bytes: &[u8]) -> Result<(usize, u32), DecodeError> {
+/// Read and check the header, answering the body's length and how many contexts
+/// the table holds.
+fn header(bytes: &[u8]) -> Result<(usize, usize), DecodeError> {
     let mut reader = Reader::new(bytes);
     if reader.take(MAGIC.len()).ok_or(DecodeError::Truncated)? != MAGIC {
         return Err(DecodeError::NotASnapshot);
@@ -369,7 +451,7 @@ fn header(bytes: &[u8]) -> Result<(usize, u32), DecodeError> {
     }
     reader.take(2).ok_or(DecodeError::Truncated)?;
     let body_len = reader.u32().ok_or(DecodeError::Truncated)? as usize;
-    let root = reader.u32().ok_or(DecodeError::Truncated)?;
+    let context_count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
 
     let available = bytes.len().saturating_sub(HEADER_LEN + MAGIC.len());
     if body_len != available {
@@ -381,7 +463,7 @@ fn header(bytes: &[u8]) -> Result<(usize, u32), DecodeError> {
     if bytes[bytes.len() - MAGIC.len()..] != *MAGIC {
         return Err(DecodeError::NotASnapshot);
     }
-    Ok((body_len, root))
+    Ok((body_len, context_count))
 }
 
 fn write_u32(buffer: &mut Vec<u8>, value: u32) {
@@ -460,11 +542,14 @@ impl<'a> Reader<'a> {
 /// Walk `value`, answering the serial of the record that will carry it.
 ///
 /// A value the walk has seen is answered by its existing serial, which is what
-/// makes a graph a graph rather than a tree.
+/// makes a graph a graph rather than a tree. Each record remembers the realm its
+/// value was first reached through, because that is the realm whose intrinsics
+/// recognize it — the name a reference is written as.
 fn visit(
+    agent: &Agent,
     realm: &Handle<Realm>,
     value: Value,
-    objects: &mut Vec<Value>,
+    objects: &mut Vec<(Value, Handle<Realm>)>,
     serials: &mut HashMap<Identity, u32>,
 ) -> Result<u32, Unsupported> {
     let key = identity(realm, value);
@@ -473,22 +558,19 @@ fn visit(
     }
     serials.insert(key, objects.len() as u32);
     let serial = objects.len() as u32;
-    objects.push(value);
+    objects.push((value, *realm));
 
     match value.kind() {
         ValueKind::Object(object) => {
             if realm.intrinsics.name_of_value(&value).is_none() {
                 for child in children(&object)? {
-                    visit(realm, child, objects, serials)?;
+                    visit(agent, realm, child, objects, serials)?;
                 }
             }
         }
         ValueKind::Function(_) => {
             if realm.intrinsics.name_of_value(&value).is_none() {
-                return Err(Unsupported::new(
-                    "a function",
-                    "a function body is not carried yet",
-                ));
+                return Err(uncarried_callable(agent, realm, &value));
             }
         }
         ValueKind::Undefined
@@ -500,6 +582,28 @@ fn visit(
         | ValueKind::Symbol(_) => {}
     }
     Ok(serial)
+}
+
+/// Why a callable was not carried, as precisely as the walk can tell.
+///
+/// A callable the walking realm does not know may be one *another* realm of this
+/// isolate knows, which means the value was built in a different context than
+/// the slot it is being written into. That is a host's mistake rather than a
+/// missing feature, and it has a different fix, so it gets a different message —
+/// otherwise the failure surfaces three frames later as "a function", which is
+/// what the first version of this walk reported for it.
+fn uncarried_callable(agent: &Agent, realm: &Handle<Realm>, value: &Value) -> Unsupported {
+    let from_another_realm = agent.realms.borrow().iter().any(|other| {
+        !Handle::ptr_eq(*other, *realm) && other.intrinsics.name_of_value(value).is_some()
+    });
+    if from_another_realm {
+        Unsupported::new(
+            "a value from another realm",
+            "the value was built in another context of this isolate, so the realm it is being written into cannot name its builtins",
+        )
+    } else {
+        Unsupported::new("a function", "a function body is not carried yet")
+    }
 }
 
 /// Every value an object reaches: its prototype, its keys, and its values.
@@ -711,12 +815,10 @@ fn write_record(
                 body.push(REC_INTRINSIC);
                 write_text(body, &name);
             }
-            None => {
-                return Err(Unsupported::new(
-                    "a function",
-                    "a function body is not carried yet",
-                ));
-            }
+            // The walk refuses an uncarried callable before this, so reaching
+            // here means the walk and the writer disagree about a record rather
+            // than that a host's value is uncarried.
+            None => return Err(uncarried_callable(agent, realm, &value)),
         },
         ValueKind::Object(object) => match realm.intrinsics.name_of_value(&value) {
             Some(name) => {
@@ -1517,15 +1619,115 @@ mod tests {
     }
 
     #[test]
-    fn a_root_that_names_no_record_is_refused() {
+    fn a_reference_that_names_no_record_is_refused() {
         let (isolate, realm) = fixture();
         let mut blob = encode_value(&isolate, &realm, Value::Number(1.0));
         assert!(decode(agent_of(&isolate), &realm, &blob).is_ok());
-        // The root serial sits at the end of the header; a blob whose graph
-        // does not close is refused rather than answered with a guess.
-        let root_at = HEADER_LEN - 4;
-        blob[root_at..root_at + 4].copy_from_slice(&7u32.to_le_bytes());
+        // The body is the context table — slot index, item count, item serial —
+        // then the object count and the records. Pointing the item serial past
+        // the table is a blob whose graph does not close, which is refused
+        // rather than answered with a guess.
+        let item = HEADER_LEN + 8;
+        blob[item..item + 4].copy_from_slice(&9u32.to_le_bytes());
         assert!(decode(agent_of(&isolate), &realm, &blob).is_err());
+    }
+
+    /// The context table is structural: two slots keep their own items, and a
+    /// slot the blob does not name answers `None` rather than an empty list.
+    #[test]
+    fn two_slots_keep_their_own_items() {
+        let (isolate, realm) = fixture();
+        let first = [Value::Number(1.0), Value::Number(2.0)];
+        let second = [Value::String(Handle::new(JsString::from_utf8("two")))];
+        let slots = [
+            Slot {
+                index: 0,
+                realm,
+                items: &first,
+            },
+            Slot {
+                index: 3,
+                realm,
+                items: &second,
+            },
+        ];
+        let blob = encode_slots(agent_of(&isolate), &slots).expect("a blob");
+
+        let read = |slot| {
+            decode_slot(agent_of(&isolate), &realm, &blob, slot).expect("a blob of this tree")
+        };
+        let zero = read(0).expect("slot 0");
+        assert_eq!(zero.len(), 2);
+        assert_eq!(zero[1].as_number(), Some(2.0));
+        let three = read(3).expect("slot 3");
+        assert_eq!(three.len(), 1);
+        assert_eq!(
+            three[0].as_string().map(|text| text.to_string_lossy()),
+            Some("two".to_string())
+        );
+        assert!(read(1).is_none(), "a slot the blob does not name");
+    }
+
+    /// Each slot is written against its own realm, so two realms' `%Object.prototype%`
+    /// — two objects with one name — come back as the realm's own, and a slot's
+    /// items keep the realm's intrinsics.
+    #[test]
+    fn each_slot_is_written_against_its_own_realm() {
+        let mut isolate = api::Isolate::new();
+        let first = api::Context::new(&mut isolate).expect("a realm");
+        let second = api::Context::new(&mut isolate).expect("a second realm");
+        let value = second
+            .try_eval("({ n: 1 })")
+            .expect("an object in the second realm")
+            .into_value();
+        let second_prototype = second
+            .intrinsic("%Object.prototype%")
+            .and_then(|value| value.as_object())
+            .expect("the second realm's object prototype");
+        let items = [value];
+        let slots = [Slot {
+            index: 1,
+            realm: *second.realm(),
+            items: &items,
+        }];
+        let blob = encode_slots(agent_of(&isolate), &slots).expect("a blob");
+
+        let back = decode_slot(agent_of(&isolate), second.realm(), &blob, 1)
+            .expect("a blob of this tree")
+            .expect("slot 1");
+        assert_eq!(
+            back[0]
+                .as_object()
+                .expect("an object")
+                .get_prototype_of()
+                .expect("its prototype")
+                .map(|prototype| prototype.id()),
+            Some(second_prototype.id()),
+            "the object came back linked to its own realm's prototype"
+        );
+        let _ = first;
+    }
+
+    /// A value built in one realm, written into a slot named by another, is
+    /// refused as such: its builtins belong to a realm the slot cannot name,
+    /// which is a host's mistake about contexts rather than a missing feature.
+    #[test]
+    fn a_value_from_another_realm_is_refused_as_such() {
+        let mut isolate = api::Isolate::new();
+        let first = api::Context::new(&mut isolate).expect("a realm");
+        let second = api::Context::new(&mut isolate).expect("a second realm");
+        let value = second
+            .try_eval("({ n: 1 })")
+            .expect("an object in the second realm")
+            .into_value();
+        let items = [value];
+        let slots = [Slot {
+            index: 0,
+            realm: *first.realm(),
+            items: &items,
+        }];
+        let error = encode_slots(agent_of(&isolate), &slots).expect_err("refused");
+        assert_eq!(error.type_name, "a value from another realm");
     }
 
     #[test]
@@ -1564,7 +1766,9 @@ mod tests {
         assert!(decode_it(&cut_short).is_err());
 
         let mut bad_tag = blob.clone();
-        bad_tag[HEADER_LEN + 4] = 200;
+        // The body is the context table (slot index, item count, one item) then
+        // the object count, so the first record's tag follows those 16 bytes.
+        bad_tag[HEADER_LEN + 16] = 200;
         assert!(matches!(decode_it(&bad_tag), Err(DecodeError::BadTag(200))));
 
         assert_eq!(

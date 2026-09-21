@@ -9,7 +9,7 @@ use crate::agent::Agent;
 use crate::realm::Realm;
 
 use super::Isolate;
-use super::handle::{Local, MaybeLocal};
+use super::handle::{Global, Local, MaybeLocal};
 
 /// A realm on an isolate (v8::Context).
 ///
@@ -68,30 +68,64 @@ impl Context {
         &self.realm
     }
 
-    /// Write the data a host attached to each context slot.
+    /// Write the data a host attached to each context, as one snapshot blob.
     ///
-    /// The slots are the blob's context table in V8's convention — slot 0 the
-    /// default context, the ones added after it next — and the table is built
-    /// in *this* context's realm, so a builtin in the graph is written as the
-    /// name this realm knows it by.
+    /// The slots are the host's own numbering, in the crate we stand in for's
+    /// convention: the default context is 0 and the contexts added after it are
+    /// 1, 2, ... Each slot is written against the realm of the context it
+    /// names, because a value's builtins are its own realm's. A value a slot's
+    /// realm cannot name is an error naming it — see
+    /// [`crate::snapshot::Unsupported`].
     pub fn write_snapshot(
-        &self,
-        slots: &[Vec<Local>],
+        slots: &[(usize, Context, Vec<Local>)],
     ) -> Result<Vec<u8>, crate::snapshot::Unsupported> {
-        let slots: Vec<Vec<Value>> = slots
-            .iter()
-            .map(|slot| slot.iter().map(|local| *local.value()).collect())
-            .collect();
-        self.with_agent(|agent| crate::snapshot::encode_slots(agent, &self.realm, &slots))
+        let Some((_, first, _)) = slots.first() else {
+            return Err(crate::snapshot::Unsupported::empty_table());
+        };
+        first.with_agent(|agent| {
+            // The converted values are owned here rather than in the slot list
+            // the encoder reads, which borrows them.
+            let owned: Vec<(usize, Handle<Realm>, Vec<Value>)> = slots
+                .iter()
+                .map(|(index, context, items)| {
+                    (
+                        *index,
+                        *context.realm(),
+                        items.iter().map(|item| *item.value()).collect(),
+                    )
+                })
+                .collect();
+            let engine_slots: Vec<crate::snapshot::Slot<'_>> = owned
+                .iter()
+                .map(|(index, realm, items)| crate::snapshot::Slot {
+                    index: *index,
+                    realm: *realm,
+                    items,
+                })
+                .collect();
+            crate::snapshot::encode_slots(agent, &engine_slots)
+        })
     }
 
-    /// Read a snapshot blob, making the values it carries in this realm.
+    /// Read the data a blob carried for one context slot, made in this realm.
     ///
-    /// The values are rooted only by the caller: the answer is a handle like
-    /// any other, so a host that means to keep it takes a persistent one.
-    pub fn read_snapshot(&self, bytes: &[u8]) -> Result<Local, crate::snapshot::DecodeError> {
-        self.with_agent(|agent| crate::snapshot::decode(agent, &self.realm, bytes))
-            .map(Local)
+    /// `None` when the blob names no such slot. The values are persistent
+    /// handles: they are rooted from the moment they exist, so a host does not
+    /// have to pin them itself, and dropping one releases it.
+    pub fn read_snapshot(
+        &self,
+        bytes: &[u8],
+        slot: usize,
+    ) -> Result<Option<Vec<Global>>, crate::snapshot::DecodeError> {
+        self.with_agent(|agent| {
+            let items = crate::snapshot::decode_slot(agent, &self.realm, bytes, slot)?;
+            Ok(items.map(|items| {
+                items
+                    .into_iter()
+                    .map(|value| Global::new(Local(value)))
+                    .collect()
+            }))
+        })
     }
 
     /// Run `body` with this isolate's agent recorded as current, so host

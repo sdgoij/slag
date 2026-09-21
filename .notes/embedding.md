@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last record, ledger item 16): a versioned blob over the host's attached context data, restored into a rebuilt realm, with what it refuses named. External references are the half of that pair still missing, and the rows below record why they are a compatibility surface from day one. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last two records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, with what it refuses named. External references are the half of that pair still missing, and the rows below record why they are a compatibility surface from day one. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2568,7 +2568,7 @@ The exotic gate was found by asking what the first version would have *done* wit
 
 *The index conventions are V8's*, because the host reads them back: context slot 0 is the default context and `AddContext` answers 1, 2, … — `kFirstAddtlContextIndex` in `v8/src/snapshot/snapshot.cc`, which the bridge's earlier 0-based answer did not match. Nothing depended on the old value, since no blob existed to read it back out of. A context's own data starts at 0 and each attached item answers the next index. `StartupData::is_valid` is now a real question — magic, version, word size, byte order, lengths, tail — and an isolate handed a blob that is not this engine's **boots from source** rather than consuming it, which is what the host's own `is_valid` check told it to expect.
 
-*The slot table is the engine's, not the bridge's, and that is a measurement rather than a preference.* The first version had the bridge build an array-of-item-arrays with `api::Array::new`, and it failed: that path creates the array through the agent's **current** realm (`builtins::array::create` → `agent.current_realm()`), so with a second context created — which is exactly what `AddContext` does — the root array carried the *other* realm's `%Array.prototype%`, the walk could not name it in the realm it was writing, and it descended into that realm's builtin methods until it hit a function. `encode_slots` therefore builds the table in the realm it was given, via `realm.intrinsics.array_prototype()`. What is still not carried, and says so where a host would look for it: data attached to a context other than the default one refuses at `AddContextData` with "an isolate here has one realm" — a second `Context::new` shadows the first in this engine's api, so a second realm's objects are built in the wrong one and a blob of them would be *wrong* rather than partial. Isolate-level data answers `NoData`, as its doc says. Continuation from an existing blob is not consumed yet.
+*The slot table is the engine's, not the bridge's, and that is a measurement rather than a preference.* The first version had the bridge build an array-of-item-arrays with `api::Array::new`, and it failed: that path creates the array through the agent's **current** realm (`builtins::array::create` → `agent.current_realm()`), so with a second context created — which is exactly what `AddContext` does — the root array carried the *other* realm's `%Array.prototype%`, the walk could not name it in the realm it was writing, and it descended into that realm's builtin methods until it hit a function. `encode_slots` therefore builds the table in the realm it was given, via `realm.intrinsics.array_prototype()`. What is still not carried, and says so where a host would look for it: data attached to a context other than the default one refuses at `AddContextData` with "an isolate here has one realm" — a second `Context::new` shadows the first in this engine's api, so a second realm's objects are built in the wrong one and a blob of them would be *wrong* rather than partial. *(Superseded by the next record: the table carries a slot per context and that refusal is gone.)* Isolate-level data answers `NoData`, as its doc says. Continuation from an existing blob is not consumed yet.
 
 *Both modes write the same blob*: nothing carries a function body, so no compiled code is carried in either, and `FunctionCodeHandling` is recorded rather than honored. The code cache and the unbound scripts (§12 item 3) are what that waits on.
 
@@ -2583,6 +2583,26 @@ What that means for the next measurement, and why it was not taken here: re-runn
 Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **811 passed / 0 failed**; `cargo test -p v8 --features simdutf` **213 passed / 0 failed**; `cargo test -p crux --lib` 248 / 0; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,176 passed / 0 failed**. `crates/runtime` changed, so the whole battery ran and every number is the certified one: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail. Nothing in this workspace depends on `crates/v8`, so the bridge half implicates no sweep.
 
 The battery ran on the tree as it stood when the format landed; the exotic gate and the `visit` signature came after it, and both are inside `crates/runtime/src/snapshot.rs`, so the numbers still stand for this tree — checked by grep rather than assumed: the only files naming `write_snapshot`, `read_snapshot`, `snapshot::encode` or `Intrinsics::name_of_value` are `crates/runtime/src/{snapshot.rs,realm.rs,api/context.rs}` and `crates/v8/snapshot.rs`, and none of `crates/test262`, `crates/wasmtest`, `crates/wasm` or `crates/cli` names `runtime::api` at all.
+
+**The context table, one slot per context — landed, and the one-realm refusal is gone.** The gap the record above named, and the half `deno_core` actually reads: its build takes a *fresh, empty* context as slot 0 (`jsruntime.rs:2937`, `v8::Context::new` then `set_default_context`) and adds the realm it bootstrapped in at slot 1, attaching everything it snapshotted to *that* context. So slot 1 is not a corner case, it is the only slot with data in it.
+
+*The table is structural now, not a value graph.* Slice 1 built the table as an array of arrays — engine values, which is what made the realm question unavoidable: the array had to be made in *some* realm, and the first version's failure came from making it through the isolate's current one. A table is the format's own structure, so it is written as one: the header carries the context count and the body carries `(slot, item count, item serials)` per context, then the records. No scaffolding objects exist to be attributed to a realm.
+
+*Each slot is written and read against its own realm.* `encode_slots` takes `Slot { index, realm, items }` and walks each slot's items with that slot's realm; `decode_slot(realm, bytes, slot)` materializes that slot's items in the realm being restored into. The realm is not a hint: a value's builtins are its own realm's, and a reference to one is written as *the name its realm knows it by*. So every record remembers the realm it was first reached through — that is the realm whose `name_of_value` recognizes it — which is why `objects` carries `(Value, Handle<Realm>)` pairs rather than values.
+
+*An intrinsic name is realm-agnostic, and that is the mechanism rather than a leak.* Two realms' `%Object.prototype%` are two objects with one name, so they share the identity key, share one record, and each restore resolves the name to the realm it is materializing in — which is the correct object for each slot. A value *shared* between two slots that is not an intrinsic comes back as one value per slot, because a restore makes values one slot at a time; a host that needs one object in both realms has a cross-realm reference, which V8's own snapshot would carry and this format does not claim to yet.
+
+*And a value built in the wrong realm now says so.* The slice-1 measurement chased that failure by hand: an object from realm B written into a slot named by realm A mis-recognizes B's `%Object.prototype%`, descends into it, and surfaces as "a function". `uncarried_callable` checks the agent's other realms before answering, so the refusal is now `a value from another realm` with the reason — a host's mistake about contexts, which has a different fix from a missing feature. It costs one scan of the realm list, on the failure path only.
+
+*The bridge stopped refusing.* `add_context_data` accepts an added context and answers the index within that context's own list; `slot_of` is default → 0, added → 1, 2, … again; `create_blob` writes one table entry per recorded context (empty lists included, because "recorded with nothing" is not "not named"); `restore` decodes the slot the host asks for, in the realm `from_snapshot` just created. The one remaining refusal is for a context the creator never recorded, which is V8's own check and now says which call to make first.
+
+The version stays 1: nothing outside this tree has ever written a blob in this format, so a layout change is part of v1 rather than a v2 — the header's version field is what will make the next change a v2.
+
+*And the next blocker is now named.* With the table in place, deno's `create_blob` no longer fails for lack of a slot — it fails on what deno *registers*: `SnapshotStoreDataStore::register` takes `v8::Global<Function>`s (the promise-rejection callback, the `ext_import_meta_proto` object) and function templates, and a function body is the one thing this format refuses by name. So carrying a function is the next slice, and it splits the way §12 item 3 already splits it: a JS body recompiled from the source the engine kept, and a *native* one — an op — named through the index-stable external-reference table, which is the other half of engine item (3).
+
+*Tests.* Three in the engine: two slots keeping their own items with a third slot answering `None`; a slot written and read against its own realm, asserted on the restored prototype's *identity* (the second realm's `%Object.prototype%`, not the first's); and a value built in another realm refused as such. Two in the bridge, and the second is the acceptance test for this slice: `an_added_context_carries_its_own_data` — an empty-item default at slot 0, an object built in the added context's realm at slot 1, each restored into its own context and read back. Two mutations, both caught: writing every slot against slot 0's realm fails the added-context test with the engine's refusal at `create_blob`, and making `uncarried_callable` always answer "a function" fails the refinement test.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **814 passed / 0 failed**; `cargo test -p v8 --features simdutf` **214 passed / 0 failed**; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,180 passed / 0 failed**. `crates/runtime` changed, so the battery ran again and every number is unchanged: test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang (158 skip), `intl402` 3,205 pass / 0 fail (152 skip), the eight wasm core suites 64,594 checks / 0 fail / 0 pending, the JS-API sweep 1,001 tests / 0 fail.
 
 ## 8. Parked: the C++ face
 
@@ -3247,9 +3267,22 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   **Landed** (§7 records it): what carries, what refuses by name, the versioned
   header, the index conventions, and the one thing the first version got wrong
   and the measurement caught — a root table built through an isolate's current
-  realm rather than the realm being written. What it does not do is named there
-  too rather than here: one context slot, no external references, no compiled
-  code, no isolate data, no continuation.
+  realm rather than the realm being written.
+
+  **Second half — the context table, named before it was written.** The table
+  becomes structural (the header carries the context count, the body carries
+  `(slot, item serials)` per context) instead of an array of arrays built as
+  engine values, and each slot is written and read against *its own realm*:
+  `encode_slots` takes a realm per slot, `decode_slot(realm, bytes, slot)`
+  materializes into the realm being restored, and every record remembers the
+  realm it was reached through, because that is the realm whose intrinsics
+  recognize it. This is the engine change the one-realm refusal in the bridge's
+  `add_context_data` was waiting on, so that refusal goes with it, and a value
+  built in another realm is refused as such rather than surfacing as "a
+  function" three frames later. What it does not do is still named in §7: a
+  value shared between two contexts comes back one per context, the format
+  carries no external references, no compiled code, no isolate data and no
+  continuation.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3388,15 +3421,15 @@ a frame view of the running stack. §7's survey already split the subsystem: the
 ## 10. Build order
 
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
-external references + per-isolate/context data slots — **the format landed
-(§7's last record, ledger item 16): a versioned blob carrying the value graph
-rooted at the data a host attached to its default context, with a restore that
+external references + per-isolate/context data slots — **the format and its
+context table landed (§7's last two records, ledger item 16): a versioned blob
+carrying the value graph rooted at the data a host attached to each of its
+contexts, written and read against each slot's own realm, with a restore that
 resolves a builtin by name in the realm it rebuilds. What is left of this item
 is named rather than implied: external references (the index-stable table,
-nothing in the format carries one yet), a slot per added context (today's
-answer is a refusal at `AddContextData` naming the one-realm reason),
-`FunctionCodeHandling::Keep`'s compiled code (which waits on the code cache),
-the isolate-level data slots, and continuation from an existing blob**; (4) module resolver as a
+nothing in the format carries one yet), `FunctionCodeHandling::Keep`'s compiled
+code (which waits on the code cache), the isolate-level data slots, and
+continuation from an existing blob**; (4) module resolver as a
 host trait (landed), **unbound scripts and script origins** (the bridge side
 landed — every Rust script handle is already context-unbound — and what the
 engine still owes there is the *code cache*: serializing its compiled program, so
@@ -3454,14 +3487,11 @@ from `LocalHandle` onto the tags, file by file, then (b) deleting `LocalHandle`
 and its deref table, which is when the tier §9 states stops being a tier;
 (3) point the local `deno/` checkout at the crate and run a script — the
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
-last record: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
+last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's first slice has landed, so what stops them now is narrower
-and named: the format carries the *default* context's attached data, while
-`deno_core` attaches its data to the realm it added at slot 1, so the next thing
-to close is a slot per context — and the reason it is not just a loop is that
-this engine's api gives an isolate one realm, so a second context's objects are
-built in the first one's realm. The `ext`-crate frontier of §7's measurement
+bridge. That item's two halves have landed, so the blocker this plan could name
+is gone: the format carries a slot per context, and `deno_core`'s data lives on
+the realm it added at slot 1. The `ext`-crate frontier of §7's measurement
 (341 errors across eight crates, none of them `deno_core`) is still what stands
 between this and a `deno` binary, and
 deno's own runtime gaps (`queueMicrotask` among them) sit behind that; (4)
@@ -3482,14 +3512,15 @@ delete.
 
 1. **Weak persistent handles** — the last L2 item. Design sketched in
    `.notes/host-object-gc.md` §4.3; not started.
-2. **Snapshot format** — **v1 landed** (§7's last record, ledger item 16): a
-   versioned blob over a value graph rooted at the host's attached context data,
-   with intrinsics written by name and a refusal naming anything uncarried. What
-   this item still owns: external references (nothing in the format carries an
-   index yet, and index stability across builds is the compatibility surface it
-   was always going to be), a slot per added context, compiled code for
-   `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
-   existing blob.
+2. **Snapshot format** — **v1 landed with its context table** (§7's last two
+   records, ledger item 16): a versioned blob over a value graph rooted at the
+   data a host attached to each of its contexts, written and read against each
+   slot's own realm, intrinsics by name, a refusal naming anything uncarried.
+   What this item still owns: external references (nothing in the format carries
+   an index yet, and index stability across builds is the compatibility surface
+   it was always going to be), a value shared between two contexts coming back
+   one per context, compiled code for `FunctionCodeHandling::Keep`, isolate-level
+   data, and continuation from an existing blob.
 3. **Sealing `slag::api`** — the re-export exists (`crates/slag/src/lib.rs`, with a
    test that drives a module through it), so a host can depend on `slag` alone.
    Still open: `Local::value`, `Isolate::agent`, `Local::as_object` name
