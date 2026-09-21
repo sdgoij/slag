@@ -544,6 +544,7 @@ number is the certified one.
 | after the first method pass (the handle casts and `Local`'s cross-type equality, the value conversions and element predicates, the object/array/function/promise/proxy/string calls, `NewTryCatch` from a callback scope) | **374** (see below) |
 | after the `From`/`TryFrom` closure (the transitive casts, and the predicate a template cast needs) | **369** (see below) |
 | after the scope and property bounds (`NewTryCatch` from a `ContextScope`, `PropertyFilter: Default`, and the `Proxy` getters they were hiding) | **364** (see below) |
+| after the identity hashes (the `Hash`/`Eq` a host's tables key on, and the module identity they hang off) | **351** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -783,6 +784,71 @@ failed** (118 with the crashing test skipped), `clippy` clean at crate and
 workspace scope, and `cargo test --locked --workspace` **5,051 passed / 0 failed
 / 4 ignored** across 38 binaries with that test skipped.
 
+**The identity hashes — landed, 364 → 351, and the sweeps re-run because an
+engine crate changed.** Thirteen `E0599`s were not missing methods at all: they
+were `HashSet<Local<'s, Object>>` and `HashMap<Global<Module>, _>`, whose methods
+exist but need `Hash` on a handle. The crate's shape is `Hash for Local<'_, T>`
+where `T: Hash`, with each tag's hash coming from V8 — an **identity** hash for
+every object and for `Name`/`String`/`Symbol`/`Module`, and a **value** hash for
+`Value` and the primitives.
+
+This bridge's tags are zero-sized, so there is nothing on a tag to hash; the
+impls go on the handles instead, in `data.rs` beside `PartialEq`. The half that
+landed is the identity half, over the same identity `payload_eq` already
+compares, which is the one contract a host's table needs — handles that compare
+equal hash equal:
+
+- Thirty-three tags (`Object` and everything below it, and `Module`) get `Eq`
+  and `Hash` for `Local<'_, T>` and `Global<T>`. An object's hash is the engine's
+  object id; a function's is the function's id; a module's is the box address.
+- `Object::get_identity_hash` and `Module::get_identity_hash` land with the
+  crate's names, folded to its non-zero `i32` shape. The module one needed an
+  engine addition, because a module record has no identity a language value could
+  carry and nothing in `runtime::api` reached its address:
+  `api::Module::get_identity_hash` now reports what `PartialEq` already compares
+  (the box address, which the arena never moves).
+- The **value** tags (`Value`, `Name`, `String`, `Symbol`, the primitives) stay
+  absent, and the reason is the equality they would have to agree with: this
+  bridge's `Local` equality is the payload's (`f64::eq`, content for strings),
+  while the crate's is `SameValue` — so a hash that agrees with ours is a
+  different number from the one that agrees with theirs, and for `Number` the
+  bridge's equality is not even reflexive (`NaN`). That is a divergence §9 now
+  records, and it is the thing to settle before the value half can land.
+
+Measured: **364 → 351**, and `E0599` 271 → 258 — exactly the thirteen bound
+failures, checked by diffing the two error lists. Two tests guard the new impls
+and both were made to fail: one puts two handles to the global object and one to
+a fresh object in a set and a `Global` set, the other does the same with two
+compiled modules; forcing the hash to a constant fails them.
+
+Gates: `cargo test -p v8 --features simdutf` **121 passed / 0 failed** (120 with
+the crashing test skipped), `clippy` clean at crate and workspace scope, and
+`cargo test --locked --workspace` **5,053 passed / 0 failed / 4 ignored** across
+38 binaries with that test skipped. `crates/runtime` changed, so the sweep
+battery ran rather than being argued away:
+
+| sweep | result |
+|---|---|
+| test262 `all` (15s/15s) | 48,622 fixtures — 48,461 pass, **0 fail / 0 crash**, 158 skip, **3 hang** (see below) |
+| test262 `intl402` | 3,357 fixtures — 3,205 pass, 0 fail / 0 crash / 0 hang, 152 skip |
+| wasm core (`run --strict`, 8 suites) | 64,594 checks — 0 fail, 0 pending (20,662 + 7,485 + 105 + 654 + 8,709 + 912 + 77 + 25,990) |
+| wasm JS-API (`jsapi`) | 1,001 tests — 0 fail |
+
+The three hangs, reported honestly: `TypedArray/prototype/copyWithin/`
+`coerced-values-{start,end}-detached*.js`, reported in two consecutive full
+sweeps and in neither the directory sweep (65/65 pass, 0 hang) nor the worker
+(they pass alone, in **7.8s, 8.1s and 10.4s**). They are deadline artefacts, not
+hangs, and the counts say so: pass plus skip is 48,461 + 158, exactly the
+certified total with those three moved from pass to hang, so the engine's verdict
+on every fixture is unchanged. Their slowness is inherent to what they build —
+with `includeArgFactories: ["immutable"]` the harness still runs the callback
+eight times per constructor over a 10,000-element source, and constructing a
+10,000-element typed array from the harness's array-like object costs ~105 ms
+(574 ms for the `Float64Array` round) in this engine — so the same fixtures sat
+close to the deadline at certification and crossed it here. Recorded as an open
+item: the construction path from an array-like object is worth a look, and the
+next sweep should be read against these three by name rather than by count.
+
 **The documented `runtime` flake reproduced.**
 `builtins::function::tests::certified_body_global_read_fast_path_stays_spec_exact`
 failed during this pass's first workspace run —
@@ -945,6 +1011,17 @@ if that proves possible.
   `ContextScope` receiver also needed `ContextScope::new` to hand back the scope
   rather than its storage, which is what the crate does: a shape that looks
   equivalent can decide whether an impl is reachable through `DerefMut` at all.
+- **Handle equality here is the payload's, where the crate's is `SameValue`.**
+  `Local<Number>` under this bridge compares with `f64::eq`, so `NaN != NaN` and
+  `-0 == 0`; the crate compares with `v8::Value::SameValue`, so `NaN == NaN` and
+  `-0 != 0`. Nothing host-facing has asked yet, and the consequence today is one
+  missing group of impls rather than a wrong answer: the value tags cannot carry
+  a `Hash` that agrees with this bridge's `==` and with the crate's at the same
+  time, which is why only the identity half of the hash surface landed. Settling
+  it means asking the engine for the same operation the crate asks V8 for
+  (`same_value` already does, for the explicit call), and then the value hashes
+  follow. Recorded here rather than left to be discovered from a `HashMap` that
+  behaves differently on two NaNs.
 - **The tag shape blocks a quarter of the remaining `deno_core` surface, and
   the decision is open.** `deno_core` calls methods on `&v8::Value` and
   `&v8::String` and transmutes between them (`libs/core/runtime/ops.rs:273`,
@@ -985,10 +1062,10 @@ Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks
 frontier is closed (8 left, the wasm tail) and the serializer is landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
 first pass through them took it to 374, the cast closure to 369, the scope and
-property bounds to 364, and what is left is the method surface (271 `E0599`s:
-51 on a `Local<…>`, 122 on a tag, 85 on another bridge type, 13 missing `Hash`),
-the 78 `E0308`s the tag shape explains, the 8 names, and six stragglers
-(3 `E0515`, 2 `E0605`, 1 `E0282`);
+property bounds to 364, the identity hashes to 351, and what is left is the
+method surface (258 `E0599`s: 51 on a `Local<…>`, 122 on a tag, 85 on another
+bridge type), the 78 `E0308`s the tag shape explains, the 8 names, and six
+stragglers (3 `E0515`, 2 `E0605`, 1 `E0282`);
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then

@@ -1,6 +1,8 @@
 //! Objects, arrays, and the keyed collections (`v8::Object`, `v8::Array`,
 //! `v8::Map`, `v8::Set`).
 
+use std::num::NonZeroI32;
+
 use crux::handle::Handle;
 use crux::object::{JsObject, ObjectKind, PropertyKind};
 use crux::property::{PropertyDescriptor, PropertyKey};
@@ -76,6 +78,16 @@ impl Object {
 }
 
 impl<'s> Local<'s, Object> {
+    /// The object's identity hash (v8::Object::GetIdentityHash), the number a
+    /// host keys a table by.
+    ///
+    /// The engine gives every object an id of its own for as long as it lives,
+    /// which is the identity this bridge's handle equality already compares, so
+    /// a table keyed by this agrees with `==`.
+    pub fn get_identity_hash(&self) -> NonZeroI32 {
+        self.identity_hash()
+    }
+
     /// [[Get]] a property (`v8::Object::Get`).
     ///
     /// Only string keys are supported: Slag's public API resolves properties by
@@ -532,7 +544,9 @@ fn entries_array<'a>(scope: &PinScope<'a, '_>, values: Vec<EngineValue>) -> Loca
 mod tests {
     use super::*;
     use crate::data::{Number, Set};
+    use crate::handle::Global;
     use crate::property::{GetPropertyNamesArgsBuilder, IndexFilter, KeyCollectionMode};
+    use crate::scope::GetIsolate;
     use crate::test_support::{bind, eval, eval_number, in_context};
 
     /// The number a handle holds.
@@ -543,6 +557,46 @@ mod tests {
     /// The text a handle holds.
     fn text_of(scope: &PinScope<'_, '_>, value: Local<'_, Value>) -> std::string::String {
         value.to_rust_string_lossy(scope)
+    }
+
+    /// A handle can key a host's table, which needs `Hash` to agree with `==`:
+    /// one object under two handles is one key, a different object is another,
+    /// and the same holds for a persistent handle. The identity hash a host can
+    /// read is the same number the table keys on.
+    #[test]
+    fn handle_identity_is_what_a_host_table_keys_on() {
+        in_context!(scope, {
+            let global = Local::<Object>::try_from(eval(scope, "globalThis")).expect("object");
+            let same_global = Local::<Object>::try_from(eval(scope, "globalThis")).expect("object");
+            let other = Local::<Object>::try_from(eval(scope, "({})")).expect("object");
+
+            assert_eq!(global, same_global);
+            assert_eq!(global.get_identity_hash(), same_global.get_identity_hash());
+            assert_ne!(global.get_identity_hash(), other.get_identity_hash());
+
+            let mut keys = std::collections::HashSet::new();
+            keys.insert(global);
+            keys.insert(same_global);
+            assert_eq!(
+                keys.len(),
+                1,
+                "one object is one key, however many handles name it"
+            );
+            keys.insert(other);
+            assert_eq!(keys.len(), 2, "and a different object is a different key");
+            assert!(keys.contains(&global));
+
+            let isolate = scope.get_isolate_ptr();
+            let mut persistent = std::collections::HashSet::new();
+            persistent.insert(Global::new(&isolate, global));
+            persistent.insert(Global::new(&isolate, same_global));
+            assert_eq!(
+                persistent.len(),
+                1,
+                "a `Global` keys the same way a `Local` does"
+            );
+            assert!(!persistent.contains(&Global::new(&isolate, other)));
+        });
     }
 
     #[test]

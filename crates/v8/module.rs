@@ -24,6 +24,8 @@
 //!   module's own record, so `instantiate_module2`'s source callback is never
 //!   called.
 
+use std::num::NonZeroI32;
+
 use crux::error::JsError;
 use runtime::api;
 
@@ -132,6 +134,12 @@ where
 }
 
 impl<'s> Local<'s, Module> {
+    /// The record's identity hash (v8::Module::GetIdentityHash), for a host that
+    /// keys a table by module.
+    pub fn get_identity_hash(self) -> NonZeroI32 {
+        self.module().get_identity_hash()
+    }
+
     /// The module's current status (v8::Module::GetStatus).
     pub fn get_status(self) -> ModuleStatus {
         self.module().status()
@@ -317,11 +325,50 @@ fn attributes_of(
 mod tests {
     use super::*;
     use crate::data::{Number, Promise};
+    use crate::handle::Global;
+    use crate::scope::GetIsolate;
     use crate::script_compiler::{Source, compile_module};
     use crate::test_support::in_context;
 
     fn number_of(value: Local<'_, Value>) -> f64 {
         Local::<Number>::try_from(value).expect("number").value()
+    }
+
+    /// A module handle keys a host's table the way the crate's does: one record
+    /// under two handles is one key, a different record is another, and that
+    /// holds for a persistent handle too — which it cannot unless the hash
+    /// agrees with `==`.
+    #[test]
+    fn a_module_handle_keys_a_table() {
+        in_context!(scope, {
+            let text = JsString::new(scope, "export const x = 1;").expect("string");
+            let mut source = Source::new(text, None);
+            let module = compile_module(scope, &mut source).expect("compile");
+            let same = module;
+
+            let other_text = JsString::new(scope, "export const y = 2;").expect("string");
+            let mut other_source = Source::new(other_text, None);
+            let other = compile_module(scope, &mut other_source).expect("compile");
+
+            assert_eq!(module, same);
+            assert_eq!(module.get_identity_hash(), same.get_identity_hash());
+            assert_ne!(module.get_identity_hash(), other.get_identity_hash());
+
+            let mut keys = std::collections::HashSet::new();
+            keys.insert(module);
+            keys.insert(same);
+            assert_eq!(keys.len(), 1, "one record is one key");
+            keys.insert(other);
+            assert_eq!(keys.len(), 2, "and a different record is a different key");
+            assert!(keys.contains(&module));
+
+            let isolate = scope.get_isolate_ptr();
+            let mut persistent = std::collections::HashSet::new();
+            persistent.insert(Global::new(&isolate, module));
+            persistent.insert(Global::new(&isolate, same));
+            assert_eq!(persistent.len(), 1);
+            assert!(!persistent.contains(&Global::new(&isolate, other)));
+        });
     }
 
     /// A module compiled through the compiler runs, reports the status a host

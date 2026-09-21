@@ -16,6 +16,8 @@ use std::any::type_name;
 use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroI32;
 use std::ops::Deref;
 
 use crux::object::ObjectKind;
@@ -25,7 +27,7 @@ use runtime::Agent;
 use runtime::api;
 use runtime::function::EcmaFunction;
 
-use crate::handle::{Local, Payload};
+use crate::handle::{Global, Local, Payload};
 
 /// Every tag in the API. Zero-sized by design: a tag selects methods and
 /// comparison/cast impls, and holds nothing.
@@ -1009,6 +1011,79 @@ impl_try_from! {
     TypedArray => BigUint64Array,
 
     Template => FunctionTemplate,
+}
+
+/// The tags the crate we stand in for hashes by identity, which is the half of
+/// its hash surface this bridge can answer: every one of them names an object (or
+/// a module record), so the identity `PartialEq` already compares — the object's
+/// id in the arena — is the hash. The value tags (`Value`, `Name`, `String`,
+/// `Symbol` and the primitives) are the other half and are absent: their
+/// equality here is the value's, and a hash that agrees with it needs the
+/// same-value work `Local`'s `PartialEq` does not do yet.
+macro_rules! identity_hashes {
+    ($($tag:ident),* $(,)?) => {
+        $(
+            impl Eq for Local<'_, $tag> {}
+
+            impl Eq for Global<$tag> {}
+
+            impl Hash for Local<'_, $tag> {
+                fn hash<H: Hasher>(&self, state: &mut H) {
+                    self.identity_hash().hash(state);
+                }
+            }
+
+            impl Hash for Global<$tag> {
+                fn hash<H: Hasher>(&self, state: &mut H) {
+                    self.handle().identity_hash().hash(state);
+                }
+            }
+        )*
+    };
+}
+
+impl<'s, T> Local<'s, T> {
+    /// The identity hash of the thing this handle names, for the tagged impls
+    /// above; a crate-private door onto [`identity_hash`](crate::handle::identity_hash).
+    pub(crate) fn identity_hash(&self) -> NonZeroI32 {
+        crate::handle::identity_hash(self.payload())
+    }
+}
+
+identity_hashes! {
+    Module,
+    Object,
+    Array,
+    Function,
+    Promise,
+    PromiseResolver,
+    Proxy,
+    RegExp,
+    Date,
+    Map,
+    Set,
+    StringObject,
+    NumberObject,
+    BooleanObject,
+    SymbolObject,
+    BigIntObject,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    ArrayBufferView,
+    DataView,
+    TypedArray,
+    Uint8Array,
+    Uint8ClampedArray,
+    Int8Array,
+    Uint16Array,
+    Int16Array,
+    Uint32Array,
+    Int32Array,
+    Float16Array,
+    Float32Array,
+    Float64Array,
+    BigInt64Array,
+    BigUint64Array,
 }
 
 /// The error of a failed [`Local`] cast: the value was not of the type the tag

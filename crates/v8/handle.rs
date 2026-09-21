@@ -2,8 +2,10 @@
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::num::NonZeroI32;
 use std::rc::Rc;
 
+use crux::value::ValueKind;
 use runtime::api;
 
 use crate::scope::PinScope;
@@ -319,6 +321,44 @@ impl<T, Rhs: Handle> PartialEq<Rhs> for Global<T> {
     fn eq(&self, other: &Rhs) -> bool {
         payload_eq(&self.payload, other.payload_ref())
     }
+}
+
+/// The identity a handle names, as the crate's `GetIdentityHash` reports it.
+///
+/// This is the identity `payload_eq` compares, which is the whole contract a
+/// host's table needs from it: handles that compare equal hash equal. A handle
+/// that names no object — a primitive, a context, a script — has no identity to
+/// report, and the casts that can build one are unchecked, so this panics rather
+/// than answering a hash that would collide with every other such handle.
+pub(crate) fn identity_hash(payload: &Payload) -> NonZeroI32 {
+    match payload {
+        Payload::Value(value) => fold_identity(value_identity(value)),
+        Payload::Module(module) => module.get_identity_hash(),
+        Payload::Context(_) | Payload::Script { .. } => {
+            panic!("bridge bug: a handle with no identity was hashed")
+        }
+    }
+}
+
+/// The engine's id for the object or function a value names. An object and a
+/// function have ids of their own, and a handle of one is never compared with a
+/// handle of the other, so one id space is enough here.
+fn value_identity(value: &api::Local) -> Option<u64> {
+    match value.value().kind() {
+        ValueKind::Object(object) => Some(object.id()),
+        ValueKind::Function(function) => Some(function.id()),
+        _ => None,
+    }
+}
+
+/// An id, folded to the non-zero `i32` the crate's hashes are.
+fn fold_identity(identity: Option<u64>) -> NonZeroI32 {
+    let Some(identity) = identity else {
+        panic!("bridge bug: a handle with no identity was hashed");
+    };
+    // The low bits are the ones that differ between live boxes, and forcing the
+    // low bit keeps the result non-zero; the fallback is unreachable.
+    NonZeroI32::new((identity as u32 | 1) as i32).unwrap_or(NonZeroI32::MIN)
 }
 
 /// Whether two payloads name the same thing.

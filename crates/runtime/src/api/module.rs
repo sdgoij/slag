@@ -1,5 +1,7 @@
 //! Modules: a source text module record (v8::Module).
 
+use std::num::NonZeroI32;
+
 use crux::error::JsError;
 use crux::handle::Handle;
 use crux::string::JsString;
@@ -113,6 +115,21 @@ impl Module {
             }
             module::ModuleStatus::Evaluated => ModuleStatus::Evaluated,
         }
+    }
+
+    /// The record's identity hash (v8::Module::GetIdentityHash), for a host that
+    /// keys a table by module.
+    ///
+    /// A module has no identity a language value could carry, so what this
+    /// hashes is the address its box lives at — the same thing `PartialEq`
+    /// compares, and stable for as long as the record is alive, because the
+    /// arena never moves a box. Folded to the width the crate's API answers
+    /// with, and forced non-zero so it cannot be mistaken for an absent hash.
+    pub fn get_identity_hash(&self) -> NonZeroI32 {
+        let address = self.module.as_any().addr();
+        // Any odd fold of an address is a usable hash and, being odd, is never
+        // zero; the fallback is unreachable and exists to keep this total.
+        NonZeroI32::new((address as u32 | 1) as i32).unwrap_or(NonZeroI32::MIN)
     }
 
     /// Keep the module, and everything it reaches, alive until the returned
