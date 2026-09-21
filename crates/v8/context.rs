@@ -81,18 +81,33 @@ impl Context {
 
     /// A context restored from a snapshot (`v8::Context::FromSnapshot`).
     ///
-    /// `None`, and honestly so: this bridge cannot create a snapshot — see
-    /// [`SnapshotCreator`](crate::SnapshotCreator), whose `create_blob` says why
-    /// — so there is no blob whose contexts could be restored here. A host that
-    /// booted without one takes the other branch of its own initialization and
-    /// never asks; one that asks is told, rather than handed a context that is
-    /// not the one its blob names.
+    /// A context slot the isolate's blob names becomes a fresh realm with that
+    /// slot's attached data rooted in it, which the host then reads out through
+    /// [`get_context_data_from_snapshot_once`]. A slot the blob does not name
+    /// answers `None` — the same refusal the crate we stand in for makes with
+    /// an empty `MaybeLocal`, so a host takes its own other branch. The realm
+    /// which is passed over that way stays the isolate's current one, which is
+    /// the realm a host that asked for a slot its blob does not have would have
+    /// made anyway.
+    ///
+    /// A restored context gets what a new one gets — the engine's realm and the
+    /// console `Context::new` installs — plus the blob's data: what the blob
+    /// carries is the host's own attached state, not the engine's realm, which
+    /// is rebuilt deterministically either way.
+    ///
+    /// [`get_context_data_from_snapshot_once`]: crate::HandleScope::get_context_data_from_snapshot_once
     pub fn from_snapshot<'s>(
-        _scope: &PinScope<'s, '_, ()>,
-        _context_snapshot_index: usize,
-        _options: ContextOptions<'_>,
+        scope: &PinScope<'s, '_, ()>,
+        context_snapshot_index: usize,
+        options: ContextOptions<'_>,
     ) -> Option<Local<'s, Context>> {
-        None
+        let mut isolate = scope.isolate_ptr();
+        let handle = Self::new(scope, options);
+        let context = handle.context();
+        if !crate::snapshot::restore_context(&mut isolate, context, context_snapshot_index) {
+            return None;
+        }
+        Some(handle)
     }
 }
 
@@ -358,14 +373,15 @@ mod tests {
         });
     }
 
-    /// Nothing here can restore a snapshot, and the entry point says so rather
-    /// than handing back a context that is not the one a blob names.
+    /// An isolate that booted from source has no contexts to restore, and the
+    /// entry point says so rather than handing back a context that is not the
+    /// one a blob names.
     #[test]
-    fn a_context_cannot_be_restored_from_a_snapshot() {
+    fn a_context_without_a_blob_cannot_be_restored() {
         in_context!(scope, {
             assert!(
                 Context::from_snapshot(scope, 0, ContextOptions::default()).is_none(),
-                "a blob this bridge cannot make has no contexts to restore"
+                "the isolate booted from source, so it has no snapshot to restore"
             );
         });
     }

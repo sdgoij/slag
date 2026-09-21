@@ -35,6 +35,7 @@ pub mod raylib;
 pub mod realm;
 mod rlx;
 pub mod script;
+pub mod snapshot;
 mod stack;
 mod time;
 #[cfg(feature = "workers")]

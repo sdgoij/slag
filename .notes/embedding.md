@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last record, ledger item 16): a versioned blob over the host's attached context data, restored into a rebuilt realm, with what it refuses named. External references are the half of that pair still missing, and the rows below record why they are a compatibility surface from day one. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -281,10 +281,14 @@ engine doing no work off the calling thread and having no snapshot:
   agent and isolate are. A host that initializes on one thread and asks
   `get_current_platform` from another is told it is uninitialized instead of
   being handed a platform it cannot safely share.
-- **A snapshot blob is carried, not consumed**, and `StartupData::is_valid()`
-  answers `false`: a blob from V8 is not valid for this engine, and Slag
-  produces none of its own. A host that depends on its snapshot's contents must
-  be built without one — a configuration Deno-class hosts have.
+- **A snapshot blob is carried, not consumed, when it is not one this engine
+  wrote** — and `StartupData::is_valid()` answers that question for real now
+  (superseded by §7's last record: the engine has a format, and a blob of it is
+  consumed by the isolate it is handed to). Before the format landed, `is_valid`
+  answered `false` for everything, because a blob from V8 is not valid for this
+  engine and Slag produced none of its own. A host that depends on its
+  snapshot's contents must still be able to be built without one — which is the
+  configuration a Deno-class host has.
 
 Flags are recorded (`V8::get_flags`, the bridge's own accessor) and not
 interpreted: Slag's engine is not flag-configurable, so a host whose behavior
@@ -294,7 +298,10 @@ around: **`globalThis.queueMicrotask` does not exist in the engine** (Deno's
 core JS uses it, and its `--enable-queue-microtask` flag is how V8 supplies one),
 and there is no engine flag surface at all.
 
-**Snapshot creation — landed, and it refuses.** `Isolate::snapshot_creator` /
+**Snapshot creation — landed, and it refuses.** *(Superseded by §7's last record:
+this bridge now produces a blob. What follows is the state this step landed in,
+kept because the refusal decision it records is what the format then replaced.)*
+`Isolate::snapshot_creator` /
 `snapshot_creator_from_existing_snapshot`, `set_default_context`, `add_context`,
 `add_context_data` and `OwnedIsolate::create_blob`, with
 `v8::FunctionCodeHandling`. A creator isolate is a real isolate — a context can
@@ -315,9 +322,13 @@ it: `HandleScope::get_context_data_from_snapshot_once` and
 `get_isolate_data_from_snapshot_once`, over the same seal the crate we stand in
 for uses so the cast bounds stay unimplementable by a host. They answer
 `DataError::NoData` for every index — the crate we stand in for answers that for
-the *second* read of an index; here it is every read, which is the same statement
-about a snapshot that was never made — so the restore path reports through the
-error channel the shape already has rather than panicking.
+the *second* read of an index; here it was every read, which was the same
+statement about a snapshot that was never made — so the restore path reports
+through the error channel the shape already has rather than panicking. With the
+format landed the first of the two reads a restored context's items once, and
+the second is what still answers `NoData`; the isolate-level one answers it for
+every read, because the format carries a *context's* data and that is where a
+host attaches it.
 
 Between them, the two steps moved the count by **one** (`FunctionCodeHandling`,
 the only *name* in the group) and then by **zero**: every other item there was
@@ -2545,6 +2556,34 @@ Gates: `cargo test -p runtime --lib` **795 passed / 0 failed**, `cargo test -p v
 
 before failing inside `create_blob`, which this bridge aborts *on purpose*: "Slag has no snapshot format: an isolate boots from source" (§9). So the engine runs deno_core's bootstrap now, and what stands between `deno/` and a snapshot is the engine feature §10's engine-side item (3) already names: the snapshot format, with the external references that have to stay index-stable across builds. A host that boots from source needs none of it; deno's CLI does, so that is the next slice and it is an engine one.
 
+**The snapshot format, slice 1 — landed, and `create_blob` produces one.** The engine-side item the record above named, and ledger item 16 names the change before it was written. `crates/runtime/src/snapshot.rs` is the format; `api::Context::write_snapshot` / `read_snapshot` are the two entry points; the bridge's `SnapshotCreator` records and its restore decodes.
+
+*What a blob is.* Not a heap image: a realm here is rebuilt deterministically by `Context::new` on every boot, so what a host has to get back is the state **it** built. The blob is a *value graph rooted at the data the host attached to a context*, written once per value and referred to by serial — so a cycle round-trips as a cycle and two references to one object come back one object. Version 1, with the format version, the pointer width and the byte order in the header and the magic repeated at the tail, so a truncated blob is not a blob.
+
+*Two decisions make the graph small.* A builtin is written **by name, not by structure**: `Intrinsics::name_of_value` (new, in `realm.rs`) answers the name a value is registered under in a realm — functions through the id-keyed name table `name_of` already had, everything else by walking the entry table — so a reference to `%Object.prototype%` is a name that the restore resolves in the realm it is rebuilding, and the walk never descends into a builtin. Without it the first prototype would drag in every builtin the realm has: measured, the alternative is what the *first* failing attempt produced. A value is written once, keyed by identity (an object's id, a symbol's id) or by content where the language makes content the identity (a string's code units, a bigint's hex), and primitives by bit pattern — which is what lets a property's value be a serial rather than a copy.
+
+*The walk refuses rather than guessing*, and names what it refused (`Unsupported { type_name, detail }`): a function body, a proxy, a typed array, a module namespace, a host object, a host's document-all object, a `String` object, an arguments object, an `External`, an array with a hole, an indexed accessor, an array whose length is not an index. The exotic gate is one match over `ObjectKind` in the walk, before the prototype is read, so an exotic kind can never be written as the ordinary object its shape would suggest — a proxy without its traps, a typed array without its buffer, a `String` object without its string. Both the engine walk and the blob writer agree about which values they carry, so nothing is discovered on the read side. `create_blob` turns that error into a panic with the reason, which is the loudest message the crate's `Option` signature allows; the module docs say why a blob that quietly lost part of a host's state would be worse.
+
+The exotic gate was found by asking what the first version would have *done* with a proxy rather than by a failure: it had no `ObjectKind` check, so a proxy's own keys would have been written onto an ordinary object and its traps silently dropped — the exact shape of failure the plan's "a blob that quietly lost part of a host's state" rule forbids. It is therefore in the landed version, with the test above guarding it.
+
+*The index conventions are V8's*, because the host reads them back: context slot 0 is the default context and `AddContext` answers 1, 2, … — `kFirstAddtlContextIndex` in `v8/src/snapshot/snapshot.cc`, which the bridge's earlier 0-based answer did not match. Nothing depended on the old value, since no blob existed to read it back out of. A context's own data starts at 0 and each attached item answers the next index. `StartupData::is_valid` is now a real question — magic, version, word size, byte order, lengths, tail — and an isolate handed a blob that is not this engine's **boots from source** rather than consuming it, which is what the host's own `is_valid` check told it to expect.
+
+*The slot table is the engine's, not the bridge's, and that is a measurement rather than a preference.* The first version had the bridge build an array-of-item-arrays with `api::Array::new`, and it failed: that path creates the array through the agent's **current** realm (`builtins::array::create` → `agent.current_realm()`), so with a second context created — which is exactly what `AddContext` does — the root array carried the *other* realm's `%Array.prototype%`, the walk could not name it in the realm it was writing, and it descended into that realm's builtin methods until it hit a function. `encode_slots` therefore builds the table in the realm it was given, via `realm.intrinsics.array_prototype()`. What is still not carried, and says so where a host would look for it: data attached to a context other than the default one refuses at `AddContextData` with "an isolate here has one realm" — a second `Context::new` shadows the first in this engine's api, so a second realm's objects are built in the wrong one and a blob of them would be *wrong* rather than partial. Isolate-level data answers `NoData`, as its doc says. Continuation from an existing blob is not consumed yet.
+
+*Both modes write the same blob*: nothing carries a function body, so no compiled code is carried in either, and `FunctionCodeHandling` is recorded rather than honored. The code cache and the unbound scripts (§12 item 3) are what that waits on.
+
+*Tests.* Sixteen in `crates/runtime/src/snapshot.rs`, end to end over the format: primitives, a lone surrogate (code units, not a `String`), bigints by value, well-known symbols keeping their identity, registry symbols coming back as the registry's own, two symbols with one description staying two, an object's attributes and its intrinsic prototype by name, a cycle, a null prototype, an array with its length and elements, a hole refused, each exotic kind refused by name, a root that names no record, and a foreign blob refused by each of its header fields. Sixteen in `crates/v8/snapshot.rs`, through the V8-shaped surface: data attached and read back at its index, a self-reference surviving, an index read once, a slot the blob does not name answering `None`, an isolate without a blob having no data, a foreign blob not consumed, a function ending the build with its name, the slot convention, a creator without a context, data for another context refused, and a restored value made persistent and read after its scope is gone. Four were verified by mutating the code they guard and restoring it: passing `None` for a decoded prototype fails the prototype test; a refusal whose name is not the one the walk uses fails the exotic test; writing a symbol without its well-known entry fails the identity test; taking a snapshot item without removing it fails the read-once test.
+
+One thing did not need a test because it could not fail: a blob written by this tree is one this tree reads, asserted as the positive control in every round-trip test.
+
+*And the checkpoint moved under this work, in our favor.* `deno/`'s root now aliases the `v8` dependency to a facade: `Cargo.toml:109` declares `v8 = { package = "deno_v8", path = "./libs/deno_v8", default-features = false, features = ["simdutf"] }`, and `libs/deno_v8` ("JavaScript engine facade for Deno") depends on `rusty_v8 = { package = "v8", version = "150.4.0", optional = true }` — which the root's `[patch.crates-io] v8 = { path = "../crates/v8" }` redirects to this crate. `deno_core`'s `default = ["v8", ...]` turns that on, so **`cargo check -p deno_core` answering 0 is measured through the facade into `crates/v8`** — the hijack is no longer a plan, it is what the checkpoint's dependency graph does.
+
+What that means for the next measurement, and why it was not taken here: re-running the snapshot build script (`dcore`, or `libs/core/examples/snapshot`) fails *before* deno_core's JavaScript runs, because `dcore`'s **build-dependency** graph (`deno_core_testing`) resolves the facade without a backend under `resolver = "2"`'s per-kind unification, and `deno_v8` is a `compile_error!` then. That is the checkpoint's own feature selection rather than this change, and it is the same trap §10 records for `-p` measurements: the load-bearing number is `-p deno_core`, and it is 0. The bootstrap's next blocker past `create_blob` is therefore not measured yet, and the named candidate is the one §10 lists: deno attaches its data to the realm it added at slot 1.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **811 passed / 0 failed**; `cargo test -p v8 --features simdutf` **213 passed / 0 failed**; `cargo test -p crux --lib` 248 / 0; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,176 passed / 0 failed**. `crates/runtime` changed, so the whole battery ran and every number is the certified one: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail. Nothing in this workspace depends on `crates/v8`, so the bridge half implicates no sweep.
+
+The battery ran on the tree as it stood when the format landed; the exotic gate and the `visit` signature came after it, and both are inside `crates/runtime/src/snapshot.rs`, so the numbers still stand for this tree — checked by grep rather than assumed: the only files naming `write_snapshot`, `read_snapshot`, `snapshot::encode` or `Intrinsics::name_of_value` are `crates/runtime/src/{snapshot.rs,realm.rs,api/context.rs}` and `crates/v8/snapshot.rs`, and none of `crates/test262`, `crates/wasmtest`, `crates/wasm` or `crates/cli` names `runtime::api` at all.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3185,6 +3224,32 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   which is what the spec has, and its values are traced through the module's
   environment. As the entry said it would, nothing else in the module machinery
   moved.
+16. **The snapshot format — named before it is written.** The engine-side item
+  §10's build order has carried as (3) since the plan was written, and the one
+  the record above left `deno/`'s build scripts failing on.
+
+  **What the change is, named:** a new `crates/runtime/src/snapshot.rs` — the
+  format, its walk and its reader — plus one accessor
+  (`Intrinsics::name_of_value`, `realm.rs`) and two methods on `api::Context`
+  (`write_snapshot`, `read_snapshot`). Nothing in `crux` moves: the walk reads
+  and writes through the object model's existing surface
+  (`ordinary_object_create`, `array_create`, `get_own_property`, `own_property_keys`,
+  `define_property_key`, `intern`/`lookup`, `well_known`), which is why this is a
+  new file and a name rather than a change to the heap.
+
+  **Why the engine and not the bridge.** A blob's compatibility surface is the
+  names it writes — an intrinsic name, a well-known symbol name — and the thing
+  that has to mean the same in the writing tree and the reading tree is the
+  engine's realm, not a bridge crate that is scheduled to be deleted. The
+  bridge owns the *shape* (`StartupData`, `SnapshotCreator`, the V8 index
+  conventions); the format is the engine's.
+
+  **Landed** (§7 records it): what carries, what refuses by name, the versioned
+  header, the index conventions, and the one thing the first version got wrong
+  and the measurement caught — a root table built through an isolate's current
+  realm rather than the realm being written. What it does not do is named there
+  too rather than here: one context slot, no external references, no compiled
+  code, no isolate data, no continuation.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3323,7 +3388,15 @@ a frame view of the running stack. §7's survey already split the subsystem: the
 ## 10. Build order
 
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
-external references + per-isolate/context data slots; (4) module resolver as a
+external references + per-isolate/context data slots — **the format landed
+(§7's last record, ledger item 16): a versioned blob carrying the value graph
+rooted at the data a host attached to its default context, with a restore that
+resolves a builtin by name in the realm it rebuilds. What is left of this item
+is named rather than implied: external references (the index-stable table,
+nothing in the format carries one yet), a slot per added context (today's
+answer is a refusal at `AddContextData` naming the one-realm reason),
+`FunctionCodeHandling::Keep`'s compiled code (which waits on the code cache),
+the isolate-level data slots, and continuation from an existing blob**; (4) module resolver as a
 host trait (landed), **unbound scripts and script origins** (the bridge side
 landed — every Rust script handle is already context-unbound — and what the
 engine still owes there is the *code cache*: serializing its compiled program, so
@@ -3382,10 +3455,15 @@ and its deref table, which is when the tier §9 states stops being a tier;
 (3) point the local `deno/` checkout at the crate and run a script — the
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last record: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
-what stops them is the engine-side item (3) below rather than anything in the
-bridge — a host that boots from source needs no snapshot, deno's CLI does. The
-`ext`-crate frontier of §7's measurement (341 errors across eight crates, none of
-them `deno_core`) is still what stands between this and a `deno` binary, and
+what stopped them was the engine-side item (3) below rather than anything in the
+bridge. That item's first slice has landed, so what stops them now is narrower
+and named: the format carries the *default* context's attached data, while
+`deno_core` attaches its data to the realm it added at slot 1, so the next thing
+to close is a slot per context — and the reason it is not just a loop is that
+this engine's api gives an isolate one realm, so a second context's objects are
+built in the first one's realm. The `ext`-crate frontier of §7's measurement
+(341 errors across eight crates, none of them `deno_core`) is still what stands
+between this and a `deno` binary, and
 deno's own runtime gaps (`queueMicrotask` among them) sit behind that; (4)
 migrate, then delete.
 delete.
@@ -3404,8 +3482,14 @@ delete.
 
 1. **Weak persistent handles** — the last L2 item. Design sketched in
    `.notes/host-object-gc.md` §4.3; not started.
-2. **Snapshot format** — ours to version; external references must stay
-   index-stable across builds, a compatibility surface from day one.
+2. **Snapshot format** — **v1 landed** (§7's last record, ledger item 16): a
+   versioned blob over a value graph rooted at the host's attached context data,
+   with intrinsics written by name and a refusal naming anything uncarried. What
+   this item still owns: external references (nothing in the format carries an
+   index yet, and index stability across builds is the compatibility surface it
+   was always going to be), a slot per added context, compiled code for
+   `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
+   existing blob.
 3. **Sealing `slag::api`** — the re-export exists (`crates/slag/src/lib.rs`, with a
    test that drives a module through it), so a host can depend on `slag` alone.
    Still open: `Local::value`, `Isolate::agent`, `Local::as_object` name

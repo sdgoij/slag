@@ -236,11 +236,10 @@ impl<'p, 'i, C> PinnedRef<'p, HandleScope<'i, C>> {
     /// The data a snapshot carried for the isolate at `index`
     /// (v8::HandleScope::GetIsolateDataFromSnapshotOnce).
     ///
-    /// Always [`DataError::NoData`], and truthfully so: there is no snapshot to
-    /// read from, because Slag has no snapshot format (see
-    /// [`StartupData`](crate::StartupData)). The crate we stand in for answers
-    /// this for the *second* read of an index; here it is every read, which is
-    /// the same statement about a snapshot that was never made.
+    /// Always [`DataError::NoData`], and truthfully so: the format carries what
+    /// a *context* was given, because that is what a host attaches and what a
+    /// restorable realm is rebuilt around. The crate we stand in for answers
+    /// this for the *second* read of an index; here it is every read.
     pub fn get_isolate_data_from_snapshot_once<T>(
         &self,
         index: usize,
@@ -257,8 +256,12 @@ impl<'p, 'i, C> PinnedRef<'p, HandleScope<'i, C>> {
     /// The data a snapshot carried for the context at `index`
     /// (v8::HandleScope::GetContextDataFromSnapshotOnce).
     ///
-    /// Always [`DataError::NoData`], for the same reason as
-    /// [`get_isolate_data_from_snapshot_once`](Self::get_isolate_data_from_snapshot_once).
+    /// The item the creator attached there, once: the crate we stand in for
+    /// hands each index out a single time, and so does this, because what a
+    /// restore holds is the one persistent handle the blob's graph rooted. An
+    /// index that was never attached, or has already been read, answers
+    /// [`DataError::NoData`] — including on an isolate that booted from source,
+    /// where every index does.
     pub fn get_context_data_from_snapshot_once<T>(
         &self,
         index: usize,
@@ -268,8 +271,17 @@ impl<'p, 'i, C> PinnedRef<'p, HandleScope<'i, C>> {
         for<'l> <Local<'l, Data> as TryInto<Local<'l, T>>>::Error: get_data_sealed::ToDataError,
         for<'l> Local<'l, Data>: TryInto<Local<'l, T>>,
     {
-        let _ = index;
-        Err(DataError::no_data::<T>())
+        let Some(context) = self.0.context else {
+            return Err(DataError::no_data::<T>());
+        };
+        let mut isolate = self.0.isolate;
+        let identity = crate::snapshot::context_identity(context);
+        let Some(item) = crate::snapshot::take_context_data(&mut isolate, identity, index) else {
+            return Err(DataError::no_data::<T>());
+        };
+        let data: Local<'p, Data> = Local::from_payload(item.payload_value());
+        data.try_into()
+            .map_err(get_data_sealed::ToDataError::to_data_error)
     }
 }
 
@@ -1178,8 +1190,8 @@ mod tests {
         assert_eq!(text.to_rust_string_lossy(scope), "'bracketed'");
     }
 
-    /// The snapshot restore side answers for a snapshot that was never made, and
-    /// says so through the error channel the shape has rather than a panic.
+    /// The snapshot restore side answers for an isolate that booted from source,
+    /// and says so through the error channel the shape has rather than a panic.
     #[test]
     fn reading_snapshot_data_reports_that_there_is_none() {
         crate::test_support::in_context!(scope, {

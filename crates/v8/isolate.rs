@@ -18,18 +18,23 @@ use crate::handle::{Global, Local, Payload};
 use crate::position::Position;
 use crate::promise::{PromiseRejectEvent, PromiseRejectMessage};
 use crate::scope::PinScope;
-use crate::snapshot::{FunctionCodeHandling, SnapshotCreator, StartupData};
+use crate::snapshot::{FunctionCodeHandling, SnapshotCreator, SnapshotRestore, StartupData};
 use crate::support::{MapFnFrom, MapFnTo, UniqueRef, UnitType};
 use crate::wasm::WasmStreaming;
 
 /// Create parameters (`v8::CreateParams`).
 ///
-/// Two of the crate we stand in for's settings have no effect on a Slag
-/// isolate, and both for the same reason — the engine has no snapshot:
+/// Two of the crate we stand in for's settings are carried rather than acted
+/// on:
 ///
-/// - `snapshot_blob` is carried and not consumed; the isolate boots from source
-///   (see [`StartupData`](crate::StartupData)).
-/// - `external_references` index into that blob, so there is nothing to index.
+/// - `snapshot_blob` is consumed when it is a blob of this engine's own format
+///   (see [`StartupData`](crate::StartupData)), and booted from source when it
+///   is not — which is the answer `is_valid` gives the host before it hands one
+///   over.
+/// - `external_references` index into that blob; nothing in this format carries
+///   an index yet, so the table is held and indexed by nothing. It is the one
+///   compatibility surface a snapshot has from its first version, and this is
+///   where it will be honored.
 ///
 /// Everything else there configures V8's heap, its allocator or its sandbox,
 /// none of which Slag exposed as an embedding setting. The one setting besides
@@ -155,6 +160,11 @@ pub struct IsolateInner {
     /// serializing. `None` for every isolate that is not, which is what makes
     /// the creator-only methods refuse on those.
     pub(crate) snapshot_creator: Option<SnapshotCreator>,
+    /// The blob this isolate booted from, once its header checked out, and what
+    /// has been read out of it. `None` for an isolate that booted from source —
+    /// which is every isolate that was not handed a valid blob, since a blob
+    /// that is not one of this engine's is not consumed.
+    pub(crate) restore: RefCell<Option<SnapshotRestore>>,
     /// The host's promise-rejection callback
     /// (`v8::Isolate::SetPromiseRejectCallback`), once it installed one.
     ///
@@ -481,6 +491,12 @@ impl Isolate {
             Some(heap) => heap,
             None => Heap::new(),
         };
+        // A blob this engine cannot read is carried and not consumed, the same
+        // statement `StartupData::is_valid` makes: the isolate boots from source
+        // and the host finds out by asking rather than by being refused.
+        let restore = params
+            .snapshot_blob
+            .and_then(crate::snapshot::SnapshotRestore::new);
         let mut inner = Box::new(IsolateInner {
             engine,
             context: RefCell::new(None),
@@ -495,6 +511,7 @@ impl Isolate {
             positions: RefCell::new(HashMap::new()),
             object_templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
+            restore: RefCell::new(restore),
             promise_reject: None,
             wasm_streaming: None,
         });
@@ -502,6 +519,16 @@ impl Isolate {
         // every handle to it — `OwnedIsolate` keeps it alive.
         let handle = unsafe { Self::from_inner_ptr(&mut *inner) };
         OwnedIsolate { inner, handle }
+    }
+
+    /// Take the restore out of this isolate, so the caller can make handles
+    /// from it without holding a borrow of the isolate that they need.
+    pub(crate) fn take_restore(&mut self) -> Option<SnapshotRestore> {
+        self.inner_mut().restore.borrow_mut().take()
+    }
+
+    pub(crate) fn put_restore(&mut self, restore: SnapshotRestore) {
+        *self.inner_mut().restore.borrow_mut() = Some(restore);
     }
 
     /// The handle for the state at `ptr`.
@@ -705,13 +732,15 @@ impl Isolate {
     /// # Panics
     ///
     /// Panics if the isolate did not come from
-    /// [`snapshot_creator`](Self::snapshot_creator).
+    /// [`snapshot_creator`](Self::snapshot_creator), as the crate we stand in
+    /// for does, or if the context is not one the snapshot carries.
     pub fn add_context_data<T>(&mut self, context: Local<Context>, data: Local<'_, T>) -> usize
     where
         for<'l> Local<'l, T>: Into<Local<'l, Data>>,
     {
-        let _ = (context, data);
-        self.creator().add_context_data()
+        let data: Local<'_, Data> = data.into();
+        let held = Global::new(self, data);
+        self.creator().add_context_data(context.context(), held)
     }
 
     /// The creator this isolate was made with, or a panic saying it has none.
@@ -1270,11 +1299,15 @@ impl OwnedIsolate {
     ///
     /// # Panics
     ///
-    /// Always, and with the reason: Slag has no snapshot format, so there is
-    /// nothing to serialize a heap into and nothing that could read a blob back.
-    /// The crate we stand in for answers `Option` here and its callers unwrap it,
-    /// so refusing with the reason is the loudest thing the shape allows. A host
-    /// that needs a snapshot needs an engine that has one.
+    /// When the isolate did not come from
+    /// [`Isolate::snapshot_creator`](Isolate::snapshot_creator), as the crate we
+    /// stand in for does; when the creator took no context, since a blob
+    /// carries what a context holds; and when a value in the graph is one the
+    /// format cannot carry yet — see [`SnapshotCreator`](crate::SnapshotCreator),
+    /// whose message names the value. The crate's `Option` is unwrapped by its
+    /// own callers, so the loudest available message is the honest one: a blob
+    /// that quietly lost part of a host's state would move the failure to where
+    /// the host cannot see it.
     pub fn create_blob(self, function_code_handling: FunctionCodeHandling) -> Option<StartupData> {
         let mut handle = self.handle;
         let mut creator = handle
@@ -1282,7 +1315,7 @@ impl OwnedIsolate {
             .snapshot_creator
             .take()
             .expect("v8::OwnedIsolate::create_blob: this isolate was not created by Isolate::snapshot_creator");
-        creator.create_blob(function_code_handling)
+        Some(creator.create_blob(function_code_handling))
     }
 }
 

@@ -233,6 +233,29 @@ impl Intrinsics {
         ResolvedNames(id.and_then(|id| self.names.borrow().get(&id).cloned()))
     }
 
+    /// The name an intrinsic value is registered under, when it is one of this
+    /// realm's, compared by identity: a string that spells an intrinsic's name
+    /// is not that intrinsic, and two symbols with one description are two
+    /// symbols. Named rather than unnamed because a snapshot writes a reference
+    /// to a builtin as this name and a restore resolves it in the realm it
+    /// rebuilds, which is what keeps a prototype or a constructor out of the
+    /// graph the snapshot has to carry.
+    ///
+    /// Functions are answered by the id-keyed name table `name_of` reads;
+    /// everything else — %Object.prototype% and its siblings — has no name
+    /// record, so the entry table is scanned by identity.
+    pub fn name_of_value(&self, value: &Value) -> Option<Rc<str>> {
+        if let Some(name) = self.name_of(value).names().first() {
+            return Some(Rc::clone(name));
+        }
+        let id = value.as_object().map(|object| object.id())?;
+        self.entries
+            .borrow()
+            .iter()
+            .find(|(_, entry)| entry.as_object().is_some_and(|entry| entry.id() == id))
+            .map(|(name, _)| Rc::clone(name))
+    }
+
     /// The realm's %Object.prototype% value, cached after the first
     /// resolution (see the struct field).
     pub fn object_prototype(&self) -> Option<Value> {

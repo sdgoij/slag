@@ -68,6 +68,32 @@ impl Context {
         &self.realm
     }
 
+    /// Write the data a host attached to each context slot.
+    ///
+    /// The slots are the blob's context table in V8's convention — slot 0 the
+    /// default context, the ones added after it next — and the table is built
+    /// in *this* context's realm, so a builtin in the graph is written as the
+    /// name this realm knows it by.
+    pub fn write_snapshot(
+        &self,
+        slots: &[Vec<Local>],
+    ) -> Result<Vec<u8>, crate::snapshot::Unsupported> {
+        let slots: Vec<Vec<Value>> = slots
+            .iter()
+            .map(|slot| slot.iter().map(|local| *local.value()).collect())
+            .collect();
+        self.with_agent(|agent| crate::snapshot::encode_slots(agent, &self.realm, &slots))
+    }
+
+    /// Read a snapshot blob, making the values it carries in this realm.
+    ///
+    /// The values are rooted only by the caller: the answer is a handle like
+    /// any other, so a host that means to keep it takes a persistent one.
+    pub fn read_snapshot(&self, bytes: &[u8]) -> Result<Local, crate::snapshot::DecodeError> {
+        self.with_agent(|agent| crate::snapshot::decode(agent, &self.realm, bytes))
+            .map(Local)
+    }
+
     /// Run `body` with this isolate's agent recorded as current, so host
     /// callbacks can re-enter through [`Isolate::get_current`].
     pub fn with_agent<T>(&self, body: impl FnOnce(&mut Agent) -> T) -> T {
