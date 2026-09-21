@@ -4,9 +4,44 @@ use std::ffi::c_void;
 
 use runtime::api;
 
-use crate::data::{Context, Object, ObjectTemplate};
+use crate::String as JsString;
+use crate::data::{Context, Function, Object, ObjectTemplate};
+use crate::function::{ConstructorBehavior, FunctionCallbackArguments, ReturnValue};
 use crate::handle::{Local, LocalHandle, Payload};
 use crate::scope::PinScope;
+
+/// The property V8 installs the console under, on the extras binding object and
+/// on the global object.
+const CONSOLE_PROPERTY: &str = "console";
+
+/// The methods V8 installs on the console it hands out
+/// (`Genesis::InitializeConsole`, `v8/src/init/bootstrapper.cc:5617`), in the
+/// order it installs them.
+const CONSOLE_METHODS: [&str; 23] = [
+    "debug",
+    "error",
+    "info",
+    "log",
+    "warn",
+    "dir",
+    "dirxml",
+    "table",
+    "trace",
+    "group",
+    "groupCollapsed",
+    "groupEnd",
+    "clear",
+    "count",
+    "countReset",
+    "assert",
+    "profile",
+    "profileEnd",
+    "time",
+    "timeLog",
+    "timeEnd",
+    "timeStamp",
+    "context",
+];
 
 /// Options for [`Context::new`] (`v8::ContextOptions`).
 ///
@@ -36,7 +71,12 @@ impl Context {
         // The engine makes the new realm current on its isolate; mirror that
         // here so operations with no scope to read it from can find it.
         crate::realm::enter(context);
-        Local::from_payload(Payload::Context(context))
+        let handle = Local::from_payload(Payload::Context(context));
+        // V8 fills a new context's extras binding object, and its global
+        // object, as it creates the context (`Genesis::InitializeConsole`), so
+        // a host finds the console without asking for either.
+        install_console(scope, handle);
+        handle
     }
 
     /// A context restored from a snapshot (`v8::Context::FromSnapshot`).
@@ -54,6 +94,84 @@ impl Context {
     ) -> Option<Local<'s, Context>> {
         None
     }
+}
+
+/// Fill a new context as V8 fills it: the extras binding object carries a
+/// console, and the global object names the same one.
+fn install_console<'s>(scope: &PinScope<'s, '_, ()>, context: Local<'s, Context>) {
+    let extras = context.get_extras_binding_object(scope);
+    let console = console_object(scope).unwrap_or_else(|| {
+        // The same invariant the extras binding object's own creation states: a
+        // realm that cannot make an ordinary object or a function is a bridge
+        // bug, not a failure a host can act on.
+        panic!("bridge: creating the console failed")
+    });
+    let realm = crate::realm_of(scope);
+    // `JSObject::AddProperty(..., DONT_ENUM)`: writable and configurable, and
+    // not enumerable, on both objects.
+    for target in [extras, context.global(scope)] {
+        if let Err(error) = api::Object::define(
+            &realm,
+            target.engine(),
+            CONSOLE_PROPERTY,
+            console.engine(),
+            true,
+            false,
+            true,
+        ) {
+            panic!("bridge: defining the console failed: {error}");
+        }
+    }
+}
+
+/// The console V8 puts on a context's extras binding object
+/// (`Genesis::InitializeConsole`, `v8/src/init/bootstrapper.cc:5617`).
+///
+/// Every method does nothing, which is what V8's own do when the isolate has no
+/// console delegate: `ConsoleCall` returns before it reaches one
+/// (`v8/src/builtins/builtins-console.cc:158`), and the crate we stand in for
+/// exposes no way to install one. It matters that this one stays silent rather
+/// than printing — a host that wraps it calls *both* consoles
+/// (`deno_core`'s `callConsole`, `runtime/bindings.rs:1753`), so a bridge that
+/// printed here would print every message twice.
+///
+/// The methods are built as V8 builds them: zero-length, named after the
+/// property, enumerable — `deno_core`'s bootstrap walks them with `Object.keys`
+/// (`01_core.js:756`), so a method that were not enumerable would be invisible
+/// to it — and with no `[[Construct]]`, so `new console.log()` throws the
+/// `TypeError` V8's throws. V8 builds these without a `.prototype` as well
+/// (`CreateFunctionForBuiltinWithoutPrototype`); this bridge's function path
+/// gives every function one, which is a shape difference it has everywhere and
+/// not one a host acts on here.
+///
+/// V8 also tags the console (`InstallToStringTag(isolate_, console, "console")`),
+/// which is absent for the reason §9 already records for
+/// `get_constructor_name`: the engine's object API takes string keys, so a
+/// symbol-keyed define means reaching past it and that gap is a named follow-up.
+fn console_object<'s>(scope: &PinScope<'s, '_, ()>) -> Option<Local<'s, Object>> {
+    let realm = crate::realm_of(scope);
+    let console = api::Object::new(&realm).ok()?;
+    for name in CONSOLE_METHODS {
+        let template = Function::builder(console_method)
+            .constructor_behavior(ConstructorBehavior::Throw)
+            .into_template(scope);
+        template.set_class_name(JsString::new(scope, name)?);
+        let method = template.get_function(scope)?;
+        match api::Object::set(&realm, &console, name, method.engine(), false) {
+            Ok(true) => {}
+            _ => return None,
+        }
+    }
+    Some(Local::from_engine(console))
+}
+
+/// One of the console's methods, and what it does with no console delegate:
+/// nothing (see [`console_object`]).
+fn console_method(
+    _scope: &mut PinScope<'_, '_>,
+    _args: FunctionCallbackArguments,
+    _rv: ReturnValue,
+) {
 }
 
 impl<'s> LocalHandle<'s, Context> {
@@ -95,12 +213,16 @@ impl<'s> LocalHandle<'s, Context> {
     /// (`v8::Context::GetExtrasBindingObject`).
     ///
     /// There, V8 makes this object per context and fills it from the embedder's
-    /// snapshot — `deno_core` reads `console` out of it. Here it is created on the
-    /// first ask and left **empty**: this bridge cannot run a snapshot (see
-    /// [`SnapshotCreator`](crate::SnapshotCreator), whose `create_blob` says why),
-    /// so what the host's bootstrap puts in it is what it holds, and the host is
-    /// the one that knows what that is. It is the same object on every ask for a
-    /// context, because a host stashing its own bindings on it needs that.
+    /// snapshot, with the console among its properties — `deno_core` reads
+    /// `console` out of it (`runtime/bindings.rs:373`). Here it is created on the
+    /// first ask, which [`Context::new`] makes as it creates the context, and it
+    /// is the same object on every ask: a host stashing its own bindings on it
+    /// needs that, and V8's is one object too.
+    ///
+    /// The rest of a snapshot's bindings are not here: this bridge cannot restore
+    /// one (see [`SnapshotCreator`](crate::SnapshotCreator), whose `create_blob`
+    /// says why), so what the host's bootstrap puts in the object is what it
+    /// holds, and the host is the one that knows what that is.
     pub fn get_extras_binding_object<'a>(&self, scope: &PinScope<'a, '_, ()>) -> Local<'a, Object> {
         let isolate = self.slots_isolate();
         let key = self.identity();
@@ -146,13 +268,16 @@ impl<'s> LocalHandle<'s, Context> {
 mod tests {
     use std::ffi::c_void;
 
+    use super::CONSOLE_METHODS;
+    use crate::data::Object;
+    use crate::handle::Local;
+    use crate::scope::PinScope;
     use crate::test_support::in_context;
     use crate::{Context, ContextOptions};
 
     /// The extras binding object is one per context and the same on every ask,
-    /// and it starts empty: nothing here runs an embedder snapshot, so what the
-    /// host's bootstrap puts in it is what it holds — and a host that puts
-    /// something there finds it again.
+    /// it carries the console V8 puts there, the global object names that same
+    /// console, and a host that puts something of its own there finds it again.
     #[test]
     fn the_extras_binding_object_is_one_per_context() {
         in_context!(scope, {
@@ -161,21 +286,75 @@ mod tests {
             let second = context.get_extras_binding_object(scope);
             assert_eq!(first, second, "the same object on every ask");
 
-            assert!(
-                first
-                    .get(scope, crate::String::new(scope, "console").unwrap().into())
-                    .is_some_and(|value| value.is_undefined()),
-                "empty until the host fills it: reading a name nobody wrote is undefined"
-            );
+            // Both places `deno_core` reads it from: the extras binding object
+            // (`runtime/bindings.rs:373`) and the global object
+            // (`01_core.js:827`), which name the same console.
+            let key = crate::String::new(scope, "console").unwrap();
+            let console = first.get(scope, key.into()).expect("get");
+            assert!(!console.is_undefined(), "the extras binding object has one");
+            let key = crate::String::new(scope, "console").unwrap();
+            let global = context.global(scope).get(scope, key.into()).expect("get");
+            assert_eq!(global, console, "and the global object names it too");
 
             // What the host puts there it gets back, which is what the object is
             // for: a place for the bootstrap's own bindings.
-            let key = crate::String::new(scope, "console").unwrap();
+            let key = crate::String::new(scope, "host").unwrap();
             first
                 .set(scope, key.into(), crate::Number::new(scope, 1.0).into())
                 .expect("set");
             let again = context.get_extras_binding_object(scope);
             assert_eq!(again, first);
+        });
+    }
+
+    /// The value a script evaluates to, as text.
+    fn evaluated(scope: &mut PinScope<'_, '_>, source: &str) -> String {
+        crate::test_support::eval(scope, source).to_rust_string_lossy(scope)
+    }
+
+    /// One field of the property descriptor a script evaluates to, as text.
+    fn descriptor_field(scope: &mut PinScope<'_, '_>, source: &str, field: &str) -> String {
+        let descriptor = Local::<Object>::try_from(crate::test_support::eval(scope, source))
+            .expect("a property descriptor");
+        let key = crate::String::new(scope, field).expect("string");
+        descriptor
+            .get(scope, key.into())
+            .expect("the field")
+            .to_rust_string_lossy(scope)
+    }
+
+    /// The console has V8's methods, enumerably so — `deno_core`'s bootstrap
+    /// walks them with `Object.keys` — and every one of them does nothing.
+    #[test]
+    fn the_console_has_v8s_methods_and_none_of_them_run() {
+        in_context!(scope, {
+            assert_eq!(
+                evaluated(scope, "Object.keys(console).join()"),
+                CONSOLE_METHODS.join(","),
+                "every method is an own enumerable property"
+            );
+            assert_eq!(evaluated(scope, "typeof console.log"), "function");
+            assert_eq!(evaluated(scope, "console.log.name"), "log");
+            assert_eq!(evaluated(scope, "console.log.length"), "0");
+
+            // What V8's do with no console delegate installed: nothing at all.
+            assert_eq!(evaluated(scope, "String(console.log('gone'))"), "undefined");
+
+            // No `[[Construct]]`, as V8 builds them, so `new` refuses.
+            assert_eq!(
+                evaluated(
+                    scope,
+                    "(() => { try { new console.log(); return 'constructed'; } \
+                     catch (e) { return e.constructor.name; } })()"
+                ),
+                "TypeError"
+            );
+
+            // The console is not an enumerable property of the global object,
+            // which is the attribute V8 gives it there.
+            let on_global = "Object.getOwnPropertyDescriptor(globalThis, 'console')";
+            assert_eq!(descriptor_field(scope, on_global, "enumerable"), "false");
+            assert_eq!(descriptor_field(scope, on_global, "writable"), "true");
         });
     }
 

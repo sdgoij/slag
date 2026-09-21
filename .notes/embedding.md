@@ -2460,6 +2460,74 @@ what one would find if it were. What the metric never measured is what stands
 between the two: the runtime gaps this work found (`queueMicrotask`, a host that
 must boot without a snapshot), which is §10's (3).
 
+**Deno itself, measured — the frontier moved, and it is not `deno_core`.** With
+the boundary clean, the next question was whether the *CLI* compiles, and it does
+not. `cargo check -p deno` (the CLI's reachable graph) reports **113 errors**, and
+`cargo check --workspace --keep-going` (which reaches the members the CLI's
+graph never got to, because a failed dependency stops the walk) reports **341
+across eight crates**: `deno_web` 83, `deno_telemetry` 213, `deno_node_sqlite`
+19, `deno_webgpu` 14, `deno_crypto` 6, `deno_ffi` 3, `deno_os` 2,
+`deno_inspector_server` 1. Those are cargo's own totals from its summary lines;
+counting raw diagnostics instead doubles every one of them, because the workspace
+builds each crate in two feature-unified units. `deno_telemetry`'s 213 are almost
+all a single surface — `ValueView` and `ValueViewData`, 196 of the 213 — with a
+dozen GC-callback methods (`add_gc_prologue_callback`,
+`add_gc_epilogue_callback`, `get_heap_space_statistics`,
+`get_number_of_data_slots`, `Isolate::from_raw_isolate_ptr_unchecked`) behind
+them. **None of them is `deno_core`, and `deno_runtime` and
+the CLI were never attempted** — they depend on the crates that failed — so the
+total is a lower bound in exactly the way §7's name frontier was. Every failing
+crate is the *host's own op library*, not the engine boundary: the frontier is
+now "what the ext crates name", which is a larger surface than what `deno_core`
+names.
+
+The classes, which matter more than the count:
+
+| class | surface | where |
+|---|---|---|
+| **engine capability** | `TracedReference`, `Weak` | `ext/web` (console, geometry, image data), `ext/node_sqlite` |
+| **engine capability** | `ValueView`, `ValueViewData` | `ext/telemetry` (the bulk of its 213) |
+| bridge-only | the simdutf **base64** half (`Base64Options`, `LastChunkHandling`, `base64_to_binary`, `base64_length_from_binary`, `maximal_binary_length_from_base64`) | `ext/web/lib.rs` |
+| bridge-only | `GCType`, `GCCallbackFlags`, `IntegrityLevel` + `Array::set_integrity_level`, `TimeZoneDetection` + `Isolate::date_time_configuration_change_notification`, `VERSION_STRING` | `ext/web`, `ext/os`, `ext/inspector_server` |
+| bridge-only | the method tail: `Symbol::description`, `Value::{type_of, instance_of}`, `Object::{get_own_property_descriptor, preview_entries}`, `Set::size`, `Map::size`, `TypedArray::length`, `Date::value_of`, `SharedArrayBuffer::byte_length`, `String::{new_external_onebyte, write_utf8_v2}` | `ext/web/console` |
+| shape | `NewHandleScope for PinnedRef<CallbackScope>` (6), two `E0512` transmute-size mismatches, one `Rc<BackingStore>: Send` | `ext/ffi`, `ext/node_sqlite`, `ext/web/broadcast_channel.rs` |
+
+The first row is the plan's own **L2 weak-persistent-handle item**, recorded in
+§12 item 1 as "not started" — `deno_core` never names it, so the `deno_core`
+metric could never have reached it, and the ext crates make it a *blocker for
+Deno* rather than a tidy-up. That is the most useful thing this measurement
+bought.
+
+**And the engine is already being run.** Two build scripts — `dcore`'s and
+`libs/core/examples/snapshot`'s — execute a JavaScript bootstrap to create a
+startup snapshot, and they get as far as `JsRuntimeForSnapshot::try_new` before
+panicking at `libs/core/runtime/bindings.rs:316` ("unable to convert"). The
+backtrace puts it in `initialize_deno_core_namespace`, reading
+`ExtrasBindingObject.console` with `bindings::get::<Local<Object>>`: the property
+is absent, so the read answers `undefined` and the conversion to `Local<Object>`
+fails. The engine's extras binding object exists (§12 item 9, where the work to
+make it a per-context object landed) but nothing populates its `console`, which
+in V8 is a C++ extras binding. So the first *runtime* blocker is a named thing
+rather than a mystery: the extras binding object needs the `console` V8 puts
+there, and after that the bootstrap has the rest of deno_core's JS to get
+through.
+
+**The extras binding console — landed, and the bootstrap runs past it.** The first runtime blocker the measurement above named: `initialize_deno_core_namespace` reads `ExtrasBindingObject.console` (`runtime/bindings.rs:373`) and the engine's extras binding object had nothing there. V8 fills it in `Genesis::InitializeConsole` (`v8/src/init/bootstrapper.cc:5617`), so the bridge now builds that object and puts it in both places V8 does — the extras binding object, and `globalThis` (`01_core.js:827` reads the latter), each with the `DONT_ENUM` attributes V8 gives it.
+
+The methods are inert, and that is the faithful answer rather than a shortcut: V8's own console methods return before doing anything when the isolate has no console delegate (`v8/src/builtins/builtins-console.cc:158`), and the crate we stand in for exposes no way to install one — so `deno_core`, whose `callConsole` calls *both* the V8 method and its own (`runtime/bindings.rs:1753`), prints once. A console here that printed would double every message. Their shape is V8's too: zero-length, named after the property, enumerable (the bootstrap walks them with `Object.keys`, `01_core.js:756`) and with no `[[Construct]]`, so `new console.log()` throws the `TypeError` V8's throws.
+
+Two tests (one replacing the old "the extras binding object starts empty", which documented the tier this change ends), each verified by mutating the code it guards: dropping the constructor behaviour fails with `left: "constructed"`, dropping the name fails with `left: ""`, and installing the console on the extras binding object alone fails the global-object assertion.
+
+Gates: `cargo test -p v8 --features simdutf` **204 passed / 0 failed**, `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,150 passed / 0 failed / 4 ignored**. `crates/v8` changed and nothing in this workspace depends on it — checked rather than assumed, since no member names it — so the battery is not implicated and the previous step's certified numbers stand.
+
+**And the bootstrap moved.** Re-measured on the same tree, `deno/`'s two snapshot build scripts now reach a *JavaScript* failure instead of a conversion one:
+
+    SyntaxError: Module ext:core/ops does not export op_log_debug
+
+`op_log_debug` is a host op (`libs/core_testing/checkin/runner/extensions.rs`) that the harness's `ext:core/ops` synthetic module is meant to export, and `checkin/runtime/console.ts` imports — so what fails is the engine's link of an import against a **synthetic** module. The cause is readable in `crates/runtime/src/module.rs`: `resolve_export` (`:3015`) walks a module's `local_export_entries`, its `indirect_export_entries` and its star exports, and a synthetic module has none of the three — its names are its host's declaration, in `synthetic.export_names`, which is the list `collect_exported_names` already reads for the namespace (`:2259`). So the import resolves to nothing and linking reports the name as missing. That is the next slice, and it is an engine change: ledger item 15 names it before it is written.
+
+One detail worth recording because it is not obvious: the failure arrives as a `CoreError(Js(JsError { ... }))` with `frames: []` and `source_line: None` — this bridge's own recorded gaps (no call stack, no per-activation positions, §9) showing up in an error a host formats for a user.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -2486,6 +2554,24 @@ if that proves possible.
 - **Shapes are declared, not implied.** Every shape facade states its tier in its
   header, so nobody mistakes "changes at the class-name level" for "links
   unchanged".
+- **The console V8 installs is here, without its tag and without the rest of the
+  extras binding object's properties.** `GetExtrasBindingObject` carries
+  `console` — the one property `deno_core` reads — and V8's object also carries
+  `isTraceCategoryEnabled`, `trace`, and (when the build enables them)
+  `getContinuationPreservedEmbedderData`/`setContinuationPreservedEmbedderData`.
+  None of those is here, because nothing in the frontier reads them and an inert
+  function that looks like a working feature is worse than an absent one. The
+  console itself carries V8's method set but not its `Symbol.toStringTag`, for the
+  reason the `get_constructor_name` bullet records: a symbol-keyed define means
+  reaching past the engine's string-keyed object API. And V8 builds those methods
+  without a `.prototype` (`CreateFunctionForBuiltinWithoutPrototype`) where every
+  function this bridge makes has one — a shape the crate's own
+  `Function::builder` shares, so it is not this console's alone. What a host can
+  act on is the same in all three cases: the methods are callable, they are
+  enumerable under their V8 names, and they do nothing.
+- **A synthetic module cannot be imported from.** `resolve_export` has no branch
+  for one, so a name its host declared is reported missing at link time (ledger
+  item 15 names the change; §7 records the measurement that found it).
 - **The platform is a shape without a producer, and that is stated.** Slag posts
   no task, so `Platform`/`PlatformImpl`/`Task` exist so a host's initialization
   and its own implementation type-check, and the bridge's module docs say so
@@ -3057,6 +3143,27 @@ a frame view of the running stack. §7's survey already split the subsystem: the
 
   **Landed, 2 → 0** (§7 records it), which is the end of the metric rather than
   of the work: the divergences the two sites carry are recorded below.
+15. **Linking an import against a synthetic module — named before it is written.**
+  Found by running rather than reading: `deno/`'s snapshot build now fails with
+  `SyntaxError: Module ext:core/ops does not export op_log_debug`, and that module
+  is one `deno_core` makes with `CreateSyntheticModule`.
+
+  **The cause.** `resolve_export` (`crates/runtime/src/module.rs:3015`) answers a
+  name through a module's `local_export_entries`, its `indirect_export_entries`
+  and its star exports. A synthetic module has none of the three — its names are
+  its host's declaration (`SyntheticModule::export_names`) and its values are the
+  slots `SetSyntheticModuleExport` writes. The namespace path already knows that
+  (`:2259` reads the names, `:3130` the values); the *link* path does not, so an
+  import of a name a synthetic module declares resolves to nothing and linking
+  reports the name missing.
+
+  **What the change is, named:** the synthetic branch in `resolve_export`,
+  answering the binding spec 16.2.1.5.2 gives a synthetic module's export — the
+  module itself, bound to the name — together with whatever the import-binding
+  path needs to read that binding instead of an environment slot. Its shape, and
+  whether the binding needs a slot in the synthetic module's environment rather
+  than a new binding kind, is what the first measurement inside the change will
+  settle; nothing else in the module machinery is expected to move.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3251,9 +3358,13 @@ landed, the tag-shape column is closed — what remains is methods to write and 
 subsystems they name; and the shape's own tail is (a) the methods moving
 from `LocalHandle` onto the tags, file by file, then (b) deleting `LocalHandle`
 and its deref table, which is when the tier §9 states stops being a tier;
-(3) point the local `deno/` checkout at the crate and run a script — the type
-errors are gone, so what blocks it now is the runtime gaps this work found
-(`queueMicrotask`, and a host that must boot without a snapshot); (4) migrate,
+(3) point the local `deno/` checkout at the crate and run a script — the
+`deno_core` type errors are gone, but the CLI does not build yet (§7's
+measurement: 341 errors across eight ext crates, with `deno_runtime` and the CLI
+never reached, and the extras binding object's missing `console` as the first
+runtime blocker), so this step is the **ext-crate frontier** first and the
+runtime gaps second — the gaps this work already found (`queueMicrotask`, a host
+that must boot without a snapshot) are still waiting behind it; (4) migrate,
 then delete.
 delete.
 
