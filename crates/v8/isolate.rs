@@ -8,6 +8,8 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use crux::handle::Handle;
+use crux::string::JsString;
 use runtime::api;
 
 use crate::cppgc::Heap;
@@ -106,6 +108,16 @@ pub struct IsolateInner {
     /// global object — the identity the bridge already tells two contexts
     /// apart by — and the index the host chose.
     context_slots: RefCell<HashMap<(u64, i32), usize>>,
+    /// The private names the bridge minted here (`v8::Private::ForApi`), by
+    /// description. A private name is a symbol the bridge mints and keeps: the
+    /// engine has no private-name kind, and a symbol-keyed property is invisible
+    /// to the walks a private name has to be invisible to. Keeping the symbol is
+    /// what makes one description one name, and what keeps it off the
+    /// collector's list — the crate promises a private name is never collected.
+    ///
+    /// The key is code units, because that is what tells two names apart; the
+    /// engine's `JsString` has no hash to be a map key.
+    private_names: RefCell<HashMap<Vec<u16>, Global<Value>>>,
     /// The heap for host objects, which this isolate owns for its whole life.
     /// Not behind a `RefCell` because `get_cpp_heap` hands out a reference to it;
     /// the heap's own allocation list is the interior-mutable part.
@@ -277,6 +289,7 @@ impl Isolate {
             continuation_data: None,
             slots: UnsafeCell::new(HashMap::new()),
             context_slots: RefCell::new(HashMap::new()),
+            private_names: RefCell::new(HashMap::new()),
             cpp_heap,
             templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
@@ -563,6 +576,37 @@ impl Isolate {
             .get(&(context, index))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The private name that goes with `description`, minting and keeping one
+    /// the first time it is asked for (`v8::Private::ForApi`).
+    ///
+    /// The returned value is a symbol, which is how a private name exists here
+    /// at all — see [`private`](crate::private) for what that does and does not
+    /// hide.
+    pub(crate) fn private_symbol(&self, description: Option<&[u16]>) -> api::Local {
+        let key = description.unwrap_or_default().to_vec();
+        if let Some(held) = self.inner().private_names.borrow().get(&key) {
+            return *held.handle().engine();
+        }
+        let symbol = crux::symbol::Symbol::new(description.map(JsString::from_utf16));
+        let value = api::Local::from(crux::value::Value::Symbol(crux::handle::Handle::new(
+            symbol,
+        )));
+        self.inner()
+            .private_names
+            .borrow_mut()
+            .insert(key, Global::new(self, Local::from_engine(value)));
+        value
+    }
+
+    /// Whether this isolate minted `symbol` as a private name.
+    pub(crate) fn owns_private(&self, symbol: Handle<crux::symbol::Symbol>) -> bool {
+        self.inner()
+            .private_names
+            .borrow()
+            .values()
+            .any(|held| held.handle().engine().value().as_symbol() == Some(symbol))
     }
 
     /// Whether this isolate stores a function template at `pointer`.

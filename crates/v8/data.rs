@@ -324,6 +324,7 @@ tag_checks! {
 tag_checks! {
     Template => is_function_template,
     FunctionTemplate => is_function_template,
+    Private => is_private,
 }
 
 // The predicates below are what both callers share: the cast tables above, and
@@ -404,6 +405,23 @@ pub(crate) fn is_function_template(value: &api::Local) -> bool {
     // carries names a live inner — see `Isolate::from_engine_ptr`.
     let isolate = unsafe { crate::Isolate::from_engine_ptr(realm.isolate()) };
     isolate.owns_template(pointer)
+}
+
+/// A private name: a symbol this isolate minted as one for
+/// [`Private::for_api`](crate::Private::for_api), and holds. The engine has no
+/// private-name kind, so "is this a private name" is the same shape of question
+/// as "is this a template" — whether the isolate is holding it.
+pub(crate) fn is_private(value: &api::Local) -> bool {
+    let Some(symbol) = value.value().as_symbol() else {
+        return false;
+    };
+    let Some(realm) = crate::realm::current() else {
+        return false;
+    };
+    // SAFETY: as in `is_function_template`: a realm lives in the agent of a live
+    // isolate, and the engine isolate is the first field of `IsolateInner`.
+    let isolate = unsafe { crate::Isolate::from_engine_ptr(realm.isolate()) };
+    isolate.owns_private(symbol)
 }
 
 /// The host pointer an `External` carries, for a value that is one.
@@ -842,6 +860,7 @@ macro_rules! impl_try_from {
 impl_try_from! {
     Data => Context,
     Data => Module,
+    Data => Private,
     Data => Value,
     Data => Primitive,
     Data => Name,

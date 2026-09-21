@@ -11,7 +11,7 @@ use crux::value::ValueKind;
 use runtime::api;
 use slag::objects::{ensure_deferred_namespace_evaluation, materialize_pending_prototype_value};
 
-use crate::data::{Array, Map, Name, Object, Proxy, Set, Value};
+use crate::data::{Array, Map, Name, Object, Private, Proxy, Set, Value};
 use crate::handle::Local;
 use crate::property::{GetPropertyNamesArgs, KeyConversionMode, PropertyAttribute, PropertyFilter};
 use crate::property_descriptor::PropertyDescriptor as V8PropertyDescriptor;
@@ -78,6 +78,58 @@ impl Object {
 }
 
 impl<'s> Local<'s, Object> {
+    /// [[Get]] a property by a private name (`v8::Object::GetPrivate`).
+    ///
+    /// A private name is a symbol here — see [`private`](crate::private) — so
+    /// this is the symbol-keyed read, and `None` is the empty handle the crate
+    /// answers with for a name the object does not have.
+    pub fn get_private<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        key: Local<'_, Private>,
+    ) -> Option<Local<'a, Value>> {
+        let symbol = key.engine().value().as_symbol()?;
+        let object = self.engine().value().as_object()?;
+        let key = PropertyKey::Symbol(symbol);
+        let realm = crate::realm_of(scope);
+        let value = realm.with_agent(|_| object.get_key(&key).ok())?;
+        if value.is_undefined() {
+            // A read answers `undefined` both for a name that was never set and
+            // for one that was set to `undefined`, and the crate's empty handle
+            // is only the first. The own-property question is what tells them
+            // apart, and it is the same extra lookup the crate's own
+            // implementation makes to detect absence.
+            let own = realm
+                .with_agent(|_| object.has_own_property_key(&key))
+                .unwrap_or(false);
+            if !own {
+                return None;
+            }
+        }
+        Some(Local::from_engine(api::Local::from(value)))
+    }
+
+    /// [[Set]] a property by a private name (`v8::Object::SetPrivate`).
+    ///
+    /// Throw semantics, as there: a rejection (`Some(false)`) is a property that
+    /// could not be written, and `None` is a real error — a proxy trap that
+    /// threw — with it pending.
+    pub fn set_private(
+        &self,
+        scope: &PinScope<'_, '_>,
+        key: Local<'_, Private>,
+        value: Local<'_, Value>,
+    ) -> Option<bool> {
+        let symbol = key.engine().value().as_symbol()?;
+        let object = self.engine().value().as_object()?;
+        let value = *value.engine().value();
+        crate::realm_of(scope).with_agent(|_| {
+            object
+                .set_key(&PropertyKey::Symbol(symbol), value, true)
+                .ok()
+        })
+    }
+
     /// The object's identity hash (v8::Object::GetIdentityHash), the number a
     /// host keys a table by.
     ///

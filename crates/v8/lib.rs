@@ -43,6 +43,7 @@ mod module;
 mod object;
 mod platform;
 mod primitives;
+mod private;
 mod promise;
 mod property;
 mod property_descriptor;

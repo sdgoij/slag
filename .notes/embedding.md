@@ -546,6 +546,7 @@ number is the certified one.
 | after the scope and property bounds (`NewTryCatch` from a `ContextScope`, `PropertyFilter: Default`, and the `Proxy` getters they were hiding) | **364** (see below) |
 | after the identity hashes (the `Hash`/`Eq` a host's tables key on, and the module identity they hang off) | **351** (see below) |
 | after the context embedder-data slots (the two methods a host stashes its realm state through) | **347** (see below) |
+| after private names (`Private::for_api`, the private read and write, and the cast to one) | **336** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -670,24 +671,24 @@ change what it does; `PromiseResolver::{resolve, reject}`; `Proxy::{get_target,
 get_handler}`; `SharedArrayBuffer::get_backing_store`;
 `String::to_rust_cow_lossy`.
 
-**What the remaining 347 are, measured.** By error kind: **254** `E0599`s, **78**
+**What the remaining 336 are, measured.** By error kind: **243** `E0599`s, **78**
 `E0308`s, **8** names, **3** `E0515`s, **2** `E0605`s and **1** `E0282`. The
-`E0599`s split by the receiver each message names: **47** on a `Local<…>`, **122**
+`E0599`s split by the receiver each message names: **39** on a `Local<…>`, **119**
 on a bare tag (`Value` 53, `String` 9, `Symbol` 9, `Function` 8, `ArrayBuffer` 6,
-`BigInt` 6, `PromiseResolver` 4, `PrimitiveArray` 4, `Private` 3, and one or two
-for each of the rest) — the shape §9 records as open, since the methods live on
-the tag there — **85** on another bridge type (`PinnedRef` 34, `Global` 27,
-`OwnedIsolate` 11, `ReturnValue` 8, `Exception` 3, and two single sites). The
-`E0308`s are the other half of the tag shape's toll, and the `E0515`s are
-scope-lifetime sites. Not one of them is a name to declare.
+`BigInt` 6, `PromiseResolver` 4, `PrimitiveArray` 4, and one or two for each of
+the rest) — the shape §9 records as open, since the methods live on the tag there
+— and **85** on another bridge type (`PinnedRef` 34, `Global` 27, `OwnedIsolate`
+11, `ReturnValue` 8, `Exception` 3, and two single sites). The `E0308`s are the
+other half of the tag shape's toll, and the `E0515`s are scope-lifetime sites.
+Not one of them is a name to declare.
 
 **The `From`/`TryFrom` closure — landed, and eleven casts deliberately absent.**
 The crate's cast tables are transitive closures, not direct-edge tables, so a
 host's `Local<Data>: From<Local<Function>>` and
 `TryFrom<Local<Data>> for Local<FunctionTemplate>` have to exist. `impl_from!`
 reached the crate's 176 pairs at the end of the previous step; `impl_try_from!` is
-now **162 of the crate's 173**, checked by diffing the two lists rather than by
-reading them. Every one of the eleven left out needs a predicate the bridge
+now **163 of the crate's 173**, checked by diffing the two lists rather than by
+reading them. Every one of the ten left out needs a predicate the bridge
 cannot honestly answer with, which is the rule `TagCheck` already states — a cast
 whose answer would be a guess is a compile error instead:
 
@@ -695,7 +696,7 @@ whose answer would be a guess is a compile error instead:
 |---|---|
 | `Data`/`Template` → `ObjectTemplate` | the bridge mints no object template yet, so nothing can be one |
 | `Data` → `FixedArray` | a `FixedArray` here is the JS array the bridge built for the host, so `is_array` would answer `true` for every array |
-| `Data` → `ModuleRequest`, `Data` → `Private` | neither has a payload or a table here; a `Module` does (`Payload::Module`), which is why that pair landed |
+| `Data` → `ModuleRequest` | there is no payload or table for one here; `Module` and `Private` both have one, which is why those pairs landed |
 | `Data`/`Value`/`Object` → `WasmMemoryObject`, `WasmModuleObject` | the bridge builds no wasm object, and `crates/wasm` is not in its graph |
 
 The two pairs `deno_core` actually asks for are both real answers. `Data =>
@@ -781,6 +782,42 @@ Gates for this step: `cargo test -p v8 --features simdutf` **119 passed / 0
 failed** (118 with the crashing test skipped), `clippy` clean at crate and
 workspace scope, and `cargo test --locked --workspace` **5,051 passed / 0 failed
 / 4 ignored** across 38 binaries with that test skipped.
+
+**Private names — landed, 347 → 336, and the one divergence they carry.** Eleven
+sites were `v8::Private::for_api` (3) and `Object::{get_private, set_private}`
+(8), which is how `deno_core` hangs internal bookkeeping on an error object — the
+call-site information its `prepareStackTrace` reads.
+
+The engine has no private-name kind, so the bridge models one the way the
+language allows: **a private name is a symbol the isolate mints and keeps**, and
+a private property is a symbol-keyed property. `IsolateInner` carries the
+registry, keyed by the description's code units (the engine's `JsString` has no
+hash to be a key), and holding a `Global` so the symbol is a root — the crate
+promises a private name is never collected, and a pin is what that is here.
+`Private::for_api` is therefore a lookup-then-mint: one description, one name,
+for as long as the isolate lives. `get_private` is the symbol-keyed read, with
+the crate's empty handle for a name the object does not have — `undefined` is
+both "never set" and "set to undefined", so the own-property question decides it,
+which is the same extra lookup the crate's own implementation makes. `set_private`
+is the symbol-keyed write with throw semantics, answering `Some(false)` for a
+rejection and `None` for a proxy trap that threw. And `Data => Private` landed
+with them: the check is "the isolate is holding this symbol as a private name",
+the same shape as the template tags' — so the deliberately-absent cast list is
+ten now, not eleven.
+
+**The divergence, stated and asserted rather than left to be found.** A private
+property here *is* a property: `Object.keys`, `for-in`, `JSON.stringify`,
+`Object.getOwnPropertyNames` and `in` do not see it (all four asserted), but
+`Object.getOwnPropertySymbols` does, and a script that can see the object can
+read the value through it. A V8 private name is not a property at all, so that
+walk finds nothing. The test asserts the current behaviour on purpose — a host
+that hands one of these names to script is handing out something script can find
+— and §9 records it as the price of not having a private-name kind in the engine.
+
+Gates: `cargo test -p v8 --features simdutf` **123 passed / 0 failed** (122 with
+the crashing test skipped), `clippy` clean at crate and workspace scope, and
+`cargo test --locked --workspace` **5,056 passed / 0 failed / 4 ignored** across
+38 binaries with that test skipped. `crates/v8` only, so no sweep is implicated.
 
 **The context embedder-data slots — landed, 351 → 347.** Four sites were
 `Context::get_aligned_pointer_from_embedder_data` and its setter, which is how
@@ -1038,6 +1075,20 @@ if that proves possible.
   (`same_value` already does, for the explicit call), and then the value hashes
   follow. Recorded here rather than left to be discovered from a `HashMap` that
   behaves differently on two NaNs.
+- **A private name is a symbol here, so it is a property, and that is a
+  divergence.** The engine has no private-name kind, so `Private::for_api` maps a
+  description to a symbol the isolate mints and keeps, and a private property is
+  a symbol-keyed property. The walks a private name has to be invisible to do
+  not see it (`Object.keys`, `for-in`, `JSON.stringify`,
+  `Object.getOwnPropertyNames`, `in` — all asserted in `crates/v8/private.rs`),
+  but `Object.getOwnPropertySymbols` does, and the value is reachable through the
+  symbol it returns; a V8 private name is not a property at all and cannot be
+  found that way. A host that hands one of these names to script is therefore
+  handing out something script can find on any object it shares. The alternative
+  — private names as a kind the engine keeps off the properties entirely — is
+  engine work rather than bridge work, and is the thing to do if a host ever
+  needs V8's strength here; recorded now so the weakness is a decision rather
+  than a surprise.
 - **The tag shape blocks a quarter of the remaining `deno_core` surface, and
   the decision is open.** `deno_core` calls methods on `&v8::Value` and
   `&v8::String` and transmutes between them (`libs/core/runtime/ops.rs:273`,
@@ -1079,9 +1130,10 @@ frontier is closed (8 left, the wasm tail) and the serializer is landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
 first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
-347, and what is left is the method surface (254 `E0599`s: 47 on a `Local<…>`,
-122 on a tag, 85 on another bridge type), the 78 `E0308`s the tag shape explains,
-the 8 names, and six stragglers (3 `E0515`, 2 `E0605`, 1 `E0282`);
+347, private names to 336, and what is left is the method surface (243 `E0599`s:
+39 on a `Local<…>`, 119 on a tag, 85 on another bridge type), the 78 `E0308`s the
+tag shape explains, the 8 names, and six stragglers (3 `E0515`, 2 `E0605`,
+1 `E0282`);
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then
