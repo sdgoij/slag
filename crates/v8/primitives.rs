@@ -302,6 +302,30 @@ impl<'s> LocalHandle<'s, String> {
             .all(|&unit| unit <= u16::from(u8::MAX))
     }
 
+    /// Whether the string is one-byte (`v8::String::IsOneByte`).
+    ///
+    /// There that answer is a hint read off the string's representation, so it
+    /// may say `false` for a string that is one-byte anyway. Here it is the
+    /// exact answer ([`contains_only_onebyte`](Self::contains_only_onebyte)),
+    /// which is a refinement of the same promise: a caller that acts on `true`
+    /// is acting on a fact, and a `false` is never a wrong answer for a string
+    /// that is not Latin-1.
+    pub fn is_onebyte(&self) -> bool {
+        self.contains_only_onebyte()
+    }
+
+    /// Replace `buf` with the string's UTF-8 (`v8::String::write_utf8_into`).
+    ///
+    /// Cleared first, as there: a caller that keeps one buffer across calls
+    /// reuses the allocation, and what `buf` holds afterwards is this string
+    /// rather than an append to what was in it. Lone surrogates become U+FFFD,
+    /// which is the encoding's own replacement and what the lossy rendering
+    /// writes for one.
+    pub fn write_utf8_into(&self, scope: &crate::Isolate, buf: &mut std::string::String) {
+        buf.clear();
+        buf.push_str(&self.to_rust_string_lossy(scope));
+    }
+
     /// The byte count of the UTF-8 encoding (`v8::String::Utf8Length`).
     ///
     /// A lone surrogate counts three bytes, which is what the encoding writes
@@ -1109,6 +1133,49 @@ mod onebyte_const_tests {
                     .value(),
                 text.to_utf16().len() as f64
             );
+        });
+    }
+
+    /// `write_utf8_into` replaces what the buffer held instead of appending to
+    /// it, and writes the same encoding the lossy rendering writes — a lone
+    /// surrogate becomes the replacement character rather than a UTF-8 encoding
+    /// of its own.
+    #[test]
+    fn write_utf8_into_replaces_the_buffer() {
+        in_context!(scope, {
+            let mut buffer = std::string::String::from("kept from the last call");
+            let text = String::new(scope, "héllo").expect("string");
+            text.write_utf8_into(scope, &mut buffer);
+            assert_eq!(buffer, "héllo");
+
+            // Reusing the buffer for the next string is the point of the
+            // method, so the second write is not an append either.
+            let short = String::new(scope, "ab").expect("string");
+            short.write_utf8_into(scope, &mut buffer);
+            assert_eq!(buffer, "ab");
+
+            let surrogate =
+                String::new_from_two_byte(scope, &[0xD800], crate::NewStringType::Normal)
+                    .expect("string");
+            surrogate.write_utf8_into(scope, &mut buffer);
+            assert_eq!(buffer, "\u{FFFD}");
+        });
+    }
+
+    /// `is_onebyte` is the crate's hint read exactly here: Latin-1 answers
+    /// `true`, and a string with a code unit above it answers `false`.
+    #[test]
+    fn is_onebyte_answers_for_latin1_and_beyond() {
+        in_context!(scope, {
+            let latin1 =
+                String::new_from_one_byte(scope, &[b'a', 0xE9], crate::NewStringType::Normal)
+                    .expect("string");
+            assert!(latin1.is_onebyte());
+            assert!(latin1.contains_only_onebyte());
+
+            let astral = String::new(scope, "\u{1F600}").expect("string");
+            assert!(!astral.is_onebyte());
+            assert!(!astral.contains_only_onebyte());
         });
     }
 }

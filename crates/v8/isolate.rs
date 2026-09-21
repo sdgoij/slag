@@ -138,6 +138,9 @@ pub struct IsolateInner {
     /// which is later than the collector would reap an unused template, and
     /// never earlier.
     templates: RefCell<Vec<Rc<api::FunctionTemplate>>>,
+    /// The object templates the host created on this isolate, held the same way
+    /// and for the same reason as the function templates above.
+    object_templates: RefCell<Vec<Rc<api::ObjectTemplate>>>,
     /// What a snapshot would carry, when this isolate is one a host is
     /// serializing. `None` for every isolate that is not, which is what makes
     /// the creator-only methods refuse on those.
@@ -441,6 +444,7 @@ impl Isolate {
             resolver_rejects: RefCell::new(HashMap::new()),
             cpp_heap,
             templates: RefCell::new(Vec::new()),
+            object_templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
         });
         // SAFETY: the box's allocation is where the state lives and it outlives
@@ -821,6 +825,16 @@ impl Isolate {
             .borrow()
             .iter()
             .any(|template| Rc::as_ptr(template) as *mut c_void == pointer)
+    }
+
+    /// Take ownership of an object template, so a handle can name its address
+    /// for as long as the isolate lives.
+    ///
+    /// The sibling of [`add_template`](Self::add_template) rather than the same
+    /// list: a handle names the address it was registered under, and the two
+    /// kinds are then told apart by which list holds it.
+    pub(crate) fn add_object_template(&self, template: Rc<api::ObjectTemplate>) {
+        self.inner().object_templates.borrow_mut().push(template);
     }
 
     /// Whether the isolate has background work pending

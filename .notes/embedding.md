@@ -556,6 +556,7 @@ number is the certified one.
 | after the buffer-handing shapes (`ArrayBuffer::new_backing_store_from_bytes` and its `Rawable` widths, and `SharedArrayBuffer::with_backing_store`) | **213** (see below) |
 | after the host-memory store (`ArrayBuffer::new_backing_store_from_ptr`, the borrowed block the engine gained for it, and the `workers` shape that forced) | **209** (see below) |
 | after the tag shape (`Local<'s, T>: Deref<Target = T>`, the tag receiver chain, and the `LocalHandle` the methods sit on until they move) | **62** (see below) |
+| after the template surface a host fills in (the prototype and instance templates, `ObjectTemplate::{new, set}`, the two `String` conversions and `build_fast`) | **56** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -1017,6 +1018,55 @@ that guards them. The exception is the continuation-value test, whose content *i
 the borrow shape: it fails to compile if the handle goes back to borrowing its
 scope.
 
+**The template surface a host fills in — landed, 62 → 56, ten sites fixed and four
+revealed.** Ten of the errors were methods the engine already backs, so this was
+bridge work: `FunctionTemplate::{prototype_template, instance_template}` (3 sites),
+`ObjectTemplate::{new, set}` (3), `String::{write_utf8_into, is_onebyte}` (3) and
+`FunctionBuilder::build_fast` (1). Four more were *behind* those — resolving a
+receiver makes the next line's error appear — which is why the net is six:
+`ObjectTemplate::{new_instance, set_with_attr}` and `FunctionTemplate::{set,
+inherit, set_accessor_property}` are the rest of the same cluster.
+
+- **`ObjectTemplate::new` had to go on the tag.** A host writes it as
+  `v8::ObjectTemplate::new(scope)` — a tag-scoped call, not a method on a handle —
+  so an inherent impl on `LocalHandle` does not answer it, and the first cut of
+  this was on the handle. `FunctionTemplate::new` was already on the tag for the
+  same reason; the rest of the cluster is called by method syntax, where the
+  tag's deref chain reaches the handle.
+- **An object-template handle is an `External` over an address the isolate
+  keeps**, the same shape a function template's handle has. It needed a registry
+  of its own beside the function templates, because a handle names the address it
+  was registered under and the two kinds are then told apart by which list holds
+  it.
+- **`build_fast`'s overloads are accepted and not used**, stated rather than
+  silent: a fast call is V8's own compiled entry point for a host function and
+  there is no compiler here to generate one, so a call reaches the callback the
+  builder was given — which is also where the crate we stand in for lands when a
+  fast call does not apply. The test hands it a real overload slice and asserts
+  the callback still runs.
+- **`is_onebyte` is exact here where the crate's is a hint.** There the answer is
+  read off the string's representation and may say `false` for a Latin-1 string;
+  here it is `contains_only_onebyte`'s answer. That is a refinement of the same
+  promise rather than a different one — `false` remains correct for a string that
+  is not Latin-1, and `true` is now a fact rather than a guess.
+- **`ObjectTemplate::set` panics on a non-string key.** The engine's templates are
+  string-keyed, the crate gives that method no channel to report on, and the
+  alternative to the panic is a property that silently does not exist.
+
+Measured: **62 → 56**, `E0599` 53 → 47. Five new tests, all in `crates/v8`: the
+prototype and instance templates reaching the objects they describe (a
+prototype-template method called on an instance, an instance-template property
+read off it), an object template standing on its own, `write_utf8_into` replacing
+what its buffer held (including a lone surrogate becoming U+FFFD) and `is_onebyte`
+either way.
+
+Gates: `cargo test -p v8 --features simdutf` **157 passed / 0 failed** with the
+crashing test skipped (it aborted a full-binary run during this pass as well,
+which is the documented pre-existing crash), `clippy --locked --workspace
+--all-targets -- -D warnings` clean, and `cargo test --locked --workspace`
+**5,092 passed / 0 failed / 4 ignored** across 38 binaries. `crates/v8` only, so no
+sweep is implicated.
+
 **The tag shape — landed, 209 → 62, and the three decisions it forced.** `Local<'s, T>`
 is now `#[repr(C)] { payload, marker }` with `Deref<Target = T>`, so a tag
 *reference* is a receiver: a `&v8::Value` calls the methods a
@@ -1467,12 +1517,22 @@ if that proves possible.
 - **A setting that is a hint is carried; a setting that is observable is
   implemented.** `FunctionBuilder::side_effect_type` describes what V8's
   optimizer may assume about a call — this engine has no optimizer, so the bridge
-  accepts it and says so where a host would look for its effect. The same test
-  decides `CreateParams::snapshot_blob` (carried, `is_valid` answers `false`) and
+  accepts it and says so where a host would look for its effect, and
+  `FunctionBuilder::build_fast` lands the same way: the fast-call overloads are a
+  compiled entry point this engine cannot enter, so the callback the builder was
+  given is what a call reaches. The same test decides `CreateParams::snapshot_blob` (carried, `is_valid` answers `false`) and
   the platform's tasks (accepted, never posted). The distinction matters because
   the two failure modes are not symmetric: a carried hint costs an optimization
   the host never had, while a carried *property* — `length`, say — would be a
   wrong answer.
+- **The engine's templates are string-keyed, and the two places that shows are
+  stated rather than hidden.** `ObjectTemplate::set` panics on a symbol key — the
+  crate's `Template::Set` takes a `Name` and this engine's template properties are
+  `JsString`-named, so the alternatives were a silent no-op or a panic — and the
+  attributes overload (`set_with_attr`) and `new_instance` are absent until a host
+  asks, which the next slice does. `is_onebyte` is the third: the crate's answer
+  is a representation hint and this one is exact, which is a refinement of the
+  same promise and is documented where a host would read it.
 - **The value serializer's wire format is this bridge's own.** The crate we
   stand in for serializes into a format that is internal to V8 — 16 versions of
   history in 2,993 lines of C++ — and matching those bytes buys exactly one
@@ -1679,11 +1739,13 @@ property bounds to 364, the identity hashes to 351, the embedder-data slots to
 347, private names to 336, the method tail to 292, scheduling and exception
 control to 260, the isolate-level callback vocabulary to 242, the symbol surface
 to 233, the primitive array to 225, the leftovers to 217, the buffer-handing
-shapes to 213, the host-memory store to 209, the tag shape to 62, and what is left
-is the method surface (53 `E0599`s, all of them named methods and subsystems: the
+shapes to 213, the host-memory store to 209, the tag shape to 62, the template
+surface to 56, and what is left
+is the method surface (47 `E0599`s, all of them named methods and subsystems: the
 message and stack-trace surface, synthetic modules, wasm streaming, code cache,
-source offsets, the extras binding object), the 4 names, and four stragglers
-(3 `E0515`, 1 `E0282`). Three
+source offsets, the extras binding object, and the half of the template cluster
+that needs attributes, static properties and `new_instance`), the 4 names, and
+four stragglers (3 `E0515`, 1 `E0282`). Three
 surveyed-and-left items sit outside those counts' reach — `get_constructor_name`
 (needs V8's map), `get_extras_binding_object` (needs an engine-side extras
 object) and `get_heap_statistics` (needs byte accounting in `crux::heap`) — and
