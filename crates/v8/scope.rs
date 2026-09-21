@@ -720,6 +720,18 @@ impl<'p, 'obj, P> PinnedRef<'p, TryCatch<'_, 'obj, P>> {
         self.catch_mut().reset();
     }
 
+    /// Re-throw what this handler caught (v8::TryCatch::ReThrow), answering the
+    /// value that will now propagate to the handler around it.
+    ///
+    /// The engine keeps one pending-exception slot and the handler clears it on
+    /// drop unless it was rethrown — which is what calling this records — so the
+    /// value comes back and stays pending together.
+    pub fn rethrow(&mut self) -> Option<Local<'obj, Value>> {
+        let exception = self.catch().exception().map(Local::from_engine);
+        self.catch_mut().rethrow();
+        exception
+    }
+
     fn catch(&self) -> &api::TryCatch {
         self.0
             .catch
@@ -958,6 +970,57 @@ macro_rules! escapable_handle_scope {
 #[cfg(test)]
 mod tests {
     use crate::DataError;
+
+    /// Run a script that throws, leaving its exception pending.
+    fn throw_a_test_error(scope: &crate::scope::PinScope<'_, '_>) {
+        let text = crate::String::new(scope, "throw new Error('boom')").expect("string");
+        let script = crate::Script::compile(scope, text, None).expect("compile");
+        assert!(script.run(scope).is_none(), "the script throws");
+    }
+
+    /// A handler that rethrows leaves the exception pending past itself — which
+    /// is what a handler opened around it sees — and hands back the value that
+    /// is doing the propagating.
+    ///
+    /// The throwing call has to happen *inside* the handler: opening one takes
+    /// the pending exception aside, which is what lets the handler see what it
+    /// caught rather than what was already there.
+    #[test]
+    fn a_rethrown_exception_stays_pending() {
+        crate::test_support::in_context!(scope, {
+            {
+                crate::tc_scope!(let caught, scope);
+                throw_a_test_error(caught);
+                assert!(caught.has_caught());
+                let thrown = caught.rethrow().expect("the caught exception comes back");
+                assert!(thrown.is_object());
+                assert!(scope.engine().has_pending_exception());
+            }
+
+            assert!(
+                scope.engine().has_pending_exception(),
+                "the rethrow left it pending for the handler around this one"
+            );
+        });
+    }
+
+    /// The handler that does *not* rethrow swallows what it caught, which is what
+    /// makes the test above say something.
+    #[test]
+    fn an_exception_a_handler_did_not_rethrow_does_not_survive_it() {
+        crate::test_support::in_context!(scope, {
+            {
+                crate::tc_scope!(let caught, scope);
+                throw_a_test_error(caught);
+                assert!(caught.has_caught());
+            }
+
+            assert!(
+                !scope.engine().has_pending_exception(),
+                "the handler swallowed it on the way out"
+            );
+        });
+    }
 
     /// The pattern a host writes: pin the scope, init it, and hand it wherever a
     /// scope goes. It wraps the scope it was made from rather than replacing it,

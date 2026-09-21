@@ -446,6 +446,19 @@ impl Isolate {
         self.engine_mut().run_microtasks()
     }
 
+    /// Run the queues until they are empty
+    /// (`v8::Isolate::PerformMicrotaskCheckpoint`), which is how a host drains
+    /// them while the policy is explicit.
+    ///
+    /// One divergence, and it is the one this bridge already records for the
+    /// `Auto` policy: the crate swallows what a job throws, and this makes it the
+    /// pending exception instead, so a host that wants to see it can.
+    pub fn perform_microtask_checkpoint(&mut self) {
+        if let Err(error) = self.run_microtasks() {
+            crate::throw(self, &error);
+        }
+    }
+
     /// When the queues drain without the host asking
     /// (v8::Isolate::GetMicrotasksPolicy).
     ///
@@ -755,5 +768,33 @@ mod tests {
         let handle = isolate.thread_safe_handle();
         assert!(!handle.request_interrupt(on_interrupt, std::ptr::null_mut()));
         assert!(!CALLED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A checkpoint runs what is queued, which under the explicit policy is the
+    /// only thing that runs it — and the queue is empty afterwards, so a second
+    /// checkpoint has nothing to do.
+    #[test]
+    fn a_checkpoint_runs_the_queued_jobs() {
+        crate::test_support::in_context!(scope, {
+            scope.set_microtasks_policy(crate::MicrotasksPolicy::Explicit);
+            crate::test_support::eval(
+                scope,
+                "Promise.resolve().then(function () { globalThis.ran = 7; })",
+            );
+            assert_eq!(
+                crate::test_support::eval_number(
+                    scope,
+                    "globalThis.ran === undefined ? -1 : globalThis.ran"
+                ),
+                -1.0,
+                "nothing runs the queue but the checkpoint"
+            );
+
+            scope.perform_microtask_checkpoint();
+            assert_eq!(
+                crate::test_support::eval_number(scope, "globalThis.ran"),
+                7.0
+            );
+        });
     }
 }

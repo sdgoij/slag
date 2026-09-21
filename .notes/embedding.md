@@ -548,6 +548,7 @@ number is the certified one.
 | after the context embedder-data slots (the two methods a host stashes its realm state through) | **347** (see below) |
 | after private names (`Private::for_api`, the private read and write, and the cast to one) | **336** (see below) |
 | after the method tail a host calls by name (`Global::open`, the typed `ReturnValue` setters, `Function::builder`, the promise resolver, and the pointer-shaped isolate slots) | **292** (see below) |
+| after the scheduling and exception-control methods (`Isolate::perform_microtask_checkpoint` and `TryCatch::rethrow`) | **260** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -672,16 +673,15 @@ change what it does; `PromiseResolver::{resolve, reject}`; `Proxy::{get_target,
 get_handler}`; `SharedArrayBuffer::get_backing_store`;
 `String::to_rust_cow_lossy`.
 
-**What the remaining 292 are, measured.** By error kind: **201** `E0599`s, **78**
-`E0308`s, **8** names, **3** `E0515`s and **1** `E0282` — the `E0605` pair the last
-step had is gone. The `E0599`s split by the receiver each message names: **41** on
-a `Local<…>`, **107** on a bare tag (`Value` 53, `String` 9, `Symbol` 9,
-`ArrayBuffer` 6, `BigInt` 6, `PrimitiveArray` 4, and one or two for each of the
-rest) — the shape §9 records as open, since the methods live on the tag there —
-and **53** on another bridge type (`PinnedRef` 34, `OwnedIsolate` 11, `Exception`
-3, `Global` 2, and three single sites). The `E0308`s are the other half of the tag
-shape's toll, and the `E0515`s are scope-lifetime sites. Not one of them is a name
-to declare.
+**What the remaining 260 are, measured.** By error kind: **169** `E0599`s, **78**
+`E0308`s, **8** names, **3** `E0515`s and **1** `E0282`. The `E0599`s split by the
+receiver each message names: **41** on a `Local<…>`, **106** on a bare tag
+(`Value` 53, `String` 9, `Symbol` 9, `ArrayBuffer` 6, `BigInt` 6, `PrimitiveArray`
+4, and one or two for each of the rest) — the shape §9 records as open, since the
+methods live on the tag there — and **22** on another bridge type (`OwnedIsolate`
+11, `Exception` 3, `PinnedRef` 3, `Global` 2, and three single sites). The
+`E0308`s are the other half of the tag shape's toll, and the `E0515`s are
+scope-lifetime sites. Not one of them is a name to declare.
 
 **The `From`/`TryFrom` closure — landed, and eleven casts deliberately absent.**
 The crate's cast tables are transitive closures, not direct-edge tables, so a
@@ -783,6 +783,43 @@ Gates for this step: `cargo test -p v8 --features simdutf` **119 passed / 0
 failed** (118 with the crashing test skipped), `clippy` clean at crate and
 workspace scope, and `cargo test --locked --workspace` **5,051 passed / 0 failed
 / 4 ignored** across 38 binaries with that test skipped.
+
+**Scheduling and exception control — landed, 292 → 260.** Two methods, and both
+are the crate's names for things the bridge already did under its own:
+
+- **`Isolate::perform_microtask_checkpoint` (25 sites, and 31 of the resolved
+errors were this one's `PinnedRef` receivers).** The crate's method runs the
+  default microtask queue until it is empty. The bridge already had
+  `run_microtasks` as an accessor that *returns* a job's error; the checkpoint is
+  the crate's name for the same call with the crate's error policy — and there
+  the divergence is the one this bridge records for `Auto` (a job that throws
+  becomes the pending exception, where the crate swallows it), so it reuses the
+  bridge's own `throw` rather than inventing a second copy of the conversion.
+  The sites reach it through the deref chain (`scope.perform_microtask_checkpoint()`
+  is `Isolate`'s method, as in the crate).
+- **`TryCatch::rethrow` (8 sites, on the handler view).** The engine observes the
+  isolate's one pending-exception slot and clears it when a handler drops —
+  unless the handler was rethrown, which is the flag the engine keeps for exactly
+  this. What the bridge adds is the crate's *signature*: it hands the
+  propagating value back, so a host can rethrow and use the value together.
+
+Two things the tests pinned down, both worth having in writing. A handler sees
+what is thrown *inside* it, not what was pending when it opened — opening one
+takes the pending exception aside, which is the engine's model and the reason a
+handler's `has_caught` is about its own lifetime. And a rethrow leaves the
+exception in the slot past the handler that caught it, so a handler opened around
+that one sees it; the test asserts the slot rather than a second `TryCatch`,
+because opening one takes the exception aside again.
+
+Measured: **292 → 260**, all of it `E0599` (201 → 169); the kinds beside it are
+unchanged.
+
+Gates: `cargo test -p v8 --features simdutf` **131 passed / 0 failed** (130 with
+the crashing test skipped), `clippy` clean at crate and workspace scope, and
+`cargo test --locked --workspace` **5,064 passed / 0 failed / 4 ignored** across
+38 binaries with that test skipped. `crates/v8` only, so no sweep is implicated.
+Both new tests were made to fail: removing the rethrow call from `rethrow` fails
+the first, and a checkpoint that does not run the queue fails the second.
 
 **The method tail — landed, 336 → 292, one real bug found, and a pointer shape
 corrected.** Forty-three sites were methods a host calls by name that the bridge
@@ -1175,10 +1212,10 @@ frontier is closed (8 left, the wasm tail) and the serializer is landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
 first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
-347, private names to 336, the method tail to 292, and what is left is the method
-surface (201 `E0599`s: 41 on a `Local<…>`, 107 on a tag, 53 on another bridge
-type), the 78 `E0308`s the tag shape explains, the 8 names, and four stragglers
-(3 `E0515`, 1 `E0282`);
+347, private names to 336, the method tail to 292, scheduling and exception
+control to 260, and what is left is the method surface (169 `E0599`s: 41 on a
+`Local<…>`, 106 on a tag, 22 on another bridge type), the 78 `E0308`s the tag
+shape explains, the 8 names, and four stragglers (3 `E0515`, 1 `E0282`);
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then
