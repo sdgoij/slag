@@ -1,5 +1,7 @@
 //! Contexts: the realm a scope operates on (`v8::Context`).
 
+use std::ffi::c_void;
+
 use runtime::api;
 
 use crate::data::{Context, Object, ObjectTemplate};
@@ -42,5 +44,71 @@ impl<'s> Local<'s, Context> {
     /// The context's global object (`v8::Context::Global`).
     pub fn global(&self, _scope: &PinScope<'s, '_, ()>) -> Local<'s, Object> {
         Local::from_engine(self.context().global())
+    }
+
+    /// Store a host pointer in a slot on this context
+    /// (`v8::Context::SetAlignedPointerInEmbedderData`).
+    ///
+    /// Slag's contexts have no embedder-data slots, so the bridge keeps them,
+    /// on the isolate and keyed by this context. A slot that was never written
+    /// reads back null, which is what the crate we stand in for answers too.
+    pub fn set_aligned_pointer_in_embedder_data(&self, index: i32, value: *mut c_void) {
+        self.slots_isolate()
+            .set_context_slot(self.identity(), index, value as usize);
+    }
+
+    /// The host pointer in a slot on this context
+    /// (`v8::Context::GetAlignedPointerFromEmbedderData`), null when nothing was
+    /// stored there.
+    pub fn get_aligned_pointer_from_embedder_data(&self, index: i32) -> *mut c_void {
+        self.slots_isolate().context_slot(self.identity(), index) as *mut c_void
+    }
+
+    /// The isolate the slots live on.
+    fn slots_isolate(&self) -> crate::Isolate {
+        // SAFETY: a context lives in the agent of a live isolate, and the engine
+        // isolate is the first field of `IsolateInner`, which is what makes the
+        // two addresses the same — see `Isolate::from_engine_ptr`.
+        unsafe { crate::Isolate::from_engine_ptr(self.context().isolate()) }
+    }
+
+    /// What this context's slots are keyed by: its global object's id, which is
+    /// how the bridge already tells two contexts apart.
+    fn identity(&self) -> u64 {
+        self.context()
+            .global()
+            .value()
+            .as_object()
+            .map(|object| object.id())
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+
+    use crate::test_support::in_context;
+
+    /// A host pointer lands in the slot it was put in and only there, and a slot
+    /// the host never wrote reads back null rather than a stale neighbour.
+    #[test]
+    fn a_host_pointer_round_trips_through_a_context_slot() {
+        in_context!(scope, {
+            let context = scope.get_current_context();
+            let pointer = 0x1234usize as *mut c_void;
+
+            assert!(context.get_aligned_pointer_from_embedder_data(3).is_null());
+
+            context.set_aligned_pointer_in_embedder_data(3, pointer);
+            assert_eq!(context.get_aligned_pointer_from_embedder_data(3), pointer);
+            assert!(context.get_aligned_pointer_from_embedder_data(4).is_null());
+
+            // A second slot, so one write cannot be mistaken for another.
+            let other = 0x5678usize as *mut c_void;
+            context.set_aligned_pointer_in_embedder_data(4, other);
+            assert_eq!(context.get_aligned_pointer_from_embedder_data(3), pointer);
+            assert_eq!(context.get_aligned_pointer_from_embedder_data(4), other);
+        });
     }
 }

@@ -100,6 +100,12 @@ pub struct IsolateInner {
     /// reference into the map, which no borrow guard could outlive; the
     /// contract on that method is the crate we stand in for's.
     slots: UnsafeCell<HashMap<TypeId, Box<dyn Any>>>,
+    /// The slots a host keeps on a context
+    /// (`v8::Context::SetAlignedPointerInEmbedderData`). The engine's contexts
+    /// have no such slots, so the bridge owns them, keyed by the context's
+    /// global object — the identity the bridge already tells two contexts
+    /// apart by — and the index the host chose.
+    context_slots: RefCell<HashMap<(u64, i32), usize>>,
     /// The heap for host objects, which this isolate owns for its whole life.
     /// Not behind a `RefCell` because `get_cpp_heap` hands out a reference to it;
     /// the heap's own allocation list is the interior-mutable part.
@@ -270,6 +276,7 @@ impl Isolate {
             context: RefCell::new(None),
             continuation_data: None,
             slots: UnsafeCell::new(HashMap::new()),
+            context_slots: RefCell::new(HashMap::new()),
             cpp_heap,
             templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
@@ -536,6 +543,26 @@ impl Isolate {
     /// for as long as the isolate lives.
     pub(crate) fn add_template(&self, template: Rc<api::FunctionTemplate>) {
         self.inner().templates.borrow_mut().push(template);
+    }
+
+    /// Write the host's pointer into one of a context's slots
+    /// (`v8::Context::SetAlignedPointerInEmbedderData`).
+    pub(crate) fn set_context_slot(&self, context: u64, index: i32, pointer: usize) {
+        self.inner()
+            .context_slots
+            .borrow_mut()
+            .insert((context, index), pointer);
+    }
+
+    /// The pointer in one of a context's slots, or null when the host never
+    /// wrote one there.
+    pub(crate) fn context_slot(&self, context: u64, index: i32) -> usize {
+        self.inner()
+            .context_slots
+            .borrow()
+            .get(&(context, index))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Whether this isolate stores a function template at `pointer`.

@@ -545,6 +545,7 @@ number is the certified one.
 | after the `From`/`TryFrom` closure (the transitive casts, and the predicate a template cast needs) | **369** (see below) |
 | after the scope and property bounds (`NewTryCatch` from a `ContextScope`, `PropertyFilter: Default`, and the `Proxy` getters they were hiding) | **364** (see below) |
 | after the identity hashes (the `Hash`/`Eq` a host's tables key on, and the module identity they hang off) | **351** (see below) |
+| after the context embedder-data slots (the two methods a host stashes its realm state through) | **347** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -669,19 +670,16 @@ change what it does; `PromiseResolver::{resolve, reject}`; `Proxy::{get_target,
 get_handler}`; `SharedArrayBuffer::get_backing_store`;
 `String::to_rust_cow_lossy`.
 
-**What the remaining 364 are, measured.** By error kind: **271** `E0599`s, **78**
+**What the remaining 347 are, measured.** By error kind: **254** `E0599`s, **78**
 `E0308`s, **8** names, **3** `E0515`s, **2** `E0605`s and **1** `E0282`. The
-`E0599`s split by the receiver each message names: **51** on a `Local<…>`, **122**
+`E0599`s split by the receiver each message names: **47** on a `Local<…>`, **122**
 on a bare tag (`Value` 53, `String` 9, `Symbol` 9, `Function` 8, `ArrayBuffer` 6,
 `BigInt` 6, `PromiseResolver` 4, `PrimitiveArray` 4, `Private` 3, and one or two
 for each of the rest) — the shape §9 records as open, since the methods live on
 the tag there — **85** on another bridge type (`PinnedRef` 34, `Global` 27,
-`OwnedIsolate` 11, `ReturnValue` 8, `Exception` 3, and two single sites), and
-**13** where the method is there but a bound is not: `HashSet<Local<…>>` and
-`HashMap<Global<…>, …>` need `Hash` on a handle, which upstream has as an
-identity hash and this bridge does not. The `E0308`s are the other half of the
-tag shape's toll, and the `E0515`s are scope-lifetime sites like the one this
-step fixed. Not one of them is a name to declare.
+`OwnedIsolate` 11, `ReturnValue` 8, `Exception` 3, and two single sites). The
+`E0308`s are the other half of the tag shape's toll, and the `E0515`s are
+scope-lifetime sites. Not one of them is a name to declare.
 
 **The `From`/`TryFrom` closure — landed, and eleven casts deliberately absent.**
 The crate's cast tables are transitive closures, not direct-edge tables, so a
@@ -783,6 +781,24 @@ Gates for this step: `cargo test -p v8 --features simdutf` **119 passed / 0
 failed** (118 with the crashing test skipped), `clippy` clean at crate and
 workspace scope, and `cargo test --locked --workspace` **5,051 passed / 0 failed
 / 4 ignored** across 38 binaries with that test skipped.
+
+**The context embedder-data slots — landed, 351 → 347.** Four sites were
+`Context::get_aligned_pointer_from_embedder_data` and its setter, which is how
+`deno_core` hangs its realm state (`ContextState`, the module map) off a context
+through indices it chose. The engine's contexts have no such slots, so the bridge
+keeps them: one table on the isolate, keyed by the context's global object — the
+identity `payload_eq` already tells two contexts apart by — and the index. A slot
+nothing was written to reads back null, which is what the crate answers, and the
+test checks that a write lands in the index it was given and nowhere else
+(making the lookup ignore the index fails it). The value-carrying pair
+(`set_embedder_data`/`get_embedder_data`, which take a `Local<Value>`) is absent:
+nothing has asked for it.
+
+Gates: `cargo test -p v8 --features simdutf` **121 passed / 0 failed** (120 with
+the crashing test skipped), `clippy` clean at crate and workspace scope, and
+`cargo test --locked --workspace` **5,054 passed / 0 failed / 4 ignored** across
+38 binaries with that test skipped. No engine crate changed this time, so the
+sweep results above stand for the tree as it is.
 
 **The identity hashes — landed, 364 → 351, and the sweeps re-run because an
 engine crate changed.** Thirteen `E0599`s were not missing methods at all: they
@@ -1062,10 +1078,10 @@ Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks
 frontier is closed (8 left, the wasm tail) and the serializer is landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
 first pass through them took it to 374, the cast closure to 369, the scope and
-property bounds to 364, the identity hashes to 351, and what is left is the
-method surface (258 `E0599`s: 51 on a `Local<…>`, 122 on a tag, 85 on another
-bridge type), the 78 `E0308`s the tag shape explains, the 8 names, and six
-stragglers (3 `E0515`, 2 `E0605`, 1 `E0282`);
+property bounds to 364, the identity hashes to 351, the embedder-data slots to
+347, and what is left is the method surface (254 `E0599`s: 47 on a `Local<…>`,
+122 on a tag, 85 on another bridge type), the 78 `E0308`s the tag shape explains,
+the 8 names, and six stragglers (3 `E0515`, 2 `E0605`, 1 `E0282`);
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then
