@@ -32,7 +32,9 @@ pub use external::External;
 pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal};
 pub use json::Json;
 pub use microtask::MicrotasksPolicy;
-pub use module::{Module, ModuleImportPhase, ModuleRequest, ModuleStatus};
+pub use module::{
+    Module, ModuleImportPhase, ModuleRequest, ModuleStatus, SyntheticModuleEvaluationSteps,
+};
 pub use object::{Array, Object};
 pub use promise::Promise;
 pub use script::Script;

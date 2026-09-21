@@ -82,7 +82,7 @@ pub use isolate::{
     PromiseRejectCallback, UnsafeRawIsolatePtr, WasmAsyncResolvePromiseCallback, WasmAsyncSuccess,
 };
 pub use json::{parse as json_parse, stringify as json_stringify};
-pub use module::{ModuleImportPhase, ModuleStatus};
+pub use module::{ModuleImportPhase, ModuleStatus, SyntheticModuleEvaluationSteps};
 pub use platform::{
     IdleTask, Platform, PlatformImpl, Task, new_custom_platform, new_default_platform,
     new_single_threaded_default_platform, new_unprotected_default_platform,

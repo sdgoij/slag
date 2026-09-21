@@ -23,6 +23,10 @@
 //! - A source-phase request (`import source`) is answered by the engine from the
 //!   module's own record, so `instantiate_module2`'s source callback is never
 //!   called.
+//! - A synthetic module's steps that fail leave the module errored with that
+//!   failure as its exception, and its evaluation answers the rejection the
+//!   engine made from it; the crate we stand in for answers the empty handle
+//!   there instead.
 
 use std::num::NonZeroI32;
 
@@ -36,6 +40,80 @@ use crate::scope::PinScope;
 use crate::support::{MapFnFrom, MapFnTo, UnitType};
 
 pub use runtime::api::{ModuleImportPhase, ModuleStatus};
+
+/// What a synthetic module's evaluation runs
+/// (v8::SyntheticModuleEvaluationSteps).
+///
+/// The crate we stand in for spells this as two C function pointers — one per
+/// platform, because `MaybeLocal<Value>` is returned differently on Windows —
+/// and a host's own function is converted into one by `MapFnTo`. Nothing here
+/// crosses a language boundary, so it is one plain function pointer with the
+/// same argument list, and `None` is the empty `MaybeLocal` (the steps threw).
+pub type SyntheticModuleEvaluationSteps<'s> =
+    fn(Local<'s, Context>, Local<'s, Module>) -> Option<Local<'s, Value>>;
+
+impl<'s, F> MapFnFrom<F> for SyntheticModuleEvaluationSteps<'s>
+where
+    F: UnitType + Fn(Local<'s, Context>, Local<'s, Module>) -> Option<Local<'s, Value>>,
+{
+    fn mapping() -> Self {
+        synthetic_module_evaluation_steps::<F>
+    }
+}
+
+/// The concrete function that stands in for a host's steps: a generic type
+/// parameter cannot coerce to a function pointer, so the host's function item is
+/// reconstructed and called from one that can.
+fn synthetic_module_evaluation_steps<'s, F>(
+    context: Local<'s, Context>,
+    module: Local<'s, Module>,
+) -> Option<Local<'s, Value>>
+where
+    F: UnitType + Fn(Local<'s, Context>, Local<'s, Module>) -> Option<Local<'s, Value>>,
+{
+    (F::get())(context, module)
+}
+
+/// The function the engine keeps for a synthetic module's evaluation: the
+/// host's steps, reached through their *type* rather than through a value.
+///
+/// The record holds this for as long as the record lives, so it is a plain
+/// function pointer with no lifetime of its own. The host's steps cannot be
+/// closed over the way `instantiate_module`'s callback is: the engine calls them
+/// long after the scopes the host had open when it declared the module are gone,
+/// so the handles they receive are made at the call rather than borrowed from a
+/// host scope.
+fn engine_evaluation_steps<F>(
+    context: api::Context,
+    module: api::Module,
+) -> Result<api::Local, crux::error::JsError>
+where
+    F: UnitType + for<'s> Fn(Local<'s, Context>, Local<'s, Module>) -> Option<Local<'s, Value>>,
+{
+    let answered = (F::get())(
+        Local::from_payload(Payload::Context(context)),
+        Local::from_module(module),
+    );
+    match answered {
+        Some(value) => Ok(value.into_engine()),
+        // The empty handle is how the crate's steps report a throw, and the
+        // pending exception is what V8 records as the module's error
+        // (`SyntheticModule::Evaluate`,
+        // `v8/src/objects/synthetic-module.cc:132`). Nothing pending means the
+        // steps answered nothing at all, which is their `undefined`.
+        None => match crate::scope::isolate_of(context)
+            .engine()
+            .take_pending_exception()
+        {
+            Some(thrown) => Err(crux::error::JsError::new(
+                crux::error::ErrorKind::TypeError,
+                "exception thrown by a synthetic module's evaluation steps".into(),
+            )
+            .with_value(thrown)),
+            None => Ok(api::Local::undefined()),
+        },
+    }
+}
 
 /// A location in JavaScript source (v8::Location).
 ///
@@ -155,6 +233,50 @@ where
         ) -> Option<Local<'s, Object>>,
 {
     (F::get())(context, specifier, attributes, referrer)
+}
+
+impl Module {
+    /// Create a synthetic module (v8::Module::CreateSyntheticModule): a record
+    /// that carries no source, exposes the exports its host declares, and
+    /// evaluates by running `evaluation_steps`.
+    ///
+    /// `export_names` are the bindings the module exposes and must not repeat;
+    /// `module_name` is for logging and changes no behavior. What the steps
+    /// answer is the evaluation promise, or the empty handle if they threw.
+    ///
+    /// The steps are taken by value as there, but only their *type* is used: the
+    /// engine keeps a plain function pointer for them, reconstructed from that
+    /// type (see [`engine_evaluation_steps`]).
+    ///
+    /// Linking and evaluating a synthetic module cannot fail except through its
+    /// steps, so a failure here is the engine refusing the empty program the
+    /// record is built from: it sets the exception and aborts, as the crate we
+    /// stand in for does on the same result.
+    pub fn create_synthetic_module<'s, 'i, F>(
+        scope: &PinScope<'s, 'i>,
+        module_name: Local<'s, JsString>,
+        export_names: &[Local<'s, JsString>],
+        _evaluation_steps: F,
+    ) -> Local<'s, Module>
+    where
+        F: UnitType + for<'a> Fn(Local<'a, Context>, Local<'a, Module>) -> Option<Local<'a, Value>>,
+    {
+        let realm = scope.get_current_context().context();
+        let names: Vec<api::Local> = export_names.iter().map(|name| name.into_engine()).collect();
+        let module = api::Module::create_synthetic_module(
+            &realm,
+            &module_name.into_engine(),
+            &names,
+            engine_evaluation_steps::<F>,
+        );
+        match module {
+            Ok(module) => Local::from_module(module),
+            Err(error) => {
+                crate::throw(scope, &error);
+                panic!("bridge: creating a synthetic module failed: {error}");
+            }
+        }
+    }
 }
 
 impl<'s> LocalHandle<'s, Module> {
@@ -310,19 +432,42 @@ impl<'s> LocalHandle<'s, Module> {
 
     /// Whether this module is a source text module
     /// (v8::Module::IsSourceTextModule).
-    ///
-    /// Every module the engine compiles is one, so this is `true` — stated
-    /// rather than assumed because a host branches on it.
     pub fn is_source_text_module(&self) -> bool {
-        let _ = self;
-        true
+        self.module().is_source_text_module()
     }
 
     /// Whether this module is a synthetic module
-    /// (v8::Module::IsSyntheticModule).
+    /// (v8::Module::IsSyntheticModule): a record whose exports its host
+    /// declared, rather than one parsed from source.
     pub fn is_synthetic_module(&self) -> bool {
-        let _ = self;
-        false
+        self.module().is_synthetic_module()
+    }
+
+    /// Set one of this synthetic module's exports
+    /// (v8::Module::SetSyntheticModuleExport).
+    ///
+    /// The module must be one
+    /// [`create_synthetic_module`](Module::create_synthetic_module) made and
+    /// must have been instantiated, and `export_name` must be one it declared —
+    /// V8 makes the cells the names bind to at instantiation — so anything else
+    /// throws and answers `None`, the crate's empty `Maybe<bool>`. An export set
+    /// again is the mutable binding V8 makes it, which a namespace read follows.
+    pub fn set_synthetic_module_export<'s2>(
+        &self,
+        scope: &PinScope<'s2, '_>,
+        export_name: Local<'s2, JsString>,
+        export_value: Local<'s2, Value>,
+    ) -> Option<bool> {
+        let set = self
+            .module()
+            .set_synthetic_module_export(&export_name.into_engine(), &export_value.into_engine());
+        match set {
+            Ok(set) => Some(set),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
     }
 
     /// Resolve every request in the graph, then link.
@@ -467,8 +612,9 @@ impl LocalHandle<'_, ModuleRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{Number, Promise};
+    use crate::data::{Number, Promise, PromiseResolver};
     use crate::handle::Global;
+    use crate::promise::PromiseState;
     use crate::scope::GetIsolate;
     use crate::script_compiler::{Source, compile_module};
     use crate::test_support::in_context;
@@ -780,6 +926,89 @@ mod tests {
                 Local::<Object>::try_from(module.get_module_namespace()).expect("namespace");
             let key = JsString::new(scope, "doubled").expect("string").into();
             assert_eq!(number_of(namespace.get(scope, key).expect("get")), 82.0);
+        });
+    }
+
+    /// The steps a synthetic module runs: one export set in a callback scope of
+    /// their own, and the promise the crate's steps answer.
+    fn synthetic_steps<'s>(
+        context: Local<'s, Context>,
+        module: Local<'s, Module>,
+    ) -> Option<Local<'s, Value>> {
+        crate::callback_scope!(unsafe scope, context);
+        let name = JsString::new(scope, "answer").expect("string");
+        let value = Number::new(scope, 42.0).into();
+        assert_eq!(
+            module.set_synthetic_module_export(scope, name, value),
+            Some(true),
+            "the host's own export"
+        );
+        let resolver = PromiseResolver::new(scope).expect("resolver");
+        let promise = resolver.get_promise(scope);
+        // A handle is the value it carries, and an engine value outlives the
+        // scope it was made in — what a scope's region holds is compiled
+        // source, which this names none of.
+        Some(Local::from_engine(promise.into_engine()))
+    }
+
+    /// Steps that refuse their own module's export, which is how a host's steps
+    /// report a throw: the empty handle, with the exception pending.
+    fn refusing_steps<'s>(
+        context: Local<'s, Context>,
+        module: Local<'s, Module>,
+    ) -> Option<Local<'s, Value>> {
+        crate::callback_scope!(unsafe scope, context);
+        let name = JsString::new(scope, "undeclared").expect("string");
+        let value = Number::new(scope, 1.0).into();
+        assert_eq!(module.set_synthetic_module_export(scope, name, value), None);
+        None
+    }
+
+    /// A synthetic module carries no source: what it exposes comes from the
+    /// steps its host declared, which the engine calls back into with handles
+    /// the host's own scopes cannot name.
+    #[test]
+    fn a_synthetic_module_runs_the_steps_its_host_declared() {
+        in_context!(scope, {
+            let name = JsString::new(scope, "host").expect("string");
+            let names = [JsString::new(scope, "answer").expect("string")];
+            let module = Module::create_synthetic_module(scope, name, &names, synthetic_steps);
+
+            assert!(module.is_synthetic_module());
+            assert!(!module.is_source_text_module());
+            assert_eq!(module.get_status(), ModuleStatus::Uninstantiated);
+
+            let value = module.evaluate(scope).expect("evaluate");
+            Local::<Promise>::try_from(value).expect("evaluation promise");
+            assert_eq!(module.get_status(), ModuleStatus::Evaluated);
+
+            let namespace =
+                Local::<Object>::try_from(module.get_module_namespace()).expect("namespace");
+            let key = JsString::new(scope, "answer").expect("string").into();
+            assert_eq!(number_of(namespace.get(scope, key).expect("get")), 42.0);
+        });
+    }
+
+    /// Steps that fail leave the module errored with the failure they threw as
+    /// its exception, which is what the crate's evaluation answers the empty
+    /// handle for.
+    #[test]
+    fn a_synthetic_modules_failure_becomes_its_exception() {
+        in_context!(scope, {
+            let name = JsString::new(scope, "host").expect("string");
+            let names = [JsString::new(scope, "answer").expect("string")];
+            let module = Module::create_synthetic_module(scope, name, &names, refusing_steps);
+            assert!(module.get_exception().is_undefined());
+
+            let value = module.evaluate(scope).expect("evaluate");
+            assert_eq!(module.get_status(), ModuleStatus::Errored);
+            assert!(!module.get_exception().is_undefined());
+            assert_eq!(
+                Local::<Promise>::try_from(value)
+                    .expect("evaluation promise")
+                    .state(),
+                PromiseState::Rejected
+            );
         });
     }
 }

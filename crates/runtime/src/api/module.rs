@@ -2,7 +2,7 @@
 
 use std::num::NonZeroI32;
 
-use crux::error::JsError;
+use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::string::JsString;
 
@@ -10,6 +10,15 @@ use crate::module::{self, SourceTextModule};
 
 use super::context::Context;
 use super::handle::Local;
+
+/// The text a value holds, or a `TypeError` naming what asked for it.
+fn string_value(value: &Local, what: &str) -> Result<JsString, JsError> {
+    value
+        .value()
+        .as_string()
+        .map(|text| JsString::owned_of(&text))
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, format!("{what} is not a string")))
+}
 
 /// Where a module is in its life (v8::ModuleStatus).
 ///
@@ -64,6 +73,15 @@ pub struct ModuleRequest {
     pub source_offset: u32,
 }
 
+/// What a synthetic module's evaluation runs
+/// (v8::SyntheticModuleEvaluationSteps).
+///
+/// The engine hands the callback the module's context and the module during
+/// evaluation. What it answers is the evaluation promise — V8's steps return a
+/// promise, which becomes the module's [[TopLevelCapability]] — and `Err` is
+/// the failure the module records and every later evaluation answers.
+pub type SyntheticModuleEvaluationSteps = fn(Context, Module) -> Result<Local, JsError>;
+
 /// A source text module record (v8::Module).
 ///
 /// The record is reachable from the realm for as long as the realm lives, so
@@ -74,6 +92,12 @@ pub struct Module {
 }
 
 impl Module {
+    /// The handle for a record the engine made itself, which is how a
+    /// synthetic module's evaluation callback is handed its own module.
+    pub(crate) fn from_handle(module: Handle<SourceTextModule>) -> Self {
+        Self { module }
+    }
+
     /// Parse `source` as a module in `context`'s realm
     /// (v8::ScriptCompiler::CompileModule).
     pub fn compile(context: &Context, specifier: &str, source: &str) -> Result<Self, JsError> {
@@ -82,6 +106,60 @@ impl Module {
         context.with_agent(|agent| {
             module::parse_module(agent, &specifier, &source, &[]).map(|module| Self { module })
         })
+    }
+
+    /// Whether this module is a source text module
+    /// (v8::Module::IsSourceTextModule).
+    pub fn is_source_text_module(&self) -> bool {
+        self.module.synthetic.is_none()
+    }
+
+    /// Whether this module is a synthetic one
+    /// (v8::Module::IsSyntheticModule): a record a host declared the exports of
+    /// and gave an evaluation callback, rather than one parsed from source.
+    pub fn is_synthetic_module(&self) -> bool {
+        self.module.synthetic.is_some()
+    }
+
+    /// Create a synthetic module (spec 16.2.1.5.2 /
+    /// v8::Module::CreateSyntheticModule): `export_names` are the bindings it
+    /// exposes, and `context` is the realm the evaluation callback is handed.
+    ///
+    /// The names must be strings and must not repeat, which V8 requires too
+    /// ("export_names must not contain duplicates"); a name that is not a
+    /// string is a `TypeError` here rather than an unchecked handle.
+    #[allow(clippy::new_ret_no_self)] // v8::Module::CreateSyntheticModule returns a module.
+    pub fn create_synthetic_module(
+        context: &Context,
+        name: &Local,
+        export_names: &[Local],
+        evaluation_steps: SyntheticModuleEvaluationSteps,
+    ) -> Result<Self, JsError> {
+        let name = string_value(name, "the synthetic module's name")?;
+        let mut names = Vec::with_capacity(export_names.len());
+        for export in export_names {
+            names.push(string_value(export, "an export name")?);
+        }
+        context.with_agent(|agent| {
+            module::synthetic_module_create(agent, *context, &name, names, evaluation_steps)
+                .map(|module| Self { module })
+        })
+    }
+
+    /// Set one of a synthetic module's exports
+    /// (v8::Module::SetSyntheticModuleExport).
+    ///
+    /// The module must have been created by
+    /// [`create_synthetic_module`](Self::create_synthetic_module) *and*
+    /// instantiated, and the name must be one it declared; anything else is a
+    /// `ReferenceError`, which is V8's own check and message.
+    pub fn set_synthetic_module_export(
+        &self,
+        export_name: &Local,
+        export_value: &Local,
+    ) -> Result<bool, JsError> {
+        let name = string_value(export_name, "an export name")?;
+        module::set_synthetic_module_export(&self.module, &name, export_value.into_value())
     }
 
     /// Name the module, so linking resolves imports of it without asking the
@@ -166,7 +244,8 @@ impl Module {
     /// # Panics
     ///
     /// On a module that is not a source text module, which is the crate's own
-    /// check (`Utils::ApiCheck`, `src/api/api.cc:2340`).
+    /// check (`Utils::ApiCheck`, `src/api/api.cc:2340`). A synthetic module has
+    /// no source, and its offsets are not source offsets.
     pub fn source_offset_to_location(&self, offset: u32) -> crux::SourceLocation {
         let text = syntax::SourceText::from_utf16(self.module.source.as_slice().to_vec());
         text.line_column(offset)
@@ -272,7 +351,7 @@ impl Eq for Module {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Context, Isolate, Object};
+    use crate::api::{Context, Isolate, Object, Promise};
 
     /// A module compiles, links against a registered dependency, evaluates in
     /// order, and exposes its exports through a namespace.
@@ -334,5 +413,130 @@ mod tests {
         let mut isolate = Isolate::new();
         let context = Context::new(&mut isolate).expect("context");
         assert!(Module::compile(&context, "bad", "export const = 1;").is_err());
+    }
+
+    /// The steps a synthetic module evaluates through: set the two exports, and
+    /// answer the resolved promise V8's steps must answer.
+    fn steps(context: Context, module: Module) -> Result<Local, JsError> {
+        for (name, value) in [("a", 1.0), ("b", 2.0)] {
+            let name = Local::string(name);
+            assert!(
+                module
+                    .set_synthetic_module_export(&name, &Local::number(value))
+                    .expect("set an export")
+            );
+        }
+        Promise::resolve(&context, &Local::undefined())
+    }
+
+    /// A synthetic module is one a host declared the exports of: its namespace
+    /// answers what the steps set, a name it did not declare or a module that
+    /// is not yet instantiated is refused, and a second evaluation answers the
+    /// same promise rather than running the steps again.
+    #[test]
+    fn a_synthetic_module_answers_its_hosts_exports() {
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+
+        let names = [Local::string("a"), Local::string("b")];
+        let module =
+            Module::create_synthetic_module(&context, &Local::string("host"), &names, steps)
+                .expect("create");
+        assert!(module.is_synthetic_module());
+        assert!(!module.is_source_text_module());
+
+        // The bindings a name is set into are created at instantiation, so
+        // setting one before that is V8's ``Export '%' is not defined``.
+        let error = module
+            .set_synthetic_module_export(&names[0], &Local::number(1.0))
+            .expect_err("a module that is not instantiated refuses");
+        assert_eq!(error.kind, ErrorKind::ReferenceError);
+
+        assert_eq!(module.status(), ModuleStatus::Uninstantiated);
+        module.instantiate(&context).expect("instantiate");
+        assert_eq!(module.status(), ModuleStatus::Instantiated);
+
+        let promise = module.evaluate(&context).expect("evaluate");
+        assert_eq!(module.status(), ModuleStatus::Evaluated);
+        assert_eq!(
+            Promise::state(&context, &promise).expect("state"),
+            "fulfilled"
+        );
+
+        let namespace = module.namespace(&context).expect("namespace");
+        for (name, expected) in [("a", 1.0), ("b", 2.0)] {
+            assert_eq!(
+                Object::get(&context, &namespace, name)
+                    .expect("read")
+                    .as_number(),
+                Some(expected)
+            );
+        }
+        // A name the host never declared is not on the namespace at all.
+        assert!(
+            Object::get(&context, &namespace, "c")
+                .expect("read")
+                .is_undefined()
+        );
+        let refused = module
+            .set_synthetic_module_export(&Local::string("c"), &Local::number(3.0))
+            .expect_err("an undeclared name is refused");
+        assert_eq!(refused.kind, ErrorKind::ReferenceError);
+
+        // An export set again reads through, which is V8's mutable binding.
+        module
+            .set_synthetic_module_export(&names[0], &Local::number(7.0))
+            .expect("set again");
+        assert_eq!(
+            Object::get(&context, &namespace, "a")
+                .expect("read")
+                .as_number(),
+            Some(7.0)
+        );
+
+        // A second evaluation answers the same promise: the steps ran once.
+        let again = module.evaluate(&context).expect("evaluate again");
+        assert_eq!(again, promise);
+    }
+
+    /// A synthetic module's steps that fail leave the module errored, and both
+    /// its exception and every later evaluation carry the failure.
+    #[test]
+    fn a_failing_synthetic_module_records_its_error() {
+        fn failing(_context: Context, _module: Module) -> Result<Local, JsError> {
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "the steps refused".into(),
+            ))
+        }
+
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+        let module = Module::create_synthetic_module(
+            &context,
+            &Local::string("failing"),
+            &[Local::string("a")],
+            failing,
+        )
+        .expect("create");
+        module.instantiate(&context).expect("instantiate");
+
+        let promise = module.evaluate(&context).expect("evaluate");
+        assert_eq!(module.status(), ModuleStatus::Errored);
+        assert_eq!(
+            Promise::state(&context, &promise).expect("state"),
+            "rejected"
+        );
+        assert!(module.exception().is_some());
+        assert_eq!(
+            Object::get(
+                &context,
+                &module.namespace(&context).expect("namespace"),
+                "a"
+            )
+            .expect("read")
+            .as_number(),
+            None
+        );
     }
 }

@@ -562,6 +562,7 @@ number is the certified one.
 | after the three stragglers a `Context` and an `Object` answer (`get_constructor_name`, `get_extras_binding_object`, `Context::from_snapshot`) | **44** (see below) |
 | after the message surface (`Exception::create_message`, `Message::{get, get_script_resource_name, get_line_number, get_start_column, get_stack_trace}`, and the recorded position behind them) | **37** (see below) |
 | after the module structure surface (a module's requests and the four reads on one, an offset's location, the graph's async-ness, the deferred namespace, and the two callback-scope sites `Local::new` was blocking) | **25** (see below) |
+| after the synthetic-module surface (the record kind the engine gained, its export writes, its evaluation steps, and the `SyntheticModuleEvaluationSteps` re-export) | **21** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -580,6 +581,12 @@ sites, all of them names, and the count fell by exactly 16; `FunctionBuilder` wa
 6 sites and it fell by exactly 6 (5 in `runtime/bindings.rs`, 1 in `libs/core/
 error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
+
+That was the shape of the frontier then. It is no longer: with three names left,
+the 21 errors are 15 `E0599`s (methods and the subsystems they name), 3
+`E0425`s, 1 `E0282` and 2 `E0515`s, so the count is a *method-level* metric now,
+as §10 says — and each step's own record below names which code classes moved
+rather than only the total.
 
 **The serializer — landed, and the count stopped being a progress metric.**
 `crates/v8/serialize.rs` carries `ValueSerializer`/`ValueDeserializer`, the two
@@ -1797,22 +1804,20 @@ has a second occurrence with the values, in a crate this pass cannot reach
    `CompiledWasmModule` (1) needs a module handle the bridge can hold. Neither is
    a name to declare, and `set_wasm_streaming_callback` waits with them:
    `runtime/setup.rs` is otherwise closed, and its last error is that call.
-3. **The stragglers (3 → 1).** `PromiseRejectMessage` (1) **landed**, and it
+3. **The stragglers (3 → 0).** `PromiseRejectMessage` (1) **landed**, and it
    turned out to be a name the engine *can* back: the method it was hiding,
    `set_promise_reject_callback`, is now the one isolate callback that fires.
    `NearHeapLimitCallback` (1) **landed** as an accepted-and-not-fired shape.
-   `SyntheticModuleEvaluationSteps` (1) is still a callback for synthetic
-   modules, which the engine does not have (its JSON/text/bytes modules are
-   source-text modules with a synthetic body).
-4. **The rest of `v8::Module`** — method-level, so invisible in today's count:
-   `get_module_requests` (a `FixedArray` of `ModuleRequest`, which needs a `Data`
-   downcast the bridge has no exact predicate for yet), `is_graph_async`,
+   `SyntheticModuleEvaluationSteps` (1) **landed** with the synthetic-module
+   surface below, once the engine had the record kind to hang it on.
+4. **The rest of `v8::Module`** — method-level, so invisible in today's count.
+   Landed since: `get_module_requests` (a `FixedArray` of `ModuleRequest`, which
+   needed a payload-keyed `Data` downcast), `is_graph_async`,
    `source_offset_to_location` + `Location`, `get_module_namespace_with_phase`,
-   `evaluate_for_import_defer`, `create_synthetic_module` +
-   `set_synthetic_module_export` (the engine has no synthetic modules at all —
-   its JSON/text/bytes modules are source text modules with a synthetic body),
-   and `get_unbound_module_script` (no engine equivalent: the engine parses at
-   load).
+   and — with the surface below — `create_synthetic_module`,
+   `set_synthetic_module_export` and the two `is_*_module` answers. Still open:
+   `evaluate_for_import_defer` and `get_unbound_module_script` (no engine
+   equivalent: the engine parses at load).
 
 Every one of these is a real subsystem rather than a name to declare: the
 inspector protocol, a second GC heap, a task runner, snapshots, structured
@@ -1823,6 +1828,87 @@ by walking the graph, asking the host, and registering the answers. The
 **platform** turned out to be the other way round — a name whose honest
 implementation is "held and never used", because there is no background work to
 schedule; that is recorded in §9, not hidden in the code.
+
+**The synthetic-module surface — landed, 25 → 21, one name and three methods.**
+Four sites: `Module::create_synthetic_module` (`libs/core/modules/map.rs:650`,
+`:716`), `Module::set_synthetic_module_export` (`:1794`) and the
+`SyntheticModuleEvaluationSteps` type (`libs/core/runtime/bindings.rs:75`, cast
+to a `c_void` for the snapshot's external references).
+
+The engine gained the *record kind* this needed (§12 item 9, and the one engine
+change this slice names): a `SyntheticModule` aspect on `SourceTextModule` (the
+host's name for the record, the export names it declared with their cells, the
+callback evaluation runs and the realm that callback is handed), the four
+`api::Module` methods, and four dispatch points. Instantiation does nothing but
+the status, which is V8's own `PrepareInstantiate`/`FinishInstantiate`
+(`v8/src/objects/synthetic-module.cc:86`); evaluation links if it must, runs the
+steps and records the promise they answer, keeping it so a second evaluation
+answers the same promise rather than running them again, and records a failure
+the way `RecordError` does (`:132`); namespace creation reads the declared names
+instead of resolving them, because a synthetic record holds no bindings to
+resolve and `resolve_export` would throw (`module.cc:358`); and a namespace read
+answers the export cell, an unset export reading as *undefined* — which is what
+the cell was created as. The kind was deliberately absent until now: a
+JSON, text or bytes module is *wrapped* as `export default …` source
+(`crates/runtime/src/module.rs:288-320`), and a host callback cannot be wrapped.
+
+The bridge half is a shape question rather than a mapping, and it is where the
+engine's `fn`-pointer callback earns its place. A record keeps its steps for its
+whole life, so the engine stores a plain function pointer that names no lifetime
+— and a host's steps cannot be closed over the way `instantiate_module`'s
+callback is, because they outlive every scope the host has open when it declares
+the module. So the bridge reaches the host's function through its *type*: `F:
+UnitType + for<'s> Fn(..)` and an adapter generic over `F`, which is exactly what
+`FunctionCallback` does for the same reason (a mapped function pointer is a value
+whose type names the scope's lifetime, and that cannot be stored).
+`MapFnFrom<F> for SyntheticModuleEvaluationSteps<'s>` keeps the crate's own
+bound, because `bindings.rs` needs `map_fn_to()` and nothing else.
+
+Two divergences, stated rather than implied. The crate's steps answer the empty
+handle to report a throw; here that reads the isolate's pending exception and
+becomes the engine's error, so a failing evaluation answers the rejection the
+engine made from the failure where the crate answers the empty handle. And
+`Module::create_synthetic_module` answers the handle directly, as there, but
+aborts on an engine refusal: the shape has no failure channel, and the engine's
+only way to fail there is refusing the empty program the record is built from —
+which is the same result the crate's own `.unwrap()` panics on.
+
+Measured: **25 → 21**, `E0599` 18 → 15 — one name and three methods, and the
+remaining count is now 3 `E0425`s, 15 `E0599`s, 1 `E0282` and 2 `E0515`s. Two
+new bridge tests, each made to fail: the happy path fails when the declared
+export names are dropped (the steps' own `set_synthetic_module_export` then
+answers `None`, `left: None, right: Some(true)`), and the failure path fails when
+the adapter stops reading the pending exception (`left: Evaluated, right:
+Errored`). The engine's two tests were verified the same way when they landed.
+
+Gates: `cargo test -p v8 --features simdutf` **183 passed / 0 failed** (1
+filtered: the known crashing test), `cargo test -p runtime --lib api::module` 5
+passed, `cargo check -p v8 -p test262` (the feature-unification probe) clean,
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and
+`cargo test --locked --workspace -- --skip
+the_data_a_built_function_carries_survives_a_collection` **5,120 passed / 0
+failed / 4 ignored across 38 binaries**. One clippy finding this pass was in the
+engine half itself (`synthetic.exports.borrow()[index].clone()` on a `Copy`
+value) and is fixed rather than allowed.
+
+An engine crate changed, so the battery was re-run rather than argued, and the
+grep check is *not* the argument by itself this time: two of the dispatch points
+(`create_namespace`, `namespace_get`) sit in paths every namespace read takes.
+It holds anyway — no runner names `SyntheticModule`, `synthetic_module_create`,
+`set_synthetic_module_export`, `synthetic_result` or `rejected_promise`, and
+none reaches `runtime::api` — and the numbers are the certified ones: test262
+`all` 48,622 fixtures, 48,464 pass, **0 fail / 0 crash / 0 hang**, 158 skip;
+`intl402` 3,357 fixtures, 3,205 pass, 0 fail / 0 crash / 0 hang, 152 skip; the
+eight wasm core suites **64,594 checks / 0 fail / 0 pending** (20,662 + 25,990 +
+77 + 7,485 + 105 + 654 + 8,709 + 912); the JS-API sweep **1,001 tests / 0 fail**.
+
+**What this exposes.** The synthetic path is name-complete, but `deno_core`'s own
+steps function still does not type-check, and not for a reason this slice owns:
+`map.rs:1805` is a second instance of §12 item 8 — a host helper returning a
+handle it made under a callback scope — previously hidden behind the missing
+names. `E0515` went 1 → 2 for that reason, and it is the same one fix §12 item 8
+already describes: the callback scope's first lifetime has to be the parameter's
+rather than the storage borrow's.
 
 ## 8. Parked: the C++ face
 
@@ -2134,6 +2220,20 @@ if that proves possible.
   heap that refuses (the inspector's treatment) would take WebCrypto and canvas
   away from a host that can otherwise work, and a heap that sweeps anyway would
   be unsound. A host that needs reclamation needs L2.
+- **A synthetic module's steps are a function pointer, and the host's function is
+  reached through its type.** The crate's `SyntheticModuleEvaluationSteps<'s>`
+  names the scope's lifetime in its arguments, and the engine keeps the callback
+  in the record for the record's whole life, so the mapped pointer cannot be
+  stored — a `.map_fn_to()` value would have to outlive the scope it was mapped
+  under. The bridge therefore reconstructs the host's function item and bounds
+  `create_synthetic_module` by the higher-ranked `Fn` rather than by the crate's
+  `impl MapFnTo<..>`, which is the same shape `FunctionCallback` uses and accepts
+  every host function the crate's bound accepts. Two consequences a host can
+  see: a failing evaluation answers the rejection the engine made from the
+  steps' failure where the crate answers the empty handle (the crate's steps
+  report a throw that way, and V8 records `isolate->exception()` as the module's
+  error), and `create_synthetic_module` aborts on an engine refusal, which that
+  shape has no channel to report.
 
 ## 10. Build order
 
@@ -2150,13 +2250,14 @@ message's position landed as bridge work
 landed — a store over memory the host owns is `SharedBuffer::borrowed`; the
 accounting half, externally allocated memory and backing-store shrink, is not),
 synthetic modules (host-filled records with a host evaluation callback, §12 item
-9 — the engine's JSON/text/bytes shortcut is why it has none), inspector and
+9 — **landed**; the engine's JSON/text/bytes shortcut is why it had none until
+then), inspector and
 source maps, traced host objects, structured clone.
 
 Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks;
 (2) grow the surface from the items `deno_core` names, in call order — the name
-frontier is nearly closed (4 left: `WasmStreaming` twice, `CompiledWasmModule` and
-`SyntheticModuleEvaluationSteps`) and the serializer is landed, so this
+frontier is nearly closed (3 left: `WasmStreaming` twice and `CompiledWasmModule`)
+and the serializer is landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
 first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
@@ -2167,12 +2268,13 @@ shapes to 213, the host-memory store to 209, the tag shape to 62, the template
 surface to 56, the attribute-carrying half of the template cluster to 52, the static
 half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
 `Message` surface and `Exception::create_message` (piece 2 of the stack-trace
-split) to 37, the module structure surface to 25, and what is left is the method
-surface (18 `E0599`s, all of them named methods and subsystems: synthetic modules,
-wasm streaming and the module-object round trip, code cache, unbound scripts,
-import-defer's evaluation entry point, the stalled-top-level-await report, the
-frames of a stack trace, and `get_heap_statistics`), the 4 names, and two
-stragglers (1 `E0515`, 1 `E0282`).
+split) to 37, the module structure surface to 25, the synthetic-module surface to
+21, and what is left is the method
+surface (15 `E0599`s, all of them named methods and subsystems: wasm streaming
+and the module-object round trip, code cache, unbound scripts, import-defer's
+evaluation entry point, the stalled-top-level-await report, the frames of a stack
+trace, and `get_heap_statistics`), the 3 names, and two
+stragglers (2 `E0515`s, 1 `E0282`).
 The two that the suite had surveyed as needing engine work have landed since,
 `get_constructor_name` and `get_extras_binding_object`, and they turned out to
 need a walk of the prototype chain and a per-context object rather than V8's map
@@ -2236,31 +2338,28 @@ delete.
    register, or the table is rebuilt per compile, and both are decisions rather
    than drive-bys.
 8. **A host helper that ties a handle to the callback scope's own lifetime still
-   does not compile, and the fix is a scope shape.** One site
-   (`deno/libs/core/modules/map.rs:1374`) is `MapData::resolve_callback`, whose
-   signature is `fn resolve_callback<'s, 'i>(&self, scope: &mut PinScope<'s, 'i>,
-   ...) -> Option<Local<'s, Module>>` — it names the scope's *first* lifetime and
-   returns a handle built under it, and its caller (a `callback_scope!`-opened
-   scope inside `module_resolve_callback`) has that lifetime be the borrow of the
-   scope's own storage frame. `Local::new` no longer has the problem (its scope
+   does not compile, and the fix is a scope shape.** Two sites today:
+   `deno/libs/core/modules/map.rs:1374` is `MapData::resolve_callback`, and
+   `map.rs:1805` is `synthetic_module_evaluation_steps`' return (exposed only
+   once the synthetic-module names resolved, §7). Both name the scope's *first*
+   lifetime and return a handle built under it, and their caller (a
+   `callback_scope!`-opened scope) has that lifetime be the borrow of the scope's
+   own storage frame. `Local::new` no longer has the problem (its scope
    binding is free, §7), but an argument's binding is a different question, and
    making it go away means the callback scope's first lifetime being the
    *parameter's* — the context's — rather than the storage borrow's. That is a
    `PinnedRef` shape change (its `'p` is a real `&'p mut`), and the cheap version
    of it — a raw pointer plus a phantom lifetime — would let safe code move a
    scope reference past the storage that owns it. Worth doing deliberately, not
-   as a drive-by for one site.
-9. **Synthetic modules are the next engine subsystem the module machinery
-   needs.** `Module::create_synthetic_module` (`map.rs:650`, `:716`),
-   `set_synthetic_module_export` (`:1794`) and the `SyntheticModuleEvaluationSteps`
-   callback (`bindings.rs:75`) are four of the remaining errors, and they are one
-   capability: a module record the host fills with exports and evaluates through
-   its own callback. The engine has deliberately avoided that kind once already —
-   a JSON, text or bytes module is *wrapped* as source text (`export default …`,
-   `crates/runtime/src/module.rs:288-320`) rather than built as a synthetic module
-   — which is why every record it knows is a `SourceTextModule` and
-   `is_synthetic_module` answers `false` structurally. A host callback cannot be
-   wrapped that way, so this one is real work rather than a bridge mapping. The
-   shape is decided by what `deno_core` does with it: build the record from a name
-   and an export-name list, stage the values in the host's own table, and have the
-   evaluation callback set them.
+   as a drive-by for two sites, and it is now the only thing between the
+   synthetic path and a compiling `deno_core`.
+9. **Synthetic modules — landed** (the engine half and the bridge half; §7
+   records both, and §9's bullet records the two shape decisions). What the
+   engine grew: the `SyntheticModule` aspect on `SourceTextModule`, the four
+   `api::Module` methods, and the four dispatch points (instantiation, the
+   namespace's names, a read of an export, and the steps themselves, with the
+   promise kept so a second evaluation does not re-run them). What is *not*
+   there: duplicate export names are not refused (V8 throws for them, and the
+   crate's own `.unwrap()` panics), because the engine's `create` cannot fail and
+   a host that passes one gets a record whose cells are ambiguous rather than an
+   error — a named follow-up, not a guess.

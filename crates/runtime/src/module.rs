@@ -104,6 +104,15 @@ pub struct SourceTextModule {
     pub indirect_export_entries: Vec<ExportEntry>,
     pub star_export_entries: Vec<ExportEntry>,
     pub top_level_capability: RefCell<Option<crate::promise::PromiseCapability>>,
+    /// A synthetic module's evaluation promise — what its steps answered —
+    /// kept so a second evaluation answers the same promise instead of running
+    /// the steps again. V8 keeps it as the module's [[TopLevelCapability]];
+    /// the field above holds a *source text* module's capability, whose
+    /// resolver the asynchronous waves settle.
+    pub synthetic_result: RefCell<Option<Value>>,
+    /// This module's synthetic aspect, `None` for every source text module
+    /// (v8::Module::IsSyntheticModule).
+    pub synthetic: Option<SyntheticModule>,
     pub evaluation_error: RefCell<Option<Value>>,
     /// [[ImportMeta]] (spec 16.2.1.8): created on first access and cached.
     pub import_meta: RefCell<Option<Value>>,
@@ -126,6 +135,8 @@ impl Trace for SourceTextModule {
         self.cycle_root.trace(visit);
         self.async_parents.trace(visit);
         self.top_level_capability.trace(visit);
+        self.synthetic_result.trace(visit);
+        self.synthetic.trace(visit);
         self.evaluation_error.trace(visit);
         self.import_meta.trace(visit);
         self.module_source.trace(visit);
@@ -345,6 +356,8 @@ pub fn parse_module(
         indirect_export_entries: records.indirect_export_entries,
         star_export_entries: records.star_export_entries,
         top_level_capability: RefCell::new(None),
+        synthetic_result: RefCell::new(None),
+        synthetic: None,
         evaluation_error: RefCell::new(None),
         import_meta: RefCell::new(None),
         module_source: RefCell::new(None),
@@ -354,6 +367,141 @@ pub fn parse_module(
         pending_async: RefCell::new(0),
     });
     Ok(module)
+}
+
+/// A synthetic module's own aspect (spec 16.2.1.5.2 CreateSyntheticModule /
+/// `v8::Module::CreateSyntheticModule`): the export names the host declared,
+/// the values it has set, and the callback its evaluation runs.
+///
+/// V8 keeps this as a record *kind* beside the source text one
+/// (`SyntheticModule`, `v8/src/objects/synthetic-module.tq`); the engine keeps
+/// one record with an aspect that decides, because everything else a module
+/// has — its realm, status, namespace, cycle root and evaluation error — is the
+/// same for both.
+pub struct SyntheticModule {
+    /// The name the host gave. Nothing in the language reads it; V8 keeps it
+    /// for tooling.
+    pub name: JsString,
+    /// The declared export names, in the order the host gave them.
+    pub export_names: Vec<JsString>,
+    /// The value of each declared export, parallel to `export_names`. `None` is
+    /// an export that has not been set, which reads as *undefined* — V8
+    /// creates a cell initialized to undefined per name at instantiation
+    /// (`SyntheticModule::PrepareInstantiate`).
+    pub exports: RefCell<Vec<Option<Value>>>,
+    /// What evaluation runs (v8::SyntheticModuleEvaluationSteps).
+    pub evaluation_steps: crate::api::SyntheticModuleEvaluationSteps,
+    /// The realm the module was made in, which is the context the callback is
+    /// handed.
+    pub context: crate::api::Context,
+}
+
+impl Trace for SyntheticModule {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.name.trace(visit);
+        for name in &self.export_names {
+            name.trace(visit);
+        }
+        self.exports.trace(visit);
+        self.context.realm().trace(visit);
+    }
+}
+
+impl std::fmt::Debug for SyntheticModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The context is left out: it is a realm handle on its isolate, which
+        // says nothing about this record that the module's own `realm` does not.
+        f.debug_struct("SyntheticModule")
+            .field("name", &self.name)
+            .field("export_names", &self.export_names)
+            .field("exports", &self.exports)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Create a synthetic module (spec 16.2.1.5.2): a record with the export names
+/// the host declared and no source. It has no imports, so its instantiation
+/// does nothing but the status, and its evaluation is the host's callback.
+pub fn synthetic_module_create(
+    agent: &mut Agent,
+    context: crate::api::Context,
+    name: &JsString,
+    export_names: Vec<JsString>,
+    evaluation_steps: crate::api::SyntheticModuleEvaluationSteps,
+) -> Result<Handle<SourceTextModule>, JsError> {
+    let realm = agent.current_realm()?;
+    let slots = export_names.len();
+    let module = Handle::new(SourceTextModule {
+        realm,
+        // An empty program: a synthetic module has no statements, which is
+        // what `module_has_tla` and the other AST readers see of it.
+        code: parser::parse_module("")?,
+        source: JsString::from_utf8(""),
+        kind: ModuleKind::Js,
+        status: RefCell::new(ModuleStatus::Unlinked),
+        environment: RefCell::new(None),
+        namespace: RefCell::new(None),
+        requested_modules: Vec::new(),
+        import_entries: Vec::new(),
+        local_export_entries: Vec::new(),
+        indirect_export_entries: Vec::new(),
+        star_export_entries: Vec::new(),
+        top_level_capability: RefCell::new(None),
+        synthetic_result: RefCell::new(None),
+        synthetic: Some(SyntheticModule {
+            name: name.clone(),
+            export_names,
+            exports: RefCell::new(vec![None; slots]),
+            evaluation_steps,
+            context,
+        }),
+        evaluation_error: RefCell::new(None),
+        import_meta: RefCell::new(None),
+        module_source: RefCell::new(None),
+        deferred_namespace: RefCell::new(None),
+        cycle_root: RefCell::new(None),
+        async_parents: RefCell::new(Vec::new()),
+        pending_async: RefCell::new(0),
+    });
+    Ok(module)
+}
+
+/// Set one of a synthetic module's exports
+/// (v8::Module::SetSyntheticModuleExport).
+///
+/// A name the host did not declare, or a module that is not yet instantiated,
+/// is a `ReferenceError` — V8's `kModuleExportUndefined`, "Export '%' is not
+/// defined in module" — and both cases are the same check there: the cell the
+/// name would find is created per export name at instantiation
+/// (`SyntheticModule::SetExport`, `v8/src/objects/synthetic-module.cc:22`).
+pub fn set_synthetic_module_export(
+    module: &Handle<SourceTextModule>,
+    name: &JsString,
+    value: Value,
+) -> Result<bool, JsError> {
+    let synthetic = module.synthetic.as_ref().ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "SetSyntheticModuleExport on a source text module".into(),
+        )
+    })?;
+    let declared = synthetic
+        .export_names
+        .iter()
+        .position(|declared| declared == name);
+    let declared = declared.filter(|_| *module.status.borrow() != ModuleStatus::Unlinked);
+    let Some(index) = declared else {
+        return Err(JsError::new(
+            ErrorKind::ReferenceError,
+            format!(
+                "Export '{}' is not defined in module",
+                name.to_string_lossy()
+            ),
+        ));
+    };
+    crux::heap::write_barrier(&**module, value);
+    synthetic.exports.borrow_mut()[index] = Some(value);
+    Ok(true)
 }
 
 /// The module kind requested by import attributes, or the `.json` extension
@@ -752,6 +900,16 @@ pub fn module_declaration_instantiation(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<(), JsError> {
+    // A synthetic module has no imports and no exports to resolve: its bindings
+    // are the names its host declared, so V8's PrepareInstantiate and
+    // FinishInstantiate have nothing to do but the status
+    // (`v8/src/objects/synthetic-module.cc:86`).
+    if module.synthetic.is_some() {
+        if *module.status.borrow() == ModuleStatus::Unlinked {
+            module.status.replace(ModuleStatus::Linked);
+        }
+        return Ok(());
+    }
     // GC-2: the resolved-imports Vec and the specifier/import-entry clones
     // are local heap buffers the stack scan cannot see, held across the
     // resolve/instantiate recursion that allocates — suppress `--gc-stress`
@@ -1251,6 +1409,9 @@ pub fn module_evaluation(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<Value, JsError> {
+    if module.synthetic.is_some() {
+        return synthetic_module_evaluation(agent, module);
+    }
     // GC-2: the wave holds module handles and specifier JsStrings in local
     // heap buffers (the dependency clone, the gathered async-dependency
     // Vec) the conservative stack scan cannot see, across recursion that
@@ -2012,14 +2173,21 @@ fn create_namespace(
     // not rely on the cached namespace, which is set at the end.
     let mut names: Vec<JsString> = Vec::new();
     let mut stack: Vec<Handle<SourceTextModule>> = Vec::new();
-    collect_exported_names(agent, module, &mut stack, &mut names)?;
-    // GetModuleNamespace (spec 10.4.6.6 step 4): only names that resolve
-    // unambiguously appear on the namespace. A name that does not resolve
-    // (or resolves ambiguously through multiple star exports) is omitted.
-    names.retain(|name| {
-        let mut resolve_set = Vec::new();
-        resolve_export(agent, module, name, &mut resolve_set).is_ok_and(|r| r.is_some())
-    });
+    if let Some(synthetic) = &module.synthetic {
+        // A synthetic module's exports are exactly the names its host declared:
+        // there is nothing to resolve and no star to follow
+        // (`Module::GetModuleNamespace`, `v8/src/objects/module.cc:380`).
+        names.extend(synthetic.export_names.iter().cloned());
+    } else {
+        collect_exported_names(agent, module, &mut stack, &mut names)?;
+        // GetModuleNamespace (spec 10.4.6.6 step 4): only names that resolve
+        // unambiguously appear on the namespace. A name that does not resolve
+        // (or resolves ambiguously through multiple star exports) is omitted.
+        names.retain(|name| {
+            let mut resolve_set = Vec::new();
+            resolve_export(agent, module, name, &mut resolve_set).is_ok_and(|r| r.is_some())
+        });
+    }
     names.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
     let exports: Vec<PropertyKey> = names
         .into_iter()
@@ -2216,6 +2384,72 @@ fn module_sync_ready(
         }
     }
     Ok(true)
+}
+
+/// Evaluate a synthetic module (v8::Module::Evaluate for a synthetic record):
+/// run the host's steps, which set the exports, and answer the promise they
+/// returned.
+///
+/// The steps run *synchronously* — V8 calls them from
+/// `SyntheticModule::Evaluate` (`v8/src/objects/synthetic-module.cc:120`) and
+/// stores what they answer as the module's [[TopLevelCapability]] — and the
+/// graph never awaits that promise: a synthetic module has no [[HasTLA]], so it
+/// is not an asynchronous dependency (GatherAsynchronousTransitiveDependencies)
+/// and its exports are in place as soon as the steps return. A second
+/// evaluation answers the same promise rather than running the steps again.
+fn synthetic_module_evaluation(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+) -> Result<Value, JsError> {
+    if let Some(answered) = *module.synthetic_result.borrow() {
+        return Ok(answered);
+    }
+    if *module.status.borrow() == ModuleStatus::Unlinked {
+        module_declaration_instantiation(agent, module)?;
+    }
+    let (evaluation_steps, context) = {
+        let synthetic = module
+            .synthetic
+            .as_ref()
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a synthetic module".into()))?;
+        (synthetic.evaluation_steps, synthetic.context)
+    };
+    module.status.replace(ModuleStatus::Evaluating);
+    let answered = match evaluation_steps(context, crate::api::Module::from_handle(*module)) {
+        Ok(value) => value.into_value(),
+        Err(error) => {
+            // The steps failed: the module records the error and every later
+            // evaluation answers the rejection, which is what V8 records
+            // through `RecordError` and then answers an empty handle for.
+            let value = crate::builtins::error::to_throwable(agent, &error)?;
+            crux::heap::write_barrier(&**module, value);
+            module.evaluation_error.replace(Some(value));
+            module.status.replace(ModuleStatus::Evaluated);
+            let rejection = rejected_promise(agent, module, value)?;
+            *module.synthetic_result.borrow_mut() = Some(rejection);
+            return Ok(rejection);
+        }
+    };
+    module.status.replace(ModuleStatus::Evaluated);
+    crux::heap::write_barrier(&**module, answered);
+    *module.synthetic_result.borrow_mut() = Some(answered);
+    Ok(answered)
+}
+
+/// A promise rejected with `value`, in the module's realm.
+fn rejected_promise(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    value: Value,
+) -> Result<Value, JsError> {
+    let promise_ctor = module
+        .realm
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
+    crate::function::call(agent, &capability.reject, Value::Undefined, &[value])?;
+    Ok(capability.promise)
 }
 
 /// [[HasTLA]] (spec 16.2.1.5.1): whether the module's top-level code contains
@@ -2742,6 +2976,19 @@ pub fn namespace_get(
     module: &Handle<SourceTextModule>,
     name: &JsString,
 ) -> Result<Value, JsError> {
+    if let Some(synthetic) = &module.synthetic {
+        // A synthetic module's namespace reads its export slots. A name that is
+        // not declared is not a property of the namespace, so a read never
+        // arrives with one; an export the host has not set reads as *undefined*,
+        // which is what its cell was created as.
+        let index = synthetic
+            .export_names
+            .iter()
+            .position(|declared| declared == name);
+        return Ok(index
+            .and_then(|index| synthetic.exports.borrow()[index])
+            .unwrap_or(Value::Undefined));
+    }
     let mut resolve_set = Vec::new();
     match resolve_export(agent, module, name, &mut resolve_set)? {
         Some(ResolvedBinding::Local(target, local)) => {
