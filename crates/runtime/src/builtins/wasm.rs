@@ -830,9 +830,36 @@ fn compile_module_bytes(
             &format!("wasm module validation failed: {error}"),
         )?));
     }
+    Ok(module_object_with(agent, module, proto))
+}
+
+/// A Module object carrying `module`, with `proto` as its prototype (the Module
+/// default prototype when `None`) and its [[Module]] slot registered. This is
+/// what `v8::WasmModuleObject::{Compile, FromCompiledModule}` answer, so it is
+/// exported to the api layer rather than duplicated there: a host's compiled
+/// module is the same object the JS-API's own `WebAssembly.Module` would be.
+pub(crate) fn module_object_with(
+    agent: &mut Agent,
+    module: wasm::Module,
+    proto: Option<Handle<JsObject>>,
+) -> Value {
     let object = JsObject::ordinary_object_create(proto);
     agent.wasm_modules.insert(object.id(), module);
-    Ok(Value::Object(object))
+    Value::Object(object)
+}
+
+/// A Module object in the current realm for `module`, which is
+/// `v8::WasmModuleObject::FromCompiledModule`.
+pub(crate) fn module_object(agent: &mut Agent, module: wasm::Module) -> Result<Value, JsError> {
+    let proto = module_proto(agent)?;
+    Ok(module_object_with(agent, module, Some(proto)))
+}
+
+/// Compile `bytes` into a Module object in the current realm, which is
+/// `v8::WasmModuleObject::Compile`.
+pub(crate) fn compile_module_value(agent: &mut Agent, bytes: &[u8]) -> Result<Value, JsError> {
+    let proto = module_proto(agent)?;
+    compile_module_bytes(agent, bytes, Some(proto))
 }
 
 /// `new WebAssembly.Module(bytes)` (JS-API spec 4.2.1): compile (decode +

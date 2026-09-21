@@ -26,6 +26,8 @@ mod promise;
 mod script;
 mod template;
 mod try_catch;
+#[cfg(feature = "wasm")]
+mod wasm;
 
 pub use context::{Context, ContextScope};
 pub use external::External;
@@ -43,6 +45,8 @@ pub use template::{
     ReturnValue,
 };
 pub use try_catch::{Exception, TryCatch};
+#[cfg(feature = "wasm")]
+pub use wasm::{CompiledWasmModule, WasmModuleObject};
 
 use std::cell::RefCell;
 use std::collections::HashMap;

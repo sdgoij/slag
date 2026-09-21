@@ -564,6 +564,7 @@ number is the certified one.
 | after the module structure surface (a module's requests and the four reads on one, an offset's location, the graph's async-ness, the deferred namespace, and the two callback-scope sites `Local::new` was blocking) | **25** (see below) |
 | after the synthetic-module surface (the record kind the engine gained, its export writes, its evaluation steps, and the `SyntheticModuleEvaluationSteps` re-export) | **21** (see below) |
 | after the callback scope's lifetime (the two `E0515`s) | **19** (see below) |
+| after the compiled-module surface (the engine's wasm API exposed: `api::WasmModuleObject`, `api::CompiledWasmModule`, and the bridge's `WasmModuleObject` over them) | **15** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -583,8 +584,8 @@ sites, all of them names, and the count fell by exactly 16; `FunctionBuilder` wa
 error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
 
-That was the shape of the frontier then. It is no longer: with three names left,
-the 19 errors are 15 `E0599`s (methods and the subsystems they name), 3
+That was the shape of the frontier then. It is no longer: with two names left,
+the 15 errors are 12 `E0599`s (methods and the subsystems they name), 2
 `E0425`s and 1 `E0282`, so the count is a *method-level* metric now,
 as §10 says — and each step's own record below names which code classes moved
 rather than only the total.
@@ -1964,6 +1965,69 @@ a grep this time: no runner crate depends on `crates/v8` at all — no manifest
 under `crates/{test262,wasmtest,wasm,cli}` names it and `cargo tree -p test262`
 shows none — so the battery cannot see this change either way.
 
+**The compiled-module surface — landed, 19 → 15, and the first wasm the bridge
+has ever compiled.** Four sites: `v8::WasmModuleObject::compile`
+(`libs/core/modules/map/wasm.rs:48`), `module.get_compiled_module()`
+(`ops_builtin_v8.rs:704`), `WasmModuleObject::from_compiled_module` (`:799`) and
+the `CompiledWasmModule` name (`runtime/jsruntime.rs:507`, in the cross-isolate
+store's type).
+
+The engine already compiled wasm: a `WebAssembly.Module` object is an ordinary
+object whose decoded `wasm::Module` sits in `agent.wasm_modules` under the object's
+id (`crates/runtime/src/builtins/wasm.rs:808-836`). So the engine change is an
+*exposure* — `api::WasmModuleObject::{compile, from_compiled_module,
+get_compiled_module}` over a new `api::CompiledWasmModule`, plus one `pub(crate)`
+split in `builtins/wasm.rs` so that the JS API's own `WebAssembly.compile` and a
+host's `compile` build their object the same way (prototype and [[Module]] slot
+alike). The refactor is behaviour-preserving by construction: `compile_module_bytes`
+now ends in the same `module_object_with` the new entry points call, and no
+existing caller changed path. `crates/v8/Cargo.toml` also changed, and that is the
+mechanism that makes any of it reachable: it now asks `slag` for its `wasm`
+feature, because the crate we stand in for always has WebAssembly — a host never
+asks for it and must not have to.
+
+`api::CompiledWasmModule` is the decoded module, not a handle to a shared
+allocation, and that is what makes it work for what a host does with it: it points
+at nothing in the isolate's arena, so it outlives the object it came from and can
+travel to another isolate — the two properties `deno_core`'s `CrossIsolateStore`
+needs, and the reason upstream marks its own `Send + Sync`. What it does not carry
+is the wire bytes, so `get_wire_bytes_ref` is absent rather than wrong.
+
+Measured: **19 → 15** (`E0599` 15 → 12, `E0425` 3 → 2). Two bridge tests, each
+verified by mutating the code it guards: the round trip fails when
+`from_compiled_module` answers a default module (`left: Module { … exports: [] }`
+against the real one, memory and `m` export), and the failure path fails when
+`compile` stops recording the exception (`assertion failed: tc_scope.has_caught()`).
+The round trip also pins what a host's `instanceof WebAssembly.Module` will say,
+by comparing the object's prototype with `WebAssembly.Module.prototype` — dropping
+the module prototype in `compile_module_value` fails it (`left:
+Payload::Value(Local(Null))`). The bytes the tests compile are hand-built — 20 of
+them: header, a one-page memory, `m` exported as memory 0 — which is what makes
+the round trip's equality meaningful.
+
+Gates: `cargo test -p v8 --features simdutf` **186 passed / 0 failed** (1 filtered:
+the known crashing test), `cargo clippy --locked --workspace --all-targets -- -D
+warnings` clean, `cargo test --locked --workspace -- --skip
+the_data_a_built_function_carries_survives_a_collection` **5,123 passed / 0 failed
+/ 4 ignored across 38 binaries** (the root `Cargo.lock` is untouched by any of
+this). `crates/v8` *and* `crates/runtime` changed, and the engine half sits in
+exactly the path the wasm JS-API sweep exercises, so the battery ran rather than
+being argued: test262 `all` 48,622 fixtures — 48,464 pass, **0 fail / 0 crash / 0
+hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 0 fail / 0 crash / 0 hang, 152
+skip; the eight wasm core suites **64,594 checks / 0 fail / 0 pending** (20,662 +
+25,990 + 77 + 7,485 + 105 + 654 + 8,709 + 912); the JS-API sweep **1,001 tests / 0
+fail**. Every number is the certified one.
+
+One trap this slice hit twice, recorded because it costs time: the wasm core suite
+is invoked as `wasmtest run --strict waspec/test/core/*.wast`. A doubled slash —
+`core//*.wast`, which is what an unset shell variable produces inside a loop —
+globs into the subdirectories as well and reports 20,736 pass with 2 "fails" that
+are the same suites reached twice.
+
+**What is left of the wasm tail** is streaming: `WasmStreaming<false>` twice and
+`set_wasm_streaming_callback`, the second half of §12 item 10, and the one that
+needs the engine to grow a host-driven path.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -2275,7 +2339,7 @@ if that proves possible.
   away from a host that can otherwise work, and a heap that sweeps anyway would
   be unsound. A host that needs reclamation needs L2.
 - **A synthetic module's steps are a function pointer, and the host's function is
-  reached through its type.**The crate's `SyntheticModuleEvaluationSteps<'s>`
+  reached through its type.** The crate's `SyntheticModuleEvaluationSteps<'s>`
   names the scope's lifetime in its arguments, and the engine keeps the callback
   in the record for the record's whole life, so the mapped pointer cannot be
   stored — a `.map_fn_to()` value would have to outlive the scope it was mapped
@@ -2288,6 +2352,95 @@ if that proves possible.
   report a throw that way, and V8 records `isolate->exception()` as the module's
   error), and `create_synthetic_module` aborts on an engine refusal, which that
   shape has no channel to report.
+10. **The wasm tail — surveyed and split into two slices before either is
+  started.** Seven of the remaining 19 errors are this one subsystem, and they
+  are two capabilities rather than one.
+
+  - **The compiled module (4 sites: `libs/core/modules/map/wasm.rs:48`,
+    `libs/core/ops_builtin_v8.rs:704` and `:799`, and
+    `libs/core/runtime/jsruntime.rs:507`).** `WasmModuleObject::compile(scope,
+    bytes)`, `module.get_compiled_module()`, `WasmModuleObject::from_compiled_module`
+    and the `CompiledWasmModule` name (which upstream marks `Send + Sync`). The
+    engine already does the work — a `WebAssembly.Module` object is an ordinary
+    object whose decoded `wasm::Module` sits in `agent.wasm_modules` keyed by the
+    object's id (`crates/runtime/src/builtins/wasm.rs:808-836`) — so this is an
+    *exposure*, not a capability. **Engine change, named:** `runtime::api` gains
+    `api::WasmModuleObject` (`compile`, `from_compiled_module`,
+    `get_compiled_module`) over a new `api::CompiledWasmModule` carrying the
+    decoded module, plus one `pub(crate)` entry in `builtins::wasm` for the
+    existing `compile_module_bytes` path — because what a host's `compile` must
+    answer is the *Module object* (prototype and all), not a bare record.
+    Existing behaviour is untouched: the api module is additive.
+  - **Streaming (3 sites: `ops_builtin.rs:263`, `ops_builtin_v8.rs:1414`,
+    `runtime/setup.rs:302`), and this one needs the engine to grow the hook.**
+    `Isolate::set_wasm_streaming_callback`, the `WasmStreaming<false>` handle,
+    and `WebAssembly.compileStreaming`. V8's shape is fixed
+    (`v8/src/wasm/wasm-js.cc:889-911`): `compileStreaming` makes the resolver,
+    then `Promise.resolve(source).then(compile_callback, reject_callback)`, and
+    the embedder's callback is handed the resolved response together with a
+    `WasmStreaming` it feeds and `finish()`es; V8 compiles into it as bytes
+    arrive and `DCHECK_NOT_NULL`s that a callback was installed. This engine has
+    no `compileStreaming` at all (its `WebAssembly` namespace defines `validate`
+    and `compile`), so what is missing is the *host-driven* path, not a decoder.
+    **Engine change, named:** a per-isolate `wasm_streaming_callback` (the shape
+    `set_promise_reject_callback` already has), an `api::WasmStreaming` record
+    (accumulated bytes, a promise capability, the url, a settled state) with
+    `on_bytes_received`/`set_url`/`finish`/`abort`, and
+    `WebAssembly.compileStreaming` in the engine's JS-API, routing through the
+    hook when one is installed and otherwise throwing a `TypeError` (V8
+    `DCHECK`s there — a divergence for §9 to state rather than to pretend
+    about). Decoding happens at `finish`, not as bytes arrive: the same module
+    and the same promise, without V8's compile-as-it-arrives, which is what this
+    engine's decoder can honestly offer and is not observable through the API.
+    This slice changes the `WebAssembly` namespace, so the wasm JS-API sweep is
+    implicated and gets re-run.
+
+  **Deliberately not in either slice, with the reason:**
+  `CompiledWasmModule::get_wire_bytes_ref` and `source_url` (this engine decodes
+  into structures and keeps no wire bytes, so retaining them would cost a copy
+  per `Module` object across every wasm sweep for two methods nothing in the
+  frontier uses); `WasmModuleCompilation` and `ModuleCachingInterface` (V8's
+  *asynchronous* compilation and its cache-bytes protocol — a host that wants
+  those wants V8's compiler); and `WasmMemoryObject::buffer` (nothing names it).
+
+  **The first thing Slice A found: the engine's wasm support had never been in a
+  host's build at all, and putting it there costs the host Cranelift.** The
+  bridge's compiling the engine's wasm is what makes `v8::WasmModuleObject`
+  exist, and `runtime/wasm` is a single feature covering both the JS API and, on
+  native targets (through a `cfg(not(target_arch = "wasm32"))` table), the
+  Cranelift codegen. Inside this workspace that is invisible; inside `deno/` the
+  first `cargo check` after the bridge turned it on stopped at *resolution*,
+  before any error could be counted: the engine's Cranelift 0.134.3 needs
+  `target-lexicon ^0.13.5`, `libm ^0.2.16`, `arbitrary ^1.4.1` and `bumpalo
+  ^3.20.2` where Deno's lock (its own Cranelift 0.117, through `deno_ffi`) has
+  the older patches, and cargo will not move a locked patch version to satisfy a
+  newly added member — it reports `failed to select a version` and writes
+  nothing, so bumping one crate at a time cannot converge.
+
+  **The alternative engine change was tried and is not available.** Splitting
+  `wasm` into "the JS API and the interpreter" and "native codegen", with the
+  native half as a *second* optional dependency on the same package (so that
+  `default` could still mean codegen-on while a host asks for the JS API alone),
+  is refused by cargo: `runtime` would then "depend on crate `wasm` multiple
+  times with different names". Asking for `wasm` alone does give zero Cranelift
+  (`cargo tree -p runtime --no-default-features --features wasm` shows none), so
+  the split is *possible* — but only by moving the wasm32 carve-out into the
+  `wasm` crate itself (its `compile` feature would have to become a no-op on
+  wasm32 rather than a `compile_error!`), which is a much larger change to the
+  engine's feature plumbing than this slice should carry. It is left open rather
+  than half-done: recorded here, with the exact cargo error, so the next session
+  does not try the same shape again.
+
+  **What was done instead, named:** the host accepts the engine's Cranelift. Six
+  leaf crates were bumped in `deno/Cargo.lock` — `target-lexicon` 0.13.2 →
+  0.13.5, `libm` 0.2.8 → 0.2.16, and `arbitrary`, `bumpalo`, `gimli`,
+  `regalloc2` to their newest compatible versions — which is a lockfile change in
+  the *test subject* (untracked, and what any host integrating an engine with a
+  Cranelift wasm JIT would do; V8's own crate brings a C++ toolchain for the
+  same reason). No manifest in `deno/` changed. The cost is stated: the host's
+  graph now carries two Cranelifts (its own 0.117 and ours 0.134) until it drops
+  one, and a host whose lock predates those six patches must bump them. The
+  engine's manifests are unchanged from what they were.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -2296,6 +2449,24 @@ if that proves possible.
   rather than undefined behavior: the one payload this bridge ties to a region is
   a script's source text, so a script handle that outlives its scope reads a
   released slot and panics, where the crate's pointer would simply dangle.
+- **The bridge always compiles the engine's WebAssembly, and a host pays for that
+  in its lockfile rather than in its source.** The crate we stand in for has
+  WebAssembly unconditionally — `v8::WasmModuleObject` and the tags beside it
+  exist whether or not a host names them — so `crates/v8` asks `slag` for its
+  `wasm` feature, and the engine's wasm is in every host's graph. On native
+  targets that feature also carries the engine's Cranelift codegen (the
+  `cfg(not(target_arch = "wasm32"))` table in `crates/runtime/Cargo.toml`), so the
+  host's lock must be able to admit Cranelift 0.134: `deno/`'s could not until six
+  leaf crates were bumped (§7, §12 item 10). A host's source needs no change at
+  all; the alternative engine design — a feature meaning "the JS API without the
+  native codegen" — is recorded as open rather than half-built, because the cheap
+  form of it is refused by cargo.
+- **A compiled wasm module here is the decoded module, and its wire bytes are
+  deliberately absent.** V8's `CompiledWasmModule` is a shared allocation that can
+  hand out the bytes it was compiled from; this engine decodes into structures and
+  keeps none, so `get_wire_bytes_ref` and `source_url` have no answer and are
+  missing rather than wrong. Retaining the bytes would cost a copy per `Module`
+  object through every wasm sweep, and nothing in the frontier asks for them.
 
 ## 10. Build order
 
@@ -2313,13 +2484,15 @@ landed — a store over memory the host owns is `SharedBuffer::borrowed`; the
 accounting half, externally allocated memory and backing-store shrink, is not),
 synthetic modules (host-filled records with a host evaluation callback, §12 item
 9 — **landed**; the engine's JSON/text/bytes shortcut is why it had none until
-then), inspector and
+then), the wasm tail (§12 item 10 — two slices, surveyed before either started:
+the compiled module is an exposure, streaming is a new isolate hook), inspector
+and
 source maps, traced host objects, structured clone.
 
 Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks;
 (2) grow the surface from the items `deno_core` names, in call order — the name
-frontier is nearly closed (3 left: `WasmStreaming` twice and `CompiledWasmModule`)
-and the serializer is landed, so this
+frontier is nearly closed (2 left: `WasmStreaming`, twice) and the serializer is
+landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
 first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
@@ -2331,11 +2504,12 @@ surface to 56, the attribute-carrying half of the template cluster to 52, the st
 half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
 `Message` surface and `Exception::create_message` (piece 2 of the stack-trace
 split) to 37, the module structure surface to 25, the synthetic-module surface to
-21, the callback scope's lifetime to 19, and what is left is the method
-surface (15 `E0599`s, all of them named methods and subsystems: wasm streaming
+21, the callback scope's lifetime to 19, the compiled-module surface to 15, and
+what is left is the method
+surface (12 `E0599`s, all of them named methods and subsystems: wasm streaming
 and the module-object round trip, code cache, unbound scripts, import-defer's
 evaluation entry point, the stalled-top-level-await report, the frames of a stack
-trace, and `get_heap_statistics`), the 3 names, and one
+trace, and `get_heap_statistics`), the 2 names, and one
 straggler (1 `E0282`).
 The two that the suite had surveyed as needing engine work have landed since,
 `get_constructor_name` and `get_extras_binding_object`, and they turned out to

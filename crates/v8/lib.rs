@@ -64,6 +64,7 @@ mod template;
 #[cfg(test)]
 mod test_support;
 mod value;
+mod wasm;
 
 pub use array_buffer::BackingStoreDeleterCallback;
 pub use context::ContextOptions;
@@ -117,6 +118,7 @@ pub use support::{
     BackingStore, DefaultTag, MapFnFrom, MapFnTo, Rawable, SharedRef, UniquePtr, UniqueRef,
     UnitType,
 };
+pub use wasm::CompiledWasmModule;
 
 use runtime::api;
 

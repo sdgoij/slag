@@ -16,10 +16,12 @@ crux = { path = "../crux" }
 # type; it is already in the workspace's lock, so this adds no new download.
 bitflags = "2"
 # The host-facing engine entry points come through the embedding API rather
-# than from `runtime` directly. Its `wasm` feature is off, as it is here: a
-# host that needs WebAssembly turns it on, which is also what brings the wasm
-# brand tables this bridge's predicates ask about.
-slag = { path = "../slag", default-features = false }
+# than from `runtime` directly. Its `wasm` feature is on here because the crate
+# we stand in for always has WebAssembly: `v8::WasmModuleObject` and the rest
+# exist in `rusty_v8` unconditionally, so a host never asks for them and must
+# not have to. (The engine's own default is off, for slim embeddings that drop
+# the `wasm` crate from the build; this bridge is not one of those.)
+slag = { path = "../slag", default-features = false, features = ["wasm"] }
 
 # Mirrors the feature surface the crate we stand in for declares, so a
 # consumer's passthroughs (`features = ["simdutf"]`, `v8_use_custom_libcxx`, the
