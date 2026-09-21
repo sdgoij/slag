@@ -24,6 +24,7 @@ use runtime::api;
 
 use crate::data::{Function, Module, Object, Script, String};
 use crate::handle::Local;
+use crate::position::Origin;
 use crate::scope::PinScope;
 use crate::script::ScriptOrigin;
 use crate::support::UniqueRef;
@@ -31,21 +32,27 @@ use crate::support::UniqueRef;
 /// Source code to compile (`v8::script_compiler::Source`).
 ///
 /// The crate we stand in for keeps the string handle and lets C++ hold the rest;
-/// here the text is what the engine parses, so that is what this carries.
+/// here the text is what the engine parses, so that is what this carries. The
+/// origin's name and offsets are kept beside it, because a failed compile
+/// records the error's position from them ([`crate::position`]).
 #[derive(Debug)]
 pub struct Source {
     text: std::string::String,
+    origin: Origin,
     cached_data: Option<CachedData<'static>>,
 }
 
 impl Source {
     /// A source to compile (`v8::ScriptCompiler::Source::New`).
     ///
-    /// The origin is carried by the host's own [`ScriptOrigin`]; nothing reads
-    /// it back yet, so it is taken for the shape's sake and dropped.
-    pub fn new(source_string: Local<'_, String>, _origin: Option<&ScriptOrigin<'_>>) -> Self {
+    /// The origin is the host's own [`ScriptOrigin`], of which the name and the
+    /// two offsets are carried here: the engine's parser takes source and no
+    /// origin, so the bridge is the only place they can be read from when a
+    /// compile fails.
+    pub fn new(source_string: Local<'_, String>, origin: Option<&ScriptOrigin<'_>>) -> Self {
         Self {
             text: text_of(&source_string),
+            origin: Origin::of(origin),
             cached_data: None,
         }
     }
@@ -54,7 +61,7 @@ impl Source {
     /// (`v8::ScriptCompiler::Source::New` with a cache).
     pub fn new_with_cached_data(
         source_string: Local<'_, String>,
-        _origin: Option<&ScriptOrigin<'_>>,
+        origin: Option<&ScriptOrigin<'_>>,
         cached_data: UniqueRef<CachedData<'_>>,
     ) -> Self {
         // SAFETY: the host's `&'a [u8]` outlives the source it is compiled by —
@@ -66,6 +73,7 @@ impl Source {
         };
         Self {
             text: text_of(&source_string),
+            origin: Origin::of(origin),
             cached_data: Some(cached_data),
         }
     }
@@ -175,7 +183,7 @@ pub fn compile<'s>(
     match Script::parse(scope, &source.text) {
         Ok(script) => Some(script),
         Err(error) => {
-            crate::throw(scope, &error);
+            crate::throw_at(scope, &error, &source.text, &source.origin);
             None
         }
     }
@@ -211,7 +219,7 @@ pub fn compile_module2<'s>(
     match api::Module::compile(&realm, "", &source.text) {
         Ok(module) => Some(Local::from_module(module)),
         Err(error) => {
-            crate::throw(scope, &error);
+            crate::throw_at(scope, &error, &source.text, &source.origin);
             None
         }
     }
@@ -223,6 +231,10 @@ pub fn compile_module2<'s>(
 /// The engine parses source as a whole program, so the body is wrapped in a
 /// function expression with the same parameters and the function is what that
 /// expression evaluates to.
+///
+/// Nothing records a position for a failure here, unlike the two compiles
+/// above: the span the engine reports indexes the *wrapped* text, so the line
+/// it names is one the host never wrote.
 pub fn compile_function<'s>(
     scope: &PinScope<'s, '_, ()>,
     source: &mut Source,

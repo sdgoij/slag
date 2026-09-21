@@ -15,6 +15,7 @@ use runtime::api;
 use crate::cppgc::Heap;
 use crate::data::{Array, Context, Data, FixedArray, Object, Promise, PromiseResolver, Value};
 use crate::handle::{Global, Local, Payload};
+use crate::position::Position;
 use crate::promise::{PromiseRejectEvent, PromiseRejectMessage};
 use crate::scope::PinScope;
 use crate::snapshot::{FunctionCodeHandling, SnapshotCreator, StartupData};
@@ -142,6 +143,10 @@ pub struct IsolateInner {
     /// the isolate owns it, because a handle to it outlives the scope it was made
     /// in.
     extras_bindings: RefCell<std::collections::HashMap<u64, Global<Object>>>,
+    /// Where the errors the bridge threw came from, by object identity, for the
+    /// `v8::Message` a host later makes from one of them; see
+    /// [`position`](crate::position) for why only a failed compile records one.
+    positions: RefCell<HashMap<u64, Position>>,
     /// The object templates the host created on this isolate, held the same way
     /// and for the same reason as the function templates above.
     object_templates: RefCell<Vec<Rc<api::ObjectTemplate>>>,
@@ -449,6 +454,7 @@ impl Isolate {
             cpp_heap,
             templates: RefCell::new(Vec::new()),
             extras_bindings: RefCell::new(std::collections::HashMap::new()),
+            positions: RefCell::new(HashMap::new()),
             object_templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
         });
@@ -767,6 +773,31 @@ impl Isolate {
             .context_slots
             .borrow_mut()
             .retain(|(owner, _), _| *owner != context);
+    }
+
+    /// Record where a thrown error came from, for the `v8::Message` a host makes
+    /// from it later ([`position`](crate::position)).
+    ///
+    /// A primitive has no identity to key by, and no message made from one can
+    /// carry a position either, so it records nothing.
+    pub(crate) fn record_position(&self, thrown: &api::Local, position: Position) {
+        let Some(object) = thrown.as_object() else {
+            return;
+        };
+        self.inner()
+            .positions
+            .borrow_mut()
+            .insert(object.id(), position);
+    }
+
+    /// The position recorded for `thrown`, if the bridge recorded one.
+    ///
+    /// Nothing removes an entry: the object's identity keys it, and only a
+    /// collection knows an object is gone. The engine's own per-object tables
+    /// (`error_data`, `error_stack`) hold their entries the same way.
+    pub(crate) fn position_of(&self, thrown: &api::Local) -> Option<Position> {
+        let object = thrown.as_object()?;
+        self.inner().positions.borrow().get(&object.id()).cloned()
     }
 
     /// The private name that goes with `description`, minting and keeping one

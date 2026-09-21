@@ -518,6 +518,12 @@ fn bridge_isolate(engine: *mut api::Isolate) -> Isolate {
     unsafe { Isolate::from_inner_ptr(engine.cast()) }
 }
 
+/// The bridge isolate a context belongs to, for an operation the crate we stand
+/// in for declares without a scope (it has no scope to take one from).
+pub(crate) fn isolate_of(context: api::Context) -> Isolate {
+    bridge_isolate(context.isolate())
+}
+
 impl GetIsolate for Isolate {
     fn get_isolate_ptr(&self) -> Isolate {
         *self
@@ -580,7 +586,7 @@ impl<P: GetIsolate> GetIsolate for TryCatch<'_, '_, P> {
 
 impl GetIsolate for Local<'_, Context> {
     fn get_isolate_ptr(&self) -> Isolate {
-        bridge_isolate(self.context().isolate())
+        isolate_of(self.context())
     }
 }
 

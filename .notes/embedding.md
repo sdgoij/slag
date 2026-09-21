@@ -560,6 +560,7 @@ number is the certified one.
 | after the attribute-carrying half of the template cluster (`PropertyAttributes` in the engine, `ObjectTemplate::{set_with_attr, set_accessor_property, new_instance}`) | **52** (see below) |
 | after the static half of the template cluster (`FunctionTemplate::{set, inherit}`, the per-realm materialization memo, and `set_internal_field_count`) | **49** (see below) |
 | after the three stragglers a `Context` and an `Object` answer (`get_constructor_name`, `get_extras_binding_object`, `Context::from_snapshot`) | **44** (see below) |
+| after the message surface (`Exception::create_message`, `Message::{get, get_script_resource_name, get_line_number, get_start_column, get_stack_trace}`, and the recorded position behind them) | **37** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -1021,6 +1022,61 @@ that guards them. The exception is the continuation-value test, whose content *i
 the borrow shape: it fails to compile if the handle goes back to borrowing its
 scope.
 
+**The message and stack-trace surface — surveyed, not landed, and the estimate for it
+changes.** Ten sites: `Exception::create_message` (3: `error.rs:1035`,
+`inspector.rs:981`, `bindings.rs:1635`), `Message::{get, get_script_resource_name,
+get_line_number, get_start_column}` (4: `error.rs:841/844/846/975`) and
+`StackTrace::{current_stack_trace, get_frame_count, get_frame}` with
+`StackFrame::{is_user_javascript, get_script_name}` (2: `import_graph.rs:164`,
+`ops_builtin_v8.rs:1518`). Every one of them asks the engine for a *position*, and
+this is what the survey found where the bridge would need it:
+
+- **The engine's frames carry a function name and nothing else.**
+  `builtins/error.rs::define_stack` walks `agent.execution_context_stack` at error
+  construction and stores a **string** per error object (`    at {function}`),
+  which is what `error_stack` holds and what the `stack` accessor serves. No line,
+  no column, no script name.
+- **There is no per-activation source position to ask for.** `ExecutionContext`
+  (spec 9.4) has `function`, `realm`, `script_or_module`, the three environments
+  and `source`, and no span; spans live in the IR and appear in `JsError.span` and
+  `capture_source(agent, span)` — read from *static* nodes (`function.span`,
+  `expr.span`), not from “where execution is now”. So `Message::get_line_number`
+  and `StackFrame::{get_line_number, get_column}` have nothing to answer from, for
+  a runtime error or for a frame.
+- **`is_user_javascript` needs a notion of script *type*.** V8's answers from the
+  script a frame belongs to (an ordinary script is user JavaScript, an
+  engine/embedder one is not), and `deno_core` uses it to skip its own
+  `ext:core/01_core.js` frames; the engine does not classify scripts yet.
+
+So this is the **structured frames** item the engine-side order already lists, not
+ten methods: per-activation source positions (updated where the IR knows a span),
+script classification, and then the frame surface. Landing it well is an engine
+subsystem with its own acceptance tests, and starting it at the end of a session
+is how a half-landed thing gets written, so it is recorded here instead — in two
+pieces, because only one of them needs the positions:
+
+1. **`StackTrace`, without line or column.** An engine accessor over the
+execution-context stack that already exists — a frame as `{ function name, script
+name, is_user_javascript }` — closes `import_graph.rs:164` and
+`ops_builtin_v8.rs:1518`, both of which read exactly those three and never a
+number. `StackFrame::{get_line_number, get_column}` stay **absent** rather than
+answering `0`: the crate's callers get a compile error, which is the honest
+channel, and `is_user_javascript` needs the script classification above before it
+means anything.
+2. **`Message`, from the locations the bridge itself knows.** A compile-time
+failure has a span (`JsError.span`) and the source text in hand at compile time,
+so the bridge can record `{ script name, line, column }` per error object and
+answer `Message`'s four methods from it. A *runtime* error has no recorded
+location, and the crate's own shapes are `Option`s — `get_script_resource_name`
+and `get_line_number` answer `None`, which is what `deno_core`'s
+`JsStackFrame::from_v8_message` already handles (`?` on both). What stays absent is
+the runtime location and any line/column in a frame, which is the position work
+above. This piece is bridge-only and closes 7 of the 10.
+
+Both pieces are ready to start and named here so the next session does not
+re-derive them. Piece 2 is now landed (below); piece 1 is not started, and it needs
+the script classification to be honest about its one boolean.
+
 **The three stragglers a `Context` and an `Object` answer — landed, 49 → 44, all bridge.**
 Five sites: `Object::get_constructor_name` (`ops_builtin_v8.rs:1342`),
 `Context::get_extras_binding_object` (`bindings.rs:372`, `ops_builtin_v8.rs:1607`)
@@ -1061,6 +1117,92 @@ one object per context that starts empty and keeps what the host puts there, and
 the engine was right: the iterator case answers "Iterator" rather than "Object",
 and an empty object's absent name reads back *undefined* rather than as no read at
 all.
+
+**The message surface, piece 2 of the split above — landed, 44 → 37, one engine
+exposure.** The seven sites that need a `Message` and no frame: `create_message`
+(`error.rs:1035`, `inspector.rs:981`, `bindings.rs:1635`) and
+`Message::{get, get_script_resource_name, get_line_number, get_start_column}`
+(`error.rs:841/844/846/975`). `Message::get_stack_trace` came with them because
+`inspector.rs:982` asks for it the moment the line above compiles.
+
+What the answers are made of:
+
+- **`create_message` copies nothing.** V8 builds a record at the throw site and
+  the message answers from it; here the handle names the exception itself, and
+  every answer is read from it. That is why `Message` is a tag outside the `Data`
+  hierarchy whose payload is an ordinary value handle.
+- **The position is the bridge's, recorded where the error is thrown.**
+  `crates/v8/position.rs` holds a `Position { name, line, column }`, and the
+  isolate keeps one per error object keyed by identity — the way the engine keys
+  its own per-object tables, and the way V8 keys the same record (`error_start_pos_symbol`
+  and friends, read back by `ComputeLocationFromException`,
+  `v8/src/execution/isolate.cc:3640`). Line 1-based and column 0-based are V8's
+  own conventions (`JSMessageObject::GetLineNumber`/`GetColumnNumber`,
+  `v8/src/objects/js-objects.cc:6093`, the latter's comment being *no '+1' in
+  contrast*), the offsets are added by `Script::AddPositionInfoOffset`'s rule
+  (`script.cc:324`: the line always, the column only on the first line), and the
+  spans counted are UTF-16 code units, which is what the parser's spans are and
+  what a line's terminators are (`\n`, `\r` not followed by `\n`, `\r\n`,
+  U+2028, U+2029 as one sequence each).
+- **Only a failed compile records one, and that is the honest half.** A `JsError`
+  span indexes whichever source the failing code was parsed from, so an error
+  raised while a script runs can carry a span into any other script; recording it
+  against the running one would put a wrong position on an error. At a compile the
+  error necessarily came from the text in hand. `CompileFunction` records nothing
+  for the same reason in reverse: its body is wrapped before it is parsed, so the
+  span names a line the host never wrote. Those are the only three compile paths
+  (`Script::compile`, `script_compiler::compile`, `compile_module2`), and the
+  origin — which the engine never sees — is where the name and the two offsets
+  come from.
+- **The text is V8's uncaught rendering.** The message `create_message` makes
+  holds the `Uncaught %` template (`v8/src/common/message-template.h:25`) over a
+  side-effect-free string of the exception (`MessageHandler::GetMessage`,
+  `messages.cc:188`), so `Message::get` renders `name: message` for an error
+  (V8's `NoSideEffectsErrorToString`, `objects.cc:536`) and the built-in tag —
+  `[object Array]`, `[object Function]` — for anything else
+  (`NoSideEffectsToString`, `objects.cc:719`). Two property reads away from V8:
+  V8 reads `name`/`message` as *data* properties so no host code runs while an
+  error is formatted, and this reads them with a [[Get]]; and V8's `#<CtorName>`
+  form for an object whose `toString` is the default is not reproduced.
+- **`get_stack_trace` is `None`, and that is V8's default too.** V8 captures a
+  trace for a message only when the embedder asked
+  (`SetCaptureStackTraceForUncaughtExceptions`, which this bridge accepts and
+  carries nowhere); the one caller in `deno_core` hands the answer to an
+  inspector that refuses. The frame surface itself is piece 1, and the two
+  `StackTrace::current_stack_trace` sites are still errors.
+
+**One engine exposure, named before it was made:** `runtime::api::Object::builtin_tag`
+(a thin wrapper over `builtins::object::builtin_tag`, which became `pub`), because
+the `[object Tag]` an object is described by comes from the engine's own brands —
+[[Call]], [[ParameterMap]], the boxed-primitive marker, the error/Date/RegExp
+slots, the object kind — and none of them is reachable by a property read. It is
+"already existing infrastructure", which is the tier §9 sets for an engine change.
+
+Measured: **44 → 37** (`E0599` 35 → 28). Twelve new tests, each verified by
+mutating the code it guards and watching it fail: five over `line_and_column`
+(the line/column count, every line terminator, the code-unit count, an offset past
+the end, the origin offsets and their saturation) and seven over the message — a
+compile error answering its recorded name/line/column, the position following the
+source, the offsets shifting it, a position outliving the scope it was recorded
+in, a message with no record answering `None` for all three, the uncaught
+rendering across eleven value shapes, and an error's text coming from its own
+`name`/`message`. One test expectation was wrong first time:
+`new Error('m').message = 42` as a *source* evaluates to `42`, so the case had to
+build the error and return it.
+
+Gates for the slice: `cargo test -p v8 --features simdutf` (176 in that binary, 12
+of them new), `cargo test --locked --workspace -- --skip
+the_data_a_built_function_carries_survives_a_collection` — **5,110 passed / 0
+failed / 4 ignored across 38 binaries**, the 12 over the 5,098 recorded before it
+— and `cargo clippy --locked --workspace --all-targets -- -D warnings` clean. No
+sweep: `crates/runtime` changed, and the change is one new method on
+`api::Object` plus a `pub` on the `builtin_tag` it wraps, which is a visibility
+edit and cannot move behaviour. Checked rather than assumed, the same way §7 does
+it for the microtask change: no runner names `runtime::api` at all (`grep` over
+`test262`, `wasmtest`, `wasm`, `cli` — only `crates/slag/src/lib.rs` re-exports
+it), and nothing outside the three files that define and use it names
+`builtin_tag`. The corpus totals recorded in §5 therefore still stand for this
+tree.
 
 Gates: `cargo test -p v8 --features simdutf` **164 passed / 0 failed**,
 `clippy --locked --workspace --all-targets -- -D warnings` clean, and
@@ -1742,6 +1884,27 @@ if that proves possible.
   (`same_value` already does, for the explicit call), and then the value hashes
   follow. Recorded here rather than left to be discovered from a `HashMap` that
   behaves differently on two NaNs.
+- **A message's position is the bridge's record, and only a failed compile makes
+  one.** V8 reads a start position, an end position and the script back off the
+  error object itself (`ComputeLocationFromException`, `isolate.cc:3640`); Slag's
+  error objects carry no such properties, so `crates/v8/position.rs` records
+  `{name, line, column}` per error identity on the isolate, at the one moment the
+  bridge can trust the span it has. *Trust* is the load-bearing word: a `JsError`
+  span indexes whichever source the failing code was parsed from and does not say
+  which source that was, so a runtime error's span may belong to another script —
+  those record nothing, and `get_line_number` answers `None`, which is the crate's
+  own absent-location channel (its two callers `?` on it, `error.rs:841`). A host
+  that needs a runtime position needs the engine's per-activation source
+  positions, which is the structured-frames item §10 lists as the next engine
+  work. Two smaller divergences ride along: `Message::get` reads an error's `name`
+  and `message` with a [[Get]] where V8 reads data properties only, so a getter a
+  host installed on either can run while an error is being formatted; and V8's
+  `#<CtorName>` form for an object whose `toString` is the default is not
+  reproduced, so a non-error object is described by its built-in tag.
+  `Message::get_stack_trace` answers `None`, which is V8's default too — nothing
+  here captures a trace for a message, and
+  `set_capture_stack_trace_for_uncaught_exceptions` is accepted and carried
+  nowhere.
 - **A private name is a symbol here, so it is a property, and that is a
   divergence.** The engine has no private-name kind, so `Private::for_api` maps a
   description to a symbol the isolate mints and keeps, and a private property is
@@ -1890,7 +2053,13 @@ if that proves possible.
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots; (4) module resolver as a
 host trait, unbound scripts, code cache, script origins. Then, in the order the
-shim histogram implies: structured frames and termination, host memory (partly
+shim histogram implies: structured frames and termination — **now the next engine
+item**, and the survey in §7 splits it into the execution-context frame accessor
+(no positions) and the per-activation source positions that `Message`'s runtime
+location and every `StackFrame` line number need; the compile-time half of a
+message's position landed as bridge work
+(`crates/v8/position.rs`, §7), and what is left for the engine is the
+*per-activation* half a runtime error would need — then host memory (partly
 landed — a store over memory the host owns is `SharedBuffer::borrowed`; the
 accounting half, externally allocated memory and backing-store shrink, is not),
 inspector and source maps, traced host objects, structured clone.
@@ -1907,11 +2076,13 @@ control to 260, the isolate-level callback vocabulary to 242, the symbol surface
 to 233, the primitive array to 225, the leftovers to 217, the buffer-handing
 shapes to 213, the host-memory store to 209, the tag shape to 62, the template
 surface to 56, the attribute-carrying half of the template cluster to 52, the static
-half of it to 49, the stragglers a `Context` and an `Object` answer to 44, and what
-is left is the method surface (35 `E0599`s, all of them named methods and
-subsystems: the message and stack-trace surface, synthetic modules, wasm
-streaming, code cache, source offsets, and the internal fields a `ContextOptions`
-global template names), the 4 names, and four stragglers (3 `E0515`, 1 `E0282`).
+half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
+`Message` surface and `Exception::create_message` (piece 2 of the stack-trace
+split) to 37, and what is left is the method surface (28 `E0599`s, all of them
+named methods and subsystems: synthetic modules, wasm streaming, code cache,
+source offsets, the frames of a stack trace, `get_unbound_script`, and the
+internal fields a `ContextOptions` global template names), the 4 names, and four
+stragglers (3 `E0515`, 1 `E0282`).
 One surveyed-and-left item sits outside those counts' reach —
 `get_heap_statistics` (needs byte accounting in `crux::heap`) — and the other two
 that the suite had surveyed have landed since, `get_constructor_name` and
@@ -1966,3 +2137,13 @@ delete.
    one of these blocks reports. The bridge compensates where it builds a shared
    buffer; the engine fix is one line but touches wasm memory, workers and the
    test262 runner, so it is the operator's call rather than a drive-by.
+7. **The bridge's position table has no way to forget an entry.**
+   `IsolateInner::positions` (and `runtime`'s own `error_data` / `error_stack`)
+   is keyed by object identity, which only a collection can retire, and the
+   sweep hook that would prune it (`Agent::compact_weak_tables`, which sees the
+   dead addresses) is the engine's. It grows by one entry per *positioned* error —
+   a host in a watch loop that recompiles a broken file is the case to think
+   about — and the values are the record and the script name, so the shape is the
+   engine's own existing tables's. Either the engine grows a hook a bridge can
+   register, or the table is rebuilt per compile, and both are decisions rather
+   than drive-bys.

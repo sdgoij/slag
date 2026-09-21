@@ -5,14 +5,28 @@
 
 use runtime::api;
 
-use crate::data::{String, Value};
-use crate::handle::Local;
+use crate::data::{Message, String, Value};
+use crate::handle::{Local, Payload};
 use crate::scope::PinScope;
 
 /// The native error constructors (v8::Exception).
 pub struct Exception;
 
 impl Exception {
+    /// The message to read about `exception`
+    /// (v8::Exception::CreateMessage).
+    ///
+    /// Nothing is copied: V8 builds a record at the throw site and the message
+    /// answers from it, so the handle this returns names the exception itself
+    /// and every answer is read from it when a host asks — see
+    /// [`message`](crate::message) for what each one is.
+    pub fn create_message<'s>(
+        _scope: &PinScope<'s, '_, ()>,
+        exception: Local<'s, Value>,
+    ) -> Local<'s, Message> {
+        Local::from_payload(Payload::Value(exception.into_engine()))
+    }
+
     /// A new `Error` (v8::Exception::Error).
     pub fn error<'s>(scope: &PinScope<'s, '_, ()>, message: Local<'_, String>) -> Local<'s, Value> {
         Self::throw_with(scope, message, api::Exception::throw_error)

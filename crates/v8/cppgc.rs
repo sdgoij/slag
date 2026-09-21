@@ -884,7 +884,9 @@ impl Object {
                     crate::throw(isolate, &error);
                 }
             }
-            Err(error) => crate::throw(isolate, &error),
+            Err(error) => {
+                crate::throw(isolate, &error);
+            }
         }
     }
 

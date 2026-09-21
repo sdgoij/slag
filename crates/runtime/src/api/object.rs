@@ -97,6 +97,22 @@ impl Object {
         })
     }
 
+    /// The built-in tag `Object.prototype.toString` reports for `value`
+    /// (spec 20.1.3.6 steps 4-14), with the value ToObject'd first.
+    ///
+    /// The tag is decided by the engine's own brands — [[Call]], the
+    /// [[ParameterMap]] slot, the boxed-primitive marker, the error, Date and
+    /// RegExp slots, the object kind — none of which a host can reach by reading
+    /// properties, and a host that has to describe a value without running any
+    /// of its code needs the name for it. The string `@@toStringTag` override
+    /// that `Object.prototype.toString` applies is deliberately not applied
+    /// here, so the answer is the tag of the value's kind and nothing a script
+    /// can change.
+    pub fn builtin_tag(context: &Context, value: &Local) -> Result<String, JsError> {
+        let object = context.with_agent(|agent| crate::context::to_object(agent, value.value()))?;
+        context.with_agent(|agent| crate::builtins::object::builtin_tag(agent, &object))
+    }
+
     /// Get the object's prototype (v8::Object::GetPrototype).
     pub fn get_prototype(context: &Context, object: &Local) -> Result<Local, JsError> {
         let object = Self::handle(object)?;

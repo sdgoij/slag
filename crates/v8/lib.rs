@@ -39,9 +39,11 @@ mod handle;
 pub mod inspector;
 mod isolate;
 pub mod json;
+mod message;
 mod module;
 mod object;
 mod platform;
+mod position;
 mod primitive_array;
 mod primitives;
 mod private;
@@ -139,7 +141,10 @@ pub(crate) fn realm_current() -> api::Context {
 
 /// Set `error` as the scope's pending exception, the way the crate we stand in
 /// for reports a failed operation that has no error return.
-pub(crate) fn throw(scope: &Isolate, error: &crux::error::JsError) {
+///
+/// Answers the value that became the exception, which a caller that knows where
+/// the error came from hands to [`throw_at`].
+pub(crate) fn throw(scope: &Isolate, error: &crux::error::JsError) -> api::Local {
     let value = match scope.current_context() {
         Some(realm) => realm
             .with_agent(|agent| runtime::builtins::error::to_throwable(agent, error))
@@ -147,6 +152,21 @@ pub(crate) fn throw(scope: &Isolate, error: &crux::error::JsError) {
         None => crux::value::Value::Undefined,
     };
     scope.engine().set_pending_exception(value);
+    api::Local::from(value)
+}
+
+/// The same, for a caller that knows which source the error was parsed from —
+/// the compile paths. The error's span indexes that source, so its position is
+/// recorded for the `v8::Message` a host later makes from the exception; see
+/// [`position`].
+pub(crate) fn throw_at(
+    scope: &Isolate,
+    error: &crux::error::JsError,
+    source: &str,
+    origin: &position::Origin,
+) {
+    let thrown = throw(scope, error);
+    position::record(scope, &thrown, source, error.span, origin);
 }
 
 /// The largest byte length of a typed array whose elements are stored inside the

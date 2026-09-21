@@ -333,7 +333,10 @@ fn prototype_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError
 
 /// The built-in tag of a ToObject'd value (spec 20.1.3.6 steps 4-14). Note
 /// that there is no BigInt built-in tag: BigInt wrappers fall to "Object".
-fn builtin_tag(agent: &mut Agent, object: &Value) -> Result<String, JsError> {
+///
+/// `pub` because the embedding API answers a host with it
+/// (`api::Object::builtin_tag`): the brands it reads are the engine's own.
+pub fn builtin_tag(agent: &mut Agent, object: &Value) -> Result<String, JsError> {
     if is_array_for_to_string(object)? {
         return Ok("Array".to_string());
     }
