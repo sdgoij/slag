@@ -1291,6 +1291,71 @@ pub fn with_heap_mut<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
     HEAP.with(|heap| f(&mut heap.borrow_mut()))
 }
 
+thread_local! {
+    /// The boxes a host pinned. The heap is thread-local, so the pins are too:
+    /// a pin is taken and released on one thread.
+    static PINNED: RefCell<Vec<GcAny>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A pin: the value it names is a root of every collection until it is dropped.
+///
+/// This is what makes a handle that does not live on the stack safe. The
+/// conservative stack scan finds Rust-held handles because they sit in stack
+/// words; a handle stored in a heap box — a host's persistent handle, a handle
+/// table — is invisible to it, so without a pin a collection can free the box
+/// and let its address be reused, and the handle then silently aliases
+/// whatever took the slot.
+pub struct Pin {
+    any: Option<GcAny>,
+}
+
+impl std::fmt::Debug for Pin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.any {
+            Some(any) => write!(f, "Pin({:#x})", any.addr()),
+            None => f.write_str("Pin(none)"),
+        }
+    }
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let Some(any) = self.any else {
+            return;
+        };
+        PINNED.with(|pinned| {
+            let mut pinned = pinned.borrow_mut();
+            if let Some(index) = pinned.iter().position(|held| held.addr() == any.addr()) {
+                pinned.remove(index);
+            }
+        });
+    }
+}
+
+/// Keep `value`, and everything it reaches, alive until the returned pin is
+/// dropped.
+///
+/// Pinning a value that holds no heap box (a number, `undefined`, a boolean)
+/// roots nothing and still returns a pin, so a caller never has to test first.
+pub fn pin(value: crate::value::Value) -> Pin {
+    let any = crate::value::Value::encoded_box_address(value.bits())
+        .map(|addr| GcAny(addr as *mut GcHeader));
+    if let Some(any) = any {
+        PINNED.with(|pinned| pinned.borrow_mut().push(any));
+    }
+    Pin { any }
+}
+
+/// The precise roots for a collection: the caller's, plus every pin.
+///
+/// Every collection entry point seeds its mark through this, so a pin cannot be
+/// lost by taking a path that collects.
+fn pinned_roots(roots: &[GcAny]) -> Vec<GcAny> {
+    let mut all = roots.to_vec();
+    PINNED.with(|pinned| all.extend(pinned.borrow().iter().copied()));
+    all
+}
+
 impl Default for Heap {
     fn default() -> Self {
         Heap::new()
@@ -1471,10 +1536,11 @@ impl Heap {
     /// (a long rope, a deep prototype chain) cannot overflow the native
     /// stack.
     pub fn collect(&mut self, roots: &[GcAny]) -> Vec<usize> {
-        let work = roots.to_vec();
+        let roots = pinned_roots(roots);
+        let work = roots.clone();
         self.reset_trace_start();
         let trace = self.trace_start();
-        let swept = self.collect_from_work(work, roots, false, &mut |_, _| {});
+        let swept = self.collect_from_work(work, &roots, false, &mut |_, _| {});
         self.trace_end("major", trace, swept.len());
         swept
     }
@@ -1638,7 +1704,8 @@ impl Heap {
         // stack top, covering every caller frame that may hold a handle.
         let stack_bottom_marker = 0usize;
         let sp = &stack_bottom_marker as *const usize as usize;
-        let mut work: Vec<GcAny> = roots.to_vec();
+        let roots = pinned_roots(roots);
+        let mut work: Vec<GcAny> = roots.clone();
         self.reset_trace_start();
         let trace = self.trace_start();
         if let Some((_low, high)) = stack_bounds()
@@ -1650,7 +1717,7 @@ impl Heap {
             let live_sorted = self.live_sorted();
             self.scan_stack(sp, high, &live_sorted, &mut work);
         }
-        let swept = self.collect_from_work(work, roots, precise, compact);
+        let swept = self.collect_from_work(work, &roots, precise, compact);
         self.trace_end("major", trace, swept.len());
         swept
     }
@@ -1703,6 +1770,7 @@ impl Heap {
         self.verify_barrier();
         self.reset_trace_start();
         let trace = self.trace_start();
+        let roots = pinned_roots(roots);
         let mut work: Vec<GcAny> = Vec::new();
         // A precise root that is young is marked; one that is old is only
         // stepped through to reach its direct young children.
@@ -1717,7 +1785,7 @@ impl Heap {
         // 980 children seeded 3087 times, i.e. ~3.0M child visits per minor.
         // Dedup by address before seeding.
         let mut seeded: AddrSet = AddrSet::default();
-        for &any in roots {
+        for &any in &roots {
             if !seeded.insert(any.addr()) {
                 continue;
             }
@@ -1803,7 +1871,7 @@ impl Heap {
         // nothing about to be swept is reachable. The ephemerons are still
         // registered (they are cleared only below).
         if verify_minor_enabled()
-            && let Some((container, child)) = self.minor_reachable_offender(roots, &dead)
+            && let Some((container, child)) = self.minor_reachable_offender(&roots, &dead)
         {
             EPHEMERONS.with(|slot| slot.borrow_mut().clear());
             self.drain_remembered();
@@ -2801,5 +2869,80 @@ mod tests {
         assert!(matches!(value.kind(), ValueKind::String(_)));
         assert_eq!(with_heap(|heap| heap.live_count()), start + 1);
         let _ = std::hint::black_box(&value);
+    }
+
+    /// The box address a string value points at.
+    fn string_box_addr(value: crate::value::Value) -> usize {
+        match value.kind() {
+            crate::value::ValueKind::String(handle) => handle.as_any().addr(),
+            other => panic!("expected a string value, got {other:?}"),
+        }
+    }
+
+    /// A handle a host keeps in its own memory is invisible to the conservative
+    /// stack scan, so a pin is the only thing that can keep it alive.
+    #[test]
+    fn a_pin_roots_a_value_the_stack_scan_cannot_see() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        let pinned = Value::String(Handle::new(JsString::from_utf8("pinned")));
+        let peer = Value::String(Handle::new(JsString::from_utf8("peer")));
+        let pinned_box = string_box_addr(pinned);
+        let peer_box = string_box_addr(peer);
+
+        let pin = pin(pinned);
+
+        // `Heap::collect` is the deterministic entry point — no stack scan — so
+        // neither value is a root unless it was pinned.
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            !swept.contains(&pinned_box),
+            "the pinned box was swept: {swept:?}"
+        );
+        assert!(
+            swept.contains(&peer_box),
+            "the unpinned peer survived: {swept:?}"
+        );
+
+        // Releasing the pin puts the box back where an unpinned collection can
+        // reach it.
+        drop(pin);
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&pinned_box),
+            "a released pin still rooted the box: {swept:?}"
+        );
+    }
+
+    /// A minor collection sees the pins too: it is the common one.
+    #[test]
+    fn a_pin_survives_a_minor_collection() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        let value = Value::String(Handle::new(JsString::from_utf8("pinned")));
+        let boxed = string_box_addr(value);
+
+        let pin = pin(value);
+        let swept = with_heap_mut(|heap| heap.collect_minor(&[]));
+        assert!(
+            !swept.contains(&boxed),
+            "a minor swept the pinned box: {swept:?}"
+        );
+        drop(pin);
+    }
+
+    /// Pinning a value with no heap box is a no-op, so a caller never has to
+    /// test for one first.
+    #[test]
+    fn pinning_a_non_heap_value_roots_nothing() {
+        use crate::value::Value;
+
+        let pin = pin(Value::Undefined);
+        with_heap_mut(|heap| heap.collect(&[]));
+        drop(pin);
     }
 }

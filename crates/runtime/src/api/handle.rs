@@ -129,37 +129,60 @@ impl From<Local> for Value {
 }
 
 /// A persistent handle: keeps a value alive for as long as the handle
-/// exists (v8::Global). Values are `Rc`-backed, so a `Global` holds a
-/// strong reference either way; the type exists to mirror `v8::Global`'s
-/// intent and move semantics.
-#[derive(Debug, Clone)]
-pub struct Global(Value);
+/// exists (v8::Global).
+///
+/// "Persistent" has to mean it: a `Global` generally lives in host memory the
+/// conservative stack scan cannot see, so it holds a [`crux::heap::Pin`] and
+/// is a root of every collection until it is dropped. Without that, a
+/// collection could free the box and the handle would silently alias whatever
+/// reused the address.
+#[derive(Debug)]
+pub struct Global {
+    value: Value,
+    /// Held only for its `Drop`: the pin is what makes the handle persistent,
+    /// and releasing it on drop is the whole of its API.
+    #[allow(dead_code)]
+    pin: crux::heap::Pin,
+}
 
 impl Global {
     /// A persistent handle over a value.
     pub fn new(value: Local) -> Self {
-        Self(value.0)
+        Self::pinning(value.0)
+    }
+
+    fn pinning(value: Value) -> Self {
+        Self {
+            value,
+            pin: crux::heap::pin(value),
+        }
     }
 
     /// An empty handle (v8::Global::Empty).
     pub fn empty() -> Self {
-        Self(Value::Undefined)
+        Self::pinning(Value::Undefined)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_undefined()
+        self.value.is_undefined()
     }
 
     pub fn get(&self) -> Local {
-        Local(self.0)
+        Local(self.value)
     }
 
     pub fn reset(&mut self, local: Local) {
-        self.0 = local.0;
+        *self = Self::pinning(local.0);
     }
 
     pub fn clear(&mut self) {
-        self.0 = Value::Undefined;
+        *self = Self::pinning(Value::Undefined);
+    }
+}
+
+impl Clone for Global {
+    fn clone(&self) -> Self {
+        Self::pinning(self.value)
     }
 }
 
