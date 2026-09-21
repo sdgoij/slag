@@ -2,18 +2,29 @@
 //! `v8::Map`, `v8::Set`).
 
 use crux::handle::Handle;
-use crux::object::{JsObject, PropertyKind};
+use crux::object::{JsObject, ObjectKind, PropertyKind};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::value::Value as EngineValue;
 use crux::value::ValueKind;
 use runtime::api;
 use slag::objects::{ensure_deferred_namespace_evaluation, materialize_pending_prototype_value};
 
-use crate::data::{Array, Map, Name, Object, Set, Value};
+use crate::data::{Array, Map, Name, Object, Proxy, Set, Value};
 use crate::handle::Local;
-use crate::property::{GetPropertyNamesArgs, KeyConversionMode, PropertyFilter};
+use crate::property::{GetPropertyNamesArgs, KeyConversionMode, PropertyAttribute, PropertyFilter};
 use crate::property_descriptor::PropertyDescriptor as V8PropertyDescriptor;
 use crate::scope::PinScope;
+
+/// A descriptor that defines a new own data property with every attribute set,
+/// which is `CreateDataProperty` (spec 7.3.5) — every attribute, so nothing a
+/// prototype's setter or a non-configurable inherited property says can change
+/// what the define does.
+pub(crate) fn data_property(value: Local<'_, Value>) -> V8PropertyDescriptor {
+    let mut descriptor = V8PropertyDescriptor::new_from_value_writable(value, true);
+    descriptor.set_enumerable(true);
+    descriptor.set_configurable(true);
+    descriptor
+}
 
 impl Object {
     /// A new ordinary object in the scope's realm (`v8::Object::New`).
@@ -128,6 +139,95 @@ impl<'s> Local<'s, Object> {
                 None
             }
         }
+    }
+
+    /// [[Set]] with an integer index (`v8::Object::SetIndex`).
+    ///
+    /// As [`get_index`](Self::get_index): the engine resolves properties by
+    /// name, so the index goes in as one.
+    pub fn set_index(
+        &self,
+        scope: &PinScope<'_, '_>,
+        index: u32,
+        value: Local<Value>,
+    ) -> Option<bool> {
+        self.set(
+            scope,
+            Local::from_engine(api::Local::string(index.to_string())),
+            value,
+        )
+    }
+
+    /// [[Delete]] (`v8::Object::Delete`).
+    pub fn delete(&self, scope: &PinScope<'_, '_>, key: Local<Value>) -> Option<bool> {
+        let name = key.engine().as_string()?;
+        let realm = crate::realm_of(scope);
+        match api::Object::delete(&realm, self.engine(), &name) {
+            Ok(deleted) => Some(deleted),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// The object's prototype (`v8::Object::GetPrototype`), or *null* for an
+    /// object with none.
+    pub fn get_prototype<'a>(&self, scope: &PinScope<'a, '_>) -> Option<Local<'a, Value>> {
+        let realm = crate::realm_of(scope);
+        match api::Object::get_prototype(&realm, self.engine()) {
+            Ok(prototype) => Some(Local::from_engine(prototype)),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// Set the object's prototype (`v8::Object::SetPrototype`); `prototype` must
+    /// be an object or *null*.
+    pub fn set_prototype(&self, scope: &PinScope<'_, '_>, prototype: Local<Value>) -> Option<bool> {
+        let realm = crate::realm_of(scope);
+        match api::Object::set_prototype(&realm, self.engine(), prototype.engine()) {
+            Ok(set) => Some(set),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// CreateDataProperty (spec 7.3.4, `v8::Object::CreateDataProperty`): an own
+    /// data property, configurable, writable and enumerable.
+    pub fn create_data_property(
+        &self,
+        scope: &PinScope<'_, '_>,
+        key: Local<Name>,
+        value: Local<Value>,
+    ) -> Option<bool> {
+        self.define_property(scope, key, &data_property(value))
+    }
+
+    /// DefineOwnProperty with the attributes `attr` names
+    /// (`v8::Object::DefineOwnProperty`).
+    ///
+    /// The attributes are the crate we stand in for's mask, and the ones it does
+    /// not name are set: a property defined with `READ_ONLY` is not writable, and
+    /// one with `DONT_ENUM` is not enumerable.
+    pub fn define_own_property(
+        &self,
+        scope: &PinScope<'_, '_>,
+        key: Local<Name>,
+        value: Local<Value>,
+        attr: PropertyAttribute,
+    ) -> Option<bool> {
+        let mut descriptor = V8PropertyDescriptor::new_from_value_writable(
+            value,
+            !attr.has(PropertyAttribute::READ_ONLY),
+        );
+        descriptor.set_enumerable(!attr.has(PropertyAttribute::DONT_ENUM));
+        descriptor.set_configurable(!attr.has(PropertyAttribute::DONT_DELETE));
+        self.define_property(scope, key, &descriptor)
     }
 
     /// Define a property from a descriptor (`v8::Object::DefineProperty`).
@@ -328,6 +428,42 @@ impl<'s> Local<'s, Array> {
         let realm = crate::realm_current();
         api::Array::length(&realm, self.engine()).map_or(0, |len| len as u32)
     }
+}
+
+impl<'s> Local<'s, Proxy> {
+    /// The proxy's target (`v8::Proxy::GetTarget`).
+    ///
+    /// A revoked proxy has none. The crate we stand in for's wrapper aborts on
+    /// the empty handle its own API answers there, so this aborts too, with the
+    /// reason rather than a null dereference.
+    pub fn get_target(&self, _scope: &PinScope<'_, '_>) -> Local<'_, Value> {
+        self.slot(|slots| *slots.target.borrow())
+            .unwrap_or_else(|| panic_proxy_slot("get_target"))
+    }
+
+    /// The proxy's handler (`v8::Proxy::GetHandler`), with the same answer for a
+    /// revoked proxy as [`get_target`](Self::get_target).
+    pub fn get_handler(&self, _scope: &PinScope<'_, '_>) -> Local<'_, Value> {
+        self.slot(|slots| *slots.handler.borrow())
+            .unwrap_or_else(|| panic_proxy_slot("get_handler"))
+    }
+
+    /// The engine value one of the proxy's cells holds, if the proxy is live.
+    fn slot(
+        &self,
+        read: impl FnOnce(&crux::proxy::ProxySlots) -> Option<crux::value::Value>,
+    ) -> Option<Local<'_, Value>> {
+        let object = self.engine().value().as_object()?;
+        let ObjectKind::Proxy(slots) = &object.kind else {
+            return None;
+        };
+        Some(Local::from_engine(api::Local::from(read(slots)?)))
+    }
+}
+
+/// The abort a revoked proxy's cell asks for.
+fn panic_proxy_slot(what: &str) -> Local<'static, Value> {
+    panic!("bridge: Proxy::{what} on a proxy with no target or handler")
 }
 
 impl<'s> Local<'s, Map> {

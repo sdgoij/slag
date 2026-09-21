@@ -11,13 +11,13 @@ use crate::scope::PinScope;
 impl BigInt {
     /// A BigInt from a signed 64-bit integer (`v8::BigInt::NewFromInt64`).
     pub fn new_from_i64<'s>(_scope: &PinScope<'s, '_, ()>, value: i64) -> Local<'s, BigInt> {
-        handle(crux::BigInt::from(value))
+        from_engine_int(crux::BigInt::from(value))
     }
 
     /// A BigInt from an unsigned 64-bit integer
     /// (`v8::BigInt::NewFromUnsigned`).
     pub fn new_from_u64<'s>(_scope: &PinScope<'s, '_, ()>, value: u64) -> Local<'s, BigInt> {
-        handle(crux::BigInt::from(value))
+        from_engine_int(crux::BigInt::from(value))
     }
 
     /// A BigInt from a sign bit and little-endian 64-bit words
@@ -40,7 +40,7 @@ impl BigInt {
         } else {
             magnitude
         };
-        Some(handle(value))
+        Some(from_engine_int(value))
     }
 }
 
@@ -94,7 +94,7 @@ fn with_bigint<T>(value: &api::Local, question: impl FnOnce(&crux::BigInt) -> T)
 }
 
 /// The handle for an engine integer.
-fn handle<'s>(value: crux::BigInt) -> Local<'s, BigInt> {
+pub(crate) fn from_engine_int<'s>(value: crux::BigInt) -> Local<'s, BigInt> {
     Local::from_engine(api::Local::from(Value::BigInt(crux::handle::Handle::new(
         value,
     ))))

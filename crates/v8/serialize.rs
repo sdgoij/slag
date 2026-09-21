@@ -172,14 +172,15 @@ fn store_bytes(store: &BackingStore) -> Option<&[u8]> {
 }
 
 /// A descriptor that defines a new own data property with every attribute set,
-/// which is `CreateDataProperty` (spec 7.3.5) — the define a deserialize wants,
-/// since `[[Set]]` would run a setter the object inherited (`__proto__` is one
-/// on `Object.prototype`) instead of creating the property that was written.
+/// which is `CreateDataProperty` (spec 7.3.5).
+///
+/// The define a deserialize wants rather than a store: `[[Set]]` would run a
+/// setter the object inherited (`__proto__` is one on `Object.prototype`)
+/// instead of creating the property that was written. Shared with
+/// [`crate::Object::create_data_property`], which is the same operation under
+/// the name a host calls it by.
 fn data_property(value: Local<'_, Value>) -> PropertyDescriptor {
-    let mut descriptor = PropertyDescriptor::new_from_value_writable(value, true);
-    descriptor.set_enumerable(true);
-    descriptor.set_configurable(true);
-    descriptor
+    crate::object::data_property(value)
 }
 
 /// A `Local<Name>` for a string name.

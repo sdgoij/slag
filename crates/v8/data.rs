@@ -562,7 +562,7 @@ macro_rules! impl_from {
         $(
             impl<'s> From<Local<'s, $source>> for Local<'s, $target> {
                 fn from(local: Local<'s, $source>) -> Self {
-                    local.cast()
+                    local.retag()
                 }
             }
         )*
@@ -728,7 +728,7 @@ macro_rules! impl_try_from {
 
                 fn try_from(local: Local<'s, $source>) -> Result<Self, Self::Error> {
                     if <$target as TagCheck>::check(local.payload()) {
-                        Ok(local.cast())
+                        Ok(local.retag())
                     } else {
                         Err(DataError::bad_type::<$target, $source>())
                     }

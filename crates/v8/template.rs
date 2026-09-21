@@ -89,7 +89,9 @@ impl FunctionTemplate {
         let pointer = Rc::as_ptr(&engine) as *mut c_void;
         isolate.add_template(engine);
         let handle: Local<'s, External> = External::new(scope, pointer);
-        handle.cast()
+        // The pointer the template was just stored under, retagged: the bridge
+        // put it there itself, so there is nothing for a checked cast to ask.
+        handle.retag()
     }
 }
 

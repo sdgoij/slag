@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 
 use runtime::api;
 
-use crate::data::{Function, FunctionTemplate, Object, Value};
+use crate::data::{Context, Function, FunctionTemplate, Object, Value};
 use crate::handle::Local;
 use crate::isolate::{Isolate, UnsafeRawIsolatePtr};
 use crate::scope::PinScope;
@@ -38,6 +38,70 @@ pub enum SideEffectType {
 /// struct; here it is this bridge's view of the same call, which is what a
 /// callback mapped from a Rust function reads.
 pub type FunctionCallback = unsafe extern "C" fn(*const FunctionCallbackInfo);
+
+impl<'s> Local<'s, Function> {
+    /// Call the function (`v8::Function::Call`). A failure leaves the thrown
+    /// value as the pending exception, which is what the crate we stand in for
+    /// reports the same way.
+    pub fn call<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        recv: Local<'_, Value>,
+        args: &[Local<'_, Value>],
+    ) -> Option<Local<'a, Value>> {
+        let context = scope.get_current_context();
+        self.call_with_context(scope, context, recv, args)
+    }
+
+    /// Call the function inside `context` (`v8::Function::Call` with a
+    /// context), which is how a host calls back into a realm other than the one
+    /// entered on this thread.
+    pub fn call_with_context<'a>(
+        &self,
+        scope: &PinScope<'a, '_, ()>,
+        context: Local<'_, Context>,
+        recv: Local<'_, Value>,
+        args: &[Local<'_, Value>],
+    ) -> Option<Local<'a, Value>> {
+        let _ = scope;
+        let realm = context.context();
+        let recv = recv.into_engine();
+        let args: Vec<api::Local> = args.iter().map(|arg| arg.into_engine()).collect();
+        let value = realm.call(self.engine(), &recv, &args).to_local()?;
+        Some(Local::from_engine(value))
+    }
+
+    /// Construct an object through the function (`v8::Function::NewInstance`).
+    pub fn new_instance<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        args: &[Local<'_, Value>],
+    ) -> Option<Local<'a, Object>> {
+        let realm = crate::realm_of(scope);
+        let args: Vec<api::Local> = args.iter().map(|arg| arg.into_engine()).collect();
+        let value = realm.construct(self.engine(), &args).to_local()?;
+        Some(Local::from_engine(value))
+    }
+
+    /// Set the function's `name` (`v8::Function::SetName`).
+    ///
+    /// The define is the engine's `define_property_or_throw`, so a failure has
+    /// already left its own exception pending; the answer is dropped here for
+    /// the same reason the crate we stand in for drops it — `SetName` is the one
+    /// call in this API with no channel to report a failure on.
+    pub fn set_name(&self, name: Local<'_, crate::data::String>) {
+        let realm = crate::realm_current();
+        let _ = api::Object::define(
+            &realm,
+            self.engine(),
+            "name",
+            &name.into_engine(),
+            false,
+            false,
+            true,
+        );
+    }
+}
 
 /// The call a callback reads (v8::FunctionCallbackInfo).
 ///

@@ -342,6 +342,29 @@ impl<'s> Local<'s, String> {
         }
     }
 
+    /// The string as UTF-8, borrowed from `buffer` when it fits there and owned
+    /// when it does not (`v8::String::ToRustCowLossy`).
+    ///
+    /// The borrow is of the bytes the write filled, so a caller that passes a
+    /// large enough buffer allocates nothing. A string with a lone surrogate is
+    /// not valid UTF-8 — this is the *lossy* form — so it is replaced and owned,
+    /// which is what the crate we stand in for's answer is a `str` requires too.
+    pub fn to_rust_cow_lossy<'a, const N: usize>(
+        &self,
+        scope: &crate::Isolate,
+        buffer: &'a mut [MaybeUninit<u8>; N],
+    ) -> std::borrow::Cow<'a, str> {
+        let written = self.write_utf8_uninit_v2(scope, buffer, WriteFlags::empty(), None);
+        let needed = self.utf8_length(scope);
+        // SAFETY: the write filled `written` bytes of the buffer, which is what
+        // the slice covers; the borrow is of the caller's own buffer.
+        let filled = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), written) };
+        match std::str::from_utf8(filled) {
+            Ok(text) if written == needed => std::borrow::Cow::Borrowed(text),
+            _ => std::borrow::Cow::Owned(self.to_rust_string_lossy(scope)),
+        }
+    }
+
     /// The string as UTF-8 (`v8::String::WriteUtf8`), stopping before a
     /// character that does not fit and reporting how many code units that
     /// covered.
@@ -350,6 +373,9 @@ impl<'s> Local<'s, String> {
     /// lone surrogate is written as its own three-byte sequence, which is the
     /// only faithful answer and not a valid encoding of anything. The returned
     /// byte count includes the terminator when one was asked for and written.
+    /// [`write_utf8_uninit_v2`](Self::write_utf8_uninit_v2) into a buffer that is
+    /// not initialized yet
+    /// (`v8::String::WriteUtf8` over uninitialized memory).
     pub fn write_utf8_uninit_v2(
         &self,
         _scope: &crate::Isolate,

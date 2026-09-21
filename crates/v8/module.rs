@@ -274,7 +274,7 @@ impl<'s> Local<'s, Module> {
                 let text = api::Local::string(request.specifier.clone());
                 let specifier = Local::<JsString>::from_engine(text);
                 let attributes =
-                    Local::<FixedArray>::from_engine(attributes_of(realm, &request)?).cast();
+                    Local::<FixedArray>::from_engine(attributes_of(realm, &request)?).retag();
                 let Some(resolved) = resolve(context, specifier, attributes, referrer) else {
                     return Ok(false);
                 };

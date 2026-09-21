@@ -4,7 +4,7 @@
 //! which is also what the tag casts in [`crate::data`] check against, so a
 //! `TryFrom` cast and the corresponding `is_*` cannot disagree.
 
-use crate::data::{self as predicates, String, Value};
+use crate::data::{self as predicates, BigInt, Boolean, Integer, Number, Object, String, Value};
 use crate::handle::Local;
 use crate::scope::PinScope;
 
@@ -169,6 +169,54 @@ impl<'s> Local<'s, Value> {
         predicates::is_typed_array(self.engine())
     }
 
+    pub fn is_int8_array(&self) -> bool {
+        predicates::is_int8_array(self.engine())
+    }
+
+    pub fn is_uint8_array(&self) -> bool {
+        predicates::is_uint8_array(self.engine())
+    }
+
+    pub fn is_uint8_clamped_array(&self) -> bool {
+        predicates::is_uint8_clamped_array(self.engine())
+    }
+
+    pub fn is_int16_array(&self) -> bool {
+        predicates::is_int16_array(self.engine())
+    }
+
+    pub fn is_uint16_array(&self) -> bool {
+        predicates::is_uint16_array(self.engine())
+    }
+
+    pub fn is_int32_array(&self) -> bool {
+        predicates::is_int32_array(self.engine())
+    }
+
+    pub fn is_uint32_array(&self) -> bool {
+        predicates::is_uint32_array(self.engine())
+    }
+
+    pub fn is_float16_array(&self) -> bool {
+        predicates::is_float16_array(self.engine())
+    }
+
+    pub fn is_float32_array(&self) -> bool {
+        predicates::is_float32_array(self.engine())
+    }
+
+    pub fn is_float64_array(&self) -> bool {
+        predicates::is_float64_array(self.engine())
+    }
+
+    pub fn is_big_int64_array(&self) -> bool {
+        predicates::is_big_int64_array(self.engine())
+    }
+
+    pub fn is_big_uint64_array(&self) -> bool {
+        predicates::is_big_uint64_array(self.engine())
+    }
+
     pub fn is_data_view(&self) -> bool {
         predicates::is_data_view(self.engine())
     }
@@ -190,13 +238,22 @@ impl<'s> Local<'s, Value> {
     }
 
     /// Strict equality (spec 7.2.13). Engine values compare structurally, which
-    /// for `Rc`-backed handles means reference identity for objects.
-    pub fn strict_equals(&self, other: &Local<'s, Value>) -> bool {
-        self.engine() == other.engine()
+    /// for `Rc`-backed handles means reference identity for objects — and `-0`
+    /// equal to `0`, and `NaN` to nothing.
+    pub fn strict_equals(&self, that: Local<'s, Value>) -> bool {
+        self.engine() == that.engine()
     }
 
-    pub fn same_value(&self, other: &Local<'s, Value>) -> bool {
-        self.strict_equals(other)
+    /// SameValue (spec 7.2.14): strict equality with `NaN` equal to itself and
+    /// `-0` distinct from `0`, which is what `Object.is` asks.
+    pub fn same_value(&self, that: Local<'s, Value>) -> bool {
+        crux::ops::same_value(self.engine().value(), that.engine().value())
+    }
+
+    /// SameValueZero (spec 7.2.10): as [`same_value`](Self::same_value) with `-0`
+    /// equal to `0`, which is what a keyed collection asks.
+    pub fn same_value_zero(&self, that: Local<'s, Value>) -> bool {
+        crux::ops::same_value_zero(self.engine().value(), that.engine().value())
     }
 
     /// A name for the type of this value, for error messages: the chain the
@@ -283,6 +340,102 @@ impl<'s> Local<'s, Value> {
         } else {
             "unknown"
         }
+    }
+
+    /// ToBigInt (`v8::Value::ToBigInt`). A failing conversion leaves a pending
+    /// exception, which is where a `Number` or a `Symbol` lands.
+    pub fn to_big_int<'a>(&self, scope: &PinScope<'a, '_>) -> Option<Local<'a, BigInt>> {
+        let value = *self.engine().value();
+        let realm = crate::realm_of(scope);
+        match realm.with_agent(|agent| runtime::context::to_big_int(agent, &value)) {
+            Ok(big) => Some(crate::bigint::from_engine_int(big)),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// ToObject (`v8::Value::ToObject`). A receiver is itself; every other value
+    /// is wrapped, and `null`/`undefined` fail with a pending exception.
+    pub fn to_object<'a>(&self, scope: &PinScope<'a, '_>) -> Option<Local<'a, Object>> {
+        let value = *self.engine().value();
+        let realm = crate::realm_of(scope);
+        match realm.with_agent(|agent| runtime::context::to_object(agent, &value)) {
+            Ok(object) => Some(Local::from_engine(api::Local::from(object))),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// ToBoolean (`v8::Value::ToBoolean`). Every value has one, so this cannot
+    /// fail and has no error channel.
+    pub fn to_boolean<'a>(&self, scope: &PinScope<'a, '_>) -> Local<'a, Boolean> {
+        Boolean::new(scope, self.boolean_value(scope))
+    }
+
+    /// The value's truthiness (`v8::Value::BooleanValue`).
+    pub fn boolean_value(&self, _scope: &PinScope<'_, '_>) -> bool {
+        crux::convert::to_boolean(self.engine().value())
+    }
+
+    /// ToInteger (`v8::Value::ToInteger`).
+    ///
+    /// The value is exact where the crate we stand in for's handle would not be:
+    /// its `Integer` is a 32-bit slot, so an integral value outside that range
+    /// does not survive the cast it does here, while this bridge's
+    /// [`Local<Integer>::value`] reads an `i64`.
+    pub fn to_integer<'a>(&self, scope: &PinScope<'a, '_>) -> Option<Local<'a, Integer>> {
+        let number = self.number_value(scope)?;
+        Some(Local::from_engine(api::Local::number(
+            crux::convert::to_integer_or_infinity(number),
+        )))
+    }
+
+    /// The value as a number (`v8::Value::NumberValue`): a number is itself, and
+    /// anything else is `ToNumber`'d — which is where a `Symbol` or a `BigInt`
+    /// fails, with the pending exception the conversion left.
+    pub fn number_value(&self, scope: &PinScope<'_, '_>) -> Option<f64> {
+        if let Some(number) = self.engine().as_number() {
+            return Some(number);
+        }
+        Some(self.to_number(scope)?.value())
+    }
+
+    /// ToNumber (`v8::Value::ToNumber`). A failing conversion leaves a pending
+    /// exception.
+    pub fn to_number<'a>(&self, scope: &PinScope<'a, '_>) -> Option<Local<'a, Number>> {
+        let value = *self.engine().value();
+        let realm = crate::realm_of(scope);
+        match realm.with_agent(|agent| runtime::context::to_number(agent, &value)) {
+            Ok(number) => Some(Number::new(scope, number)),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// The value as an `i64` (`v8::Value::IntegerValue`): a number is truncated
+    /// toward zero, and anything else is `ToInteger`'d first, which is where a
+    /// failing conversion leaves its exception.
+    pub fn integer_value(&self, scope: &PinScope<'_, '_>) -> Option<i64> {
+        let number = self.number_value(scope)?;
+        Some(crux::convert::to_integer_or_infinity(number) as i64)
+    }
+
+    /// The value as an `i32` (`v8::Value::Int32Value`).
+    pub fn int32_value(&self, scope: &PinScope<'_, '_>) -> Option<i32> {
+        let number = self.number_value(scope)?;
+        Some(crux::convert::to_int32(number))
+    }
+
+    /// The value as a `u32` (`v8::Value::Uint32Value`).
+    pub fn uint32_value(&self, scope: &PinScope<'_, '_>) -> Option<u32> {
+        let number = self.number_value(scope)?;
+        Some(crux::convert::to_uint32(number))
     }
 
     /// ToString (spec 7.1.17). A failing conversion leaves a pending exception.

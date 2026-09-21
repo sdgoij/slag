@@ -170,12 +170,55 @@ impl<'s, T> Local<'s, T> {
         }
     }
 
-    /// Retag the handle.
+    /// Retag the handle, with no check that the payload is of the new tag.
     ///
     /// Safe, unlike the crate we stand in for: the payload is untouched and the
-    /// tag is phantom, so this is a rebuild rather than a reinterpretation.
-    pub(crate) fn cast<U>(self) -> Local<'s, U> {
+    /// tag is phantom, so this is a rebuild rather than a reinterpretation. It is
+    /// the bridge's own retag, not the crate's `cast` (which checks and panics) —
+    /// kept separate for the callers that know the tag from context and cannot
+    /// pay for a check, like the `From`/`TryFrom` tables in [`crate::data`].
+    pub(crate) fn retag<U>(self) -> Local<'s, U> {
         let Self { payload, .. } = self;
+        Local::from_payload(payload)
+    }
+
+    /// Attempts to cast the contained type to another, returning an error if the
+    /// conversion fails (`v8::Local::try_cast`).
+    pub fn try_cast<A>(self) -> Result<Local<'s, A>, <Self as TryInto<Local<'s, A>>>::Error>
+    where
+        Self: TryInto<Local<'s, A>>,
+    {
+        self.try_into()
+    }
+
+    /// Attempts to cast the contained type to another, panicking if the
+    /// conversion fails (`v8::Local::cast`).
+    ///
+    /// The panic is the crate we stand in for's contract, not a shortcut: the
+    /// return type is a handle, so there is no channel an error could come back
+    /// on, and a host that wants the error asks [`try_cast`](Self::try_cast).
+    pub fn cast<A>(self) -> Local<'s, A>
+    where
+        Self: TryInto<Local<'s, A>, Error: std::fmt::Debug>,
+    {
+        self.try_into().unwrap()
+    }
+
+    /// A handle of this tag built from one of its super types
+    /// (`v8::Local::cast_unchecked`).
+    ///
+    /// # Safety
+    ///
+    /// In the crate we stand in for this reinterprets a pointer, hence the
+    /// `unsafe`; here the payload is plain data and the call is a rebuild, so the
+    /// signature is reproduced for the shapes. The bound is the crate's own: it
+    /// asks that the *other* direction is a conversion that exists at all.
+    #[inline(always)]
+    pub unsafe fn cast_unchecked<A>(other: Local<'s, A>) -> Self
+    where
+        Local<'s, A>: TryFrom<Self>,
+    {
+        let Local { payload, .. } = other;
         Local::from_payload(payload)
     }
 
@@ -264,29 +307,42 @@ impl<'o, 's, T> ExtendLifetime<'s, T> for Local<'o, T> {
     }
 }
 
-impl<T> PartialEq for Local<'_, T> {
-    fn eq(&self, other: &Self) -> bool {
-        match (&self.payload, &other.payload) {
-            (Payload::Value(a), Payload::Value(b)) => a == b,
-            // A copy of the same context names the same realm on the same
-            // isolate; its global object identifies it, since the realm table
-            // is private to the engine.
-            (Payload::Context(a), Payload::Context(b)) => {
-                a.isolate() == b.isolate() && a.global() == b.global()
-            }
-            (Payload::Module(a), Payload::Module(b)) => a == b,
-            (
-                Payload::Script {
-                    slot: a,
-                    generation: ag,
-                },
-                Payload::Script {
-                    slot: b,
-                    generation: bg,
-                },
-            ) => a == b && ag == bg,
-            _ => false,
+impl<T, Rhs: Handle> PartialEq<Rhs> for Local<'_, T> {
+    /// Identity between two handles, whatever their tags: the payload is what a
+    /// handle names, and the tag is a type-level selector.
+    fn eq(&self, other: &Rhs) -> bool {
+        payload_eq(&self.payload, other.payload_ref())
+    }
+}
+
+impl<T, Rhs: Handle> PartialEq<Rhs> for Global<T> {
+    fn eq(&self, other: &Rhs) -> bool {
+        payload_eq(&self.payload, other.payload_ref())
+    }
+}
+
+/// Whether two payloads name the same thing.
+fn payload_eq(left: &Payload, right: &Payload) -> bool {
+    match (left, right) {
+        (Payload::Value(a), Payload::Value(b)) => a == b,
+        // A copy of the same context names the same realm on the same isolate;
+        // its global object identifies it, since the realm table is private to
+        // the engine.
+        (Payload::Context(a), Payload::Context(b)) => {
+            a.isolate() == b.isolate() && a.global() == b.global()
         }
+        (Payload::Module(a), Payload::Module(b)) => a == b,
+        (
+            Payload::Script {
+                slot: a,
+                generation: ag,
+            },
+            Payload::Script {
+                slot: b,
+                generation: bg,
+            },
+        ) => a == b && ag == bg,
+        _ => false,
     }
 }
 
@@ -461,6 +517,11 @@ pub trait Handle: Sized {
 
     #[doc(hidden)]
     fn into_payload(self) -> Payload;
+
+    /// The payload, borrowed — what a comparison between two handles needs,
+    /// since only one of them is being consumed.
+    #[doc(hidden)]
+    fn payload_ref(&self) -> &Payload;
 }
 
 impl<T> Handle for Local<'_, T> {
@@ -468,6 +529,10 @@ impl<T> Handle for Local<'_, T> {
 
     fn into_payload(self) -> Payload {
         self.payload
+    }
+
+    fn payload_ref(&self) -> &Payload {
+        &self.payload
     }
 }
 
@@ -477,6 +542,10 @@ impl<T> Handle for &Local<'_, T> {
     fn into_payload(self) -> Payload {
         self.payload
     }
+
+    fn payload_ref(&self) -> &Payload {
+        &self.payload
+    }
 }
 
 impl<T> Handle for Global<T> {
@@ -485,6 +554,10 @@ impl<T> Handle for Global<T> {
     fn into_payload(self) -> Payload {
         self.payload
     }
+
+    fn payload_ref(&self) -> &Payload {
+        &self.payload
+    }
 }
 
 impl<T> Handle for &Global<T> {
@@ -492,5 +565,9 @@ impl<T> Handle for &Global<T> {
 
     fn into_payload(self) -> Payload {
         self.payload
+    }
+
+    fn payload_ref(&self) -> &Payload {
+        &self.payload
     }
 }

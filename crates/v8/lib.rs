@@ -183,8 +183,9 @@ mod tests {
 
         let text = String::new(scope, "hello").expect("string");
         // `is_string` is declared on `Local<Value>`; `Array` sits three tags
-        // below it in the chain.
-        let array: crate::Local<'_, crate::data::Array> = text.cast();
+        // below it in the chain. The tag is deliberately wrong here, which is
+        // why the retag is the unchecked one.
+        let array: crate::Local<'_, crate::data::Array> = text.retag();
         assert!(array.is_string());
         assert!(!array.is_number());
     }

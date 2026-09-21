@@ -625,6 +625,20 @@ impl<'scope, 'obj: 'scope, 'i, C> NewTryCatch<'scope> for PinnedRef<'obj, Handle
     }
 }
 
+impl<'scope, 'obj: 'scope, 'i, C> NewTryCatch<'scope> for PinnedRef<'obj, CallbackScope<'i, C>> {
+    type NewScope = TryCatch<'scope, 'obj, HandleScope<'i, C>>;
+
+    fn make_new_scope(me: &'scope mut Self) -> Self::NewScope {
+        TryCatch {
+            // A callback scope *is* a handle scope: the two `PinnedRef`s name
+            // the same address, which is the bridge's own `Deref` between them.
+            scope: cast_pinned_ref_mut(me),
+            catch: None,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
 /// An external exception handler (v8::TryCatch).
 ///
 /// Slag keeps one pending exception on its isolate, so this scope observes that

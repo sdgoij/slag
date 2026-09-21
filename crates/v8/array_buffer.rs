@@ -20,8 +20,8 @@ use slag::buffers::{
 
 use crate::data::{
     ArrayBuffer, ArrayBufferView, BigInt64Array, BigUint64Array, Float16Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Uint8Array, Uint8ClampedArray, Uint16Array,
-    Uint32Array, Value,
+    Float64Array, Int8Array, Int16Array, Int32Array, SharedArrayBuffer, Uint8Array,
+    Uint8ClampedArray, Uint16Array, Uint32Array, Value,
 };
 use crate::handle::Local;
 use crate::scope::PinScope;
@@ -259,6 +259,20 @@ impl<'s> Local<'s, ArrayBuffer> {
     /// The first byte of the storage (`v8::ArrayBuffer::data`).
     pub fn data(&self) -> Option<NonNull<c_void>> {
         self.get_backing_store().data()
+    }
+}
+
+impl<'s> Local<'s, SharedArrayBuffer> {
+    /// A shared reference to the bytes
+    /// (`v8::SharedArrayBuffer::get_backing_store`).
+    ///
+    /// The same record an `ArrayBuffer` reads, because the engine keeps one
+    /// table for both kinds of buffer; the store's own `is_shared` is what tells
+    /// them apart.
+    pub fn get_backing_store(&self) -> SharedRef<BackingStore> {
+        let facts = buffer_facts(self.engine())
+            .expect("bridge bug: a SharedArrayBuffer handle needs the realm it came from");
+        SharedRef::new(facts.store())
     }
 }
 

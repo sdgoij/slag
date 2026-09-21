@@ -541,6 +541,7 @@ number is the certified one.
 | after `cppgc` (`v8::cppgc`, `Object::wrap`/`unwrap`/`is_api_wrapper`, `get_cpp_heap`) | **26** |
 | after `FunctionBuilder` (`FunctionBuilder`, `data`/`length`/`constructor_behavior`, `FunctionTemplate::builder*`) | **20** |
 | after the serializer (`ValueSerializer`/`ValueDeserializer`, the delegate and helper traits, this bridge's own wire format) | **8 names, and 617 type errors behind them** (see below) |
+| after the first method pass (the handle casts and `Local`'s cross-type equality, the value conversions and element predicates, the object/array/function/promise/proxy/string calls, `NewTryCatch` from a callback scope) | **374** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -626,7 +627,77 @@ test that aborts instead of failing is the hazard §7's last step warned about
 from the other direction.
 
 What is left is 8 names, and behind them the type errors the table's numbers
-now measure:
+now measure. The first pass through those, 617 → 374, is the step below.
+
+**The method surface — first pass, 617 → 374, and what it fixed.** Five of the
+things this added were not additions but *corrections*, which matter more than
+the count:
+
+- `Local::cast` was the bridge's unchecked retag wearing the crate's name. The
+  crate's `cast` is checked and **panics** on a failed cast, and its unchecked
+  form is the *associated* `cast_unchecked`; the retag is now a private `retag`,
+  and `cast`/`try_cast`/`cast_unchecked` landed with the crate's semantics.
+  Including the bound `Local<'s, A>: TryFrom<Self>` — which is satisfiable at all
+  only through the blanket `TryFrom` over `From`, which is how the crate's own
+  bound works.
+- `strict_equals`/`same_value` took `&Local` where the crate takes `Local` **by
+  value**, and `same_value` was aliased to strict equality — a wrong answer for
+  `NaN` (false where it must be true) and for `-0`/`0` (true where it must be
+  false). Both now ask the engine's own operations, and `same_value_zero` came
+  with them.
+- `Local`'s `PartialEq` was same-tag only. The crate's is
+  `impl<T, Rhs: Handle> PartialEq<Rhs> for Local<'_, T>`, which is what lets a
+  host write `value == object`; it is now that impl, comparing the payload (the
+  bridge's tags carry nothing to compare), and `Global` has the matching one.
+- `NewTryCatch` existed for a handle scope only, where the crate has five
+  receivers — and `deno_core` opens a try-catch from a *callback* scope.
+- `Object::has_own_property` came with the serializer step, because a `[[Get]]`
+  cannot tell an array element from a hole.
+
+The rest is additions, each against the crate's own signature: twelve
+element-type predicates on `Value`; the value conversions (`to_object`,
+`to_number`, `to_big_int`, `to_boolean`, `to_integer`, `number_value`,
+`integer_value`, `int32_value`, `uint32_value`);
+`Object::{set_index, delete, get_prototype, set_prototype, create_data_property,
+define_own_property}`; `Function::{call, call_with_context, new_instance,
+set_name}`; `Promise::{result, mark_as_handled, then2}` — `then2` through the
+engine's own PerformPromiseThen, so a replaced `Promise.prototype.then` cannot
+change what it does; `PromiseResolver::{resolve, reject}`; `Proxy::{get_target,
+get_handler}`; `SharedArrayBuffer::get_backing_store`;
+`String::to_rust_cow_lossy`.
+
+**What the remaining 374 are, measured.** **51** are `E0599`s on a `Local<…>` —
+the tail (private names, the module accessors, the templates, context embedder
+data, `PrimitiveArray`, `Message`, `create_code_cache`), each needing its own
+look at what the engine has. **34** are `E0599`s on another bridge type
+(`Global::open`, `Function::builder`, `Symbol::get_iterator`,
+`ArrayBuffer::new_backing_store_from_ptr`, …). **155** are the tag shape §9
+records as open (78 `E0599`s with a tag receiver, 77 of the 78 `E0308`s being
+`expected &Tag, found &Local<…>`). **8** are still names (the wasm tail). And
+**17** `E0277`s are a second mechanical gap this pass found: **the `From`/`TryFrom`
+tables here are direct-edge tables where the crate's are transitive closures**
+(176 `impl_from!` entries there, 60 here), so a host's
+`Local<Data>: From<Local<Function>>` and
+`TryFrom<Local<Data>> for Local<FunctionTemplate>` do not exist. Closing that is
+mechanical — write out the closure — and is the next chunk; the *template* tags
+need one thing more before a cast to them can exist at all, since the bridge
+keeps a template as an `External` under an isolate-registered pointer and has no
+predicate that tells a template from any other `External`.
+
+Gates: `cargo test -p v8 --features simdutf` **117 passed / 0 failed**,
+`clippy` clean at crate and workspace scope, and
+`cargo test --locked --workspace` **5,050 passed / 0 failed / 4 ignored** with
+the crashing test skipped (a re-run: the first run failed on the `runtime` flake
+below, which aborts cargo and so hides every later binary's count).
+
+**The documented `runtime` flake reproduced.**
+`builtins::function::tests::certified_body_global_read_fast_path_stays_spec_exact`
+failed during this pass's first workspace run —
+`left: Number(4.0), right: Number(9.0)` at
+`crates/runtime/src/builtins/function.rs:1273` — and passed on the re-run. §7 had
+recorded it once before as "failed once, never reproduced, unexplained"; it now
+has a second occurrence with the values, in a crate this pass cannot reach
+(`crates/v8` is in no engine crate's graph).
 
 1. **The value serializer — landed** (13 sites: the two delegate traits, the
    two helper traits, both entry points, and the walk). The design note that
@@ -799,10 +870,11 @@ and source maps, traced host objects, structured clone.
 
 Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks;
 (2) grow the surface from the items `deno_core` names, in call order — the name
-frontier is effectively closed (8 left, the wasm tail), and the serializer is
-landed, so this is now a **method-level** stage: 617 type errors are visible for
-the first time, 291 of them additions of the mechanical kind, 153 blocked on the
-tag shape §9 records as open;
+frontier is closed (8 left, the wasm tail) and the serializer is landed, so this
+is a **method-level** stage: 617 type errors were visible for the first time, the
+first pass through them took it to 374, and what is left is the mechanical
+`From`/`TryFrom` closure, the ~85 remaining call sites on `Local` and the other
+bridge types, the 155 errors the tag shape in §9 blocks, and the wasm tail;
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then
