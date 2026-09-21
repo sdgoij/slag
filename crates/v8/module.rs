@@ -33,7 +33,9 @@ use std::num::NonZeroI32;
 use crux::error::JsError;
 use runtime::api;
 
-use crate::data::{Context, FixedArray, Module, ModuleRequest, Object, String as JsString, Value};
+use crate::data::{
+    Context, FixedArray, Message, Module, ModuleRequest, Object, String as JsString, Value,
+};
 use crate::handle::{Local, LocalHandle, Payload};
 use crate::primitives::undefined;
 use crate::scope::PinScope;
@@ -428,6 +430,51 @@ impl<'s> LocalHandle<'s, Module> {
                 None
             }
         }
+    }
+
+    /// Start evaluating the module's asynchronous transitive dependencies, and
+    /// answer the promise that settles when they have (v8::Module::
+    /// EvaluateForImportDefer). The module itself is not evaluated: its
+    /// deferred namespace evaluates on first property access.
+    ///
+    /// A module with no asynchronous dependency to gather is answered with an
+    /// already-fulfilled promise carrying the deferred namespace, which is how
+    /// the crate we stand in for's callers tell "nothing to wait for" from
+    /// "still waiting" without awaiting. `None` means a dependency could not be
+    /// evaluated at all, with the exception pending.
+    pub fn evaluate_for_import_defer(&self, scope: &PinScope<'s, '_>) -> Option<Local<'s, Value>> {
+        let realm = scope.get_current_context().context();
+        match self.module().evaluate_for_import_defer(&realm) {
+            Ok(value) => Some(Local::from_engine(value)),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// The modules in this module's graph that are stalled on a top-level await,
+    /// each paired with the message the crate we stand in for reports for it
+    /// (v8::Module::GetStalledTopLevelAwaitMessage). A host calls this on the
+    /// way out of its event loop, to explain why a program is still pending.
+    ///
+    /// The message carries the crate's `kTopLevelAwaitStalled` text and is
+    /// identified by the module it reports on. V8's carries a location as well
+    /// — the module's script and the offset the await suspended at — which the
+    /// engine has no record of, so the two position answers are the ones the
+    /// bridge gives any message with no recorded position: nothing.
+    pub fn get_stalled_top_level_await_message(
+        &self,
+        _scope: &PinScope<'s, '_, ()>,
+    ) -> Vec<(Local<'s, Module>, Local<'s, Message>)> {
+        self.module()
+            .stalled_top_level_await_modules()
+            .into_iter()
+            .map(|stalled| {
+                let message = Local::from_payload(Payload::TemplateMessage { module: stalled });
+                (Local::from_module(stalled), message)
+            })
+            .collect()
     }
 
     /// Whether this module is a source text module
@@ -1040,6 +1087,83 @@ mod tests {
                     .state(),
                 PromiseState::Rejected
             );
+        });
+    }
+
+    /// A deferred dynamic import answers a promise either way: a module with
+    /// nothing to gather is already settled, and what it settled with is the
+    /// *deferred* namespace. Either way the module itself is not evaluated.
+    #[test]
+    fn a_deferred_import_answers_a_settled_promise() {
+        in_context!(scope, {
+            let plain = compile_text(scope, "export const x = 1;");
+            assert_eq!(
+                plain.instantiate_module(scope, resolve_by_compiling),
+                Some(true)
+            );
+
+            let promise = plain.evaluate_for_import_defer(scope).expect("a promise");
+            let promise = Local::<Promise>::try_from(promise).expect("promise");
+            assert_eq!(promise.state(), PromiseState::Fulfilled);
+            let settled = promise.result(scope);
+            let deferred = plain.get_module_namespace_with_phase(ModuleImportPhase::kDefer);
+            assert_eq!(settled, deferred);
+            assert_eq!(plain.get_status(), ModuleStatus::Instantiated);
+        });
+    }
+
+    /// A deferred dynamic import whose module awaits answers a pending promise:
+    /// the dependency's evaluation has begun, and the deferring module's has
+    /// not.
+    #[test]
+    fn a_deferred_import_of_a_top_level_await_is_pending() {
+        in_context!(scope, {
+            let module = compile_text(scope, "import defer * as ns from 'dep';");
+            assert_eq!(
+                module.instantiate_module(scope, resolve_with_tla),
+                Some(true)
+            );
+
+            let promise = module.evaluate_for_import_defer(scope).expect("a promise");
+            let promise = Local::<Promise>::try_from(promise).expect("promise");
+            assert_eq!(promise.state(), PromiseState::Pending);
+            assert_eq!(module.get_status(), ModuleStatus::Instantiated);
+        });
+    }
+
+    /// A module suspended on a top-level await that never settles is reported,
+    /// with the message the crate we stand in for mints for it — the template's
+    /// own text rather than the uncaught-exception rendering — and two stalled
+    /// modules are two messages.
+    #[test]
+    fn a_stalled_top_level_await_is_reported_with_its_message() {
+        in_context!(scope, {
+            let module = compile_text(scope, "await new Promise(() => {});");
+            let value = module.evaluate(scope).expect("evaluate");
+            assert_eq!(
+                Local::<Promise>::try_from(value).expect("promise").state(),
+                PromiseState::Pending
+            );
+            assert_eq!(module.get_status(), ModuleStatus::Evaluating);
+
+            let stalled = module.get_stalled_top_level_await_message(scope);
+            assert_eq!(stalled.len(), 1);
+            let (reported, message) = stalled[0];
+            assert_eq!(reported, module);
+            assert_eq!(
+                message.get(scope).to_rust_string_lossy(scope),
+                "Top-level await promise never resolved"
+            );
+            // The same module is the same message, however many times it is
+            // asked about...
+            let (_, again) = module.get_stalled_top_level_await_message(scope)[0];
+            assert!(message == again);
+
+            // ...and a second stalled module is a message of its own.
+            let other = compile_text(scope, "await new Promise(() => {});");
+            other.evaluate(scope).expect("evaluate");
+            let (_, other_message) = other.get_stalled_top_level_await_message(scope)[0];
+            assert!(message != other_message, "one message per stalled module");
         });
     }
 }

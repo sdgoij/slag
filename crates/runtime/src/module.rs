@@ -2012,39 +2012,15 @@ fn deferred_module_then(
                     &reject,
                 );
             }
-            // Wait for every async dependency's evaluation promise before
-            // settling (spec FinishLoadingImportedModule step 4: Perform
-            // PromiseAll over the evaluation promises).
-            let remaining = Rc::new(RefCell::new(async_deps.len() as u32));
-            let wait_id = NEXT_DEFERRED_WAIT.fetch_add(1, Ordering::Relaxed);
-            agent.deferred_module_waits.insert(
-                wait_id,
-                DeferredWait(
-                    remaining.clone(),
-                    on_fulfilled,
-                    on_rejected,
-                    module,
-                    resolve,
-                    reject,
-                ),
-            );
-            let fulfill = make_deferred_waiter(agent, wait_id, false)?;
-            let on_rejected_wait = make_deferred_waiter(agent, wait_id, true)?;
-            for dep in async_deps {
-                let evaluation = module_evaluation(agent, &dep)?;
-                // SafePerformPromiseAll (spec 16.2.1.6.2.1): the evaluation
-                // promises are aggregated with PerformPromiseThen, which
-                // attaches reactions directly — a patched
-                // `Promise.prototype.then` is never consulted.
-                crate::promise::perform_promise_then(
-                    agent,
-                    &evaluation,
-                    Some(fulfill),
-                    Some(on_rejected_wait),
-                    None,
-                )?;
-            }
-            Ok(())
+            await_async_dependencies(
+                agent,
+                &module,
+                async_deps,
+                on_fulfilled,
+                on_rejected,
+                resolve,
+                reject,
+            )
         })();
         if let Err(error) = result {
             let rejection = crate::promise::error_value(agent, &error);
@@ -2052,6 +2028,100 @@ fn deferred_module_then(
         }
         Ok(Value::Undefined)
     });
+    Ok(capability.promise)
+}
+
+/// Wait for every async dependency's evaluation promise before settling
+/// (spec FinishLoadingImportedModule step 4: Perform PromiseAll over the
+/// evaluation promises), then settle the capability through
+/// `on_fulfilled`/`on_rejected` with `module`'s deferred namespace.
+fn await_async_dependencies(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    async_deps: Vec<Handle<SourceTextModule>>,
+    on_fulfilled: Value,
+    on_rejected: Value,
+    resolve: Value,
+    reject: Value,
+) -> Result<(), JsError> {
+    let remaining = Rc::new(RefCell::new(async_deps.len() as u32));
+    let wait_id = NEXT_DEFERRED_WAIT.fetch_add(1, Ordering::Relaxed);
+    agent.deferred_module_waits.insert(
+        wait_id,
+        DeferredWait(
+            remaining.clone(),
+            on_fulfilled,
+            on_rejected,
+            *module,
+            resolve,
+            reject,
+        ),
+    );
+    let fulfill = make_deferred_waiter(agent, wait_id, false)?;
+    let on_rejected_wait = make_deferred_waiter(agent, wait_id, true)?;
+    for dep in async_deps {
+        let evaluation = module_evaluation(agent, &dep)?;
+        // SafePerformPromiseAll (spec 16.2.1.6.2.1): the evaluation promises
+        // are aggregated with PerformPromiseThen, which attaches reactions
+        // directly — a patched `Promise.prototype.then` is never consulted.
+        crate::promise::perform_promise_then(
+            agent,
+            &evaluation,
+            Some(fulfill),
+            Some(on_rejected_wait),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// `Module::EvaluateForImportDefer` (`v8/src/api/api.cc:2473`): start
+/// evaluating this module's asynchronous transitive dependencies and answer a
+/// promise that settles once they have. The module itself is not evaluated —
+/// its deferred namespace evaluates lazily, on first property access.
+///
+/// A module with no asynchronous dependency has nothing to wait for, and V8
+/// answers an already-fulfilled promise carrying the deferred namespace: the
+/// promise's state is how a host tells that case from the waiting one without
+/// awaiting either.
+pub fn evaluate_for_import_defer(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+) -> Result<Value, JsError> {
+    // GC-2: the gathered dependency handles sit in a local Vec the stack scan
+    // cannot see, held across the dependency evaluation below that allocates —
+    // suppress `--gc-stress` for the window, as the wave and the `.then` job
+    // do.
+    let _stress = crate::ir::StressSuppress::new();
+    let async_deps = gather_async_transitive_dependencies(agent, module, &mut Vec::new())?;
+    let promise_ctor = module
+        .realm
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
+    if async_deps.is_empty() {
+        let namespace = deferred_namespace(agent, module)?;
+        crate::function::call(
+            agent,
+            &capability.resolve,
+            Value::Undefined,
+            std::slice::from_ref(&namespace),
+        )?;
+        return Ok(capability.promise);
+    }
+    // A dependency that fails to evaluate at all (a cyclic record, an errored
+    // one) propagates: V8 answers the empty handle with the exception pending,
+    // rather than a promise that rejects.
+    await_async_dependencies(
+        agent,
+        module,
+        async_deps,
+        Value::Undefined,
+        Value::Undefined,
+        capability.resolve,
+        capability.reject,
+    )?;
     Ok(capability.promise)
 }
 
@@ -2514,6 +2584,74 @@ pub fn module_graph_has_tla(
         }
     }
     Ok(false)
+}
+
+/// GetStalledTopLevelAwaitMessages (`SourceTextModule::
+/// InnerGetStalledTopLevelAwaitModule`,
+/// `v8/src/objects/source-text-module.cc:1630`): the modules in `root`'s graph
+/// that are still being evaluated asynchronously with nothing left to wait
+/// for — a top-level await that has not settled, and will not.
+///
+/// The walk follows `root` first, then the *evaluation*-phase requests that
+/// were linked; V8 skips the others, because an `import source` or
+/// `import defer` request is not evaluated by the graph it appears in. It
+/// stops descending at a module it reports, and neither reports nor descends
+/// into a synthetic module — a synthetic module's body is a host callback, so
+/// it has no source graph.
+///
+/// `root` is marked visited here, where V8 leaves that to its caller, so a
+/// cycle back into the root does not re-walk the graph.
+pub fn stalled_top_level_await_modules(
+    root: &Handle<SourceTextModule>,
+) -> Vec<Handle<SourceTextModule>> {
+    // V8 has the root's kind checked by an ApiCheck that aborts on a synthetic
+    // module; a synthetic module has no graph to walk, so this answers nothing
+    // instead of aborting.
+    if root.synthetic.is_some() {
+        return Vec::new();
+    }
+    let mut visited = vec![*root];
+    let mut result = Vec::new();
+    collect_stalled(&mut visited, &mut result, root);
+    result
+}
+
+fn collect_stalled(
+    visited: &mut Vec<Handle<SourceTextModule>>,
+    result: &mut Vec<Handle<SourceTextModule>>,
+    module: &Handle<SourceTextModule>,
+) {
+    // A module whose async evaluation has begun and which has no pending async
+    // dependency left has run its body as far as it can: it is suspended on
+    // its own top-level await. V8 asks the same question through its
+    // async-evaluation ordinal, which is set while a module is async-evaluating
+    // and cleared when it finishes.
+    if *module.status.borrow() == ModuleStatus::EvaluatingAsync
+        && *module.pending_async.borrow() == 0
+    {
+        result.push(*module);
+        return;
+    }
+    let reached = {
+        let loaded = module.realm.loaded_modules.borrow();
+        module
+            .requested_modules
+            .iter()
+            .filter(|request| request.phase == ImportPhase::Import)
+            .filter_map(|request| loaded.get(&request.specifier).copied())
+            .collect::<Vec<_>>()
+    };
+    for reached in reached {
+        if reached.synthetic.is_some()
+            || visited
+                .iter()
+                .any(|visited| Handle::ptr_eq(*visited, reached))
+        {
+            continue;
+        }
+        visited.push(reached);
+        collect_stalled(visited, result, &reached);
+    }
 }
 
 fn stmt_has_top_level_await(stmt: &Stmt) -> bool {

@@ -266,6 +266,18 @@ impl Module {
         context.with_agent(|agent| module::module_graph_has_tla(agent, &self.module))
     }
 
+    /// The modules this one's graph reaches that are stalled on a top-level
+    /// await (v8::Module::GetStalledTopLevelAwaitMessages): they are being
+    /// evaluated asynchronously with nothing left to wait for, so the await
+    /// they are suspended on will not settle. A host reports these before
+    /// exiting, to explain why a program is still pending.
+    pub fn stalled_top_level_await_modules(&self) -> Vec<Self> {
+        module::stalled_top_level_await_modules(&self.module)
+            .into_iter()
+            .map(Self::from_handle)
+            .collect()
+    }
+
     /// Where `offset` into this module's source is
     /// (v8::Module::SourceOffsetToLocation), as a 1-based line and column
     /// (the crate we stand in for's `Location` is 0-based; its callers add
@@ -355,6 +367,15 @@ impl Module {
     /// Evaluate the module (spec 16.2.1.6.2.1); the value is a promise.
     pub fn evaluate(&self, context: &Context) -> Result<Local, JsError> {
         context.with_agent(|agent| module::module_evaluation(agent, &self.module).map(Local))
+    }
+
+    /// Start evaluating the module's asynchronous transitive dependencies and
+    /// answer a promise that settles when they have (v8::Module::
+    /// EvaluateForImportDefer). The module itself is not evaluated: its
+    /// deferred namespace evaluates on first property access.
+    pub fn evaluate_for_import_defer(&self, context: &Context) -> Result<Local, JsError> {
+        context
+            .with_agent(|agent| module::evaluate_for_import_defer(agent, &self.module).map(Local))
     }
 
     /// The module's namespace object (spec 16.2.1.10).
@@ -568,5 +589,92 @@ mod tests {
             .as_number(),
             None
         );
+    }
+
+    /// The deferred form of a dynamic import: a module with no asynchronous
+    /// transitive dependency is answered an already-fulfilled promise carrying
+    /// the deferred namespace, and one that has such a dependency is answered a
+    /// pending promise having started that dependency's evaluation. The module
+    /// itself is not evaluated either way.
+    #[test]
+    fn a_deferred_import_settles_on_its_async_dependencies() {
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+
+        // Nothing to gather, so the promise is resolved before it is handed
+        // back — which is how a host tells this case from the waiting one.
+        let plain = Module::compile(&context, "plain", "export const x = 1;").expect("plain");
+        plain.register(&context, "plain").expect("register");
+        plain.instantiate(&context).expect("instantiate");
+        let promise = plain.evaluate_for_import_defer(&context).expect("promise");
+        assert_eq!(
+            Promise::state(&context, &promise).expect("state"),
+            "fulfilled"
+        );
+        let settled = Promise::result(&context, &promise).expect("result");
+        let deferred = plain.deferred_namespace(&context).expect("deferred");
+        assert_eq!(
+            settled.value().as_object().map(|object| object.id()),
+            deferred.value().as_object().map(|object| object.id())
+        );
+        assert_eq!(plain.status(), ModuleStatus::Instantiated);
+
+        // A dependency that awaits: gathered, evaluated, and still running, so
+        // the promise it settles with is pending.
+        let dep = Module::compile(
+            &context,
+            "dep",
+            "await new Promise(() => {});\nexport const x = 1;",
+        )
+        .expect("dep");
+        dep.register(&context, "dep").expect("register");
+        let main =
+            Module::compile(&context, "main", "import defer * as ns from 'dep';").expect("main");
+        main.register(&context, "main").expect("register");
+        main.instantiate(&context).expect("instantiate");
+
+        let promise = main.evaluate_for_import_defer(&context).expect("promise");
+        assert_eq!(
+            Promise::state(&context, &promise).expect("state"),
+            "pending"
+        );
+        assert_eq!(dep.status(), ModuleStatus::Evaluating);
+        assert_eq!(main.status(), ModuleStatus::Instantiated);
+    }
+
+    /// A module suspended on a top-level await that will not settle is what a
+    /// host reports on the way out. A module that finished is not reported, and
+    /// one whose dependency is stalled reports that dependency — the walk
+    /// looks through the graph, not just at the module it was asked about.
+    #[test]
+    fn a_module_stalled_on_its_own_await_is_reported() {
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+
+        let done = Module::compile(&context, "done", "export const x = 1;").expect("done");
+        done.register(&context, "done").expect("register");
+        done.instantiate(&context).expect("instantiate");
+        done.evaluate(&context).expect("evaluate");
+        assert!(done.stalled_top_level_await_modules().is_empty());
+
+        let waiting =
+            Module::compile(&context, "waiting", "await new Promise(() => {});").expect("waiting");
+        waiting.register(&context, "waiting").expect("register");
+        waiting.instantiate(&context).expect("instantiate");
+        let promise = waiting.evaluate(&context).expect("evaluate");
+        assert_eq!(
+            Promise::state(&context, &promise).expect("state"),
+            "pending"
+        );
+        let stalled = waiting.stalled_top_level_await_modules();
+        assert_eq!(stalled.len(), 1);
+        assert!(stalled[0] == waiting);
+
+        let graph = Module::compile(&context, "graph", "import 'waiting';").expect("graph");
+        graph.register(&context, "graph").expect("register");
+        graph.instantiate(&context).expect("instantiate");
+        let stalled = graph.stalled_top_level_await_modules();
+        assert_eq!(stalled.len(), 1);
+        assert!(stalled[0] == waiting);
     }
 }

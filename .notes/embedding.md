@@ -570,6 +570,7 @@ number is the certified one.
 | after the stack-trace frames (`StackTrace::current_stack_trace` and the frame accessors, over the engine's execution contexts) | **4** (see below) |
 | after the escapable handle scope (the macro's inference, which the `E0282` that had been unexplained since the serializer step turned out to be) | **3** (see below) |
 | after the heap statistics (`HeapStatistics`, the four accessors a host reads, over the arena's own numbers and the agent's own record of live buffers) | **2** (see below) |
+| after the module-graph tail (`Module::{evaluate_for_import_defer, get_stalled_top_level_await_message}`, over the engine's own defer machinery and a walk it already had) | **0** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -590,9 +591,11 @@ error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
 
 That was the shape of the frontier then. It is no longer: with no names left, the
-2 errors now are 2 `E0599`s (methods and the subsystems they name), so the count
-is a *method-level* metric now, as §10 says — and each step's own
-record below names which code classes moved rather than only the total.
+count became a *method-level* metric, and it closed at 0 — the last steps are two
+`E0599`s and then none, with each step's own record below naming which code
+classes moved rather than only the total. A count of 0 does not mean `deno_core`
+works: it means it *compiles* against this crate, which is all that metric ever
+measured, and §7's last record and §10's (3) say what is left.
 
 **The serializer — landed, and the count stopped being a progress metric.**
 `crates/v8/serialize.rs` carries `ValueSerializer`/`ValueDeserializer`, the two
@@ -2401,8 +2404,61 @@ pass, **0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 0
 / 0 crash / 0 hang, 152 skip; the eight wasm core suites **64,594 checks / 0 fail /
 0 pending**; the JS-API sweep **1,001 tests / 0 fail**.
 
-Two sites are left: `Module::evaluate_for_import_defer` and
-`Module::get_stalled_top_level_await_message`, both module-graph work.
+**The module-graph tail — landed, 2 → 0, and the crate type-checks.** Two
+sites, both reaching machinery the engine already had.
+
+`Module::evaluate_for_import_defer` (`libs/core/modules/map/dynamic.rs:604`, the
+`import.defer()` path). V8's own body (`v8/src/api/api.cc:2473`) gathers the
+module's asynchronous transitive dependencies; with none it resolves a *fresh*
+promise with the deferred namespace and returns it — already fulfilled — and
+otherwise evaluates each dependency and performs `Promise.all` over their
+evaluation promises. The engine's deferred-import protocol does all of it
+already (`gather_async_transitive_dependencies`, the countdown waiters, the
+deferred namespace), so what was missing was the entry point rather than a
+mechanism: the `.then` job's tail was extracted into `await_async_dependencies`
+so the same wait is reachable without the DeferredModule object, and the entry
+point resolves the empty case *before returning*. That last part is the one
+`deno_core` reads — its caller branches on `promise.state()` to tell "nothing to
+wait for" from "still waiting" (`dynamic.rs:621`) — and resolving through the job
+instead would answer `Pending` where V8 answers `Fulfilled`, which is exactly
+what the first mutation of this slice showed.
+
+`Module::get_stalled_top_level_await_message`
+(`libs/core/modules/map/evaluation.rs:347`). V8 walks the graph
+(`SourceTextModule::InnerGetStalledTopLevelAwaitModule`,
+`v8/src/objects/source-text-module.cc:1630`) and reports a module with no pending
+async dependency and an async-evaluation ordinal — one suspended on its own
+top-level await. The engine's `ModuleStatus::EvaluatingAsync` with
+`pending_async == 0` is that same state (the body has begun and there is nothing
+left to wait for), so the walk is the shape `module_graph_has_tla` already had:
+the root first, then the *evaluation*-phase requests that were linked, stopping
+at a module it reports. The message has no exception behind it, so the bridge
+mints one — `Payload::TemplateMessage { module }`, whose text is the crate's
+`kTopLevelAwaitStalled` template and whose identity is the module it reports on.
+
+Five new tests, each verified by mutating the code it guards: taking the
+non-empty branch unconditionally fails both deferred-import tests (`left:
+"pending", right: "fulfilled"`); a pending-dependency count of 1 fails both
+stalled tests; a wrong template text fails the bridge text assertion; a negated
+payload-equality arm fails `message == again`; and a defer-phase request filter
+fails the graph-descent assertion.
+
+Gates: `cargo test -p v8 --features simdutf` **203 passed / 0 failed**,
+`cargo test -p runtime --lib` **794 passed / 0 failed**, `cargo test -p crux
+--lib` **248 passed / 0 failed**, `cargo clippy --locked --workspace --all-targets
+-- -D warnings` clean, `cargo test --locked --workspace -- --skip
+the_data_a_built_function_carries_survives_a_collection` **5,149 passed / 0
+failed / 4 ignored**. `crates/runtime` changed, so the battery ran and every
+number is the certified one: test262 `all` 48,622 — 48,464 pass, **0 fail / 0
+crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 0 fail / 0 crash / 0
+hang, 152 skip; the eight wasm core suites **64,594 checks / 0 fail / 0
+pending**; the JS-API sweep **1,001 tests / 0 fail**.
+
+`cargo check -p deno_core` from `deno/` is **0 errors**. That is a *compile*
+milestone and nothing more — no host has been *run*, and §9's divergences say
+what one would find if it were. What the metric never measured is what stands
+between the two: the runtime gaps this work found (`queueMicrotask`, a host that
+must boot without a snapshot), which is §10's (3).
 
 ## 8. Parked: the C++ face
 
@@ -2978,6 +3034,29 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   mutated to prove it can fail; one of those mutations is what showed the first
   version of the external-memory test could not fail, so its subject changed
   (a view is not a buffer object) and the dedupe it was written for is gone.
+14. **The module-graph tail — the engine half was written first, in the same
+  session, so this entry is a record rather than an advance notice** (items 11-13
+  were named before their engine halves existed; saying so here would be
+  dressing it up). Two sites, and the engine change is additive rather than a new
+  mechanism:
+  - `api::Module::evaluate_for_import_defer` over a new
+    `module::evaluate_for_import_defer` (`crates/runtime/src/module.rs`), which
+    gathers the module's asynchronous transitive dependencies with the walk the
+    deferred-import protocol already uses, resolves the deferred namespace
+    immediately when there are none, and otherwise attaches the same countdown
+    waiters the `.then` path attaches. `deferred_module_then`'s tail was split
+    out into `await_async_dependencies` so both share it; that is a move, and
+    the `.then` path's behaviour is unchanged (its own test still passes).
+  - `api::Module::stalled_top_level_await_modules` over a new
+    `module::stalled_top_level_await_modules`: a read-only walk over module
+    status and the realm's link table, the shape `module_graph_has_tla` already
+    has. No new state, no allocation path, and nothing written.
+  - Bridge side: a `Payload::TemplateMessage { module }` variant (the shape
+    `Payload::ModuleRequest` already has) for a message with no thrown value
+    behind it, and the two methods over the above.
+
+  **Landed, 2 → 0** (§7 records it), which is the end of the metric rather than
+  of the work: the divergences the two sites carry are recorded below.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3084,6 +3163,34 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   *absent*: a host that names one gets a compile error rather than a plausible
   zero. A host comparing its numbers to V8's must read them as "what this engine
   holds", not as the same quantities.
+- **A deferred import's promise settles with the deferred namespace, where V8's
+  settles with the result of an internal `Promise.all`.**
+  `Module::EvaluateForImportDefer` answers a promise mostly for its *state*: the
+  one caller in the frontier branches on it to tell a module with no
+  asynchronous dependency — which V8 resolves before returning — from one still
+  waiting, and resolves its own promise with the deferred namespace either way
+  (`libs/core/modules/map/dynamic.rs:621-633`). What the promise *carries* in the
+  waiting case is an implementation detail of V8 that nothing reads; here it is
+  the deferred namespace, because that is what the engine's existing wait
+  settles with. Stated so that a host inspecting it knows it is reading a
+  different value.
+- **A stalled-await message has no location.** V8 mints a `JSMessageObject`
+  carrying `kTopLevelAwaitStalled` and a `MessageLocation` for the module's
+  script and the generator's resume offset
+  (`v8/src/objects/source-text-module.cc:1620`), so `GetScriptResourceName` and
+  `GetLineNumber` answer on it. The engine records no position for a suspended
+  module, so both answers here are the ones this bridge gives any message with no
+  recorded position — none — and the text is the template's own. The frontier's
+  one consumer reads the text and treats a missing location as a message with no
+  frame (`libs/core/error.rs:841`), so the report a user sees is V8's wording;
+  the source line V8 prints underneath it is what is missing.
+- **A synthetic module asked for stalled awaits answers nothing, where V8
+  aborts.** `GetStalledTopLevelAwaitMessages` `ApiCheck`s that its receiver is a
+  source text module (`v8/src/api/api.cc:2622`) — a crash in a release build —
+  and a synthetic module's body is a host callback rather than a source graph, so
+  the walk here answers the empty list instead. `deno_core` asks only behind its
+  own `is_synthetic_module` guard (`evaluation.rs:343`), so the divergence is
+  unreachable from the frontier's host and recorded for the next one.
 
 ## 10. Build order
 
@@ -3131,9 +3238,10 @@ split) to 37, the module structure surface to 25, the synthetic-module surface t
 21, the callback scope's lifetime to 19, the compiled-module surface to 15, the
 streaming half to 12, the unbound scripts and the code cache to 6, the
 stack-trace frames to 4, the escapable handle scope to 3, the heap statistics to
-2, and what is left is the method
-surface (2 `E0599`s: the stalled `await` report and import-defer's evaluation
-entry point) — with no stragglers left at all.
+2, and the module-graph tail to **0** — the crate type-checks against this one,
+with no stragglers left at all. That metric is spent: what is left of (2) is no
+longer type errors but the runtime gaps a host would hit the moment one ran, and
+(3) is where they surface.
 The two that the suite had surveyed as needing engine work have landed since,
 `get_constructor_name` and `get_extras_binding_object`, and they turned out to
 need a walk of the prototype chain and a per-context object rather than V8's map
@@ -3143,9 +3251,10 @@ landed, the tag-shape column is closed — what remains is methods to write and 
 subsystems they name; and the shape's own tail is (a) the methods moving
 from `LocalHandle` onto the tags, file by file, then (b) deleting `LocalHandle`
 and its deref table, which is when the tier §9 states stops being a tier;
-(3) point the local `deno/` checkout at the crate and run a script — blocked on
-those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
-a host that must boot without a snapshot); (4) migrate, then
+(3) point the local `deno/` checkout at the crate and run a script — the type
+errors are gone, so what blocks it now is the runtime gaps this work found
+(`queueMicrotask`, and a host that must boot without a snapshot); (4) migrate,
+then delete.
 delete.
 
 ## 11. Working rules

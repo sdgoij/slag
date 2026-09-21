@@ -1,4 +1,5 @@
-//! The message a host makes from an exception (`v8::Message`).
+//! The message a host makes from an exception, or the engine makes about a
+//! stalled top-level await (`v8::Message`).
 //!
 //! Every answer here comes from the *error object* in the crate we stand in
 //! for: `Isolate::CreateMessage` reads a start position, an end position and the
@@ -7,6 +8,11 @@
 //! them. Slag's error objects carry no such properties, so the position comes
 //! from the bridge's own record ([`crate::position`], made where the error was
 //! thrown) and the text from the exception the message names.
+//!
+//! The exception is not the only source: a message minted for a stalled
+//! top-level await has no thrown value behind it, so its text is the template
+//! V8 fills in for it and its two position answers are the ones a message with
+//! no recorded position gives.
 //!
 //! Two deliberate gaps, both recorded in `.notes/embedding.md` §9:
 //!
@@ -26,9 +32,15 @@ use crux::value::ValueKind;
 use runtime::api;
 
 use crate::data::{Message, StackTrace, String, Value};
-use crate::handle::{Local, LocalHandle};
+use crate::handle::{Local, LocalHandle, Payload};
 use crate::position::Position;
 use crate::scope::PinScope;
+
+/// The rendering of the one message the bridge mints from a template rather
+/// than from a thrown value: V8's `kTopLevelAwaitStalled`
+/// (`v8/src/common/message-template.h:383`), whose text is this — it has no
+/// placeholder to fill.
+const TOP_LEVEL_AWAIT_STALLED: &str = "Top-level await promise never resolved";
 
 impl LocalHandle<'_, Message> {
     /// The message text (v8::Message::Get).
@@ -40,6 +52,9 @@ impl LocalHandle<'_, Message> {
     /// the exception (`MessageHandler::GetMessage`,
     /// `v8/src/execution/messages.cc:188`). This is that rendering.
     pub fn get<'a>(&self, scope: &PinScope<'a, '_>) -> Local<'a, String> {
+        if matches!(self.payload(), Payload::TemplateMessage { .. }) {
+            return Local::from_engine(api::Local::string(TOP_LEVEL_AWAIT_STALLED));
+        }
         Local::from_engine(api::Local::string(format!(
             "Uncaught {}",
             side_effect_free(scope, self.engine())

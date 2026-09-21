@@ -62,6 +62,14 @@ pub enum Payload {
         trace: api::Local,
         index: u32,
     },
+    /// A message the bridge minted from a fixed template rather than read off
+    /// a thrown value (`v8::Module::GetStalledTopLevelAwaitMessage`). V8 keeps
+    /// a message object per template, whose text is the template's; there is
+    /// nothing to hold but which template, and the module it reports on, which
+    /// is the identity two such messages compare by.
+    TemplateMessage {
+        module: api::Module,
+    },
 }
 
 impl Payload {
@@ -81,7 +89,8 @@ impl Payload {
             | Self::Script { .. }
             | Self::ModuleRequest { .. }
             | Self::ModuleRequests { .. }
-            | Self::StackFrame { .. } => None,
+            | Self::StackFrame { .. }
+            | Self::TemplateMessage { .. } => None,
         }
     }
 
@@ -150,6 +159,7 @@ impl fmt::Debug for Payload {
             }
             Self::ModuleRequests { module: _ } => f.write_str("Payload::ModuleRequests(..)"),
             Self::StackFrame { trace: _, index } => write!(f, "Payload::StackFrame({index})"),
+            Self::TemplateMessage { module: _ } => f.write_str("Payload::TemplateMessage(..)"),
         }
     }
 }
@@ -468,6 +478,7 @@ pub(crate) fn identity_hash(payload: &Payload) -> NonZeroI32 {
         | Payload::Script { .. }
         | Payload::ModuleRequest { .. }
         | Payload::ModuleRequests { .. }
+        | Payload::TemplateMessage { .. }
         | Payload::StackFrame { .. } => {
             panic!("bridge bug: a handle with no identity was hashed")
         }
@@ -536,6 +547,10 @@ fn payload_eq(left: &Payload, right: &Payload) -> bool {
                 generation: bg,
             },
         ) => a == b && ag == bg,
+        // The template a minted message came from is the same in both, so the
+        // module it reports on is what tells two of them apart — and V8 mints
+        // one message per stalled module, so it tells them apart the same way.
+        (Payload::TemplateMessage { module: a }, Payload::TemplateMessage { module: b }) => a == b,
         _ => false,
     }
 }
@@ -629,6 +644,9 @@ impl<T> Global<T> {
         let pin = match &payload {
             Payload::Value(value) => Some(crux::heap::pin(*value.value())),
             Payload::Module(module) => Some(module.pin()),
+            // A minted message names a module the same way a module handle
+            // does, so it is rooted the same way.
+            Payload::TemplateMessage { module } => Some(module.pin()),
             Payload::Context(_)
             | Payload::Script { .. }
             | Payload::ModuleRequest { .. }
@@ -657,7 +675,8 @@ impl<T> Global<T> {
             | Payload::Script { .. }
             | Payload::ModuleRequest { .. }
             | Payload::ModuleRequests { .. }
-            | Payload::StackFrame { .. } => false,
+            | Payload::StackFrame { .. }
+            | Payload::TemplateMessage { .. } => false,
         }
     }
 
@@ -743,6 +762,7 @@ impl<T> Clone for Global<T> {
             pin: match &self.payload {
                 Payload::Value(value) => Some(crux::heap::pin(*value.value())),
                 Payload::Module(module) => Some(module.pin()),
+                Payload::TemplateMessage { module } => Some(module.pin()),
                 Payload::Context(_)
                 | Payload::Script { .. }
                 | Payload::ModuleRequest { .. }
