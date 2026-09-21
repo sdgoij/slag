@@ -436,14 +436,14 @@ impl<'s> Local<'s, Proxy> {
     /// A revoked proxy has none. The crate we stand in for's wrapper aborts on
     /// the empty handle its own API answers there, so this aborts too, with the
     /// reason rather than a null dereference.
-    pub fn get_target(&self, _scope: &PinScope<'_, '_>) -> Local<'_, Value> {
+    pub fn get_target(&self, _scope: &PinScope<'s, '_>) -> Local<'s, Value> {
         self.slot(|slots| *slots.target.borrow())
             .unwrap_or_else(|| panic_proxy_slot("get_target"))
     }
 
     /// The proxy's handler (`v8::Proxy::GetHandler`), with the same answer for a
     /// revoked proxy as [`get_target`](Self::get_target).
-    pub fn get_handler(&self, _scope: &PinScope<'_, '_>) -> Local<'_, Value> {
+    pub fn get_handler(&self, _scope: &PinScope<'s, '_>) -> Local<'s, Value> {
         self.slot(|slots| *slots.handler.borrow())
             .unwrap_or_else(|| panic_proxy_slot("get_handler"))
     }
@@ -452,7 +452,7 @@ impl<'s> Local<'s, Proxy> {
     fn slot(
         &self,
         read: impl FnOnce(&crux::proxy::ProxySlots) -> Option<crux::value::Value>,
-    ) -> Option<Local<'_, Value>> {
+    ) -> Option<Local<'s, Value>> {
         let object = self.engine().value().as_object()?;
         let ObjectKind::Proxy(slots) = &object.kind else {
             return None;

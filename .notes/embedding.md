@@ -543,6 +543,7 @@ number is the certified one.
 | after the serializer (`ValueSerializer`/`ValueDeserializer`, the delegate and helper traits, this bridge's own wire format) | **8 names, and 617 type errors behind them** (see below) |
 | after the first method pass (the handle casts and `Local`'s cross-type equality, the value conversions and element predicates, the object/array/function/promise/proxy/string calls, `NewTryCatch` from a callback scope) | **374** (see below) |
 | after the `From`/`TryFrom` closure (the transitive casts, and the predicate a template cast needs) | **369** (see below) |
+| after the scope and property bounds (`NewTryCatch` from a `ContextScope`, `PropertyFilter: Default`, and the `Proxy` getters they were hiding) | **364** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -667,17 +668,19 @@ change what it does; `PromiseResolver::{resolve, reject}`; `Proxy::{get_target,
 get_handler}`; `SharedArrayBuffer::get_backing_store`;
 `String::to_rust_cow_lossy`.
 
-**What the remaining 369 are, measured.** **51** are `E0599`s on a `Local<…>` —
-the tail (private names, the module accessors, the templates, context embedder
-data, `PrimitiveArray`, `Message`, `create_code_cache`), each needing its own
-look at what the engine has. **34** are `E0599`s on another bridge type
-(`Global::open`, `Function::builder`, `Symbol::get_iterator`,
-`ArrayBuffer::new_backing_store_from_ptr`, …). **155** are the tag shape §9
-records as open (78 `E0599`s with a tag receiver, 77 of the 78 `E0308`s being
-`expected &Tag, found &Local<…>`). **8** are still names (the wasm tail). The
-`E0277` group is down to **5** — four `NewTryCatch` receivers and one
-`PropertyFilter: Default` — after the cast closure below; the other 12 in it were
-the `From`/`TryFrom` gap, which is now closed.
+**What the remaining 364 are, measured.** By error kind: **271** `E0599`s, **78**
+`E0308`s, **8** names, **3** `E0515`s, **2** `E0605`s and **1** `E0282`. The
+`E0599`s split by the receiver each message names: **51** on a `Local<…>`, **122**
+on a bare tag (`Value` 53, `String` 9, `Symbol` 9, `Function` 8, `ArrayBuffer` 6,
+`BigInt` 6, `PromiseResolver` 4, `PrimitiveArray` 4, `Private` 3, and one or two
+for each of the rest) — the shape §9 records as open, since the methods live on
+the tag there — **85** on another bridge type (`PinnedRef` 34, `Global` 27,
+`OwnedIsolate` 11, `ReturnValue` 8, `Exception` 3, and two single sites), and
+**13** where the method is there but a bound is not: `HashSet<Local<…>>` and
+`HashMap<Global<…>, …>` need `Hash` on a handle, which upstream has as an
+identity hash and this bridge does not. The `E0308`s are the other half of the
+tag shape's toll, and the `E0515`s are scope-lifetime sites like the one this
+step fixed. Not one of them is a name to declare.
 
 **The `From`/`TryFrom` closure — landed, and eleven casts deliberately absent.**
 The crate's cast tables are transitive closures, not direct-edge tables, so a
@@ -737,6 +740,48 @@ crate and workspace scope, and
 `cargo test --locked --workspace` **5,051 passed / 0 failed / 4 ignored** with
 the crashing test skipped (a re-run: the first run failed on the `runtime` flake
 below, which aborts cargo and so hides every later binary's count).
+
+**The scope and property bounds — landed, 369 → 364, and one error that had been
+hiding behind them.** Three things were missing, and the first needed a shape
+correction before it could be added at all:
+
+- **`NewTryCatch` had two receivers where the crate has five.** `deno_core`
+  opens its try-catch through its own `context_scope!` macro, so what it hands
+  `TryCatch::new` is a `&mut ScopeStorage<ContextScope<..>>`; the crate's
+  `TryCatch::new(param: &mut P)` reaches its `ContextScope` impl through
+  `ScopeStorage`'s `DerefMut`. That only works because the crate's
+  `ContextScope::new` returns the scope itself — this bridge wrapped it in
+  `ScopeStorage`, so `P` unified to `ScopeStorage<..>`, the `ContextScope` impl
+  was never reached, and the bound failed on the storage. So: `ContextScope::new`
+  now returns the scope (a context scope is not address-sensitive — it borrows the
+  scope it wraps — and the new doc comment says so), and the `ContextScope`
+  receiver was added. The crate's other two — an escapable handle scope and a
+  nested try-catch — stay absent until a host asks.
+- **`PropertyFilter: Default`** is `ALL_PROPERTIES`, written out rather than
+  derived, as there.
+- **`Proxy::get_target`/`get_handler`** returned `Local<'_>` elided to `&self`,
+  which is the receiver rule: a caller that reads a target inside an `if let`
+  then holds a result borrowed from the `proxy` binding (deno's
+  `libs/core/webidl.rs:706`). The crate takes the scope's lifetime; the two
+  getters and the `slot` behind them now do too.
+
+**Measured: five bounds out, one error in.** Putting the tree back the way it was
+before those changes leaves it at 369 with five `E0277`s; landing them removes
+exactly those five and reveals one `E0597` — the `Proxy` lifetime above, which the
+failing bound had been masking, the same effect that made the count jump when the
+last names resolved. Fixing that borrow is the fourth change, and only then is the
+count 364 with **no `E0277` left anywhere in the `deno_core` check**. `deno_core`'s
+own total goes 450 → 446.
+What is left, by kind and by count: **271 `E0599`** (51 on a `Local<…>`, 122 on
+a tag, 85 on another bridge type, 13 bound failures), **78 `E0308`** (the tag
+shape §9 records as open), **8 names** (the wasm tail and the three stragglers,
+one of them an `E0433` rather than an `E0425`), **3 `E0515`**, **2 `E0605`** and
+**1 `E0282`**.
+
+Gates for this step: `cargo test -p v8 --features simdutf` **119 passed / 0
+failed** (118 with the crashing test skipped), `clippy` clean at crate and
+workspace scope, and `cargo test --locked --workspace` **5,051 passed / 0 failed
+/ 4 ignored** across 38 binaries with that test skipped.
 
 **The documented `runtime` flake reproduced.**
 `builtins::function::tests::certified_body_global_read_fast_path_stays_spec_exact`
@@ -892,6 +937,14 @@ if that proves possible.
   payload test — it asks the entered realm's isolate whether that address is one
   of its templates — so a cast with no realm entered fails, which is the
   documented behaviour of every other table predicate in the bridge.
+- **A receiver the crate has and this bridge does not is a bound the host's call
+  site fails on, and the bridge grows it from demand.** `NewTryCatch` has three
+  receivers here and five there (`crates/v8/scope.rs`); the two absent ones — an
+  escapable handle scope and a nested try-catch — are absent because no host has
+  asked, and the compiler names the missing impl the moment one does. The
+  `ContextScope` receiver also needed `ContextScope::new` to hand back the scope
+  rather than its storage, which is what the crate does: a shape that looks
+  equivalent can decide whether an impl is reachable through `DerefMut` at all.
 - **The tag shape blocks a quarter of the remaining `deno_core` surface, and
   the decision is open.** `deno_core` calls methods on `&v8::Value` and
   `&v8::String` and transmutes between them (`libs/core/runtime/ops.rs:273`,
@@ -931,9 +984,11 @@ Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks
 (2) grow the surface from the items `deno_core` names, in call order — the name
 frontier is closed (8 left, the wasm tail) and the serializer is landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
-first pass through them took it to 374, the cast closure to 369, and what is left
-is the ~85 remaining call sites on `Local` and the other bridge types, the 155
-errors the tag shape in §9 blocks, the 5 `E0277`s beside them, and the wasm tail;
+first pass through them took it to 374, the cast closure to 369, the scope and
+property bounds to 364, and what is left is the method surface (271 `E0599`s:
+51 on a `Local<…>`, 122 on a tag, 85 on another bridge type, 13 missing `Hash`),
+the 78 `E0308`s the tag shape explains, the 8 names, and six stragglers
+(3 `E0515`, 2 `E0605`, 1 `E0282`);
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then

@@ -90,6 +90,16 @@ impl PropertyFilter {
     }
 }
 
+impl Default for PropertyFilter {
+    /// The default filter, which is no filter at all
+    /// (`v8::PropertyFilter`'s own `Default`). Spelled out rather than derived,
+    /// as there: `ALL_PROPERTIES` is the zero value, and naming it says what a
+    /// host is asking for.
+    fn default() -> Self {
+        Self::ALL_PROPERTIES
+    }
+}
+
 impl BitOr for PropertyFilter {
     type Output = Self;
 

@@ -351,11 +351,17 @@ impl<'borrow, 'scope, 'i> ContextScope<'borrow, 'scope, HandleScope<'i, Context>
     /// The scope handed back has `C = Context` regardless of the parent's `C`,
     /// which is what the crate we stand in for does: entering a context is
     /// exactly the upgrade that type parameter records.
-    #[allow(clippy::new_ret_no_self)]
+    ///
+    /// Handed back as the scope itself rather than through [`ScopeStorage`], as
+    /// there: a context scope is not address-sensitive, because it borrows the
+    /// scope it wraps instead of holding one, so a host keeps it by reference.
+    /// Storage here would make `&mut ContextScope::new(..)` a
+    /// `&mut ScopeStorage<..>`, which is not a receiver the crate's
+    /// `TryCatch::new` takes.
     pub fn new<C>(
         scope: &'borrow mut PinnedRef<'scope, HandleScope<'i, C>>,
         context: Local<'_, Context>,
-    ) -> ScopeStorage<Self>
+    ) -> Self
     where
         'scope: 'borrow,
     {
@@ -372,11 +378,11 @@ impl<'borrow, 'scope, 'i> ContextScope<'borrow, 'scope, HandleScope<'i, Context>
         // from, which outlives the scope.
         inner.isolate.set_current_context(inner.context);
         let previous = crate::realm::enter(realm);
-        ScopeStorage::new(Self {
+        Self {
             scope,
             previous,
             _pinned: PhantomPinned,
-        })
+        }
     }
 }
 
@@ -633,6 +639,22 @@ impl<'scope, 'obj: 'scope, 'i, C> NewTryCatch<'scope> for PinnedRef<'obj, Callba
             // A callback scope *is* a handle scope: the two `PinnedRef`s name
             // the same address, which is the bridge's own `Deref` between them.
             scope: cast_pinned_ref_mut(me),
+            catch: None,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
+impl<'scope, 'obj: 'scope, T: GetIsolate + ScopeInit> NewTryCatch<'scope>
+    for ContextScope<'_, 'obj, T>
+{
+    type NewScope = TryCatch<'scope, 'obj, T>;
+
+    fn make_new_scope(me: &'scope mut Self) -> Self::NewScope {
+        TryCatch {
+            // A context scope *is* a pinned reference to the scope it wraps —
+            // its own `Deref` — so the handler borrows that inner scope.
+            scope: me,
             catch: None,
             _pinned: PhantomPinned,
         }
