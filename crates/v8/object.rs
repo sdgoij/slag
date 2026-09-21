@@ -1,6 +1,7 @@
 //! Objects, arrays, and the keyed collections (`v8::Object`, `v8::Array`,
 //! `v8::Map`, `v8::Set`).
 
+use std::collections::HashSet;
 use std::num::NonZeroI32;
 
 use crux::handle::Handle;
@@ -13,7 +14,10 @@ use slag::objects::{ensure_deferred_namespace_evaluation, materialize_pending_pr
 
 use crate::data::{Array, Map, Name, Object, Private, Proxy, Set, Value};
 use crate::handle::Local;
-use crate::property::{GetPropertyNamesArgs, KeyConversionMode, PropertyAttribute, PropertyFilter};
+use crate::property::{
+    GetPropertyNamesArgs, IndexFilter, KeyCollectionMode, KeyConversionMode, PropertyAttribute,
+    PropertyFilter,
+};
 use crate::property_descriptor::PropertyDescriptor as V8PropertyDescriptor;
 use crate::scope::PinScope;
 
@@ -337,6 +341,10 @@ impl<'s> Local<'s, Object> {
     /// and two barriers are crossed first, because an enumeration observes keys
     /// a single-key lookup does not: a function's pending `prototype`, and a
     /// deferred module namespace, whose reading triggers its module.
+    ///
+    /// Own keys only, whatever `args`' mode says: that is what this call asks
+    /// for. [`get_property_names`](Self::get_property_names) is the one that
+    /// walks the chain.
     pub fn get_own_property_names<'a>(
         &self,
         scope: &PinScope<'a, '_>,
@@ -344,42 +352,40 @@ impl<'s> Local<'s, Object> {
     ) -> Option<Local<'a, Array>> {
         let value = *self.engine().value();
         let object = object_of(&value)?;
-        let realm = crate::realm_of(scope);
-        let keys = match realm.with_agent(|agent| {
-            materialize_pending_prototype_value(agent, &value)?;
-            ensure_deferred_namespace_evaluation(agent, &object)?;
-            object.own_property_keys()
-        }) {
-            Ok(keys) => keys,
-            Err(error) => {
-                crate::throw(scope, &error);
-                return None;
-            }
-        };
+        names_of_objects(scope, &value, &[object], args)
+    }
 
-        let filter = args.property_filter;
-        let mut names: Vec<Local<'_, Value>> = Vec::new();
-        for key in keys {
-            let skipped = match &key {
-                PropertyKey::Symbol(_) => filter.is_skip_symbols(),
-                PropertyKey::String(_) => filter.is_skip_strings(),
-            };
-            if skipped {
-                continue;
-            }
-            match key_passes_filter(&filter, &object, &key) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(error) => {
-                    crate::throw(scope, &error);
-                    return None;
-                }
-            }
-            if let Some(name) = key_name(&key, args.key_conversion) {
-                names.push(Local::from_engine(api::Local::from(name)));
+    /// The object's property names, including the prototype chain's when `args`
+    /// asks for them (`v8::Object::GetPropertyNames`).
+    pub fn get_property_names<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        args: GetPropertyNamesArgs,
+    ) -> Option<Local<'a, Array>> {
+        let value = *self.engine().value();
+        let object = object_of(&value)?;
+        let mut objects = vec![object];
+        if args.mode == KeyCollectionMode::IncludePrototypes {
+            let realm = crate::realm_of(scope);
+            let mut current: Local<'_, Object> = *self;
+            loop {
+                let prototype = match api::Object::get_prototype(&realm, current.engine()) {
+                    Ok(prototype) => prototype,
+                    Err(error) => {
+                        crate::throw(scope, &error);
+                        return None;
+                    }
+                };
+                // The chain ends where the crate's does: at the first value that
+                // is not an object, which is `null` for every ordinary chain.
+                let Some(next) = object_of(prototype.value()) else {
+                    break;
+                };
+                objects.push(next);
+                current = Local::from_engine(prototype);
             }
         }
-        Some(Array::new_with_elements(scope, &names))
+        names_of_objects(scope, &value, &objects, args)
     }
 }
 
@@ -400,6 +406,77 @@ fn property_key(name: &Local<'_, Name>) -> PropertyKey {
         ValueKind::Symbol(symbol) => PropertyKey::Symbol(symbol),
         _ => panic!("bridge bug: a Name handle that is neither string nor symbol"),
     }
+}
+
+/// The names `args` selects out of the own keys of `objects`, visited in order.
+///
+/// One object is the own-property call; a chain of them is what
+/// `GetPropertyNames` asks for. Which object answers for a key is the whole of
+/// the subtlety, and both rules are the crate we stand in for's:
+///
+/// - A key is reported where it is *first* seen, so an occurrence further along
+///   the chain contributes nothing.
+/// - A key the *attribute* filter rejects still counts as seen, which is what
+///   makes a non-enumerable own property hide an enumerable one further up. The
+///   kind filter (strings against symbols) and the index filter do not count,
+///   because the crate drops those before its shadowing bookkeeping — and with
+///   no key remembered there is nothing for the chain to shadow.
+fn names_of_objects<'a>(
+    scope: &PinScope<'a, '_>,
+    value: &EngineValue,
+    objects: &[Handle<JsObject>],
+    args: GetPropertyNamesArgs,
+) -> Option<Local<'a, Array>> {
+    let realm = crate::realm_of(scope);
+    let filter = args.property_filter;
+    let mut seen: HashSet<PropertyKey> = HashSet::new();
+    let mut names: Vec<Local<'a, Value>> = Vec::new();
+    for (visited, object) in objects.iter().enumerate() {
+        let keys = match realm.with_agent(|agent| {
+            if visited == 0 {
+                materialize_pending_prototype_value(agent, value)?;
+            }
+            ensure_deferred_namespace_evaluation(agent, object)?;
+            object.own_property_keys()
+        }) {
+            Ok(keys) => keys,
+            Err(error) => {
+                crate::throw(scope, &error);
+                return None;
+            }
+        };
+        for key in keys {
+            let kind_wanted = match &key {
+                PropertyKey::Symbol(_) => !filter.is_skip_symbols(),
+                PropertyKey::String(_) => !filter.is_skip_strings(),
+            };
+            if !kind_wanted {
+                continue;
+            }
+            if args.index_filter == IndexFilter::SkipIndices
+                && crux::object::array_index_of(&key).is_some()
+            {
+                continue;
+            }
+            // The key answers for itself from here on, whether or not the
+            // attribute filter keeps it.
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            match key_passes_filter(&filter, object, &key) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    crate::throw(scope, &error);
+                    return None;
+                }
+            }
+            if let Some(name) = key_name(&key, args.key_conversion) {
+                names.push(Local::from_engine(api::Local::from(name)));
+            }
+        }
+    }
+    Some(Array::new_with_elements(scope, &names))
 }
 
 /// Whether the key's own property survives the attribute half of the filter.
@@ -677,6 +754,104 @@ mod tests {
         (0..names.length())
             .map(|index| text_of(scope, names.get_index(scope, index).expect("name")))
             .collect()
+    }
+
+    /// As [`names_of`], through `GetPropertyNames`, which is the call that may
+    /// walk the prototype chain.
+    fn chained_names(
+        scope: &PinScope<'_, '_>,
+        object: &Local<'_, Object>,
+        args: GetPropertyNamesArgs,
+    ) -> Vec<std::string::String> {
+        let names = object.get_property_names(scope, args).expect("names");
+        (0..names.length())
+            .map(|index| text_of(scope, names.get_index(scope, index).expect("name")))
+            .collect()
+    }
+
+    /// The chain walk answers a key where it is first seen, and a key the filter
+    /// rejects on the nearer object hides the same key further up — which is the
+    /// difference between the two modes, and the difference between this and
+    /// `get_own_property_names`.
+    #[test]
+    fn property_names_walk_the_chain_only_when_asked() {
+        in_context!(scope, {
+            let object = Local::<Object>::try_from(eval(
+                scope,
+                "globalThis.proto = { inherited: 1, shadowed: 2 };\n\
+                 globalThis.child = Object.create(globalThis.proto);\n\
+                 Object.defineProperty(globalThis.child, 'shadowed', { value: 3, enumerable: false });\n\
+                 globalThis.child.own = 4; globalThis.child",
+            ))
+            .expect("object");
+
+            let own = GetPropertyNamesArgs {
+                mode: KeyCollectionMode::OwnOnly,
+                property_filter: PropertyFilter::ONLY_ENUMERABLE,
+                index_filter: IndexFilter::IncludeIndices,
+                key_conversion: KeyConversionMode::KeepNumbers,
+            };
+            assert_eq!(names_of(scope, &object, own), vec!["own".to_string()]);
+
+            let chain = GetPropertyNamesArgs {
+                mode: KeyCollectionMode::IncludePrototypes,
+                property_filter: PropertyFilter::ONLY_ENUMERABLE,
+                index_filter: IndexFilter::IncludeIndices,
+                key_conversion: KeyConversionMode::KeepNumbers,
+            };
+            assert_eq!(
+                chained_names(scope, &object, chain),
+                vec!["own".to_string(), "inherited".to_string()],
+                "the chain's keys follow the object's, and the non-enumerable own \
+                 `shadowed` keeps the inherited one out"
+            );
+
+            // The own-only call is the own-only call, whatever the mode says.
+            let chain_again = GetPropertyNamesArgs {
+                mode: KeyCollectionMode::IncludePrototypes,
+                property_filter: PropertyFilter::ONLY_ENUMERABLE,
+                index_filter: IndexFilter::IncludeIndices,
+                key_conversion: KeyConversionMode::KeepNumbers,
+            };
+            assert_eq!(
+                names_of(scope, &object, chain_again),
+                vec!["own".to_string()],
+                "`get_own_property_names` does not walk the chain"
+            );
+        });
+    }
+
+    /// The index filter drops integer-like keys and keeps everything else, which
+    /// is the spelling the host this stands in for asks for when it names an
+    /// object's properties for a serializer.
+    #[test]
+    fn the_index_filter_drops_indices_only() {
+        in_context!(scope, {
+            let object = Local::<Object>::try_from(eval(
+                scope,
+                "globalThis.o = { 0: 'a', 2: 'b', name: 'c' }; globalThis.o",
+            ))
+            .expect("object");
+
+            let with = GetPropertyNamesArgs {
+                mode: KeyCollectionMode::OwnOnly,
+                property_filter: PropertyFilter::ONLY_ENUMERABLE,
+                index_filter: IndexFilter::IncludeIndices,
+                key_conversion: KeyConversionMode::KeepNumbers,
+            };
+            assert_eq!(
+                names_of(scope, &object, with),
+                vec!["0".to_string(), "2".to_string(), "name".to_string()]
+            );
+
+            let without = GetPropertyNamesArgs {
+                mode: KeyCollectionMode::OwnOnly,
+                property_filter: PropertyFilter::ONLY_ENUMERABLE,
+                index_filter: IndexFilter::SkipIndices,
+                key_conversion: KeyConversionMode::KeepNumbers,
+            };
+            assert_eq!(names_of(scope, &object, without), vec!["name".to_string()]);
+        });
     }
 
     /// An object's names come out in the engine's key order, spelled the way

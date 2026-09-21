@@ -3,6 +3,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroI32;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crux::value::ValueKind;
@@ -527,6 +528,45 @@ impl<T> Global<T> {
         Local::from_payload(self.payload)
     }
 
+    /// The payload by value, for a caller holding a longer lifetime than this
+    /// handle: a `Local` is a payload plus a lifetime, so this is what the scope
+    /// types rebuild into a handle of their own.
+    pub(crate) fn payload_value(&self) -> Payload {
+        self.payload
+    }
+
+    /// Consume this handle and hand out a raw pointer to it
+    /// (`v8::Global::into_raw`).
+    ///
+    /// The pointer owns the handle: it has to come back through
+    /// [`from_raw`](Self::from_raw), or what was rooted stays rooted. That is the
+    /// crate we stand in for's contract too, where the V8-side slot stays pinned
+    /// until it is taken back; here the handle is one boxed value in host memory,
+    /// so "not taken back" is one leaked box rather than a pin the collector
+    /// must hold.
+    pub fn into_raw(self) -> NonNull<T> {
+        // SAFETY: `Box::into_raw` never hands back a null pointer.
+        unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(self))) }.cast::<T>()
+    }
+
+    /// Take back a handle handed out by [`into_raw`](Self::into_raw)
+    /// (`v8::Global::from_raw`).
+    ///
+    /// The isolate is not read: the crate needs it to re-establish the handle's
+    /// liveness against the isolate, and a handle here carries its own pin.
+    ///
+    /// # Safety
+    ///
+    /// `data` must come from `into_raw` on a `Global<T>` and be taken back
+    /// exactly once — taking it back twice, or reading through it in between,
+    /// is what the contract forbids.
+    pub unsafe fn from_raw(isolate: &mut crate::Isolate, data: NonNull<T>) -> Self {
+        let _ = isolate;
+        // SAFETY: the caller's contract: this is the box `into_raw` leaked, and
+        // taking it back here is what gives the handle an owner again.
+        unsafe { *Box::from_raw(data.as_ptr().cast::<Global<T>>()) }
+    }
+
     pub fn reset(&mut self) {
         *self = Self::from_payload(Payload::Value(api::Local::undefined()));
     }
@@ -646,6 +686,29 @@ mod tests {
             let empty: Global<Value> = Global::empty();
             assert!(empty.is_empty());
             assert!(empty.open(scope).is_undefined());
+        });
+    }
+
+    /// The raw-pointer trip the host this stands in for makes: a persistent
+    /// handle is handed out as a pointer, kept somewhere with no scope in reach,
+    /// and taken back. The value is still the one it named in between.
+    #[test]
+    fn a_persistent_handle_survives_a_trip_through_a_raw_pointer() {
+        in_context!(scope, {
+            let isolate = scope.get_isolate_ptr();
+            let value = eval(scope, "[1, 2, 3]");
+            let persistent = Global::new(&isolate, value);
+
+            let raw = persistent.into_raw();
+            let mut isolate = isolate;
+            // SAFETY: `raw` is the pointer `into_raw` handed out just above, and
+            // it is taken back here — once.
+            let back = unsafe { Global::<Value>::from_raw(&mut isolate, raw) };
+
+            let opened = back.get(scope);
+            crate::test_support::bind(scope, "arr", opened);
+            assert_eq!(crate::test_support::eval_number(scope, "arr.length"), 3.0);
+            assert_eq!(crate::test_support::eval_number(scope, "arr[2]"), 3.0);
         });
     }
 }

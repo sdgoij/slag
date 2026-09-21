@@ -92,6 +92,30 @@ impl<'s> Local<'s, Promise> {
         on_fulfilled: Local<'_, Function>,
         on_rejected: Local<'_, Function>,
     ) -> Option<Local<'a, Promise>> {
+        self.then_with(scope, Some(on_fulfilled), Some(on_rejected))
+    }
+
+    /// `promise.catch(on_rejected)` (v8::Promise::Catch).
+    ///
+    /// The fulfilling side is *undefined*, which is what the crate we stand in
+    /// for passes V8 — a promise that fulfils runs no handler of its own through
+    /// this call, so its result passes through.
+    pub fn catch<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        on_rejected: Local<'_, Function>,
+    ) -> Option<Local<'a, Promise>> {
+        self.then_with(scope, None, Some(on_rejected))
+    }
+
+    /// The engine's PerformPromiseThen with either side optional, which is how
+    /// the engine takes it: a side the host did not give is *undefined*.
+    fn then_with<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        on_fulfilled: Option<Local<'_, Function>>,
+        on_rejected: Option<Local<'_, Function>>,
+    ) -> Option<Local<'a, Promise>> {
         let realm = crate::realm_of(scope);
         let promise = *self.engine().value();
         let constructor = realm.intrinsic("%Promise%")?;
@@ -108,8 +132,8 @@ impl<'s> Local<'s, Promise> {
             runtime::promise::perform_promise_then(
                 agent,
                 &promise,
-                Some(on_fulfilled.into_engine().into_value()),
-                Some(on_rejected.into_engine().into_value()),
+                on_fulfilled.map(|handler| handler.into_engine().into_value()),
+                on_rejected.map(|handler| handler.into_engine().into_value()),
                 Some(capability),
             )
         });
@@ -312,7 +336,7 @@ impl<'s> Local<'s, PromiseResolver> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::Number;
+    use crate::data::{Function, Number};
     use crate::test_support::{eval, in_context};
 
     /// The number a promise settled with.
@@ -338,6 +362,38 @@ mod tests {
             assert_eq!(settled_number(scope, promise), 7.0);
 
             assert_eq!(resolver.resolve(scope, seven), Some(false));
+        });
+    }
+
+    /// `catch` sends a rejection to its handler. The fulfilling side is
+    /// *undefined* there, so a rejection is the only way the handler can run —
+    /// which is what tells this apart from `then2` with a fulfilling handler.
+    #[test]
+    fn catch_runs_the_rejection_handler() {
+        in_context!(scope, {
+            scope.set_microtasks_policy(crate::MicrotasksPolicy::Explicit);
+
+            let promise = eval(scope, "Promise.reject(new Error('boom'))");
+            let promise = Local::<Promise>::try_from(promise).expect("promise");
+            let handler = eval(scope, "(function () { globalThis.caught = 7; })");
+            let handler = Local::<Function>::try_from(handler).expect("function");
+
+            assert!(promise.catch(scope, handler).is_some());
+            assert_eq!(
+                crate::test_support::eval_number(
+                    scope,
+                    "globalThis.caught === undefined ? -1 : globalThis.caught"
+                ),
+                -1.0,
+                "nothing runs a queued reaction until a checkpoint"
+            );
+
+            scope.perform_microtask_checkpoint();
+            assert_eq!(
+                crate::test_support::eval_number(scope, "globalThis.caught"),
+                7.0,
+                "the rejection reached the handler"
+            );
         });
     }
 

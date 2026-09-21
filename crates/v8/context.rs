@@ -64,6 +64,17 @@ impl<'s> Local<'s, Context> {
         self.slots_isolate().context_slot(self.identity(), index) as *mut c_void
     }
 
+    /// Forget every slot written on this context
+    /// (`v8::Context::ClearAllSlots`).
+    ///
+    /// The crate clears the *values* it keeps for the context, including its own
+    /// bookkeeping; the slots here are the host's pointers, so this forgets the
+    /// pointers and the host keeps what they point at — which is the same
+    /// contract, one side of it written down.
+    pub fn clear_all_slots(&self) {
+        self.slots_isolate().clear_context_slots(self.identity());
+    }
+
     /// The isolate the slots live on.
     fn slots_isolate(&self) -> crate::Isolate {
         // SAFETY: a context lives in the agent of a live isolate, and the engine
@@ -109,6 +120,27 @@ mod tests {
             context.set_aligned_pointer_in_embedder_data(4, other);
             assert_eq!(context.get_aligned_pointer_from_embedder_data(3), pointer);
             assert_eq!(context.get_aligned_pointer_from_embedder_data(4), other);
+        });
+    }
+
+    /// Clearing the slots forgets every index on this context, and nothing else.
+    #[test]
+    fn clearing_the_slots_forgets_what_was_written() {
+        in_context!(scope, {
+            let context = scope.get_current_context();
+            let pointer = 0x1234usize as *mut c_void;
+            context.set_aligned_pointer_in_embedder_data(1, pointer);
+            context.set_aligned_pointer_in_embedder_data(2, pointer);
+            assert_eq!(context.get_aligned_pointer_from_embedder_data(1), pointer);
+
+            context.clear_all_slots();
+            assert!(context.get_aligned_pointer_from_embedder_data(1).is_null());
+            assert!(context.get_aligned_pointer_from_embedder_data(2).is_null());
+
+            // And a write after the clear lands where it should, so the map is
+            // still usable rather than merely emptied.
+            context.set_aligned_pointer_in_embedder_data(2, pointer);
+            assert_eq!(context.get_aligned_pointer_from_embedder_data(2), pointer);
         });
     }
 }

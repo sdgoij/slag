@@ -184,6 +184,28 @@ impl String {
         Some(Self::from_code_units(&units))
     }
 
+    /// The empty string (`v8::String::Empty`).
+    ///
+    /// Infallible, as there: the engine always has one, so there is nothing for
+    /// a host to handle.
+    pub fn empty<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, String> {
+        Self::from_code_units(&[])
+    }
+
+    /// A string over a one-byte const (`v8::String::NewExternalOneByteConst`).
+    ///
+    /// The crate's version makes a string that *references* the const's bytes
+    /// and caches the handle inside it, which is why its `OneByteConst` carries
+    /// a cache slot; here the bytes are read into the engine's own string and
+    /// the const stays a compile-time buffer. Same text, one copy, nothing kept
+    /// alive on the const's behalf.
+    pub fn new_from_onebyte_const<'s>(
+        scope: &PinScope<'s, '_, ()>,
+        onebyte_const: &'static OneByteConst,
+    ) -> Option<Local<'s, String>> {
+        Self::new_external_onebyte_static(scope, onebyte_const.as_ref())
+    }
+
     /// A new string from UTF-8 bytes (`v8::String::NewFromUtf8`).
     pub fn new_from_utf8<'s>(
         _scope: &PinScope<'s, '_, ()>,
@@ -817,6 +839,25 @@ mod tests {
                 eval_number(scope, "instanceKey === Symbol.hasInstance ? 1 : 0"),
                 1.0
             );
+        });
+    }
+
+    /// The empty string and a one-byte const are the text script sees — the
+    /// const's bytes read one code unit per byte, as they are there.
+    #[test]
+    fn strings_from_the_static_side_are_the_ones_script_sees() {
+        in_context!(scope, {
+            let empty = String::empty(scope);
+            bind(scope, "empty", empty.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "empty === '' && empty.length === 0 ? 1 : 0"),
+                1.0
+            );
+
+            static NAME: OneByteConst = String::create_external_onebyte_const(b"deno.core");
+            let text = String::new_from_onebyte_const(scope, &NAME).expect("string");
+            bind(scope, "text", text.cast::<Value>());
+            assert_eq!(eval_number(scope, "text === 'deno.core' ? 1 : 0"), 1.0);
         });
     }
 

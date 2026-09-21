@@ -552,6 +552,7 @@ number is the certified one.
 | after the isolate-level callback vocabulary (the promise-reject, prepare-stack-trace, `import.meta`, dynamic-import, phase-import and wasm-async-resolve callbacks, the near-heap-limit pair, `set_idle`, `set_bool`, `set_promise_hooks`, and `AsMut<Isolate>`) | **242** (see below) |
 | after the symbol surface (`Symbol::for_key` and the eleven well-known accessors) | **233** (see below) |
 | after the primitive array (`PrimitiveArray::new`/`length`/`set`/`get`) and the two typed integer accessors it surfaced (`Uint32::value`, `Int32::value`) | **225** (see below) |
+| after the leftovers (the empty string and a one-byte const, `clear_all_slots`, `Promise::catch`, `get_property_names`, `has_pending_background_tasks`, and the `Global` raw-pointer pair) plus the continuation-value move it forced | **217** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -955,6 +956,63 @@ clean at crate and workspace scope, and `cargo test --locked --workspace`
 `crates/v8` only, so no sweep is implicated. All three new tests were made to
 fail: dropping the requested length, no-opping `set`, and truncating the `u32`
 read each fail the assertion guarding it.
+
+**The leftovers — landed, 225 → 217, and two corrections behind them.** Eight small
+accessors with no subsystem behind them: `String::empty`,
+`String::new_from_onebyte_const`, `Context::clear_all_slots`, `Promise::catch`,
+`Object::get_property_names`, `Isolate::has_pending_background_tasks`, and the
+`Global::into_raw`/`from_raw` pair. Three carry a decision worth reading:
+
+- **`get_property_names` made the shared key walk honest.** Both enumeration calls
+  now run one walk over a *list* of objects, because the difference between them
+  is which objects are visited. Two rules came with it, read off V8's
+  `KeyAccumulator` rather than guessed: a key is reported where it is *first*
+  seen, and a key the *attribute* filter rejects still counts as seen — which is
+  what makes a non-enumerable own property hide an enumerable one up the chain.
+  The kind and index filters do not count, because V8 drops those before its
+  shadowing bookkeeping. The `index_filter` had been **ignored entirely**: the
+  host's serializer asks for `SkipIndices` and was getting the indices back.
+- **`Global::into_raw`/`from_raw` is ownership through a pointer.** The box
+  `into_raw` leaks is what `from_raw` takes back, and a handle left out leaks
+  rather than pinning anything — the crate's contract with a different noun for
+  the resource. The isolate argument is unread here, and says so.
+- **`has_pending_background_tasks` answers `false`**: a background task is work
+  posted to another thread and this engine posts none (§9's platform decision,
+  seen from the isolate). The test sits next to a *queued job* so the assertion
+  states the distinction rather than just the constant.
+
+Two corrections the step forced, both from the host reaching code the errors had
+been hiding:
+
+- **The continuation-preserved value belongs on the scope.** The bridge had
+  `set`/`get_continuation_preserved_embedder_data` on the isolate; the crate has
+  them on the handle scope, and the difference is a borrow error at the host:
+  `let cped = scope.get_...()` followed by `tc_scope!(let t, scope)` cannot
+  borrow-check when the handle is tied to the borrow of the scope instead of the
+  scope's own lifetime. The pair moved; the isolate still stores the value, and
+  the new test holds it across a `&mut` use of the same scope.
+- **Two `E0502`s appeared and left.** They were *behind* `Promise::catch` in the
+  same function, so the borrow check only ran once that method resolved — the same
+  masking §7 records for name resolution, one layer down.
+
+Three items were surveyed and left, each needing something the engine does not
+have: `Object::get_constructor_name` (V8 answers from its *map* —
+`new_target_is_base`, `is_prototype_map`, the map's constructor slot,
+`FunctionTemplateInfo::class_name` — with `Symbol.toStringTag` as a fallback, so a
+walk over properties would answer a different string for exactly the objects a
+host shows it), `Context::get_extras_binding_object` (the host reads `console` out
+of it, so an empty object would be a wrong answer rather than a missing one), and
+`Isolate::get_heap_statistics` (the engine counts boxes, not bytes).
+
+Gates: `cargo test -p v8 --features simdutf` **148 passed / 0 failed**, `clippy`
+clean at crate and workspace scope, and `cargo test --locked --workspace`
+**5,080 passed / 0 failed / 4 ignored** with the crashing `v8` test skipped.
+`crates/v8` only, so no sweep is implicated. Every new test but one was made to
+fail: swapping `catch`'s handler to the fulfilling side, ignoring the collection
+mode, inverting the index filter, and stubbing `from_raw` each fail the assertion
+that guards them. The exception is the continuation-value test, whose content *is*
+the borrow shape: it fails to compile if the handle goes back to borrowing its
+scope.
 
 **The method tail — landed, 336 → 292, one real bug found, and a pointer shape
 corrected.** Forty-three sites were methods a host calls by name that the bridge
@@ -1377,6 +1435,21 @@ if that proves possible.
   *undefined* rather than uninitialized, which a host cannot tell apart either
   way, and the value is never a property of anything, so the walks that could see
   it do not.
+- **A key walk's object list is the whole difference between the two enumeration
+  calls, and a filter's two halves behave differently.** `get_property_names` and
+  `get_own_property_names` share one walk over a list of objects, because the
+  difference between them is which objects are in that list. The index filter had
+  been ignored by both — a host asking for `SkipIndices` got the indices back —
+  and the shadowing rules came from V8's `KeyAccumulator`: a key the *attribute*
+  filter rejects still hides the same key further up the chain, while a key
+  dropped by the kind or index filter does not.
+- **A receiver the crate puts on the scope is a borrow-shape decision, not a
+  naming one.** The continuation-preserved value was a method on the bridge's
+  isolate where the crate keeps it on the handle scope, and the cost was paid in
+  the *host*: a handle tied to the borrow of a scope cannot outlive a `&mut` use
+  of that scope, which is precisely the sequence a suspension performs. The pair
+  moved onto the scope (the isolate still stores the value) and the getter hands
+  back a handle carrying the scope's lifetime.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
@@ -1403,11 +1476,15 @@ first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
 347, private names to 336, the method tail to 292, scheduling and exception
 control to 260, the isolate-level callback vocabulary to 242, the symbol surface
-to 233, the primitive array to 225, and what is left is the method surface (138
-`E0599`s: 72 where a value handle is the receiver — the tag shape — 37 on a
-`Local<…>`, 25 associated items on a tag, 4 on another bridge type), the 78
-`E0308`s the tag shape explains, the 4 names, and four stragglers (3 `E0515`, 1
-`E0282`);
+to 233, the primitive array to 225, the leftovers to 217, and what is left is the
+method surface (130 `E0599`s: 72 where a value handle is the receiver — the tag
+shape — 34 on a `Local<…>`, 20 associated items on a tag, 4 on another bridge
+type), the 78 `E0308`s the tag shape explains, the 4 names, and four stragglers
+(3 `E0515`, 1 `E0282`). Three surveyed-and-left items sit outside those counts'
+reach — `get_constructor_name` (needs V8's map), `get_extras_binding_object`
+(needs an engine-side extras object) and `get_heap_statistics` (needs byte
+accounting in `crux::heap`) — and everything else needs the tag shape or an
+engine capability;
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then

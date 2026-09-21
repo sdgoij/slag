@@ -188,6 +188,30 @@ impl<'p, 'i> PinnedRef<'p, HandleScope<'i, Context>> {
         Local::from_payload(crate::handle::Payload::Context(self.realm()))
     }
 
+    /// Store the host's value that survives a suspension
+    /// (`v8::HandleScope::SetContinuationPreservedEmbedderData`).
+    ///
+    /// The receiver is the scope, as it is in the crate we stand in for: the
+    /// value is read back mid-suspension, where a host has a scope rather than
+    /// the isolate it came from. The isolate keeps it.
+    pub fn set_continuation_preserved_embedder_data(&self, data: Local<Value>) {
+        let mut isolate = self.0.isolate;
+        isolate.set_continuation_data(data);
+    }
+
+    /// The value [`set_continuation_preserved_embedder_data`] stored, or
+    /// *undefined* (`v8::HandleScope::GetContinuationPreservedEmbedderData`).
+    ///
+    /// The handle carries the *scope's* lifetime rather than the borrow of it,
+    /// as there: a host holds this value across the scope manipulations a
+    /// suspension goes through, and a handle tied to a borrow could not survive
+    /// one.
+    ///
+    /// [`set_continuation_preserved_embedder_data`]: Self::set_continuation_preserved_embedder_data
+    pub fn get_continuation_preserved_embedder_data(&self) -> Local<'p, Value> {
+        Local::from_payload(self.0.isolate.continuation_data_payload())
+    }
+
     /// The hooks the engine would run around a promise's settlement
     /// (v8::HandleScope::SetPromiseHooks).
     ///
@@ -1007,6 +1031,27 @@ macro_rules! escapable_handle_scope {
 #[cfg(test)]
 mod tests {
     use crate::DataError;
+
+    /// The continuation-preserved value is held across the scope manipulations a
+    /// suspension goes through: the handle carries the scope's lifetime, not a
+    /// borrow of it, so a host can keep reading the value while the scope is
+    /// mutated underneath. That shape is the whole of what the host this stands
+    /// in for needs it for, and getting it wrong is a borrow error there rather
+    /// than a wrong answer here.
+    #[test]
+    fn the_continuation_value_survives_a_mutation_of_its_scope() {
+        crate::test_support::in_context!(scope, {
+            let value = crate::test_support::eval(scope, "40 + 2");
+            scope.set_continuation_preserved_embedder_data(value);
+            let held = scope.get_continuation_preserved_embedder_data();
+
+            // A `&mut` use of the same scope, with `held` still live.
+            scope.set_microtasks_policy(crate::MicrotasksPolicy::Explicit);
+
+            crate::test_support::bind(scope, "cped", held);
+            assert_eq!(crate::test_support::eval_number(scope, "cped"), 42.0);
+        });
+    }
 
     /// Run a script that throws, leaving its exception pending.
     fn throw_a_test_error(scope: &crate::scope::PinScope<'_, '_>) {

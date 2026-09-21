@@ -14,7 +14,7 @@ use runtime::api;
 
 use crate::cppgc::Heap;
 use crate::data::{Array, Context, Data, FixedArray, Promise, PromiseResolver, Value};
-use crate::handle::{Global, Local};
+use crate::handle::{Global, Local, Payload};
 use crate::promise::{PromiseRejectEvent, PromiseRejectMessage};
 use crate::scope::PinScope;
 use crate::snapshot::{FunctionCodeHandling, SnapshotCreator, StartupData};
@@ -520,20 +520,26 @@ impl Isolate {
         Some(&self.inner().cpp_heap)
     }
 
-    /// The host's value that survives a suspension
-    /// (`v8::Isolate::SetContinuationPreservedEmbedderData`).
-    pub fn set_continuation_preserved_embedder_data(&mut self, data: Local<Value>) {
+    /// Keep the value a scope's `SetContinuationPreservedEmbedderData` stores.
+    ///
+    /// The receiver is the *scope* there, as it is for the getter below: the
+    /// value survives a suspension, and the scope is what a host has in hand
+    /// while one is in flight.
+    pub(crate) fn set_continuation_data(&mut self, data: Local<Value>) {
         self.inner_mut().continuation_data = Some(Global::new(self, data));
     }
 
-    /// The value [`set_continuation_preserved_embedder_data`] kept, or
-    /// `undefined` (`v8::Isolate::GetContinuationPreservedEmbedderData`).
+    /// The payload a scope turns into its own-lifetime handle for
+    /// `GetContinuationPreservedEmbedderData`, *undefined* when nothing was
+    /// stored.
     ///
-    /// [`set_continuation_preserved_embedder_data`]: Self::set_continuation_preserved_embedder_data
-    pub fn get_continuation_preserved_embedder_data(&self) -> Local<'_, Value> {
-        self.inner().continuation_data.as_ref().map_or_else(
-            || Local::from_engine(api::Local::undefined()),
-            Global::handle,
+    /// A payload rather than a handle: the crate ties the answer to the scope's
+    /// lifetime, so the scope rebuilds the handle and this only names what it
+    /// holds.
+    pub(crate) fn continuation_data_payload(&self) -> Payload {
+        self.inner().continuation_data.as_ref().map_or(
+            Payload::Value(api::Local::undefined()),
+            Global::payload_value,
         )
     }
 
@@ -745,6 +751,15 @@ impl Isolate {
             .unwrap_or(0)
     }
 
+    /// Forget every slot written for one context
+    /// (`v8::Context::ClearAllSlots`), leaving other contexts' slots alone.
+    pub(crate) fn clear_context_slots(&self, context: u64) {
+        self.inner()
+            .context_slots
+            .borrow_mut()
+            .retain(|(owner, _), _| *owner != context);
+    }
+
     /// The private name that goes with `description`, minting and keeping one
     /// the first time it is asked for (`v8::Private::ForApi`).
     ///
@@ -806,6 +821,19 @@ impl Isolate {
             .borrow()
             .iter()
             .any(|template| Rc::as_ptr(template) as *mut c_void == pointer)
+    }
+
+    /// Whether the isolate has background work pending
+    /// (v8::Isolate::HasPendingBackgroundTasks).
+    ///
+    /// `false`, and honestly so: a background task is work the isolate posted to
+    /// another thread, and this engine posts none — [`Platform`](crate::Platform)
+    /// is the shape for that same gap. Work the host could *make progress on* is
+    /// a different question, and the job queues answer it: those are drained by
+    /// [`run_microtasks`](Self::run_microtasks), and a queued job is not a
+    /// background task.
+    pub fn has_pending_background_tasks(&self) -> bool {
+        false
     }
 
     /// Tells the engine to capture a stack trace when an exception goes
@@ -1228,6 +1256,32 @@ mod tests {
             let hook = Local::<crate::data::Function>::try_from(hook).expect("a function");
             scope.set_promise_hooks(Some(hook), Some(hook), Some(hook), Some(hook));
             assert_eq!(crate::test_support::eval_number(scope, "1 + 1"), 2.0);
+        });
+    }
+
+    /// Nothing is ever pending in the background, and that is not the same
+    /// statement as "nothing is pending": the job below is pending, and running
+    /// it is what this assertion sits next to.
+    #[test]
+    fn nothing_is_pending_in_the_background() {
+        crate::test_support::in_context!(scope, {
+            scope.set_microtasks_policy(crate::MicrotasksPolicy::Explicit);
+            crate::test_support::eval(
+                scope,
+                "Promise.resolve().then(function () { globalThis.ran = 7; })",
+            );
+            assert!(
+                !scope.has_pending_background_tasks(),
+                "a queued job is drained by a checkpoint, not by another thread"
+            );
+
+            scope.perform_microtask_checkpoint();
+            assert_eq!(
+                crate::test_support::eval_number(scope, "globalThis.ran"),
+                7.0,
+                "work really was pending, and the checkpoint is what ran it"
+            );
+            assert!(!scope.has_pending_background_tasks());
         });
     }
 
