@@ -218,7 +218,10 @@ fn typed_array_out_of_bounds(agent: &Agent, slots: &TypedArraySlots) -> bool {
 /// whose byte range exceeds the buffer, or an auto view whose byte offset
 /// exceeds the buffer. Callers that need the detached half of the check
 /// combine it with `slots.buffer.is_detached()`.
-pub(crate) fn view_out_of_bounds(slots: &TypedArraySlots) -> bool {
+///
+/// Host-facing: a host reporting a view's geometry needs the same verdict a
+/// view's element access does.
+pub fn view_out_of_bounds(slots: &TypedArraySlots) -> bool {
     if slots.auto_length {
         slots.byte_offset > slots.buffer.byte_length()
     } else {
@@ -849,7 +852,13 @@ fn copy_typed_array(
 
 /// TypedArray(buffer [, byteOffset [, length]]) (spec 25.2.2.1 step 5.b):
 /// view a byte range of the buffer.
-fn typed_array_buffer_path(
+///
+/// `args` are the constructor's remaining arguments: the byte offset, then the
+/// length in elements, where an absent or `undefined` length means the view
+/// covers the rest of the buffer. Host-facing: this is what a
+/// `v8::Uint8Array::new` should do, so that a host builds views the way the
+/// constructor does instead of keeping its own copy of the rules.
+pub fn typed_array_buffer_path(
     agent: &mut Agent,
     prototype: Handle<JsObject>,
     element_type: ElementType,

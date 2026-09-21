@@ -19,6 +19,8 @@ pub use runtime::dump;
 pub use runtime::embed::{Context, FunctionCall, HostCallbacks, HostFn, JsObject, JsValue};
 pub use runtime::embed::{OutputFn, RandomFn};
 
+pub mod buffers;
+
 /// Re-export the WebAssembly engine, so an embedder can drive a module from
 /// Rust (`Store`/`Instance`/`Memory`/`Value`) instead of through the JS API.
 #[cfg(feature = "wasm")]

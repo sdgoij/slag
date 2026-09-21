@@ -254,7 +254,10 @@ fn allocate_shared_array_buffer(
 /// must be guarded by `IsDetachedBuffer`; the crux `SharedBuffer` carries
 /// the same flag so Integer-Indexed access from the object model rejects
 /// views too.
-pub(crate) fn detach_array_buffer(agent: &mut Agent, id: u64) {
+///
+/// Host-facing: the only place a detach happens, and so the one a
+/// `v8::ArrayBuffer::detach` should go through.
+pub fn detach_array_buffer(agent: &mut Agent, id: u64) {
     if let Some(cell) = agent.buffer_data.get(&id) {
         let mut state = cell.borrow_mut();
         state.shared.mark_detached();
