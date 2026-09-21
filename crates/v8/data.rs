@@ -280,6 +280,16 @@ impl TagCheck for Module {
     }
 }
 
+/// One of a module's requests, which is not a language value here either —
+/// see `Payload::ModuleRequest`. The check is the payload's own rather than a
+/// shape test, so a cast that was not built by `Module::get_module_requests`
+/// fails rather than accepting any array that happens to look like one.
+impl TagCheck for ModuleRequest {
+    fn check(payload: &Payload) -> bool {
+        matches!(payload, Payload::ModuleRequest { .. })
+    }
+}
+
 macro_rules! tag_checks {
     ($($tag:ident => $check:path),* $(,)?) => {
         $(
@@ -888,6 +898,7 @@ macro_rules! impl_try_from {
 impl_try_from! {
     Data => Context,
     Data => Module,
+    Data => ModuleRequest,
     Data => Private,
     Data => Value,
     Data => Primitive,

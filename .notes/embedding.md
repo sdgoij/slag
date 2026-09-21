@@ -561,6 +561,7 @@ number is the certified one.
 | after the static half of the template cluster (`FunctionTemplate::{set, inherit}`, the per-realm materialization memo, and `set_internal_field_count`) | **49** (see below) |
 | after the three stragglers a `Context` and an `Object` answer (`get_constructor_name`, `get_extras_binding_object`, `Context::from_snapshot`) | **44** (see below) |
 | after the message surface (`Exception::create_message`, `Message::{get, get_script_resource_name, get_line_number, get_start_column, get_stack_trace}`, and the recorded position behind them) | **37** (see below) |
+| after the module structure surface (a module's requests and the four reads on one, an offset's location, the graph's async-ness, the deferred namespace, and the two callback-scope sites `Local::new` was blocking) | **25** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -1203,6 +1204,82 @@ it for the microtask change: no runner names `runtime::api` at all (`grep` over
 it), and nothing outside the three files that define and use it names
 `builtin_tag`. The corpus totals recorded in §5 therefore still stand for this
 tree.
+
+**The module structure surface — landed, 37 → 25, and two of the three callback-scope
+sites with it.** Twelve sites: `Module::get_module_requests` (`map.rs:965`), the
+four reads on one request — `get_specifier` (`:976`), `get_import_attributes`
+(`:979`), `get_source_offset` (`:1048`, `:995`), `get_phase` (`:1063`) —
+`Module::source_offset_to_location` (`:995`), `Module::is_graph_async`
+(`evaluation.rs:261`, `ops_builtin.rs:768`),
+`Module::get_module_namespace_with_phase` (`dynamic.rs:616`), and two of the three
+`E0515`s (`map.rs:1435`, `ops_builtin.rs:705`).
+
+- **A request is a payload, not an object.** V8 has a `v8::ModuleRequest` heap
+  object inside a `FixedArray`; the engine keeps a module's requests in the
+  module's own record, so `Payload::ModuleRequest { module, index }` names one and
+  `Payload::ModuleRequests { module }` names the list, which is what
+  `Module::get_module_requests` hands back under the `FixedArray` tag. That is
+  why `FixedArray::{length, get}` dispatch on the payload: the attributes array a
+  resolve callback receives is still the engine array it was, and a request list
+  is the record. The payoff is the cast: `TagCheck for ModuleRequest` is the
+  payload's own, where the alternative — building the requests as engine arrays
+  and casting by shape — would accept any host array that happened to look like
+  one. The divergence is that a request's reads are one field of the engine's
+  record away rather than a heap object's, which no host can see.
+- **The graph's async-ness is V8's own walk.** `Module::IsGraphAsync`
+  (`v8/src/objects/module.cc:614`) is a worklist from the root over the modules
+  its requests reached, stopping at the first `has_toplevel_await`. The engine
+  had only the per-module `module_has_tla`, so
+  `runtime::module::module_graph_has_tla` is that walk over the realm's own link
+  table. A request whose specifier nothing registered is not walked, which is
+  what an unlinked request is — and it makes the answer *before* linking “the
+  root alone”, which the test pins.
+- **`source_offset_to_location` is the engine's `SourceText`.** `SourceText::
+  line_column` (`crates/syntax/src/source.rs`, with its own tests) already
+  counts line terminators the way `Script::GetPositionInfo` does, so the api
+  method is that call and the bridge's `Location` is the 1-based-to-0-based
+  conversion — V8's `Location` is 0-based in both numbers (`api.cc:2347` builds
+  it from `PositionInfo`, and `deno_core` adds one to report it).
+- **The deferred namespace was already in the engine.** `module::deferred_namespace`
+  and the `[[DeferredNamespace]]` slot exist for import-defer, so
+  `get_module_namespace_with_phase` is the choice between the two namespaces V8
+  keeps, and the test pins that they are different objects. V8's own `DCHECK`
+  (`module.cc:340`) admits only evaluation and defer; its release fallthrough for
+  anything else is the deferred one, which is what a source phase gets here too.
+- **`Local::new`'s scope binding was the `E0515`.** A host's resolvers open a
+  callback scope and return a handle made inside it (three sites); the crate
+  accepts that because a `Local` there is a pointer whose lifetime is *phantom* —
+  `NonNull<T>` plus `PhantomData<&'s ()>`, checked in `scratch/ref/v8-150/handle.rs:109`
+  — while this bridge's `Local::new` tied the answer to the scope's *first*
+  lifetime, which for a callback scope is the borrow of its storage. Freeing it
+  (`&PinScope<'_, 'i, ()>`) is honest rather than convenient: a handle here is the
+  value it carries, so nothing about it depends on a scope's borrow, and the new
+  test is the host's own shape — a callback that returns a handle made in its
+  scope, which does not compile without the change.
+
+**One engine exposure and one engine function, both named before they were made:**
+`api::Module::{request_count, request, is_graph_async, source_offset_to_location,
+deferred_namespace}` — thin over what the record already had — and
+`runtime::module::module_graph_has_tla`, the walk above.
+
+Measured: **37 → 25** (`E0599` 28 → 18, `E0515` 3 → 1). Six new tests, each
+verified by mutating the code it guards and watching it fail: the three reads on a
+request in source order (indexing the list wrong fails two of them), an offset's
+location (dropping the 0-based conversion fails it), the two elements of `FixedArray`
+(the cast's honesty, which `TagCheck → true` breaks), the graph walk (not enqueueing
+what a request reached fails it), the two namespaces (answering the eager one for
+defer fails it), and the callback-scope shape (which fails to *compile* when
+`Local::new`'s binding is put back).
+
+Gates: `cargo test -p v8 --features simdutf` (182 in that binary, 6 new),
+`cargo test --locked --workspace -- --skip
+the_data_a_built_function_carries_survives_a_collection` — **5,116 passed / 0
+failed / 4 ignored across 38 binaries** — and `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean. No sweep, checked the same way as the slice
+above: the engine change is two additive items (`api::Module` methods and the
+graph walk), and no runner names `module_graph_has_tla`, `is_graph_async`,
+`source_offset_to_location`, `deferred_namespace` or `request_count` (`grep` over
+`test262`, `wasmtest`, `wasm`, `cli`).
 
 Gates: `cargo test -p v8 --features simdutf` **164 passed / 0 failed**,
 `clippy --locked --workspace --all-targets -- -D warnings` clean, and
@@ -1884,6 +1961,16 @@ if that proves possible.
   (`same_value` already does, for the explicit call), and then the value hashes
   follow. Recorded here rather than left to be discovered from a `HashMap` that
   behaves differently on two NaNs.
+- **A module request is a payload here, not a heap object.** V8 has a
+  `v8::ModuleRequest` inside a `FixedArray` of them; the engine keeps a module's
+  requests in the module's own record, so a handle names the record and where in
+  it (`Payload::ModuleRequest`) and the list names the record
+  (`Payload::ModuleRequests`). Nothing a host can observe differs — the reads are
+  the same five — but two consequences are worth stating: a cast *to*
+  `ModuleRequest` is refused for anything the bridge did not build (a host's array
+  of the right shape is not a request), and a request handle keeps its module
+  alive only through whatever keeps the module alive, because a pin is per
+  object and a request is not one.
 - **A message's position is the bridge's record, and only a failed compile makes
   one.** V8 reads a start position, an end position and the script back off the
   error object itself (`ComputeLocationFromException`, `isolate.cc:3640`); Slag's
@@ -2062,7 +2149,9 @@ message's position landed as bridge work
 *per-activation* half a runtime error would need — then host memory (partly
 landed — a store over memory the host owns is `SharedBuffer::borrowed`; the
 accounting half, externally allocated memory and backing-store shrink, is not),
-inspector and source maps, traced host objects, structured clone.
+synthetic modules (host-filled records with a host evaluation callback, §12 item
+9 — the engine's JSON/text/bytes shortcut is why it has none), inspector and
+source maps, traced host objects, structured clone.
 
 Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks;
 (2) grow the surface from the items `deno_core` names, in call order — the name
@@ -2078,18 +2167,17 @@ shapes to 213, the host-memory store to 209, the tag shape to 62, the template
 surface to 56, the attribute-carrying half of the template cluster to 52, the static
 half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
 `Message` surface and `Exception::create_message` (piece 2 of the stack-trace
-split) to 37, and what is left is the method surface (28 `E0599`s, all of them
-named methods and subsystems: synthetic modules, wasm streaming, code cache,
-source offsets, the frames of a stack trace, `get_unbound_script`, and the
-internal fields a `ContextOptions` global template names), the 4 names, and four
-stragglers (3 `E0515`, 1 `E0282`).
-One surveyed-and-left item sits outside those counts' reach —
-`get_heap_statistics` (needs byte accounting in `crux::heap`) — and the other two
-that the suite had surveyed have landed since, `get_constructor_name` and
-`get_extras_binding_object`, which turned out to need a walk of the prototype
-chain and a per-context object rather than V8's map and an engine-side extras
-object. Everything else needs the tag shape or an engine capability; with the
-shape
+split) to 37, the module structure surface to 25, and what is left is the method
+surface (18 `E0599`s, all of them named methods and subsystems: synthetic modules,
+wasm streaming and the module-object round trip, code cache, unbound scripts,
+import-defer's evaluation entry point, the stalled-top-level-await report, the
+frames of a stack trace, and `get_heap_statistics`), the 4 names, and two
+stragglers (1 `E0515`, 1 `E0282`).
+The two that the suite had surveyed as needing engine work have landed since,
+`get_constructor_name` and `get_extras_binding_object`, and they turned out to
+need a walk of the prototype chain and a per-context object rather than V8's map
+and an engine-side extras object. Everything else needs the tag shape or an
+engine capability; with the shape
 landed, the tag-shape column is closed — what remains is methods to write and the
 subsystems they name; and the shape's own tail is (a) the methods moving
 from `LocalHandle` onto the tags, file by file, then (b) deleting `LocalHandle`
@@ -2147,3 +2235,32 @@ delete.
    engine's own existing tables's. Either the engine grows a hook a bridge can
    register, or the table is rebuilt per compile, and both are decisions rather
    than drive-bys.
+8. **A host helper that ties a handle to the callback scope's own lifetime still
+   does not compile, and the fix is a scope shape.** One site
+   (`deno/libs/core/modules/map.rs:1374`) is `MapData::resolve_callback`, whose
+   signature is `fn resolve_callback<'s, 'i>(&self, scope: &mut PinScope<'s, 'i>,
+   ...) -> Option<Local<'s, Module>>` — it names the scope's *first* lifetime and
+   returns a handle built under it, and its caller (a `callback_scope!`-opened
+   scope inside `module_resolve_callback`) has that lifetime be the borrow of the
+   scope's own storage frame. `Local::new` no longer has the problem (its scope
+   binding is free, §7), but an argument's binding is a different question, and
+   making it go away means the callback scope's first lifetime being the
+   *parameter's* — the context's — rather than the storage borrow's. That is a
+   `PinnedRef` shape change (its `'p` is a real `&'p mut`), and the cheap version
+   of it — a raw pointer plus a phantom lifetime — would let safe code move a
+   scope reference past the storage that owns it. Worth doing deliberately, not
+   as a drive-by for one site.
+9. **Synthetic modules are the next engine subsystem the module machinery
+   needs.** `Module::create_synthetic_module` (`map.rs:650`, `:716`),
+   `set_synthetic_module_export` (`:1794`) and the `SyntheticModuleEvaluationSteps`
+   callback (`bindings.rs:75`) are four of the remaining errors, and they are one
+   capability: a module record the host fills with exports and evaluates through
+   its own callback. The engine has deliberately avoided that kind once already —
+   a JSON, text or bytes module is *wrapped* as source text (`export default …`,
+   `crates/runtime/src/module.rs:288-320`) rather than built as a synthetic module
+   — which is why every record it knows is a `SourceTextModule` and
+   `is_synthetic_module` answers `false` structurally. A host callback cannot be
+   wrapped that way, so this one is real work rather than a bridge mapping. The
+   shape is decided by what `deno_core` does with it: build the record from a name
+   and an export-name list, stage the values in the host's own table, and have the
+   evaluation callback set them.

@@ -29,13 +29,37 @@ use std::num::NonZeroI32;
 use crux::error::JsError;
 use runtime::api;
 
-use crate::data::{Context, FixedArray, Module, Object, String as JsString, Value};
-use crate::handle::{Local, LocalHandle};
+use crate::data::{Context, FixedArray, Module, ModuleRequest, Object, String as JsString, Value};
+use crate::handle::{Local, LocalHandle, Payload};
 use crate::primitives::undefined;
 use crate::scope::PinScope;
 use crate::support::{MapFnFrom, MapFnTo, UnitType};
 
 pub use runtime::api::{ModuleImportPhase, ModuleStatus};
+
+/// A location in JavaScript source (v8::Location).
+///
+/// The crate we stand in for fills this from V8's `Script::PositionInfo`, whose
+/// two numbers are **0-based** — its own callers add one to report a position
+/// to a user. The engine's [`SourceLocation`](crux::SourceLocation) is 1-based,
+/// so the conversion is here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Location {
+    line_number: i32,
+    column_number: i32,
+}
+
+impl Location {
+    /// The line, 0-based (v8::Location::GetLineNumber).
+    pub fn get_line_number(&self) -> i32 {
+        self.line_number
+    }
+
+    /// The column, 0-based (v8::Location::GetColumnNumber).
+    pub fn get_column_number(&self) -> i32 {
+        self.column_number
+    }
+}
 
 /// How a host resolves one module request during
 /// [`Local::<Module>::instantiate_module`] (v8::ResolveModuleCallback).
@@ -168,6 +192,71 @@ impl<'s> LocalHandle<'s, Module> {
             Ok(value) => Local::from_engine(value),
             Err(error) => panic!("bridge: module namespace creation failed: {error}"),
         }
+    }
+
+    /// The module's namespace object for `phase`
+    /// (v8::Module::GetModuleNamespace with an import phase).
+    ///
+    /// The engine keeps the two namespaces V8 keeps — the eager one and the
+    /// deferred one that evaluates on first property access — so this is the
+    /// choice between them. An *evaluation* request answers the former and
+    /// anything else the latter: V8's own check is that the phase is one of
+    /// those two (`DCHECK`, `src/objects/module.cc:340`), and its release
+    /// build's fallthrough for anything else is the deferred namespace, which
+    /// is what a *source* phase would get here too.
+    pub fn get_module_namespace_with_phase(&self, phase: ModuleImportPhase) -> Local<'s, Value> {
+        let realm = crate::realm_current();
+        let namespace = match phase {
+            ModuleImportPhase::kEvaluation => self.module().namespace(&realm),
+            ModuleImportPhase::kSource | ModuleImportPhase::kDefer => {
+                self.module().deferred_namespace(&realm)
+            }
+        };
+        match namespace {
+            Ok(value) => Local::from_engine(value),
+            Err(error) => panic!("bridge: module namespace creation failed: {error}"),
+        }
+    }
+
+    /// Whether any module this one reaches awaits
+    /// (v8::Module::IsGraphAsync).
+    ///
+    /// The engine walks the graph itself, over the modules the host has
+    /// registered, so this answers before or after linking alike.
+    pub fn is_graph_async(&self) -> bool {
+        let realm = crate::realm_current();
+        self.module().is_graph_async(&realm).unwrap_or(false)
+    }
+
+    /// Where `offset` into this module's source is
+    /// (v8::Module::SourceOffsetToLocation).
+    ///
+    /// For a module request's offset, convert
+    /// `ModuleRequest::get_source_offset` with this.
+    pub fn source_offset_to_location(&self, offset: i32) -> Location {
+        let location = self
+            .module()
+            .source_offset_to_location(offset.max(0) as u32);
+        Location {
+            // The engine reports 1-based numbers and V8's Location is 0-based
+            // in both.
+            line_number: location.line as i32 - 1,
+            column_number: location.column as i32 - 1,
+        }
+    }
+
+    /// The module's requests, in source order
+    /// (v8::Module::GetModuleRequests).
+    ///
+    /// V8 answers a `FixedArray` of request objects; the engine keeps them in
+    /// the module's own record, so the array here names the record and each
+    /// element names a position in it (see
+    /// [`FixedArray`](crate::data::FixedArray)). A host reads it the same way:
+    /// a length and `get`.
+    pub fn get_module_requests(&self) -> Local<'s, FixedArray> {
+        Local::from_payload(Payload::ModuleRequests {
+            module: self.module(),
+        })
     }
 
     /// Link the module and everything it imports
@@ -321,6 +410,60 @@ fn attributes_of(
     api::Array::new(realm, &elements)
 }
 
+impl LocalHandle<'_, ModuleRequest> {
+    /// The module specifier this request names (v8::ModuleRequest::GetSpecifier).
+    pub fn get_specifier(&self) -> Local<'static, JsString> {
+        Local::from_engine(api::Local::string(self.request().specifier))
+    }
+
+    /// What kind of import this is (v8::ModuleRequest::GetPhase).
+    pub fn get_phase(&self) -> ModuleImportPhase {
+        self.request().phase
+    }
+
+    /// The source offset of the declaration that asked for this request
+    /// (v8::ModuleRequest::GetSourceOffset).
+    ///
+    /// Convert it with
+    /// [`Module::source_offset_to_location`](LocalHandle::source_offset_to_location).
+    pub fn get_source_offset(&self) -> i32 {
+        self.request().source_offset as i32
+    }
+
+    /// The request's import attributes, as the triples a resolve callback gets:
+    /// `[key1, value1, offset1, key2, value2, offset2, ...]`
+    /// (v8::ModuleRequest::GetImportAttributes).
+    ///
+    /// The offsets are the requesting declaration's, the same divergence
+    /// [`attributes_of`] records for the callback's array.
+    pub fn get_import_attributes(&self) -> Local<'static, FixedArray> {
+        // No scope in the crate's signature, so the realm is the one entered on
+        // this thread, as `FixedArray::length` also reads it.
+        let realm = crate::realm_current();
+        match attributes_of(&realm, &self.request()) {
+            Ok(elements) => Local::from_engine(elements),
+            Err(error) => panic!("bridge: building a request's attributes failed: {error}"),
+        }
+    }
+
+    /// The engine's own record of the request this handle names.
+    ///
+    /// # Panics
+    ///
+    /// On a handle that did not come from
+    /// [`Module::get_module_requests`](LocalHandle::get_module_requests), which
+    /// the tag check already refuses.
+    fn request(&self) -> api::ModuleRequest {
+        let (module, index) = self
+            .payload()
+            .as_module_request()
+            .expect("bridge bug: a ModuleRequest handle without a request");
+        module
+            .request(index as usize)
+            .expect("bridge bug: a ModuleRequest handle outlived its list")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +475,186 @@ mod tests {
 
     fn number_of(value: Local<'_, Value>) -> f64 {
         Local::<Number>::try_from(value).expect("number").value()
+    }
+
+    /// Compile `text` as a module, in the scope's realm.
+    fn compile_text<'s>(scope: &mut PinScope<'s, '_>, text: &str) -> Local<'s, Module> {
+        let text = JsString::new(scope, text).expect("string");
+        let mut source = Source::new(text, None);
+        compile_module(scope, &mut source).expect("compile")
+    }
+
+    /// A resolver that answers every request with a module that awaits.
+    fn resolve_with_tla<'s>(
+        context: Local<'s, Context>,
+        _specifier: Local<'s, JsString>,
+        _attributes: Local<'s, FixedArray>,
+        _referrer: Local<'s, Module>,
+    ) -> Option<Local<'s, Module>> {
+        crate::callback_scope!(unsafe scope, context);
+        let module = compile_text(scope, "await 0;\nexport const x = 1;");
+        Some(Local::from_module(module.module()))
+    }
+
+    /// A module's requests are read one at a time, in source order, with the
+    /// specifier, phase, source offset and attributes each was written with —
+    /// which is the whole of what `deno_core` reads out of
+    /// `GetModuleRequests`.
+    #[test]
+    fn a_modules_requests_are_read_one_at_a_time() {
+        in_context!(scope, {
+            let module = compile_text(
+                scope,
+                "import { a } from 'one';\n\
+                 import * as ns from 'two' with { type: 'json' };\n\
+                 import defer * as deferred from 'three';\n",
+            );
+            let requests = module.get_module_requests();
+            assert_eq!(requests.length(), 3);
+
+            let read = |index: usize| {
+                let element = requests.get(scope, index).expect("a request");
+                Local::<ModuleRequest>::try_from(element).expect("a request")
+            };
+
+            assert_eq!(read(0).get_specifier().to_rust_string_lossy(scope), "one");
+            assert_eq!(read(0).get_phase(), ModuleImportPhase::kEvaluation);
+            assert_eq!(read(0).get_source_offset(), 0);
+            assert_eq!(read(0).get_import_attributes().length(), 0);
+
+            assert_eq!(read(1).get_specifier().to_rust_string_lossy(scope), "two");
+            assert_eq!(read(1).get_phase(), ModuleImportPhase::kEvaluation);
+            let attributes = read(1).get_import_attributes();
+            assert_eq!(attributes.length(), 3);
+            let attribute = |index: usize| {
+                let element = attributes.get(scope, index).expect("an attribute");
+                Local::<Value>::try_from(element).expect("a value")
+            };
+            assert_eq!(attribute(0).to_rust_string_lossy(scope), "type");
+            assert_eq!(attribute(1).to_rust_string_lossy(scope), "json");
+
+            assert_eq!(read(2).get_specifier().to_rust_string_lossy(scope), "three");
+            assert_eq!(read(2).get_phase(), ModuleImportPhase::kDefer);
+
+            // Past the end there is no element, and neither is there a request.
+            assert!(requests.get(scope, 3).is_none());
+        });
+    }
+
+    /// A request's source offset names the declaration that asked for it, and
+    /// `source_offset_to_location` converts it — 0-based, as the crate we stand
+    /// in for reports it.
+    #[test]
+    fn a_requests_offset_names_a_location() {
+        in_context!(scope, {
+            let module = compile_text(scope, "import 'one';\nimport 'two';");
+            let requests = module.get_module_requests();
+            let offset = |index: usize| {
+                let element = requests.get(scope, index).expect("a request");
+                Local::<ModuleRequest>::try_from(element)
+                    .expect("a request")
+                    .get_source_offset()
+            };
+
+            let first = module.source_offset_to_location(offset(0));
+            assert_eq!((first.get_line_number(), first.get_column_number()), (0, 0));
+            let second = module.source_offset_to_location(offset(1));
+            assert_eq!(
+                (second.get_line_number(), second.get_column_number()),
+                (1, 0)
+            );
+        });
+    }
+
+    /// Only what `get_module_requests` hands out is a request: the element of
+    /// any other fixed array is not, which is what a payload-based cast buys
+    /// over a test that a host's own array could satisfy.
+    #[test]
+    fn a_plain_element_is_not_a_module_request() {
+        in_context!(scope, {
+            let module = compile_text(scope, "import * as ns from 'two' with { type: 'json' };");
+            let requests = module.get_module_requests();
+            let request = requests.get(scope, 0).expect("a request");
+            assert!(Local::<ModuleRequest>::try_from(request).is_ok());
+
+            let element = requests
+                .get(scope, 0)
+                .and_then(|request| Local::<ModuleRequest>::try_from(request).ok())
+                .expect("a request")
+                .get_import_attributes()
+                .get(scope, 0)
+                .expect("an attribute");
+            assert!(Local::<ModuleRequest>::try_from(element).is_err());
+        });
+    }
+
+    /// The graph's async-ness follows the modules a root reaches, not the root
+    /// alone, and only a module the host registered is in the graph the engine
+    /// walks.
+    #[test]
+    fn the_graph_is_async_when_a_module_it_reaches_awaits() {
+        in_context!(scope, {
+            let main = compile_text(scope, "import { x } from 'dep';");
+            // Nothing registered yet, and the root itself does not await.
+            assert!(!main.is_graph_async());
+
+            assert_eq!(
+                main.instantiate_module(scope, resolve_by_compiling),
+                Some(true)
+            );
+            assert!(!main.is_graph_async());
+
+            let awaiting = compile_text(scope, "import { x } from 'dep';");
+            assert_eq!(
+                awaiting.instantiate_module(scope, resolve_with_tla),
+                Some(true)
+            );
+            assert!(awaiting.is_graph_async());
+        });
+    }
+
+    /// A module has the two namespaces V8 gives it: the eager one, and a
+    /// deferred one that is a different object and evaluates lazily.
+    #[test]
+    fn the_deferred_namespace_is_not_the_eager_one() {
+        in_context!(scope, {
+            let module = compile_text(scope, "export const x = 1;");
+            assert_eq!(
+                module.instantiate_module(scope, resolve_by_compiling),
+                Some(true)
+            );
+
+            let eager = module.get_module_namespace();
+            let by_phase = module.get_module_namespace_with_phase(ModuleImportPhase::kEvaluation);
+            assert!(eager == by_phase);
+
+            let deferred = module.get_module_namespace_with_phase(ModuleImportPhase::kDefer);
+            assert!(eager != deferred);
+            assert!(!deferred.is_undefined());
+        });
+    }
+
+    /// A handle made inside a callback scope can be returned from it, which is
+    /// the shape every resolver in `deno_core` has: the callback opens its own
+    /// scope and answers with a handle made there. The scope's *borrow* is not
+    /// what a handle is valid for — a handle is the value it carries — so the
+    /// answer takes the callback's own lifetime.
+    #[test]
+    fn a_handle_made_in_a_callback_scope_can_be_returned_from_it() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_scope, isolate);
+        let context = Context::new(handle_scope, Default::default());
+        let scope = &mut crate::ContextScope::new(handle_scope, context);
+        let value: Local<'_, Value> = JsString::new(scope, "held").expect("string").into();
+        let held = Global::<Value>::new(scope, value);
+
+        fn resolver<'s>(context: Local<'s, Context>, held: &Global<Value>) -> Local<'s, Value> {
+            crate::callback_scope!(unsafe scope, context);
+            Local::new(scope, held.clone())
+        }
+
+        let answered = resolver(context, &held);
+        assert_eq!(answered.to_rust_string_lossy(scope), "held");
     }
 
     /// A module handle keys a host's table the way the crate's does: one record

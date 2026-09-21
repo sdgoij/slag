@@ -2229,6 +2229,46 @@ pub(crate) fn module_has_tla(
     Ok(stmts.iter().any(stmt_has_top_level_await))
 }
 
+/// Whether any module the graph reaches from `root` awaits
+/// (v8::Module::IsGraphAsync, `Module::IsGraphAsync` in
+/// `v8/src/objects/module.cc:614`): `root` first, then every module its
+/// requests reached once it was linked, until one has [[HasTLA]].
+///
+/// A request whose specifier nothing has registered is not walked: the link
+/// table is what V8's walk over `requested_modules` reads too, and a module
+/// that was never linked cannot be reached through it.
+pub fn module_graph_has_tla(
+    agent: &Agent,
+    root: &Handle<SourceTextModule>,
+) -> Result<bool, JsError> {
+    let mut visited: Vec<Handle<SourceTextModule>> = vec![*root];
+    let mut worklist: Vec<Handle<SourceTextModule>> = vec![*root];
+    while let Some(module) = worklist.pop() {
+        if module_has_tla(agent, &module)? {
+            return Ok(true);
+        }
+        let mut reached = Vec::new();
+        {
+            let loaded = module.realm.loaded_modules.borrow();
+            for request in &module.requested_modules {
+                if let Some(reached_module) = loaded.get(&request.specifier) {
+                    reached.push(*reached_module);
+                }
+            }
+        }
+        for reached in reached {
+            if !visited
+                .iter()
+                .any(|visited| Handle::ptr_eq(*visited, reached))
+            {
+                visited.push(reached);
+                worklist.push(reached);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn stmt_has_top_level_await(stmt: &Stmt) -> bool {
     match &stmt.kind {
         StmtKind::Block(block) => block.stmts.iter().any(stmt_has_top_level_await),

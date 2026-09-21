@@ -146,6 +146,38 @@ impl Module {
         context.with_agent(|agent| module::module_has_tla(agent, &self.module))
     }
 
+    /// Whether any module the graph reaches from this one awaits
+    /// (v8::Module::IsGraphAsync).
+    ///
+    /// V8's own walk (`Module::IsGraphAsync`, `src/objects/module.cc:614`):
+    /// this module first, then every `SourceTextModule` its requests reached
+    /// once it was linked, until one answers [[HasTLA]]. The engine resolves
+    /// from its own link table, so a module whose specifier nothing registered
+    /// is not walked — which is what a not-yet-linked request is.
+    pub fn is_graph_async(&self, context: &Context) -> Result<bool, JsError> {
+        context.with_agent(|agent| module::module_graph_has_tla(agent, &self.module))
+    }
+
+    /// Where `offset` into this module's source is
+    /// (v8::Module::SourceOffsetToLocation), as a 1-based line and column
+    /// (the crate we stand in for's `Location` is 0-based; its callers add
+    /// one, and `crates/v8` subtracts it again).
+    ///
+    /// # Panics
+    ///
+    /// On a module that is not a source text module, which is the crate's own
+    /// check (`Utils::ApiCheck`, `src/api/api.cc:2340`).
+    pub fn source_offset_to_location(&self, offset: u32) -> crux::SourceLocation {
+        let text = syntax::SourceText::from_utf16(self.module.source.as_slice().to_vec());
+        text.line_column(offset)
+    }
+
+    /// The module's deferred namespace object (spec 16.2.1.10 with ~defer~),
+    /// evaluated lazily on first property access.
+    pub fn deferred_namespace(&self, context: &Context) -> Result<Local, JsError> {
+        context.with_agent(|agent| module::deferred_namespace(agent, &self.module).map(Local))
+    }
+
     /// The specifiers the module imports or re-exports, in source order.
     pub fn requested_specifiers(&self) -> Vec<String> {
         self.module
@@ -153,6 +185,33 @@ impl Module {
             .iter()
             .map(|request| request.specifier.to_string_lossy())
             .collect()
+    }
+
+    /// How many requests the module has (the length of the array
+    /// [`requested_modules`](Self::requested_modules) builds).
+    pub fn request_count(&self) -> usize {
+        self.module.requested_modules.len()
+    }
+
+    /// The request at `index`, without building the whole list
+    /// (`v8::Module::GetModuleRequests` reads one element at a time through
+    /// its array, which is what this pairs with).
+    pub fn request(&self, index: usize) -> Option<ModuleRequest> {
+        let request = self.module.requested_modules.get(index)?;
+        Some(ModuleRequest {
+            specifier: request.specifier.to_string_lossy(),
+            attributes: request
+                .attributes
+                .iter()
+                .map(|(key, value)| (module::key_string(key), value.to_string_lossy()))
+                .collect(),
+            phase: match request.phase {
+                syntax::ast::ImportPhase::Import => ModuleImportPhase::kEvaluation,
+                syntax::ast::ImportPhase::Source => ModuleImportPhase::kSource,
+                syntax::ast::ImportPhase::Defer => ModuleImportPhase::kDefer,
+            },
+            source_offset: request.span.start,
+        })
     }
 
     /// The module's requests, in source order, with the attributes, phase and

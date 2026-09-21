@@ -43,6 +43,18 @@ pub enum Payload {
         slot: usize,
         generation: u32,
     },
+    /// One of a module's requests (`v8::ModuleRequest`). V8 has a heap object
+    /// per request; the engine keeps the requests as part of the module's own
+    /// record, so a handle names the record and where in it.
+    ModuleRequest {
+        module: api::Module,
+        index: u32,
+    },
+    /// A module's whole request list, as `Module::GetModuleRequests` hands it
+    /// back: a `FixedArray` whose elements are the requests above.
+    ModuleRequests {
+        module: api::Module,
+    },
 }
 
 impl Payload {
@@ -57,7 +69,11 @@ impl Payload {
     pub(crate) fn as_value_opt(&self) -> Option<&api::Local> {
         match self {
             Self::Value(value) => Some(value),
-            Self::Context(_) | Self::Module(_) | Self::Script { .. } => None,
+            Self::Context(_)
+            | Self::Module(_)
+            | Self::Script { .. }
+            | Self::ModuleRequest { .. }
+            | Self::ModuleRequests { .. } => None,
         }
     }
 
@@ -72,6 +88,22 @@ impl Payload {
         match self {
             Self::Module(module) => *module,
             _ => panic!("bridge bug: a non-Module handle read as a Module"),
+        }
+    }
+
+    /// The request a `ModuleRequest` handle names, and the module whose list a
+    /// `FixedArray` handle is, when the payload is that kind.
+    pub(crate) fn as_module_request(&self) -> Option<(api::Module, u32)> {
+        match self {
+            Self::ModuleRequest { module, index } => Some((*module, *index)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_module_requests(&self) -> Option<api::Module> {
+        match self {
+            Self::ModuleRequests { module } => Some(*module),
+            _ => None,
         }
     }
 
@@ -97,6 +129,10 @@ impl fmt::Debug for Payload {
             Self::Script { slot, generation } => {
                 write!(f, "Payload::Script({slot}, {generation})")
             }
+            Self::ModuleRequest { module: _, index } => {
+                write!(f, "Payload::ModuleRequest({index})")
+            }
+            Self::ModuleRequests { module: _ } => f.write_str("Payload::ModuleRequests(..)"),
         }
     }
 }
@@ -231,7 +267,14 @@ impl<'s, T> Local<'s, T> {
     }
 
     /// Construct a handle from an existing persistent handle (`v8::Local::New`).
-    pub fn new<'i, H: Handle<Data = T>>(_scope: &PinScope<'s, 'i, ()>, handle: H) -> Local<'s, T> {
+    ///
+    /// The scope is the shape's, not this bridge's: a handle here is the value
+    /// it carries, so nothing about it depends on a scope's lifetime, and
+    /// tying the answer to the scope's *borrow* would say otherwise. A host
+    /// that opens a callback scope and returns the handle it makes — which the
+    /// crate's module resolvers all do — carries the callback's lifetime, not
+    /// the body-local scope's, and this is the signature that lets it.
+    pub fn new<'i, H: Handle<Data = T>>(_scope: &PinScope<'_, 'i, ()>, handle: H) -> Local<'s, T> {
         Self::from_payload(handle.into_payload())
     }
 
@@ -404,7 +447,10 @@ pub(crate) fn identity_hash(payload: &Payload) -> NonZeroI32 {
     match payload {
         Payload::Value(value) => fold_identity(value_identity(value)),
         Payload::Module(module) => module.get_identity_hash(),
-        Payload::Context(_) | Payload::Script { .. } => {
+        Payload::Context(_)
+        | Payload::Script { .. }
+        | Payload::ModuleRequest { .. }
+        | Payload::ModuleRequests { .. } => {
             panic!("bridge bug: a handle with no identity was hashed")
         }
     }
@@ -442,6 +488,16 @@ fn payload_eq(left: &Payload, right: &Payload) -> bool {
             a.isolate() == b.isolate() && a.global() == b.global()
         }
         (Payload::Module(a), Payload::Module(b)) => a == b,
+        (
+            Payload::ModuleRequest {
+                module: am,
+                index: ai,
+            },
+            Payload::ModuleRequest {
+                module: bm,
+                index: bi,
+            },
+        ) => am == bm && ai == bi,
         (
             Payload::Script {
                 slot: a,
@@ -539,11 +595,16 @@ impl<T> Global<T> {
     }
 
     fn from_payload(payload: Payload) -> Self {
-        // A script's source is owned; a module's box is pinned instead.
+        // A script's source is owned; a module's box is pinned instead. A
+        // request is not a value at all, and what keeps its module alive is the
+        // pin on the module's own handle, so a request handle pins nothing.
         let pin = match &payload {
             Payload::Value(value) => Some(crux::heap::pin(*value.value())),
             Payload::Module(module) => Some(module.pin()),
-            Payload::Context(_) | Payload::Script { .. } => None,
+            Payload::Context(_)
+            | Payload::Script { .. }
+            | Payload::ModuleRequest { .. }
+            | Payload::ModuleRequests { .. } => None,
         };
         let script = payload.as_script_source();
         Self {
@@ -562,7 +623,11 @@ impl<T> Global<T> {
     pub fn is_empty(&self) -> bool {
         match &self.payload {
             Payload::Value(value) => value.is_undefined(),
-            Payload::Context(_) | Payload::Module(_) | Payload::Script { .. } => false,
+            Payload::Context(_)
+            | Payload::Module(_)
+            | Payload::Script { .. }
+            | Payload::ModuleRequest { .. }
+            | Payload::ModuleRequests { .. } => false,
         }
     }
 
@@ -648,7 +713,10 @@ impl<T> Clone for Global<T> {
             pin: match &self.payload {
                 Payload::Value(value) => Some(crux::heap::pin(*value.value())),
                 Payload::Module(module) => Some(module.pin()),
-                Payload::Context(_) | Payload::Script { .. } => None,
+                Payload::Context(_)
+                | Payload::Script { .. }
+                | Payload::ModuleRequest { .. }
+                | Payload::ModuleRequests { .. } => None,
             },
             script: self.script.clone(),
             marker: PhantomData,
