@@ -8,7 +8,7 @@ use crux::string::JsString;
 use crux::value::ValueKind;
 use runtime::api;
 
-use crate::data::{Boolean, Integer, Number, Primitive, String};
+use crate::data::{Boolean, Integer, Number, Primitive, String, Symbol};
 use crate::handle::Local;
 use crate::scope::PinScope;
 
@@ -612,11 +612,194 @@ pub unsafe fn latin1_to_utf8(input_length: usize, inbuf: *const u8, outbuf: *mut
     written
 }
 
+/// A handle for a symbol the engine's own tables hold.
+fn symbol_handle<'s>(symbol: crux::handle::Handle<crux::symbol::Symbol>) -> Local<'s, Symbol> {
+    Local::from_engine(api::Local::from(crux::value::Value::Symbol(symbol)))
+}
+
+impl Symbol {
+    /// The global-registry symbol for `description`, minting it on first use
+    /// (v8::Symbol::For).
+    ///
+    /// The registry is the engine's own — the same list `Symbol.for` reads — so
+    /// a name either side registers is the one symbol both sides get. The
+    /// description is the key, exactly as there: the lookup is the string's
+    /// contents, so a rope and its flattened form are one entry.
+    ///
+    /// The crate we stand in for notes that these symbols are never collected.
+    /// Here they are kept by the registry, which lives on the agent for as long
+    /// as the isolate does.
+    pub fn for_key<'s>(
+        scope: &PinScope<'s, '_, ()>,
+        description: Local<'_, String>,
+    ) -> Local<'s, Symbol> {
+        // The description is the registry key, so it has to be the string's own
+        // code units: the crate's lossy text conversion would fold two names a
+        // lone surrogate tells apart into one entry.
+        let key: JsString = (*description
+            .engine()
+            .value()
+            .as_string()
+            .expect("bridge bug: a String handle the engine does not know"))
+        .clone();
+        let symbol = crate::realm_of(scope).with_agent(|agent| {
+            let mut registry = agent.global_symbol_registry.borrow_mut();
+            if let Some((_, symbol)) = registry.iter().find(|(name, _)| *name == key) {
+                return symbol.clone();
+            }
+            let symbol = crux::symbol::Symbol::new(Some(key.clone()));
+            registry.push((key.clone(), symbol.clone()));
+            symbol
+        });
+        symbol_handle(crux::handle::Handle::new(symbol))
+    }
+
+    /// The canonical `Symbol.iterator` (v8::Symbol::GetIterator).
+    ///
+    /// The well-known symbols below are the engine's own singletons, not copies
+    /// of them: the engine installs `Symbol.name` from the same table, so
+    /// `get_iterator(scope)` and script's `Symbol.iterator` are one value, and a
+    /// bridge-read symbol used as a property key is the key a script's
+    /// iteration finds.
+    pub fn get_iterator<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("iterator")
+    }
+
+    /// `Symbol.asyncIterator` (v8::Symbol::GetAsyncIterator).
+    pub fn get_async_iterator<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("asyncIterator")
+    }
+
+    /// `Symbol.hasInstance` (v8::Symbol::GetHasInstance).
+    pub fn get_has_instance<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("hasInstance")
+    }
+
+    /// `Symbol.isConcatSpreadable` (v8::Symbol::GetIsConcatSpreadable).
+    pub fn get_is_concat_spreadable<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("isConcatSpreadable")
+    }
+
+    /// `Symbol.match` (v8::Symbol::GetMatch).
+    pub fn get_match<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("match")
+    }
+
+    /// `Symbol.replace` (v8::Symbol::GetReplace).
+    pub fn get_replace<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("replace")
+    }
+
+    /// `Symbol.search` (v8::Symbol::GetSearch).
+    pub fn get_search<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("search")
+    }
+
+    /// `Symbol.split` (v8::Symbol::GetSplit).
+    pub fn get_split<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("split")
+    }
+
+    /// `Symbol.toPrimitive` (v8::Symbol::GetToPrimitive).
+    pub fn get_to_primitive<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("toPrimitive")
+    }
+
+    /// `Symbol.toStringTag` (v8::Symbol::GetToStringTag).
+    pub fn get_to_string_tag<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("toStringTag")
+    }
+
+    /// `Symbol.unscopables` (v8::Symbol::GetUnscopables).
+    pub fn get_unscopables<'s>(_scope: &PinScope<'s, '_, ()>) -> Local<'s, Symbol> {
+        well_known("unscopables")
+    }
+}
+
+/// The engine's canonical well-known symbol `name`, which is the value script
+/// sees as `Symbol.name`.
+fn well_known<'s>(name: &str) -> Local<'s, Symbol> {
+    symbol_handle(crux::symbol::well_known(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::NewStringType;
-    use crate::test_support::{eval, in_context};
+    use crate::data::Value;
+    use crate::test_support::{bind, eval, eval_number, in_context};
+
+    /// The registry is one table: a name script registers is the symbol the
+    /// bridge is handed, and the other way round.
+    #[test]
+    fn the_symbol_registry_is_shared_with_script() {
+        in_context!(scope, {
+            // Script first: `for_key` has to find what `Symbol.for` made.
+            bind(
+                scope,
+                "fromScript",
+                eval(scope, "Symbol.for('bridge.test')"),
+            );
+            let name = String::new(scope, "bridge.test").expect("string");
+            let symbol = Symbol::for_key(scope, name);
+            bind(scope, "fromHost", symbol.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "fromScript === fromHost ? 1 : 0"),
+                1.0,
+                "the host is handed the symbol script registered"
+            );
+
+            // And a name the host registers is the one script gets afterwards.
+            let name = String::new(scope, "bridge.other").expect("string");
+            let symbol = Symbol::for_key(scope, name);
+            bind(scope, "hostFirst", symbol.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "hostFirst === Symbol.for('bridge.other') ? 1 : 0"),
+                1.0,
+                "a host-registered name is the symbol script resolves"
+            );
+
+            // Two lookups of one name are one symbol, which is what makes the
+            // registry worth having.
+            let name = String::new(scope, "bridge.other").expect("string");
+            let symbol = Symbol::for_key(scope, name);
+            bind(scope, "again", symbol.cast::<Value>());
+            assert_eq!(eval_number(scope, "again === hostFirst ? 1 : 0"), 1.0);
+        });
+    }
+
+    /// The well-known accessors answer the engine's singletons, which are the
+    /// values script sees as `Symbol.name` — and they work as property keys.
+    #[test]
+    fn the_well_known_symbols_are_the_ones_script_sees() {
+        in_context!(scope, {
+            let iterator = Symbol::get_iterator(scope);
+            bind(scope, "iterKey", iterator.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "iterKey === Symbol.iterator ? 1 : 0"),
+                1.0
+            );
+            assert_eq!(
+                eval_number(scope, "typeof [][iterKey] === 'function' ? 1 : 0"),
+                1.0,
+                "the host's key finds what the engine hung there"
+            );
+
+            let tag = Symbol::get_to_string_tag(scope);
+            bind(scope, "tagKey", tag.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "tagKey === Symbol.toStringTag ? 1 : 0"),
+                1.0
+            );
+
+            let instance = Symbol::get_has_instance(scope);
+            bind(scope, "instanceKey", instance.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "instanceKey === Symbol.hasInstance ? 1 : 0"),
+                1.0
+            );
+        });
+    }
 
     /// The string a script evaluates to.
     fn eval_string<'s>(scope: &crate::PinScope<'s, '_>, source: &str) -> Local<'s, String> {

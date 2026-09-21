@@ -550,6 +550,7 @@ number is the certified one.
 | after the method tail a host calls by name (`Global::open`, the typed `ReturnValue` setters, `Function::builder`, the promise resolver, and the pointer-shaped isolate slots) | **292** (see below) |
 | after the scheduling and exception-control methods (`Isolate::perform_microtask_checkpoint` and `TryCatch::rethrow`) | **260** (see below) |
 | after the isolate-level callback vocabulary (the promise-reject, prepare-stack-trace, `import.meta`, dynamic-import, phase-import and wasm-async-resolve callbacks, the near-heap-limit pair, `set_idle`, `set_bool`, `set_promise_hooks`, and `AsMut<Isolate>`) | **242** (see below) |
+| after the symbol surface (`Symbol::for_key` and the eleven well-known accessors) | **233** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -893,6 +894,37 @@ clean at crate and workspace scope, and `cargo test --locked --workspace`
 engine crates do not depend on it; checked in their manifests, not assumed) — so
 no sweep is implicated. The firing test was made to fail: with the `host_hooks`
 install removed it reports an empty event list.
+
+**The symbol surface — landed, 242 → 233, and it is the registry script uses.**
+Nine sites were `Symbol::for_key` (eight) and `Symbol::get_iterator` (one), and
+the engine already had both halves: `Agent::global_symbol_registry` *is* the list
+`Symbol.for` reads, and `crux::symbol::well_known` is what the engine installs
+`Symbol.name` from. So the bridge calls those tables rather than keeping its own:
+a name registered from either side is the one symbol both sides get, and a
+bridge-held symbol used as a property key is the key a script's own lookup finds.
+Two things the tests pin down, because both would pass with a
+plausible-looking wrong implementation. A bridge that minted a fresh symbol for a
+name would still return *a* symbol whose description matched, so the test asserts
+identity with what script holds — in both directions, and twice for one name. And
+a bridge that minted its own "well-known" symbol would still make `arr[key]` work
+when the key came from the bridge, so that test asserts identity with
+`Symbol.iterator` first and then reads *through* the key.
+
+The description is the string's own code units rather than the crate's lossy text
+conversion: two names a lone surrogate tells apart would otherwise fold into one
+registry entry. The accessors are the eleven the crate we stand in for has, no
+more — `Symbol::new`, `Symbol::for_api` and `Symbol::description` stay absent
+until a call site asks, which is the demand rule §9 states.
+
+Measured: **242 → 233**; `E0599` 155 → 146, every other kind unchanged, and no
+new error surfaced behind the nine.
+
+Gates: `cargo test -p v8 --features simdutf` **137 passed / 0 failed**, `clippy`
+clean at crate and workspace scope, and `cargo test --locked --workspace`
+**5,069 passed / 0 failed / 4 ignored** with the crashing `v8` test skipped.
+`crates/v8` only, so no sweep is implicated. Both tests were made to fail:
+replacing the registry lookup with a fresh symbol fails the first, and minting a
+fresh "well-known" symbol fails the second.
 
 **The method tail — landed, 336 → 292, one real bug found, and a pointer shape
 corrected.** Forty-three sites were methods a host calls by name that the bridge
@@ -1297,6 +1329,16 @@ if that proves possible.
   calls `set_promise_reject_callback` keeps the defaults — but a later hook the
   engine grows joins `PromiseRejectHooks` rather than reaching for the seam
   again, and that is why the type exists rather than an inline `Box`.
+- **The symbol surface is the engine's own registry, and what is absent is absent
+  by demand.** `Symbol::for_key` reads `Agent::global_symbol_registry`, the list
+  `Symbol.for` reads, so a host-made name and a script-made one are one symbol;
+  the well-known accessors read `crux::symbol::well_known`, which is what the
+  engine installs `Symbol.name` from, so a host never mints a look-alike. The
+  deliberate omission is `Symbol::for_api`: the crate we stand in for gives it a
+  *second* registry JavaScript cannot reach, the bridge has no such table, and
+  offering the name over the one registry would be a promise it could not keep —
+  a script could then find an API symbol. Recorded with `Symbol::new` and
+  `Symbol::description`, which are absent until a call site asks.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
@@ -1322,11 +1364,11 @@ is a **method-level** stage: 617 type errors were visible for the first time, th
 first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
 347, private names to 336, the method tail to 292, scheduling and exception
-control to 260, the isolate-level callback vocabulary to 242, and what is left is
-the method surface (155 `E0599`s: 72 where a value handle is the receiver — the
-tag shape — 41 on a `Local<…>`, 38 associated items on a tag, 4 on another bridge
-type), the 78 `E0308`s the tag shape explains, the 4 names, and four stragglers
-(3 `E0515`, 1 `E0282`);
+control to 260, the isolate-level callback vocabulary to 242, the symbol surface
+to 233, and what is left is the method surface (146 `E0599`s: 72 where a value
+handle is the receiver — the tag shape — 41 on a `Local<…>`, 29 associated items
+on a tag, 4 on another bridge type), the 78 `E0308`s the tag shape explains, the 4
+names, and four stragglers (3 `E0515`, 1 `E0282`);
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then
