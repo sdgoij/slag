@@ -569,6 +569,7 @@ number is the certified one.
 | after the unbound scripts and the code cache (`UnboundScript`/`UnboundModuleScript`, `create_code_cache` on the script, the module script and a function, `get_source_mapping_url`) | **6** (see below) |
 | after the stack-trace frames (`StackTrace::current_stack_trace` and the frame accessors, over the engine's execution contexts) | **4** (see below) |
 | after the escapable handle scope (the macro's inference, which the `E0282` that had been unexplained since the serializer step turned out to be) | **3** (see below) |
+| after the heap statistics (`HeapStatistics`, the four accessors a host reads, over the arena's own numbers and the agent's own record of live buffers) | **2** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -589,7 +590,7 @@ error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
 
 That was the shape of the frontier then. It is no longer: with no names left, the
-3 errors now are 3 `E0599`s (methods and the subsystems they name), so the count
+2 errors now are 2 `E0599`s (methods and the subsystems they name), so the count
 is a *method-level* metric now, as §10 says — and each step's own
 record below names which code classes moved rather than only the total.
 
@@ -2345,6 +2346,64 @@ the_data_a_built_function_carries_survives_a_collection` **5,141 passed / 0 fail
 which no runner depends on — so the sweep battery is not implicated, and the
 numbers from the step above stand.
 
+**The heap statistics — landed, 3 → 2, and every number is one the engine already
+kept.** One site: `op_memory_usage` (`libs/core/ops_builtin_v8.rs:1362`), which is
+`Deno.core.memoryUsage()`, reading four of the crate's fifteen `HeapStatistics`
+accessors.
+
+The question a host's four numbers raise is what a "heap" is here, and the
+answer is not V8's: a chunked bump arena that grows on demand, never reserves
+beyond what it commits, and has no limit. So `total_heap_size` and
+`total_physical_size` are the *same* number — the committed bytes — and that is
+stated rather than faked into two. `used_heap_size` is the bytes the live boxes
+occupy, counted by the same arena walk the collector uses (`for_each_live`), each
+box's own footprint without the bytes of anything it points at, and swept slots
+excluded. `external_memory` is the interesting one: an `ArrayBuffer`'s storage is
+an `Rc<Vec<u8>>` in `crates/byteblock`, outside the arena and outside any
+counter, so the arena's numbers cannot see it — but the engine keeps its own
+record of every live buffer object (`Agent::buffer_data`), and summing that is
+exact rather than guessed: a detached buffer has no bytes and a *borrowed* block
+(the host pointer path) is the host's memory, not this engine's.
+
+**What the crate's other eleven accessors are: absent.** `heap_size_limit`,
+`total_available_size` (no limit), `malloced_memory`, `peak_malloced_memory`,
+`total_allocated_bytes` (no allocation total is kept),
+`total_global_handles_size`, `used_global_handles_size` (no handle registry),
+`total_heap_size_executable` (no code lives in the heap — the JIT's code is
+Cranelift's own allocation) and `does_zap_garbage` have no honest value, so a host
+that names one gets a compile error. That is the same rule every earlier slice
+followed, and §9 records it as the tier.
+
+Engine change, as named before it was written (§9's ledger, item 13): two
+read-only accessors on `crux::heap::Heap` (`committed_bytes`, `live_bytes` — the
+latter the existing arena walk, so no allocation path gained a write), a new
+`api::HeapStatistics`, and `api::Isolate::heap_statistics`. Bridge side: a
+`crates/v8/heap.rs` with the four accessors as methods and
+`Isolate::get_heap_statistics`, which is reachable from a *scope* through the
+deref chain — the receiver `deno_core` uses, and the test uses it that way.
+
+Measured: **3 → 2** (`E0599` 3 → 2), with nothing unmasked. Three new tests, each
+verified by mutating the code it guards: a `committed_bytes` of 0 fails the arena
+test, a doubled byte length fails the external-memory test (which is also the test
+that showed a first version of that test could not fail — a *view* was asserted
+about as if it were a buffer object, and the dedupe it was supposed to exercise
+turned out to be unreachable, so the dedupe is gone and the test now says what it
+checks), and a `total_physical_size` of 0 fails the bridge test.
+
+Gates: `cargo test -p v8 --features simdutf` **200 passed / 0 failed**,
+`cargo test -p runtime --lib` **792 passed / 0 failed**, `cargo test -p crux --lib`
+**248 passed / 0 failed**, `cargo clippy --locked --workspace --all-targets -- -D
+warnings` clean, `cargo test --locked --workspace -- --skip
+the_data_a_built_function_carries_survives_a_collection` **5,144 passed / 0 failed
+/ 4 ignored across 38 binaries**. `crates/crux` and `crates/runtime` changed, so the
+battery ran and every number is the certified one: test262 `all` 48,622 — 48,464
+pass, **0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 0 fail
+/ 0 crash / 0 hang, 152 skip; the eight wasm core suites **64,594 checks / 0 fail /
+0 pending**; the JS-API sweep **1,001 tests / 0 fail**.
+
+Two sites are left: `Module::evaluate_for_import_defer` and
+`Module::get_stalled_top_level_await_message`, both module-graph work.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -2876,6 +2935,49 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   "how did I get here" needs the VM's own frames, which is a
   performance-sensitive engine feature and is what §10's *structured frames* item
   now means.
+13. **The heap statistics — named before the bridge half is written.**
+  `HandleScope::GetHeapStatistics` (1 site: `libs/core/ops_builtin_v8.rs:1362`,
+  `op_memory_usage`, which is `Deno.core.memoryUsage()`), and deno reads four of
+  the crate's fifteen accessors: `total_physical_size`, `total_heap_size`,
+  `used_heap_size`, `external_memory`.
+
+  **What the engine has, and what it does not.** The heap is a chunked bump
+  arena: `ArenaChunk { data, start, bump, end }` and a `for_each_live` walk the
+  sweep already uses, so *committed* bytes (every chunk's buffer) and *live*
+  bytes (the walk's live box footprints) are both readable without new state.
+  What the engine has **no** notion of is V8's `external_memory` — bytes held
+  outside the heap for the host's buffers — because an `ArrayBuffer`'s storage is
+  an `Rc<Vec<u8>>` in `crates/byteblock`, outside the arena and outside any
+  counter. What it *does* have is the engine's own record of every live buffer
+  object: `Agent::buffer_data`, keyed by object identity, each with the
+  `SharedBuffer` behind it. So the number is real rather than guessed.
+
+  **Engine change, named — two read-only heap accessors and one api struct:**
+  - `crux::heap::Heap` gains `committed_bytes()` (every chunk's buffer) and
+    `live_bytes()` (the existing arena walk, summing each live box's footprint).
+    Neither adds state and neither is on an allocation path.
+  - `api::HeapStatistics` with the four fields deno reads, and
+    `api::Isolate::heap_statistics()`: the arena's two numbers from `crux::heap`,
+    and `external_memory` summed over `Agent::buffer_data` — skipping detached
+    buffers, counting a shared block once (a block can back more than one buffer
+    object), and *not* counting a borrowed block, whose bytes belong to the host
+    (the `new_backing_store_from_ptr` path).
+
+  **What the crate's other eleven accessors are: absent.** `heap_size_limit`,
+  `malloced_memory`, `total_allocated_bytes`, `total_available_size`,
+  `total_global_handles_size`, `used_global_handles_size`,
+  `total_heap_size_executable` and the rest have no honest value here — the arena
+  has no limit, the engine keeps no allocation total, and the JIT's code is not
+  in the heap — so a host that names one gets a compile error rather than a 0
+  (§9 records it). The four that land are exactly the four `deno_core` reads.
+
+  **Landed, 3 → 2** (§7 records it): every number is one the engine already kept
+  — the arena's committed and live bytes, and the agent's own record of live
+  buffer objects for the external bytes, which are real because the engine's
+  bookkeeping is, and stated as the engine's rather than V8's. Three tests, each
+  mutated to prove it can fail; one of those mutations is what showed the first
+  version of the external-memory test could not fail, so its subject changed
+  (a view is not a buffer object) and the dedupe it was written for is gone.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -2970,6 +3072,18 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   specifier a host-provided source was resolved under), while a script parsed by
   `parse_script` carries none — threading one would touch the eval path every
   runner uses, and no site in the frontier needs it.
+- **`HeapStatistics` reports the engine's own numbers, four of the crate's
+  fifteen, and the definitions are not V8's.** The heap here is a chunked bump
+  arena: `total_heap_size` and `total_physical_size` are the same number (the
+  committed bytes — an arena that never over-reserves has one number for both),
+  `used_heap_size` is the live boxes' footprints as the arena walk counts them,
+  and `external_memory` is the bytes of the buffers the agent holds, summed over
+  its own record of live buffer objects rather than measured. The other eleven
+  accessors — a heap limit, an allocation total, malloced memory, handle-registry
+  sizes, executable bytes, the zap flag — have no honest value here and are
+  *absent*: a host that names one gets a compile error rather than a plausible
+  zero. A host comparing its numbers to V8's must read them as "what this engine
+  holds", not as the same quantities.
 
 ## 10. Build order
 
@@ -3016,10 +3130,10 @@ half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
 split) to 37, the module structure surface to 25, the synthetic-module surface to
 21, the callback scope's lifetime to 19, the compiled-module surface to 15, the
 streaming half to 12, the unbound scripts and the code cache to 6, the
-stack-trace frames to 4, the escapable handle scope to 3, and
-what is left is the method
-surface (3 `E0599`s: the stalled `await` report, import-defer's evaluation entry
-point, and `get_heap_statistics`) — with no stragglers left at all.
+stack-trace frames to 4, the escapable handle scope to 3, the heap statistics to
+2, and what is left is the method
+surface (2 `E0599`s: the stalled `await` report and import-defer's evaluation
+entry point) — with no stragglers left at all.
 The two that the suite had surveyed as needing engine work have landed since,
 `get_constructor_name` and `get_extras_binding_object`, and they turned out to
 need a walk of the prototype chain and a per-context object rather than V8's map

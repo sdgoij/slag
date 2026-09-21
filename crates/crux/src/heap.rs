@@ -1408,6 +1408,37 @@ impl Heap {
         self.free.iter().map(|slots| slots.len()).sum()
     }
 
+    /// The bytes the arena has committed: every chunk's buffer.
+    ///
+    /// The arena grows a chunk at a time and never reserves beyond what it
+    /// commits, so this is both the size a host sees as the heap's and the
+    /// physical memory the chunks hold — which is why `HeapStatistics` reports
+    /// the two as the same number (see `crate::api::HeapStatistics`).
+    pub fn committed_bytes(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|chunk| chunk.end - chunk.start)
+            .sum()
+    }
+
+    /// The bytes the live boxes occupy, as the arena walk counts them: each
+    /// box's own footprint (its header included, rounded as the allocator
+    /// rounded it), not the bytes of anything it points at.
+    ///
+    /// A walk rather than a counter because a counter would be one more write on
+    /// the allocation path, and a host asks this for a diagnostic. Swept slots
+    /// are not counted: the walk filters on the box's live bit.
+    pub fn live_bytes(&self) -> usize {
+        let mut total = 0;
+        self.for_each_live(|header| {
+            // SAFETY: `for_each_live` hands out the header of a live box inside a
+            // chunk's allocated range, and every slot's size is written at
+            // allocation and survives the sweep.
+            total += unsafe { (*header).size as usize };
+        });
+        total
+    }
+
     /// Allocate `size` bytes aligned to `align` in the arena, reusing a
     /// swept slot of the same rounded size when one is free, else bumping
     /// into the current chunk (growing the arena by a chunk when full).

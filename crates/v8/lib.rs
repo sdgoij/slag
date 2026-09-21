@@ -36,6 +36,7 @@ pub mod fast_api;
 mod fixed_array;
 mod function;
 mod handle;
+mod heap;
 pub mod inspector;
 mod isolate;
 pub mod json;
@@ -78,6 +79,7 @@ pub use function::{
     FunctionCallbackInfo, FunctionCallbackInfoParts, ReturnValue, SideEffectType,
 };
 pub use handle::{Global, Handle, Local, MaybeLocal};
+pub use heap::HeapStatistics;
 pub use isolate::{
     CreateParams, HostImportModuleDynamicallyCallback,
     HostImportModuleWithPhaseDynamicallyCallback, HostInitializeImportMetaObjectCallback, Isolate,

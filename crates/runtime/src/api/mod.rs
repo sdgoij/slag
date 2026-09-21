@@ -18,6 +18,7 @@
 mod context;
 mod external;
 mod handle;
+mod heap;
 mod json;
 mod microtask;
 mod module;
@@ -33,6 +34,7 @@ mod wasm;
 pub use context::{Context, ContextScope};
 pub use external::External;
 pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal};
+pub use heap::HeapStatistics;
 pub use json::Json;
 pub use microtask::MicrotasksPolicy;
 pub use module::{
