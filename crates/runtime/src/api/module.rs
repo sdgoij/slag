@@ -442,6 +442,47 @@ mod tests {
         );
     }
 
+    /// A synthetic module's exports are linkable: a source module that imports
+    /// one binds that module's own export binding, so the value its steps set
+    /// is what the importer reads — and a name the host did not declare is the
+    /// link error V8 reports.
+    #[test]
+    fn a_name_a_synthetic_module_declares_can_be_imported() {
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+
+        let names = [Local::string("a"), Local::string("b")];
+        let host = Module::create_synthetic_module(&context, &Local::string("host"), &names, steps)
+            .expect("create");
+        host.register(&context, "ext:host").expect("register");
+
+        let main = Module::compile(
+            &context,
+            "main",
+            "import { a, b } from 'ext:host';\nexport const sum = a + b;",
+        )
+        .expect("main");
+        main.register(&context, "main").expect("register");
+        main.instantiate(&context).expect("instantiate");
+        main.evaluate(&context).expect("evaluate");
+
+        let namespace = main.namespace(&context).expect("namespace");
+        assert_eq!(
+            Object::get(&context, &namespace, "sum")
+                .expect("read")
+                .as_number(),
+            Some(3.0)
+        );
+
+        let undeclared =
+            Module::compile(&context, "bad", "import { nope } from 'ext:host';").expect("compile");
+        undeclared.register(&context, "bad").expect("register");
+        let error = undeclared
+            .instantiate(&context)
+            .expect_err("a name the host did not declare");
+        assert_eq!(error.kind, ErrorKind::SyntaxError);
+    }
+
     /// A module that throws records the error, and the status says it evaluated
     /// with one — which is what the host reports as `errored`.
     #[test]

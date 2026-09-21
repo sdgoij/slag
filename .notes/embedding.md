@@ -2528,6 +2528,23 @@ Gates: `cargo test -p v8 --features simdutf` **204 passed / 0 failed**, `cargo c
 
 One detail worth recording because it is not obvious: the failure arrives as a `CoreError(Js(JsError { ... }))` with `frames: []` and `source_line: None` — this bridge's own recorded gaps (no call stack, no per-activation positions, §9) showing up in an error a host formats for a user.
 
+**The synthetic-module link — landed, and deno_core's bootstrap completes.** The blocker the previous record named, found by running: linking an import against a synthetic module. The change is the one ledger item 15 named, with the shape its first measurement settled — the module's exports live in a real module environment rather than beside it.
+
+`module_declaration_instantiation`'s synthetic branch now creates what spec 16.2.1.5.2 says a synthetic module's [[Environment]] is: a mutable binding per declared name, initialized to *undefined*. `set_synthetic_module_export` writes that binding (`SetMutableBinding(name, value, true)`) where it used to write a `synthetic.exports` slot table, and `namespace_get` reads it the same way. So that table is gone rather than kept in sync — one storage location, which is what the spec has, and the values are traced through the module's environment (already traced) instead of through a field of their own. `resolve_export` gains the branch it lacked: a declared name resolves to the module itself, bound to that name, which is what the *existing* import-binding machinery (`create_import_binding`) then reads — so an import of a synthetic module's export is live, and no new binding kind was needed.
+
+The creation sits behind the status check that branch already had, and it has to: the branch returns early whether or not the module is linked, so creating unconditionally would discard a host's exports on a second instantiation.
+
+One new engine test, verified by mutating the code it guards — and the first mutation is the diagnosis itself: `resolve_export` answering `None` for a synthetic module reproduces deno's failure exactly, `Module ext:host does not export a`. The second drops the binding write, which the importer then reads as `undefined` (`left: Some(NaN)`).
+
+Gates: `cargo test -p runtime --lib` **795 passed / 0 failed**, `cargo test -p v8 --features simdutf` **204 passed / 0 failed**, `cargo test -p crux --lib` **248 passed / 0 failed**, `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,151 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the whole battery ran and every number is the certified one: test262 `all` 48,622 — 48,464 pass, 0 fail / 0 crash / 0 hang, 158 skip; `intl402` 3,357 — 3,205 pass, 0 fail / 0 crash / 0 hang, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+**And the bootstrap finished.** Both of `deno/`'s snapshot build scripts now get all the way through deno_core's JavaScript — primordials, `00_infra`, `01_core`, the `ext:core/ops` synthetic module, the extensions' own modules — and report
+
+    Creating a snapshot...
+    JsRuntimeForSnapshot prepared, took 231.7474ms
+
+before failing inside `create_blob`, which this bridge aborts *on purpose*: "Slag has no snapshot format: an isolate boots from source" (§9). So the engine runs deno_core's bootstrap now, and what stands between `deno/` and a snapshot is the engine feature §10's engine-side item (3) already names: the snapshot format, with the external references that have to stay index-stable across builds. A host that boots from source needs none of it; deno's CLI does, so that is the next slice and it is an engine one.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -2569,9 +2586,6 @@ if that proves possible.
   `Function::builder` shares, so it is not this console's alone. What a host can
   act on is the same in all three cases: the methods are callable, they are
   enumerable under their V8 names, and they do nothing.
-- **A synthetic module cannot be imported from.** `resolve_export` has no branch
-  for one, so a name its host declared is reported missing at link time (ledger
-  item 15 names the change; §7 records the measurement that found it).
 - **The platform is a shape without a producer, and that is stated.** Slag posts
   no task, so `Platform`/`PlatformImpl`/`Task` exist so a host's initialization
   and its own implementation type-check, and the bridge's module docs say so
@@ -3160,10 +3174,17 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   **What the change is, named:** the synthetic branch in `resolve_export`,
   answering the binding spec 16.2.1.5.2 gives a synthetic module's export — the
   module itself, bound to the name — together with whatever the import-binding
-  path needs to read that binding instead of an environment slot. Its shape, and
-  whether the binding needs a slot in the synthetic module's environment rather
-  than a new binding kind, is what the first measurement inside the change will
-  settle; nothing else in the module machinery is expected to move.
+  path needs to read that binding instead of an environment slot.
+
+  **Landed** (§7 records it), with the shape the first measurement settled: the
+  bindings are the module's own environment, created at instantiation, so
+  `resolve_export` answering `Local` for a declared name is all the link needed —
+  the import-binding machinery (`create_import_binding`) was already there and
+  reads an environment by name. `SyntheticModule::exports`, the slot table the
+  namespace used to read, is gone rather than kept in step: one storage location,
+  which is what the spec has, and its values are traced through the module's
+  environment. As the entry said it would, nothing else in the module machinery
+  moved.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3359,13 +3380,14 @@ subsystems they name; and the shape's own tail is (a) the methods moving
 from `LocalHandle` onto the tags, file by file, then (b) deleting `LocalHandle`
 and its deref table, which is when the tier §9 states stops being a tier;
 (3) point the local `deno/` checkout at the crate and run a script — the
-`deno_core` type errors are gone, but the CLI does not build yet (§7's
-measurement: 341 errors across eight ext crates, with `deno_runtime` and the CLI
-never reached, and the extras binding object's missing `console` as the first
-runtime blocker), so this step is the **ext-crate frontier** first and the
-runtime gaps second — the gaps this work already found (`queueMicrotask`, a host
-that must boot without a snapshot) are still waiting behind it; (4) migrate,
-then delete.
+`deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
+last record: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
+what stops them is the engine-side item (3) below rather than anything in the
+bridge — a host that boots from source needs no snapshot, deno's CLI does. The
+`ext`-crate frontier of §7's measurement (341 errors across eight crates, none of
+them `deno_core`) is still what stands between this and a `deno` binary, and
+deno's own runtime gaps (`queueMicrotask` among them) sit behind that; (4)
+migrate, then delete.
 delete.
 
 ## 11. Working rules

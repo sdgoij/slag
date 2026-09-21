@@ -396,11 +396,6 @@ pub struct SyntheticModule {
     pub name: JsString,
     /// The declared export names, in the order the host gave them.
     pub export_names: Vec<JsString>,
-    /// The value of each declared export, parallel to `export_names`. `None` is
-    /// an export that has not been set, which reads as *undefined* — V8
-    /// creates a cell initialized to undefined per name at instantiation
-    /// (`SyntheticModule::PrepareInstantiate`).
-    pub exports: RefCell<Vec<Option<Value>>>,
     /// What evaluation runs (v8::SyntheticModuleEvaluationSteps).
     pub evaluation_steps: crate::api::SyntheticModuleEvaluationSteps,
     /// The realm the module was made in, which is the context the callback is
@@ -414,7 +409,6 @@ impl Trace for SyntheticModule {
         for name in &self.export_names {
             name.trace(visit);
         }
-        self.exports.trace(visit);
         self.context.realm().trace(visit);
     }
 }
@@ -426,7 +420,6 @@ impl std::fmt::Debug for SyntheticModule {
         f.debug_struct("SyntheticModule")
             .field("name", &self.name)
             .field("export_names", &self.export_names)
-            .field("exports", &self.exports)
             .finish_non_exhaustive()
     }
 }
@@ -442,7 +435,6 @@ pub fn synthetic_module_create(
     evaluation_steps: crate::api::SyntheticModuleEvaluationSteps,
 ) -> Result<Handle<SourceTextModule>, JsError> {
     let realm = agent.current_realm()?;
-    let slots = export_names.len();
     let module = Handle::new(SourceTextModule {
         realm,
         // An empty program: a synthetic module has no statements, which is
@@ -464,7 +456,6 @@ pub fn synthetic_module_create(
         synthetic: Some(SyntheticModule {
             name: name.clone(),
             export_names,
-            exports: RefCell::new(vec![None; slots]),
             evaluation_steps,
             context,
         }),
@@ -480,12 +471,12 @@ pub fn synthetic_module_create(
 }
 
 /// Set one of a synthetic module's exports
-/// (v8::Module::SetSyntheticModuleExport).
+/// (v8::Module::SetSyntheticModuleExport): a write to the module's own export
+/// binding, which is what an importer of that name holds.
 ///
-/// A name the host did not declare, or a module that is not yet instantiated,
-/// is a `ReferenceError` — V8's `kModuleExportUndefined`, "Export '%' is not
-/// defined in module" — and both cases are the same check there: the cell the
-/// name would find is created per export name at instantiation
+/// A name the host did not declare, or a module that is not yet instantiated —
+/// so whose bindings do not exist — is a `ReferenceError`, V8's
+/// `kModuleExportUndefined`, "Export '%' is not defined in module"
 /// (`SyntheticModule::SetExport`, `v8/src/objects/synthetic-module.cc:22`).
 pub fn set_synthetic_module_export(
     module: &Handle<SourceTextModule>,
@@ -501,9 +492,9 @@ pub fn set_synthetic_module_export(
     let declared = synthetic
         .export_names
         .iter()
-        .position(|declared| declared == name);
-    let declared = declared.filter(|_| *module.status.borrow() != ModuleStatus::Unlinked);
-    let Some(index) = declared else {
+        .any(|declared| declared == name);
+    let environment = module.environment.borrow().as_ref().copied();
+    let Some(environment) = environment.filter(|_| declared) else {
         return Err(JsError::new(
             ErrorKind::ReferenceError,
             format!(
@@ -512,8 +503,7 @@ pub fn set_synthetic_module_export(
             ),
         ));
     };
-    crux::heap::write_barrier(&**module, value);
-    synthetic.exports.borrow_mut()[index] = Some(value);
+    environment.set_mutable_binding(name, value, true)?;
     Ok(true)
 }
 
@@ -913,12 +903,27 @@ pub fn module_declaration_instantiation(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<(), JsError> {
-    // A synthetic module has no imports and no exports to resolve: its bindings
-    // are the names its host declared, so V8's PrepareInstantiate and
-    // FinishInstantiate have nothing to do but the status
-    // (`v8/src/objects/synthetic-module.cc:86`).
-    if module.synthetic.is_some() {
+    // CreateSyntheticModule (spec 16.2.1.5.2): a synthetic module's
+    // [[Environment]] holds a mutable binding for each name its host declared,
+    // initialized to *undefined* — the cell per name V8 makes at instantiation
+    // (`SyntheticModule::PrepareInstantiate`,
+    // `v8/src/objects/synthetic-module.cc:86`). It has no imports to resolve and
+    // no outer environment: those bindings are the whole of what
+    // `SetSyntheticModuleExport` writes and what an import of one of these names
+    // reads, which is why the record is made here rather than a side table
+    // beside it.
+    if let Some(synthetic) = &module.synthetic {
+        // Replacing a record that already exists would discard the values a
+        // host has set, so the creation is behind the same status check the
+        // early return always had.
         if *module.status.borrow() == ModuleStatus::Unlinked {
+            let env = new_module_environment(None);
+            crux::heap::write_barrier_handle(&**module, env);
+            for name in &synthetic.export_names {
+                env.create_mutable_binding(name, false)?;
+                env.initialize_binding(name, Value::Undefined)?;
+            }
+            module.environment.replace(Some(env));
             module.status.replace(ModuleStatus::Linked);
         }
         return Ok(());
@@ -3029,6 +3034,17 @@ fn resolve_export(
         return Ok(None);
     }
     resolve_set.push((*module, name.clone()));
+    // A synthetic module's exports are its host's declaration, and each is a
+    // binding in the module's own environment — what it has no export entries
+    // for, and all it has (spec 16.2.1.5.2 `ResolveExport`: the module itself,
+    // bound to the name).
+    if let Some(synthetic) = &module.synthetic {
+        return Ok(synthetic
+            .export_names
+            .iter()
+            .any(|declared| declared == name)
+            .then(|| ResolvedBinding::Local(*module, name.clone())));
+    }
     for export in &module.local_export_entries {
         if export_name_string(export.export_name.as_ref())
             .ok()
@@ -3128,17 +3144,19 @@ pub fn namespace_get(
     name: &JsString,
 ) -> Result<Value, JsError> {
     if let Some(synthetic) = &module.synthetic {
-        // A synthetic module's namespace reads its export slots. A name that is
-        // not declared is not a property of the namespace, so a read never
-        // arrives with one; an export the host has not set reads as *undefined*,
-        // which is what its cell was created as.
-        let index = synthetic
+        // A synthetic module's namespace reads that module's own bindings. A
+        // name it did not declare is not a property of the namespace, so a read
+        // never arrives with one; an export the host has not set reads as
+        // *undefined*, which is what the binding was initialized to.
+        let declared = synthetic
             .export_names
             .iter()
-            .position(|declared| declared == name);
-        return Ok(index
-            .and_then(|index| synthetic.exports.borrow()[index])
-            .unwrap_or(Value::Undefined));
+            .any(|declared| declared == name);
+        let environment = module.environment.borrow().as_ref().copied();
+        return match environment.filter(|_| declared) {
+            Some(environment) => environment.get_binding_value(name, true),
+            None => Ok(Value::Undefined),
+        };
     }
     let mut resolve_set = Vec::new();
     match resolve_export(agent, module, name, &mut resolve_set)? {
