@@ -63,6 +63,7 @@ mod support;
 mod template;
 #[cfg(test)]
 mod test_support;
+mod unbound_script;
 mod value;
 mod wasm;
 

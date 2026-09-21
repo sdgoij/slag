@@ -195,6 +195,18 @@ impl Module {
         }
     }
 
+    /// The module's source text, when it is a source text module
+    /// (`Function.prototype.toString` for the module's functions, and the code
+    /// cache a host asks the module's unbound script for).
+    ///
+    /// `None` for a synthetic module: its body is a host callback, and the
+    /// record's source field is the empty program it was built from rather than
+    /// anything the host wrote.
+    pub fn source_text(&self) -> Option<String> {
+        self.is_source_text_module()
+            .then(|| self.module.source.to_string_lossy())
+    }
+
     /// The record's identity hash (v8::Module::GetIdentityHash), for a host that
     /// keys a table by module.
     ///

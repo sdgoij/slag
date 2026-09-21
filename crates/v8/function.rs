@@ -9,7 +9,8 @@ use crate::data::{Context, Function, FunctionTemplate, Object, Value};
 use crate::handle::{Local, LocalHandle};
 use crate::isolate::{Isolate, UnsafeRawIsolatePtr};
 use crate::scope::PinScope;
-use crate::support::{MapFnFrom, MapFnTo, UnitType};
+use crate::script_compiler::CachedData;
+use crate::support::{MapFnFrom, MapFnTo, UniqueRef, UnitType};
 
 /// Whether a function can be called with `new` (v8::ConstructorBehavior).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +41,25 @@ pub enum SideEffectType {
 pub type FunctionCallback = unsafe extern "C" fn(*const FunctionCallbackInfo);
 
 impl<'s> LocalHandle<'s, Function> {
+    /// A code cache for this function
+    /// (v8::Function::CreateCodeCache).
+    ///
+    /// The function's own definition text — what the record keeps for
+    /// `Function.prototype.toString` — and `None` for a callable that has none,
+    /// which is the crate's answer for a function it cannot serialize. See
+    /// [`crate::UnboundScript::create_code_cache`] for what the bytes are and
+    /// why they are not compiled code.
+    ///
+    /// The crate takes no scope here, so this reads the realm the thread has
+    /// entered, as its other scope-free accessors do; with no realm entered
+    /// there is no function to describe.
+    pub fn create_code_cache(&self) -> Option<UniqueRef<CachedData<'static>>> {
+        let isolate = crate::scope::isolate_of(crate::realm::current()?);
+        let mut isolate = isolate;
+        let source = isolate.engine_mut().function_source(self.engine())?;
+        Some(CachedData::owned(source.into_bytes()))
+    }
+
     /// Call the function (`v8::Function::Call`). A failure leaves the thrown
     /// value as the pending exception, which is what the crate we stand in for
     /// reports the same way.

@@ -52,7 +52,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crux::error::JsError;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 
@@ -116,6 +116,24 @@ impl Isolate {
     /// The underlying agent (advanced use; the spec state lives here).
     pub fn agent(&mut self) -> &mut Agent {
         &mut self.agent
+    }
+
+    /// The exact source text of `function`'s definition, when the record keeps
+    /// one (`Function.prototype.toString`, and the code cache a host asks a
+    /// function for).
+    ///
+    /// `None` for a value that is not a function and for a callable the engine
+    /// did not parse from source — a builtin's body is a builtin, and a
+    /// synthesized function has no text of its own.
+    pub fn function_source(&mut self, function: &Local) -> Option<String> {
+        let ValueKind::Function(function) = function.value().kind() else {
+            return None;
+        };
+        self.agent
+            .ecma_functions
+            .get(&function.id())
+            .and_then(|data| data.source.as_ref())
+            .map(|source| source.to_string_lossy())
     }
 
     /// The current isolate on this thread, or `None` outside an eval/call

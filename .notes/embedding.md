@@ -566,6 +566,7 @@ number is the certified one.
 | after the callback scope's lifetime (the two `E0515`s) | **19** (see below) |
 | after the compiled-module surface (the engine's wasm API exposed: `api::WasmModuleObject`, `api::CompiledWasmModule`, and the bridge's `WasmModuleObject` over them) | **15** (see below) |
 | after the streaming half (the engine's `HostHooks` wasm-streaming pair, `api::WasmStreaming`, and the bridge's `Isolate::set_wasm_streaming_callback` / `WasmStreaming`) | **12** (see below) |
+| after the unbound scripts and the code cache (`UnboundScript`/`UnboundModuleScript`, `create_code_cache` on the script, the module script and a function, `get_source_mapping_url`) | **6** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -586,7 +587,7 @@ error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
 
 That was the shape of the frontier then. It is no longer: with no names left, the
-12 errors are 11 `E0599`s (methods and the subsystems they name) and 1 `E0282`,
+6 errors now are 5 `E0599`s (methods and the subsystems they name) and 1 `E0282`,
 so the count is a *method-level* metric now, as §10 says — and each step's own
 record below names which code classes moved rather than only the total.
 
@@ -2116,11 +2117,99 @@ fail / 0 pending**; the JS-API sweep **1,001 tests / 0 fail**. Every number is t
 certified one.
 
 The wasm tail is closed. What is left of the bridge's frontier is the method
-surface: 11 `E0599`s (`Function::create_code_cache` twice,
-`Script::get_unbound_script` twice, `Module::get_unbound_module_script` twice,
-`Module::evaluate_for_import_defer`, `Module::get_stalled_top_level_await_message`,
-`StackTrace::current_stack_trace` twice, and `HandleScope::get_heap_statistics`),
-and the one `E0282` nothing has explained yet.
+surface: 5 `E0599`s (`Module::evaluate_for_import_defer`,
+`Module::get_stalled_top_level_await_message`, `StackTrace::current_stack_trace`
+twice, and `HandleScope::get_heap_statistics`), and the one `E0282` nothing has
+explained yet.
+
+**The unbound scripts and the code cache — landed, 12 → 6, and the one that made
+`None` unavailable.** Six
+sites, three names: `Script::get_unbound_script` (`libs/core/runtime/jsrealm.rs:575`
+and `ops_builtin_v8.rs:398`), `Module::get_unbound_module_script`
+(`libs/core/modules/map.rs:904` and `:918`), and `create_code_cache` twice — on
+the unbound script (`ops_builtin_v8.rs:550`) and on a function
+(`libs/core/modules/map/ext_script.rs:711`).
+
+The setup is what made this the next slice rather than any of the other
+remaining ones, and it is worth reading before the code: **V8's code cache is
+load-bearing in `deno_core`'s default configuration.** The module map asks for a
+cache on *every* module load — a cache *miss* included
+(`modules/map.rs:900`, guarded by `try_store_code_cache`, which the no-data
+branch sets `true`) — and turns `None` into
+`ModuleError::Concrete(UnboundModuleScriptCodeCache)`, i.e. a failed load, and
+the CLI enables caching unless `--no-code-cache` is passed
+(`cli/args/flags.rs:680`). So the crate's own documented answer for a script that
+cannot be serialized (`None`, "This will return nullptr if the script cannot be
+serialized") is not one this bridge can give, however truthful it would be on its
+own.
+
+What it gives instead is the code's own **source text**. The engine keeps no
+serialized compiled form — it parses and evaluates in one pass — so there is
+nothing else it *could* give; V8's contract makes the bytes opaque to a host; and
+`CachedData::rejected()` answers `true` always, which is the flag's own escape
+hatch: a host that trusts it re-produces its cache, and nothing is ever believed
+that was not checked. The cost is stated where a host would look for it (the
+module header of `crates/v8/unbound_script.rs`): its cache database holds a copy
+of the source and the round trip saves nothing. A cache that saves something
+means serializing the compiled program, which §10 already lists as engine-side
+build-order work — not something a bridge can fake into being faster.
+
+`CachedData` gained an owned form for that (`crates/v8/script_compiler.rs`),
+because `create_code_cache` answers `CachedData<'static>` — data that outlives
+the call that made it, where `new` wraps bytes a host lends for a compile.
+
+**The unbound forms are the identity, and that is the engine's shape rather than
+a shortcut.** There, a `Script` is bytecode bound to a context and an
+`UnboundScript` is the same bytecode unbound; here a script *is* its source text
+(`crates/v8/script.rs`) and a module *is* a record, and neither names a context —
+every script handle is already unbound, so `bind_to_current_context` returns the
+handle it was given and `get_unbound_script` / `get_unbound_module_script` retag
+it. No engine state was needed for any of that, and a synthetic module — which
+has no script, and which the crate `DCHECK`s against — aborts with that reason.
+
+`get_source_mapping_url` came with it, because the same name the fix unmasks is
+what `modules/map.rs:919` reads to find a module's source map. V8 reads a *magic
+comment* as syntax (`Scanner::TryToParseMagicComment`,
+`v8/src/parsing/scanner.cc:280`: `//[#@]\s*sourceMappingURL\s*=\s*<url>`, last one
+wins) and the bridge has no lexer to do that with — the engine's parser keeps its
+comments to itself, and its only public surface is the parse functions — so it
+reads the source as text with one restriction that keeps a false positive very
+unlikely: the comment must be on a line of its own, which is how every emitter
+writes one. §9 states that as a divergence, both directions.
+
+**Engine change, as named before it was written (§9's ledger, item 11): two
+exposures, no new state.** `api::Isolate::function_source` reads
+`agent.ecma_functions`' stored definition text — the same text
+`Function.prototype.toString` answers with, which is also why a builtin, whose
+body is a builtin, answers `None` — and `api::Module::source_text` reads
+`SourceTextModule.source`, kept for the same reason. Neither changes any
+behaviour; the battery below ran anyway, because the engine crate changed.
+
+Measured: **12 → 6** (`E0599` 11 → 5; the `E0282` is untouched and is not this
+subsystem's). Six bridge tests, each verified by mutating the code it guards:
+an empty cache instead of the source text fails the script test on the bytes; a
+fixed payload fails the module test; answering the *first* magic comment instead
+of the last fails the ordering assertion; making `source_text` answer for a
+synthetic module fails the synthetic-module abort; making the source map answer
+of a comment-free source a string instead of `undefined` fails two tests; and a
+`function_source` that always answers `Some(String::new())` fails both halves of
+the function test (the definition text and the builtin's `None`).
+
+Gates: `cargo test -p v8 --features simdutf` **195 passed / 0 failed** (6 of them
+this step), `cargo test -p runtime --lib` **787 passed / 0 failed**,
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean (one
+`trim_split_whitespace` the scan had to answer for), `cargo test --locked
+--workspace -- --skip the_data_a_built_function_carries_survives_a_collection`
+**5,134 passed / 0 failed / 4 ignored across 38 binaries**. `crates/runtime`
+changed, so the battery ran and every number is the certified one: test262 `all`
+48,622 fixtures — 48,464 pass, **0 fail / 0 crash / 0 hang**, 158 skip;
+`intl402` 3,357 — 3,205 pass, 0 fail / 0 crash / 0 hang, 152 skip; the eight wasm
+core suites **64,594 checks / 0 fail / 0 pending**; the JS-API sweep **1,001 tests
+/ 0 fail**.
+
+What is left is 5 `E0599`s and the `E0282`: the stack-trace frames (both
+sites, the plan's named next engine item), `get_heap_statistics`, the stalled
+`await` report, and import-defer's evaluation entry point.
 
 ## 8. Parked: the C++ face
 
@@ -2544,6 +2633,51 @@ if that proves possible.
   graph now carries two Cranelifts (its own 0.117 and ours 0.134) until it drops
   one, and a host whose lock predates those six patches must bump them. The
   engine's manifests are unchanged from what they were.
+11. **The code cache and the unbound scripts — named before the bridge half is
+  written.** Six sites, two shapes, and the first is the surprise: V8's code
+  cache is *load-bearing* in `deno_core`'s default configuration. `ModuleMap`
+  calls `create_code_cache` on every module load — a cache *miss* included
+  (`libs/core/modules/map.rs:900`, guarded by `try_store_code_cache`, which the
+  no-data branch sets `true`) — and turns `None` into
+  `ModuleError::Concrete(UnboundModuleScriptCodeCache)`, a failed load; the CLI
+  has caching on by default (`--no-code-cache` disables it,
+  `cli/args/flags.rs:680`). So `None` is not available to this bridge even
+  though it is the crate's own documented answer for a script that cannot be
+  serialized.
+
+  **Decision: `create_code_cache` answers `Some(CachedData)` whose bytes are the
+  code's own source text.** The engine keeps no compiled form to serialize — it
+  parses and evaluates in one pass — and V8's own contract makes the bytes
+  opaque to a host, while `CachedData::rejected()` answers `true` here always
+  (`crates/v8/script_compiler.rs`), so the flag keeps its meaning: a host that
+  trusts it re-produces, and nothing is ever believed that was not checked. The
+  cost is stated rather than hidden: a host's cache database holds a copy of the
+  source and the round trip saves nothing. A cache that saves something means
+  serializing the engine's compiled program, which §10 lists as engine-side
+  build-order work — not something a bridge can fake into being faster.
+
+  **Engine change, named — two exposures, no new state:**
+  `api::Isolate::function_source(function)` reads the definition text
+  `agent.ecma_functions` keeps — the text `Function.prototype.toString` answers
+  with — and `api::Module::source_text()` reads `SourceTextModule.source`, kept
+  for the same reason. Both are additive and read-only.
+
+  The rest is bridge work: `Script::get_unbound_script` and
+  `Module::get_unbound_module_script` (a retag — the engine's script handle and
+  module record *are* the context-unbound forms, since a script here is its
+  source text and a module is a record), the two unbound tags'
+  `create_code_cache` and `get_source_mapping_url`, `Function::create_code_cache`,
+  and an owned form for `CachedData` so bytes the bridge produced can outlive the
+  call (`create_code_cache` answers `CachedData<'static>`).
+  `get_source_mapping_url` is V8's own extraction — the magic comment
+  (`v8/src/parsing/scanner.cc:280`, `//[#@]\s<name>=\s*<value>`, last one wins)
+  — read as text, since the bridge has no lexer; §9 states the one word of
+  divergence that costs.
+
+  **Landed, 12 → 6** (§7 records it): the six sites resolve, six bridge tests
+  guard the six mutations that would silently break them, and the engine's two
+  exposures changed no behaviour (the battery ran anyway and reproduced every
+  certified number).
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -2582,12 +2716,40 @@ if that proves possible.
   decoded at `WasmStreaming::finish`, not as they arrive. A host sees the same
   module and the same promise — the compile-as-it-streams is what is missing, and
   it is not observable through the API.
+- **The code cache a host stores is the code's own source text, and it is inert.**
+  V8's `create_code_cache` answers serialized bytecode; this engine keeps no
+  compiled form, so there is nothing to serialize, and `None` — the crate's
+  documented answer for that — would break `deno_core`'s default configuration
+  rather than report the gap (its module map asks on every load and treats the
+  empty answer as a failed load; see §7's record, and the ledger's item 11 for
+  the decision). So the bytes are the source text, which a host stores and hands
+  back and the engine ignores, and `CachedData::rejected()` answers `true` always
+  so that a host which trusts the flag re-produces its cache. The cost, stated:
+  the host's cache database holds a copy of the source and the round trip saves
+  nothing. Nothing here is ever believed that was not checked, which is the
+  property that makes the divergence inert rather than wrong.
+- **A source map URL is read from the source text, not from a lexer.** V8's
+  scanner recognizes the magic comment as syntax (`scanner.cc:280`) and keeps the
+  last one it sees, wherever in the source it is. The bridge's `UnboundScript` /
+  `UnboundModuleScript::get_source_mapping_url` reads the source as text and
+  accepts only a comment that occupies a line of its own — the shape every
+  emitter writes, and the one a string or template literal containing the same
+  characters cannot plausibly have. Both directions of the difference are real:
+  a mid-line magic comment that V8 would find answers `undefined` here, and a
+  whole-line one that V8's *scanner* would reject as string content would be read
+  as a comment. The first is the cost of having no lexer; the second is why the
+  rule is line-anchored rather than a plain search.
 
 ## 10. Build order
 
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots; (4) module resolver as a
-host trait, unbound scripts, code cache, script origins. Then, in the order the
+host trait (landed), **unbound scripts and script origins** (the bridge side
+landed — every Rust script handle is already context-unbound — and what the
+engine still owes there is the *code cache*: serializing its compiled program, so
+that the bytes a host stores are worth storing; §7's record and the ledger's item
+11 state why the bridge hands out the source text meanwhile). Then, in the order
+the
 shim histogram implies: structured frames and termination — **now the next engine
 item**, and the survey in §7 splits it into the execution-context frame accessor
 (no positions) and the per-activation source positions that `Message`'s runtime
@@ -2620,12 +2782,11 @@ half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
 `Message` surface and `Exception::create_message` (piece 2 of the stack-trace
 split) to 37, the module structure surface to 25, the synthetic-module surface to
 21, the callback scope's lifetime to 19, the compiled-module surface to 15, the
-streaming half to 12, and
+streaming half to 12, the unbound scripts and the code cache to 6, and
 what is left is the method
-surface (11 `E0599`s, all of them named methods and subsystems: code cache,
-unbound scripts, import-defer's evaluation entry point, the
-stalled-top-level-await report, the frames of a stack trace, and
-`get_heap_statistics`), and one straggler (1 `E0282`).
+surface (5 `E0599`s, all of them named methods and subsystems: the stack-trace
+frames twice, the stalled `await` report, import-defer's evaluation entry point,
+and `get_heap_statistics`), and one straggler (1 `E0282`).
 The two that the suite had surveyed as needing engine work have landed since,
 `get_constructor_name` and `get_extras_binding_object`, and they turned out to
 need a walk of the prototype chain and a per-context object rather than V8's map

@@ -11,11 +11,16 @@
 //! - `compile_function` wraps the body in a function expression with the
 //!   parameters it was given and evaluates *that*, which yields the same
 //!   function;
-//! - a code cache round-trips — it is stored, handed back, and readable — but
-//!   nothing consumes or produces one, so [`CachedData::rejected`] answers
-//!   `true` and a host that trusts it will re-produce its cache. That is the
-//!   safe direction: it costs a re-parse, where believing a cache the engine
-//!   cannot use would cost correctness.
+//! - a code cache round-trips — it is stored, handed back, and readable — and
+//!   [`create_code_cache`](crate::UnboundScript::create_code_cache) produces
+//!   one, but nothing *consumes* it: [`CachedData::rejected`] answers `true`
+//!   always, so a host that trusts it re-produces its cache. That is the safe
+//!   direction: it costs a re-parse, where believing a cache the engine cannot
+//!   use would cost correctness. What the produced bytes are is stated where
+//!   they are made (`crates/v8/unbound_script.rs`), and why they have to exist
+//!   at all is recorded in `.notes/embedding.md` (the ledger's item 11):
+//!   `deno_core`'s module map asks for one on every load and turns `None` into
+//!   a failed load.
 
 use std::cell::Cell;
 use std::ops::Deref;
@@ -96,10 +101,21 @@ fn text_of(string: &Local<'_, String>) -> std::string::String {
 
 /// Data a host can cache and hand back
 /// (`v8::script_compiler::CachedData`).
+///
+/// Both forms exist because the crate we stand in for has them: bytes a host
+/// hands in are borrowed for the compile ([`new`](Self::new)), while the data
+/// [`create_code_cache`](crate::UnboundScript::create_code_cache) answers with
+/// belongs to the caller and outlives the call it was made in.
 #[derive(Debug)]
 pub struct CachedData<'a> {
-    data: &'a [u8],
+    data: CacheBytes<'a>,
     rejected: Cell<bool>,
+}
+
+#[derive(Debug)]
+enum CacheBytes<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
 }
 
 impl<'a> CachedData<'a> {
@@ -107,9 +123,28 @@ impl<'a> CachedData<'a> {
     /// (`v8::ScriptCompiler::CachedData::new`).
     pub fn new(data: &'a [u8]) -> UniqueRef<Self> {
         UniqueRef::new(Self {
-            data,
+            data: CacheBytes::Borrowed(data),
             rejected: Cell::new(true),
         })
+    }
+
+    /// Data the bridge produced, owned by the value rather than borrowed from a
+    /// caller — what a `create_code_cache` answer is.
+    ///
+    /// See the type's own documentation for what those bytes are.
+    pub(crate) fn owned(data: Vec<u8>) -> UniqueRef<Self> {
+        UniqueRef::new(Self {
+            data: CacheBytes::Owned(data),
+            rejected: Cell::new(true),
+        })
+    }
+
+    /// The bytes, borrowed or owned.
+    fn bytes(&self) -> &[u8] {
+        match &self.data {
+            CacheBytes::Borrowed(data) => data,
+            CacheBytes::Owned(data) => data,
+        }
     }
 
     /// Whether the engine refused this data
@@ -126,7 +161,7 @@ impl Deref for CachedData<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        self.data
+        self.bytes()
     }
 }
 
