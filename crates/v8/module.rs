@@ -803,6 +803,37 @@ mod tests {
         assert_eq!(answered.to_rust_string_lossy(scope), "held");
     }
 
+    /// A handle a *method* hands out under a callback scope is as long-lived as
+    /// the thing the scope was opened from, not as long-lived as the borrow of
+    /// the scope's storage — which is what a helper needs in order to open a
+    /// callback scope and a try-catch inside it and still answer its caller's
+    /// lifetime. `deno_core`'s synthetic-module steps are exactly that shape: a
+    /// resolver's promise, taken under a `tc_scope!` inside a `callback_scope!`.
+    #[test]
+    fn a_promise_taken_under_a_callback_scopes_try_catch_holds_the_callbacks_lifetime() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_scope, isolate);
+        let context = Context::new(handle_scope, Default::default());
+        let _scope = &mut crate::ContextScope::new(handle_scope, context);
+
+        fn settle<'s>(context: Local<'s, Context>) -> Option<Local<'s, Value>> {
+            crate::callback_scope!(unsafe scope, context);
+            crate::tc_scope!(tc_scope, scope);
+            let resolver = PromiseResolver::new(tc_scope).expect("resolver");
+            let value = Number::new(tc_scope, 42.0).into();
+            assert_eq!(resolver.resolve(tc_scope, value), Some(true));
+            let promise = resolver.get_promise(tc_scope);
+            // No re-wrapping: this conversion is what the fix buys, and it stops
+            // compiling the moment a callback scope's handles go back to being
+            // typed with the borrow of its storage.
+            Some(promise.into())
+        }
+
+        let answered = settle(context).expect("a promise");
+        let promise = Local::<Promise>::try_from(answered).expect("promise");
+        assert_eq!(promise.state(), PromiseState::Fulfilled);
+    }
+
     /// A module handle keys a host's table the way the crate's does: one record
     /// under two handles is one key, a different record is another, and that
     /// holds for a persistent handle too — which it cannot unless the hash

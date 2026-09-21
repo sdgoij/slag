@@ -313,6 +313,32 @@ fn cast_pinned_ref_mut<'a, 'p, I, O>(pinned: &'a mut PinnedRef<'p, I>) -> &'a mu
     unsafe { &mut *(pinned as *mut PinnedRef<'p, I> as *mut PinnedRef<'p, O>) }
 }
 
+/// A cast that takes on the scope's *own* lifetime instead of the borrow of its
+/// storage, which is what a callback scope's `Deref` is (see [`CallbackScope`]).
+///
+/// The casts above preserve the scope's lifetime, so they say nothing beyond the
+/// layout; this one is a claim its caller makes, and the callers are the deref
+/// pair that hands out a callback scope's handles plus the try-catch opened over
+/// one.
+fn cast_pinned_ref_widening<'a, 'p, 'q, I, O>(
+    pinned: &'a PinnedRef<'p, I>,
+) -> &'a PinnedRef<'q, O> {
+    // SAFETY: the scope types that cast into each other store the scope they
+    // wrap first and differ otherwise only in phantom type parameters, so the
+    // two `PinnedRef`s name the same address with the same contents. The
+    // lifetime is the scope's own parameter, which its constructor tied to what
+    // the scope was opened from — not a reborrow, and that is the point.
+    unsafe { &*(pinned as *const PinnedRef<'p, I> as *const PinnedRef<'q, O>) }
+}
+
+/// The mutable form of [`cast_pinned_ref_widening`].
+fn cast_pinned_ref_widening_mut<'a, 'p, 'q, I, O>(
+    pinned: &'a mut PinnedRef<'p, I>,
+) -> &'a mut PinnedRef<'q, O> {
+    // SAFETY: as above.
+    unsafe { &mut *(pinned as *mut PinnedRef<'p, I> as *mut PinnedRef<'q, O>) }
+}
+
 impl<'p, 'i> Deref for PinnedRef<'p, HandleScope<'i, Context>> {
     type Target = PinnedRef<'p, HandleScope<'i, ()>>;
 
@@ -458,6 +484,15 @@ impl<P: ScopeInit> Drop for ContextScope<'_, '_, P> {
 
 /// A handle scope for a callback (`v8::CallbackScope`). Slag has no callback
 /// handle region to open; the type exists so host code that opens one compiles.
+///
+/// Its `Deref` is not the reborrow the other scopes' are: the handles it hands
+/// out live as long as the thing it was made from — the context, which is the
+/// scope's own parameter — rather than as long as the borrow of its storage.
+/// That is the crate we stand in for's own choice, and the reason a host's helper
+/// can return a handle it built in a callback scope at all. The obligation it
+/// places on a host is real here too, and what it costs is stated in
+/// [`crate::store`]: a *script* handle that outlives the scope names a released
+/// slot, which panics rather than reading a later script's text.
 #[repr(C)]
 pub struct CallbackScope<'i, C = Context> {
     inner: HandleScope<'i, C>,
@@ -484,16 +519,16 @@ impl<'i, C> ScopeInit for CallbackScope<'i, C> {
 }
 
 impl<'p, 'i, C> Deref for PinnedRef<'p, CallbackScope<'i, C>> {
-    type Target = PinnedRef<'p, HandleScope<'i, C>>;
+    type Target = PinnedRef<'i, HandleScope<'i, C>>;
 
     fn deref(&self) -> &Self::Target {
-        cast_pinned_ref(self)
+        cast_pinned_ref_widening(self)
     }
 }
 
 impl<'p, 'i, C> DerefMut for PinnedRef<'p, CallbackScope<'i, C>> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        cast_pinned_ref_mut(self)
+        cast_pinned_ref_widening_mut(self)
     }
 }
 
@@ -699,13 +734,16 @@ impl<'scope, 'obj: 'scope, 'i, C> NewTryCatch<'scope> for PinnedRef<'obj, Handle
 }
 
 impl<'scope, 'obj: 'scope, 'i, C> NewTryCatch<'scope> for PinnedRef<'obj, CallbackScope<'i, C>> {
-    type NewScope = TryCatch<'scope, 'obj, HandleScope<'i, C>>;
+    type NewScope = TryCatch<'scope, 'i, HandleScope<'i, C>>;
 
     fn make_new_scope(me: &'scope mut Self) -> Self::NewScope {
         TryCatch {
             // A callback scope *is* a handle scope: the two `PinnedRef`s name
             // the same address, which is the bridge's own `Deref` between them.
-            scope: cast_pinned_ref_mut(me),
+            // The handler takes on that `Deref`'s lifetime rather than the
+            // borrow, so a host's `tc_scope!` opened over a callback scope hands
+            // out handles as long-lived as the callback scope's own.
+            scope: cast_pinned_ref_widening_mut(me),
             catch: None,
             _pinned: PhantomPinned,
         }

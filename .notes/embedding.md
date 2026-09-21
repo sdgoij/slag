@@ -563,6 +563,7 @@ number is the certified one.
 | after the message surface (`Exception::create_message`, `Message::{get, get_script_resource_name, get_line_number, get_start_column, get_stack_trace}`, and the recorded position behind them) | **37** (see below) |
 | after the module structure surface (a module's requests and the four reads on one, an offset's location, the graph's async-ness, the deferred namespace, and the two callback-scope sites `Local::new` was blocking) | **25** (see below) |
 | after the synthetic-module surface (the record kind the engine gained, its export writes, its evaluation steps, and the `SyntheticModuleEvaluationSteps` re-export) | **21** (see below) |
+| after the callback scope's lifetime (the two `E0515`s) | **19** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -583,8 +584,8 @@ error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
 
 That was the shape of the frontier then. It is no longer: with three names left,
-the 21 errors are 15 `E0599`s (methods and the subsystems they name), 3
-`E0425`s, 1 `E0282` and 2 `E0515`s, so the count is a *method-level* metric now,
+the 19 errors are 15 `E0599`s (methods and the subsystems they name), 3
+`E0425`s and 1 `E0282`, so the count is a *method-level* metric now,
 as §10 says — and each step's own record below names which code classes moved
 rather than only the total.
 
@@ -1902,13 +1903,66 @@ none reaches `runtime::api` — and the numbers are the certified ones: test262
 eight wasm core suites **64,594 checks / 0 fail / 0 pending** (20,662 + 25,990 +
 77 + 7,485 + 105 + 654 + 8,709 + 912); the JS-API sweep **1,001 tests / 0 fail**.
 
-**What this exposes.** The synthetic path is name-complete, but `deno_core`'s own
-steps function still does not type-check, and not for a reason this slice owns:
-`map.rs:1805` is a second instance of §12 item 8 — a host helper returning a
-handle it made under a callback scope — previously hidden behind the missing
-names. `E0515` went 1 → 2 for that reason, and it is the same one fix §12 item 8
-already describes: the callback scope's first lifetime has to be the parameter's
-rather than the storage borrow's.
+**What this exposes, and what the next record fixes.** The synthetic path is
+name-complete, but `deno_core`'s own steps function did not type-check, and not
+for a reason this slice owned: `map.rs:1805` was a second instance of §12 item 8
+— a host helper returning a handle it made under a callback scope — previously
+hidden behind the missing names. `E0515` went 1 → 2 for that reason, and the fix
+is the one §12 item 8 described: the callback scope's first lifetime has to be
+the parameter's rather than the storage borrow's. It is the record below.
+
+**The callback scope's lifetime — landed, 21 → 19, both `E0515`s with it.** The two
+sites (§12 item 8) were one shape: a host helper that opens a `callback_scope!`
+and returns a handle it made inside, typed with its caller's lifetime.
+`MapData::resolve_callback` (`libs/core/modules/map.rs:1374`) is the plain form;
+`synthetic_module_evaluation_steps` (`:1805`) adds a `tc_scope!` and hands back a
+resolver's promise — which is what exposed it, because the missing
+synthetic-module names had been hiding the error behind them.
+
+The crate we stand in for solves this in the *deref*, and says so in a comment
+(`scratch/ref/v8-150/scope.rs:1968-1973`): a callback scope's handles "live as
+long as the thing that we made the `CallbackScope` from", so
+`PinnedRef<'_, CallbackScope<'i, C>>` derefs to `PinnedRef<'i, HandleScope<'i, C>>`
+— the scope's own parameter, which `NewCallbackScope<'s> for Local<'s, Context>`
+ties to the *context* — rather than to the borrow of its storage. This bridge's
+deref kept the borrow, which is why a handle taken under a callback scope could
+not leave it.
+
+Two impls changed, and the cast between them is the interesting half: the
+existing `cast_pinned_ref`/`_mut` helpers *preserve* the scope's lifetime, so all
+they prove is the layout, while this one takes on a lifetime its caller claims —
+`cast_pinned_ref_widening`, with the claim argued where it is made. The deref pair
+widens to `'i`, and `NewTryCatch for PinnedRef<'obj, CallbackScope<'i, C>>` now
+yields `TryCatch<'scope, 'i, HandleScope<'i, C>>` instead of threading the borrow
+through: without that second half, a `tc_scope!` opened over a callback scope
+would hand back handles typed with the borrow again, which is precisely deno's
+steps function. `NewTryCatch`'s plain-`HandleScope` and `ContextScope` impls are
+left alone — they thread the parent's own parameter, as there.
+
+The consequence is stated rather than hidden, in `CallbackScope`'s documentation
+and in `crate::store`'s: a host may now hold a handle past the scope it was made
+in, which is what that shape means. The one payload this bridge ties to a region
+is a *script's* source text, so a script handle that outlives its scope names a
+released slot and panics ("a Script handle outlived its handle scope") rather
+than reading a later script's text. The crate we stand in for carries the same
+obligation with no check at all, because there the handle is a pointer into a
+scope that is gone.
+
+Measured: **21 → 19**, `E0515` 2 → 0, nothing new; the remaining 19 are 15
+`E0599`s, 3 `E0425`s and 1 `E0282`. One new test, and it *is* the guard: it
+settles a promise under a `tc_scope!` inside a `callback_scope!` and returns it
+at the caller's own lifetime with no re-wrapping, so putting either impl back to
+the borrow makes it fail to compile with the same `E0515` `deno_core` reported
+("cannot return value referencing local variable `scope`" — checked by doing it).
+
+Gates: `cargo test -p v8 --features simdutf` **184 passed / 0 failed** (1
+filtered: the known crashing test), `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean, `cargo test --locked --workspace -- --skip
+the_data_a_built_function_carries_survives_a_collection` **5,121 passed / 0
+failed / 4 ignored across 38 binaries**. No sweep, and the check is stronger than
+a grep this time: no runner crate depends on `crates/v8` at all — no manifest
+under `crates/{test262,wasmtest,wasm,cli}` names it and `cargo tree -p test262`
+shows none — so the battery cannot see this change either way.
 
 ## 8. Parked: the C++ face
 
@@ -2221,7 +2275,7 @@ if that proves possible.
   away from a host that can otherwise work, and a heap that sweeps anyway would
   be unsound. A host that needs reclamation needs L2.
 - **A synthetic module's steps are a function pointer, and the host's function is
-  reached through its type.** The crate's `SyntheticModuleEvaluationSteps<'s>`
+  reached through its type.**The crate's `SyntheticModuleEvaluationSteps<'s>`
   names the scope's lifetime in its arguments, and the engine keeps the callback
   in the record for the record's whole life, so the mapped pointer cannot be
   stored — a `.map_fn_to()` value would have to outlive the scope it was mapped
@@ -2234,6 +2288,14 @@ if that proves possible.
   report a throw that way, and V8 records `isolate->exception()` as the module's
   error), and `create_synthetic_module` aborts on an engine refusal, which that
   shape has no channel to report.
+- **A callback scope's handles carry the lifetime of what the scope was opened
+  from, not the borrow of its storage.** That is the crate we stand in for's own
+  choice, and this bridge reproduces it because a host's helper has to be able to
+  return a handle it made in a callback scope (two `deno_core` sites do, §7). The
+  obligation it places on a host is real, and what it costs here is a panic
+  rather than undefined behavior: the one payload this bridge ties to a region is
+  a script's source text, so a script handle that outlives its scope reads a
+  released slot and panics, where the crate's pointer would simply dangle.
 
 ## 10. Build order
 
@@ -2269,12 +2331,12 @@ surface to 56, the attribute-carrying half of the template cluster to 52, the st
 half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
 `Message` surface and `Exception::create_message` (piece 2 of the stack-trace
 split) to 37, the module structure surface to 25, the synthetic-module surface to
-21, and what is left is the method
+21, the callback scope's lifetime to 19, and what is left is the method
 surface (15 `E0599`s, all of them named methods and subsystems: wasm streaming
 and the module-object round trip, code cache, unbound scripts, import-defer's
 evaluation entry point, the stalled-top-level-await report, the frames of a stack
-trace, and `get_heap_statistics`), the 3 names, and two
-stragglers (2 `E0515`s, 1 `E0282`).
+trace, and `get_heap_statistics`), the 3 names, and one
+straggler (1 `E0282`).
 The two that the suite had surveyed as needing engine work have landed since,
 `get_constructor_name` and `get_extras_binding_object`, and they turned out to
 need a walk of the prototype chain and a per-context object rather than V8's map
@@ -2337,22 +2399,14 @@ delete.
    engine's own existing tables's. Either the engine grows a hook a bridge can
    register, or the table is rebuilt per compile, and both are decisions rather
    than drive-bys.
-8. **A host helper that ties a handle to the callback scope's own lifetime still
-   does not compile, and the fix is a scope shape.** Two sites today:
-   `deno/libs/core/modules/map.rs:1374` is `MapData::resolve_callback`, and
-   `map.rs:1805` is `synthetic_module_evaluation_steps`' return (exposed only
-   once the synthetic-module names resolved, §7). Both name the scope's *first*
-   lifetime and return a handle built under it, and their caller (a
-   `callback_scope!`-opened scope) has that lifetime be the borrow of the scope's
-   own storage frame. `Local::new` no longer has the problem (its scope
-   binding is free, §7), but an argument's binding is a different question, and
-   making it go away means the callback scope's first lifetime being the
-   *parameter's* — the context's — rather than the storage borrow's. That is a
-   `PinnedRef` shape change (its `'p` is a real `&'p mut`), and the cheap version
-   of it — a raw pointer plus a phantom lifetime — would let safe code move a
-   scope reference past the storage that owns it. Worth doing deliberately, not
-   as a drive-by for two sites, and it is now the only thing between the
-   synthetic path and a compiling `deno_core`.
+8. **A host helper that ties a handle to the callback scope's own lifetime —
+   landed** (§7). Two sites, one shape, one fix: a callback scope's `Deref` now
+   hands out handles at the scope's own parameter — the context's lifetime, which
+   its constructor binds — rather than at the borrow of its storage, and a
+   `tc_scope!` opened over a callback scope follows it (its `NewTryCatch` now
+   threads that lifetime rather than the borrow). `E0515` went 2 → 0, and the
+   guard is a test that settles a promise under both scopes and returns it at the
+   caller's lifetime.
 9. **Synthetic modules — landed** (the engine half and the bridge half; §7
    records both, and §9's bullet records the two shape decisions). What the
    engine grew: the `SyntheticModule` aspect on `SourceTextModule`, the four
