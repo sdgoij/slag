@@ -118,6 +118,14 @@ pub struct IsolateInner {
     /// The key is code units, because that is what tells two names apart; the
     /// engine's `JsString` has no hash to be a map key.
     private_names: RefCell<HashMap<Vec<u16>, Global<Value>>>,
+    /// The rejecting function of every resolver pair the bridge made
+    /// (`v8::Promise::Resolver::Reject`), by the resolve function's identity.
+    ///
+    /// The engine's record for a pair names each function by identity, and the
+    /// value of the rejecting one is nowhere else once the capability has been
+    /// built — a host only ever holds the resolve function — so the isolate keeps
+    /// it for a handle to name back.
+    resolver_rejects: RefCell<HashMap<u64, Global<Value>>>,
     /// The heap for host objects, which this isolate owns for its whole life.
     /// Not behind a `RefCell` because `get_cpp_heap` hands out a reference to it;
     /// the heap's own allocation list is the interior-mutable part.
@@ -290,6 +298,7 @@ impl Isolate {
             slots: UnsafeCell::new(HashMap::new()),
             context_slots: RefCell::new(HashMap::new()),
             private_names: RefCell::new(HashMap::new()),
+            resolver_rejects: RefCell::new(HashMap::new()),
             cpp_heap,
             templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
@@ -345,13 +354,18 @@ impl Isolate {
     }
 
     /// `v8::Isolate::SetData`.
-    pub fn set_data(&self, slot: u32, data: usize) {
-        self.inner().engine.set_data(slot, data);
+    ///
+    /// A host pointer, as there; the engine keeps slots of its own and this is
+    /// the same number seen as an address. The receiver is `&self` where the
+    /// crate's is `&mut self`, which is the permissive direction: every call
+    /// that compiles there compiles here.
+    pub fn set_data(&self, slot: u32, data: *mut c_void) {
+        self.inner().engine.set_data(slot, data as usize);
     }
 
-    /// `v8::Isolate::GetData`.
-    pub fn get_data(&self, slot: u32) -> Option<usize> {
-        self.inner().engine.get_data(slot)
+    /// `v8::Isolate::GetData`, null for a slot that was never set.
+    pub fn get_data(&self, slot: u32) -> *mut c_void {
+        self.inner().engine.get_data(slot).unwrap_or(0) as *mut c_void
     }
 
     /// The heap this isolate owns for host objects
@@ -607,6 +621,24 @@ impl Isolate {
             .borrow()
             .values()
             .any(|held| held.handle().engine().value().as_symbol() == Some(symbol))
+    }
+
+    /// Keep a resolver pair's rejecting function (`v8::Promise::Resolver`).
+    pub(crate) fn add_resolver_reject(&self, resolve: u64, reject: api::Local) {
+        self.inner()
+            .resolver_rejects
+            .borrow_mut()
+            .insert(resolve, Global::new(self, Local::from_engine(reject)));
+    }
+
+    /// The rejecting function of the pair whose resolve function has this
+    /// identity, when the bridge made the pair.
+    pub(crate) fn resolver_reject(&self, resolve: u64) -> Option<api::Local> {
+        self.inner()
+            .resolver_rejects
+            .borrow()
+            .get(&resolve)
+            .map(|held| *held.handle().engine())
     }
 
     /// Whether this isolate stores a function template at `pointer`.

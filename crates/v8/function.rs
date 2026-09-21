@@ -298,6 +298,39 @@ impl<'s, T> ReturnValue<'s, T> {
         // SAFETY: as `set`.
         unsafe { &*self.info }.get_return_value().set_null();
     }
+
+    /// Set the call's result to an `i32` (`v8::ReturnValue::SetInt32`).
+    ///
+    /// The engine has one number kind, so the width is the crate's way of
+    /// saying which range the value came from, and the value written is the
+    /// same number either way.
+    pub fn set_int32(&self, value: i32) {
+        // SAFETY: as `set`.
+        unsafe { &*self.info }
+            .get_return_value()
+            .set_number(value as f64);
+    }
+
+    /// Set the call's result to a `u32` (`v8::ReturnValue::SetUint32`).
+    pub fn set_uint32(&self, value: u32) {
+        // SAFETY: as `set`.
+        unsafe { &*self.info }
+            .get_return_value()
+            .set_number(value as f64);
+    }
+
+    /// Set the call's result to a `f64` (`v8::ReturnValue::SetDouble`).
+    pub fn set_double(&self, value: f64) {
+        // SAFETY: as `set`.
+        unsafe { &*self.info }.get_return_value().set_number(value);
+    }
+
+    /// Set the call's result to the empty string
+    /// (`v8::ReturnValue::SetEmptyString`).
+    pub fn set_empty_string(&self) {
+        // SAFETY: as `set`.
+        unsafe { &*self.info }.get_return_value().set_string("");
+    }
 }
 
 impl<F> MapFnFrom<F> for FunctionCallback
@@ -426,6 +459,20 @@ impl<'s> FunctionBuilder<'s, Function> {
     }
 }
 
+impl Function {
+    /// A builder over a callback mapped from a host function
+    /// (`v8::Function::builder`).
+    pub fn builder<'s>(callback: impl MapFnTo<FunctionCallback>) -> FunctionBuilder<'s, Self> {
+        FunctionBuilder::new(callback)
+    }
+
+    /// The same over a callback a host already has in the raw shape
+    /// (`v8::Function::builder_raw`).
+    pub fn builder_raw<'s>(callback: FunctionCallback) -> FunctionBuilder<'s, Self> {
+        FunctionBuilder::new_raw(callback)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +517,86 @@ mod tests {
     /// A callback that does nothing, for the settings a test reads off the
     /// function rather than off a call.
     fn noop(_scope: &mut PinScope<'_, '_>, _args: FunctionCallbackArguments, _rv: ReturnValue) {}
+
+    /// Callbacks that write the result through one of the typed setters.
+    fn returns_int32(
+        _scope: &mut PinScope<'_, '_>,
+        _args: FunctionCallbackArguments,
+        rv: ReturnValue,
+    ) {
+        rv.set_int32(-3);
+    }
+
+    fn returns_uint32(
+        _scope: &mut PinScope<'_, '_>,
+        _args: FunctionCallbackArguments,
+        rv: ReturnValue,
+    ) {
+        rv.set_uint32(7);
+    }
+
+    fn returns_double(
+        _scope: &mut PinScope<'_, '_>,
+        _args: FunctionCallbackArguments,
+        rv: ReturnValue,
+    ) {
+        rv.set_double(1.5);
+    }
+
+    fn returns_empty_string(
+        _scope: &mut PinScope<'_, '_>,
+        _args: FunctionCallbackArguments,
+        rv: ReturnValue,
+    ) {
+        rv.set_empty_string();
+    }
+
+    /// The whole point of `Function::builder`: a function built in the scope's
+    /// realm, callable from a script like any other.
+    #[test]
+    fn a_function_built_through_the_builder_is_callable() {
+        in_context!(scope, {
+            let function = Function::builder(plain_probe)
+                .build(scope)
+                .expect("function");
+            bind(scope, "probe", function.cast::<Value>());
+            assert_eq!(eval_number(scope, "probe()"), 1.0);
+        });
+    }
+
+    /// Each typed setter reaches the script that called in with the value it was
+    /// given — the empty string included, which is a string of length zero and
+    /// not *undefined*.
+    #[test]
+    fn the_typed_setters_reach_the_caller() {
+        in_context!(scope, {
+            let function = Function::builder(returns_int32)
+                .build(scope)
+                .expect("function");
+            bind(scope, "int32", function.cast::<Value>());
+            let function = Function::builder(returns_uint32)
+                .build(scope)
+                .expect("function");
+            bind(scope, "uint32", function.cast::<Value>());
+            let function = Function::builder(returns_double)
+                .build(scope)
+                .expect("function");
+            bind(scope, "double", function.cast::<Value>());
+            let function = Function::builder(returns_empty_string)
+                .build(scope)
+                .expect("function");
+            bind(scope, "empty", function.cast::<Value>());
+
+            assert_eq!(eval_number(scope, "int32()"), -3.0);
+            assert_eq!(eval_number(scope, "uint32()"), 7.0);
+            assert_eq!(eval_number(scope, "double()"), 1.5);
+            assert_eq!(eval_number(scope, "empty().length"), 0.0);
+            assert_eq!(
+                eval_number(scope, "typeof empty() === 'string' ? 1 : 0"),
+                1.0
+            );
+        });
+    }
 
     unsafe extern "C" fn noop_raw(_info: *const FunctionCallbackInfo) {}
 

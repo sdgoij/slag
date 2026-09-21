@@ -497,6 +497,17 @@ impl<T> Global<T> {
     }
 
     /// The scoped handle for this persistent one.
+    ///
+    /// The crate hands back a borrowed `&T` from `open`, which needs the methods
+    /// to live on the tag; here they live on `Local`, so what comes back is the
+    /// handle itself. An empty handle is not a panic either: the crate's `open`
+    /// dereferences the slot it names, and this bridge's empty handle is
+    /// *undefined*, so a host that opens one gets a value rather than a crash.
+    pub fn open<'s>(&self, scope: &PinScope<'s, '_, ()>) -> Local<'s, T> {
+        self.get(scope)
+    }
+
+    /// The scoped handle for this persistent one.
     pub fn get<'s>(&self, _scope: &PinScope<'s, '_, ()>) -> Local<'s, T> {
         match &self.script {
             Some(source) => {
@@ -609,5 +620,32 @@ impl<T> Handle for &Global<T> {
 
     fn payload_ref(&self) -> &Payload {
         &self.payload
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::Value;
+    use crate::scope::GetIsolate;
+    use crate::test_support::{eval, in_context};
+
+    /// `open` reads a persistent handle back under the crate's name, and answers
+    /// the same handle `get` does — an empty one included, which is *undefined*
+    /// here rather than the crate's borrow of a slot it never wrote.
+    #[test]
+    fn open_reads_back_what_the_handle_holds() {
+        in_context!(scope, {
+            let isolate = scope.get_isolate_ptr();
+            let value = eval(scope, "41 + 1");
+            let persistent = Global::new(&isolate, value);
+
+            assert_eq!(persistent.open(scope), persistent.get(scope));
+            assert_eq!(persistent.open(scope), value);
+
+            let empty: Global<Value> = Global::empty();
+            assert!(empty.is_empty());
+            assert!(empty.open(scope).is_undefined());
+        });
     }
 }

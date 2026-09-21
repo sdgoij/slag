@@ -547,6 +547,7 @@ number is the certified one.
 | after the identity hashes (the `Hash`/`Eq` a host's tables key on, and the module identity they hang off) | **351** (see below) |
 | after the context embedder-data slots (the two methods a host stashes its realm state through) | **347** (see below) |
 | after private names (`Private::for_api`, the private read and write, and the cast to one) | **336** (see below) |
+| after the method tail a host calls by name (`Global::open`, the typed `ReturnValue` setters, `Function::builder`, the promise resolver, and the pointer-shaped isolate slots) | **292** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -671,16 +672,16 @@ change what it does; `PromiseResolver::{resolve, reject}`; `Proxy::{get_target,
 get_handler}`; `SharedArrayBuffer::get_backing_store`;
 `String::to_rust_cow_lossy`.
 
-**What the remaining 336 are, measured.** By error kind: **243** `E0599`s, **78**
-`E0308`s, **8** names, **3** `E0515`s, **2** `E0605`s and **1** `E0282`. The
-`E0599`s split by the receiver each message names: **39** on a `Local<…>`, **119**
-on a bare tag (`Value` 53, `String` 9, `Symbol` 9, `Function` 8, `ArrayBuffer` 6,
-`BigInt` 6, `PromiseResolver` 4, `PrimitiveArray` 4, and one or two for each of
-the rest) — the shape §9 records as open, since the methods live on the tag there
-— and **85** on another bridge type (`PinnedRef` 34, `Global` 27, `OwnedIsolate`
-11, `ReturnValue` 8, `Exception` 3, and two single sites). The `E0308`s are the
-other half of the tag shape's toll, and the `E0515`s are scope-lifetime sites.
-Not one of them is a name to declare.
+**What the remaining 292 are, measured.** By error kind: **201** `E0599`s, **78**
+`E0308`s, **8** names, **3** `E0515`s and **1** `E0282` — the `E0605` pair the last
+step had is gone. The `E0599`s split by the receiver each message names: **41** on
+a `Local<…>`, **107** on a bare tag (`Value` 53, `String` 9, `Symbol` 9,
+`ArrayBuffer` 6, `BigInt` 6, `PrimitiveArray` 4, and one or two for each of the
+rest) — the shape §9 records as open, since the methods live on the tag there —
+and **53** on another bridge type (`PinnedRef` 34, `OwnedIsolate` 11, `Exception`
+3, `Global` 2, and three single sites). The `E0308`s are the other half of the tag
+shape's toll, and the `E0515`s are scope-lifetime sites. Not one of them is a name
+to declare.
 
 **The `From`/`TryFrom` closure — landed, and eleven casts deliberately absent.**
 The crate's cast tables are transitive closures, not direct-edge tables, so a
@@ -782,6 +783,50 @@ Gates for this step: `cargo test -p v8 --features simdutf` **119 passed / 0
 failed** (118 with the crashing test skipped), `clippy` clean at crate and
 workspace scope, and `cargo test --locked --workspace` **5,051 passed / 0 failed
 / 4 ignored** across 38 binaries with that test skipped.
+
+**The method tail — landed, 336 → 292, one real bug found, and a pointer shape
+corrected.** Forty-three sites were methods a host calls by name that the bridge
+did not have at all:
+
+- **`Global::open` (22 sites)** — the crate's read-a-persistent-handle accessor.
+  It hands back a borrowed `&T` there, which is the tag shape this bridge cannot
+  have; what comes back here is the handle itself, and an empty handle is
+  *undefined* rather than the borrow-of-a-slot-nothing-wrote the crate's own
+  `open` gives. The sites use it as `handle.open(scope)`, so the local has to be
+  usable directly — which is the shape it now has.
+- **`ReturnValue::{set_int32, set_uint32, set_double, set_empty_string}` (8)** —
+  the engine has one number kind, so the widths are the crate's way of saying
+  which range a value came from; the empty string is a string of length zero and
+  not *undefined*, and the test says so both ways.
+- **`Function::builder` / `builder_raw` (7)** — the builder existed for
+  templates; the `Function` half is what `Function::New` is in the crate (a
+  template plus `GetFunction`), so it is three lines over the same machinery.
+- **`PromiseResolver::new` (3) and `get_promise` (3)** — and this is where the
+  step found a **bug**: `reject` called the *resolving* function, because a
+  resolver handle carried only the resolve half, so `reject(scope, error)`
+  fulfilled the promise with the error instead of rejecting it. The engine keys
+  its record by function identity and the rejecting function's value is nowhere
+  else once the capability is built, so the isolate now keeps that value for the
+  pair when the resolver is made, and `settle` calls the half it was asked for.
+  The test that catches it was written first and failed against the old code —
+  which is a better check than a mutation, and the reason this bug was not found
+  by the earlier pass that added `resolve`/`reject`.
+- **`Isolate::{set_data, get_data}` (3 sites, and two shape corrections)** — they
+  took a `usize` and answered `Option<usize>` where the crate takes and answers a
+  pointer. That is what `state_ptr as *const JsRuntimeState` (two `E0605`s) and
+  the `as *mut c_void` argument (an `E0308`, which had been hidden behind the
+  `E0599` that stopped the body being checked) were about; both are gone. The
+  receiver stays `&self` where the crate's is `&mut self`, which is the permissive
+  direction and the same divergence `ReturnValue`'s setters already have.
+
+Measured: **336 → 292**; `E0599` 243 → 201, `E0605` 2 → 0, `E0308` 78 → 78 — one
+appeared behind the `open` sites and went with the `set_data` correction — and the
+name count unchanged at 8.
+
+Gates: `cargo test -p v8 --features simdutf` **128 passed / 0 failed** (127 with
+the crashing test skipped), `clippy` clean at crate and workspace scope, and
+`cargo test --locked --workspace` **5,061 passed / 0 failed / 4 ignored** across
+38 binaries with that test skipped. `crates/v8` only, so no sweep is implicated.
 
 **Private names — landed, 347 → 336, and the one divergence they carry.** Eleven
 sites were `v8::Private::for_api` (3) and `Object::{get_private, set_private}`
@@ -1130,10 +1175,10 @@ frontier is closed (8 left, the wasm tail) and the serializer is landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
 first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
-347, private names to 336, and what is left is the method surface (243 `E0599`s:
-39 on a `Local<…>`, 119 on a tag, 85 on another bridge type), the 78 `E0308`s the
-tag shape explains, the 8 names, and six stragglers (3 `E0515`, 2 `E0605`,
-1 `E0282`);
+347, private names to 336, the method tail to 292, and what is left is the method
+surface (201 `E0599`s: 41 on a `Local<…>`, 107 on a tag, 53 on another bridge
+type), the 78 `E0308`s the tag shape explains, the 8 names, and four stragglers
+(3 `E0515`, 1 `E0282`);
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then
