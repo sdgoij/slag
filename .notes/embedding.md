@@ -568,6 +568,7 @@ number is the certified one.
 | after the streaming half (the engine's `HostHooks` wasm-streaming pair, `api::WasmStreaming`, and the bridge's `Isolate::set_wasm_streaming_callback` / `WasmStreaming`) | **12** (see below) |
 | after the unbound scripts and the code cache (`UnboundScript`/`UnboundModuleScript`, `create_code_cache` on the script, the module script and a function, `get_source_mapping_url`) | **6** (see below) |
 | after the stack-trace frames (`StackTrace::current_stack_trace` and the frame accessors, over the engine's execution contexts) | **4** (see below) |
+| after the escapable handle scope (the macro's inference, which the `E0282` that had been unexplained since the serializer step turned out to be) | **3** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -588,8 +589,8 @@ error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
 
 That was the shape of the frontier then. It is no longer: with no names left, the
-4 errors now are 3 `E0599`s (methods and the subsystems they name) and 1 `E0282`,
-so the count is a *method-level* metric now, as §10 says — and each step's own
+3 errors now are 3 `E0599`s (methods and the subsystems they name), so the count
+is a *method-level* metric now, as §10 says — and each step's own
 record below names which code classes moved rather than only the total.
 
 **The serializer — landed, and the count stopped being a progress metric.**
@@ -2209,16 +2210,15 @@ changed, so the battery ran and every number is the certified one: test262 `all`
 core suites **64,594 checks / 0 fail / 0 pending**; the JS-API sweep **1,001 tests
 / 0 fail**.
 
-What is left is 4 errors and the `E0282`: the stalled `await` report,
-import-defer's evaluation entry point, `get_heap_statistics`, and the one `E0282`
-nothing has explained yet.
+What is left is 3 errors and no straggler: the stalled `await` report,
+import-defer's evaluation entry point, and `get_heap_statistics`. The `E0282` that
+had stood unexplained since the serializer step was the untested
+`escapable_handle_scope!` macro, and the step below closes it.
 
 **The stack-trace frames — landed, 6 → 4, and the step that measured the plan
 wrong.** Two sites (`ops_builtin_v8.rs:1518`, `modules/import_graph.rs:164`), and
 §10 had called this the next engine item with a survey that split it in two: the
 *execution-context frame accessor* and the *per-activation source positions*.
-The first half is what landed — but the survey's premise was wrong, and the
-measurement is the most important thing in this record.
 
 **The engine has no call stack, and `execution_context_stack` is not one.**
 The plan assumed that stack *is* the activations a trace would report. It is the
@@ -2291,7 +2291,7 @@ half a frame's accessors out would be a worse shape than answering them — and 
 had. A frame handle is a *position in a capture*, so reading one whose capture
 the collector reaped answers the no-information value rather than a stale frame.
 
-Measured: **6 → 4** (`E0599` 5 → 3; the `E0282` untouched), and nothing was
+Measured: **6 → 4** (`E0599` 5 → 3; the `E0282` untouched here), and nothing was
 unmasked behind it — every accessor `deno_core` names on a frame exists. Six new
 tests, each verified by mutating the code it guards: including the bootstrap
 context as a frame fails all three bridge tests; answering `None` for every
@@ -2309,6 +2309,41 @@ whole battery ran and every number is the certified one: test262 `all` 48,622 �
 48,464 pass, **0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205
 pass, 0 fail / 0 crash / 0 hang, 152 skip; the eight wasm core suites **64,594
 checks / 0 fail / 0 pending**; the JS-API sweep **1,001 tests / 0 fail**.
+
+**The escapable handle scope — landed, 4 → 3, and the `E0282` explained at last.**
+The one error that had survived every step since the serializer ("nothing has
+explained it yet", recorded three times) was `libs/core/runtime/jsruntime.rs:1676`:
+
+```rust
+v8::escapable_handle_scope!(let scope, scope);
+```
+
+`cannot infer type`, at the macro. **The macro had never been exercised anywhere in
+this workspace** — it is defined in `crates/v8/scope.rs` and used by no test and
+no bridge code — and it does not type-check: `EscapableHandleScope::new` is a
+constructor whose three type parameters (`'s`, `'esc`, `C`) are named by the
+*type* and by nothing in the argument, so at the call `'esc` (and `C`, for the
+isolate form) had no constraint at all to be inferred from. `deno_core`'s
+`JsRuntime::eval` is the one user, which is why the error looked like it came from
+somewhere else for eight steps.
+
+The fix ties them to the argument: `new` now requires
+`P: NewEscapableHandleScope<'s, NewScope = EscapableHandleScope<'s, 'esc, C>>`, so
+the associated type every constructor already implements determines both. The
+guard is a bridge test in the shape `deno_core` writes it — an escapable scope
+over the scope a function was handed, with a script's value escaping to the
+caller's lifetime — and it is a *compile-time* guard: reverting the bound stops
+the crate compiling (verified by doing it). Nothing about it is a divergence from
+the crate we stand in for; it is a defect this bridge had and no test reached,
+which is the same lesson as the untested `Array::new` length in §12 item 5.
+
+Gates for this step: `cargo test -p v8 --features simdutf` **199 passed / 0
+failed**, `cargo clippy --locked --workspace --all-targets -- -D warnings` clean,
+`cargo test --locked --workspace -- --skip
+the_data_a_built_function_carries_survives_a_collection` **5,141 passed / 0 failed
+/ 4 ignored across 38 binaries**. **No engine crate changed** — `crates/v8` only,
+which no runner depends on — so the sweep battery is not implicated, and the
+numbers from the step above stand.
 
 ## 8. Parked: the C++ face
 
@@ -2981,10 +3016,10 @@ half of it to 49, the stragglers a `Context` and an `Object` answer to 44, the
 split) to 37, the module structure surface to 25, the synthetic-module surface to
 21, the callback scope's lifetime to 19, the compiled-module surface to 15, the
 streaming half to 12, the unbound scripts and the code cache to 6, the
-stack-trace frames to 4, and
+stack-trace frames to 4, the escapable handle scope to 3, and
 what is left is the method
 surface (3 `E0599`s: the stalled `await` report, import-defer's evaluation entry
-point, and `get_heap_statistics`), and one straggler (1 `E0282`).
+point, and `get_heap_statistics`) — with no stragglers left at all.
 The two that the suite had surveyed as needing engine work have landed since,
 `get_constructor_name` and `get_extras_binding_object`, and they turned out to
 need a walk of the prototype chain and a per-context object rather than V8's map

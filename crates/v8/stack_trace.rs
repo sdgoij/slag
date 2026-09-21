@@ -203,6 +203,32 @@ mod tests {
     use crate::test_support::{bind, eval, in_context};
     use crate::{Context, FunctionBuilder, FunctionCallbackArguments, ReturnValue};
 
+    /// The crate's `escapable_handle_scope!` in the shape a host uses it — the
+    /// shape `deno_core`'s own `JsRuntime::eval` has: an escapable scope opened
+    /// over the scope a function was handed, with the script's value escaping to
+    /// the caller's lifetime.
+    ///
+    /// This macro had never been exercised anywhere in this workspace, and the
+    /// shape does not type-check on its own; the test is what pins the fix.
+    fn eval_in<'s, 'i, T>(scope: &mut PinScope<'s, 'i>, code: &str) -> Option<Local<'s, T>>
+    where
+        Local<'s, T>: TryFrom<Local<'s, Value>, Error = crate::DataError>,
+    {
+        crate::escapable_handle_scope!(let scope, scope);
+        let source = JsString::new(scope, code).expect("string");
+        let script = crate::Script::compile(scope, source, None).expect("compile");
+        let value = script.run(scope)?;
+        scope.escape(value).try_into().ok()
+    }
+
+    #[test]
+    fn an_escapable_scope_escapes_a_scripts_value_to_the_callers_lifetime() {
+        in_context!(scope, {
+            let value = eval_in::<crate::data::Number>(scope, "40 + 2").expect("a value");
+            assert_eq!(value.value(), 42.0);
+        });
+    }
+
     /// A host function that captures the stack where it is called and records
     /// what each frame said, so a test can assert on a capture taken inside a
     /// running stack.

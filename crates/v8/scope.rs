@@ -893,8 +893,23 @@ pub struct EscapableHandleScope<'s, 'esc, C = Context> {
 }
 
 impl<'s, 'esc, C> EscapableHandleScope<'s, 'esc, C> {
+    /// The storage for a scope opened over `scope`
+    /// (v8::EscapableHandleScope::New).
+    ///
+    /// The `where` clause is what makes the call inferable, and it is not
+    /// decoration: this type names three parameters and the argument names none
+    /// of them, so without the equality on `NewScope` the compiler has nothing to
+    /// infer `'esc` (and, for a scope over an isolate, `C`) from — `cannot infer
+    /// type` at the call, which is how the crate's own macro failed to compile.
+    /// Tying it to the associated type of the trait every constructor
+    /// implements is what makes `escapable_handle_scope!` work, and the
+    /// `escapable_handle_scope!`-shaped test in `crate::stack_trace` is what
+    /// holds it.
     #[allow(clippy::new_ret_no_self)]
-    pub fn new<P: NewEscapableHandleScope<'s>>(scope: &'s mut P) -> ScopeStorage<P::NewScope> {
+    pub fn new<P>(scope: &'s mut P) -> ScopeStorage<P::NewScope>
+    where
+        P: NewEscapableHandleScope<'s, NewScope = EscapableHandleScope<'s, 'esc, C>>,
+    {
         ScopeStorage::new(P::make_new_scope(scope))
     }
 }
