@@ -661,7 +661,10 @@ pub(crate) fn maybe_materialize_prototype_value(
 /// `prototype` from a language value — the all-own-key enumeration and
 /// integrity-level ops (ownKeys, getOwnPropertyNames, freeze/seal) observe
 /// every own key, so they need it regardless of which key is addressed.
-pub(crate) fn materialize_pending_prototype_value(
+///
+/// Host-facing: a host enumerating own keys has to cross the same barrier, and
+/// this is the only way across.
+pub fn materialize_pending_prototype_value(
     agent: &mut Agent,
     value: &Value,
 ) -> Result<bool, JsError> {
