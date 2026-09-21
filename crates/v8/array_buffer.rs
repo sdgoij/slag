@@ -15,7 +15,8 @@ use crux::typed_array::{ElementType, SharedBuffer};
 use runtime::api;
 use runtime::builtins::array_buffer::BufferState;
 use slag::buffers::{
-    array_buffer_from_block, detach_array_buffer, typed_array_from_buffer, view_out_of_bounds,
+    array_buffer_from_block, detach_array_buffer, shared_array_buffer_from_block,
+    typed_array_from_buffer, view_out_of_bounds,
 };
 
 use crate::data::{
@@ -25,7 +26,7 @@ use crate::data::{
 };
 use crate::handle::Local;
 use crate::scope::PinScope;
-use crate::support::{BackingStore, SharedRef, UniqueRef};
+use crate::support::{BackingStore, Rawable, SharedRef, UniqueRef};
 
 /// What the agent records for one buffer object, as the store and the queries
 /// below report it.
@@ -203,6 +204,19 @@ impl ArrayBuffer {
     pub fn new_backing_store_from_vec(bytes: Vec<u8>) -> UniqueRef<BackingStore> {
         Self::new_backing_store_from_boxed_slice(bytes.into_boxed_slice())
     }
+
+    /// A standalone store over `bytes`, which the caller hands over
+    /// (`v8::ArrayBuffer::new_backing_store_from_bytes`).
+    ///
+    /// The crate we stand in for takes ownership of the bytes and lets V8 read
+    /// them where they are, freeing them when the store dies. Here they are read
+    /// into the engine's block, so the caller's buffer is released as this
+    /// returns — the same contents at the same length, and the only thing that
+    /// could tell the two apart is the address [`data`](BackingStore::data)
+    /// answers with.
+    pub fn new_backing_store_from_bytes<T: Rawable>(bytes: T) -> UniqueRef<BackingStore> {
+        UniqueRef::new(BackingStore::from_bytes(bytes.as_bytes()))
+    }
 }
 
 impl<'s> Local<'s, ArrayBuffer> {
@@ -259,6 +273,35 @@ impl<'s> Local<'s, ArrayBuffer> {
     /// The first byte of the storage (`v8::ArrayBuffer::data`).
     pub fn data(&self) -> Option<NonNull<c_void>> {
         self.get_backing_store().data()
+    }
+}
+
+impl SharedArrayBuffer {
+    /// A shared buffer over a backing store
+    /// (`v8::SharedArrayBuffer::with_backing_store`).
+    ///
+    /// The store's block becomes the buffer's storage, as it does for
+    /// [`ArrayBuffer::with_backing_store`](ArrayBuffer::with_backing_store): a
+    /// host writing through the store writes what a reader of the buffer sees,
+    /// and — unlike an `ArrayBuffer` over the same store — an agent other than
+    /// this one can read it.
+    ///
+    /// The *block* is marked shared here as well as the buffer record. The
+    /// engine's language-facing constructor does both; its host-facing one
+    /// records only the buffer, so a host that asks the store afterwards would be
+    /// told it is unshared without this line.
+    pub fn with_backing_store<'s>(
+        scope: &PinScope<'s, '_, ()>,
+        store: &SharedRef<BackingStore>,
+    ) -> Local<'s, SharedArrayBuffer> {
+        store.block().mark_shared();
+        let realm = crate::realm_of(scope);
+        let block = store.block().clone();
+        let byte_length = store.byte_length();
+        let value = realm
+            .with_agent(|agent| shared_array_buffer_from_block(agent, block, byte_length))
+            .expect("bridge bug: a realm can make a SharedArrayBuffer");
+        Local::from_engine(api::Local::from(value))
     }
 }
 
@@ -479,6 +522,55 @@ typed_array_constructors! {
 mod tests {
     use super::*;
     use crate::test_support::{bind, eval, eval_number, in_context};
+
+    /// Bytes a host owns become the buffer's storage, at their width: a
+    /// `Box<[u16]>` is its elements in bytes, not its count.
+    #[test]
+    fn a_store_from_bytes_carries_them_at_their_width() {
+        in_context!(scope, {
+            let store = ArrayBuffer::new_backing_store_from_bytes(vec![1u8, 2, 3]).make_shared();
+            assert_eq!(store.byte_length(), 3);
+            let buffer = ArrayBuffer::with_backing_store(scope, &store);
+            bind(scope, "ab", buffer.cast::<Value>());
+            assert_eq!(eval_number(scope, "new Uint8Array(ab)[2]"), 3.0);
+
+            let wide: Box<[u16]> = vec![0x0102u16, 0x0304].into_boxed_slice();
+            let store = ArrayBuffer::new_backing_store_from_bytes(wide).make_shared();
+            assert_eq!(store.byte_length(), 4, "two `u16`s are four bytes");
+            let buffer = ArrayBuffer::with_backing_store(scope, &store);
+            bind(scope, "wide", buffer.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "new Uint16Array(wide)[1]"),
+                0x0304 as f64,
+                "the elements read back as themselves, not as their bytes"
+            );
+        });
+    }
+
+    /// A shared buffer over a store reads the store's bytes, and the store says
+    /// it is shared afterwards — which is the line the bridge adds, because the
+    /// engine's host-facing constructor records only the buffer.
+    #[test]
+    fn a_shared_buffer_over_a_store_shares_its_bytes() {
+        in_context!(scope, {
+            let store = ArrayBuffer::new_backing_store_from_bytes(vec![7u8, 8]).make_shared();
+            assert!(!store.is_shared(), "a store from bytes starts unshared");
+
+            let shared = SharedArrayBuffer::with_backing_store(scope, &store);
+            bind(scope, "sab", shared.cast::<Value>());
+            assert_eq!(eval_number(scope, "new Uint8Array(sab)[0]"), 7.0);
+            assert_eq!(eval_number(scope, "new Uint8Array(sab).length"), 2.0);
+            assert!(
+                store.is_shared(),
+                "the block is marked shared with the buffer"
+            );
+
+            // A write through the buffer is a write into the store, which is what
+            // makes this the host's way of handing bytes to JavaScript.
+            eval(scope, "Atomics.store(new Uint8Array(sab), 1, 9)");
+            assert_eq!(byte_of(&store, 1), 9);
+        });
+    }
 
     fn byte_of(store: &BackingStore, index: usize) -> u8 {
         let data = store.data().expect("a non-empty store has data");

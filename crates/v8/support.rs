@@ -8,11 +8,64 @@
 
 use std::ffi::c_void;
 use std::fmt;
+use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crux::typed_array::SharedBuffer;
+
+/// A buffer a host hands over as bytes
+/// (the crate we stand in for's sealed `Rawable`).
+///
+/// There, the bytes are taken by value and V8 reads them where they are; here
+/// they are read into an engine block, so all this asks a type for is a *view* of
+/// them. What a host can observe — how many bytes and what is in them — is the
+/// same either way.
+pub trait Rawable {
+    /// The length in bytes (`byte_len` there), which for an element slice is its
+    /// element count times the element's size.
+    fn byte_len(&self) -> usize;
+
+    /// The bytes.
+    fn as_bytes(&self) -> &[u8];
+}
+
+macro_rules! rawable {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl Rawable for Box<[$ty]> {
+                fn byte_len(&self) -> usize {
+                    self.len() * size_of::<$ty>()
+                }
+
+                fn as_bytes(&self) -> &[u8] {
+                    // SAFETY: the element type is a primitive scalar — no padding,
+                    // every bit pattern a value, alignment no wider than the type
+                    // — so its elements in memory are exactly their bytes.
+                    unsafe {
+                        std::slice::from_raw_parts(self.as_ptr().cast::<u8>(), self.byte_len())
+                    }
+                }
+            }
+
+            impl Rawable for Vec<$ty> {
+                fn byte_len(&self) -> usize {
+                    self.len() * size_of::<$ty>()
+                }
+
+                fn as_bytes(&self) -> &[u8] {
+                    // SAFETY: as the `Box<[$ty]>` impl above.
+                    unsafe {
+                        std::slice::from_raw_parts(self.as_ptr().cast::<u8>(), self.byte_len())
+                    }
+                }
+            }
+        )*
+    };
+}
+
+rawable!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
 
 /// A uniquely owned resource (`v8::UniqueRef`).
 pub struct UniqueRef<T>(T);

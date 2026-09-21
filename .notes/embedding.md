@@ -553,6 +553,7 @@ number is the certified one.
 | after the symbol surface (`Symbol::for_key` and the eleven well-known accessors) | **233** (see below) |
 | after the primitive array (`PrimitiveArray::new`/`length`/`set`/`get`) and the two typed integer accessors it surfaced (`Uint32::value`, `Int32::value`) | **225** (see below) |
 | after the leftovers (the empty string and a one-byte const, `clear_all_slots`, `Promise::catch`, `get_property_names`, `has_pending_background_tasks`, and the `Global` raw-pointer pair) plus the continuation-value move it forced | **217** (see below) |
+| after the buffer-handing shapes (`ArrayBuffer::new_backing_store_from_bytes` and its `Rawable` widths, and `SharedArrayBuffer::with_backing_store`) | **213** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -1014,6 +1015,42 @@ that guards them. The exception is the continuation-value test, whose content *i
 the borrow shape: it fails to compile if the handle goes back to borrowing its
 scope.
 
+**The buffer-handing shapes — landed, 217 → 213, and the engine left alone.** Four
+sites were `ArrayBuffer::new_backing_store_from_bytes` (two) and
+`SharedArrayBuffer::with_backing_store` (two). Everything the sites do around those
+— `UniqueRef::make_shared` (which is `Rc`-wrapping here, and already existed),
+`ArrayBuffer::with_backing_store`, `Local::cast_unchecked` — was already in the
+bridge, which is why the count fell by exactly the four rather than by eight: this
+is what the moment the errors resolve is for.
+
+Two decisions came with it, both visible in the doc comments:
+
+- **`new_backing_store_from_bytes` reads the bytes into an engine block.** There,
+  the bytes are taken by value and V8 reads them where they are, freeing them with
+  the store. Here the caller's buffer is released as the call returns, so the
+  length and the contents are what a host gets and the *address* is not. The
+  `Rawable` trait is the widths that difference makes load-bearing: `Box<[u16]>`
+  is two bytes per element, so a bridge that used the element count would hand
+  script half the bytes it asked for — which is the mutation the width test was
+  made to catch.
+- **`SharedArrayBuffer::with_backing_store` marks the *block* shared as well as
+  the buffer record.** The engine's language-facing constructor does both; its
+  host-facing one (`shared_array_buffer_from_block`) records only the buffer, so
+  a host asking the store afterwards would be told it is unshared. The bridge
+  compensates rather than changing an engine function with three other callers
+  (wasm memory, workers, the test262 runner) — recorded as an open decision
+  rather than fixed in passing.
+
+Measured: **217 → 213**, all of it `E0599` (130 → 126), and no error appeared
+behind the four.
+
+Gates: `cargo test -p v8 --features simdutf` **150 passed / 0 failed**, `clippy`
+clean at crate and workspace scope, and `cargo test --locked --workspace`
+**5,082 passed / 0 failed / 4 ignored** with the crashing `v8` test skipped.
+`crates/v8` only, and no engine crate was touched, so no sweep is implicated.
+Both new tests were made to fail: an element count where a byte length belongs
+fails the first, and dropping the `mark_shared` fails the second.
+
 **The method tail — landed, 336 → 292, one real bug found, and a pointer shape
 corrected.** Forty-three sites were methods a host calls by name that the bridge
 did not have at all:
@@ -1450,6 +1487,22 @@ if that proves possible.
   of that scope, which is precisely the sequence a suspension performs. The pair
   moved onto the scope (the isolate still stores the value) and the getter hands
   back a handle carrying the scope's lifetime.
+- **A store built from a host's bytes holds a copy, and the widths are the part
+  that matters.** There, `new_backing_store_from_bytes` takes the buffer by value
+  and V8 reads it where it is; here the bytes are read into an engine block, so the
+  host's allocation is freed as the call returns. The length and the contents —
+  everything a host can observe except the address `data()` answers with — are the
+  same, and the `Rawable` widths (`Box<[u16]>` is two bytes an element) are what
+  makes the difference invisible to script: a bridge that used the element count
+  would hand over half the bytes.
+- **The engine's two shared-array-buffer constructors do not agree, and the bridge
+  compensates rather than changing either.** `shared_array_buffer_from_block` (the
+  host-facing one) records sharing on the *buffer*, while the language-facing
+  constructor also calls `SharedBuffer::mark_shared` so the block's own flag
+  agrees. The bridge's `SharedArrayBuffer::with_backing_store` calls it for that
+  reason. Left as an open decision (§12) because the host-facing function has three
+  other callers — wasm memory, workers, and the test262 runner — and a change to it
+  is a change to their behaviour.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
@@ -1476,15 +1529,15 @@ first pass through them took it to 374, the cast closure to 369, the scope and
 property bounds to 364, the identity hashes to 351, the embedder-data slots to
 347, private names to 336, the method tail to 292, scheduling and exception
 control to 260, the isolate-level callback vocabulary to 242, the symbol surface
-to 233, the primitive array to 225, the leftovers to 217, and what is left is the
-method surface (130 `E0599`s: 72 where a value handle is the receiver — the tag
-shape — 34 on a `Local<…>`, 20 associated items on a tag, 4 on another bridge
-type), the 78 `E0308`s the tag shape explains, the 4 names, and four stragglers
-(3 `E0515`, 1 `E0282`). Three surveyed-and-left items sit outside those counts'
-reach — `get_constructor_name` (needs V8's map), `get_extras_binding_object`
-(needs an engine-side extras object) and `get_heap_statistics` (needs byte
-accounting in `crux::heap`) — and everything else needs the tag shape or an
-engine capability;
+to 233, the primitive array to 225, the leftovers to 217, the buffer-handing
+shapes to 213, and what is left is the method surface (126 `E0599`s: 72 where a
+value handle is the receiver — the tag shape — 30 on a `Local<…>`, 20 associated
+items on a tag, 4 on another bridge type), the 78 `E0308`s the tag shape
+explains, the 4 names, and four stragglers (3 `E0515`, 1 `E0282`). Three
+surveyed-and-left items sit outside those counts' reach — `get_constructor_name`
+(needs V8's map), `get_extras_binding_object` (needs an engine-side extras
+object) and `get_heap_statistics` (needs byte accounting in `crux::heap`) — and
+everything else needs the tag shape or an engine capability;
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then
@@ -1522,3 +1575,9 @@ delete.
    `deno_core` writes every slot it asked for, which is why it never notices. The
    fix is a holey array of that length — `length` is a property the engine
    writes — and it needs a decision, not a drive-by.
+6. **`shared_array_buffer_from_block` records sharing on the buffer and not on the
+   block.** The language-facing constructor in the same file does both
+   (`SharedBuffer::mark_shared`), so the two disagree about what a store built over
+   one of these blocks reports. The bridge compensates where it builds a shared
+   buffer; the engine fix is one line but touches wasm memory, workers and the
+   test262 runner, so it is the operator's call rather than a drive-by.
