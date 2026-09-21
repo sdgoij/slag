@@ -558,6 +558,7 @@ number is the certified one.
 | after the tag shape (`Local<'s, T>: Deref<Target = T>`, the tag receiver chain, and the `LocalHandle` the methods sit on until they move) | **62** (see below) |
 | after the template surface a host fills in (the prototype and instance templates, `ObjectTemplate::{new, set}`, the two `String` conversions and `build_fast`) | **56** (see below) |
 | after the attribute-carrying half of the template cluster (`PropertyAttributes` in the engine, `ObjectTemplate::{set_with_attr, set_accessor_property, new_instance}`) | **52** (see below) |
+| after the static half of the template cluster (`FunctionTemplate::{set, inherit}`, the per-realm materialization memo, and `set_internal_field_count`) | **49** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -1018,6 +1019,55 @@ mode, inverting the index filter, and stubbing `from_raw` each fail the assertio
 that guards them. The exception is the continuation-value test, whose content *is*
 the borrow shape: it fails to compile if the handle goes back to borrowing its
 scope.
+
+**The static half of the template cluster — landed, 52 → 49, and the engine change it
+needed is the interesting part.** Three sites: `FunctionTemplate::set` (a static
+method, `bindings.rs:511`), `inherit` (`bindings.rs:537`) and
+`ObjectTemplate::set_internal_field_count` (`jsruntime.rs:2854`).
+
+The first two are one change, because the second is what makes the first need a
+memo. This engine materialized a *fresh* function and a fresh `.prototype` object
+on every `get_function`; the crate materializes one per context and hands the same
+one back, and the difference shows exactly at `Inherit` — a child whose
+`prototype.__proto__` is set to a *second copy* of the parent's prototype looks
+identical to the right answer and fails `instanceof`. So a template now remembers
+what each realm got (`Materialized { realm, function, pins }`), keyed by the
+realm's handle address, and:
+
+- the entry pins the realm as well as the function, because nothing in that `Vec`
+  is traced and a swept realm's address could otherwise be reused by another realm
+  — two realms answering as one is the hazard §5 records for an unrooted handle;
+- the `.prototype` object needs no pin of its own: the function reaches it through
+  its `prototype` property, and a pin traces what it reaches;
+- `get_function` is idempotent per realm now, which is the crate's contract and
+  what the test's `Child === ChildAgain` asserts.
+
+`FunctionTemplate::set` landed as *data* properties only (the crate's static
+accessor stays absent until a host asks; the accessor shape this engine has is the
+one on an object template), applied at materialization, because that is when the
+function object exists.
+
+`set_internal_field_count` is the third, and it is a carried hint with the tier
+said out loud where a host would look: the engine's objects have no internal-field
+slots, the count is recorded and reported back (`internal_field_count`), and the
+crate's `SetAlignedPointerInInternalField` and its reader stay absent rather than
+present-and-wrong — a host that needs a slot has `Context`'s embedder data, which
+the isolate does keep.
+
+Measured: **52 → 49**, `E0599` 43 → 40. One new test, and it pins all three
+halves: a static is a property of the function and not of its instances, an
+instance of the child reaches the parent's prototype methods, and two
+`get_function` asks are one function. Made to fail by dropping the inheritance at
+materialization (`Object.getPrototypeOf(Child.prototype) === Parent.prototype`
+goes from 1 to 0).
+
+Gates: `cargo test -p v8 --features simdutf` **160 passed / 0 failed** with the
+crashing test skipped, `clippy --locked --workspace --all-targets -- -D warnings`
+clean, and `cargo test --locked --workspace` **5,095 passed / 0 failed / 4 ignored**
+across 38 binaries. `crates/runtime` changed, inside `runtime::api` again, and no
+runner names it (`grep` over `test262`, `wasmtest`, `wasm` and `cli` finds no
+`FunctionTemplate`, `ObjectTemplate` or `runtime::api`) — the same check and the
+same conclusion as the two `api` changes before it.
 
 **The attribute-carrying half of the template cluster — landed, 56 → 52, and the
 first engine change since the borrowed block.** Four sites: `ObjectTemplate::set_with_attr`
@@ -1560,6 +1610,16 @@ if that proves possible.
   `IsolateHandle`'s termination and interrupt requests answer `false` rather than
   aborting, because they are best-effort requests in the shape they come from
   and because `deno_core`'s exception path calls one on the way out.
+- **A template materializes one function per realm, and that is load-bearing now.**
+  The crate's `GetFunction` hands back the same function for a (template, context)
+  pair; this engine used to make a fresh one — and a fresh `.prototype` — per call,
+  which was invisible until `Inherit` arrived: a child's chain wired to a second
+  copy of the parent's prototype fails `instanceof` while looking right. The memo
+  costs one pinned entry per realm per template (the realm, and the function, which
+  reaches the `.prototype` object through its own property), and it settles what a
+  property set *after* materialization does: nothing — which is the crate's
+  contract, whose documentation requires configuring a template before
+  `GetFunction`.
 - **A setting that is a hint is carried; a setting that is observable is
   implemented.** `FunctionBuilder::side_effect_type` describes what V8's
   optimizer may assume about a call — this engine has no optimizer, so the bridge
@@ -1788,12 +1848,13 @@ property bounds to 364, the identity hashes to 351, the embedder-data slots to
 control to 260, the isolate-level callback vocabulary to 242, the symbol surface
 to 233, the primitive array to 225, the leftovers to 217, the buffer-handing
 shapes to 213, the host-memory store to 209, the tag shape to 62, the template
-surface to 56, the attribute-carrying half of the template cluster to 52, and what
-is left is the method surface (43 `E0599`s, all of them named methods and
+surface to 56, the attribute-carrying half of the template cluster to 52, the static
+half of it to 49, and what
+is left is the method surface (40 `E0599`s, all of them named methods and
 subsystems: the message and stack-trace surface, synthetic modules, wasm
-streaming, code cache, source offsets, the extras binding object, and the static
-half of the template cluster), the 4 names, and four stragglers (3 `E0515`,
-1 `E0282`). Three
+streaming, code cache, source offsets, the extras binding object, and the internal
+fields a `ContextOptions` global template names), the 4 names, and four stragglers
+(3 `E0515`, 1 `E0282`). Three
 surveyed-and-left items sit outside those counts' reach — `get_constructor_name`
 (needs V8's map), `get_extras_binding_object` (needs an engine-side extras
 object) and `get_heap_statistics` (needs byte accounting in `crux::heap`) — and

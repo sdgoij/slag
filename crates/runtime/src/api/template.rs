@@ -123,6 +123,32 @@ pub struct FunctionTemplate {
     /// Whether the function this template makes can be constructed. A
     /// non-constructible one has no [[Construct]], so `new` on it throws.
     constructible: Cell<bool>,
+    /// Properties on the function itself (v8::Template::Set with a
+    /// function template), applied when it is materialized.
+    static_properties: RefCell<Vec<TemplateProperty>>,
+    /// The template this one inherits from (v8::FunctionTemplate::Inherit),
+    /// whose `.prototype` becomes this one's prototype's prototype.
+    parent: RefCell<Option<Rc<FunctionTemplate>>>,
+    /// What this template has already made, one entry per realm.
+    ///
+    /// The crate materializes a function once per context and hands the same
+    /// one back, and two things need that here: a caller that asks twice must
+    /// not get two functions, and `Inherit` must find the parent's own
+    /// `.prototype` rather than a second copy of it — otherwise
+    /// `Child.prototype instanceof Parent` would be false with both objects
+    /// looking identical.
+    materialized: RefCell<Vec<Materialized>>,
+}
+
+/// A function as materialized in one realm.
+struct Materialized {
+    /// The realm's identity, which is its handle's address. Stable while this
+    /// entry lives, because the entry pins the realm it names.
+    realm: usize,
+    function: Value,
+    /// Dropped with the entry, and the only thing keeping the value above — and
+    /// the `.prototype` object it carries — alive: nothing else here is traced.
+    _pins: Vec<crux::heap::Pin>,
 }
 
 impl FunctionTemplate {
@@ -135,6 +161,9 @@ impl FunctionTemplate {
             prototype_template: RefCell::new(None),
             length: Cell::new(0),
             constructible: Cell::new(true),
+            static_properties: RefCell::new(Vec::new()),
+            parent: RefCell::new(None),
+            materialized: RefCell::new(Vec::new()),
         })
     }
 
@@ -153,6 +182,27 @@ impl FunctionTemplate {
     /// call is what a template's callback is.
     pub fn callback(&self) -> Option<Rc<FunctionCallback>> {
         self.callback.borrow().clone()
+    }
+
+    /// Define a property on the function itself (v8::Template::Set with a
+    /// function template), which is where a host's static methods go.
+    pub fn set(&self, name: &str, value: Local, attributes: PropertyAttributes) {
+        self.static_properties
+            .borrow_mut()
+            .push(TemplateProperty::Data {
+                name: JsString::from_utf8(name),
+                value: value.into_value(),
+                attributes,
+            });
+    }
+
+    /// Inherit from `parent` (v8::FunctionTemplate::Inherit): the function this
+    /// template makes gets `prototype.__proto__ === parent.prototype`.
+    ///
+    /// Applied at materialization, because the parent's `.prototype` only
+    /// exists in a realm once the parent has been materialized in it.
+    pub fn inherit(&self, parent: &Rc<FunctionTemplate>) {
+        *self.parent.borrow_mut() = Some(Rc::clone(parent));
     }
 
     /// Say whether the function this template makes may be constructed
@@ -196,6 +246,18 @@ impl FunctionTemplate {
     /// Materialize the function in `context`'s realm (v8::FunctionTemplate::GetFunction).
     pub fn get_function(self: &Rc<Self>, context: &Context) -> Result<Local, JsError> {
         let realm = context.realm();
+        // One function per realm, as the crate has it: a second ask hands back
+        // the one the first made, so its `.prototype` stays the object a child
+        // template inherited from.
+        let realm_key = realm.as_ptr() as usize;
+        if let Some(entry) = self
+            .materialized
+            .borrow()
+            .iter()
+            .find(|entry| entry.realm == realm_key)
+        {
+            return Ok(Local(entry.function));
+        }
         let function_prototype = realm
             .intrinsics
             .get("%Function.prototype%")
@@ -274,11 +336,21 @@ impl FunctionTemplate {
             function_prototype,
         )?;
 
-        // The constructor's `.prototype`: an ordinary object with
-        // %Object.prototype% as its prototype, populated from the
+        // The constructor's `.prototype`: an ordinary object whose prototype is
+        // %Object.prototype%, or the parent's `.prototype` when this template
+        // inherits one (v8::FunctionTemplate::Inherit) — populated from the
         // prototype template (v8: non-writable, non-configurable).
+        let parent_prototype = match self.parent.borrow().clone() {
+            Some(parent) => {
+                let parent_function = parent.get_function(context)?;
+                let value = crate::api::Object::get(context, &parent_function, "prototype")?.0;
+                crate::context::as_object(&value)
+            }
+            None => None,
+        };
         let this = Rc::clone(self);
-        let prototype_object = JsObject::ordinary_object_create(object_prototype);
+        let prototype_object =
+            JsObject::ordinary_object_create(parent_prototype.or(object_prototype));
         if let Some(prototype_template) = this.prototype_template.borrow().clone() {
             prototype_template.apply(realm, &prototype_object)?;
         }
@@ -293,6 +365,48 @@ impl FunctionTemplate {
                 set: None,
             },
         )?;
+
+        // The host's static properties: `Template::Set` on a function template
+        // puts them on the function object itself. Data properties only — the
+        // crate's static *accessor* is absent until a host asks for it, since
+        // the accessor shape this engine has is the one on an object template.
+        if !self.static_properties.borrow().is_empty() {
+            let function_object = crate::context::as_object(&Value::Function(function))
+                .expect("api bug: a function value has an object behind it");
+            for property in self.static_properties.borrow().iter() {
+                if let TemplateProperty::Data {
+                    name,
+                    value,
+                    attributes,
+                } = property
+                {
+                    function_object.define_property_or_throw(
+                        name,
+                        &PropertyDescriptor {
+                            value: Some(*value),
+                            writable: Some(attributes.writable()),
+                            enumerable: Some(attributes.enumerable()),
+                            configurable: Some(attributes.configurable()),
+                            get: None,
+                            set: None,
+                        },
+                    )?;
+                }
+            }
+        }
+
+        // Remember what this realm got, and pin it: nothing else here is traced,
+        // and the realm's own address is this entry's key — so the realm is
+        // pinned too, or a swept realm's slot could be reused by another one and
+        // two realms would answer as one.
+        self.materialized.borrow_mut().push(Materialized {
+            realm: realm_key,
+            function: Value::Function(function),
+            _pins: vec![
+                crux::heap::pin_handle(*realm),
+                crux::heap::pin(Value::Function(function)),
+            ],
+        });
         Ok(Local(Value::Function(function)))
     }
 }
@@ -302,6 +416,11 @@ impl FunctionTemplate {
 pub struct ObjectTemplate {
     isolate: *mut Isolate,
     properties: RefCell<Vec<TemplateProperty>>,
+    /// How many internal fields instances were promised. Recorded and reported,
+    /// and nothing else: an object here has no internal-field slots (see the
+    /// bridge's `set_internal_field_count`, which says the same where a host
+    /// would look).
+    internal_field_count: std::cell::Cell<usize>,
 }
 
 enum TemplateProperty {
@@ -363,7 +482,19 @@ impl ObjectTemplate {
         Rc::new(Self {
             isolate,
             properties: RefCell::new(Vec::new()),
+            internal_field_count: std::cell::Cell::new(0),
         })
+    }
+
+    /// Record how many internal fields instances are promised
+    /// (v8::ObjectTemplate::SetInternalFieldCount).
+    pub fn set_internal_field_count(&self, count: usize) {
+        self.internal_field_count.set(count);
+    }
+
+    /// The count recorded above (v8::ObjectTemplate::InternalFieldCount).
+    pub fn internal_field_count(&self) -> usize {
+        self.internal_field_count.get()
     }
 
     /// Define a data property (v8::ObjectTemplate::Set).

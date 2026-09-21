@@ -141,6 +141,40 @@ impl<'s> LocalHandle<'s, FunctionTemplate> {
         object_template_handle(scope, self.template_rc().instance_template())
     }
 
+    /// Cause this template to inherit from `parent`
+    /// (`v8::FunctionTemplate::Inherit`): the function this template makes gets
+    /// `prototype.__proto__ === parent.prototype`, so the parent's methods are
+    /// reached through an instance of the child.
+    pub fn inherit(&self, parent: Local<'_, FunctionTemplate>) {
+        self.template_rc().inherit(&parent.template_rc());
+    }
+
+    /// Define a property on the function itself (`v8::Template::Set` with a
+    /// function template), which is where a host's static methods go.
+    ///
+    /// Data properties only: the crate's static *accessor* form is absent until
+    /// a host asks for it, and the accessor shape this engine has is the one on
+    /// an object template.
+    ///
+    /// # Panics
+    ///
+    /// If `key` is not a string, as [`ObjectTemplate::set`](Self::set).
+    pub fn set(&self, key: Local<'_, Name>, value: Local<'_, Data>) {
+        self.set_with_attr(key, value, PropertyAttribute::NONE);
+    }
+
+    /// The same with the attributes the host asked for.
+    pub fn set_with_attr(
+        &self,
+        key: Local<'_, Name>,
+        value: Local<'_, Data>,
+        attr: PropertyAttribute,
+    ) {
+        let name = template_key_name(&key);
+        self.template_rc()
+            .set(&name, *value.engine(), engine_attributes(attr));
+    }
+
     /// The template's `name`, and the name a `new` instance is printed under
     /// (v8::FunctionTemplate::SetClassName).
     pub fn set_class_name(&self, name: Local<'_, String>) {
@@ -269,6 +303,25 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
         let realm = crate::realm_of(scope);
         let value = self.object_template().new_instance(&realm).ok()?;
         Some(Local::from_engine(value))
+    }
+
+    /// Record how many internal fields instances get
+    /// (`v8::ObjectTemplate::SetInternalFieldCount`).
+    ///
+    /// The count is recorded and reported back, and that is the whole of it:
+    /// this engine's objects have no internal-field slots, and the crate's
+    /// `SetAlignedPointerInInternalField` and its reader are deliberately absent
+    /// rather than present-and-wrong — a host that needs a slot has to ask for
+    /// one through [`Context`](crate::Context)'s embedder data, which the
+    /// isolate does keep.
+    pub fn set_internal_field_count(&self, count: usize) {
+        self.object_template().set_internal_field_count(count);
+    }
+
+    /// How many internal fields instances were promised
+    /// (`v8::ObjectTemplate::InternalFieldCount`).
+    pub fn internal_field_count(&self) -> usize {
+        self.object_template().internal_field_count()
     }
 
     fn object_template(&self) -> &api::ObjectTemplate {
@@ -519,6 +572,70 @@ mod tests {
             assert_eq!(
                 eval_number(scope, "instance.answer = 7, instance.answer"),
                 42.0
+            );
+        });
+    }
+
+    /// A static property lives on the function and not on its instances, and
+    /// `inherit` makes the child's `prototype` chain reach the parent's own
+    /// prototype — which is only true because a template materializes one
+    /// function per realm, so the parent's `.prototype` is the object the
+    /// child's chain lands on and not a second copy of it.
+    #[test]
+    fn statics_and_inheritance_reach_the_function_and_its_chain() {
+        in_context!(scope, {
+            let parent = FunctionTemplate::new(scope, sum);
+            let method_key: Local<'_, Name> = String::new(scope, "m").expect("string").into();
+            let method = FunctionTemplate::new(scope, sum)
+                .get_function(scope)
+                .expect("function");
+            parent
+                .prototype_template(scope)
+                .set(method_key, method.cast::<Data>());
+
+            let child = FunctionTemplate::new(scope, sum);
+            child.inherit(parent);
+            let static_key: Local<'_, Name> = String::new(scope, "statics").expect("string").into();
+            child.set(static_key, Number::new(scope, 5.0).cast::<Data>());
+
+            // The parent first, so its function and `.prototype` exist before
+            // the child's materialization looks for them.
+            let parent_function = parent.get_function(scope).expect("function");
+            let child_function = child.get_function(scope).expect("function");
+            bind(scope, "Parent", parent_function.cast::<Value>());
+            bind(scope, "Child", child_function.cast::<Value>());
+            // A second ask for the child's function is the first one
+            // (`get_function` per realm, as the crate has it).
+            let again = child.get_function(scope).expect("function");
+            bind(scope, "ChildAgain", again.cast::<Value>());
+
+            assert_eq!(
+                eval_number(scope, "Child.statics"),
+                5.0,
+                "a static is a property of the function"
+            );
+            assert_eq!(
+                eval_number(scope, "new Child().statics ? 1 : 0"),
+                0.0,
+                "and not of its instances"
+            );
+            assert_eq!(
+                eval_number(
+                    scope,
+                    "Object.getPrototypeOf(Child.prototype) === Parent.prototype ? 1 : 0"
+                ),
+                1.0,
+                "inherit wires the chain to the parent's own prototype object"
+            );
+            assert_eq!(
+                eval_number(scope, "new Child().m(1, 2)"),
+                3.0,
+                "so an instance of the child reaches the parent's methods"
+            );
+            assert_eq!(
+                eval_number(scope, "Child === ChildAgain ? 1 : 0"),
+                1.0,
+                "one materialization per realm"
             );
         });
     }
