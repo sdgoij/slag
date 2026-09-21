@@ -141,9 +141,12 @@ impl<'s> Local<'s, FunctionTemplate> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+
     use super::*;
-    use crate::data::Value;
+    use crate::data::{Data, Value};
     use crate::function::{FunctionCallbackArguments, ReturnValue};
+    use crate::scope::GetIsolate;
     use crate::test_support::{bind, eval_number, in_context};
 
     /// A host function in the shape the crate we stand in for maps: a plain
@@ -173,6 +176,30 @@ mod tests {
             assert_eq!(eval_number(scope, "sum(1, 2, 3)"), 6.0);
             assert_eq!(eval_number(scope, "sum()"), 0.0);
             assert_eq!(eval_number(scope, "sum.call(null, 1.5, 2.5)"), 4.0);
+        });
+    }
+
+    /// The cast a host's snapshot machinery asks: the data a template was
+    /// registered under casts back to a function template, while the same
+    /// engine object wrapped around a pointer the host chose does not.
+    #[test]
+    fn a_template_casts_back_but_a_host_pointer_does_not() {
+        in_context!(scope, {
+            let template = FunctionTemplate::new(scope, sum);
+            let data: Local<'_, Data> = template.cast();
+            let cast = Local::<FunctionTemplate>::try_from(data).expect("template");
+            assert_eq!(cast, template);
+
+            // A persistent handle is the shape a host keeps one in, and the
+            // text-free round trip through it is the one the cast sees.
+            let isolate = scope.get_isolate_ptr();
+            let persistent = Global::new(&isolate, template);
+            let from_global: Local<'_, Data> = persistent.get(scope).cast();
+            assert!(Local::<FunctionTemplate>::try_from(from_global).is_ok());
+
+            let pointer = 0x1234usize as *mut c_void;
+            let host_pointer: Local<'_, Data> = crate::External::new(scope, pointer).cast();
+            assert!(Local::<FunctionTemplate>::try_from(host_pointer).is_err());
         });
     }
 }

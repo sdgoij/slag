@@ -3,6 +3,7 @@
 use std::any::{Any, TypeId};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -535,6 +536,20 @@ impl Isolate {
     /// for as long as the isolate lives.
     pub(crate) fn add_template(&self, template: Rc<api::FunctionTemplate>) {
         self.inner().templates.borrow_mut().push(template);
+    }
+
+    /// Whether this isolate stores a function template at `pointer`.
+    ///
+    /// This is what a cast to [`FunctionTemplate`](crate::FunctionTemplate)
+    /// asks: a template handle carries an `External` naming the address the
+    /// isolate took ownership of, and a host pointer the host wrapped itself is
+    /// some other address.
+    pub(crate) fn owns_template(&self, pointer: *mut c_void) -> bool {
+        self.inner()
+            .templates
+            .borrow()
+            .iter()
+            .any(|template| Rc::as_ptr(template) as *mut c_void == pointer)
     }
 
     fn inner(&self) -> &IsolateInner {

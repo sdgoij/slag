@@ -242,6 +242,14 @@ impl TagCheck for Context {
     }
 }
 
+/// A module record, which has a payload of its own rather than an encoded
+/// language value — see `Payload::Module`.
+impl TagCheck for Module {
+    fn check(payload: &Payload) -> bool {
+        matches!(payload, Payload::Module(_))
+    }
+}
+
 macro_rules! tag_checks {
     ($($tag:ident => $check:path),* $(,)?) => {
         $(
@@ -306,6 +314,16 @@ tag_checks! {
     SymbolObject => is_symbol_object,
 }
 
+// A template has no engine object of its own: a handle is an `External` naming
+// the address the isolate took the template under, so the question is whether
+// the entered realm's isolate has that address. The only kind this bridge mints
+// is a function one, which is why `Template` — the base both kinds share — asks
+// the same question; an object template would have to widen both.
+tag_checks! {
+    Template => is_function_template,
+    FunctionTemplate => is_function_template,
+}
+
 // The predicates below are what both callers share: the cast tables above, and
 // the public `Value` surface in [`crate::value`]. They are named after the
 // methods of the crate we stand in for and take its handle, since that is what
@@ -363,6 +381,35 @@ pub(crate) fn is_function(value: &api::Local) -> bool {
 
 pub(crate) fn is_external(value: &api::Local) -> bool {
     object_matches(value, |kind| matches!(kind, ObjectKind::External(_)))
+}
+
+/// A function template this isolate minted.
+///
+/// The handle carries an `External` naming the template's address in the
+/// isolate, so the address has to be on the isolate's list of the templates it
+/// took ownership of. Without a realm entered there is no isolate to ask, which
+/// is the answer the other table predicates give too; an `External` the host
+/// wrapped around a pointer of its own is never an answer of this one.
+pub(crate) fn is_function_template(value: &api::Local) -> bool {
+    let Some(pointer) = external_pointer(value) else {
+        return false;
+    };
+    let Some(realm) = crate::realm::current() else {
+        return false;
+    };
+    // SAFETY: a realm lives in the agent of a live isolate, and the engine
+    // isolate is the first field of `IsolateInner`, so the pointer the realm
+    // carries names a live inner — see `Isolate::from_engine_ptr`.
+    let isolate = unsafe { crate::Isolate::from_engine_ptr(realm.isolate()) };
+    isolate.owns_template(pointer)
+}
+
+/// The host pointer an `External` carries, for a value that is one.
+fn external_pointer(value: &api::Local) -> Option<*mut std::ffi::c_void> {
+    match &value.value().as_object()?.kind {
+        ObjectKind::External(pointer) => Some(*pointer as *mut std::ffi::c_void),
+        _ => None,
+    }
 }
 
 pub(crate) fn is_array(value: &api::Local) -> bool {
@@ -718,6 +765,55 @@ impl_from! {
 
     FunctionTemplate => Template,
     ObjectTemplate => Template,
+
+    // Every tag to `Data`, which is the transitive half of the list above: the
+    // crate we stand in for declares each descendant against *every* base it is
+    // reachable from by `Deref`, and a host that upcasts two steps at once
+    // (`Local<Function>` to `Local<Data>`, say) needs the pair to exist.
+    Array => Data,
+    ArrayBuffer => Data,
+    ArrayBufferView => Data,
+    BigInt => Data,
+    BigInt64Array => Data,
+    BigIntObject => Data,
+    BigUint64Array => Data,
+    Boolean => Data,
+    BooleanObject => Data,
+    DataView => Data,
+    Date => Data,
+    External => Data,
+    Float32Array => Data,
+    Float64Array => Data,
+    Function => Data,
+    Int16Array => Data,
+    Int32 => Data,
+    Int32Array => Data,
+    Int8Array => Data,
+    Integer => Data,
+    Map => Data,
+    Name => Data,
+    Number => Data,
+    NumberObject => Data,
+    Object => Data,
+    Primitive => Data,
+    Promise => Data,
+    PromiseResolver => Data,
+    Proxy => Data,
+    RegExp => Data,
+    Set => Data,
+    SharedArrayBuffer => Data,
+    String => Data,
+    StringObject => Data,
+    Symbol => Data,
+    SymbolObject => Data,
+    TypedArray => Data,
+    Uint16Array => Data,
+    Uint32 => Data,
+    Uint32Array => Data,
+    Uint8Array => Data,
+    Uint8ClampedArray => Data,
+    WasmMemoryObject => Data,
+    WasmModuleObject => Data,
 }
 
 macro_rules! impl_try_from {
@@ -743,6 +839,7 @@ macro_rules! impl_try_from {
 // reports the missing cast instead of the cast silently failing.
 impl_try_from! {
     Data => Context,
+    Data => Module,
     Data => Value,
     Data => Primitive,
     Data => Name,
@@ -786,6 +883,8 @@ impl_try_from! {
     Data => BooleanObject,
     Data => NumberObject,
     Data => SymbolObject,
+    Data => Template,
+    Data => FunctionTemplate,
 
     Value => Primitive,
     Value => Name,
@@ -908,6 +1007,8 @@ impl_try_from! {
     TypedArray => Float64Array,
     TypedArray => BigInt64Array,
     TypedArray => BigUint64Array,
+
+    Template => FunctionTemplate,
 }
 
 /// The error of a failed [`Local`] cast: the value was not of the type the tag

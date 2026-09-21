@@ -542,6 +542,7 @@ number is the certified one.
 | after `FunctionBuilder` (`FunctionBuilder`, `data`/`length`/`constructor_behavior`, `FunctionTemplate::builder*`) | **20** |
 | after the serializer (`ValueSerializer`/`ValueDeserializer`, the delegate and helper traits, this bridge's own wire format) | **8 names, and 617 type errors behind them** (see below) |
 | after the first method pass (the handle casts and `Local`'s cross-type equality, the value conversions and element predicates, the object/array/function/promise/proxy/string calls, `NewTryCatch` from a callback scope) | **374** (see below) |
+| after the `From`/`TryFrom` closure (the transitive casts, and the predicate a template cast needs) | **369** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -666,27 +667,74 @@ change what it does; `PromiseResolver::{resolve, reject}`; `Proxy::{get_target,
 get_handler}`; `SharedArrayBuffer::get_backing_store`;
 `String::to_rust_cow_lossy`.
 
-**What the remaining 374 are, measured.** **51** are `E0599`s on a `Local<…>` —
+**What the remaining 369 are, measured.** **51** are `E0599`s on a `Local<…>` —
 the tail (private names, the module accessors, the templates, context embedder
 data, `PrimitiveArray`, `Message`, `create_code_cache`), each needing its own
 look at what the engine has. **34** are `E0599`s on another bridge type
 (`Global::open`, `Function::builder`, `Symbol::get_iterator`,
 `ArrayBuffer::new_backing_store_from_ptr`, …). **155** are the tag shape §9
 records as open (78 `E0599`s with a tag receiver, 77 of the 78 `E0308`s being
-`expected &Tag, found &Local<…>`). **8** are still names (the wasm tail). And
-**17** `E0277`s are a second mechanical gap this pass found: **the `From`/`TryFrom`
-tables here are direct-edge tables where the crate's are transitive closures**
-(176 `impl_from!` entries there, 60 here), so a host's
-`Local<Data>: From<Local<Function>>` and
-`TryFrom<Local<Data>> for Local<FunctionTemplate>` do not exist. Closing that is
-mechanical — write out the closure — and is the next chunk; the *template* tags
-need one thing more before a cast to them can exist at all, since the bridge
-keeps a template as an `External` under an isolate-registered pointer and has no
-predicate that tells a template from any other `External`.
+`expected &Tag, found &Local<…>`). **8** are still names (the wasm tail). The
+`E0277` group is down to **5** — four `NewTryCatch` receivers and one
+`PropertyFilter: Default` — after the cast closure below; the other 12 in it were
+the `From`/`TryFrom` gap, which is now closed.
 
-Gates: `cargo test -p v8 --features simdutf` **117 passed / 0 failed**,
-`clippy` clean at crate and workspace scope, and
-`cargo test --locked --workspace` **5,050 passed / 0 failed / 4 ignored** with
+**The `From`/`TryFrom` closure — landed, and eleven casts deliberately absent.**
+The crate's cast tables are transitive closures, not direct-edge tables, so a
+host's `Local<Data>: From<Local<Function>>` and
+`TryFrom<Local<Data>> for Local<FunctionTemplate>` have to exist. `impl_from!`
+reached the crate's 176 pairs at the end of the previous step; `impl_try_from!` is
+now **162 of the crate's 173**, checked by diffing the two lists rather than by
+reading them. Every one of the eleven left out needs a predicate the bridge
+cannot honestly answer with, which is the rule `TagCheck` already states — a cast
+whose answer would be a guess is a compile error instead:
+
+| absent cast | why |
+|---|---|
+| `Data`/`Template` → `ObjectTemplate` | the bridge mints no object template yet, so nothing can be one |
+| `Data` → `FixedArray` | a `FixedArray` here is the JS array the bridge built for the host, so `is_array` would answer `true` for every array |
+| `Data` → `ModuleRequest`, `Data` → `Private` | neither has a payload or a table here; a `Module` does (`Payload::Module`), which is why that pair landed |
+| `Data`/`Value`/`Object` → `WasmMemoryObject`, `WasmModuleObject` | the bridge builds no wasm object, and `crates/wasm` is not in its graph |
+
+The two pairs `deno_core` actually asks for are both real answers. `Data =>
+Module` reads the payload the module handle already carries: a module record is
+not a language value, so it has no encoded form a `Value` payload could hold, and
+the predicate is exact rather than a heuristic. The template family needed one
+thing more. A template has no engine object of its own, so a handle *is* an
+`External` naming the address the isolate took the template under — and nothing
+about an `External` says whether it is a template, because a host wraps its own
+pointers in the same shape. The predicate is therefore that address question
+asked of the isolate that owns it: `Isolate::owns_template` over
+`IsolateInner::templates`, reached from the value through the entered realm
+(`realm::current().isolate()`) by the same `Isolate::from_engine_ptr` the
+bridge's `GetIsolate` already uses, resting on the layout assertion that keeps an
+engine pointer and a handle naming one address. With no realm entered the answer
+is `false`, as it is for every other table predicate here. What is *not* claimed:
+`Template` and `FunctionTemplate` share that predicate today, because the only
+templates this bridge mints are function ones, and the first object template has
+to widen both.
+
+The test guarding it can fail, and was made to: the data a template was
+registered under casts back to a `FunctionTemplate` — including across a `Global`
+round trip, the shape a host's snapshot machinery keeps one in — while an
+`External` around a host pointer does not; with the predicate forced to `true`
+the second assertion fails, which is how it was checked.
+
+**The measurement, four ways.** The last step recorded 374 for this tree, and
+374 is exactly this tree *without* this step's four pairs *and* without the
+transitive `impl_from!` block that step landed last. With the block and without
+the pairs it is 371, with the pairs and without the block 372, with both **369** —
+so the previous step's closure is worth 3 of the difference and this step's pairs
+exactly 2, which are the two `TryFrom` bound errors `deno_core`'s
+`SnapshotLoadDataStore::get::<T>` raises (its bound is literally
+`Local<'s, T>: TryFrom<Local<'s, Data>>`, and the two `T`s it asks for are
+`Module` and `FunctionTemplate`). No other error appeared or vanished in either
+measurement, checked by diffing the two error lists rather than by the count.
+
+Gates: `cargo test -p v8 --features simdutf` **119 passed / 0 failed** (the new
+cast test included; the feature is what the last steps used), `clippy` clean at
+crate and workspace scope, and
+`cargo test --locked --workspace` **5,051 passed / 0 failed / 4 ignored** with
 the crashing test skipped (a re-run: the first run failed on the `runtime` flake
 below, which aborts cargo and so hides every later binary's count).
 
@@ -833,6 +881,17 @@ if that proves possible.
   ask for and never written, which is what the crate we stand in for does with
   the flag; a stream naming a newer version is refused by `read_header` rather
   than misread.
+- **A cast whose predicate the bridge cannot answer honestly is a compile
+  error, not a guess.** `impl_try_from!` is 162 of the crate's 173 pairs, and §7
+  lists the eleven left out with their reasons (the object template,
+  `FixedArray`, `ModuleRequest`/`Private`, the two wasm object types). A check
+  that always answers `true` would let a host's failed cast succeed and hand it a
+  value of the wrong shape, which is worse than a name the compiler reports; the
+  `TagCheck` doc comment in `crates/v8/data.rs` says so where the next reader
+  meets it. The template predicate is the one case that needs state rather than a
+  payload test — it asks the entered realm's isolate whether that address is one
+  of its templates — so a cast with no realm entered fails, which is the
+  documented behaviour of every other table predicate in the bridge.
 - **The tag shape blocks a quarter of the remaining `deno_core` surface, and
   the decision is open.** `deno_core` calls methods on `&v8::Value` and
   `&v8::String` and transmutes between them (`libs/core/runtime/ops.rs:273`,
@@ -872,9 +931,9 @@ Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks
 (2) grow the surface from the items `deno_core` names, in call order — the name
 frontier is closed (8 left, the wasm tail) and the serializer is landed, so this
 is a **method-level** stage: 617 type errors were visible for the first time, the
-first pass through them took it to 374, and what is left is the mechanical
-`From`/`TryFrom` closure, the ~85 remaining call sites on `Local` and the other
-bridge types, the 155 errors the tag shape in §9 blocks, and the wasm tail;
+first pass through them took it to 374, the cast closure to 369, and what is left
+is the ~85 remaining call sites on `Local` and the other bridge types, the 155
+errors the tag shape in §9 blocks, the 5 `E0277`s beside them, and the wasm tail;
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
 those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
 a host that must boot without a snapshot); (4) migrate, then
