@@ -50,6 +50,7 @@ mod realm;
 mod scope;
 mod script;
 pub mod script_compiler;
+mod serialize;
 #[cfg(feature = "simdutf")]
 pub mod simdutf;
 mod snapshot;
@@ -97,6 +98,10 @@ pub use scope::{
 };
 pub use script::ScriptOrigin;
 pub use script_compiler::CachedData;
+pub use serialize::{
+    ValueDeserializer, ValueDeserializerHeap, ValueDeserializerHelper, ValueDeserializerImpl,
+    ValueSerializer, ValueSerializerHeap, ValueSerializerHelper, ValueSerializerImpl,
+};
 pub use snapshot::{FunctionCodeHandling, StartupData};
 pub use support::{
     BackingStore, DefaultTag, MapFnFrom, MapFnTo, SharedRef, UniquePtr, UniqueRef, UnitType,

@@ -113,6 +113,23 @@ impl<'s> Local<'s, Object> {
         }
     }
 
+    /// [[HasOwnProperty]] (`v8::Object::HasOwnProperty`).
+    ///
+    /// The chain is not consulted, so an inherited property answers `false` —
+    /// which is the question that tells an array element from a hole, since a
+    /// `[[Get]]` of either answers `undefined`.
+    pub fn has_own_property(&self, scope: &PinScope<'_, '_>, key: Local<Value>) -> Option<bool> {
+        let name = key.engine().as_string()?;
+        let object = self.engine().value().as_object()?;
+        match object.has_own_property(&crux::string::JsString::from_utf8(&name)) {
+            Ok(found) => Some(found),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
     /// Define a property from a descriptor (`v8::Object::DefineProperty`).
     ///
     /// An ordinary `DefineOwnProperty` that does not throw, as there: the

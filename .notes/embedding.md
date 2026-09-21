@@ -540,6 +540,7 @@ number is the certified one.
 | after the inspector (`v8::inspector`, `UniquePtr`, `IsolateHandle`, `ExtendLifetime`) | **42** |
 | after `cppgc` (`v8::cppgc`, `Object::wrap`/`unwrap`/`is_api_wrapper`, `get_cpp_heap`) | **26** |
 | after `FunctionBuilder` (`FunctionBuilder`, `data`/`length`/`constructor_behavior`, `FunctionTemplate::builder*`) | **20** |
+| after the serializer (`ValueSerializer`/`ValueDeserializer`, the delegate and helper traits, this bridge's own wire format) | **8 names, and 617 type errors behind them** (see below) |
 
 The count went *up* once because it had been lying: while a crate has unresolved
 imports, rustc reports those and stays silent about the names behind them, so the
@@ -559,16 +560,114 @@ sites, all of them names, and the count fell by exactly 16; `FunctionBuilder` wa
 error.rs`, which is now clean). Nothing was hidden behind either, which is worth
 stating because the *opposite* was equally likely both times.
 
-What is left is 20 sites, and the order to take them in:
+**The serializer — landed, and the count stopped being a progress metric.**
+`crates/v8/serialize.rs` carries `ValueSerializer`/`ValueDeserializer`, the two
+delegate traits and the two helper traits, over a walk that round-trips
+`undefined`/`null`/booleans, numbers as the `f64` itself (so `-0` and every NaN
+survive), strings as UTF-16 code units (so a lone surrogate survives), BigInts,
+arrays with holes written as holes, ordinary objects by their own enumerable
+string keys, `Map`, `Set`, `Date`, `RegExp`, `ArrayBuffer`, typed arrays and
+`DataView` — with object identity, so a cycle comes back a cycle and two
+references to one object come back as one object. Host objects go through the
+delegate's hooks and a shared array buffer through its transfer-id hook;
+everything else (a function, a symbol, a promise, a proxy, a weak collection, an
+iterator, an `Error`, a primitive wrapper, a detached buffer) fails through
+`throw_data_clone_error`, which is V8's own path for a value it will not clone.
+Four findings are worth more than the code.
 
-1. **The value serializers (~13)** — `ValueSerializer`/`ValueDeserializer` and
-   the four helper traits. The engine's structured clone is the closest thing to
-   a real implementation behind them. The largest remaining cluster.
-2. **The wasm tail (~5)** — `WasmStreaming`, `WasmAsyncSuccess`,
-   `CompiledWasmModule`. `crates/wasm` exists, so what is missing is the
-   streaming/wrapping API a host uses, not the engine.
-3. **The stragglers (3)** — `PromiseRejectMessage`, `NearHeapLimitCallback`,
-   `SyntheticModuleEvaluationSteps`.
+- **Name resolution had been masking type checking.** The 20 "remaining" names
+  were not 20 things left: while the crate has an unresolved *import*, rustc
+  reports that and never type-checks a body. Resolving the serializer's six
+  names let it through, and the count went **21 → 625** — 8 names (the wasm
+  tail) and **617 type errors that had never been visible**. Every number in
+  the table above counts *name* errors, and the way it fell by exactly the
+  number of names added was a property of the phase, not of the work.
+- **A quarter of those 617 are blocked by a shape difference, not by missing
+  methods.** `rusty_v8` puts the methods on the *tag* types and gives
+  `Local<'s, T>: Deref<Target = T>`, which is how `&v8::Value` is a receiver at
+  all (`deno_core`'s `runtime/ops.rs:273` calls `is_string` on one) and how
+  `&v8::Value → &v8::String` is a legal `transmute`. This bridge puts the
+  methods on `Local<T>` and derefs along the tag chain instead, because its tags
+  are zero-sized and a method on a tag has no payload to read. Measured:
+  **78** `E0599`s have a tag receiver, and **75 of the 77** `E0308`s are
+  `expected &Tag, found &Local<…>` — **153** errors that no number of added
+  methods can close. The other **291** `E0599`s are on `Local<…>` and are the
+  mechanical kind; **9** are `E0624`, `Local::cast` being `pub(crate)` here and
+  `pub` there — and *checked* there (it panics on a bad cast) where this
+  bridge's is an unchecked retag, so making it public is a decision rather than
+  a one-word change.
+- **The wasm module transfer-id hook is part of the delegate surface and
+  unreachable**: the engine hands out no wasm module value for the walk to
+  recognize. That is stated in the module header, not left to be discovered.
+- **Two gaps in the walk**, both narrow and both in the module header: a
+  property *key* that is not UTF-8 clean is spelled as U+FFFD by the bridge's
+  own property enumeration (a *value* string is exact), and a malformed stream
+  raises a pending `Error` where V8 raises a `DOMException` `DataCloneError`
+  the engine has no type for.
+
+Gates: `cargo test -p v8 --features simdutf` **118 passed / 0 failed** (17 of
+them this step), `cargo clippy -p v8 --all-targets --features simdutf -- -D
+warnings` clean, and the workspace: **5,050 passed / 0 failed / 4 ignored**
+across 38 binaries, with one test skipped — see the crash below.
+`crates/v8` is a workspace member and no runner depends on it, so the test262
+and wasm sweeps are not implicated (checked in the Cargo manifests, not assumed).
+
+**A pre-existing crash, found while gating this step.** The v8 test binary
+aborts with `STATUS_ACCESS_VIOLATION` on most runs, and the test it dies in is
+`function::tests::the_data_a_built_function_carries_survives_a_collection` —
+the collection test the `FunctionBuilder` step above added. It passes 5/5 in
+isolation and aborts about two runs in three when the whole binary runs, so what
+it interacts with is what runs before it rather than the test alone. It is not
+this step's (it reproduces with the serializer's tests skipped, and on HEAD's
+tree, which has no serializer), and it is not fixed here: recorded because it
+means `cargo test --locked --workspace` is *not* green as a whole — cargo stops
+at that binary, so every count above is taken with it skipped — and because a
+test that aborts instead of failing is the hazard §7's last step warned about
+from the other direction.
+
+What is left is 8 names, and behind them the type errors the table's numbers
+now measure:
+
+1. **The value serializer — landed** (13 sites: the two delegate traits, the
+   two helper traits, both entry points, and the walk). The design note that
+   follows is kept because it is why the walk looks the way it does.
+   The *walk* had to be written against the bridge's value API, since the engine
+   has no structured clone anywhere (`grep -rn 'structured_clone'` finds none):
+   own-key enumeration for objects, elements and holes for arrays,
+   `Map`/`Set` through `as_array`, typed-array kind and bytes,
+   `Date`/`RegExp` through the agent's own tables, and an identity map for
+   cycles and shared references. The *delegate* side was fully specified by
+   `deno_core`'s uses and that enumeration held. The *format* is this bridge's
+   own version 1, recorded in §9.
+   **Slice 1's design.** The walk runs under a scope the serializer and
+   deserializer *synthesise* for the call: the delegate traits take a
+   `&mut PinScope`, and every accessor the bridge offers takes one too
+   (`Local<Array>::get_index`, `Map::as_array`, `Set::as_array`,
+   `Object::get_own_property_names`), while the engine offers no scope-free
+   equivalent for a `Map`'s or `Set`'s slots. So both entry points store the
+   isolate and open a `CallbackScope` + `ContextScope` per call, which is what
+   the delegate's error path needs anyway (`throw_data_clone_error` is handed a
+   scope). A first cut written against `crux`'s agent-free accessors was deleted
+   rather than landed: it invented method names and could not reach a `Map`'s
+   entries at all. Both decisions are visible in `crates/v8/serialize.rs` now,
+   and the `Global<Context>` that note predicted turned out to be unnecessary
+   (the delegate is handed the walk's scope directly, so the stored realm is
+   never read).
+2. **The wasm tail (5 sites) — surveyed, and two of the three need engine work.**
+   `WasmAsyncSuccess` (2) is an enum and nothing else, but it appears in the
+   signature of the async-resolve hook `deno_core` installs, which the engine has
+   no counterpart for. `WasmStreaming` (2) needs the streaming decoder —
+   `crates/wasm` decodes binaries, so what is missing is the byte-at-a-time API
+   and the promise it resolves — and `CompiledWasmModule` (1) needs a module
+   handle the bridge can hold. None of the three is a name to declare.
+3. **The stragglers (3) — one of them is not a name either.** `PromiseRejectMessage`
+   (1) is a struct, but its only use is the argument of the callback
+   `set_promise_reject_callback` installs, and the engine has no promise-reject
+   hook; that missing method is currently *masked* by the unresolved type, so
+   fixing the name will surface it. `NearHeapLimitCallback` (1) is a callback for
+   a heap limit the engine does not enforce. `SyntheticModuleEvaluationSteps` (1)
+   is a callback for synthetic modules, which the engine does not have (its
+   JSON/text/bytes modules are source-text modules with a synthetic body).
 4. **The rest of `v8::Module`** — method-level, so invisible in today's count:
    `get_module_requests` (a `FixedArray` of `ModuleRequest`, which needs a `Data`
    downcast the bridge has no exact predicate for yet), `is_graph_async`,
@@ -650,6 +749,37 @@ if that proves possible.
   the two failure modes are not symmetric: a carried hint costs an optimization
   the host never had, while a carried *property* — `length`, say — would be a
   wrong answer.
+- **The value serializer's wire format is this bridge's own.** The crate we
+  stand in for serializes into a format that is internal to V8 — 16 versions of
+  history in 2,993 lines of C++ — and matching those bytes buys exactly one
+  thing: exchanging blobs with a real V8 process. Every use `deno_core` has is
+  in-process, so the bridge defines its own versioned format, states that in the
+  module's header, and a host that needs the other thing needs a different
+  engine. Recorded here rather than left to be discovered from a stack of
+  bytes. **Landed as version 1**: a two-byte header (tag + version) and one tag
+  per value kind, little-endian, with object identity written as a reference to
+  an earlier id. Legacy streams are *accepted* as the version-0 shape a host can
+  ask for and never written, which is what the crate we stand in for does with
+  the flag; a stream naming a newer version is refused by `read_header` rather
+  than misread.
+- **The tag shape blocks a quarter of the remaining `deno_core` surface, and
+  the decision is open.** `deno_core` calls methods on `&v8::Value` and
+  `&v8::String` and transmutes between them (`libs/core/runtime/ops.rs:273`,
+  `convert.rs:211`), which needs `Local<'s, T>: Deref<Target = T>` over
+  pointer-carrying tags — the crate we stand in for's shape. This bridge's tags
+  are zero-sized and its methods live on `Local`, which is why 153 of the 617
+  errors behind the last names cannot be closed by adding methods. Rust allows
+  one `Deref` per type, so the two shapes cannot both be had: either the deref
+  chain moves onto the tags and the methods move with it (a rewrite of the
+  bridge's handle layer and its ~800 methods, and the only path to `deno_core`
+  compiling unmodified), or the deref-to-tag stays absent and those call sites
+  are the difference a porting host must absorb. Recorded with the numbers and
+  left unresolved rather than decided mid-flight by an agent.
+- **A pre-existing crash in the v8 test binary is recorded, not hidden.**
+  `function::tests::the_data_a_built_function_carries_survives_a_collection`
+  aborts the process on most full-binary runs (it passes in isolation, so the
+  interaction is with earlier tests in the same process). It predates the
+  serializer and is not fixed here; §7 carries the evidence.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
@@ -668,14 +798,14 @@ shim histogram implies: structured frames and termination, host memory, inspecto
 and source maps, traced host objects, structured clone.
 
 Bridge side: (1) signature-compatible Rust face — done, `serde_v8` type-checks;
-(2) grow the surface from the items `deno_core` names, in call order — in
-progress, 124 → 20 errors, with initialization, module loading, the callback ABI,
-snapshot creation and restore, the inspector, the host-object heap and the name
-tail landed; what is left is the value serializer and the names around the wasm
-and builder APIs, plus the method-level gaps behind them;
+(2) grow the surface from the items `deno_core` names, in call order — the name
+frontier is effectively closed (8 left, the wasm tail), and the serializer is
+landed, so this is now a **method-level** stage: 617 type errors are visible for
+the first time, 291 of them additions of the mechanical kind, 153 blocked on the
+tag shape §9 records as open;
 (3) point the local `deno/` checkout at the crate and run a script — blocked on
-those names, and on the runtime gaps this work found (`queueMicrotask`, and a
-host that must boot without a snapshot); (4) migrate, then
+those type errors, and on the runtime gaps this work found (`queueMicrotask`, and
+a host that must boot without a snapshot); (4) migrate, then
 delete.
 
 ## 11. Working rules
