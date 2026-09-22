@@ -21,12 +21,25 @@
 //!   object — which is what a host's own bookkeeping depends on.
 //!
 //! What it does not carry yet ends the walk with [`Unsupported`], which names
-//! the value it refused: a function body, a proxy, a typed array, a module
-//! namespace, a host object, an array with a hole, an indexed accessor, an array
-//! whose `length` is not an index, and a host pointer the host's
-//! external-reference table does not have. Each entry is a subsystem to carry,
-//! and the walk refuses rather than writing something a restore would read back
-//! wrong.
+//! the value it refused: a proxy, a typed array, a module namespace, a host
+//! object, an array with a hole, an indexed accessor, an array whose `length` is
+//! not an index, a host pointer the host's external-reference table does not
+//! have, a host callback (a built-in that is not an intrinsic), a bound
+//! function, and a function the engine kept no source text for — an arrow, a
+//! method or an accessor. Each entry is a subsystem to carry, and the walk
+//! refuses rather than writing something a restore would read back wrong.
+//!
+//! # A function
+//!
+//! A JavaScript function is written as the source text it can be re-parsed
+//! from, its [[Strict]], and its object part, and the restore evaluates that
+//! source in the realm's global environment. That is enough for a function
+//! whose body is self-contained and not for one that closed over a scope: a
+//! blob holds the value graph, not the environment chain a closure was
+//! compiled in, so a restored function resolves a free name globally. The
+//! format says so here rather than promising a closure it cannot rebuild; a
+//! host callback — a Rust closure in this engine — has no source at all and
+//! refuses by name.
 //!
 //! Version 1. The format is ours to version, and its compatibility surface is
 //! the *names* it writes: an intrinsic name and a well-known symbol name have to
@@ -54,6 +67,7 @@
 use std::collections::HashMap;
 
 use crux::bigint::{self, BigInt};
+use crux::function::{Function, FunctionKind};
 use crux::handle::Handle;
 use crux::heap::Pin;
 use crux::object::{JsObject, ObjectKind, Property, PropertyKind};
@@ -63,6 +77,7 @@ use crux::symbol::{self, Symbol};
 use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
+use crate::function::EcmaFunction;
 use crate::realm::Realm;
 
 /// The blob's first eight bytes, and its last eight: a blob that lost its head
@@ -91,6 +106,7 @@ const REC_INTRINSIC: u8 = 10;
 const REC_OBJECT: u8 = 11;
 const REC_ARRAY: u8 = 12;
 const REC_EXTERNAL: u8 = 13;
+const REC_FUNCTION: u8 = 14;
 
 const FLAG_ENUMERABLE: u8 = 1;
 const FLAG_CONFIGURABLE: u8 = 2;
@@ -159,6 +175,9 @@ pub enum DecodeError {
     Truncated,
     /// A record tag this version does not write.
     BadTag(u8),
+    /// A function record's source could not be rebuilt into a function in the
+    /// realm being restored.
+    UnrebuildableFunction(String),
     /// A blob names an intrinsic the reading realm does not have.
     UnknownIntrinsic(String),
     /// A blob names an entry the host's external-reference table does not have.
@@ -187,6 +206,9 @@ impl std::fmt::Display for DecodeError {
             ),
             Self::Truncated => write!(f, "snapshot ends in the middle of a field"),
             Self::BadTag(tag) => write!(f, "snapshot record tag {tag} is not one of this format's"),
+            Self::UnrebuildableFunction(reason) => {
+                write!(f, "snapshot function could not be rebuilt: {reason}")
+            }
             Self::UnknownIntrinsic(name) => {
                 write!(
                     f,
@@ -250,6 +272,15 @@ enum Record {
     Intrinsic(String),
     /// A host pointer, by its index in the host's external-reference table.
     External(u32),
+    /// A function: its source, whether that source is strict, and its object
+    /// part.
+    Function {
+        source: Vec<u16>,
+        strict: bool,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
     Object {
         proto: u32,
         extensible: bool,
@@ -378,8 +409,11 @@ pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u
 /// realm that wrote it. `externals` is the host's table, rebuilt for this load:
 /// the index a blob wrote is resolved against it, and an index it does not have
 /// is refused rather than read past the end.
+///
+/// The agent is mutable because carrying a function means re-running the parser
+/// and registering a new body: a blob holds source text, not a compiled body.
 pub fn decode_slot(
-    agent: &Agent,
+    agent: &mut Agent,
     realm: &Handle<Realm>,
     bytes: &[u8],
     slot: usize,
@@ -436,7 +470,11 @@ pub fn decode_slot(
 /// Read a blob, answering the value at slot 0's index 0.
 ///
 /// The single-value form of [`decode_slot`], matching [`encode`].
-pub fn decode(agent: &Agent, realm: &Handle<Realm>, bytes: &[u8]) -> Result<Value, DecodeError> {
+pub fn decode(
+    agent: &mut Agent,
+    realm: &Handle<Realm>,
+    bytes: &[u8],
+) -> Result<Value, DecodeError> {
     decode_slot(agent, realm, bytes, 0, &[])?
         .and_then(|items| items.first().copied())
         .ok_or(DecodeError::Truncated)
@@ -589,6 +627,7 @@ fn visit(
     objects: &mut Vec<(Value, Handle<Realm>)>,
     serials: &mut HashMap<Identity, u32>,
 ) -> Result<u32, Unsupported> {
+    let value = canonical(value);
     let key = identity(realm, value);
     if let Some(serial) = serials.get(&key) {
         return Ok(*serial);
@@ -608,9 +647,24 @@ fn visit(
                 }
             }
         }
-        ValueKind::Function(_) => {
+        ValueKind::Function(function) => {
             if realm.intrinsics.name_of_value(&value).is_none() {
-                return Err(uncarried_callable(agent, realm, &value));
+                // A function this realm cannot name may be one *another* realm of
+                // this isolate knows, which means the value was built in a
+                // different context than the slot it is being written into. That
+                // is a host's mistake rather than a missing feature and it has a
+                // different fix, so it gets its own message rather than
+                // surfacing as "a built-in function" three frames later.
+                if named_by_another_realm(agent, realm, &value) {
+                    return Err(Unsupported::new(
+                        "a value from another realm",
+                        "the value was built in another context of this isolate, so the realm it is being written into cannot name its builtins",
+                    ));
+                }
+                function_record(agent, &function)?;
+                for child in children(&function.object)? {
+                    visit(agent, realm, externals, child, objects, serials)?;
+                }
             }
         }
         ValueKind::Undefined
@@ -622,6 +676,72 @@ fn visit(
         | ValueKind::Symbol(_) => {}
     }
     Ok(serial)
+}
+
+/// The value a serial names, with a function's object part folded back into the
+/// function it belongs to.
+///
+/// `Object.setPrototypeOf(x, f)` stores `f`'s *object side*, so a prototype link
+/// can reach a function as an object — the engine keeps a back-reference on the
+/// object part for exactly that reason. The two are one value in the language,
+/// and writing the object side as the ordinary object its shape suggests would
+/// restore a plain object where a function belongs, so the walk canonicalizes
+/// it here: the one place that decides what a serial names.
+fn canonical(value: Value) -> Value {
+    if let ValueKind::Object(object) = value.kind()
+        && let Some(function) = object.function_value()
+    {
+        return function;
+    }
+    value
+}
+
+/// The record a function is written from, or the reason this format cannot
+/// carry it.
+///
+/// A built-in that is not an intrinsic is a host callback, and in this engine a
+/// host callback is a Rust closure rather than an address or a name a blob could
+/// hold; a bound function is the target and arguments it closed over; an arrow,
+/// a method or an accessor has no standalone source text (`Function.prototype.
+/// toString` already answers the native form for them). Each is refused by the
+/// kind it is, because the fix differs: a callback wants the external-reference
+/// table's `function` field, an arrow wants the scope it closed over.
+fn function_record<'a>(
+    agent: &'a Agent,
+    function: &Handle<Function>,
+) -> Result<&'a EcmaFunction, Unsupported> {
+    match &function.kind {
+        FunctionKind::Builtin { .. } => Err(Unsupported::new(
+            "a built-in function",
+            "a host callback is a Rust closure, not a name or an address a snapshot can carry",
+        )),
+        FunctionKind::Bound { .. } => Err(Unsupported::new(
+            "a bound function",
+            "its target and bound arguments are not carried yet",
+        )),
+        FunctionKind::EcmaScript => {
+            let data = agent
+                .ecma_functions
+                .get(&function.id())
+                .ok_or(Unsupported::new(
+                    "a function",
+                    "its body is not registered on this agent",
+                ))?;
+            if data.is_method {
+                return Err(Unsupported::new(
+                    "a method",
+                    "a method's source has no `function` keyword, so it cannot be re-parsed on its own",
+                ));
+            }
+            if data.source.is_none() {
+                return Err(Unsupported::new(
+                    "a function",
+                    "the engine kept no source text for it",
+                ));
+            }
+            Ok(data)
+        }
+    }
 }
 
 /// The index a host pointer has in the external-reference table.
@@ -639,26 +759,12 @@ fn external_index(externals: &[usize], pointer: usize) -> Result<u32, Unsupporte
         ))
 }
 
-/// Why a callable was not carried, as precisely as the walk can tell.
-///
-/// A callable the walking realm does not know may be one *another* realm of this
-/// isolate knows, which means the value was built in a different context than
-/// the slot it is being written into. That is a host's mistake rather than a
-/// missing feature, and it has a different fix, so it gets a different message —
-/// otherwise the failure surfaces three frames later as "a function", which is
-/// what the first version of this walk reported for it.
-fn uncarried_callable(agent: &Agent, realm: &Handle<Realm>, value: &Value) -> Unsupported {
-    let from_another_realm = agent.realms.borrow().iter().any(|other| {
+/// Whether a realm other than the walking one knows this value as one of its
+/// intrinsics.
+fn named_by_another_realm(agent: &Agent, realm: &Handle<Realm>, value: &Value) -> bool {
+    agent.realms.borrow().iter().any(|other| {
         !Handle::ptr_eq(*other, *realm) && other.intrinsics.name_of_value(value).is_some()
-    });
-    if from_another_realm {
-        Unsupported::new(
-            "a value from another realm",
-            "the value was built in another context of this isolate, so the realm it is being written into cannot name its builtins",
-        )
-    } else {
-        Unsupported::new("a function", "a function body is not carried yet")
-    }
+    })
 }
 
 /// Every value an object reaches: its prototype, its keys, and its values.
@@ -863,15 +969,15 @@ fn write_record(
             write_text(body, &bigint::to_string(&number, BIGINT_RADIX));
         }
         ValueKind::Symbol(symbol) => write_symbol(agent, symbol, body),
-        ValueKind::Function(_) => match realm.intrinsics.name_of_value(&value) {
+        ValueKind::Function(function) => match realm.intrinsics.name_of_value(&value) {
             Some(name) => {
                 body.push(REC_INTRINSIC);
                 write_text(body, &name);
             }
-            // The walk refuses an uncarried callable before this, so reaching
-            // here means the walk and the writer disagree about a record rather
-            // than that a host's value is uncarried.
-            None => return Err(uncarried_callable(agent, realm, &value)),
+            // The walk refuses a function it cannot carry before this, so
+            // reaching here with one means the walk and the writer disagree
+            // about a record rather than that a host's value is uncarried.
+            None => write_function(agent, realm, &function, serials, body)?,
         },
         ValueKind::Object(object) => match realm.intrinsics.name_of_value(&value) {
             Some(name) => {
@@ -933,6 +1039,41 @@ fn write_object(
     write_u32(body, prototype_serial(realm, &object, serials)?);
     body.push(u8::from(object.extensible.get()));
     write_properties(realm, &object, serials, body)?;
+    Ok(())
+}
+
+/// Write a JavaScript function as the source text it can be rebuilt from, its
+/// [[Strict]], and its object part — the same prototype/extensible/properties
+/// triple an object gets, because a function's own keys are its own keys.
+///
+/// The source is what makes this the one record a restore re-runs the parser
+/// for, and it is also the record's limit: what the source cannot say is the
+/// [[Environment]] the function closed over, so a restored function resolves a
+/// free name through the realm's global environment rather than through the
+/// scope it was compiled in. A function whose body is not self-contained — an
+/// arrow, or anything deno's bootstrap closed over — is refused upstream.
+fn write_function(
+    agent: &Agent,
+    realm: &Handle<Realm>,
+    function: &Handle<Function>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    let data = function_record(agent, function)?;
+    // `function_record` refuses a function without source, so the read cannot
+    // miss; a record without one would be a blob this writer would not read.
+    let Some(source) = data.source.as_ref() else {
+        return Err(Unsupported::new(
+            "a function",
+            "the engine kept no source text for it",
+        ));
+    };
+    body.push(REC_FUNCTION);
+    body.push(u8::from(data.strict));
+    write_units(body, source.as_slice());
+    write_u32(body, prototype_serial(realm, &function.object, serials)?);
+    body.push(u8::from(function.object.extensible.get()));
+    write_properties(realm, &function.object, serials, body)?;
     Ok(())
 }
 
@@ -1059,7 +1200,7 @@ fn stored_property(
 /// shows up as a refused decode instead of a crash in a host's build.
 fn serial_in(realm: &Handle<Realm>, serials: &HashMap<Identity, u32>, value: Value) -> u32 {
     serials
-        .get(&identity(realm, value))
+        .get(&identity(realm, canonical(value)))
         .copied()
         .unwrap_or(NO_REF)
 }
@@ -1083,6 +1224,20 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
         REC_EXTERNAL => Ok(Record::External(
             reader.u32().ok_or(DecodeError::Truncated)?,
         )),
+        REC_FUNCTION => {
+            let strict = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let source = reader.units().ok_or(DecodeError::Truncated)?;
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::Function {
+                source,
+                strict,
+                proto,
+                extensible,
+                properties,
+            })
+        }
         REC_SYMBOL_WELL_KNOWN => Ok(Record::SymbolWellKnown(
             reader.u16().ok_or(DecodeError::Truncated)?,
         )),
@@ -1144,7 +1299,7 @@ fn read_properties(reader: &mut Reader<'_>) -> Result<Vec<StoredProperty>, Decod
 }
 
 struct Builder<'a> {
-    agent: &'a Agent,
+    agent: &'a mut Agent,
     realm: &'a Handle<Realm>,
     /// The host's external-reference table, which a host pointer record is
     /// resolved against.
@@ -1268,11 +1423,98 @@ impl Builder<'_> {
                 define_properties(self, array, extras)?;
                 Built::Object(array)
             }
+            Record::Function {
+                source,
+                strict,
+                proto,
+                extensible,
+                properties,
+            } => {
+                let function = self.build_function(source, *strict, *proto)?;
+                // Recorded before the properties are defined, so an own
+                // property that refers back to the function — `prototype`'s
+                // `constructor`, for one — resolves to it rather than
+                // restarting the build.
+                self.remember(index, Built::Value(Value::Function(function)));
+                let object = function.object;
+                object.extensible.set(*extensible);
+                define_properties(self, object, properties)?;
+                // An own `prototype` in the record means the writing realm had
+                // materialized the deferred one; clearing the flag keeps the
+                // first later observation from making a second over it. With no
+                // such property the flag stays set and the prototype
+                // materializes lazily, exactly as the source function's would.
+                if object
+                    .get_own_property(&JsString::from_utf8("prototype"))
+                    .ok()
+                    .flatten()
+                    .is_some()
+                    && let Some(data) = self.agent.ecma_functions.get_mut(&function.id())
+                {
+                    data.prototype_pending = false;
+                }
+                Built::Value(Value::Function(function))
+            }
         };
         if self.made[index].is_none() {
             self.remember(index, built);
         }
         Ok(built)
+    }
+
+    /// A function record, rebuilt from the source text it carries.
+    ///
+    /// The parse is what makes this record different from every other one, and
+    /// the realm's global environment is what it is instantiated in: a blob
+    /// holds the value graph, not the scope a closure was compiled in, so a free
+    /// name in the body resolves globally here. A source the parser cannot read
+    /// as a function expression, or a function whose scope the writing realm
+    /// had no source for, is refused by name rather than restored wrong.
+    fn build_function(
+        &mut self,
+        source: &[u16],
+        strict: bool,
+        proto: u32,
+    ) -> Result<Handle<Function>, DecodeError> {
+        let proto = self.prototype(proto)?.ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("the record names no prototype".into())
+        })?;
+        let text = String::from_utf16(source).map_err(|_| {
+            DecodeError::UnrebuildableFunction("its source is not valid UTF-16".into())
+        })?;
+        let parsed = match parser::parse_function(&text) {
+            Ok(function) => function,
+            // An `async function` source has no standalone expression entry in
+            // `parse_function`, which expects the `function` keyword first, so
+            // the async form is the one retry this needs.
+            Err(plain) => parser::parse_function_with_async(&text, true).map_err(|_| {
+                DecodeError::UnrebuildableFunction(format!(
+                    "its source does not parse as a function expression: {plain}"
+                ))
+            })?,
+        };
+        let realm = *self.realm;
+        // A bootstrap execution context makes the realm current and gives the
+        // registration the running context it reads; it is popped on every
+        // path, so a failed restore leaves the agent's stack as it found it.
+        self.agent.push_bootstrap_context(realm);
+        let value = crate::function::instantiate_function_from_source(
+            self.agent,
+            &parsed,
+            realm.global_env,
+            proto,
+            Some(JsString::from_utf16(source)),
+            strict,
+        );
+        self.agent.execution_context_stack.pop();
+        let value = value.map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!(
+                "its source could not be instantiated: {error}"
+            ))
+        })?;
+        value.as_function().ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("its source did not evaluate to a function".into())
+        })
     }
 
     fn prototype(&mut self, serial: u32) -> Result<Option<Handle<JsObject>>, DecodeError> {
@@ -1284,7 +1526,10 @@ impl Builder<'_> {
             // An intrinsic's record materializes as a value, not as a built
             // object, because a prototype is not always one: `%Object.prototype%`
             // arrives this way and is exactly the case the format exists for.
-            Built::Value(value) => value.as_object(),
+            // The engine's coercion, not `Value::as_object`, because
+            // `%Function.prototype%` and the resumable kinds' prototypes are
+            // callable and report no object side on the value's own accessor.
+            Built::Value(value) => crate::context::as_object(&value),
         })
     }
 
@@ -1384,13 +1629,24 @@ mod tests {
         unsafe { &*isolate.agent_ptr() }
     }
 
+    /// The reader's accessor. A restore that carries a function re-runs the
+    /// parser and registers a new body, so it borrows the agent mutably — which
+    /// the isolate's shared reference cannot express, the same reason the api's
+    /// own `with_agent` builds its `&mut` from the raw pointer.
+    #[allow(clippy::mut_from_ref)]
+    fn agent_mut(isolate: &api::Isolate) -> &mut Agent {
+        // SAFETY: as `agent_of`; no `&Agent` is live across a call that takes
+        // this, because every call site is one statement long.
+        unsafe { &mut *isolate.agent_ptr() }
+    }
+
     fn encode_value(isolate: &api::Isolate, realm: &Handle<Realm>, value: Value) -> Vec<u8> {
         encode(agent_of(isolate), realm, value).expect("encode")
     }
 
     fn round_trip(isolate: &api::Isolate, realm: &Handle<Realm>, value: Value) -> Value {
         let blob = encode_value(isolate, realm, value);
-        decode(agent_of(isolate), realm, &blob).expect("decode")
+        decode(agent_mut(isolate), realm, &blob).expect("decode")
     }
 
     fn array_with(realm: &Handle<Realm>, values: &[Value]) -> Value {
@@ -1705,14 +1961,14 @@ mod tests {
     fn a_reference_that_names_no_record_is_refused() {
         let (isolate, realm) = fixture();
         let mut blob = encode_value(&isolate, &realm, Value::Number(1.0));
-        assert!(decode(agent_of(&isolate), &realm, &blob).is_ok());
+        assert!(decode(agent_mut(&isolate), &realm, &blob).is_ok());
         // The body is the context table — slot index, item count, item serial —
         // then the object count and the records. Pointing the item serial past
         // the table is a blob whose graph does not close, which is refused
         // rather than answered with a guess.
         let item = HEADER_LEN + 8;
         blob[item..item + 4].copy_from_slice(&9u32.to_le_bytes());
-        assert!(decode(agent_of(&isolate), &realm, &blob).is_err());
+        assert!(decode(agent_mut(&isolate), &realm, &blob).is_err());
     }
 
     /// The context table is structural: two slots keep their own items, and a
@@ -1737,7 +1993,7 @@ mod tests {
         let blob = encode_slots(agent_of(&isolate), &slots, &[]).expect("a blob");
 
         let read = |slot| {
-            decode_slot(agent_of(&isolate), &realm, &blob, slot, &[]).expect("a blob of this tree")
+            decode_slot(agent_mut(&isolate), &realm, &blob, slot, &[]).expect("a blob of this tree")
         };
         let zero = read(0).expect("slot 0");
         assert_eq!(zero.len(), 2);
@@ -1775,7 +2031,7 @@ mod tests {
         }];
         let blob = encode_slots(agent_of(&isolate), &slots, &[]).expect("a blob");
 
-        let back = decode_slot(agent_of(&isolate), second.realm(), &blob, 1, &[])
+        let back = decode_slot(agent_mut(&isolate), second.realm(), &blob, 1, &[])
             .expect("a blob of this tree")
             .expect("slot 1");
         assert_eq!(
@@ -1842,7 +2098,7 @@ mod tests {
         let table = [0x9999usize, pointer as usize, other as usize];
         let blob = encode_slots(agent_of(&isolate), &slots, &table).expect("a blob");
 
-        let back = decode_slot(agent_of(&isolate), &realm, &blob, 0, &table)
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &table)
             .expect("a blob of this tree")
             .expect("slot 0");
         let held = back[0].as_object().expect("an object");
@@ -1913,17 +2169,17 @@ mod tests {
         let blob = encode_slots(agent_of(&isolate), &slots, &[first, pointer]).expect("a blob");
 
         assert_eq!(
-            decode_slot(agent_of(&isolate), &realm, &blob, 0, &[]),
+            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[]),
             Err(DecodeError::ExternalIndexOutOfRange { index: 1, count: 0 })
         );
         assert_eq!(
-            decode_slot(agent_of(&isolate), &realm, &blob, 0, &[first]),
+            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[first]),
             Err(DecodeError::ExternalIndexOutOfRange { index: 1, count: 1 })
         );
         // And the host's table is what an index resolves against, entry by
         // entry, which is the contract: the blob carries the index, never the
         // address.
-        let back = decode_slot(agent_of(&isolate), &realm, &blob, 0, &[first, other])
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[first, other])
             .expect("a blob of this tree")
             .expect("slot 0");
         assert_eq!(
@@ -1938,7 +2194,7 @@ mod tests {
     fn a_foreign_blob_is_refused_by_each_of_its_fields() {
         let (isolate, realm) = fixture();
         let blob = encode_value(&isolate, &realm, Value::Number(1.0));
-        let decode_it = |bytes: &[u8]| decode(agent_of(&isolate), &realm, bytes);
+        let decode_it = |bytes: &[u8]| decode(agent_mut(&isolate), &realm, bytes);
 
         let mut wrong_magic = blob.clone();
         wrong_magic[0] = b'X';
@@ -1993,7 +2249,7 @@ mod tests {
             blob.windows(13).any(|window| window == b"%Object.proto"),
             "the builtin is in the blob by name, not by structure"
         );
-        let back = decode(agent_of(&isolate), &realm, &blob).expect("decode");
+        let back = decode(agent_mut(&isolate), &realm, &blob).expect("decode");
         assert_eq!(
             back.as_object().expect("an object").id(),
             prototype.as_object().unwrap().id()
@@ -2018,5 +2274,316 @@ mod tests {
                 .id()
         };
         assert_eq!(read("0"), read("1"));
+    }
+
+    /// Install a restored value on a realm's global object and run a script with
+    /// it there, which is the shape a host uses a value it read back in.
+    fn run_restored(
+        isolate: &api::Isolate,
+        realm: &Handle<Realm>,
+        value: Value,
+        source: &str,
+    ) -> Value {
+        realm
+            .global_object
+            .create_data_property(&JsString::from_utf8("restored"), value)
+            .expect("install");
+        agent_mut(isolate).run_script(source).expect("run")
+    }
+
+    /// The same, calling `restored` with a literal argument list.
+    fn call_restored(
+        isolate: &api::Isolate,
+        realm: &Handle<Realm>,
+        function: Value,
+        arguments: &str,
+    ) -> Value {
+        run_restored(isolate, realm, function, &format!("restored({arguments})"))
+    }
+
+    /// A JavaScript function is carried as the source text it can be re-parsed
+    /// from, and the restore makes a callable value of it — which is the whole
+    /// of what a host does with one.
+    #[test]
+    fn a_function_round_trips_and_is_callable() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let function = context
+            .try_eval("(function addOne(a) { return a + 1; })")
+            .expect("a function")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, function);
+        let back = back.as_function().expect("a function");
+        assert_eq!(
+            call_restored(&isolate, &realm, Value::Function(back), "41").as_number(),
+            Some(42.0)
+        );
+        // The function never had its `prototype` materialized, so the record
+        // carries none and the restored body keeps the deferral: the first
+        // observation still makes the spec's object, with its back-reference.
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                Value::Function(back),
+                "Object.getOwnPropertyDescriptor(restored, 'prototype').value.constructor === restored",
+            )
+            .as_boolean(),
+            Some(true),
+            "a deferred prototype still materializes on a restore"
+        );
+    }
+
+    /// A function's own properties are its object part's, so they ride with it:
+    /// the name and length the engine computed, and anything a host put there.
+    #[test]
+    fn a_functions_own_properties_ride_with_it() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let function = context
+            .try_eval("(function named(a, b) { return a; })")
+            .expect("a function")
+            .into_value();
+        function
+            .as_function()
+            .expect("a function")
+            .object
+            .create_data_property(&JsString::from_utf8("tag"), Value::Number(7.0))
+            .expect("define");
+
+        let back = round_trip(&isolate, &realm, function);
+        let back = back.as_function().expect("a function");
+        let own = |name: &str| {
+            back.object
+                .get_own_property(&JsString::from_utf8(name))
+                .expect("read")
+                .and_then(|property| property.value())
+                .unwrap_or_else(|| panic!("{name} is missing"))
+        };
+        assert_eq!(
+            own("name").as_string().map(|text| text.to_string_lossy()),
+            Some("named".to_string())
+        );
+        assert_eq!(own("length").as_number(), Some(2.0));
+        assert_eq!(own("tag").as_number(), Some(7.0));
+    }
+
+    /// The restore instantiates in the **reading** realm's global environment,
+    /// so a free name in the body resolves there — the one promise a blob can
+    /// make, because it carries a value graph rather than the environment chain a
+    /// closure closed over. The realms differ here so that the answer can only be
+    /// the reading one's global.
+    #[test]
+    fn a_functions_free_names_resolve_through_the_reading_realms_globals() {
+        let mut isolate = api::Isolate::new();
+        let writer = api::Context::new(&mut isolate).expect("a realm");
+        writer
+            .try_eval("globalThis.offset = 10;")
+            .expect("a global");
+        let function = writer
+            .try_eval("(function (a) { return a + offset; })")
+            .expect("a function")
+            .into_value();
+        let blob = encode(agent_of(&isolate), writer.realm(), function).expect("a blob");
+
+        let reader = api::Context::new(&mut isolate).expect("a second realm");
+        reader
+            .try_eval("globalThis.offset = 100;")
+            .expect("a global");
+        let items = decode_slot(agent_mut(&isolate), reader.realm(), &blob, 0, &[])
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        assert_eq!(
+            call_restored(&isolate, reader.realm(), items[0], "5").as_number(),
+            Some(105.0),
+            "the free name resolved through the reading realm's global"
+        );
+    }
+
+    /// A function whose `prototype` the writing realm had already materialized
+    /// keeps it, and keeps one: the record carries the object, and the restored
+    /// function must not make a second one beside it when an observation crosses
+    /// the lazy-prototype barrier.
+    #[test]
+    fn a_materialized_prototype_survives_the_restore() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let function = context
+            .try_eval("var C = function () {}; C.prototype.marker = 7; C")
+            .expect("a function")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, function);
+        // Two of the observations that materialize a deferred `prototype`, so a
+        // flag left set would append a second one here.
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "Object.getOwnPropertyDescriptor(restored, 'prototype').value.marker",
+            )
+            .as_number(),
+            Some(7.0)
+        );
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "new restored().marker").as_number(),
+            Some(7.0)
+        );
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "Object.getOwnPropertyNames(restored).filter((k) => k === 'prototype').length",
+            )
+            .as_number(),
+            Some(1.0),
+            "the record's prototype is the only one the restore left"
+        );
+    }
+
+    /// Two references to one function come back as one function, because a
+    /// function's identity is its serial like any other value's.
+    #[test]
+    fn a_shared_function_stays_one_function() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let function = context
+            .try_eval("(function () { return 1; })")
+            .expect("a function")
+            .into_value();
+
+        // Two items of one slot, rather than two elements of an array: an
+        // array's elements are written from the serial map, which would answer
+        // the same serial for both even if the walk had made two records.
+        let items = [function, function];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+        let blob = encode_slots(agent_of(&isolate), &slots, &[]).expect("a blob");
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[])
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        assert_eq!(
+            back[0]
+                .as_function()
+                .expect("the first item is a function")
+                .id(),
+            back[1]
+                .as_function()
+                .expect("the second item is a function")
+                .id(),
+            "the two references came back one function"
+        );
+    }
+
+    /// `Object.setPrototypeOf(x, f)` stores a function's *object side*, so the
+    /// walk can reach a function as an object — and it has to come back the
+    /// function. Writing the object side as the ordinary object its shape
+    /// suggests would restore a plain object where a function belongs.
+    #[test]
+    fn a_function_reached_as_a_prototype_comes_back_a_function() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let function = context
+            .try_eval("(function f() { return 1; })")
+            .expect("a function")
+            .into_value();
+        let holder = context.try_eval("({})").expect("an object").into_value();
+        holder
+            .as_object()
+            .expect("an object")
+            .set_prototype_of(Some(function.as_function().expect("a function").object))
+            .expect("link");
+
+        let pair = array_with(&realm, &[holder, function]);
+        let back = round_trip(&isolate, &realm, pair);
+        let back = back.as_object().expect("an array");
+        let element = |index: &str| {
+            back.get_own_property(&JsString::from_utf8(index))
+                .expect("read")
+                .and_then(|property| property.value())
+                .expect("present")
+        };
+        let prototype = element("0")
+            .as_object()
+            .expect("the holder")
+            .get_prototype_of()
+            .expect("its prototype")
+            .expect("a prototype");
+        let function = element("1").as_function().expect("the function");
+        assert_eq!(
+            prototype
+                .function_value()
+                .and_then(|value| value.as_function())
+                .map(|function| function.id()),
+            Some(function.id()),
+            "the prototype came back as the function, not as an object copy of it"
+        );
+    }
+
+    /// Each function the format cannot carry is refused by the kind it is: the
+    /// fix differs, so the message does.
+    #[test]
+    fn an_uncarried_function_is_refused_by_kind() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        for (source, expected, detail) in [
+            (
+                "(function () {}).bind(null)",
+                "a bound function",
+                "bound arguments",
+            ),
+            ("(() => 1)", "a function", "no source text"),
+            (
+                "({ m() { return 1; } }).m",
+                "a method",
+                "`function` keyword",
+            ),
+        ] {
+            let value = context
+                .try_eval(source)
+                .expect("a value to refuse")
+                .into_value();
+            let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
+            assert_eq!(
+                error.type_name, expected,
+                "{source} was refused as something else"
+            );
+            assert!(error.detail.contains(detail), "{source}: {}", error.detail);
+        }
+    }
+
+    /// A host callback is a Rust closure in this engine rather than an address or
+    /// a name, so it refuses as such — the one function kind no source can come
+    /// back from.
+    #[test]
+    fn a_host_callback_is_refused_by_name() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let callback = Function::create_builtin(
+            Some(JsString::from_utf8("an_op")),
+            0,
+            Box::new(|_, _| Ok(Value::Undefined)),
+            None,
+            None,
+        )
+        .expect("a builtin");
+
+        let error = encode(agent_of(&isolate), &realm, Value::Function(callback))
+            .expect_err("the walk refuses");
+        assert_eq!(error.type_name, "a built-in function");
+        assert!(error.detail.contains("Rust closure"), "{}", error.detail);
     }
 }

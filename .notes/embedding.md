@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last three records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, and **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last four records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — and **a JavaScript function is carried as the source it is re-parsed from**, so a host's attached callbacks come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2622,6 +2622,26 @@ That second mutation is worth recording because it *did not fail* the first vers
 
 Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **817 passed / 0 failed**; `cargo test -p v8 --features simdutf` **217 passed / 0 failed**; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,186 passed / 0 failed**. `crates/runtime` changed, so the battery ran and every number is unchanged: test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang (158 skip), `intl402` 3,205 pass / 0 fail (152 skip), the eight wasm core suites 64,594 checks / 0 fail / 0 pending, the JS-API sweep 1,001 tests / 0 fail.
 
+**Carrying a function — landed, and deno's `create_blob` moves one kind further.** The blocker the record above named, and the fourth part of ledger item 16. A JavaScript function is carried as the **source text** it can be re-parsed from, its [[Strict]], and its object part, and the restore evaluates that source in the reading realm's global environment.
+
+*What a record is.* `REC_FUNCTION` (tag 14): a strict byte, the source as UTF-16 code units, the prototype serial, extensible, and the same property list an object gets — a function's own keys are its own keys, so `length`, `name` and a host's own property ride along rather than being recomputed. The walk descends into the function's object part, so a `prototype` object a host filled in is carried by the graph like any other.
+
+*Why source and not a body.* A compiled body is not something a blob can name: it is an `Rc<CompiledBody>` over literal `Value`s and step indices, and the engine rebuilds it deterministically from an AST it can parse. So the record holds what a parser can read, and `instantiate_function_from_source` (new in `function.rs`) is the one door into it: `parser::parse_function`, the async form as the single retry (an `async function` source has no standalone expression entry in `parse_function`), then OrdinaryFunctionCreate with the record's strictness. That last part is why the helper exists instead of reusing `instantiate_dynamic_function` — a function that is strict because of its *enclosing* context has no `"use strict"` of its own, and re-deriving strictness from the source alone would silently restore it sloppy.
+
+*The environment is the limit, and it is stated rather than papered over.* A blob carries the value graph, not the environment chain a closure was compiled in, so a restored function resolves a free name through the **reading** realm's global environment. That is enough for a self-contained body and not for a closure over a module's bindings, and the module docs say so where a host will read it. The walk refuses what source cannot express at all, by kind: a **host callback** — a `FunctionKind::Builtin` that is not an intrinsic, which in this engine is a Rust closure rather than an address or a name a table could hold — a **bound function**, and a function the engine kept no source for (an arrow, a method, an accessor; `Function.prototype.toString` already answers the native form for them).
+
+*Two things the tests found, not the design.* A function reached as an **object** — `Object.setPrototypeOf(x, f)` stores `f`'s object side, and the engine keeps a `function_self` back-reference on it for exactly that — had to be folded back into the function value before a serial is assigned, or the walk would write an ordinary object where a function belongs; `canonical` does it at the one place that decides what a serial names. And `%Function.prototype%` is **callable**, so the reader's `prototype()` could not use `Value::as_object` — that accessor answers `None` for a function value, and the resumable kinds' prototypes are functions too — and uses the engine's own `as_object`, the same coercion the builtins use. The first was caught by the test written for it and the second by every function test failing as "the record names no prototype" on the first run.
+
+*And the deferred `prototype` needed a rule.* A plain function's `prototype` is created lazily, and the record carries it only when the writing realm had materialized it. Clearing the deferral flag on every restore leaves a function with no `prototype` at all; leaving it set when the record *does* carry one makes the first observation that crosses the barrier — a descriptor read, `new`, own-name enumeration — append a **second** `prototype` beside the restored one, measured as the own-key count going 5 to 6. So the reader clears the flag exactly when the record carries the property, and each half of that condition has a test.
+
+*Tests.* Eight in `crates/runtime/src/snapshot.rs`: a function round trips and is callable, and a deferred `prototype` still materializes on an observation; its own properties ride with it; a free name resolves through the **reading** realm's global, measured across two realms (10 in the writer, 100 in the reader, the answer 105); two items of one slot come back one function; a function reached as a prototype comes back a function; a materialized `prototype` survives and stays single; each uncarried kind is refused by its own name; and a host callback is refused as a Rust closure. Two in `crates/v8/snapshot.rs`: the acceptance test — a `v8::Function` attached to a context, restored, and called from a script (`restored(41)` answering 42) — and the honesty test, a `FunctionTemplate`'s function still ending the build by name.
+
+Each of the eight engine tests was verified by mutating the code it guards and restoring it: disabling `canonical` fails the prototype test; dropping the method refusal writes the method's source (`m() { return 1; }`, which is not a function expression, and the failing blob shows it); making the builtin arm fall through fails the callback test; removing the `prototype_pending` clear fails the duplicate count; clearing it unconditionally fails the deferred-prototype test with the same `null` V8 gives a function with no `prototype`; removing the bootstrap execution context fails with "No running execution context"; discarding the record's properties fails on a missing `name`; and instantiating in the *first* realm instead of the reading one answers 15 instead of 105. The shared-function test was written against an array first and **passed** under a per-occurrence mutation — an array's elements are written from the serial map, which a mutation that overrides keys masks — so it was rewritten as two items of one slot, where the mutation is caught. That is the second time this plan's "a test that cannot fail" rule has been caught by mutating rather than by inspection, and it cost a rewrite rather than a wrong claim.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **825 passed / 0 failed**; `cargo test -p v8 --features simdutf` **218 passed / 0 failed**; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,195 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the battery ran again and every number is the certified one: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail. Nothing in this workspace depends on `crates/v8`, so the bridge half implicates no sweep.
+
+*And the checkpoint moved again, by one kind.* `cargo check -p deno_core` still answers 0. The example that builds its own snapshot cannot be built through its own build-dependency graph, and that is the checkpoint's feature selection rather than this change: `deno_core` is a *workspace dependency* with `default-features = false` and a feature list without `v8`, so the facade is a `compile_error!` when `deno_core` is used as a dependency rather than as the `-p` root — `--features deno_core/v8` supplies it for a measurement. With that, the build script runs deno's bootstrap to the end (`JsRuntimeForSnapshot prepared, took ~253ms`) and fails inside `create_blob` on the **next** kind rather than on a function: *slot 1, item 0 — the module map deno serializes for snapshotting — reaches a **bound function***. So what the record before this one left refusing is refused no longer — a `v8::Function` attachment round trips and is callable, through the bridge's own tests rather than through deno's graph, which stops before it reaches one — and what stands between `deno/` and a blob is one more kind, whose shape the refusal already names: a bound function is its target plus its bound `this` and arguments, and a target that is itself uncarried still refuses. That is ledger item 16's fifth part and §12 item 2's next slice.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3316,7 +3336,29 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   body needs the scope it was compiled in; a host callback here is a Rust
   closure rather than a pointer), compiled code, isolate data, continuation, and
   the things a host pointer points at — a template address is the host's to mean
-  something again.
+  something again. *(The function half is superseded by the part below: a JS body
+  is now carried as the source it is re-parsed from, and it is the **scope** a
+  restore cannot rebuild — a host callback still refuses.)*
+
+  **Fourth part — carrying a function, named before it was written.** The half
+  the third part left refusing, and the blocker between `deno/` and a blob.
+  `crates/runtime/src/snapshot.rs` gains `REC_FUNCTION` (a strict byte, the
+  source as UTF-16 code units, the prototype serial, extensible, the property
+  list), the walk descends into a function's object part, and
+  `crates/runtime/src/function.rs` gains `instantiate_function_from_source` — the
+  shared tail of CreateDynamicFunction's path, with [[Strict]] *supplied*, since
+  a function strict by its enclosing context has no directive to re-derive it
+  from. Reading a blob can now create a body, so `decode_slot`/`decode` and the
+  builder take the agent mutably. A function reached as an *object* — which a
+  prototype link makes possible — is folded back into the function value before a
+  serial is assigned (`canonical`), or the walk would write an ordinary object
+  where a function belongs. Still refused, by kind: a host callback (a Rust
+  closure, not a name or an address a table holds), a bound function, and a
+  function the engine kept no source for. And what a restore cannot promise, and
+  says in its own docs: an environment chain, so a free name in the body resolves
+  through the reading realm's global. **The next kind is named by the measurement
+  that follows this one in §7**: deno's `create_blob` now fails on a *bound
+  function* reached from the module map it attaches at slot 1.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3456,12 +3498,13 @@ a frame view of the running stack. §7's survey already split the subsystem: the
 
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots — **the format landed with
-its context table, and the external-reference table with it (§7's last three
-records, ledger item 16). What is left of this item is named rather than
-implied: `FunctionCodeHandling::Keep`'s compiled code (which waits on the code
-cache), the isolate-level data slots, and continuation from an existing blob —
-plus the thing standing between this and deno's `create_blob`: carrying a
-function.**; (4) module resolver as a
+its context table, the external-reference table and a function with it (§7's
+last four records, ledger item 16). What is left of this item is named rather
+than implied: `FunctionCodeHandling::Keep`'s compiled code (which waits on the
+code cache), the isolate-level data slots, continuation from an existing blob,
+and one more carried kind — a **bound function**, which is the value deno's
+`create_blob` now stops on (its module map at slot 1 reaches one), and which is
+its target plus its bound `this` and arguments.**; (4) module resolver as a
 host trait (landed), **unbound scripts and script origins** (the bridge side
 landed — every Rust script handle is already context-unbound — and what the
 engine still owes there is the *code cache*: serializing its compiled program, so
@@ -3521,12 +3564,15 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's three parts have landed — the format, the context table, the
-external-reference table — so the blocker this plan could name is gone: the
+bridge. That item's four parts have landed — the format, the context table, the
+external-reference table, and a function — so the blocker this plan could name is
+gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
-added at slot 1, and a host pointer is an index into the table the host rebuilds
-for every load. What is left before a snapshot comes back out is a *function*,
-which §12 item 2 names as the next slice. The `ext`-crate frontier of §7's
+added at slot 1, a host pointer is an index into the table the host rebuilds
+for every load, and a function comes back callable. What is left before a
+snapshot comes back out is one carried kind, a *bound function*, which §12 item 2
+names as the next slice — measured, not guessed: deno's `create_blob` now stops
+there rather than on a function. The `ext`-crate frontier of §7's
 measurement
 (341 errors across eight crates, none of them `deno_core`) is still what stands
 between this and a `deno` binary, and
@@ -3548,13 +3594,14 @@ delete.
 
 1. **Weak persistent handles** — the last L2 item. Design sketched in
    `.notes/host-object-gc.md` §4.3; not started.
-2. **Snapshot format** — **v1 landed with its context table and external
-   references** (§7's last three records, ledger item 16): a versioned blob over
-   a value graph rooted at the data a host attached to each of its contexts,
-   written and read against each slot's own realm, intrinsics by name, host
-   pointers as indices into the host's table, a refusal naming anything
-   uncarried. What this item still owns: carrying a function (the next slice,
-   and the blocker for deno's build), a value shared between two contexts coming
+2. **Snapshot format** — **v1 landed with its context table, external
+   references and a function** (§7's last four records, ledger item 16): a
+   versioned blob over a value graph rooted at the data a host attached to each
+   of its contexts, written and read against each slot's own realm, intrinsics by
+   name, host pointers as indices into the host's table, a JavaScript function as
+   the source it is re-parsed from, a refusal naming anything uncarried. What
+   this item still owns: carrying a **bound function** (the next slice, and the
+   value deno's build now stops on), a value shared between two contexts coming
    back one per context, compiled code for `FunctionCodeHandling::Keep`,
    isolate-level data, and continuation from an existing blob.
 3. **Sealing `slag::api`** — the re-export exists (`crates/slag/src/lib.rs`, with a

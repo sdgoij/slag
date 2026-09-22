@@ -12,6 +12,12 @@
 //! restoring into — which is why a reference to a builtin is written as the
 //! builtin's name rather than as a copy of the builtin.
 //!
+//! A JavaScript function is carried as the source text it can be re-parsed from,
+//! so a restored function is callable and a host's attached callbacks come back.
+//! What the source cannot say is the scope the function closed over: a restored
+//! function resolves a free name through the realm's global environment, and a
+//! host callback — a Rust closure in this bridge — has no source at all.
+//!
 //! # Index conventions
 //!
 //! V8's, because the host this stands in for reads them back: context slot 0 is
@@ -24,17 +30,19 @@
 //!
 //! # What is not carried yet
 //!
-//! A value the engine's walk refuses — a function body, a proxy, a typed array,
-//! a module namespace, a host object, an array with a hole — ends
-//! [`create_blob`](SnapshotCreator::create_blob) with a panic naming it. The
-//! crate's signature is `Option`, which its own callers unwrap, so the loudest
-//! available message is the honest one; a blob that quietly lost part of a
-//! host's state would move that failure to where the host cannot see it.
+//! A value the engine's walk refuses — a proxy, a typed array, a module
+//! namespace, a host object, an array with a hole, a host callback, a bound
+//! function — ends [`create_blob`](SnapshotCreator::create_blob) with a panic
+//! naming it. The crate's signature is `Option`, which its own callers unwrap,
+//! so the loudest available message is the honest one; a blob that quietly lost
+//! part of a host's state would move that failure to where the host cannot see
+//! it.
 //!
-//! Neither `FunctionCodeHandling` mode carries compiled code, because nothing
-//! carries a function at all: both answers write the same blob. Isolate-level
-//! data and continuation-from-an-existing-blob are likewise not carried yet,
-//! and say so where a host would look for them.
+//! Neither `FunctionCodeHandling` mode carries compiled code, because a blob
+//! holds the source a function is rebuilt from rather than a compiled body:
+//! both answers write the same blob. Isolate-level data and
+//! continuation-from-an-existing-blob are likewise not carried yet, and say so
+//! where a host would look for them.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -241,8 +249,8 @@ impl SnapshotCreator {
         &mut self,
         function_code_handling: FunctionCodeHandling,
     ) -> StartupData {
-        // Neither mode carries compiled code yet, because nothing carries a
-        // function body at all, and a blob is therefore the same either way.
+        // Neither mode carries compiled code: a function is carried as the
+        // source it is rebuilt from, so a blob is the same either way.
         let _ = function_code_handling;
         assert!(
             self.default_context.is_some() || !self.contexts.is_empty(),
@@ -589,19 +597,62 @@ mod tests {
         );
     }
 
-    /// A value the engine cannot carry ends the build with a panic naming it,
-    /// rather than a blob that quietly lost part of a host's state.
+    /// A JavaScript function is carried as the source text it can be re-parsed
+    /// from and comes back callable from a script, which is the shape
+    /// `deno_core` builds: it attaches functions to the realm it snapshotted and
+    /// calls them after the restore.
     #[test]
-    #[should_panic(expected = "cannot carry a function")]
-    fn a_function_ends_the_build_with_its_name() {
+    fn a_function_round_trips_and_is_callable_from_a_script() {
         let mut isolate = Isolate::snapshot_creator(None, None);
         {
             crate::scope!(let scope, &mut isolate);
             let context = Context::new(scope, Default::default());
             let scope = &mut crate::ContextScope::new(scope, context);
             scope.set_default_context(context);
-            let function = crate::test_support::eval(scope, "(function f() {})");
+            let function =
+                crate::test_support::eval(scope, "(function addOne(a) { return a + 1; })");
             scope.add_context_data(context, function);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let function = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the function");
+        crate::test_support::bind(scope, "restored", function);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restored(41)"),
+            42.0
+        );
+    }
+
+    /// A host callback is a Rust closure rather than source text, so it still
+    /// ends the build, by name: this is the function kind the external-reference
+    /// table's `function` field is for, and it is not wired to real ops yet.
+    #[test]
+    #[should_panic(expected = "cannot carry a built-in function")]
+    fn a_host_callback_ends_the_build_with_its_name() {
+        fn an_op(
+            _scope: &mut crate::scope::PinScope<'_, '_>,
+            _args: crate::function::FunctionCallbackArguments,
+            _rv: crate::function::ReturnValue,
+        ) {
+        }
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let template = crate::FunctionTemplate::new(scope, an_op);
+            let function = template.get_function(scope).expect("function");
+            scope.add_context_data(context, function.cast::<Value>());
         }
         let _ = isolate.create_blob(FunctionCodeHandling::Keep);
     }

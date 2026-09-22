@@ -1490,6 +1490,28 @@ pub fn instantiate_dynamic_function(
         .as_ref()
         .map(|source| body_is_strict(agent, &f.body, Some(source)))
         .unwrap_or(false);
+    instantiate_function_from_source(agent, f, environment, proto, source, strict)
+}
+
+/// CreateDynamicFunction's OrdinaryFunctionCreate (spec 20.2.1.1 step 41)
+/// with [[Strict]] supplied rather than derived: an ordinary function whose
+/// [[Prototype]] is `proto`, whose body is compiled from the parsed form, and
+/// whose `source` is the text its spans refer to.
+///
+/// The two callers differ exactly in where strictness comes from.
+/// CreateDynamicFunction derives it from the assembled source's own directive;
+/// a snapshot restore passes the [[Strict]] its record carries, because a
+/// function that is strict by virtue of its *enclosing* context — a module, or
+/// strict code — has no directive of its own, and re-deriving it from the
+/// source alone would silently make the restored function sloppy.
+pub fn instantiate_function_from_source(
+    agent: &mut Agent,
+    f: &syntax::ast::Function,
+    environment: EnvRef,
+    proto: Handle<JsObject>,
+    source: Option<JsString>,
+    strict: bool,
+) -> Result<Value, JsError> {
     let body = shared_function_body(agent, f, source.as_ref());
     let params = shared_params(&body, &f.params);
     let value = register_function(
