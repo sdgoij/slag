@@ -937,6 +937,52 @@ mod tests {
         assert_eq!(crate::test_support::eval_number(scope, "restored()"), 41.0);
     }
 
+    /// A method that reads a private name (here a private **method**) is carried as
+    /// a member of its class, so it comes back callable on an instance of the class
+    /// the restore rebuilt — the operation deno's `uncurryThis(Class.prototype
+    /// .method)` performs, and the value its blob's first load stopped on.
+    #[test]
+    fn a_private_name_method_round_trips_and_reads_its_classs_private_field() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let holder = crate::test_support::eval(
+                scope,
+                "var holder = {};\n\
+                 holder.ctor = class Counter { #count = 3; \
+                 #bump() { this.#count = this.#count + 1; return this.#count; } \
+                 bump() { return this.#bump(); } };\n\
+                 holder.method = holder.ctor.prototype.bump;\n\
+                 holder",
+            );
+            scope.add_context_data(context, holder);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let holder = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the holder");
+        crate::test_support::bind(scope, "restored", holder);
+        assert_eq!(
+            crate::test_support::eval_number(
+                scope,
+                "(function () { var c = new restored.ctor(); restored.method.call(c); \
+                 return restored.method.call(c); })()",
+            ),
+            5.0
+        );
+    }
+
     /// The console this bridge installs is the one host function no host had a
     /// chance to register — the bridge makes it for every context, including the
     /// ones a snapshot is taken of — so the bridge puts its callback in the table

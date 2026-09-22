@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, and **the realm's own global functions and the members of its own builtin objects by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time (§7), where the next value, a method whose body reads a private name, is part 13; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, and **the realm's own global functions, the members of its own builtin objects by the spec's names and a method that reads a private name, as a member of its class**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time and reads past every value it used to stop on (§7), where the next value is a class's own evaluation re-running definition-time code, part 14; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2774,6 +2774,24 @@ Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --
 
 *And the next value is at the load, which had never been exercised against deno's blob.* `create_snapshot` writes the blob; `JsRuntime::new` with `startup_snapshot: Some(...)` reads it, and that is the example's own `check_output` test. It now reaches the restore and panics: `v8::Context::FromSnapshot: the snapshot could not be read for context 1: snapshot function could not be rebuilt: its method source could not be evaluated: SyntaxError: Private field access is only valid inside a class`. A **method whose body reads a private name** — deno's bootstrap copies such methods out of classes into its primordials — cannot be rebuilt by evaluating it in the object-literal context the method record uses, because a `#name` is only in scope inside a class body. That is part 13, and it is the next value.
 
+**A method that reads a private name — landed, and deno's blob reads past the value it stopped on.** The thirteenth part of ledger item 16, designed from the load's own measurement.
+
+*What the load stopped on, measured.* A probe in the restore's failure path printed the source of the value it could not rebuild: `enter(value) { const previousContextMapping = getAsyncContext(); this.#enterWithPreviousContext(value, previousContextMapping); return previousContextMapping; }` — an ordinary class method calling a **private method**. A `#name` is in scope only inside a class body, and the method record evaluates its source in the object literal a MethodDefinition is only valid inside, so that rebuild cannot work. Rebuilding it by evaluating the class source *again* was rejected too: a private name belongs to one class declaration, so a second evaluation's brand is not the brand the class the graph holds gives its instances, and the method would throw when called on one.
+
+*The trigger is exact.* `EcmaFunction` already records the private environment a closure resolves `#name` through, and `build_class` installs the class's own on every method it instantiates, so the walk asks whether that environment **has names**: a method that could resolve one is carried as its class's member, and a method that could not keeps the record it had. That is what leaves every class with no private elements — and so every existing class test — on the old path.
+
+*Format.* `REC_CLASS_METHOD` (tag 17): the class, the member's key as a slot of its own (a string or a symbol, so a computed or symbol-keyed method is the same record), the form (data, getter, setter — which is what tells an accessor's two members apart when they share a key), the home object, and the function tail. **The source is not carried**: the class the restore evaluates already holds the method.
+
+*The class is identified only when it is certain.* A static method's `[[HomeObject]]` is the class itself; an instance method's is a class constructor's own `prototype`, compared **by identity**, so an object that merely carries a class as its `constructor` is not mistaken for a prototype. The member's key is found by identity — the key whose descriptor holds *this* function — which makes a computed key no harder than any other. A class **constructor** is excluded, and a stack overflow is what showed it: its own `constructor` property names the class as a member of itself, so the record resolved through itself forever.
+
+*Restore.* The class is materialized first, and its build keeps the `prototype` its own evaluation made — stashed by class serial and pinned — before the record's property tail replaces it with the carried prototype. The member is read out of that prototype, or out of the class itself for a static, by key and form, and `make_method` re-homes it to the record's home object so `super` resolves through the rebuilt prototype rather than the evaluation's orphan. One re-entrancy is handled explicitly: the carried prototype's own properties include this very member, so the class's build reaches the record while the record — reached first as a value, as a `bind` target — is being built; the record re-reads the builder's `made` table after materializing the class and returns that build rather than making a second method.
+
+*Tests.* Three: `snapshot::tests::a_method_that_reads_a_private_name_round_trips_as_its_classs_member` (the deno shape — a public method calling a private one — called on an instance of the restored class, so the private brand has to match, with the blob asserted to spell the record), `snapshot::tests::a_private_name_method_reaches_super_through_the_carried_prototype` (the re-homing, whose discrimination is that the mutation is on the carried prototype and only the carried object has it), and one bridge (`a_private_name_method_round_trips_and_reads_its_classs_private_field`, the same through attached context data). Three mutations, each caught: the trigger disabled (the blob carries no class-member record), the re-homing dropped (`super.added` is `undefined`), and the constructor guard removed — which the existing private-field test turns into a stack overflow.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **854 → 856 passed / 0 failed** (855 with the documented flake `certified_body_global_read_fast_path_stays_spec_exact` skipped); `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,231 → 5,234 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the battery ran with the release binaries rebuilt after the last engine edit: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*And the next value is the class's own evaluation.* Re-measured, deno's blob now reads past the private-name method — the first time that value has been carried — and the restore stops on the **class**: `v8::Context::FromSnapshot: the snapshot could not be read for context 1: snapshot function could not be rebuilt: its class source could not be evaluated: ReferenceError: "SymbolIterator" is not defined`. That is part 7's stated divergence arriving as a hard failure: a class's definition-time code runs again at restore, so a **computed key** (or a static field initializer, or a `static {}` block) that reads a name from the module which defined the class finds the reading realm's global instead. The engine already has the mechanism that removes the re-evaluation — `class_definition_evaluation_with_scope` takes the element keys **precomputed** — so the next part is to carry them, which is part 14.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -4110,6 +4128,90 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   private name** and panics: the object-literal context the method record
   evaluates in cannot bring a `#name` into scope. That is part 13.
 
+  **Thirteenth part — a method that reads a private name is carried as a member
+  of its class, designed before it was written, and landed.** What the load
+  stops on: an
+  ordinary class method, `enter(value) { const previousContextMapping =
+  getAsyncContext(); this.#enterWithPreviousContext(value,
+  previousContextMapping); ... }` — a `#privateMethod` call in the body. The
+  method record evaluates its source in the object literal a MethodDefinition is
+  only valid inside, and a `#name` is in scope only inside a **class body**, so a
+  method that reads one cannot be rebuilt that way. Nor may it be rebuilt by
+  evaluating the class source *again*: a private name belongs to one class
+  declaration, so a second evaluation mints a second brand and the method would
+  throw when called on an instance of the class the graph actually carries.
+
+  - **The trigger is exact rather than a guess.** `EcmaFunction` already records
+    the private environment a closure resolves `#name` through, and `build_class`
+    installs the class's own on every method it instantiates. So the walk asks
+    whether that environment **has names**: a method that could resolve a private
+    name is the kind this part carries, and a method that could not keeps the
+    record it has today. That is what keeps the change off every existing class
+    test, whose classes declare no private elements.
+  - **The class is identified from the home object, and only when it is certain.**
+    A static method's `[[HomeObject]]` is the class itself; an instance method's
+    is the class's `prototype`. So the walk accepts a home object that either *is*
+    a class constructor or is a class constructor's own `prototype` **by
+    identity** (`C.prototype === home`), and finds the member's key by searching
+    that holder's own keys for the descriptor whose member is this function.
+    Anything else — an object-literal method, a class whose `prototype` was
+    replaced — is not identified, and the method keeps the method record, which is
+    the refusal path that already exists.
+  - **Format.** `REC_CLASS_METHOD` (tag 17): the class serial, the property key as
+    a slot of its own (a string or a symbol, so a computed or symbol-keyed method
+    is the same record), the form (data, getter or setter, which is what tells an
+    accessor's two members apart when they share one key), the home object, and
+    the function's usual prototype/extensible/properties tail. The method's
+    **source is not carried at all**: the class the restore evaluates already has
+    the method.
+  - **Restore.** The class is materialized **first**, and its build keeps the
+    `prototype` object its own evaluation made — stashed by class serial and
+    pinned — before the record's property tail replaces it with the carried
+    prototype. The member is then read out of that prototype, or out of the class
+    itself for a static, by key and form, and `make_method` re-homes it to the
+    record's home object so `super` resolves through the rebuilt prototype rather
+    than the evaluation's orphan. The brand is the class evaluation's, which is
+    the point: instances of the rebuilt class have it.
+  - **The one re-entrancy, handled explicitly.** The carried prototype's own
+    properties include this very member, so the class's build reaches this record
+    while the record — reached first as a value, as a `bind` target — is already
+    being built. The record therefore re-reads the builder's `made` table after
+    materializing the class and returns that build: the member the prototype's
+    property holds, not a second method.
+
+  *What it promises.* A method that reads a private name comes back callable on
+  the instances of the class the realm rebuilt — the operation deno's
+  `uncurryThis(Class.prototype.method)` performs. What it does not promise: a
+  method whose class cannot be identified (an object-literal method reading a
+  private name, or a class whose `prototype` was replaced) keeps today's refusal
+  at restore rather than a silently wrong method.
+
+  *Acceptance tests.* Three, all landed:
+  `snapshot::tests::a_method_that_reads_a_private_name_round_trips_as_its_classs_member`
+  (the measured deno shape — a public method calling a private one — carried as a
+  class member and called on an instance of the restored class, so the private
+  brand has to match, with the blob asserted to spell the record),
+  `snapshot::tests::a_private_name_method_reaches_super_through_the_carried_prototype`
+  (the re-homing: the mutation is on the carried prototype, which only the
+  carried object has), and the bridge's
+  `a_private_name_method_round_trips_and_reads_its_classs_private_field`. Three
+  mutations, each caught: the trigger disabled (the blob carries no class-member
+  record), the re-homing dropped (`super.added` is `undefined`), and the
+  constructor guard removed — which the existing private-field test turns into a
+  stack overflow, because a class constructor's own `constructor` property names
+  the class as a member of itself.
+
+  **And the load moves past it.** With this part deno's blob reads further than it
+  ever has: the private-name method is carried, and the restore stops on the
+  **class** — `its class source could not be evaluated: ReferenceError:
+  "SymbolIterator" is not defined`. That is part 7's stated divergence arriving as
+  a hard failure: a class's definition-time code runs again at restore, so a
+  **computed key** (or a static initializer) that reads a name from the module
+  which defined the class finds the reading realm's global instead. The engine
+  already has the mechanism that removes the re-evaluation —
+  `class_definition_evaluation_with_scope` takes the element keys
+  **precomputed** — so the next part is to carry them. That is part 14.
+
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -4252,15 +4354,18 @@ Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots — **the format landed with
 its context table, the external-reference table, a function, a bound function, a
 class constructor, a host callback, an arrow, a method with its `[[HomeObject]]`,
-the realm's named global functions and the members of its own builtin objects
-with it (§7's records for it; ledger item 16 has twelve parts). What is left of
+the realm's named global functions, the members of its own builtin objects and a
+method that reads a private name with it (§7's records for it; ledger item 16 has
+thirteen parts). What is left of
 this item is named rather than implied: `FunctionCodeHandling::Keep`'s compiled
 code (which waits on the code cache), the isolate-level data slots, continuation
-from an existing blob, and the step the **load** now stops on — a **method whose
-body reads a private name**, which the object-literal context the method record
-evaluates in cannot bring into scope (§7's last record; that is part 13) —
-behind which is still the measured question of the graph reaching the **global
-object**, and behind that the accessor half of the method part.**;
+from an existing blob, and the step the **load** now stops on — a
+**computed key** in a class's own evaluation, which re-runs at restore and reads
+`SymbolIterator` from the module that defined the class where the reading realm's
+global is what it finds (§7's last record; that is part 14, and
+`class_definition_evaluation_with_scope` taking its keys **precomputed** is the
+mechanism) — behind which is still the measured question of the graph reaching
+the **global object**, and behind that the accessor half of the method part.**;
 (4) module resolver as a
 host trait (landed), **unbound scripts and script origins** (the bridge side
 landed — every Rust script handle is already context-unbound — and what the
@@ -4321,26 +4426,27 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's twelve parts have landed — the format, the context table,
+bridge. That item's thirteen parts have landed — the format, the context table,
 the external-reference table, a function, a bound function, the realm's named
 global functions, a class constructor, a host callback, an arrow, the text a call
-frame runs, **a method with its `[[HomeObject]]`** and **the members of the
-realm's own builtin objects by name** — so the blocker this plan
+frame runs, **a method with its `[[HomeObject]]`**, **the members of the
+realm's own builtin objects by name** and **a method that reads a private name,
+as a member of its class** — so the blocker this plan
 could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
-for every load, a function, a bind, a class, an arrow, a host callback, a method
-and a builtin member all
+for every load, a function, a bind, a class, an arrow, a host callback, a method,
+a builtin member and a private-name method all
 come back
 callable or
 constructable, and a closure deno's own JS creates inside a function the host
-calls from Rust carries its text. **`create_blob` now completes** — deno's
+calls from Rust carries its text. **`create_blob` completes** — deno's
 snapshot build script runs to the end and writes its 226,426-byte blob — and the
-frontier is the **load**, which had never been exercised against that blob: it
-panics rebuilding a **method whose body reads a private name**, because the
-object-literal context the method record evaluates in cannot bring a `#name`
-into scope. That is part 13. Behind it sits the
+frontier is the **load**, which now reads past every value it used to stop on and
+fails on a **class's own evaluation** instead: a computed key re-evaluates at
+restore and reads `SymbolIterator` from the module that defined the class, where
+the reading realm's global is what it finds. That is part 14. Behind it sits the
 **accessor** half of the method part, and then the measured question of the walk
 reaching the realm's global object, a realm the restore already rebuilt, so
 carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
@@ -4369,9 +4475,10 @@ migrate, then delete.
    an arrow, the realm's
    named global functions,
    the text a call frame runs,
-   a method with its [[HomeObject]] and the members of the realm's own builtin
-   objects** (§7's records for it, ledger item
-   16's twelve parts): a versioned
+   a method with its [[HomeObject]], the members of the realm's own builtin
+   objects and a method that reads a private name, carried as a member of its
+   class** (§7's records for it, ledger item
+   16's thirteen parts): a versioned
    blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
@@ -4383,18 +4490,22 @@ migrate, then delete.
    value it reads**, a
    refusal naming
    anything uncarried. And the format now **loads**: deno's blob, read back for
-   the first time, restores contexts until it reaches a **method whose body reads
-   a private name** — the object-literal context the method record evaluates in
-   cannot bring a `#name` into scope, so a method deno's bootstrap copies out of
-   a class refuses at restore (§7's last record), and that is the next measured
-   step. What this item still owns: a host callback's
-   **construct half**, that **private-name** method (part 13), the **accessor**
+   the first time, restores contexts past every value it used to stop on — the
+   realm's own builtin members by name, then a method that reads a private name —
+   and stops on a **class's own evaluation**: a computed key re-evaluates at
+   restore and reads `SymbolIterator` from the module that defined the class where
+   the reading realm's global is what it finds (§7's last record), which is part
+   14. What this item still owns: a host callback's
+   **construct half**, that **class evaluation** (part 14, whose mechanism is
+   `class_definition_evaluation_with_scope` taking its keys precomputed), the
+   **accessor**
    half of the method part, the
    measured question of the walk reaching the **global object**, a
    value shared between two contexts coming back one per context, compiled code
    for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
    existing blob. The realm's own builtin members by name — the value the walk
-   met as `Math.abs` — are **carried** now (the twelfth part). The call-frame
+   met as `Math.abs` — are **carried** (the twelfth part), and so is a method that
+   reads a private name (the thirteenth). The call-frame
    `source` the eleventh part closed was the conformance bug this item's walk
    exposed rather than a record it was missing.
 3. **Sealing `slag::api`** — the re-export exists (`crates/slag/src/lib.rs`, with a

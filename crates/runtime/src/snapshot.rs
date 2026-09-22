@@ -139,6 +139,7 @@ const REC_EXTERNAL: u8 = 13;
 const REC_FUNCTION: u8 = 14;
 const REC_BOUND_FUNCTION: u8 = 15;
 const REC_HOST_CALLBACK: u8 = 16;
+const REC_CLASS_METHOD: u8 = 17;
 
 /// Which grammar a function record's source is read in. A class constructor's
 /// `[[SourceText]]` is the **class** it came from (spec 15.7.14 sets it that way
@@ -350,6 +351,19 @@ enum Record {
         target: u32,
         bound_this: u32,
         bound_args: Vec<u32>,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
+    /// A method that reads a private name, carried as a member of its class: the
+    /// class, the member's key, which of the three forms it is, its
+    /// [[HomeObject]], and its object part. No source — the class the restore
+    /// evaluates already holds the method, under the private name's own brand.
+    ClassMethod {
+        class: u32,
+        key: u32,
+        form: Form,
+        home: u32,
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
@@ -591,6 +605,7 @@ pub fn decode_slot(
         records: &records,
         made: vec![None; records.len()],
         pins: Vec::new(),
+        class_prototypes: HashMap::new(),
     };
     let mut values = Vec::with_capacity(items.len());
     for serial in items {
@@ -824,6 +839,19 @@ fn visit(
                             visit(agent, realm, externals, host, home, objects, serials)?;
                         }
                     }
+                    Callable::ClassMember {
+                        class, key, home, ..
+                    } => {
+                        // The class is visited because the record resolves the
+                        // member *through* it: a class this format cannot carry has
+                        // to refuse here rather than leave a record no load could
+                        // read.
+                        visit(agent, realm, externals, host, class, objects, serials)?;
+                        visit(agent, realm, externals, host, key, objects, serials)?;
+                        if let Some(home) = home {
+                            visit(agent, realm, externals, host, home, objects, serials)?;
+                        }
+                    }
                 }
                 for child in children(&function.object)? {
                     visit(agent, realm, externals, host, child, objects, serials)?;
@@ -888,6 +916,17 @@ enum Callable<'a> {
     /// A host callback: the external-reference table pointer it was built from,
     /// and the data it reads when it is called.
     HostCallback { pointer: usize, data: Option<Value> },
+    /// A method that reads a private name: the class whose declaration owns the
+    /// name, the member's key, which of the three forms it is, and its
+    /// [[HomeObject]]. Carried as a **member of that class** rather than by its
+    /// own source, because a `#name` is in scope only inside a class body — so
+    /// only the class's own evaluation can rebuild the method.
+    ClassMember {
+        class: Value,
+        key: Value,
+        form: Form,
+        home: Option<Value>,
+    },
 }
 
 /// Which grammar a function record's source is read in.
@@ -939,6 +978,37 @@ impl Grammar {
             Grammar::Class => "class",
             Grammar::Arrow => "arrow",
             Grammar::Method => "method",
+        }
+    }
+}
+
+/// Which of the three forms a carried class member is.
+///
+/// A method and an accessor's getter and setter can share one key, so the form
+/// is what a class-member record adds to the key to name exactly one member —
+/// the descriptor the restore reads holds the member's function under it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    Method,
+    Getter,
+    Setter,
+}
+
+impl Form {
+    fn byte(self) -> u8 {
+        match self {
+            Form::Method => 0,
+            Form::Getter => 1,
+            Form::Setter => 2,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Form::Method),
+            1 => Some(Form::Getter),
+            2 => Some(Form::Setter),
+            _ => None,
         }
     }
 }
@@ -998,6 +1068,24 @@ fn callable<'a>(
                     "a function",
                     "its body is not registered on this agent",
                 ))?;
+            // A method that could resolve a private name cannot be rebuilt from
+            // its own text: the object literal a MethodDefinition is valid in has
+            // no class body, so a `#name` has no scope in it. It is carried as a
+            // member of the class that owns the name instead, when the home object
+            // makes that class certain (see `class_member`). A class constructor is
+            // excluded: it is a method definition too, and its own `constructor`
+            // property would name the class as a member of itself.
+            if data.is_method
+                && !data.is_class_constructor
+                && let Some((class, key, form)) = class_member(agent, function, data)
+            {
+                return Ok(Callable::ClassMember {
+                    class,
+                    key,
+                    form,
+                    home: data.home_object,
+                });
+            }
             let Some(source) = data.source.as_ref() else {
                 // No source is the primary fact, and it is checked before the
                 // method form because a class constructor, an accessor and an
@@ -1045,6 +1133,103 @@ fn callable<'a>(
             })
         }
     }
+}
+
+/// The class a method that reads a private name belongs to, with the key and the
+/// form that name it there — or `None` when it has no private names, or its class
+/// cannot be identified.
+///
+/// The trigger is the private environment a closure resolves `#name` through: a
+/// method that could not resolve one is carried by its own source, which is what
+/// every class method with no private elements keeps doing. A `#name` belongs to
+/// one class declaration, so a method that reads one has to be rebuilt from
+/// *that* class's evaluation; a second evaluation would mint a second brand, and
+/// the method would throw when called on an instance of the class the graph
+/// actually holds.
+///
+/// The class is accepted only when the home object makes it certain: a static
+/// method's [[HomeObject]] is the class itself, and an instance method's is the
+/// class constructor's own `prototype`, compared **by identity** so that an
+/// ordinary object which merely carries a class as its `constructor` is not
+/// mistaken for a class prototype.
+fn class_member(
+    agent: &Agent,
+    function: &Handle<Function>,
+    data: &crate::function::EcmaFunction,
+) -> Option<(Value, Value, Form)> {
+    let private = data.private_environment?;
+    if private.names.borrow().is_empty() {
+        return None;
+    }
+    let home = data.home_object?;
+    let (class, holder) = match home.kind() {
+        ValueKind::Function(class_function) => {
+            if !is_class_constructor(agent, &class_function) {
+                return None;
+            }
+            (home, class_function.object)
+        }
+        ValueKind::Object(object) => {
+            let constructor = object
+                .get_own_property(&JsString::from_utf8("constructor"))
+                .ok()
+                .flatten()
+                .and_then(|property| property.value())?;
+            let class_function = constructor.as_function()?;
+            if !is_class_constructor(agent, &class_function) {
+                return None;
+            }
+            let prototype = class_function
+                .object
+                .get_own_property(&JsString::from_utf8("prototype"))
+                .ok()
+                .flatten()
+                .and_then(|property| property.value())
+                .and_then(|value| value.as_object())?;
+            if prototype.id() != object.id() {
+                return None;
+            }
+            (constructor, object)
+        }
+        _ => return None,
+    };
+    // The member is found by identity rather than by name: which key a method was
+    // defined under is exactly the key whose descriptor holds *this* function, and
+    // a computed key is no harder to find than any other.
+    let id = function.id();
+    for key in holder.own_property_keys().ok()? {
+        let Some(property) = holder.get_own_property_key(&key).ok().flatten() else {
+            continue;
+        };
+        let form = match &property.kind {
+            PropertyKind::Data { value, .. } => {
+                (value.as_function().map(|member| member.id()) == Some(id)).then_some(Form::Method)
+            }
+            PropertyKind::Accessor { get, set } => [(get, Form::Getter), (set, Form::Setter)]
+                .into_iter()
+                .find(|(member, _)| {
+                    member
+                        .as_ref()
+                        .and_then(|member| member.as_function())
+                        .map(|member| member.id())
+                        == Some(id)
+                })
+                .map(|(_, form)| form),
+        };
+        if let Some(form) = form {
+            return Some((class, key_value(&key), form));
+        }
+    }
+    None
+}
+
+/// Whether a function is a class constructor: what tells a class prototype's
+/// `constructor` from an ordinary function a host stored under that name.
+fn is_class_constructor(agent: &Agent, function: &Handle<Function>) -> bool {
+    agent
+        .ecma_functions
+        .get(&function.id())
+        .is_some_and(|data| data.is_class_constructor)
 }
 
 /// The index a host pointer has in the external-reference table.
@@ -1294,6 +1479,12 @@ fn write_record(
                 Callable::HostCallback { pointer, data } => {
                     write_host_callback(realm, &function, pointer, data, externals, serials, body)?
                 }
+                Callable::ClassMember {
+                    class,
+                    key,
+                    form,
+                    home,
+                } => write_class_method(realm, &function, class, key, form, home, serials, body)?,
             },
         },
         ValueKind::Object(object) => match realm.intrinsics.name_of_value(&value) {
@@ -1392,6 +1583,41 @@ fn write_function(
         );
     }
     write_units(body, source.as_slice());
+    write_u32(body, prototype_serial(realm, &function.object, serials)?);
+    body.push(u8::from(function.object.extensible.get()));
+    write_properties(realm, &function.object, serials, body)?;
+    Ok(())
+}
+
+/// Write a method that reads a private name as the class member it is: the
+/// class, the key and form that name it there, its [[HomeObject]], and its
+/// object part.
+///
+/// The source is deliberately **not** carried. A `#name` belongs to one class
+/// declaration, so the only evaluation that can rebuild this method is the one
+/// that makes the class — a second evaluation of the class source would mint a
+/// second brand, and the method would throw on an instance of the class the
+/// graph actually holds. The record therefore names the member and lets the
+/// restore take it out of the class it evaluated.
+#[allow(clippy::too_many_arguments)]
+fn write_class_method(
+    realm: &Handle<Realm>,
+    function: &Handle<Function>,
+    class: Value,
+    key: Value,
+    form: Form,
+    home: Option<Value>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    body.push(REC_CLASS_METHOD);
+    write_u32(body, serial_in(realm, serials, class));
+    write_u32(body, serial_in(realm, serials, key));
+    body.push(form.byte());
+    write_u32(
+        body,
+        home.map_or(NO_REF, |home| serial_in(realm, serials, home)),
+    );
     write_u32(body, prototype_serial(realm, &function.object, serials)?);
     body.push(u8::from(function.object.extensible.get()));
     write_properties(realm, &function.object, serials, body)?;
@@ -1639,6 +1865,25 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 properties,
             })
         }
+        REC_CLASS_METHOD => {
+            let class = reader.u32().ok_or(DecodeError::Truncated)?;
+            let key = reader.u32().ok_or(DecodeError::Truncated)?;
+            let byte = reader.u8().ok_or(DecodeError::Truncated)?;
+            let form = Form::from_byte(byte).ok_or(DecodeError::BadGrammar(byte))?;
+            let home = reader.u32().ok_or(DecodeError::Truncated)?;
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::ClassMethod {
+                class,
+                key,
+                form,
+                home,
+                proto,
+                extensible,
+                properties,
+            })
+        }
         REC_HOST_CALLBACK => {
             let index = reader.u32().ok_or(DecodeError::Truncated)?;
             let data = reader.u32().ok_or(DecodeError::Truncated)?;
@@ -1751,6 +1996,16 @@ struct Builder<'a> {
     /// would otherwise sweep a record before the record that names it is
     /// filled.
     pins: Vec<Pin>,
+    /// The `prototype` object each rebuilt class's own evaluation made, by the
+    /// class record's serial.
+    ///
+    /// A class record's property tail replaces that object with the carried
+    /// prototype, so by the time a class-member record is read the evaluation's
+    /// object is reachable from nowhere else — and it is the only place a member
+    /// that reads a private name can come from, because it is the object the
+    /// class's private brand belongs to. Kept pinned for the same reason `pins`
+    /// is: a member record may be read after its class record is complete.
+    class_prototypes: HashMap<u32, Handle<JsObject>>,
 }
 
 /// A record's value, before it is asked for as a language value: an object's
@@ -1877,6 +2132,22 @@ impl Builder<'_> {
                         self.build_evaluated_function(source, *proto, *strict, *grammar, *home)?
                     }
                 };
+                // A class's own evaluation made a `prototype` object whose members
+                // carry the class's private brand; the tail just below replaces it
+                // with the carried prototype, so the evaluation's is kept here for
+                // the class-member records that read their method out of it.
+                if *grammar == Grammar::Class
+                    && let Some(prototype) = function
+                        .object
+                        .get_own_property(&JsString::from_utf8("prototype"))
+                        .ok()
+                        .flatten()
+                        .and_then(|property| property.value())
+                        .and_then(|value| value.as_object())
+                {
+                    self.pins.push(crux::heap::pin_handle(prototype));
+                    self.class_prototypes.insert(index as u32, prototype);
+                }
                 // Recorded before the properties are defined, so an own
                 // property that refers back to the function — `prototype`'s
                 // `constructor`, for one — resolves to it rather than
@@ -1899,6 +2170,45 @@ impl Builder<'_> {
                 {
                     data.prototype_pending = false;
                 }
+                Built::Value(Value::Function(function))
+            }
+            Record::ClassMethod {
+                class,
+                key,
+                form,
+                home,
+                proto,
+                extensible,
+                properties,
+            } => {
+                // The class is materialized **first**: reading the member out of
+                // the class's own evaluation means the class build runs the tail
+                // that defines this very member on its prototype, and that nested
+                // build is the one the prototype's property gets. If it happened,
+                // this record's value is that build rather than a second method.
+                self.materialize(*class)?;
+                if let Some(made) = self.made[index] {
+                    return Ok(made);
+                }
+                let function = self.build_class_member(*class, *key, *form, *home)?;
+                // The class's evaluation derived the member's own prototype link;
+                // the record's is what the blob was written with, so it wins — the
+                // same rule a function record's prototype follows.
+                let prototype = self.prototype(*proto)?.ok_or_else(|| {
+                    DecodeError::UnrebuildableFunction("the record names no prototype".into())
+                })?;
+                function
+                    .object
+                    .set_prototype_of(Some(prototype))
+                    .map_err(|error| {
+                        DecodeError::UnrebuildableFunction(format!(
+                            "its prototype could not be set: {error}"
+                        ))
+                    })?;
+                self.remember(index, Built::Value(Value::Function(function)));
+                let object = function.object;
+                object.extensible.set(*extensible);
+                define_properties(self, object, properties)?;
                 Built::Value(Value::Function(function))
             }
             Record::BoundFunction {
@@ -2146,6 +2456,79 @@ impl Builder<'_> {
         function.ok_or_else(|| {
             DecodeError::UnrebuildableFunction("its source's first property is not a method".into())
         })
+    }
+
+    /// A class member, read out of the class the evaluation made.
+    ///
+    /// The class record has already been materialized (see the `Record::ClassMethod`
+    /// arm), so its own evaluation prototype is stashed: that object is where a
+    /// method reading a private name has to come from, because the private brand
+    /// it closes over belongs to that evaluation and to no other. The member is
+    /// then re-homed to the record's [[HomeObject]] — the carried prototype — so
+    /// `super` resolves through the object the graph holds rather than through the
+    /// evaluation's orphan.
+    fn build_class_member(
+        &mut self,
+        class: u32,
+        key: u32,
+        form: Form,
+        home: u32,
+    ) -> Result<Handle<Function>, DecodeError> {
+        let key = self.materialize(key)?;
+        let key = crate::context::to_property_key(self.agent, &key).map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!(
+                "its member key is not a property key: {error}"
+            ))
+        })?;
+        let home_value = match home {
+            NO_REF => None,
+            home => Some(self.materialize(home)?),
+        };
+        // The holder is the object the member was defined on: the class itself for
+        // a static, and the class's own evaluation prototype for an instance
+        // method — which is why a member whose class's prototype was replaced is
+        // not carried this way at all (see `class_member`).
+        let holder = match home_value.as_ref().map(|value| value.kind()) {
+            Some(ValueKind::Function(class_function)) => class_function.object,
+            _ => *self.class_prototypes.get(&class).ok_or_else(|| {
+                DecodeError::UnrebuildableFunction(
+                    "its class's own evaluation kept no prototype to read it from".into(),
+                )
+            })?,
+        };
+        let property = holder
+            .get_own_property_key(&key)
+            .map_err(|_| DecodeError::Truncated)?
+            .ok_or_else(|| {
+                DecodeError::UnrebuildableFunction(
+                    "its class's own evaluation has no such member".into(),
+                )
+            })?;
+        let member = match (&property.kind, form) {
+            (PropertyKind::Data { value, .. }, Form::Method) => value.as_function(),
+            (PropertyKind::Accessor { get, .. }, Form::Getter) => {
+                get.as_ref().and_then(|value| value.as_function())
+            }
+            (PropertyKind::Accessor { set, .. }, Form::Setter) => {
+                set.as_ref().and_then(|value| value.as_function())
+            }
+            _ => None,
+        }
+        .ok_or_else(|| {
+            DecodeError::UnrebuildableFunction(
+                "its class's own evaluation did not define the member it is read as".into(),
+            )
+        })?;
+        if let Some(home) = home_value {
+            crate::function::make_method(self.agent, &Value::Function(member), home).map_err(
+                |error| {
+                    DecodeError::UnrebuildableFunction(format!(
+                        "its [[HomeObject]] could not be set: {error}"
+                    ))
+                },
+            )?;
+        }
+        Ok(member)
     }
 
     /// A function record, rebuilt from the source text it carries.
@@ -3967,6 +4350,83 @@ mod tests {
             run_restored(&isolate, &realm, back, "new restored().x").as_number(),
             Some(42.0),
             "the private field and the initializer that reads it were both rebuilt"
+        );
+    }
+
+    /// The measured deno shape: a public method whose body calls a **private**
+    /// method. It cannot be rebuilt from its own text — the object literal a
+    /// MethodDefinition is only valid inside has no class body, so `#bump` has no
+    /// scope in it — and it must not be rebuilt by evaluating the class a second
+    /// time either: a private name belongs to one class declaration, so a second
+    /// evaluation's brand is not the brand the class the graph holds gives its
+    /// instances. It is carried as a **member of its class**, and the restore
+    /// reads it out of that class's own evaluation.
+    #[test]
+    fn a_method_that_reads_a_private_name_round_trips_as_its_classs_member() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { class Counter { #count = 3; #bump() { this.#count = this.#count + 1; \
+                 return this.#count; } bump() { return this.#bump(); } } \
+                 return { ctor: Counter, method: Counter.prototype.bump }; })()",
+            )
+            .expect("a class and one of its methods")
+            .into_value();
+        let blob = encode_value(&isolate, &realm, value);
+        assert!(
+            blob.contains(&REC_CLASS_METHOD),
+            "the method is carried as a member of its class, not by its own source"
+        );
+
+        let back = decode(agent_mut(&isolate), &realm, &blob).expect("decode");
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "(function () { const c = new restored.ctor(); restored.method.call(c); \
+                 return restored.method.call(c); })()",
+            )
+            .as_number(),
+            Some(5.0),
+            "the restored method reads and mutates the restored class's private field"
+        );
+    }
+
+    /// A method that reads a private name **and** reaches `super` is re-homed to
+    /// the record's [[HomeObject]] — the carried prototype — rather than keeping
+    /// the object the class's own evaluation made, which the class record's tail
+    /// replaces. The mutation on the carried prototype is what makes the two
+    /// distinguishable: only the carried object has it.
+    #[test]
+    fn a_private_name_method_reaches_super_through_the_carried_prototype() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { class Box { #n = 1; run() { return super.added() + this.#n; } } \
+                 Object.setPrototypeOf(Box.prototype, { added() { return 'x'; } }); \
+                 return { ctor: Box, run: Box.prototype.run }; })()",
+            )
+            .expect("a class whose method reads a private name and reaches super")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "(function () { const s = new restored.ctor(); \
+                 return restored.run.call(s); })()",
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("x1".to_string()),
+            "`super` resolved through the prototype the graph holds"
         );
     }
 
