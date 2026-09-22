@@ -282,6 +282,10 @@ fn build_class(
 
     // The constructor (spec steps 21-25): the ConstructorMethod of the body,
     // or a default constructor.
+    // `[[SourceText]]` for the constructor (spec 15.7.14): the *class* source
+    // text, set for an implicit constructor and an explicit one alike, which is
+    // what `Function.prototype.toString` answers and what a snapshot re-parses.
+    let class_source = crate::function::capture_source(agent, class.span);
     let ctor_element = class.elements.iter().find_map(|element| match element {
         ClassElement::Method {
             is_static: false,
@@ -295,9 +299,9 @@ fn build_class(
             let ctor_source = crate::function::capture_source(agent, function.span);
             let body = crate::function::shared_function_body(agent, function, ctor_source.as_ref());
             let params = crate::function::shared_params(&body, &function.params);
-            instantiate_class_constructor(agent, params, body, class_env, true)?
+            instantiate_class_constructor(agent, params, body, class_env, true, class_source)?
         }
-        None => default_constructor(agent, super_constructor.is_some(), &class_env)?,
+        None => default_constructor(agent, super_constructor.is_some(), &class_env, class_source)?,
     };
     set_private_environment(agent, &ctor, &class_private_env)?;
     // MakeMethod(constructor, proto): the constructor's [[HomeObject]] lets
@@ -659,9 +663,10 @@ fn default_constructor(
     agent: &mut Agent,
     derived: bool,
     class_env: &EnvRef,
+    source: Option<JsString>,
 ) -> Result<Value, JsError> {
     if derived {
-        crate::function::instantiate_default_derived_constructor(agent, *class_env, true)
+        crate::function::instantiate_default_derived_constructor(agent, *class_env, true, source)
     } else {
         instantiate_class_constructor(
             agent,
@@ -672,6 +677,7 @@ fn default_constructor(
             }),
             *class_env,
             true,
+            source,
         )
     }
 }

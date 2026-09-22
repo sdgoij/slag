@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last six records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, and **the realm's own global functions by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, and **the realm's own global functions by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2672,7 +2672,27 @@ One engine test pins the boundary (`function.rs`), mutation-verified: with the g
 
 Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **832 passed / 0 failed**; `cargo test -p v8 --features simdutf` **220 passed / 0 failed**; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,204 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the battery ran — and ran twice, because the first run *failed*: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
 
-*What is left, and it is a design question this time.* `create_blob` now gets through the global object's functions and stops on that **class constructor** — a value whose body is synthesized, so there is no source to re-parse, and the same is true of every class constructor in the engine. So carrying a class means carrying what a class is made of: the constructor's body, its `fields`, its `private_methods`, its `private_environment`, its `super_constructor` and its heritage. That is ledger item 16's seventh part, and it is the first of these steps whose answer is not "write one more record".
+*What is left, and it was a design question this time.* `create_blob` got through the global object's functions and stopped on that **class constructor** — a value whose body the engine synthesizes, so there was no source to re-parse and no class constructor in the engine had one. Ledger item 16's seventh part took it from there, and it was the first of these steps whose answer was not "write one more record": what the probes said the value is (a base class, four instance fields, a private environment, an implicit constructor, no methods) is written up there with the design, the alternative that was rejected and why, and the definition-time divergence the chosen one accepts.
+
+**Class constructors — landed, and deno's `create_blob` now stops on a host callback.** The seventh part of ledger item 16, and the design that paragraph named.
+
+*The record carries the spec's `[[SourceText]]`, and the restore re-runs the class.* `REC_FUNCTION` gains a **grammar byte** after its tag — `function`-expression or `class`-expression — because the value kind is the same and only the text's grammar differs; the strict byte, the prototype, extensible and the property tail are written and read by the same code either way. The engine half is one capture: `class.rs`'s ClassDefinitionEvaluation takes `capture_source(agent, class.span)` — the **class** text, which is what the spec sets for an implicit constructor and an explicit one alike — and threads it through `instantiate_class_constructor` / `instantiate_class_constructor_with` / `instantiate_default_derived_constructor` as a new `source: Option<JsString>`, for both branches. The body-cache key is unchanged: the explicit branch still keys `shared_function_body` on the constructor *method*'s span, and the class source reaches only the constructor's own record.
+
+The restore's `Builder::build_class_function` evaluates `(<class source>)` as a **class expression** in the reading realm — the same bootstrap execution context the function path pushes, popped on every path — takes the completion value as the constructor, sets the record's prototype over the one the evaluation derived, and then defines the record's properties exactly as a function does. Everything a class constructor is made of therefore comes back from the engine's own ClassDefinitionEvaluation: its `[[ConstructorKind]]`, home object, prototype object, field records, private names and their environment, and `[[IsClassConstructor]]`. That is also the cost, stated in the module docs: definition-time code — a computed key, a `static {}` block, a static field initializer — **runs again** at restore, where V8's snapshot only restores objects.
+
+*Two consequences of the capture, one of them conformance.* A class constructor's `Function.prototype.toString` now answers the class source, which is what the spec requires and what the engine answered the native form for; the four `builtins/Function/prototype/toString/class-*-ctor.js` fixtures cannot see the difference (`assertToStringOrNativeFunction` accepts either branch), so a fresh class is pinned by a test of ours instead. And the **implicit** constructor has a source for the first time — the measured deno class is exactly that case.
+
+*Tests.* Four in `crates/runtime/src/snapshot.rs`: a class constructor round trips, constructs (`new restored().x` answering the field's 7), refuses a bare call with a `TypeError` (so `[[IsClassConstructor]]` came back), and answers the class source from `toString`; a class whose public field reads its own **private** field (`#secret = 41; x = this.#secret + 1`) answers 42, which proves the private environment *and* the initializer were rebuilt and needs no method to observe; a **fresh** class's `toString` answers its class source, the conformance half above; and a class the engine kept no source for is still refused as a class constructor. One in `crates/v8/snapshot.rs`: a class attached as context data, restored, and constructed from a script — `new restored().x` answering 7 and `restored.prototype.constructor === restored`.
+
+The refusal test is the previous record's `a_class_constructor_is_refused_by_what_it_lacks`, **re-aimed rather than deleted**: the branch is still reachable, so it now uses a class defined where the enclosing execution context has no source text — `(new Function('return class C { x = 1; }'))()` — and asserts the same "a class constructor … no source text" pair. Without the re-aim the branch would have had no coverage at all.
+
+*Mutations, and one honest limit.* Writing `Grammar::Function` for a class fails both class round-trip tests with `its source does not parse as a function expression: SyntaxError: Unexpected token` — a wrong grammar byte is a wrong record, not a subtle one. Dropping the `class_source` capture fails three tests, and the fresh-class `toString` test fails on exactly the conformance gap: `left: Some("function C() { [native code] }")`, `right: Some("class C { x = 7; }")`. The third named mutation — the class branch evaluating without the reading realm's environment — is **not independently observable in this harness**, and that is a result rather than a pass: the api makes the last context created current and every test has to eval in the reading realm, so the same mutation applied to the function record's own two-realm test is equally invisible. What *is* caught is the other half of the same discipline: pushing nothing while still popping leaves the agent with no running execution context, and `run_restored` fails with `ReferenceError: No running execution context`.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **835 passed / 0 failed**; `cargo test -p v8 --features simdutf --lib -- --skip the_data_a_built_function_carries_survives_a_collection` **220 passed / 0 failed / 1 filtered**; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,208 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the battery ran and every number is the certified one: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*A class with methods is still not carried*, which is the eighth part: the walk reaches the prototype object's method properties and refuses them as methods, whose source is method-form and needs a parse context of its own plus its carried `[[HomeObject]]`. The measured deno class has none — its prototype object's own keys are exactly `["constructor"]` — which is why this step is one part rather than two.
+
+*And the next blocker is the one this bridge's own docs name.* Re-measured the same way, `create_blob` gets past the class and stops on a **host callback**: `a built-in function (a host callback is a Rust closure, not a name or an address a snapshot can carry)` — a `FunctionKind::Builtin` with **no internal name and no own `name` property**, which is a probe's answer rather than a guess, and the probe is removed. That is the `function` field of `v8::ExternalReference`, the field `crates/v8/snapshot.rs` has called "not wired to real ops yet" since the format landed and the one `deno/libs/core/runtime/bindings.rs:63` opens with `call_console`, `import_meta_resolve`, `catch_dynamic_import_promise_error` and `op_disabled_fn` before the callsite helpers and the per-op entries. `call_console` is installed as `Deno.core.callConsole` by `v8::Function::builder(call_console).build(scope)` (`bindings.rs:363-367`) — a builder-made function with no name at all, which is the shape the probe found — and which one it is, the next slice's first probe names. The mechanism is the one already in the tree: a host pointer is written **by index** into the host's table and resolved on load, so a callback is the same index with a different restore. §12 item 2's next step.
 
 ## 8. Parked: the C++ face
 
@@ -3434,15 +3454,155 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   measurement that named it is the registration above — and it is a fix at the
   root rather than a workaround for it, which is why the registration stays.
 
-  **Seventh part — carrying a class constructor, named before it is written.**
-  What deno's `create_blob` stops on now, measured: `is_class_constructor` true,
-  no source text, a home object, no name. A class constructor's body is
-  synthesized, so — like every class constructor in the engine — there is nothing
-  to re-parse, and carrying one means carrying what a class is made of: the
-  constructor's body, `fields`, `private_methods`, `private_environment`,
-  `super_constructor` and heritage. This is the first of these parts whose answer
-  is not "write one more record", so it gets its own design before it is
-  written.
+  **Seventh part — carrying a class constructor, designed before it was written,
+  and landed.**
+  What deno's `create_blob` stops on, and what the probes say it is: a **base
+  class** whose constructor is the *implicit* one (`constructor_kind` base,
+  `default_derived` false, no `super_constructor`, no parameters, no body
+  statements), carrying **four instance fields** and a **private environment**
+  — and whose prototype object's own keys are exactly `["constructor"]`, so the
+  class has **no methods**. That last fact is what makes this one step rather
+  than two: the class's prototype and static sides are already carryable by the
+  walk as an ordinary object graph, so what is missing is the constructor alone.
+
+  *What the source is, per the spec, and why that is the whole design.*
+  ClassDefinitionEvaluation sets `ctorFunc.[[SourceText]]` to the **class source
+  text** for the explicit *and* the implicit constructor — the set is a sibling
+  of the empty/non-empty branch, not inside it (spec.html:25789-25795) — and
+  `Function.prototype.toString` answers `[[SourceText]]` when it is not empty
+  (spec.html:31977-31978). The engine captures the explicit constructor's
+  *method* span today, only as a body-cache key, and stores **no** source for the
+  record: so a class constructor answers the native form, which the four
+  `builtins/Function/prototype/toString/class-*-ctor.js` fixtures cannot see
+  because `assertToStringOrNativeFunction` accepts that branch. So the record's
+  source is not a convenience — it is the spec's own slot, and the same slot the
+  function record already carries.
+
+  *The design as landed: the record carries `[[SourceText]]`, the restore parses
+  it as a class expression.*
+
+  - **Engine.** `class.rs`'s
+    ClassDefinitionEvaluation captures the **class** source once
+    (`capture_source(agent, class.span)` — the helper functions use, and `Class`
+    carries the span) and threads it through `instantiate_class_constructor` /
+    `instantiate_class_constructor_with` / `instantiate_default_derived_constructor`
+    as a new `source: Option<JsString>`, for **both** branches. Two knock-on
+    effects, both refinements rather than risks: a class constructor's
+    `Function.prototype.toString` then answers the class source, which is what
+    the spec requires, and the implicit constructor gets a source for the first
+    time. The explicit branch keeps using a source for `shared_function_body`'s
+    cache key, and it is the constructor *method*'s span as before — the class
+    source reaches only the constructor's own record, so the body cache is
+    untouched.
+  - **Format.** `REC_FUNCTION` gains a **kind byte** after its tag
+    (`function`-expression vs `class`-expression) rather than a second tag: the
+    value kind is the same (a function), the only difference is the grammar its
+    source is read in, and the rest of the record — strict, prototype,
+    extensible, properties — is the same shape with one reader and one writer. A
+    separate tag would mean two tags for one value kind and either a duplicated
+    tail or a shared helper that makes the tags lie about being different shapes.
+    The strict byte is written `true` for a class (a class body is always strict)
+    and the class path does not read it, because the grammar decides strictness.
+    A layout change is part of v1: nothing outside this tree has ever written a
+    blob in this format.
+  - **Restore.** For a class record, evaluate `(<class source>)` as a class
+    **expression** in the reading realm's global environment — the same
+    bootstrap-context trick the function path uses, and an expression so the
+    class name is bound inside the class rather than in the global scope — take
+    the completion value as the constructor, then apply the record's
+    prototype/extensible/properties exactly as a function does. Everything a
+    class constructor is made of then comes from the engine's own
+    ClassDefinitionEvaluation: `constructor_kind`, the home object, the prototype
+    object, `fields`, the private names and their environment, and the
+    constructor's `[[IsClassConstructor]]`. That is the same code that built it,
+    which is the safest reconstruction available and the reason no class part is
+    carried.
+
+  *The alternative that was rejected, and why.* A structural record — kind,
+  home object, `super_constructor`, fields with their initializer functions,
+  private names, and a new engine entry point to assemble a class constructor
+  from them — would avoid re-running definition-time code. It was rejected
+  because it duplicates ClassDefinitionEvaluation's constructor half into the
+  deserializer, needs the private-name/brand machinery to be reconstructible
+  from a record (identity that today only the class-evaluation path creates), and
+  gives the engine a second way to make a class constructor — two paths that must
+  then agree forever on every future spec change. The measured class needs none
+  of that: base, no heritage, no methods, four fields.
+
+  *What it promises, and what it does not.*
+
+  1. A class constructor whose class source the engine kept. The source is
+     captured at class instantiation under the same condition a function's is
+     (the enclosing execution context has source text), so a class created where
+     a function would have none refuses the same way — "a class constructor (the
+     engine kept no source text for it)", the refusal already in the tree.
+  2. **The class's definition-time code runs again at restore**: computed
+     method and field keys are re-evaluated, and a `static {}` block or a static
+     field initializer *executes*. Per-instance field initializers do not, and
+     neither do method bodies. V8's snapshot restores objects without re-running
+     the definition, so this is a real divergence; it is stated in the module
+     docs and here.
+  3. The class's **environment** is the reading realm's global: `extends <expr>`
+     re-resolves there, and so do the initializer and method closures the class
+     evaluation creates. For `extends` this is the same limit the function record
+     already states for free names, but **harder**, because it fails at restore
+     (as `UnrebuildableFunction`) rather than at call time. The measured class is
+     a base class and does not reach it.
+  4. The record is a function-shaped record, not a "class unit": the walk still
+     descends into the class's own graph (its `prototype` property, its static
+     side), so a host that mutated the class keeps what it added. This is why the
+     design does not simply carry the class source and skip the subgraph.
+  5. A class **with methods** is not carried by this step: the walk reaches the
+     prototype object's method properties and refuses them as methods. Methods
+     are the eighth part, and they are a different mechanism — a method's source
+     is method-form (`m() {}`) and needs a parse context of its own plus its
+     carried `[[HomeObject]]`; the same context is what an accessor
+     (`get x() {}`, source-less today) needs.
+
+  *Acceptance tests — all landed.* Engine: a class constructor round trips and
+  constructs (`new restored().x` answering a field's value, and a bare
+  `restored()` throwing because `[[IsClassConstructor]]` came back); a class whose
+  public field reads its own **private** field (`class C { #secret = 41; x =
+  this.#secret + 1; }` → `new restored().x === 42`), which proves the private
+  environment and the initializer were both rebuilt and needs no method to
+  observe; the restored class's `Function.prototype.toString` answering the class
+  source; and the fresh class's too, which is the conformance half the capture
+  change buys and which fails before it. Bridge: a class constructor attached as
+  context data, restored, constructed from a script, with
+  `restored.prototype.constructor === restored`. The refusal the part before this
+  one left in the tree — `a_class_constructor_is_refused_by_what_it_lacks` — is
+  positive coverage now, and the branch it guarded stays covered by a re-aim:
+  `(new Function('return class C { x = 1; }'))()` defines a class where the
+  enclosing execution context has no source text, and it refuses exactly as the
+  old test said.
+
+  *Mutations.* A wrong grammar byte (writing `Grammar::Function` for a class)
+  fails both round-trip tests with the parser's own error; dropping the capture
+  fails three, including the fresh-class `toString` test on `function C() {
+  [native code] }` where the class source belongs. The third named mutation — the
+  class branch evaluating without the reading realm's environment — is **not
+  observable** in this harness, for the reason §7's record states: the api makes
+  the last context created current and every test has to eval in the reading
+  realm, so no test here can tell two realms apart at restore time. What is
+  caught instead is the push/pop pairing itself, which leaves the agent with no
+  running execution context when it is unbalanced.
+
+  *Gates, all met* (§7's record): `cargo test -p runtime --lib` 835 passed / 0
+  failed, `cargo test -p v8 --features simdutf --lib -- --skip
+  the_data_a_built_function_carries_survives_a_collection` 220 / 0 / 1 filtered,
+  the workspace 5,208 / 0 /
+  4 ignored, `cargo fmt --all -- --check` and `cargo clippy --locked --workspace
+  --all-targets -- -D warnings` clean, and the full battery unchanged — test262
+  `all` 48,464 pass / 0 fail / 0 crash / 0 hang (158 skip), `intl402` 3,205 / 0
+  (152 skip), the eight wasm core suites 64,594 checks / 0 fail / 0 pending, the
+  JS-API sweep 1,001 / 0. The four `class-*-ctor.js` toString fixtures pass
+  either way, which is why the fresh class's source is pinned by a test of ours.
+
+  *And what it exposes, now measured.* The next blocker is a **host callback** —
+  an unnamed `FunctionKind::Builtin` reached through the attached graph — which
+  is the `function` field of the external-reference table, the mechanism the
+  format already uses to write a host *pointer* by index. The method machinery of
+  (5) is still open, and is still the eighth part.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3582,14 +3742,17 @@ a frame view of the running stack. §7's survey already split the subsystem: the
 
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots — **the format landed with
-its context table, the external-reference table, a function, a bound function and
-the realm's named global functions with it (§7's last six records, ledger item
+its context table, the external-reference table, a function, a bound function, a
+class constructor and
+the realm's named global functions with it (§7's last seven records, ledger item
 16). What is left of this item is named rather than implied:
 `FunctionCodeHandling::Keep`'s compiled code (which waits on the code cache), the
 isolate-level data slots, continuation from an existing blob, and the step deno's
-`create_blob` now stops on — a **class constructor**, whose design is the first
-here that is not "one more record" (ledger item 16's seventh part) — behind which
-is still the measured question of the graph reaching the **global object**.**;
+`create_blob` now stops on — a **host callback**, which is the `function` field of
+the external-reference table, the same index mechanism a host pointer already
+uses — behind which
+is still the measured question of the graph reaching the **global object**, and
+behind that the method machinery ledger item 16's eighth part names.**;
 (4) module resolver as a
 host trait (landed), **unbound scripts and script origins** (the bridge side
 landed — every Rust script handle is already context-unbound — and what the
@@ -3650,18 +3813,20 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's five parts have landed — the format, the context table, the
-external-reference table, a function, and a bound function — so the blocker this
+bridge. That item's seven parts have landed — the format, the context table, the
+external-reference table, a function, a bound function, the realm's named global
+functions and a class constructor — so the blocker this
 plan could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
-for every load, and both a function and a bind come back callable. What is left
-before a snapshot comes back out is a *name*: the realm installs ten global
-functions and names none of them, so a reference to `isFinite` refuses, which is
-§12 item 2's next step — and it is the smaller half of a larger measurement,
-because the walk reaches the realm's global object and would carry the host's
-global state with it. The `ext`-crate frontier of §7's
+for every load, and a function, a bind and a class all come back callable or
+constructable. What is left
+before a snapshot comes back out is a **callback**: the walk's next refusal is a
+host callback with no name at all, which is what the external-reference table's
+`function` field is for — and behind it the measured question of the walk
+reaching the realm's global object, a realm the restore already rebuilt, so
+carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
 measurement
 (341 errors across eight crates, none of them `deno_core`) is still what stands
 between this and a `deno` binary, and
@@ -3684,15 +3849,19 @@ delete.
 1. **Weak persistent handles** — the last L2 item. Design sketched in
    `.notes/host-object-gc.md` §4.3; not started.
 2. **Snapshot format** — **v1 landed with its context table, external
-   references, a function, a bound function and the realm's named global
-   functions** (§7's last six records, ledger item 16): a versioned blob over a
+   references, a function, a bound function, a class constructor and the realm's
+   named global functions** (§7's last seven records, ledger item 16): a versioned
+   blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
    pointers as indices into the host's table, a JavaScript function as the source
-   it is re-parsed from, a bind as its target and bound state, a refusal naming
-   anything uncarried. What this item still owns: carrying a **class
-   constructor** (the next step, and the first whose design is not "one more
-   record"), the measured question of the walk reaching the **global object**, a
+   it is re-parsed from, a bind as its target and bound state, a class
+   constructor as the class text the engine's own class evaluation re-runs, a
+   refusal naming
+   anything uncarried. What this item still owns: carrying a **host callback**
+   (the next step — the external-reference table's `function` field, and the one
+   value on the way to a deno blob that is neither source nor a name), the
+   measured question of the walk reaching the **global object**, a
    value shared between two contexts coming back one per context, compiled code
    for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
    existing blob.

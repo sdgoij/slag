@@ -25,8 +25,9 @@
 //! object, an array with a hole, an indexed accessor, an array whose `length` is
 //! not an index, a host pointer the host's external-reference table does not
 //! have, a host callback (a built-in that is not an intrinsic), and a function
-//! the engine kept no source text for — an arrow, a method or an accessor. Each
-//! entry is a subsystem to carry, and the walk refuses rather than writing
+//! the engine kept no source text for — an arrow, a method, an accessor or a
+//! class constructor whose class text was not available where it was defined.
+//! Each entry is a subsystem to carry, and the walk refuses rather than writing
 //! something a restore would read back wrong.
 //!
 //! # Functions
@@ -41,6 +42,16 @@
 //! `this` and its bound arguments — so a chain of binds round trips and an
 //! intrinsic target is still written by name; a host callback — a Rust closure
 //! in this engine — has no source at all and refuses by name.
+//!
+//! A class constructor's source is the **class** it came from: that is the
+//! spec's own `[[SourceText]]`, which ClassDefinitionEvaluation sets for an
+//! implicit constructor and an explicit one alike. So the record says which
+//! grammar its source is in, and the restore evaluates it as a class expression,
+//! which brings everything a class is made of back through the engine's own
+//! class evaluation — its kind, home object, prototype object, fields and
+//! private environment. It is also the one record whose restore **runs
+//! definition-time code again**: a computed key, a `static {}` block and a static
+//! field initializer execute, where V8's snapshot only restores objects.
 //!
 //! Version 1. The format is ours to version, and its compatibility surface is
 //! the *names* it writes: an intrinsic name and a well-known symbol name have to
@@ -108,6 +119,14 @@ const REC_ARRAY: u8 = 12;
 const REC_EXTERNAL: u8 = 13;
 const REC_FUNCTION: u8 = 14;
 const REC_BOUND_FUNCTION: u8 = 15;
+
+/// Which grammar a function record's source is read in. A class constructor's
+/// `[[SourceText]]` is the **class** it came from (spec 15.7.14 sets it that way
+/// for an implicit constructor and an explicit one alike), so the record says
+/// which grammar its source is in rather than leaving the reader to guess from
+/// the text.
+const GRAMMAR_FUNCTION: u8 = 0;
+const GRAMMAR_CLASS: u8 = 1;
 
 const FLAG_ENUMERABLE: u8 = 1;
 const FLAG_CONFIGURABLE: u8 = 2;
@@ -177,11 +196,14 @@ pub enum DecodeError {
     /// A record tag this version does not write.
     BadTag(u8),
     /// A function record could not be rebuilt into a function in the realm being
-    /// restored: a body whose source will not parse or instantiate, or a bind
-    /// exotic whose target is not callable.
+    /// restored: a body whose source will not parse or instantiate, a class whose
+    /// class source will not evaluate, or a bind exotic whose target is not
+    /// callable.
     UnrebuildableFunction(String),
     /// A blob names an intrinsic the reading realm does not have.
     UnknownIntrinsic(String),
+    /// A function record's grammar byte is not one this format's.
+    BadGrammar(u8),
     /// A blob names an entry the host's external-reference table does not have.
     ExternalIndexOutOfRange { index: usize, count: usize },
 }
@@ -215,6 +237,12 @@ impl std::fmt::Display for DecodeError {
                 write!(
                     f,
                     "snapshot names the intrinsic {name}, which this realm has not"
+                )
+            }
+            Self::BadGrammar(byte) => {
+                write!(
+                    f,
+                    "snapshot function grammar byte {byte} is not one of this format's"
                 )
             }
             Self::ExternalIndexOutOfRange { index, count } => write!(
@@ -274,9 +302,10 @@ enum Record {
     Intrinsic(String),
     /// A host pointer, by its index in the host's external-reference table.
     External(u32),
-    /// A function: its source, whether that source is strict, and its object
-    /// part.
+    /// A function: which grammar its source is read in, that source, whether it
+    /// is strict, and its object part.
     Function {
+        grammar: Grammar,
         source: Vec<u16>,
         strict: bool,
         proto: u32,
@@ -735,15 +764,45 @@ fn canonical(value: Value) -> Value {
 /// the external-reference table's `function` field, an arrow wants the scope it
 /// closed over.
 enum Callable<'a> {
-    /// A JavaScript function with a body: the source it is rebuilt from and its
-    /// [[Strict]].
-    Body { source: &'a JsString, strict: bool },
+    /// A JavaScript function with a body: which grammar its source is read in,
+    /// the source itself, and its [[Strict]].
+    Body {
+        grammar: Grammar,
+        source: &'a JsString,
+        strict: bool,
+    },
     /// A bind exotic: the target, the bound `this`, and the bound arguments.
     Bound {
         target: Value,
         bound_this: Value,
         bound_args: &'a [Value],
     },
+}
+
+/// Which grammar a function record's source is read in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grammar {
+    /// A function expression, parsed and instantiated in the reading realm.
+    Function,
+    /// A class expression: a class constructor's `[[SourceText]]`.
+    Class,
+}
+
+impl Grammar {
+    fn byte(self) -> u8 {
+        match self {
+            Grammar::Function => GRAMMAR_FUNCTION,
+            Grammar::Class => GRAMMAR_CLASS,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            GRAMMAR_FUNCTION => Some(Grammar::Function),
+            GRAMMAR_CLASS => Some(Grammar::Class),
+            _ => None,
+        }
+    }
 }
 
 /// What a function is carried by, or why it cannot be carried.
@@ -790,13 +849,22 @@ fn callable<'a>(
                     "the engine kept no source text for it",
                 ));
             };
-            if data.is_method {
+            let grammar = if data.is_class_constructor {
+                // A class constructor's source is the class it came from, so the
+                // class grammar reads it — checked **before** the method form,
+                // because a class constructor is a method definition too and
+                // that refusal would be a false diagnosis for it.
+                Grammar::Class
+            } else if data.is_method {
                 return Err(Unsupported::new(
                     "a method",
                     "a method's source has no `function` keyword, so it cannot be re-parsed on its own",
                 ));
-            }
+            } else {
+                Grammar::Function
+            };
             Ok(Callable::Body {
+                grammar,
                 source,
                 strict: data.strict,
             })
@@ -1038,9 +1106,11 @@ fn write_record(
             // reaching here with one means the walk and the writer disagree
             // about a record rather than that a host's value is uncarried.
             None => match callable(agent, &function)? {
-                Callable::Body { source, strict } => {
-                    write_function(realm, &function, source, strict, serials, body)?
-                }
+                Callable::Body {
+                    grammar,
+                    source,
+                    strict,
+                } => write_function(realm, &function, grammar, source, strict, serials, body)?,
                 Callable::Bound { .. } => write_bound_function(realm, &function, serials, body)?,
             },
         },
@@ -1120,12 +1190,14 @@ fn write_object(
 fn write_function(
     realm: &Handle<Realm>,
     function: &Handle<Function>,
+    grammar: Grammar,
     source: &JsString,
     strict: bool,
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
 ) -> Result<(), Unsupported> {
     body.push(REC_FUNCTION);
+    body.push(grammar.byte());
     body.push(u8::from(strict));
     write_units(body, source.as_slice());
     write_u32(body, prototype_serial(realm, &function.object, serials)?);
@@ -1320,12 +1392,15 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             reader.u32().ok_or(DecodeError::Truncated)?,
         )),
         REC_FUNCTION => {
+            let byte = reader.u8().ok_or(DecodeError::Truncated)?;
+            let grammar = Grammar::from_byte(byte).ok_or(DecodeError::BadGrammar(byte))?;
             let strict = reader.u8().ok_or(DecodeError::Truncated)? != 0;
             let source = reader.units().ok_or(DecodeError::Truncated)?;
             let proto = reader.u32().ok_or(DecodeError::Truncated)?;
             let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
             let properties = read_properties(reader)?;
             Ok(Record::Function {
+                grammar,
                 source,
                 strict,
                 proto,
@@ -1539,13 +1614,17 @@ impl Builder<'_> {
                 Built::Object(array)
             }
             Record::Function {
+                grammar,
                 source,
                 strict,
                 proto,
                 extensible,
                 properties,
             } => {
-                let function = self.build_function(source, *strict, *proto)?;
+                let function = match grammar {
+                    Grammar::Function => self.build_function(source, *strict, *proto)?,
+                    Grammar::Class => self.build_class_function(source, *proto)?,
+                };
                 // Recorded before the properties are defined, so an own
                 // property that refers back to the function — `prototype`'s
                 // `constructor`, for one — resolves to it rather than
@@ -1594,6 +1673,59 @@ impl Builder<'_> {
             self.remember(index, built);
         }
         Ok(built)
+    }
+
+    /// A class-constructor record: the class source is evaluated as a class
+    /// expression in the realm being restored, and the constructor it produces is
+    /// the value.
+    ///
+    /// Everything a class constructor is made of comes from that evaluation —
+    /// its `[[ConstructorKind]]`, its home object, its prototype object, its
+    /// fields, its private names and their environment, `[[IsClassConstructor]]`
+    /// — because it is the engine's own ClassDefinitionEvaluation, the same code
+    /// that built the original. That is also this record's cost, stated in the
+    /// module docs: definition-time code (a computed key, a `static {}` block, a
+    /// static field initializer) runs again here, which V8's snapshot does not do.
+    fn build_class_function(
+        &mut self,
+        source: &[u16],
+        proto: u32,
+    ) -> Result<Handle<Function>, DecodeError> {
+        let proto = self.prototype(proto)?.ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("the record names no prototype".into())
+        })?;
+        let text = String::from_utf16(source).map_err(|_| {
+            DecodeError::UnrebuildableFunction("its class source is not valid UTF-16".into())
+        })?;
+        let realm = *self.realm;
+        // A bootstrap execution context makes the realm current, so the class is
+        // evaluated where the restore is materializing it, and it is an
+        // expression, so the class name is bound inside the class rather than in
+        // the reading realm's global scope. Popped on every path.
+        self.agent.push_bootstrap_context(realm);
+        let value = self.agent.run_script(&format!("({text})"));
+        self.agent.execution_context_stack.pop();
+        let value = value.map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!(
+                "its class source could not be evaluated: {error}"
+            ))
+        })?;
+        let function = value.as_function().ok_or_else(|| {
+            DecodeError::UnrebuildableFunction(
+                "its class source did not evaluate to a class".into(),
+            )
+        })?;
+        // The evaluation sets the class's own prototype link from its heritage;
+        // the record's is what the blob was written with, so it wins.
+        function
+            .object
+            .set_prototype_of(Some(proto))
+            .map_err(|error| {
+                DecodeError::UnrebuildableFunction(format!(
+                    "its prototype could not be set: {error}"
+                ))
+            })?;
+        Ok(function)
     }
 
     /// A function record, rebuilt from the source text it carries.
@@ -2691,6 +2823,109 @@ mod tests {
         );
     }
 
+    /// A class constructor is carried by its class's `[[SourceText]]` — the
+    /// spec's own slot for it — and the restore evaluates that text as a class
+    /// expression, so the constructor it built comes back a constructor: it
+    /// constructs, and a bare call still throws because `[[IsClassConstructor]]`
+    /// came back with it.
+    #[test]
+    fn a_class_constructor_round_trips_and_constructs() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("class C { x = 7; } C")
+            .expect("a class")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        back.as_function().expect("a class constructor");
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "new restored().x").as_number(),
+            Some(7.0),
+            "the restored class constructed, running its field initializer"
+        );
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "(() => { try { restored(); return false; } catch (e) { return e instanceof TypeError; } })()",
+            )
+            .as_boolean(),
+            Some(true),
+            "a bare call still throws, so [[IsClassConstructor]] came back"
+        );
+        // The record's source is the class's `[[SourceText]]`, so the restored
+        // constructor answers the class source rather than the native form.
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("class C { x = 7; }".to_string()),
+            "the restore kept the class's source text"
+        );
+    }
+
+    /// The class's private environment and its field initializer come back with
+    /// it, because the restore re-runs the engine's own class evaluation: a
+    /// public field that reads the class's own **private** field is the smallest
+    /// observation that proves both were rebuilt.
+    #[test]
+    fn a_classes_private_environment_comes_back_with_it() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("class C { #secret = 41; x = this.#secret + 1; } C")
+            .expect("a class")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "new restored().x").as_number(),
+            Some(42.0),
+            "the private field and the initializer that reads it were both rebuilt"
+        );
+    }
+
+    /// A class constructor's `[[SourceText]]` is the **class** text, which is
+    /// what the spec requires `Function.prototype.toString` to answer when it is
+    /// not empty — and which the engine stored nothing for before the record
+    /// that carries one existed. This is the half a fresh class pins, with no
+    /// snapshot in it.
+    #[test]
+    fn a_class_constructor_answers_the_class_source() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let text = context
+            .try_eval("class C { x = 7; }\nC.toString()")
+            .expect("a string")
+            .into_value();
+        assert_eq!(
+            text.as_string().map(|text| text.to_string_lossy()),
+            Some("class C { x = 7; }".to_string()),
+            "the class constructor answered its class source, not the native form"
+        );
+    }
+
+    /// A class constructor whose class source the engine could not keep is
+    /// still refused as what it is — the case a class defined where there is no
+    /// source text reaches, so the branch stays honest rather than dead.
+    #[test]
+    fn a_class_constructor_without_its_class_source_is_refused() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("(new Function('return class C { x = 1; }'))()")
+            .expect("a class")
+            .into_value();
+        let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
+        assert_eq!(error.type_name, "a class constructor");
+        assert!(error.detail.contains("no source text"), "{}", error.detail);
+    }
+
     /// Each function the format cannot carry is refused by the kind it is: the
     /// fix differs, so the message does.
     #[test]
@@ -2717,24 +2952,6 @@ mod tests {
             );
             assert!(error.detail.contains(detail), "{source}: {}", error.detail);
         }
-    }
-
-    /// A class constructor is refused as what it is: the engine synthesizes its
-    /// body, so there is no source to re-parse — and the message says that rather
-    /// than blaming the method form, which is a different fact about a different
-    /// value.
-    #[test]
-    fn a_class_constructor_is_refused_by_what_it_lacks() {
-        let mut isolate = api::Isolate::new();
-        let context = api::Context::new(&mut isolate).expect("a realm");
-        let realm = *context.realm();
-        let value = context
-            .try_eval("class C {} C")
-            .expect("a class")
-            .into_value();
-        let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
-        assert_eq!(error.type_name, "a class constructor");
-        assert!(error.detail.contains("no source text"), "{}", error.detail);
     }
 
     /// A host callback is a Rust closure in this engine rather than an address or

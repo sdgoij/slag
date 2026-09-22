@@ -14,6 +14,10 @@
 //!
 //! A JavaScript function is carried as the source text it can be re-parsed from,
 //! so a restored function is callable and a host's attached callbacks come back.
+//! A class constructor is one of those, with its class as the source — so a
+//! restored class is rebuilt by the engine's own class evaluation, which means
+//! its definition-time code (a computed key, a `static {}` block, a static field
+//! initializer) runs again at restore, where V8's snapshot restores objects.
 //! What the source cannot say is the scope the function closed over: a restored
 //! function resolves a free name through the realm's global environment, and a
 //! host callback — a Rust closure in this bridge — has no source at all.
@@ -31,9 +35,8 @@
 //! # What is not carried yet
 //!
 //! A value the engine's walk refuses — a proxy, a typed array, a module
-//! namespace, a host object, an array with a hole, a host callback, a bound
-//! function — ends [`create_blob`](SnapshotCreator::create_blob) with a panic
-//! naming it. The crate's signature is `Option`, which its own callers unwrap,
+//! namespace, a host object, an array with a hole, a host callback — ends
+//! [`create_blob`](SnapshotCreator::create_blob) with a panic naming it. The crate's signature is `Option`, which its own callers unwrap,
 //! so the loudest available message is the honest one; a blob that quietly lost
 //! part of a host's state would move that failure to where the host cannot see
 //! it.
@@ -663,6 +666,46 @@ mod tests {
             .expect("the bound function");
         crate::test_support::bind(scope, "restored", bound);
         assert_eq!(crate::test_support::eval_number(scope, "restored(2)"), 3.0);
+    }
+
+    /// A class constructor comes back a constructor, which is the value that
+    /// stopped `deno_core`'s own snapshot: its bootstrapped realm attaches a
+    /// class as context data and constructs it after the restore.
+    #[test]
+    fn a_class_constructor_round_trips_and_is_constructable_from_a_script() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let class = crate::test_support::eval(scope, "class C { x = 7; } C");
+            scope.add_context_data(context, class);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let class = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the class constructor");
+        crate::test_support::bind(scope, "restored", class);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "new restored().x"),
+            7.0
+        );
+        assert_eq!(
+            crate::test_support::eval_number(
+                scope,
+                "restored.prototype.constructor === restored ? 1 : 0"
+            ),
+            1.0
+        );
     }
 
     /// A realm's global function property is carried by name rather than as a

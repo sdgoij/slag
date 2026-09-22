@@ -1061,8 +1061,17 @@ pub fn instantiate_class_constructor(
     body: std::rc::Rc<Block>,
     environment: EnvRef,
     enclosing_strict: bool,
+    source: Option<JsString>,
 ) -> Result<Value, JsError> {
-    instantiate_class_constructor_with(agent, params, body, environment, enclosing_strict, false)
+    instantiate_class_constructor_with(
+        agent,
+        params,
+        body,
+        environment,
+        enclosing_strict,
+        false,
+        source,
+    )
 }
 
 /// Like `instantiate_class_constructor`, marking the synthesized default
@@ -1071,6 +1080,7 @@ pub fn instantiate_default_derived_constructor(
     agent: &mut Agent,
     environment: EnvRef,
     enclosing_strict: bool,
+    source: Option<JsString>,
 ) -> Result<Value, JsError> {
     instantiate_class_constructor_with(
         agent,
@@ -1082,6 +1092,7 @@ pub fn instantiate_default_derived_constructor(
         environment,
         enclosing_strict,
         true,
+        source,
     )
 }
 
@@ -1092,6 +1103,7 @@ fn instantiate_class_constructor_with(
     environment: EnvRef,
     enclosing_strict: bool,
     default_derived: bool,
+    source: Option<JsString>,
 ) -> Result<Value, JsError> {
     let function = register_function(
         agent,
@@ -1106,7 +1118,7 @@ fn instantiate_class_constructor_with(
             is_generator: false,
             is_class_constructor: true,
         },
-        None,
+        source,
         None,
         Vec::new(),
         false,
