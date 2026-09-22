@@ -10,6 +10,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
 use crux::heap::{GcAny, Trace};
+use crux::host::HostOps;
 use crux::object::{JsObject, PropertyKind};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -552,14 +553,27 @@ fn member_holder(value: &Value) -> Option<Handle<JsObject>> {
 }
 
 pub fn initialize_host_defined_realm(agent: &Agent) -> Result<Handle<Realm>, JsError> {
+    initialize_host_defined_realm_with_global(agent, None)
+}
+
+/// The same, with an optional host-defined exotic on the global object (spec
+/// 9.3.4's InitializeHostDefinedRealm, which leaves the global's internal
+/// methods to the host). The ops run those methods with ordinary fallback, so a
+/// realm whose host supplies none is exactly the realm above.
+pub fn initialize_host_defined_realm_with_global(
+    agent: &Agent,
+    global_ops: Option<Rc<dyn HostOps>>,
+) -> Result<Handle<Realm>, JsError> {
     let intrinsics = Intrinsics::default();
     // The global object's prototype is %Object.prototype% once the intrinsic
     // table is populated (Phase 5+); until then it is null.
-    let global = JsObject::ordinary_object_create(
-        intrinsics
-            .get("%Object.prototype%")
-            .and_then(|v| as_object(&v)),
-    );
+    let prototype = intrinsics
+        .get("%Object.prototype%")
+        .and_then(|v| as_object(&v));
+    let global = match global_ops {
+        Some(ops) => JsObject::host_object_create(ops, prototype),
+        None => JsObject::ordinary_object_create(prototype),
+    };
     let global_env = new_global_environment(global, global);
     let realm = Handle::new(Realm {
         agent_signifier: agent.signifier,
@@ -760,6 +774,82 @@ mod tests {
         intrinsics.define("%Object.prototype%", Value::Undefined);
         assert!(!intrinsics.is_empty());
         assert_eq!(intrinsics.get("%Object.prototype%"), Some(Value::Undefined));
+    }
+
+    /// A realm whose host asks for a host-defined global object gets one: the
+    /// global's internal methods are the host's, with ordinary fallback. This is
+    /// the mechanism a V8 named property handler rides on, so the test checks
+    /// the three methods one needs — `[[GetOwnProperty]]` (the descriptor
+    /// callback), `[[Set]]` (the setter) and `[[DefineOwnProperty]]` (the
+    /// definer) — and that answering `None` really leaves the ordinary method
+    /// running.
+    #[test]
+    fn a_realms_global_object_can_be_host_defined() {
+        #[derive(Debug)]
+        struct Recording(std::rc::Rc<RefCell<Vec<&'static str>>>);
+
+        impl HostOps for Recording {
+            fn get_own_property(
+                &self,
+                _object: &JsObject,
+                _key: &PropertyKey,
+            ) -> Option<Result<crux::object::Property, JsError>> {
+                self.0.borrow_mut().push("descriptor");
+                None
+            }
+
+            fn set(
+                &self,
+                _object: &JsObject,
+                _key: &PropertyKey,
+                _value: &Value,
+                _receiver: &Value,
+            ) -> Option<Result<bool, JsError>> {
+                self.0.borrow_mut().push("setter");
+                None
+            }
+
+            fn define_property(
+                &self,
+                _object: &JsObject,
+                _key: &PropertyKey,
+                _desc: &PropertyDescriptor,
+            ) -> Option<Result<bool, JsError>> {
+                self.0.borrow_mut().push("definer");
+                None
+            }
+        }
+
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let mut agent = Agent::new();
+        agent
+            .initialize_host_defined_realm_with_global(Some(std::rc::Rc::new(Recording(
+                seen.clone(),
+            ))))
+            .unwrap();
+        agent
+            .run_script(
+                "Object.defineProperty(globalThis, 'key', { value: 9, enumerable: true, configurable: true, writable: true });\
+                 globalThis.other = 1;\
+                 Object.getOwnPropertyDescriptor(globalThis, 'key');",
+            )
+            .unwrap();
+        let calls = seen.borrow().clone();
+        for call in ["definer", "setter", "descriptor"] {
+            assert!(
+                calls.contains(&call),
+                "the host's {call} was not consulted: {calls:?}"
+            );
+        }
+        // Every answer was `None` — not intercepted — so the ordinary methods
+        // still ran and both properties are where the script put them.
+        assert_eq!(
+            agent
+                .run_script("globalThis.other === 1 && globalThis.key === 9")
+                .unwrap(),
+            Value::Boolean(true),
+            "a host op that answers `None` leaves the ordinary method running"
+        );
     }
 
     /// A builtin the realm installs on one of its own objects is **nameable** by

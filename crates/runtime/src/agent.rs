@@ -20,7 +20,7 @@ use crux::value::ValueKind;
 use crate::context::ExecutionContext;
 use crate::host::HostHooks;
 use crate::job::Job;
-use crate::realm::{Realm, initialize_host_defined_realm};
+use crate::realm::{Realm, initialize_host_defined_realm_with_global};
 
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1408,12 +1408,21 @@ impl Agent {
     /// InitializeHostDefinedRealm (spec 9.3.4) and push the bootstrap
     /// execution context.
     pub fn initialize_host_defined_realm(&mut self) -> Result<Handle<Realm>, JsError> {
+        self.initialize_host_defined_realm_with_global(None)
+    }
+
+    /// The same, for a realm whose global object is a host-defined exotic
+    /// (`crux::host::HostOps`) — the seam V8 handler objects use.
+    pub fn initialize_host_defined_realm_with_global(
+        &mut self,
+        global_ops: Option<std::rc::Rc<dyn crux::host::HostOps>>,
+    ) -> Result<Handle<Realm>, JsError> {
         // Register as a live GC root before the bootstrap allocates the realm
         // boxes: an agent that holds a realm but has not yet entered a
         // `with_agent` window (the embedding created it and will evaluate it
         // later) would otherwise be invisible to a sibling's collection.
         live_agent_entered(self as *mut Agent as *mut ());
-        let realm = initialize_host_defined_realm(self)?;
+        let realm = initialize_host_defined_realm_with_global(self, global_ops)?;
         self.push_bootstrap_context(realm);
         Ok(realm)
     }

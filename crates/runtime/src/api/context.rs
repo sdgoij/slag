@@ -31,7 +31,20 @@ impl Context {
     /// InitializeHostDefinedRealm on `isolate` (spec 9.3.4) and push the
     /// bootstrap execution context.
     pub fn new(isolate: &mut Isolate) -> Result<Self, JsError> {
-        let realm = isolate.agent.initialize_host_defined_realm()?;
+        Self::new_with_global_ops(isolate, None)
+    }
+
+    /// The same, over a host-defined global object: `global_ops` are the
+    /// global's own internal methods (`crux::host::HostOps`), each falling back
+    /// to the ordinary one, which is how a host installs a named property
+    /// handler (V8's global template).
+    pub fn new_with_global_ops(
+        isolate: &mut Isolate,
+        global_ops: Option<std::rc::Rc<dyn crux::host::HostOps>>,
+    ) -> Result<Self, JsError> {
+        let realm = isolate
+            .agent
+            .initialize_host_defined_realm_with_global(global_ops)?;
         Ok(Self {
             isolate: isolate as *mut Isolate,
             realm,
@@ -242,6 +255,20 @@ impl Context {
             )?;
             Ok(Local(result))
         })
+    }
+
+    /// Add a microtask: `callback` runs with no arguments when the job queues
+    /// drain (v8::Isolate::EnqueueMicrotask).
+    ///
+    /// The engine's microtasks are its promise jobs, so the callback runs as
+    /// one, in this context's realm and behind the jobs already queued.
+    pub fn enqueue_microtask(&self, callback: Local) {
+        let realm = self.realm;
+        self.with_agent(|agent| {
+            agent.enqueue_promise_job(Some(realm), move |agent| {
+                crate::function::call(agent, callback.value(), Value::Undefined, &[])
+            });
+        });
     }
 
     /// Drain the job queues (microtasks, timers, generic jobs).

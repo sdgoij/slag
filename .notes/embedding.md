@@ -3052,6 +3052,68 @@ suites 64,594 checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 tests / 0 fail
 75 tests — the refusal test became the absence test.
 
 *And the goal is the snapshot path, not the from-source one.* Booting deno with `startup_snapshot: None` **works** — measured end to end: deno's whole bootstrap runs on this engine, `example.js` loads, its `my:runtime` import resolves and calls the Rust op, and the run prints `Received this value from JS: Hello from example.js` and exits 0 — and it is explicitly **not** the goal: it skips the integration being tested, re-runs the host's JavaScript at every start, and is what a host falls back to when its snapshot is unusable. The next part is the environment record (design named in §12's eleventh item).
+**The three methods a suite needs, and the seam under the handler — landed.** The
+deno_core tier's gap was nineteen compile errors; this part closes the six that
+are not the named property handler, and lands the engine seam that handler will
+ride on. §9's item 17 names the mechanism and the one engine edit; this is what
+it cost.
+
+*What landed.* `Symbol::new` (`crates/v8/primitives.rs`) mints a fresh symbol
+through `crux::symbol::Symbol::new`, the engine's unregistered constructor — the
+counterpart to the registry's `for_key`, which the same file already had. Three
+methods the crate we stand in for declares and this bridge did not:
+`CreateParams::heap_limits` with a `get_heap_limits` accessor, and
+`Isolate::enqueue_microtask`, which needed one engine method to exist at all —
+`api::Context::enqueue_microtask`, which enqueues the callback as a promise job
+in the context's realm (the engine's microtasks *are* its promise jobs). And the
+seam: `realm::initialize_host_defined_realm_with_global`,
+`Agent::initialize_host_defined_realm_with_global` and
+`api::Context::new_with_global_ops` let a realm's global object be built from a
+host's `HostOps` instead of ordinary — the edit §9's item 17 named before it was
+made, inert with `None`, which is what every existing caller passes.
+
+*One thing the small methods say out loud.* `CreateParams::heap_limits` is
+**recorded, not enforced**: the engine imposes no heap size limit, so there is
+nothing for the numbers to bound, and a host that arms a near-heap-limit callback
+will not see it fire from them. Recorded rather than dropped because the host
+asked; the field's own doc is where a reader finds that, and deno_core's two
+`test_heap_limit*` tests are the ones which cannot pass because of it.
+
+*The measurement moved, and only by these.* `cargo test -p deno_core --features
+v8 --lib --no-run` goes from **19 errors to 13**, and all thirteen are the
+handler (`Intercepted` ×6, `PropertyCallbackArguments` ×3, `PropertyHandlerFlags`
+×2, `NamedPropertyHandlerConfiguration`, `set_named_property_handler`) — so the
+three methods closed exactly their six and nothing else in the crate moved. The
+suite therefore still does not compile; that is what item 17's handler is for.
+
+*Tests — four, and every one mutated.* `realm::tests`'s
+`a_realms_global_object_can_be_host_defined` gives a realm a recording `HostOps`
+and asserts the three internal methods a handler needs are consulted —
+`[[GetOwnProperty]]` by a `defineProperty` and a `getOwnPropertyDescriptor`,
+`[[Set]]` by an assignment, `[[DefineOwnProperty]]` by the define — and that
+every answer being `None` leaves the ordinary method running (`globalThis.other
+=== 1 && globalThis.key === 9`). A mutation that ignores the ops (`Some(_) =>
+ordinary_object_create`) fails it. `primitives::tests`'s
+`a_fresh_symbol_is_new_every_time` checks that two `Symbol::new`s with one
+description are two symbols, that the description is carried, that neither is
+`Symbol.for`'s, and that a description-less one reads `undefined`; mutating the
+description to `None` fails it. `isolate::tests`'s
+`heap_limits_are_recorded_and_readable` checks the round trip and the default;
+dropping the store fails it. And
+`a_queued_microtask_runs_on_the_next_checkpoint` asserts a microtask enqueued
+from Rust does *not* run before the checkpoint and *does* run at it; a no-op
+`enqueue_microtask` fails it.
+
+*Gates.* `cargo test --locked --workspace` green in 38 binaries, 0 failed
+(runtime 878 — the baseline 877 plus the realm test, v8 230 — the baseline 227
+plus three); `cargo fmt --all -- --check` clean; `cargo clippy --locked
+--workspace --all-targets -- -D warnings` clean; test262 `all` 48,464 pass / 0
+fail / 0 crash / 0 hang (158 skip) of 48,622 and `intl402` 3,205 / 0 fail (152
+skip); the eight wasm core suites 64,594 checks / 0 fail / 0 pending; `wasmtest
+jsapi` 1,001 tests / 0 fail. The sweeps were run rather than argued about: the
+change is in `runtime` — the realm constructor, which every runner links — and
+the numbers are unchanged from part 21's, which is what an inert seam should
+cost.
 
 ## 8. Parked: the C++ face
 
@@ -4958,6 +5020,58 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   the walk here answers the empty list instead. `deno_core` asks only behind its
   own `is_synthetic_module` guard (`evaluation.rs:343`), so the divergence is
   unreachable from the frontier's host and recorded for the next one.
+17. **The named property handler — named before it is written.** The deno_core
+    tier's gate, taken from a measurement rather than from a guess: with the
+    local `deno/` pointed at the bridge, `cargo test -p deno_core --features v8
+    --lib --no-run` does not compile, and its **nineteen** errors are four
+    things — a named property handler (`NamedPropertyHandlerConfiguration`,
+    `PropertyHandlerFlags::{NON_MASKING, HAS_NO_SIDE_EFFECT}`, `Intercepted`,
+    `PropertyCallbackArguments` and `ObjectTemplate::set_named_property_handler`,
+    all from `runtime/tests/misc.rs`'s `global_template_middleware`),
+    `Symbol::new` (`webidl.rs`), `CreateParams::heap_limits` (`misc.rs`) and
+    `Isolate::enqueue_microtask` (`runtime/ops.rs`). The three small ones are
+    bridge methods the method-level stage of §10 already owes. The handler is a
+    mechanism, and it is named here before any edit:
+
+    - **The engine seam already exists; nothing is being invented.**
+      `crux::host::HostOps` is the documented seam for exactly this ("V8 handler
+      objects (crates/v8) implement `HostOps`"), and
+      `JsObject::get_own_property` / `set` / `define_property` already dispatch
+      to it with ordinary fallback — `None` is not-intercepted. **The only
+      engine edit this part makes is to let a realm's global object be created
+      with a `HostOps`** (`realm::initialize_host_defined_realm`, the `Agent`
+      entry point, and `api::Context::new` each gain a `with_global_ops` form).
+      It is inert: with no ops the global is the `ObjectKind::Ordinary` object it
+      is today, so every existing caller — and the corpus and the wasm sweeps —
+      see no change.
+    - **What that costs, stated rather than discovered later.** The snapshot walk
+      refuses a host object by name (`crates/runtime/src/snapshot.rs:1907`), so a
+      realm whose global carries a handler **cannot be snapshotted**. That is a
+      loud refusal rather than a silent one, and it is accepted here because no
+      deno_core snapshot test installs a global handler and no extension deno
+      ships supplies `global_template_middleware` outside the one test.
+    - **Only as far as the one test requires.** The three callbacks deno's test
+      configures — `descriptor`, `setter`, `definer` — are delivered. The getter,
+      query, deleter and enumerator callbacks, and the *indexed* variant
+      (`ext/node/ops/vm.rs`, a later tier), are not. `Intercepted::kNo` is
+      ordinary fallback; the other three answers are honoured where their meaning
+      is unambiguous (a set or a define the host handled, or a throw) and refused
+      **by name** where the bridge has nowhere to put the answer — a `descriptor`
+      answering `kYes`, whose descriptor has no carrying shape in this bridge.
+
+    **Landed so far** (this pass, with §7's record, tests and mutations): the three
+    bridge methods, and the global-object seam — `Some(ops)` builds the global
+    with `host_object_create`, `None` with `ordinary_object_create`, so every
+    existing caller is untouched and the corpus and the wasm sweeps reproduce
+    their numbers. What remains of this item is the handler itself: the four
+    callback types, the configuration, the template's storage for it, the
+    `HostOps` implementation that calls the host back, and the one design
+    question the measurement leaves open — a `descriptor` answering `kYes` has
+    nowhere to put its descriptor, because `api::FunctionCallbackInfo` (the only
+    return-value slot the bridge has) is `pub(crate)` and `HostOps` carries no
+    value out, so that answer is refused by name unless an engine return slot is
+    added for it.
+
 
 ## 10. Build order
 
@@ -5391,6 +5505,40 @@ migrate, then delete.
    from the blob — which it must, because `InitMode::FromSnapshot` skips deno's bootstrap sources. The
    next step is a **larger host**: deno's CLI, or `deno_core`'s own suite, whose graph will name the next
    mechanism the way every part above was named. Nothing is named from here without that measurement.
+
+   **The larger host was measured, and it is two tiers with two different
+   gates.** Both measurements are in the records above; this is the order and the
+   decision.
+
+   - **The deno_core tier** — `cargo test -p deno_core --features v8 --lib` does
+     not compile: nineteen errors, four things, listed in §9's item 17. Its nine
+     snapshot tests are the ones worth running, because they exercise the format
+     at a level the one example could not (`will_snapshot2`,
+     `test_snapshot_callbacks`, `test_snapshot_creator_warmup`, `es_snapshot`,
+     `snapshot_with_additional_extensions`,
+     `lazy_loaded_esm_not_snapshotted_but_metadata_survives`, `test_from_snapshot`
+     and the two `will_snapshot` pair). They are one interceptor and three methods
+     away, and the interceptor pre-pays `ext/node/ops/vm.rs` for the CLI tier.
+     **Taken first.**
+   - **The CLI tier** — `deno_snapshots`, the CLI's own snapshot host (its build
+     script uses `deno_runtime` with the `snapshot` feature, so it compiles
+     `99_main.js`, every `ext/*` and `runtime/js/*`), names a much larger surface:
+     `v8::TracedReference`, `v8::Weak`, `Object::set_integrity_level` with
+     `IntegrityLevel`, `Object::get_own_property_descriptor`,
+     `Object::preview_entries`, `Map`/`Set::size`, `TypedArray::length`,
+     `Symbol::description`, `String::write_utf8_v2`, `Value::type_of`,
+     `Date::value_of` and `simdutf::{Base64Options, LastChunkHandling, ...}`, plus
+     a `PinnedRef<'_, CallbackScope<'_>>` that does not satisfy `NewHandleScope`.
+     The bulk of it is Node-API and node ops (`ext/napi`,
+     `ext/node/ops/{handle_wrap,v8,vm}`, `ext/web/{console,geometry,image_data}`),
+     so its gate is **weak/traced handles — the plan's own remaining L2 item**
+     (item 1 below) — plus Node-API. **Declared blocked here rather than left
+     implied.** (This measurement needed one host-side line —
+     `deno_core = { workspace = true, features = ["v8"] }` under
+     `[build-dependencies]` in `cli/snapshot/Cargo.toml` — because the workspace
+     enables `deno_core/v8` only through `cli`'s own feature; without it the build
+     script answers `either feature v8 or quickjs must be enabled`. `deno/` is
+     untracked and nothing in it is committed.)
 
 12. **`Object.assign` and a function — landed, both roles fixed.** §7's
    measurement found it in passing: `Object.assign(function () {}, { tag: 7 })`

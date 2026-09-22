@@ -14,7 +14,9 @@ use runtime::api;
 
 use crate::ExternalReference;
 use crate::cppgc::Heap;
-use crate::data::{Array, Context, Data, FixedArray, Object, Promise, PromiseResolver, Value};
+use crate::data::{
+    Array, Context, Data, FixedArray, Function, Object, Promise, PromiseResolver, Value,
+};
 use crate::handle::{Global, Local, Payload};
 use crate::position::Position;
 use crate::promise::{PromiseRejectEvent, PromiseRejectMessage};
@@ -52,6 +54,14 @@ pub struct CreateParams {
     /// The heap the isolate takes ownership of for host objects
     /// (`CreateParams::cpp_heap`).
     cpp_heap: Option<Heap>,
+    /// The heap sizes a host asked for (`CreateParams::heap_limits`).
+    ///
+    /// **Recorded, not enforced.** Slag's heap is not V8's and imposes no size
+    /// limit, so there is nothing for these numbers to bound: a host that arms
+    /// a near-heap-limit callback will not see it fire from them. Kept rather
+    /// than dropped because a host sets them before `Isolate::new` and would
+    /// otherwise get no answer at all to what it asked for.
+    heap_limits: Option<(usize, usize)>,
 }
 
 impl CreateParams {
@@ -81,6 +91,19 @@ impl CreateParams {
     pub fn cpp_heap(mut self, heap: UniqueRef<Heap>) -> Self {
         self.cpp_heap = Some(heap.into_inner());
         self
+    }
+
+    /// The heap's initial and maximum size in bytes
+    /// (v8::CreateParams::heap_limits) — recorded, not enforced; see the field.
+    pub fn heap_limits(mut self, initial: usize, maximum: usize) -> Self {
+        self.heap_limits = Some((initial, maximum));
+        self
+    }
+
+    /// The limits a host asked for, if any (this bridge's own accessor, for a
+    /// host that keeps one `CreateParams` around).
+    pub fn get_heap_limits(&self) -> Option<(usize, usize)> {
+        self.heap_limits
     }
 
     /// The snapshot this host asked for, if any (this bridge's own accessor,
@@ -721,6 +744,16 @@ impl Isolate {
     /// Drain the microtask and job queues (`v8::Isolate::PerformMicrotaskCheckpoint`).
     pub fn run_microtasks(&mut self) -> Result<(), crux::error::JsError> {
         self.engine_mut().run_microtasks()
+    }
+
+    /// Add a microtask that calls `callback` with no arguments when the queues
+    /// drain (v8::Isolate::EnqueueMicrotask).
+    ///
+    /// The engine's microtasks are its promise jobs, so the callback runs with
+    /// them, in the realm this isolate has entered.
+    pub fn enqueue_microtask(&mut self, callback: Local<'_, Function>) {
+        let context = self.current_context().unwrap_or_else(crate::realm_current);
+        context.enqueue_microtask(callback.into_engine());
     }
 
     /// Run the queues until they are empty
@@ -1429,6 +1462,45 @@ mod tests {
         assert!(!handle.terminate_execution());
         assert!(!handle.cancel_terminate_execution());
         assert!(!handle.is_execution_terminating());
+    }
+
+    /// The heap limits a host sets are recorded and readable — and, as the field
+    /// says, they bound nothing: an isolate made from params carrying them is an
+    /// ordinary isolate.
+    #[test]
+    fn heap_limits_are_recorded_and_readable() {
+        assert_eq!(Isolate::create_params().get_heap_limits(), None);
+        let params = Isolate::create_params().heap_limits(0, 5 * 1024 * 1024);
+        assert_eq!(params.get_heap_limits(), Some((0, 5 * 1024 * 1024)));
+        let isolate = &mut Isolate::new(params);
+        assert!(!isolate.is_execution_terminating());
+    }
+
+    /// A microtask added from Rust runs when the queues drain, in the realm the
+    /// isolate entered, and it does not run before then.
+    #[test]
+    fn a_queued_microtask_runs_on_the_next_checkpoint() {
+        crate::test_support::in_context!(scope, {
+            crate::test_support::eval(
+                scope,
+                "globalThis.ran = 0; globalThis.microtask = function () { globalThis.ran = 7; };",
+            );
+            let microtask: Local<'_, Function> =
+                crate::test_support::eval(scope, "globalThis.microtask").cast();
+            let mut isolate = scope.isolate_ptr();
+            isolate.enqueue_microtask(microtask);
+            assert_eq!(
+                crate::test_support::eval_number(scope, "globalThis.ran"),
+                0.0,
+                "the microtask does not run before the queues drain"
+            );
+            isolate.perform_microtask_checkpoint();
+            assert_eq!(
+                crate::test_support::eval_number(scope, "globalThis.ran"),
+                7.0,
+                "the enqueued callback ran when the queues drained"
+            );
+        });
     }
 
     /// An interrupt is not scheduled, and the callback is not run: there is no

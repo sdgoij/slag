@@ -683,6 +683,18 @@ fn symbol_handle<'s>(symbol: crux::handle::Handle<crux::symbol::Symbol>) -> Loca
 }
 
 impl Symbol {
+    /// A fresh symbol (v8::Symbol::New).
+    ///
+    /// Every call mints a new symbol, even for a description just used — no
+    /// registry is consulted, which is what separates this from
+    /// [`for_key`](Self::for_key). The scope is unused because a symbol needs
+    /// no realm to exist; the crate we stand in for takes one, and a host has
+    /// one in hand.
+    pub fn new<'s>(_scope: &PinScope<'s, '_, ()>, description: Option<&str>) -> Local<'s, Symbol> {
+        let symbol = crux::symbol::Symbol::new(description.map(JsString::from_utf8));
+        symbol_handle(crux::handle::Handle::new(symbol))
+    }
+
     /// The global-registry symbol for `description`, minting it on first use
     /// (v8::Symbol::For).
     ///
@@ -793,6 +805,40 @@ mod tests {
     use crate::NewStringType;
     use crate::data::Value;
     use crate::test_support::{bind, eval, eval_number, in_context};
+
+    /// A fresh symbol is a new one every time, unlike the registry's — the whole
+    /// difference between `Symbol::new` and `Symbol::for`.
+    #[test]
+    fn a_fresh_symbol_is_new_every_time() {
+        in_context!(scope, {
+            let first = Symbol::new(scope, Some("fresh.test"));
+            let second = Symbol::new(scope, Some("fresh.test"));
+            bind(scope, "first", first.cast::<Value>());
+            bind(scope, "second", second.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "first === second ? 1 : 0"),
+                0.0,
+                "two fresh symbols with one description are two symbols"
+            );
+            assert_eq!(
+                eval_number(scope, "first.description === 'fresh.test' ? 1 : 0"),
+                1.0,
+                "the description is the one it was minted with"
+            );
+            assert_eq!(
+                eval_number(scope, "first === Symbol.for('fresh.test') ? 1 : 0"),
+                0.0,
+                "a fresh symbol is not the registry's, even for the same description"
+            );
+            let bare = Symbol::new(scope, None);
+            bind(scope, "bare", bare.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "bare.description === undefined ? 1 : 0"),
+                1.0,
+                "a fresh symbol with no description has none"
+            );
+        });
+    }
 
     /// The registry is one table: a name script registers is the symbol the
     /// bridge is handed, and the other way round.
