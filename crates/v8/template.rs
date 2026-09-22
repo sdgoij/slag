@@ -74,7 +74,17 @@ impl FunctionTemplate {
         // the scope the host's handle came from. Without a root, a collection
         // could free the value and the callback would be handed a value that is
         // no longer the one the function was built with.
+        //
+        // Pinned twice, because there are two readers: this closure, and the
+        // snapshot walk, which carries the value in a blob and therefore reads it
+        // from the isolate's own table rather than through the closure.
+        let recorded_data = data.map(|value| Global::new(&isolate, value));
         let data = data.map(|value| Global::new(&isolate, value));
+        // Read before the callback goes into the closure below: a snapshot cannot
+        // hold this address, so it is what the isolate records against the
+        // template's own, and the engine's walk later asks the host which of its
+        // callbacks a function came from.
+        let callback_address = callback as usize;
         let engine = api::FunctionTemplate::new(
             isolate.engine_mut(),
             Box::new(move |info: &api::FunctionCallbackInfo<'_>| {
@@ -92,6 +102,7 @@ impl FunctionTemplate {
         engine.set_constructible(constructible);
         let pointer = Rc::as_ptr(&engine) as *mut c_void;
         isolate.add_template(engine);
+        isolate.template_callback(pointer as usize, callback_address, recorded_data);
         let handle: Local<'s, External> = External::new(scope, pointer);
         // The pointer the template was just stored under, retagged: the bridge
         // put it there itself, so there is nothing for a checked cast to ask.
@@ -189,6 +200,17 @@ impl<'s> LocalHandle<'s, FunctionTemplate> {
         let realm = crate::realm_of(scope);
         let value = self.template_rc().get_function(&realm).ok()?;
         let function: Local<'_, Function> = Local::from_engine(value);
+        // The callback the template was built from belongs to this function now,
+        // which is the identity the engine's snapshot walk asks the host with —
+        // and so does the data it was built with, which a blob carries as a value
+        // rather than leaving the restored callback to read something else's.
+        // One line here rather than a check at every call site, because
+        // materializing through a template is the only way this bridge makes a
+        // host function.
+        if let Some(function) = function.engine().value().as_function() {
+            let template = api::External::from(*self.engine().value()).value() as usize;
+            scope.isolate_ptr().materialized(template, function.id());
+        }
         Some(function)
     }
 

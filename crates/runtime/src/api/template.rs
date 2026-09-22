@@ -714,7 +714,11 @@ fn run_callback(
 }
 
 /// Build a bare host function with the given callback and prototype.
-fn host_function(
+///
+/// The one place a host callback becomes a callable, so a function a template
+/// materializes and one a snapshot restores are the same shape: the same call
+/// view, the same return-value slot, the same pending-exception translation.
+pub(crate) fn host_function(
     isolate: *mut Isolate,
     callback: Rc<FunctionCallback>,
     name: Option<JsString>,

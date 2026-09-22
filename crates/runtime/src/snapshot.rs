@@ -24,7 +24,8 @@
 //! the value it refused: a proxy, a typed array, a module namespace, a host
 //! object, an array with a hole, an indexed accessor, an array whose `length` is
 //! not an index, a host pointer the host's external-reference table does not
-//! have, a host callback (a built-in that is not an intrinsic), and a function
+//! have, a host callback (a built-in that is not an intrinsic) when the host
+//! supplies none of its own, and a function
 //! the engine kept no source text for — an arrow, a method, an accessor or a
 //! class constructor whose class text was not available where it was defined.
 //! Each entry is a subsystem to carry, and the walk refuses rather than writing
@@ -52,6 +53,13 @@
 //! private environment. It is also the one record whose restore **runs
 //! definition-time code again**: a computed key, a `static {}` block and a static
 //! field initializer execute, where V8's snapshot only restores objects.
+//!
+//! A host callback is the one kind the engine cannot rebuild alone: its body is
+//! the host's Rust closure, so the record carries what only the host has — the
+//! index of the external-reference table entry the call came from, and the data
+//! value the function reads — and the restore asks the host to make the call
+//! again. That is the `HostCallbacks` contract: a build that supplies none
+//! carries none, which is what the walk refused before this record existed.
 //!
 //! Version 1. The format is ours to version, and its compatibility surface is
 //! the *names* it writes: an intrinsic name and a well-known symbol name have to
@@ -119,6 +127,7 @@ const REC_ARRAY: u8 = 12;
 const REC_EXTERNAL: u8 = 13;
 const REC_FUNCTION: u8 = 14;
 const REC_BOUND_FUNCTION: u8 = 15;
+const REC_HOST_CALLBACK: u8 = 16;
 
 /// Which grammar a function record's source is read in. A class constructor's
 /// `[[SourceText]]` is the **class** it came from (spec 15.7.14 sets it that way
@@ -204,6 +213,8 @@ pub enum DecodeError {
     UnknownIntrinsic(String),
     /// A function record's grammar byte is not one this format's.
     BadGrammar(u8),
+    /// A blob carries a host callback and the load supplied no callbacks.
+    NoHostCallback(usize),
     /// A blob names an entry the host's external-reference table does not have.
     ExternalIndexOutOfRange { index: usize, count: usize },
 }
@@ -245,6 +256,10 @@ impl std::fmt::Display for DecodeError {
                     "snapshot function grammar byte {byte} is not one of this format's"
                 )
             }
+            Self::NoHostCallback(index) => write!(
+                f,
+                "snapshot names a host callback at external reference {index}, which the load's host did not supply"
+            ),
             Self::ExternalIndexOutOfRange { index, count } => write!(
                 f,
                 "snapshot names external reference {index}, the host's table has {count}"
@@ -335,6 +350,15 @@ enum Record {
         elements: Vec<u32>,
         extras: Vec<StoredProperty>,
     },
+    /// A host callback: the external-reference table entry it was built from,
+    /// the data it reads, and its object part.
+    HostCallback {
+        index: u32,
+        data: u32,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
 }
 
 /// A property as read from a blob: the key, its attributes, and either one value
@@ -344,6 +368,45 @@ struct StoredProperty {
     flags: u8,
     first: u32,
     second: u32,
+}
+
+/// A host callback the host built: the table entry its call comes from, and the
+/// data it was built with.
+///
+/// The data is a *value*, so a blob carries it beside the index rather than
+/// trusting the load to have the same one — which is what makes a callback that
+/// reads `FunctionBuilder::data` carriable rather than quietly broken, and every
+/// one of deno's ops is built that way.
+pub struct HostCallback {
+    /// The external-reference table entry the call comes from.
+    pub pointer: usize,
+    /// The value the host attached when it built the function, when it did.
+    pub data: Option<crate::api::Local>,
+}
+
+/// The host half of carrying a callback: which of its own callbacks a function
+/// was built from, and the call a table entry names.
+///
+/// A built-in function in this engine is a Rust closure, so a snapshot cannot
+/// rebuild one — the closure is the host's, and only the host can make another.
+/// What both ends need is the pointer its external-reference table holds, since
+/// the address is a property of the process that loads a blob rather than of the
+/// data: the write side is asked what a function was built from, and the read
+/// side is asked what call an entry names. A host that supplies neither carries
+/// no callbacks, and its builtins refuse as they always have.
+pub trait HostCallbacks {
+    /// What the host knows about `function`, or `None` for a builtin the host
+    /// did not make.
+    fn callback_of(&self, function: &Handle<Function>) -> Option<HostCallback>;
+
+    /// The host callback the load's table holds at `pointer`, with the data a
+    /// blob carried for it, in the engine's own call shape — or `None` when that
+    /// entry is not one a callback can be made from.
+    fn callback_at(
+        &self,
+        pointer: usize,
+        data: Option<crate::api::Local>,
+    ) -> Option<crate::api::FunctionCallback>;
 }
 
 /// One context's slot in a blob: the index the host gave it, the realm its
@@ -374,11 +437,15 @@ pub struct Slot<'a> {
 /// snapshot cannot hold a function or data address, because an address is a
 /// property of the process that loads the blob rather than of the data, so a
 /// host pointer is written as its *index* into that table and the host rebuilds
-/// the table for every load.
+/// the table for every load. `host` is the host's own callbacks, when it has
+/// any: a built-in is a Rust closure, so only the host can say which table entry
+/// one was built from, and a host that supplies none has its builtins refused by
+/// name.
 pub fn encode_slots(
     agent: &Agent,
     slots: &[Slot<'_>],
     externals: &[usize],
+    host: Option<&dyn HostCallbacks>,
 ) -> Result<Vec<u8>, Unsupported> {
     let mut objects: Vec<(Value, Handle<Realm>)> = Vec::new();
     let mut serials: HashMap<Identity, u32> = HashMap::new();
@@ -390,6 +457,7 @@ pub fn encode_slots(
                 agent,
                 &slot.realm,
                 externals,
+                host,
                 *item,
                 &mut objects,
                 &mut serials,
@@ -408,7 +476,7 @@ pub fn encode_slots(
     }
     write_u32(&mut body, objects.len() as u32);
     for (value, realm) in &objects {
-        write_record(agent, realm, externals, *value, &serials, &mut body)?;
+        write_record(agent, realm, externals, host, *value, &serials, &mut body)?;
     }
 
     let mut blob = Vec::with_capacity(HEADER_LEN + body.len() + MAGIC.len());
@@ -439,6 +507,7 @@ pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u
             items: &items,
         }],
         &[],
+        None,
     )
 }
 
@@ -454,12 +523,16 @@ pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u
 ///
 /// The agent is mutable because carrying a function means re-running the parser
 /// and registering a new body: a blob holds source text, not a compiled body.
+/// `host` is the host's own callbacks, which is what a host callback record is
+/// resolved through — a blob that names one read by a load that supplied none is
+/// an error rather than a function that quietly cannot be called.
 pub fn decode_slot(
     agent: &mut Agent,
     realm: &Handle<Realm>,
     bytes: &[u8],
     slot: usize,
     externals: &[usize],
+    host: Option<&dyn HostCallbacks>,
 ) -> Result<Option<Vec<Value>>, DecodeError> {
     let (body_len, context_count) = header(bytes)?;
     let mut body = Reader::new(&bytes[HEADER_LEN..HEADER_LEN + body_len]);
@@ -498,6 +571,7 @@ pub fn decode_slot(
         agent,
         realm,
         externals,
+        host,
         records: &records,
         made: vec![None; records.len()],
         pins: Vec::new(),
@@ -517,7 +591,7 @@ pub fn decode(
     realm: &Handle<Realm>,
     bytes: &[u8],
 ) -> Result<Value, DecodeError> {
-    decode_slot(agent, realm, bytes, 0, &[])?
+    decode_slot(agent, realm, bytes, 0, &[], None)?
         .and_then(|items| items.first().copied())
         .ok_or(DecodeError::Truncated)
 }
@@ -665,6 +739,7 @@ fn visit(
     agent: &Agent,
     realm: &Handle<Realm>,
     externals: &[usize],
+    host: Option<&dyn HostCallbacks>,
     value: Value,
     objects: &mut Vec<(Value, Handle<Realm>)>,
     serials: &mut HashMap<Identity, u32>,
@@ -685,7 +760,7 @@ fn visit(
                     external_index(externals, *pointer)?;
                 }
                 for child in children(&object)? {
-                    visit(agent, realm, externals, child, objects, serials)?;
+                    visit(agent, realm, externals, host, child, objects, serials)?;
                 }
             }
         }
@@ -706,21 +781,32 @@ fn visit(
                 // A bound function's own state is three language values, so the
                 // walk reaches them the same way it reaches a property's: the
                 // object part below is joined by the target, the bound `this`
-                // and the bound arguments.
-                if let Callable::Bound {
-                    target,
-                    bound_this,
-                    bound_args,
-                } = callable(agent, &function)?
-                {
-                    visit(agent, realm, externals, target, objects, serials)?;
-                    visit(agent, realm, externals, bound_this, objects, serials)?;
-                    for argument in bound_args {
-                        visit(agent, realm, externals, *argument, objects, serials)?;
+                // and the bound arguments. A host callback's state is a pointer,
+                // so what the walk owes it is the same table check a host
+                // pointer's own record gets — a callback the build's table does
+                // not hold is named here rather than written as a bad index.
+                match callable(agent, &function, host)? {
+                    Callable::Bound {
+                        target,
+                        bound_this,
+                        bound_args,
+                    } => {
+                        visit(agent, realm, externals, host, target, objects, serials)?;
+                        visit(agent, realm, externals, host, bound_this, objects, serials)?;
+                        for argument in bound_args {
+                            visit(agent, realm, externals, host, *argument, objects, serials)?;
+                        }
                     }
+                    Callable::HostCallback { pointer, data } => {
+                        external_index(externals, pointer)?;
+                        if let Some(data) = data {
+                            visit(agent, realm, externals, host, data, objects, serials)?;
+                        }
+                    }
+                    Callable::Body { .. } => {}
                 }
                 for child in children(&function.object)? {
-                    visit(agent, realm, externals, child, objects, serials)?;
+                    visit(agent, realm, externals, host, child, objects, serials)?;
                 }
             }
         }
@@ -777,6 +863,9 @@ enum Callable<'a> {
         bound_this: Value,
         bound_args: &'a [Value],
     },
+    /// A host callback: the external-reference table pointer it was built from,
+    /// and the data it reads when it is called.
+    HostCallback { pointer: usize, data: Option<Value> },
 }
 
 /// Which grammar a function record's source is read in.
@@ -806,15 +895,43 @@ impl Grammar {
 }
 
 /// What a function is carried by, or why it cannot be carried.
+///
+/// `host` is the host's own callbacks, when the build supplied them: a built-in
+/// is a Rust closure, so the host is the only thing that can say which of its
+/// table entries a function came from, and a build with no host refuses them by
+/// name exactly as it did before the record existed.
 fn callable<'a>(
     agent: &'a Agent,
     function: &'a Handle<Function>,
+    host: Option<&dyn HostCallbacks>,
 ) -> Result<Callable<'a>, Unsupported> {
     match &function.kind {
-        FunctionKind::Builtin { .. } => Err(Unsupported::new(
-            "a built-in function",
-            "a host callback is a Rust closure, not a name or an address a snapshot can carry",
-        )),
+        FunctionKind::Builtin { construct, .. } => {
+            let callback = host.and_then(|host| host.callback_of(function));
+            let Some(callback) = callback else {
+                return Err(Unsupported::new(
+                    "a built-in function",
+                    "a host callback is a Rust closure, not a name or an address a snapshot can carry",
+                ));
+            };
+            // The call half can come back because the host can make another;
+            // the construct half cannot, because it is the *template* the host
+            // built the function with — the instance it creates, the instance
+            // template it applies, what a non-object return value means — and a
+            // blob carries no template. Writing the call half of something whose
+            // construct half would silently vanish is the "read back wrong" this
+            // format refuses everywhere else.
+            if construct.is_some() {
+                return Err(Unsupported::new(
+                    "a host constructor",
+                    "its [[Construct]] is the template the host built it with, which a blob does not carry",
+                ));
+            }
+            Ok(Callable::HostCallback {
+                pointer: callback.pointer,
+                data: callback.data.map(|data| *data.value()),
+            })
+        }
         FunctionKind::Bound {
             target,
             bound_this,
@@ -1073,6 +1190,7 @@ fn write_record(
     agent: &Agent,
     realm: &Handle<Realm>,
     externals: &[usize],
+    host: Option<&dyn HostCallbacks>,
     value: Value,
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
@@ -1105,13 +1223,16 @@ fn write_record(
             // The walk refuses a function it cannot carry before this, so
             // reaching here with one means the walk and the writer disagree
             // about a record rather than that a host's value is uncarried.
-            None => match callable(agent, &function)? {
+            None => match callable(agent, &function, host)? {
                 Callable::Body {
                     grammar,
                     source,
                     strict,
                 } => write_function(realm, &function, grammar, source, strict, serials, body)?,
                 Callable::Bound { .. } => write_bound_function(realm, &function, serials, body)?,
+                Callable::HostCallback { pointer, data } => {
+                    write_host_callback(realm, &function, pointer, data, externals, serials, body)?
+                }
             },
         },
         ValueKind::Object(object) => match realm.intrinsics.name_of_value(&value) {
@@ -1200,6 +1321,39 @@ fn write_function(
     body.push(grammar.byte());
     body.push(u8::from(strict));
     write_units(body, source.as_slice());
+    write_u32(body, prototype_serial(realm, &function.object, serials)?);
+    body.push(u8::from(function.object.extensible.get()));
+    write_properties(realm, &function.object, serials, body)?;
+    Ok(())
+}
+
+/// Write a host callback as the external-reference index it was built from and
+/// the data it reads, plus the object part its `length`, `name` and a host's own
+/// additions live on.
+///
+/// The index is the body: an address is a property of the process that loads a
+/// blob rather than of the data, so what a load needs to make the call again is
+/// which entry of *its* table the host put the same callback in. The data is a
+/// language value all the same, so it is carried as one. That is also why the
+/// record carries no `[[Construct]]` — see [`callable`].
+fn write_host_callback(
+    realm: &Handle<Realm>,
+    function: &Handle<Function>,
+    pointer: usize,
+    data: Option<Value>,
+    externals: &[usize],
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    body.push(REC_HOST_CALLBACK);
+    write_u32(body, external_index(externals, pointer)?);
+    write_u32(
+        body,
+        match data {
+            Some(value) => serial_in(realm, serials, value),
+            None => NO_REF,
+        },
+    );
     write_u32(body, prototype_serial(realm, &function.object, serials)?);
     body.push(u8::from(function.object.extensible.get()));
     write_properties(realm, &function.object, serials, body)?;
@@ -1408,6 +1562,20 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 properties,
             })
         }
+        REC_HOST_CALLBACK => {
+            let index = reader.u32().ok_or(DecodeError::Truncated)?;
+            let data = reader.u32().ok_or(DecodeError::Truncated)?;
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::HostCallback {
+                index,
+                data,
+                proto,
+                extensible,
+                properties,
+            })
+        }
         REC_BOUND_FUNCTION => {
             let target = reader.u32().ok_or(DecodeError::Truncated)?;
             let bound_this = reader.u32().ok_or(DecodeError::Truncated)?;
@@ -1494,6 +1662,10 @@ struct Builder<'a> {
     /// The host's external-reference table, which a host pointer record is
     /// resolved against.
     externals: &'a [usize],
+    /// The host's own callbacks, which is the only thing that can make one
+    /// again: the body is the host's Rust closure, so the record names a table
+    /// entry and the host answers the call it holds there.
+    host: Option<&'a dyn HostCallbacks>,
     records: &'a [Record],
     made: Vec<Option<Built>>,
     /// Every value the build has made, kept alive for the build: the walk
@@ -1668,11 +1840,78 @@ impl Builder<'_> {
                 define_properties(self, object, properties)?;
                 Built::Value(Value::Function(function))
             }
+            Record::HostCallback {
+                index: external,
+                data,
+                proto,
+                extensible,
+                properties,
+            } => {
+                let function = self.build_host_callback(*external, *data, *proto)?;
+                // As for a bind exotic: a host callback has no registered body,
+                // so nothing defers its `prototype` — the record's own
+                // properties are the whole object part.
+                self.remember(index, Built::Value(Value::Function(function)));
+                let object = function.object;
+                object.extensible.set(*extensible);
+                define_properties(self, object, properties)?;
+                Built::Value(Value::Function(function))
+            }
         };
         if self.made[index].is_none() {
             self.remember(index, built);
         }
         Ok(built)
+    }
+
+    /// A host callback record: the load's external-reference table names the
+    /// call, and the engine's own host-function path builds the function around
+    /// it.
+    ///
+    /// The callback is the host's — this engine cannot make a Rust closure from
+    /// an address — so what the record buys is direction: the index is resolved
+    /// against the table the *loading* host rebuilt, which is what puts the
+    /// address back where it belongs. `api::template::host_function` is the same
+    /// constructor a materialized `FunctionTemplate` makes its functions
+    /// through, so a restored callback's call view, return-value slot and
+    /// pending-exception translation are the engine's existing ones rather than a
+    /// second implementation of them.
+    fn build_host_callback(
+        &mut self,
+        index: u32,
+        data: u32,
+        proto: u32,
+    ) -> Result<Handle<Function>, DecodeError> {
+        let pointer =
+            *self
+                .externals
+                .get(index as usize)
+                .ok_or(DecodeError::ExternalIndexOutOfRange {
+                    index: index as usize,
+                    count: self.externals.len(),
+                })?;
+        let data = match data {
+            NO_REF => None,
+            serial => Some(self.materialize(serial)?),
+        };
+        let callback = self
+            .host
+            .and_then(|host| host.callback_at(pointer, data.map(crate::api::Local)))
+            .ok_or(DecodeError::NoHostCallback(index as usize))?;
+        let prototype = self.prototype(proto)?;
+        // SAFETY: `api::Isolate` is `repr(C)` with the agent at offset 0, so the
+        // address of the agent is the address of the isolate it belongs to. The
+        // callback view the host reads carries that pointer, and the host's
+        // callback scope is built from it — the same identity
+        // `api::Isolate::get_current` relies on.
+        let isolate = self.agent as *mut Agent as *mut crate::api::Isolate;
+        crate::api::host_function(isolate, std::rc::Rc::new(callback), None, prototype).map_err(
+            |error| {
+                DecodeError::UnrebuildableFunction(format!(
+                    "the host could not make a function for external reference {index}: {error}"
+                ))
+            },
+        )
     }
 
     /// A class-constructor record: the class source is evaluated as a class
@@ -2282,10 +2521,11 @@ mod tests {
                 items: &second,
             },
         ];
-        let blob = encode_slots(agent_of(&isolate), &slots, &[]).expect("a blob");
+        let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
 
         let read = |slot| {
-            decode_slot(agent_mut(&isolate), &realm, &blob, slot, &[]).expect("a blob of this tree")
+            decode_slot(agent_mut(&isolate), &realm, &blob, slot, &[], None)
+                .expect("a blob of this tree")
         };
         let zero = read(0).expect("slot 0");
         assert_eq!(zero.len(), 2);
@@ -2321,9 +2561,9 @@ mod tests {
             realm: *second.realm(),
             items: &items,
         }];
-        let blob = encode_slots(agent_of(&isolate), &slots, &[]).expect("a blob");
+        let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
 
-        let back = decode_slot(agent_mut(&isolate), second.realm(), &blob, 1, &[])
+        let back = decode_slot(agent_mut(&isolate), second.realm(), &blob, 1, &[], None)
             .expect("a blob of this tree")
             .expect("slot 1");
         assert_eq!(
@@ -2357,7 +2597,7 @@ mod tests {
             realm: *first.realm(),
             items: &items,
         }];
-        let error = encode_slots(agent_of(&isolate), &slots, &[]).expect_err("refused");
+        let error = encode_slots(agent_of(&isolate), &slots, &[], None).expect_err("refused");
         assert_eq!(error.type_name, "a value from another realm");
     }
 
@@ -2388,9 +2628,9 @@ mod tests {
             items: &items,
         }];
         let table = [0x9999usize, pointer as usize, other as usize];
-        let blob = encode_slots(agent_of(&isolate), &slots, &table).expect("a blob");
+        let blob = encode_slots(agent_of(&isolate), &slots, &table, None).expect("a blob");
 
-        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &table)
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &table, None)
             .expect("a blob of this tree")
             .expect("slot 0");
         let held = back[0].as_object().expect("an object");
@@ -2429,7 +2669,7 @@ mod tests {
             realm,
             items: &items,
         }];
-        let error = encode_slots(agent_of(&isolate), &slots, &[]).expect_err("refused");
+        let error = encode_slots(agent_of(&isolate), &slots, &[], None).expect_err("refused");
         assert_eq!(error.type_name, "a host pointer");
         assert!(error.detail.contains("external-reference table"));
         let _ = context;
@@ -2458,26 +2698,335 @@ mod tests {
         }];
         // The pointer sits at index 1 of a two-entry table, so an index that was
         // ignored would resolve to the wrong entry rather than to nothing.
-        let blob = encode_slots(agent_of(&isolate), &slots, &[first, pointer]).expect("a blob");
+        let blob =
+            encode_slots(agent_of(&isolate), &slots, &[first, pointer], None).expect("a blob");
 
         assert_eq!(
-            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[]),
+            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[], None),
             Err(DecodeError::ExternalIndexOutOfRange { index: 1, count: 0 })
         );
         assert_eq!(
-            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[first]),
+            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[first], None),
             Err(DecodeError::ExternalIndexOutOfRange { index: 1, count: 1 })
         );
         // And the host's table is what an index resolves against, entry by
         // entry, which is the contract: the blob carries the index, never the
         // address.
-        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[first, other])
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[first, other], None)
             .expect("a blob of this tree")
             .expect("slot 0");
         assert_eq!(
             api::External::from(back[0]).value() as usize,
             other,
             "the address is the table's entry at that index, not the blob's"
+        );
+        let _ = context;
+    }
+
+    /// A host's own callbacks, as the engine sees them: which table entry a
+    /// builtin came from, and the call an entry names. A host in a test is a Rust
+    /// closure rather than an `extern "C"` pointer, which is all the engine's
+    /// side of the contract asks for.
+    struct FakeHost {
+        pointers: HashMap<u64, usize>,
+        asked: std::cell::RefCell<Vec<usize>>,
+        /// What the restore handed each call: the data the blob carried.
+        handed: std::cell::RefCell<Vec<Option<crate::api::Local>>>,
+        answer: f64,
+        /// The data the fake host attaches to every callback it made, when it
+        /// attaches any: what a `FunctionBuilder::data` callback reads.
+        data: Option<crate::api::Local>,
+    }
+
+    impl FakeHost {
+        fn new(answer: f64) -> Self {
+            Self {
+                pointers: HashMap::new(),
+                asked: std::cell::RefCell::new(Vec::new()),
+                handed: std::cell::RefCell::new(Vec::new()),
+                answer,
+                data: None,
+            }
+        }
+
+        /// The host made this function, and its table holds `pointer`.
+        fn made(&mut self, function: &Handle<Function>, pointer: usize) {
+            self.pointers.insert(function.id(), pointer);
+        }
+    }
+
+    impl HostCallbacks for FakeHost {
+        fn callback_of(&self, function: &Handle<Function>) -> Option<HostCallback> {
+            let pointer = self.pointers.get(&function.id()).copied()?;
+            Some(HostCallback {
+                pointer,
+                data: self.data,
+            })
+        }
+
+        fn callback_at(
+            &self,
+            pointer: usize,
+            data: Option<crate::api::Local>,
+        ) -> Option<crate::api::FunctionCallback> {
+            self.asked.borrow_mut().push(pointer);
+            self.handed.borrow_mut().push(data);
+            let answer = self.answer;
+            Some(Box::new(
+                move |info: &crate::api::FunctionCallbackInfo<'_>| {
+                    info.get_return_value().set_number(answer);
+                },
+            ))
+        }
+    }
+
+    /// A host callback is carried as the table entry the host built it from, and
+    /// comes back callable — through the **load's** table, which is the whole
+    /// point: the address belongs to the process, not to the blob.
+    #[test]
+    fn a_host_callback_round_trips_through_the_table() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let function_prototype = context
+            .intrinsic("%Function.prototype%")
+            .and_then(|value| crate::context::as_object(&value))
+            .expect("the realm's function prototype");
+        let callback = Function::create_builtin(
+            Some(JsString::from_utf8("an_op")),
+            0,
+            Box::new(|_, _| Ok(Value::Number(1.0))),
+            None,
+            Some(function_prototype),
+        )
+        .expect("a builtin");
+        let pointer = 0x1111usize;
+        let other = 0x2222usize;
+        let mut host = FakeHost::new(42.0);
+        host.made(&callback, pointer);
+        // A bind over the same callback, so the walk reaches one through a bind's
+        // target as well as directly — the shape deno's first measurement was.
+        let bound = Function::bound_function_create(
+            Value::Function(callback),
+            Value::Undefined,
+            Vec::new(),
+            None,
+        )
+        .expect("a bind");
+        let items = [Value::Function(callback), Value::Function(bound)];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+        // The pointer sits at index 1, so an index that was written or read
+        // wrongly would resolve to the other entry rather than to nothing.
+        let table = [other, pointer];
+        let blob = encode_slots(agent_of(&isolate), &slots, &table, Some(&host)).expect("a blob");
+
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &table, Some(&host))
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        assert_eq!(
+            host.asked.borrow().as_slice(),
+            &[pointer],
+            "the restore asked the host for the entry's pointer"
+        );
+        assert_eq!(
+            call_restored(&isolate, &realm, back[0], "").as_number(),
+            Some(42.0),
+            "the restored function calls the host's callback"
+        );
+        // The object part is the function's: what the host built it with comes
+        // back as written, not recomputed.
+        let name = back[0]
+            .as_function()
+            .expect("a function")
+            .object
+            .get_own_property(&JsString::from_utf8("name"))
+            .expect("read")
+            .and_then(|property| property.value())
+            .and_then(|value| value.as_string())
+            .map(|text| text.to_string_lossy());
+        assert_eq!(name, Some("an_op".to_string()));
+        assert_eq!(
+            call_restored(&isolate, &realm, back[1], "").as_number(),
+            Some(42.0),
+            "a bind whose target is a host callback round trips too"
+        );
+        assert_eq!(
+            back[0]
+                .as_function()
+                .expect("a function")
+                .object
+                .get_prototype_of()
+                .expect("its prototype")
+                .map(|prototype| prototype.id()),
+            Some(function_prototype.id()),
+            "the record's prototype is the function's [[Prototype]]"
+        );
+        let _ = context;
+    }
+
+    /// The data a host built a callback with rides with it. It is a language
+    /// value, so the record carries it as one and the restore hands it back to
+    /// the host's call — which is what deno's ops all need, because every op
+    /// function is built with its own data.
+    #[test]
+    fn a_host_callbacks_data_rides_with_it() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let callback = Function::create_builtin(
+            Some(JsString::from_utf8("an_op")),
+            0,
+            Box::new(|_, _| Ok(Value::Undefined)),
+            None,
+            None,
+        )
+        .expect("a builtin");
+        let data = JsObject::ordinary_object_create(None);
+        data.create_data_property(&JsString::from_utf8("marker"), Value::Number(9.0))
+            .expect("define");
+        let pointer = 0x1111usize;
+        let mut host = FakeHost::new(0.0);
+        host.made(&callback, pointer);
+        host.data = Some(crate::api::Local(Value::Object(data)));
+        let items = [Value::Function(callback)];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+        let blob =
+            encode_slots(agent_of(&isolate), &slots, &[pointer], Some(&host)).expect("a blob");
+
+        let back = decode_slot(
+            agent_mut(&isolate),
+            &realm,
+            &blob,
+            0,
+            &[pointer],
+            Some(&host),
+        )
+        .expect("a blob of this tree")
+        .expect("slot 0");
+        back[0].as_function().expect("a function");
+        let handed = host.handed.borrow();
+        let handed = handed.last().expect("the host was asked for a call");
+        let handed = handed
+            .expect("the data came back")
+            .value()
+            .as_object()
+            .expect("the data is an object again");
+        assert_eq!(
+            handed
+                .get_own_property(&JsString::from_utf8("marker"))
+                .expect("read")
+                .and_then(|property| property.value())
+                .and_then(|value| value.as_number()),
+            Some(9.0),
+            "the data the host attached is the data the restore handed back"
+        );
+        let _ = context;
+    }
+
+    /// A callback the host recognizes but the build's table does not hold is
+    /// refused where the walk can name it, with the message a host pointer gets:
+    /// the fix is the same one — put it in the table.
+    #[test]
+    fn a_host_callback_not_in_the_table_is_refused_by_name() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let callback = Function::create_builtin(
+            Some(JsString::from_utf8("an_op")),
+            0,
+            Box::new(|_, _| Ok(Value::Undefined)),
+            None,
+            None,
+        )
+        .expect("a builtin");
+        let mut host = FakeHost::new(0.0);
+        host.made(&callback, 0x1111);
+        let items = [Value::Function(callback)];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+
+        let error =
+            encode_slots(agent_of(&isolate), &slots, &[], Some(&host)).expect_err("refused");
+        assert_eq!(error.type_name, "a host pointer");
+        assert!(error.detail.contains("external-reference table"));
+        let _ = context;
+    }
+
+    /// A host callback whose `[[Construct]]` the host built is refused rather
+    /// than restored without one: a template is what makes a host constructor,
+    /// and a blob carries no template.
+    #[test]
+    fn a_host_constructor_is_refused_rather_than_carried() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let callback = Function::create_builtin(
+            Some(JsString::from_utf8("a_host_ctor")),
+            1,
+            Box::new(|_, _| Ok(Value::Undefined)),
+            Some(Box::new(|_, _| Ok(Value::Undefined))),
+            None,
+        )
+        .expect("a builtin");
+        let mut host = FakeHost::new(0.0);
+        host.made(&callback, 0x1111);
+        let items = [Value::Function(callback)];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+
+        let error =
+            encode_slots(agent_of(&isolate), &slots, &[0x1111], Some(&host)).expect_err("refused");
+        assert_eq!(error.type_name, "a host constructor");
+        assert!(error.detail.contains("[[Construct]]"), "{}", error.detail);
+        let _ = context;
+    }
+
+    /// A blob that names a host callback, read by a load that supplied none, is
+    /// an error rather than a function that quietly cannot be called.
+    #[test]
+    fn a_host_callback_record_without_a_host_is_refused_at_restore() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let callback = Function::create_builtin(
+            Some(JsString::from_utf8("an_op")),
+            0,
+            Box::new(|_, _| Ok(Value::Undefined)),
+            None,
+            None,
+        )
+        .expect("a builtin");
+        let pointer = 0x1111usize;
+        let other = 0x2222usize;
+        let mut host = FakeHost::new(0.0);
+        host.made(&callback, pointer);
+        let items = [Value::Function(callback)];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+        let table = [other, pointer];
+        let blob = encode_slots(agent_of(&isolate), &slots, &table, Some(&host)).expect("a blob");
+
+        assert_eq!(
+            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &table, None),
+            Err(DecodeError::NoHostCallback(1)),
+            "the record's index, not the value's position"
         );
         let _ = context;
     }
@@ -2685,7 +3234,7 @@ mod tests {
         reader
             .try_eval("globalThis.offset = 100;")
             .expect("a global");
-        let items = decode_slot(agent_mut(&isolate), reader.realm(), &blob, 0, &[])
+        let items = decode_slot(agent_mut(&isolate), reader.realm(), &blob, 0, &[], None)
             .expect("a blob of this tree")
             .expect("slot 0");
         assert_eq!(
@@ -2760,8 +3309,8 @@ mod tests {
             realm,
             items: &items,
         }];
-        let blob = encode_slots(agent_of(&isolate), &slots, &[]).expect("a blob");
-        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[])
+        let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[], None)
             .expect("a blob of this tree")
             .expect("slot 0");
         assert_eq!(
@@ -3106,7 +3655,7 @@ mod tests {
                     .any(|window| window == name.as_bytes()),
                 "{name} is in the blob by name, not by structure"
             );
-            let back = decode_slot(agent_mut(&isolate), reader.realm(), &blob, 0, &[])
+            let back = decode_slot(agent_mut(&isolate), reader.realm(), &blob, 0, &[], None)
                 .expect("a blob of this tree")
                 .expect("slot 0");
             // The reading realm's own, by its intrinsic table rather than by an

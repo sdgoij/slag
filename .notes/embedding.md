@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, and **the realm's own global functions by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **a host callback as its table entry plus the data it reads**, and **the realm's own global functions by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2692,7 +2692,25 @@ Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **835 p
 
 *A class with methods is still not carried*, which is the eighth part: the walk reaches the prototype object's method properties and refuses them as methods, whose source is method-form and needs a parse context of its own plus its carried `[[HomeObject]]`. The measured deno class has none — its prototype object's own keys are exactly `["constructor"]` — which is why this step is one part rather than two.
 
-*And the next blocker is the one this bridge's own docs name.* Re-measured the same way, `create_blob` gets past the class and stops on a **host callback**: `a built-in function (a host callback is a Rust closure, not a name or an address a snapshot can carry)` — a `FunctionKind::Builtin` with **no internal name and no own `name` property**, which is a probe's answer rather than a guess, and the probe is removed. That is the `function` field of `v8::ExternalReference`, the field `crates/v8/snapshot.rs` has called "not wired to real ops yet" since the format landed and the one `deno/libs/core/runtime/bindings.rs:63` opens with `call_console`, `import_meta_resolve`, `catch_dynamic_import_promise_error` and `op_disabled_fn` before the callsite helpers and the per-op entries. `call_console` is installed as `Deno.core.callConsole` by `v8::Function::builder(call_console).build(scope)` (`bindings.rs:363-367`) — a builder-made function with no name at all, which is the shape the probe found — and which one it is, the next slice's first probe names. The mechanism is the one already in the tree: a host pointer is written **by index** into the host's table and resolved on load, so a callback is the same index with a different restore. §12 item 2's next step.
+*And the next blocker is the one this bridge's own docs name.* Re-measured the same way, `create_blob` gets past the class and stops on a **host callback**: `a built-in function (a host callback is a Rust closure, not a name or an address a snapshot can carry)` — a `FunctionKind::Builtin` with **no internal name and no own `name` property**, which is a probe's answer rather than a guess, and the probe is removed. That is the `function` field of `v8::ExternalReference`, the field `crates/v8/snapshot.rs` has called "not wired to real ops yet" since the format landed and the one `deno/libs/core/runtime/bindings.rs:63` opens with `call_console`, `import_meta_resolve`, `catch_dynamic_import_promise_error` and `op_disabled_fn` before the callsite helpers and the per-op entries. `call_console` is installed as `Deno.core.callConsole` by `v8::Function::builder(call_console).build(scope)` (`bindings.rs:363-367`) — a builder-made function with no name at all, which is the shape the probe found — and which one it is, the next record's first probe names. The mechanism is the one already in the tree: a host pointer is written **by index** into the host's table and resolved on load, so a callback is the same index with a different restore. §12 item 2's next step.
+
+**Host callbacks — landed, and deno's `create_blob` now carries `Deno.core.callConsole`.** The ninth part of ledger item 16, designed before it was written, and the value the paragraph above measured.
+
+*A builtin is a Rust closure, so the host has to answer.* `FunctionKind::Builtin` is a `Box<dyn Fn>` — not a name, not an address the engine could look up — so this is the first kind the engine cannot carry alone, and the record is a *pair*: the index of the host's external-reference table entry the function was built from, and the **data** value it reads. The index is the mechanism the format already uses for a host pointer; the data is a value, because deno builds every op with one (`.data(external.into())`, `bindings.rs:1008`), so a record that dropped it would restore a callback that runs a different branch of the host's code.
+
+*The engine side is one record and two host-facing parameters.* `REC_HOST_CALLBACK` (tag 16) carries the index, the data serial, and the same prototype/extensible/properties tail a function gets. `callable()` gains an `Option<&dyn HostCallbacks>`: a builtin the host recognizes becomes `Callable::HostCallback { pointer, data }`, whose data the walk visits like any other value, and a builtin it does not becomes exactly the "a built-in function … a Rust closure" refusal it always was. `encode_slots`/`decode_slot` and `api::Context::write_snapshot`/`read_snapshot` take the host as a parameter — **no `Agent` state and no `crux` change**, so the format's own tests and the engine's refusal test are untouched — and the restore builds the function through the engine's own `api::template::host_function` (now `pub(crate)`, one word), so a restored callback's call view, return-value slot and pending-exception translation are the engine's existing ones rather than a second implementation.
+
+*Two things are refused rather than carried, each for a reason the record cannot answer.* A builtin the host recognizes as **constructible** is refused as *a host constructor*: its `[[Construct]]` is the template the host built it with — the instance it makes, the instance template it applies, what a non-object return value means — and a blob carries no template. Deno sets that per op (`op_ctx_constructor_behavior`, `bindings.rs:800`), so the ops and `call_console` are the kind this carries, and a constructable op would be refused by name rather than restored without `new`. And a callback whose pointer the **build's** table does not hold refuses with the host-pointer message, because an index nothing would resolve is worse than a build that says which table entry to add.
+
+*The bridge had to learn what it built.* `crates/v8`'s isolate records, per materialized function, the callback address and the data its template carried (`BuiltCallback`): populated in `FunctionTemplate::from_parts` against the template's address, moved onto each function `get_function` makes. The address is stable because `map_fn_to()` monomorphizes the adapter per host function type — the same `call_console.map_fn_to()` is both the entry deno registers and the callback the function was built with — and the data is held pinned, because the walk reads it from the isolate's table rather than through the closure the function calls through.
+
+*Tests.* Six in `crates/runtime/src/snapshot.rs`, through a fake host the test owns (a `HostCallbacks` impl over builtins the test made and a pointer map): the round trip, taking the **index's** pointer back out of a two-entry table and coming back callable; a bind whose target is that callback, which is the shape deno's first measurement was; the data riding with it; a pointer absent from the table refused by name; a constructible callback refused as a host constructor; and a blob naming a callback read by a host-less load refused as `NoHostCallback`. Two in `crates/v8/snapshot.rs`: the acceptance test — a template's function with `ConstructorBehavior::Throw` and a `.data(...)` value attached as context data, restored, and called from a script, answering the data — and the test that used to end the build on a callback, re-aimed at the *table* refusal it now is.
+
+Seven mutations, each caught: index 0 instead of the entry's, the host not consulted, the record's prototype dropped at restore, the record's own properties dropped, and the data written as `NO_REF` / ignored at restore (both of which fail the engine's data test and the bridge test).
+
+Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **840 passed / 0 failed**; `cargo test -p v8 --features simdutf --lib -- --skip the_data_a_built_function_carries_survives_a_collection` **221 passed / 0 failed / 1 filtered**; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,214 passed / 0 failed / 4 ignored**. One workspace run before those showed a single failure; two re-runs were clean and the test is the documented flake `certified_body_global_read_fast_path_stays_spec_exact`, which passes on its own. `crates/runtime` changed, so the battery ran and every number is the certified one: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*And the measurement is that deno's build moved by one value and stopped on a fact about the host.* `create_blob` **carries `Deno.core.callConsole`** — the probe printed `carried index=0`, and `bindings.rs:63` is entry 0, so the callback the paragraph above stopped on is the one this record carries — and then refuses the next callback's pointer as absent from the host's **426-entry** table. That is a host-side gap rather than a missing record: deno builds those callbacks during the bootstrap's module evaluation (`Function::builder(closure).data(...)` in `deno/libs/core/modules/map/{evaluation,dynamic}.rs`) and `create_external_references` never lists them. Whether V8 requires them to be listed, or encodes an unknown callback as a null reference and lets the host replace it, is **not** in this checkout — that is the one question this measurement leaves open, and it is recorded rather than guessed. What is left on this record's own terms: the construct half, and the entry-retirement question §12 item 7 already records for the bridge's position table, which the new function→callback table shares.
 
 ## 8. Parked: the C++ face
 
@@ -3603,6 +3621,164 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   is the `function` field of the external-reference table, the mechanism the
   format already uses to write a host *pointer* by index. The method machinery of
   (5) is still open, and is still the eighth part.
+
+  **Ninth part — carrying a host callback, designed before it was written, and
+  landed before the eighth part because the seventh part's measurement named
+  it.** The
+  value the seventh part's measurement stops on: a built-in function with no
+  name and no own `name` property, i.e. one the *host* built and the engine holds
+  as a Rust closure (`FunctionKind::Builtin`). The engine cannot rebuild that on
+  its own — the body is a closure, not text — so this is the first part whose
+  answer needs the **host's** cooperation rather than one more record the engine
+  can write alone.
+
+  *What the crate we stand in for does, and why it is the same table.* V8 keeps
+  the callbacks of a host function as addresses and its serializer rewrites each
+  one into an `ExternalReference` index (`ExternalReferenceEncoder`), because the
+  address is a property of the process that loads the blob rather than of the
+  data — the exact statement `crates/v8/external_references.rs` already makes for
+  host pointers. `deno/libs/core/runtime/bindings.rs:63-75` is that table in deno:
+  `call_console`, `import_meta_resolve`, `catch_dynamic_import_promise_error`,
+  `op_disabled_fn`, the callsite helpers, and one entry per registered op. So a
+  callback is **not a new mechanism**: it is the index the format already writes
+  for a host pointer, plus the function's own object part.
+
+  *The design: one new record, two host-facing parameters, and no engine state.*
+
+  - **Format.** `REC_HOST_CALLBACK` (tag 16): the external-reference **index**, the
+    **data serial** (the value the host built the function with, `NO_REF` when it
+    built it with none), the
+    prototype serial, extensible, and the same property list every other record
+    with an object part carries. A separate tag rather than a fourth grammar byte,
+    because the carrier differs in *kind* (an address versus source text) and not
+    in grammar — the line the seventh part's grammar byte draws, drawn the other
+    way here. The index is found with the **existing** `external_index`, so a
+    callback the build's table does not hold refuses with the same message an
+    `External` value gets, and an index the load's table does not hold is
+    `ExternalIndexOutOfRange`. The data is not an afterthought: it is a value the
+    callback reads, so a record that dropped it would restore a function that
+    quietly does something else — and deno builds *every* op that way
+    (`bindings.rs:1008`, `.data(external.into())`).
+  - **The walk.** `callable()` gains the host. A builtin the host recognizes is
+    `Callable::HostCallback { pointer, data }`, and the walk visits the data like
+    any other value it carries, so the data's own graph is written once and
+    referred to by serial; a builtin it does not recognize refuses
+    exactly as today, which is why the engine's own refusal test keeps passing
+    unchanged.
+  - **The host.** `runtime::snapshot::HostCallbacks`, two methods with one
+    meaning — *the host's own callbacks*: `callback_of(&self, &Handle<Function>)
+    -> Option<HostCallback>` (the table entry and data a function was built
+    from, `None` for a builtin the host did not make) and `callback_at(&self,
+    usize, Option<api::Local>) -> Option<api::FunctionCallback>` (the call the
+    load's table holds at an index, with the data the blob carried, in the
+    engine's own callback shape). `encode_slots`/`decode_slot` and
+    `api::Context::write_snapshot`/`read_snapshot` take it as
+    `Option<&dyn HostCallbacks>`: **`None` is today's behaviour**, so the format's
+    own tests and the engine's refusal need no host and no change.
+  - **The restore** builds the function through the engine's own
+    `api::template::host_function` — the helper a materialized `FunctionTemplate`
+    already creates its functions through (**`pub(crate)` now, one word**) — so a
+    restored callback's call view, return-value slot and pending-exception
+    translation are the engine's existing ones rather than a second
+    implementation of them. The record's prototype is passed in, so the function
+    is born with it, and the record's own properties are then defined exactly as
+    they are for a function: `name`, `length` and anything a host set come back
+    as written, not recomputed.
+  - **The bridge** records what it built each host function from — the callback
+    address and the data, by the function's identity — where it materializes it
+    (`crates/v8/template.rs`), and answers the engine from there. The address is
+    stable because `map_fn_to()` monomorphizes the adapter per host function type,
+    which is why the same `call_console.map_fn_to()` is both the table entry deno
+    registers and the callback the function was built with.
+
+  *What it promises, and what it does not.*
+
+  1. A callback whose pointer is in the **build's** table, restored against the
+     pointer the **load's** table holds at that index — which is the whole point:
+     the address belongs to the process, not to the blob.
+  2. **A restored host callback has no `[[Construct]]`.** Its construct behaviour
+     is the host's *template* (V8 builds the instance, applies the instance
+     template, and decides what the callback's return value means), and a blob
+     carries none. So a builtin the host recognizes as **constructible** is
+     refused as *a host constructor*, naming that reason: writing the call half of
+     something whose construct half cannot come back is exactly the "read back
+     wrong" the format refuses everywhere else. `api::template::host_function`
+     builds the call half only, so this is also what makes the promise true rather
+     than merely stated. Deno sets the behaviour per op
+     (`op_ctx_constructor_behavior`, `bindings.rs:800`: `Allow` only for an op
+     declared constructable), so the ops and `call_console` are the non-constructible
+     kind — and a constructable op would be refused by name rather than restored
+     without `new`.
+  3. **The data is carried, and it is a value**: a restored callback reads what
+      the host attached when it built the function, or `undefined` when it
+      attached none. That is the one place this part is *stronger* than V8's
+      model, and it has to be: the data is not the template's, it is a language
+      value the callback reads, and a record that dropped it would restore a
+      function that runs a different branch of the host's code.
+  4. A **bound function over a host callback** is carried by this too, because a
+     bind's target goes through the same walk — an engine test now reaches one
+     and calls it. The engine's existing
+     `a_bound_function_over_a_host_callback_is_refused_by_name` still refuses,
+     because it supplies no host; the *bridge* test that used to end the build on
+     a callback became the table refusal, which is the failure a host with an
+     incomplete table actually gets.
+  5. **A hand-built engine builtin is still refused.** A host that never registers
+     a callback (the engine's own test builds one with `Function::create_builtin`)
+     gets today's message, because the refusal is the *host's* not answering, not
+     the engine's inability.
+
+  *Acceptance tests — all landed.* Engine, through a fake host the test owns: a
+  callback whose pointer is in the table round trips, takes the **index's**
+  pointer back (a two-entry table, where an ignored index and a used one differ —
+  the trap §7's external-reference record already paid for once), comes back
+  callable, and answers what the restored callback returns; a bind whose target is
+  that callback round trips and is callable too; the data the host built it with
+  rides with it, asserted on the value the restore handed the host; a pointer
+  absent from the table is refused by name; a constructible callback the host
+  recognizes is refused as *a host constructor*; a blob naming a callback read by
+  a load that supplied no host is `NoHostCallback`; and without a host the
+  engine's own refusal is unchanged. Bridge: a `FunctionTemplate`'s function with
+  `ConstructorBehavior::Throw` and a `.data(...)` value, attached as context data,
+  restored, and called from a script — `restored()` answering the data, which is
+  the shape deno builds every op with.
+
+  *Mutations, each caught.* Writing index 0 instead of the entry's (the two-entry
+  table answers the other pointer); not consulting the host (the old refusal
+  returns); dropping the record's prototype from the restore (a null
+  `[[Prototype]]`); dropping the record's own properties (a missing `name`); and
+  writing `NO_REF` for the data, and ignoring it at restore, each of which fails
+  both the engine's data test and the bridge test.
+
+  *Gates, all met* (§7's record): `cargo test -p runtime --lib` 840 passed / 0
+  failed, `cargo test -p v8 --features simdutf --lib -- --skip
+  the_data_a_built_function_carries_survives_a_collection` 221 / 0 / 1 filtered,
+  the workspace 5,214 / 0 / 4 ignored, `cargo fmt --all -- --check` and `cargo
+  clippy --locked --workspace --all-targets -- -D warnings` clean, and the battery
+  unchanged — test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang (158 skip),
+  `intl402` 3,205 / 0 (152 skip), the eight wasm core suites 64,594 checks / 0
+  fail / 0 pending, the JS-API sweep 1,001 / 0. One workspace run showed a single
+  failure before those; two re-runs were clean and the test is the documented
+  flake `certified_body_global_read_fast_path_stays_spec_exact`, which passes on
+  its own.
+
+  *And what it exposes, now measured: deno's build moves by exactly one value.*
+  `create_blob` **carries `Deno.core.callConsole`** — the probe printed `carried
+  index=0`, and `bindings.rs:63` is entry 0, so the callback the seventh part's
+  measurement stopped on is the one this record carries — and then stops on the
+  **next** callback: a pointer the host's 426-entry table does not hold, i.e. one
+  `create_external_references` never registers. Deno builds those during the
+  bootstrap's module evaluation — `Function::builder(closure).data(...)`
+  callbacks in `deno/libs/core/modules/map/{evaluation,dynamic}.rs` — so the next
+  step is **host-side rather than another record**: those callbacks have to be in
+  the table the host hands the creator. Whether V8 itself requires that, or
+  encodes an unknown callback as a null reference and lets the host replace it,
+  is not in this checkout; that is the one question this measurement leaves open,
+  and it is recorded rather than guessed.
+
+  *And what it still exposes.* The construct half of (2) — the template a host
+  restores alongside its table — and the entry-retirement question §12 item 7
+  already records for the bridge's position table, which the bridge's new
+  function→callback table shares.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3743,14 +3919,14 @@ a frame view of the running stack. §7's survey already split the subsystem: the
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots — **the format landed with
 its context table, the external-reference table, a function, a bound function, a
-class constructor and
-the realm's named global functions with it (§7's last seven records, ledger item
+class constructor, a host callback and
+the realm's named global functions with it (§7's last eight records, ledger item
 16). What is left of this item is named rather than implied:
 `FunctionCodeHandling::Keep`'s compiled code (which waits on the code cache), the
 isolate-level data slots, continuation from an existing blob, and the step deno's
-`create_blob` now stops on — a **host callback**, which is the `function` field of
-the external-reference table, the same index mechanism a host pointer already
-uses — behind which
+`create_blob` now stops on — a **host callback whose pointer the host's table does
+not hold**, which is a host-side gap rather than a missing record: those
+callbacks are built during deno's bootstrap and never registered — behind which
 is still the measured question of the graph reaching the **global object**, and
 behind that the method machinery ledger item 16's eighth part names.**;
 (4) module resolver as a
@@ -3813,18 +3989,20 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's seven parts have landed — the format, the context table, the
+bridge. That item's eight parts have landed — the format, the context table, the
 external-reference table, a function, a bound function, the realm's named global
-functions and a class constructor — so the blocker this
+functions, a class constructor and a host callback — so the blocker this
 plan could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
-for every load, and a function, a bind and a class all come back callable or
+for every load, and a function, a bind, a class and a host callback all come back
+callable or
 constructable. What is left
-before a snapshot comes back out is a **callback**: the walk's next refusal is a
-host callback with no name at all, which is what the external-reference table's
-`function` field is for — and behind it the measured question of the walk
+before a snapshot comes back out is a **host-side table entry**: the walk now
+carries `Deno.core.callConsole` and refuses the next callback because the table
+deno hands the creator does not list it — and behind that the measured question
+of the walk
 reaching the realm's global object, a realm the restore already rebuilt, so
 carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
 measurement
@@ -3849,18 +4027,24 @@ delete.
 1. **Weak persistent handles** — the last L2 item. Design sketched in
    `.notes/host-object-gc.md` §4.3; not started.
 2. **Snapshot format** — **v1 landed with its context table, external
-   references, a function, a bound function, a class constructor and the realm's
-   named global functions** (§7's last seven records, ledger item 16): a versioned
+   references, a function, a bound function, a class constructor, a host callback
+   and the realm's
+   named global functions** (§7's last eight records, ledger item 16): a versioned
    blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
    pointers as indices into the host's table, a JavaScript function as the source
    it is re-parsed from, a bind as its target and bound state, a class
-   constructor as the class text the engine's own class evaluation re-runs, a
+   constructor as the class text the engine's own class evaluation re-runs, a host
+   callback as the entry of the host's table its call came from **and the data
+   value it reads**, a
    refusal naming
-   anything uncarried. What this item still owns: carrying a **host callback**
-   (the next step — the external-reference table's `function` field, and the one
-   value on the way to a deno blob that is neither source nor a name), the
+   anything uncarried. What this item still owns: the **host side of a callback
+   whose pointer the table does not hold** (the next step, and a host gap rather
+   than a record — ledger item 16's ninth part records the open question about
+   what V8 does with one), a host callback's **construct half**, the method
+   machinery (the eighth part),
+   the
    measured question of the walk reaching the **global object**, a
    value shared between two contexts coming back one per context, compiled code
    for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an

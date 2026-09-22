@@ -19,8 +19,15 @@
 //! its definition-time code (a computed key, a `static {}` block, a static field
 //! initializer) runs again at restore, where V8's snapshot restores objects.
 //! What the source cannot say is the scope the function closed over: a restored
-//! function resolves a free name through the realm's global environment, and a
-//! host callback — a Rust closure in this bridge — has no source at all.
+//! function resolves a free name through the realm's global environment.
+//!
+//! A **host callback** — a Rust closure the host built through
+//! `FunctionTemplate`/`Function::builder`, which is every Deno op — has no source
+//! at all, so it is carried as the two things only the host has: the index of its
+//! external-reference table entry the call came from, and the data value it was
+//! built with (`.data(...)`, which its callback reads). A blob never holds the
+//! address; the table the *loading* host rebuilds names the call again, which is
+//! the same reason a host pointer is an index here.
 //!
 //! # Index conventions
 //!
@@ -35,8 +42,11 @@
 //! # What is not carried yet
 //!
 //! A value the engine's walk refuses — a proxy, a typed array, a module
-//! namespace, a host object, an array with a hole, a host callback — ends
-//! [`create_blob`](SnapshotCreator::create_blob) with a panic naming it. The crate's signature is `Option`, which its own callers unwrap,
+//! namespace, a host object, an array with a hole — ends
+//! [`create_blob`](SnapshotCreator::create_blob) with a panic naming it, and so
+//! does a host callback the host's external-reference table does not hold, or one
+//! the host built constructible. The crate's signature is `Option`, which its own
+//! callers unwrap,
 //! so the loudest available message is the honest one; a blob that quietly lost
 //! part of a host's state would move that failure to where the host cannot see
 //! it.
@@ -55,7 +65,7 @@ use runtime::snapshot as format;
 
 use crate::data::Data;
 use crate::handle::{Global, Local, Payload};
-use crate::isolate::{Isolate, OwnedIsolate};
+use crate::isolate::{BuiltCallback, Isolate, OwnedIsolate};
 
 /// Serialized engine state a host carries between runs (v8::StartupData).
 #[derive(Debug, Clone)]
@@ -251,6 +261,7 @@ impl SnapshotCreator {
     pub(crate) fn create_blob(
         &mut self,
         function_code_handling: FunctionCodeHandling,
+        callbacks: HashMap<u64, BuiltCallback>,
     ) -> StartupData {
         // Neither mode carries compiled code: a function is carried as the
         // source it is rebuilt from, so a blob is the same either way.
@@ -267,7 +278,8 @@ impl SnapshotCreator {
             let slot = position + 1;
             slots.push((slot, self.contexts[position], self.items_of(slot)));
         }
-        match api::Context::write_snapshot(&slots, &addresses(&self.externals)) {
+        let host = SnapshotCallbacks { callbacks };
+        match api::Context::write_snapshot(&slots, &addresses(&self.externals), Some(&host)) {
             Ok(bytes) => StartupData::new(bytes),
             Err(error) => {
                 panic!("v8::SnapshotCreator::create_blob: the engine cannot carry {error} yet")
@@ -288,6 +300,79 @@ impl SnapshotCreator {
 /// language value at all.
 fn engine_value(global: &Global<Data>) -> Option<api::Local> {
     global.payload_value().as_value_opt().copied()
+}
+
+/// This bridge as the engine's [`HostCallbacks`](format::HostCallbacks).
+///
+/// One struct for both halves, because they are one fact about the host: a
+/// function the host built keeps the callback pointer its template was built
+/// from, and the table the host rebuilds for a load names the call again. The
+/// write side reads the isolate's table of those; the read side needs nothing of
+/// its own, because the call view the engine hands a callback already carries
+/// the isolate it runs on.
+struct SnapshotCallbacks {
+    callbacks: HashMap<u64, BuiltCallback>,
+}
+
+impl SnapshotCallbacks {
+    /// The read half, which answers for any entry the load's table holds.
+    fn none() -> Self {
+        Self {
+            callbacks: HashMap::new(),
+        }
+    }
+}
+
+impl format::HostCallbacks for SnapshotCallbacks {
+    fn callback_of(
+        &self,
+        function: &crux::handle::Handle<crux::function::Function>,
+    ) -> Option<format::HostCallback> {
+        let recorded = self.callbacks.get(&function.id())?;
+        Some(format::HostCallback {
+            pointer: recorded.callback,
+            // The pinned value, as the engine's own handle: `Global` keeps it a
+            // root for as long as this table holds it, which is what makes the
+            // value the walk reads the one the function was built with.
+            data: recorded
+                .data
+                .as_ref()
+                .map(|pinned| *pinned.handle().engine()),
+        })
+    }
+
+    fn callback_at(
+        &self,
+        pointer: usize,
+        data: Option<api::Local>,
+    ) -> Option<api::FunctionCallback> {
+        // A table entry the host filled with anything but a callback — the
+        // `nullptr` entry V8's tables conventionally end with, for one — cannot
+        // be one of these, and the record can only name an entry the write side
+        // recorded a callback for.
+        if pointer == 0 {
+            return None;
+        }
+        // SAFETY: the entry is one the host put in its own table, whose
+        // `function` field is a `FunctionCallback` — the pointer the host's
+        // callback had when the function the record names was built, and the
+        // same address this bridge calls it through when it makes a function
+        // from a template.
+        let callback: crate::function::FunctionCallback = unsafe { std::mem::transmute(pointer) };
+        Some(Box::new(move |info: &api::FunctionCallbackInfo<'_>| {
+            // The data the blob carried, which is what the callback reads through
+            // `FunctionCallbackArguments::data` — `undefined` for one built
+            // without any, exactly as the template path hands it.
+            let data = match data {
+                Some(data) => Local::from_engine(data),
+                None => Local::from_engine(api::Local::undefined()),
+            };
+            let view = crate::function::FunctionCallbackInfo::new(info, data);
+            // SAFETY: the engine hands a callback a view it keeps alive for the
+            // call, and this closure only reads it here.
+            unsafe { callback(&view) };
+        }))
+    }
 }
 
 /// The addresses a table holds, in the form the engine's snapshot operations
@@ -359,7 +444,8 @@ impl SnapshotRestore {
     /// from source" branch with no way to learn why.
     fn restore(&mut self, isolate: &Isolate, context: api::Context, slot: usize) -> bool {
         let table = addresses(isolate.externals());
-        let items = match context.read_snapshot(self.blob.bytes(), slot, &table) {
+        let host = SnapshotCallbacks::none();
+        let items = match context.read_snapshot(self.blob.bytes(), slot, &table, Some(&host)) {
             Ok(Some(items)) => items,
             Ok(None) => return false,
             Err(error) => panic!(
@@ -419,6 +505,20 @@ mod tests {
     /// An isolate booted from `blob`.
     fn isolate_from(blob: StartupData) -> OwnedIsolate {
         Isolate::new(crate::CreateParams::default().snapshot_blob(blob))
+    }
+
+    /// The same, with the external-reference table a host rebuilds for every
+    /// load: the blob carries indices into it, so a restore without it answers
+    /// for none of them.
+    fn isolate_from_with(
+        blob: StartupData,
+        references: Vec<crate::ExternalReference>,
+    ) -> OwnedIsolate {
+        Isolate::new(
+            crate::CreateParams::default()
+                .snapshot_blob(blob)
+                .external_references(std::borrow::Cow::Owned(references)),
+        )
     }
 
     /// A fresh context on `isolate`, held persistently: what a host makes when
@@ -745,12 +845,68 @@ mod tests {
         );
     }
 
-    /// A host callback is a Rust closure rather than source text, so it still
-    /// ends the build, by name: this is the function kind the external-reference
-    /// table's `function` field is for, and it is not wired to real ops yet.
+    /// A host callback comes back a function, called through the entry the
+    /// load's external-reference table holds at the index the blob wrote, with
+    /// the data it was built with. This is the value deno's bootstrap installs
+    /// and the engine cannot rebuild: the address belongs to the process, so what
+    /// a blob can carry is which entry of the host's own table to put the call
+    /// back from — and the data, which is a value.
     #[test]
-    #[should_panic(expected = "cannot carry a built-in function")]
-    fn a_host_callback_ends_the_build_with_its_name() {
+    fn a_host_callback_round_trips_through_the_external_reference_table() {
+        use crate::MapFnTo;
+        fn an_op(
+            _scope: &mut crate::scope::PinScope<'_, '_>,
+            args: crate::function::FunctionCallbackArguments,
+            rv: crate::function::ReturnValue,
+        ) {
+            // What the host attached when it built the function. A blob that did
+            // not carry it would hand this `undefined` and the answer below would
+            // not be the data.
+            rv.set(args.data());
+        }
+        let references = vec![crate::ExternalReference {
+            function: an_op.map_fn_to(),
+        }];
+        let mut isolate =
+            Isolate::snapshot_creator(Some(std::borrow::Cow::Owned(references.clone())), None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            // The way deno builds an op: a callback with `new` refused and a value
+            // it reads at call time, which is the kind the record can put back in
+            // full.
+            let template = crate::FunctionTemplate::builder(an_op)
+                .constructor_behavior(crate::ConstructorBehavior::Throw)
+                .data(crate::Number::new(scope, 7.0).into())
+                .build(scope);
+            let function = template.get_function(scope).expect("function");
+            scope.add_context_data(context, function.cast::<Value>());
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from_with(blob, references);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let function = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the host callback");
+        crate::test_support::bind(scope, "restored", function);
+        assert_eq!(crate::test_support::eval_number(scope, "restored()"), 7.0);
+    }
+
+    /// A host callback whose pointer the build's table does not hold still ends
+    /// the build, by the table's own name: the record is an index, and an index
+    /// nothing would resolve is worse than a build that says which table entry to
+    /// add.
+    #[test]
+    #[should_panic(expected = "cannot carry a host pointer")]
+    fn a_host_callback_missing_from_the_creators_table_ends_the_build() {
         fn an_op(
             _scope: &mut crate::scope::PinScope<'_, '_>,
             _args: crate::function::FunctionCallbackArguments,
@@ -763,7 +919,9 @@ mod tests {
             let context = Context::new(scope, Default::default());
             let scope = &mut crate::ContextScope::new(scope, context);
             scope.set_default_context(context);
-            let template = crate::FunctionTemplate::new(scope, an_op);
+            let template = crate::FunctionTemplate::builder(an_op)
+                .constructor_behavior(crate::ConstructorBehavior::Throw)
+                .build(scope);
             let function = template.get_function(scope).expect("function");
             scope.add_context_data(context, function.cast::<Value>());
         }

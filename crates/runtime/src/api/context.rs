@@ -82,6 +82,7 @@ impl Context {
     pub fn write_snapshot(
         slots: &[(usize, Context, Vec<Local>)],
         externals: &[*mut std::ffi::c_void],
+        host: Option<&dyn crate::snapshot::HostCallbacks>,
     ) -> Result<Vec<u8>, crate::snapshot::Unsupported> {
         let Some((_, first, _)) = slots.first() else {
             return Err(crate::snapshot::Unsupported::empty_table());
@@ -108,7 +109,7 @@ impl Context {
                 })
                 .collect();
             let table: Vec<usize> = externals.iter().map(|pointer| *pointer as usize).collect();
-            crate::snapshot::encode_slots(agent, &engine_slots, &table)
+            crate::snapshot::encode_slots(agent, &engine_slots, &table, host)
         })
     }
 
@@ -124,10 +125,12 @@ impl Context {
         bytes: &[u8],
         slot: usize,
         externals: &[*mut std::ffi::c_void],
+        host: Option<&dyn crate::snapshot::HostCallbacks>,
     ) -> Result<Option<Vec<Global>>, crate::snapshot::DecodeError> {
         self.with_agent(|agent| {
             let table: Vec<usize> = externals.iter().map(|pointer| *pointer as usize).collect();
-            let items = crate::snapshot::decode_slot(agent, &self.realm, bytes, slot, &table)?;
+            let items =
+                crate::snapshot::decode_slot(agent, &self.realm, bytes, slot, &table, host)?;
             Ok(items.map(|items| {
                 items
                     .into_iter()

@@ -52,6 +52,11 @@ pub use try_catch::{Exception, TryCatch};
 #[cfg(feature = "wasm")]
 pub use wasm::{CompiledWasmModule, WasmModuleObject, WasmStreaming};
 
+// The one place a host callback becomes a callable, so a function a template
+// materializes and one a snapshot restores are the same shape — re-exported for
+// the snapshot format, which restores the second kind.
+pub(crate) use template::host_function;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 

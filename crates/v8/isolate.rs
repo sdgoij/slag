@@ -90,6 +90,21 @@ impl CreateParams {
     }
 }
 
+/// What the bridge built a host function from, and what it has to answer for
+/// when a snapshot carries one.
+///
+/// Both halves are the host's: the callback is an address in this process, so a
+/// blob names the entry of the host's table it came from instead, and the data
+/// is a *value* the callback reads, so a blob carries it as a value. The data is
+/// held pinned because the snapshot walk reads it from here rather than through
+/// the closure the function calls through.
+pub(crate) struct BuiltCallback {
+    /// The template's `FunctionCallback`, as the address its table entry holds.
+    pub(crate) callback: usize,
+    /// The value the template attached (`v8::FunctionBuilder::data`).
+    pub(crate) data: Option<Global<Value>>,
+}
+
 /// What an [`Isolate`] handle points at.
 ///
 /// The engine isolate is the first field, which is what lets an engine pointer
@@ -155,6 +170,21 @@ pub struct IsolateInner {
     /// `v8::Message` a host later makes from one of them; see
     /// [`position`](crate::position) for why only a failed compile records one.
     positions: RefCell<HashMap<u64, Position>>,
+    /// The host callback each materialized function was built from, by the
+    /// function's identity — the one thing a snapshot cannot rebuild and the
+    /// host therefore has to answer for: the record names a table entry, and the
+    /// load's table names the call again. Populated from
+    /// [`callback_templates`](Self::callback_templates) when a function is
+    /// materialized, and it holds the template's data value as a `Global`,
+    /// because the engine's walk reads it and the collector has to keep it until
+    /// the blob is written.
+    callbacks: RefCell<HashMap<u64, BuiltCallback>>,
+    /// The same, by the address a template's handle names, for the moment
+    /// between a template being built and the function it materializes: a
+    /// template has no engine object of its own, so the callback it was built
+    /// from is recorded against its address and moved onto each function
+    /// `get_function` makes.
+    callback_templates: RefCell<HashMap<usize, BuiltCallback>>,
     /// The object templates the host created on this isolate, held the same way
     /// and for the same reason as the function templates above.
     object_templates: RefCell<Vec<Rc<api::ObjectTemplate>>>,
@@ -519,6 +549,8 @@ impl Isolate {
             templates: RefCell::new(Vec::new()),
             extras_bindings: RefCell::new(std::collections::HashMap::new()),
             positions: RefCell::new(HashMap::new()),
+            callbacks: RefCell::new(HashMap::new()),
+            callback_templates: RefCell::new(HashMap::new()),
             object_templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
             restore: RefCell::new(restore),
@@ -830,6 +862,45 @@ impl Isolate {
     /// for as long as the isolate lives.
     pub(crate) fn add_template(&self, template: Rc<api::FunctionTemplate>) {
         self.inner().templates.borrow_mut().push(template);
+    }
+
+    /// Record what a template was built from, by the address its handle names —
+    /// the value [`materialized`](Self::materialized) moves when the template
+    /// finally makes a function.
+    pub(crate) fn template_callback(
+        &self,
+        address: usize,
+        callback: usize,
+        data: Option<Global<Value>>,
+    ) {
+        self.inner()
+            .callback_templates
+            .borrow_mut()
+            .insert(address, BuiltCallback { callback, data });
+    }
+
+    /// Move a template's callback and data onto the function it just
+    /// materialized, which is the identity the engine's snapshot walk asks with.
+    pub(crate) fn materialized(&self, address: usize, function: u64) {
+        let recorded = self
+            .inner()
+            .callback_templates
+            .borrow_mut()
+            .remove(&address);
+        if let Some(recorded) = recorded {
+            self.inner()
+                .callbacks
+                .borrow_mut()
+                .insert(function, recorded);
+        }
+    }
+
+    /// Every callback the host built a function from, by that function's
+    /// identity, taken: what `create_blob` writes as indices into the host's
+    /// table. Taken rather than cloned because the values are pins, and because
+    /// the isolate that calls this is the one being consumed.
+    pub(crate) fn take_callbacks(&self) -> HashMap<u64, BuiltCallback> {
+        std::mem::take(&mut self.inner().callbacks.borrow_mut())
     }
 
     /// Write the host's pointer into one of a context's slots
@@ -1327,12 +1398,16 @@ impl OwnedIsolate {
     /// the host cannot see it.
     pub fn create_blob(self, function_code_handling: FunctionCodeHandling) -> Option<StartupData> {
         let mut handle = self.handle;
+        // The callbacks the host built functions from, read before the creator is
+        // taken: the blob records each one as an index into the external-reference
+        // table, so the load can put the call back.
+        let callbacks = handle.take_callbacks();
         let mut creator = handle
             .inner_mut()
             .snapshot_creator
             .take()
             .expect("v8::OwnedIsolate::create_blob: this isolate was not created by Isolate::snapshot_creator");
-        Some(creator.create_blob(function_code_handling))
+        Some(creator.create_blob(function_code_handling, callbacks))
     }
 }
 
