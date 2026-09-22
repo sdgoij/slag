@@ -4,6 +4,7 @@ use std::ffi::c_void;
 
 use runtime::api;
 
+use crate::MapFnTo;
 use crate::String as JsString;
 use crate::data::{Context, Function, Object, ObjectTemplate};
 use crate::function::{ConstructorBehavior, FunctionCallbackArguments, ReturnValue};
@@ -187,6 +188,21 @@ fn console_method(
     _args: FunctionCallbackArguments,
     _rv: ReturnValue,
 ) {
+}
+
+/// The callback every console method this bridge installs is built from, as the
+/// address a snapshot's external-reference table names.
+///
+/// A snapshot cannot carry a callback's address — it is a property of the process
+/// that loads the blob — so it carries an index into the table the host rebuilds
+/// for every load, and this callback is the *bridge's* own: the console is
+/// installed on every context this bridge makes, so the host that hands over a
+/// blob never had a chance to register it. The bridge therefore puts it in the
+/// table itself; see [`engine_table`](crate::snapshot::engine_table). One
+/// callback for every method, because the methods are one function and differ
+/// only in the property name they are defined under.
+pub(crate) fn console_callback() -> crate::function::FunctionCallback {
+    console_method.map_fn_to()
 }
 
 impl<'s> LocalHandle<'s, Context> {

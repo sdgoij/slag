@@ -279,7 +279,7 @@ impl SnapshotCreator {
             slots.push((slot, self.contexts[position], self.items_of(slot)));
         }
         let host = SnapshotCallbacks { callbacks };
-        match api::Context::write_snapshot(&slots, &addresses(&self.externals), Some(&host)) {
+        match api::Context::write_snapshot(&slots, &engine_table(&self.externals), Some(&host)) {
             Ok(bytes) => StartupData::new(bytes),
             Err(error) => {
                 panic!("v8::SnapshotCreator::create_blob: the engine cannot carry {error} yet")
@@ -384,8 +384,31 @@ impl format::HostCallbacks for SnapshotCallbacks {
 fn addresses(references: &[crate::ExternalReference]) -> Vec<*mut std::ffi::c_void> {
     references
         .iter()
-        .map(|entry| unsafe { entry.pointer })
+        .map(|reference| unsafe { reference.pointer })
         .collect()
+}
+
+/// The table the engine writes and reads a snapshot's indices against: **this
+/// bridge's own callbacks first, then the host's**.
+///
+/// A host's table is the host's to rebuild for every load, and the two builds are
+/// legitimately different lengths: deno externalizes its lazy sources only while
+/// snapshotting, so the table it hands the creator is not the table it hands the
+/// loader. That is why the bridge's entries come first rather than last — a
+/// position that depends on a host's table length would name one entry when the
+/// blob was written and another when it is read.
+///
+/// What goes in is what the *bridge* installs and the host cannot know about: the
+/// console methods, which are one callback under many names
+/// ([`console_callback`](crate::context::console_callback)), built for every
+/// context this bridge makes — including the ones a snapshot is taken of, whose
+/// global object the walk reaches.
+fn engine_table(references: &[crate::ExternalReference]) -> Vec<*mut std::ffi::c_void> {
+    let console = crate::context::console_callback() as *mut std::ffi::c_void;
+    let mut table = Vec::with_capacity(references.len() + 1);
+    table.push(console);
+    table.extend_from_slice(&addresses(references));
+    table
 }
 
 /// A context's identity: its global object, which is the identity this bridge
@@ -443,7 +466,7 @@ impl SnapshotRestore {
     /// situation — where answering `None` would send the host down its "boot
     /// from source" branch with no way to learn why.
     fn restore(&mut self, isolate: &Isolate, context: api::Context, slot: usize) -> bool {
-        let table = addresses(isolate.externals());
+        let table = engine_table(isolate.externals());
         let host = SnapshotCallbacks::none();
         let items = match context.read_snapshot(self.blob.bytes(), slot, &table, Some(&host)) {
             Ok(Some(items)) => items,
@@ -842,6 +865,82 @@ mod tests {
         assert_eq!(
             crate::test_support::eval_number(scope, "restored(Infinity) ? 1 : 0"),
             0.0
+        );
+    }
+
+    /// An arrow comes back callable too: its source is the expression it was
+    /// written as, which the restore evaluates in the reading realm — so a host's
+    /// attached callback written as an arrow survives a snapshot, which is how a
+    /// module's own helpers are usually written.
+    #[test]
+    fn an_arrow_round_trips_and_is_callable_from_a_script() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let arrow = crate::test_support::eval(scope, "((a) => a + 1)");
+            scope.add_context_data(context, arrow);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let arrow = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the arrow");
+        crate::test_support::bind(scope, "restored", arrow);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restored(41)"),
+            42.0
+        );
+    }
+
+    /// The console this bridge installs is the one host function no host had a
+    /// chance to register — the bridge makes it for every context, including the
+    /// ones a snapshot is taken of — so the bridge puts its callback in the table
+    /// itself. A blob of a realm's console therefore comes back a console, and one
+    /// of its methods is still the silent one rather than a missing reference.
+    #[test]
+    fn the_bridges_console_round_trips_through_the_blob() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let log = crate::test_support::eval(scope, "console.log");
+            scope.add_context_data(context, log);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let log = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the console method");
+        crate::test_support::bind(scope, "restored", log);
+        // The record's own properties came back with it, so it is the *same*
+        // method rather than a fresh anonymous function.
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restored.name === 'log' ? 1 : 0"),
+            1.0
+        );
+        // And it is still silent: what V8's console method does with no delegate.
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restored('a message') === undefined ? 1 : 0"),
+            1.0
         );
     }
 

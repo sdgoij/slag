@@ -26,8 +26,9 @@
 //! not an index, a host pointer the host's external-reference table does not
 //! have, a host callback (a built-in that is not an intrinsic) when the host
 //! supplies none of its own, and a function
-//! the engine kept no source text for — an arrow, a method, an accessor or a
-//! class constructor whose class text was not available where it was defined.
+//! the engine kept no source text for — a method or an accessor, whose source is
+//! method-form and needs a parse context of its own, or a function created where
+//! there is no source text at all (a `Function`-built body, for one).
 //! Each entry is a subsystem to carry, and the walk refuses rather than writing
 //! something a restore would read back wrong.
 //!
@@ -42,7 +43,8 @@
 //! exotic is written as the three values it is made of — its target, its bound
 //! `this` and its bound arguments — so a chain of binds round trips and an
 //! intrinsic target is still written by name; a host callback — a Rust closure
-//! in this engine — has no source at all and refuses by name.
+//! in this engine — has no source at all, so it is carried through the host
+//! instead (see below).
 //!
 //! A class constructor's source is the **class** it came from: that is the
 //! spec's own `[[SourceText]]`, which ClassDefinitionEvaluation sets for an
@@ -53,6 +55,15 @@
 //! private environment. It is also the one record whose restore **runs
 //! definition-time code again**: a computed key, a `static {}` block and a static
 //! field initializer execute, where V8's snapshot only restores objects.
+//!
+//! An **arrow** is carried the same way and for the same reason: its
+//! `[[SourceText]]` is the expression it was written as (`(a) => a + 1`), which
+//! is not a form `parse_function` can read, so the restore evaluates it in the
+//! reading realm instead. What that costs is the scope the arrow closed over: a
+//! restored arrow's `this` and its free names are the reading realm's global, the
+//! same limit the function record states for free names and a harder one here,
+//! because an arrow exists to capture `this`. Its kind survives — an async
+//! arrow's `[[Prototype]]` comes from the evaluation and from the record alike.
 //!
 //! A host callback is the one kind the engine cannot rebuild alone: its body is
 //! the host's Rust closure, so the record carries what only the host has — the
@@ -131,11 +142,13 @@ const REC_HOST_CALLBACK: u8 = 16;
 
 /// Which grammar a function record's source is read in. A class constructor's
 /// `[[SourceText]]` is the **class** it came from (spec 15.7.14 sets it that way
-/// for an implicit constructor and an explicit one alike), so the record says
+/// for an implicit constructor and an explicit one alike), and an arrow's is the
+/// **expression** it was written as (spec 15.3.3), so the record says
 /// which grammar its source is in rather than leaving the reader to guess from
 /// the text.
 const GRAMMAR_FUNCTION: u8 = 0;
 const GRAMMAR_CLASS: u8 = 1;
+const GRAMMAR_ARROW: u8 = 2;
 
 const FLAG_ENUMERABLE: u8 = 1;
 const FLAG_CONFIGURABLE: u8 = 2;
@@ -875,6 +888,9 @@ enum Grammar {
     Function,
     /// A class expression: a class constructor's `[[SourceText]]`.
     Class,
+    /// An arrow function's source, which is an expression rather than a form with
+    /// a `function` keyword — so it is evaluated, not parsed.
+    Arrow,
 }
 
 impl Grammar {
@@ -882,6 +898,7 @@ impl Grammar {
         match self {
             Grammar::Function => GRAMMAR_FUNCTION,
             Grammar::Class => GRAMMAR_CLASS,
+            Grammar::Arrow => GRAMMAR_ARROW,
         }
     }
 
@@ -889,7 +906,17 @@ impl Grammar {
         match byte {
             GRAMMAR_FUNCTION => Some(Grammar::Function),
             GRAMMAR_CLASS => Some(Grammar::Class),
+            GRAMMAR_ARROW => Some(Grammar::Arrow),
             _ => None,
+        }
+    }
+
+    /// How a message names this grammar's source text: `its class source …`.
+    fn source_kind(self) -> &'static str {
+        match self {
+            Grammar::Function => "function",
+            Grammar::Class => "class",
+            Grammar::Arrow => "arrow",
         }
     }
 }
@@ -977,6 +1004,12 @@ fn callable<'a>(
                     "a method",
                     "a method's source has no `function` keyword, so it cannot be re-parsed on its own",
                 ));
+            } else if data.this_mode == crate::function::ThisMode::Lexical {
+                // An arrow: its source is an expression, not a form a function
+                // parser can read, so it is carried the way a class is — evaluated
+                // where it is being restored. `[[ThisMode]]` is what says so: it
+                // is lexical for an arrow and for nothing else in this engine.
+                Grammar::Arrow
             } else {
                 Grammar::Function
             };
@@ -1795,7 +1828,9 @@ impl Builder<'_> {
             } => {
                 let function = match grammar {
                     Grammar::Function => self.build_function(source, *strict, *proto)?,
-                    Grammar::Class => self.build_class_function(source, *proto)?,
+                    Grammar::Class | Grammar::Arrow => {
+                        self.build_evaluated_function(source, *proto, *grammar)?
+                    }
                 };
                 // Recorded before the properties are defined, so an own
                 // property that refers back to the function — `prototype`'s
@@ -1914,48 +1949,63 @@ impl Builder<'_> {
         )
     }
 
-    /// A class-constructor record: the class source is evaluated as a class
-    /// expression in the realm being restored, and the constructor it produces is
-    /// the value.
+    /// An evaluated-function record: the source is evaluated as an expression in
+    /// the realm being restored, and the function it produces is the value.
     ///
-    /// Everything a class constructor is made of comes from that evaluation —
-    /// its `[[ConstructorKind]]`, its home object, its prototype object, its
-    /// fields, its private names and their environment, `[[IsClassConstructor]]`
-    /// — because it is the engine's own ClassDefinitionEvaluation, the same code
-    /// that built the original. That is also this record's cost, stated in the
-    /// module docs: definition-time code (a computed key, a `static {}` block, a
-    /// static field initializer) runs again here, which V8's snapshot does not do.
-    fn build_class_function(
+    /// A class constructor's `[[SourceText]]` is the class and an arrow's is the
+    /// arrow — both complete expressions, and neither parseable by
+    /// `parse_function`, which expects a `function` keyword. So both are rebuilt
+    /// the way they were created: by evaluating them, which is what brings back
+    /// what the engine's own creation path gives a closure — for a class its
+    /// `[[ConstructorKind]]`, home object, prototype object, fields and private
+    /// environment, for an arrow its lexical `[[ThisMode]]` and its deferred
+    /// absence of a `prototype` — rather than an approximation assembled from a
+    /// record.
+    ///
+    /// The divergences are the module docs': a class's definition-time code (a
+    /// computed key, a `static {}` block, a static field initializer) runs again
+    /// here, and the evaluation is the **reading** realm's, so an arrow's captured
+    /// `this` and any free name are that realm's global rather than the scope the
+    /// original closed over.
+    fn build_evaluated_function(
         &mut self,
         source: &[u16],
         proto: u32,
+        grammar: Grammar,
     ) -> Result<Handle<Function>, DecodeError> {
         let proto = self.prototype(proto)?.ok_or_else(|| {
             DecodeError::UnrebuildableFunction("the record names no prototype".into())
         })?;
+        let kind = grammar.source_kind();
         let text = String::from_utf16(source).map_err(|_| {
-            DecodeError::UnrebuildableFunction("its class source is not valid UTF-16".into())
+            DecodeError::UnrebuildableFunction(format!("its {kind} source is not valid UTF-16"))
         })?;
         let realm = *self.realm;
-        // A bootstrap execution context makes the realm current, so the class is
-        // evaluated where the restore is materializing it, and it is an
-        // expression, so the class name is bound inside the class rather than in
-        // the reading realm's global scope. Popped on every path.
+        // A bootstrap execution context makes the realm current, so the source is
+        // evaluated where the restore is materializing it, and it is wrapped in
+        // parentheses so it reads as an expression: for a class that keeps the
+        // class name bound inside the class rather than in the reading realm's
+        // global scope, and for an arrow it is the parenthesis an arrow needs
+        // wherever it appears. Popped on every path.
         self.agent.push_bootstrap_context(realm);
         let value = self.agent.run_script(&format!("({text})"));
         self.agent.execution_context_stack.pop();
         let value = value.map_err(|error| {
             DecodeError::UnrebuildableFunction(format!(
-                "its class source could not be evaluated: {error}"
+                "its {kind} source could not be evaluated: {error}"
             ))
         })?;
         let function = value.as_function().ok_or_else(|| {
-            DecodeError::UnrebuildableFunction(
-                "its class source did not evaluate to a class".into(),
-            )
+            DecodeError::UnrebuildableFunction(format!(
+                "its source did not evaluate to {}",
+                match grammar {
+                    Grammar::Class => "a class",
+                    _ => "a function",
+                }
+            ))
         })?;
-        // The evaluation sets the class's own prototype link from its heritage;
-        // the record's is what the blob was written with, so it wins.
+        // The evaluation sets the function's own prototype link from what it
+        // derived; the record's is what the blob was written with, so it wins.
         function
             .object
             .set_prototype_of(Some(proto))
@@ -3416,6 +3466,96 @@ mod tests {
         );
     }
 
+    /// An arrow is carried as its own source text — an expression, so the restore
+    /// evaluates it — and comes back callable, still without the `prototype` an
+    /// arrow never has.
+    #[test]
+    fn an_arrow_round_trips_and_is_callable() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("((a) => a + 1)")
+            .expect("an arrow")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        back.as_function().expect("an arrow");
+        assert_eq!(
+            call_restored(&isolate, &realm, back, "41").as_number(),
+            Some(42.0),
+            "the restored arrow is callable"
+        );
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "Object.prototype.hasOwnProperty.call(restored, 'prototype') ? 1 : 0",
+            )
+            .as_number(),
+            Some(0.0),
+            "an arrow has no `prototype`, and the restore did not give it one"
+        );
+    }
+
+    /// A fresh arrow answers its own source text. The spec sets `[[SourceText]]`
+    /// for an arrow the same way it does for a class constructor — the text
+    /// matched by the ArrowFunction production — and `Function.prototype.toString`
+    /// answers it, where the engine answered the native form before the capture.
+    #[test]
+    fn an_arrow_answers_its_source() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let text = context
+            .try_eval("((a) => a + 1).toString()")
+            .expect("a string")
+            .into_value();
+        assert_eq!(
+            text.as_string().map(|text| text.to_string_lossy()),
+            Some("(a) => a + 1".to_string()),
+            "the arrow answered its source, not the native form"
+        );
+    }
+
+    /// An async arrow keeps its kind: the evaluation derives the same
+    /// `[[Prototype]]` the record carries (%AsyncFunction.prototype%), and a call
+    /// still answers a promise.
+    #[test]
+    fn an_async_arrow_round_trips_and_keeps_its_kind() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("(async (a) => a)")
+            .expect("an async arrow")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "Object.getPrototypeOf(restored) === Object.getPrototypeOf(async () => {}) ? 1 : 0",
+            )
+            .as_number(),
+            Some(1.0),
+            "the restored arrow kept the async function prototype"
+        );
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "restored(1) instanceof Promise ? 1 : 0"
+            )
+            .as_number(),
+            Some(1.0),
+            "and calling it still answers a promise"
+        );
+    }
+
     /// The class's private environment and its field initializer come back with
     /// it, because the restore re-runs the engine's own class evaluation: a
     /// public field that reads the class's own **private** field is the smallest
@@ -3476,14 +3616,21 @@ mod tests {
     }
 
     /// Each function the format cannot carry is refused by the kind it is: the
-    /// fix differs, so the message does.
+    /// fix differs, so the message does. An **arrow** is carried by this format
+    /// now, so the source-less case here is one the engine has no text for at
+    /// all — a closure whose body was parsed from a `Function` constructor's own
+    /// string, which is not a script whose source the context has.
     #[test]
     fn an_uncarried_function_is_refused_by_kind() {
         let mut isolate = api::Isolate::new();
         let context = api::Context::new(&mut isolate).expect("a realm");
         let realm = *context.realm();
         for (source, expected, detail) in [
-            ("(() => 1)", "a function", "no source text"),
+            (
+                "(new Function('return () => 1'))()",
+                "a function",
+                "no source text",
+            ),
             (
                 "({ m() { return 1; } }).m",
                 "a method",

@@ -499,6 +499,12 @@ pub enum Step {
         outer_chain: Vec<Vec<crux::AtomId>>,
         /// Cut 28: see [`Step::CreateFunction`].
         per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+        /// The text the arrow was parsed from, which is its `[[SourceText]]` —
+        /// what `Function.prototype.toString` answers and what a snapshot
+        /// rebuilds the closure from. The AST node is decomposed into the fields
+        /// above, so the span that names it is carried here (`CreateFunction`
+        /// keeps its whole node and reads the span off that instead).
+        span: crux::Span,
     },
     /// `new.target` (spec 13.3.5.3): the active constructor, or *undefined*
     /// at the script level.
@@ -6226,6 +6232,7 @@ impl Vm {
                     strict,
                     outer_chain,
                     per_iteration_chain,
+                    span,
                 } => {
                     let env = agent.running_context()?.lexical_environment;
                     let value = crate::function::instantiate_arrow(
@@ -6237,6 +6244,7 @@ impl Vm {
                         *strict,
                         outer_chain.clone(),
                         per_iteration_chain.clone(),
+                        *span,
                     )?;
                     self.stack.push(value);
                 }
@@ -18624,6 +18632,7 @@ impl Compiler {
                     strict: self.strict || self.class_depth > 0,
                     outer_chain,
                     per_iteration_chain,
+                    span: expr.span,
                 });
                 Ok(())
             }

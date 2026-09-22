@@ -901,11 +901,12 @@ mod tests {
         assert!(
             matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "function (a, b) {\n  return a + b;\n}")
         );
-        // Arrow functions have no tracked source (native form).
+        // Arrow functions render their source too: the ArrowFunction
+        // production's text is `[[SourceText]]` (spec 15.3.3), the same slot a
+        // function expression's is, so the native form was a gap rather than a
+        // limit — this test used to pin that gap.
         let text = value("var g = (x) => x; g.toString()");
-        assert!(
-            matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "function g() { [native code] }")
-        );
+        assert!(matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "(x) => x"));
         // %Function.prototype% has an empty name.
         let text = value("Function.prototype.toString()");
         assert!(

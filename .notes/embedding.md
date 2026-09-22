@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **a host callback as its table entry plus the data it reads**, and **the realm's own global functions by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, and **the realm's own global functions by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2712,6 +2712,20 @@ Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **840 p
 
 *And the measurement is that deno's build moved by one value and stopped on a fact about the host.* `create_blob` **carries `Deno.core.callConsole`** — the probe printed `carried index=0`, and `bindings.rs:63` is entry 0, so the callback the paragraph above stopped on is the one this record carries — and then refuses the next callback's pointer as absent from the host's **426-entry** table. That is a host-side gap rather than a missing record: deno builds those callbacks during the bootstrap's module evaluation (`Function::builder(closure).data(...)` in `deno/libs/core/modules/map/{evaluation,dynamic}.rs`) and `create_external_references` never lists them. Whether V8 requires them to be listed, or encodes an unknown callback as a null reference and lets the host replace it, is **not** in this checkout — that is the one question this measurement leaves open, and it is recorded rather than guessed. What is left on this record's own terms: the construct half, and the entry-retirement question §12 item 7 already records for the bridge's position table, which the new function→callback table shares.
 
+**Arrows and the bridge's own console — landed, and deno's build stops on a function the *engine* left without a source.** The tenth part of ledger item 16 and one bridge-side fix, and between them they moved deno's build past two more values.
+
+*An arrow had no `[[SourceText]]`, and the spec says it has one.* `instantiate_arrow` built its record with `source: None`, so an arrow's `Function.prototype.toString` answered the native form and a snapshot had nothing to carry it by. The capture is the fix: the arrow's span travels to the instantiation — through `Step::CreateArrow`, which carries the span because the AST node is decomposed into params and body there, and through the interpreter's and the JIT's helpers — and `capture_source` stores the text. The engine's own `function_to_string_renders_source_or_native` **pinned the gap** (it asserted `function g() { [native code] }` for an arrow) and now asserts `(x) => x`; a test that has to change to keep passing is the clearest evidence a change is a conformance fix rather than a preference.
+
+*The record carries it as an expression.* `GRAMMAR_ARROW` (byte 2), and the restore evaluates `(<source>)` in the reading realm rather than parsing it, because `parse_function` wants a `function` keyword and an arrow has none — the class record's path, so `build_class_function` became `build_evaluated_function(source, proto, grammar)` and serves both. `[[ThisMode]]` is the discriminator: lexical for an arrow and for nothing else in this engine. An async arrow keeps its kind (the evaluation derives `%AsyncFunction.prototype%`, and the record carries it too), and a restored arrow still has no `prototype` — the one own property an arrow must not gain. The limit is the arrow's whole point: a restored arrow's `this` and free names are the reading realm's global, which the module docs state.
+
+*And the console was the bridge's own gap.* With host callbacks carriable, `create_blob` stopped on `console.log` — not a deno callback at all but **the bridge's** console, which `Context::new` installs on every context and no host had any chance to register. The bridge now provides the table entry itself, on both sides, and **first**: a host's table is legitimately a different length at write and at load (deno externalizes its lazy sources only while snapshotting), so an index that depended on that length would resolve against a different entry on each side. No format change and no engine change — `snapshot::engine_table` is a few lines and a comment.
+
+*Tests.* Three engine (a round trip that is callable and still has no `prototype`; a fresh arrow's source; an async arrow's kind) and one bridge (an arrow attached as context data, called after the restore), the re-aimed refusal case, and two mutations. The console has its own bridge test: attached as data, restored, still named `log` and still silent.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **840 → 843 passed / 0 failed**; `cargo test -p v8 --features simdutf --lib -- --skip the_data_a_built_function_carries_survives_a_collection` **221 → 223 passed / 0 failed / 1 filtered**; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,214 → 5,219 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the battery ran and every number is the certified one — including the corpus, which is what would catch an arrow's new `[[SourceText]]` being wrong somewhere: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*And the next value is a function the **engine** left without a source, for a reason that is a bug rather than a gap.* Re-measured, `create_blob` stops on `async_op_0` — an ordinary function `00_infra.js` defines, created by `setUpAsyncStub` when the **host** calls it from Rust. A probe in `capture_source` printed what the stack looked like at that moment: **two frames, none of them carrying a source**. The host call pushes the callee's execution context with `source: None` (the certified call path, whose own comment claims the slot "is never consulted here" — true for the body, false for a closure created *inside* it), and because the call came from Rust there is no script frame beneath it to fall back on. So `[[SourceText]]` is missing for **every** closure created inside a function a host calls, and the same absent slot is what `source_hash_at` warns about when it degrades a body-cache key to raw addresses. The fix is one slot per call frame — the **callee's** own source, which is by definition the text its spans refer to — and it is the next slice.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3779,6 +3793,61 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   restores alongside its table — and the entry-retirement question §12 item 7
   already records for the bridge's position table, which the bridge's new
   function→callback table shares.
+
+  **Tenth part — carrying an arrow, designed before it was written, and landed.**
+  The kind deno's build stopped on next: a function with no `[[SourceText]]`.
+  The engine kept none for arrows — `instantiate_arrow` built its record with
+  `source: None` — though the spec sets `[[SourceText]]` for the ArrowFunction
+  production exactly as it does for a class, and `Function.prototype.toString`
+  must answer it. So this part is two halves, and the first is a conformance fix
+  the engine owed whether or not a snapshot ever carried an arrow.
+
+  - **Capture.** `instantiate_arrow` takes the arrow's span and stores
+    `capture_source(agent, span)` in the record, so an arrow's `toString` answers
+    its own text (`(x) => x`, not `function g() { [native code] }`); the span
+    travels to it through `Step::CreateArrow` (the AST node is decomposed into
+    params and body there, so the step carries the span) and through the
+    interpreter's and the JIT's helpers. An existing engine test **pinned the
+    gap** — `function_to_string_renders_source_or_native` asserted the native
+    form for an arrow — and now asserts the source, which is the clearest
+    evidence the change is a fix rather than a preference.
+  - **Format.** `GRAMMAR_ARROW` (byte 2). An arrow's source is an *expression*, so
+    `parse_function` cannot read it, and the restore **evaluates** it — the class
+    record's path, which is why `build_class_function` became
+    `build_evaluated_function(source, proto, grammar)` and serves both. The walk
+    tells them apart by `[[ThisMode]]`: lexical for an arrow and for nothing else
+    in this engine.
+
+  *What it promises, and what it does not.* An arrow's kind survives — an async
+  arrow's `[[Prototype]]` comes from the evaluation and from the record alike, and
+  a restored arrow still has no `prototype`. What no restore can give back is the
+  scope the arrow closed over: its `[[ThisMode]]` is lexical, so a restored
+  arrow's `this` and its free names are the **reading** realm's global. That is
+  the function record's free-name limit, and it is harder here because capturing
+  `this` is what an arrow is for; the module docs state it.
+
+  *Tests.* Three in `crates/runtime/src/snapshot.rs` — a round trip that is
+  callable and still has no `prototype`, a fresh arrow answering its source (the
+  conformance half, which fails before the capture), and an async arrow keeping
+  its kind (`%AsyncFunction.prototype%`, and a call still answering a promise) —
+  plus one in `crates/v8/snapshot.rs`. The refusal test's arrow case is re-aimed
+  at a closure with no text at all (`(new Function('return () => 1'))()`), because
+  an arrow is positive coverage now. Two mutations, each caught: an arrow written
+  with the function grammar fails both round trips as a parse error, and
+  `source: None` in `instantiate_arrow` fails all three arrow tests, the
+  conformance one answering `function () { [native code] }`.
+
+  **And a bridge-side fix that needed no part of its own: the bridge's console.**
+  With host callbacks carriable, deno's `create_blob` stopped on `console.log` —
+  **the bridge's** console, installed on every context `Context::new` makes,
+  which no host ever had a chance to register, so its callback was in no
+  external-reference table. The bridge now puts it in the table itself
+  (`snapshot::engine_table`), on the write and the read side, and **first** rather
+  than last: a host's table is legitimately a different length at write and at
+  load (deno externalizes its lazy sources only while snapshotting), so a
+  position that depended on that length would name one entry when the blob was
+  written and another when it is read. One entry covers every console method,
+  because they are one callback under many names.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3919,14 +3988,14 @@ a frame view of the running stack. §7's survey already split the subsystem: the
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots — **the format landed with
 its context table, the external-reference table, a function, a bound function, a
-class constructor, a host callback and
-the realm's named global functions with it (§7's last eight records, ledger item
+class constructor, a host callback, an arrow and
+the realm's named global functions with it (§7's last nine records, ledger item
 16). What is left of this item is named rather than implied:
 `FunctionCodeHandling::Keep`'s compiled code (which waits on the code cache), the
 isolate-level data slots, continuation from an existing blob, and the step deno's
-`create_blob` now stops on — a **host callback whose pointer the host's table does
-not hold**, which is a host-side gap rather than a missing record: those
-callbacks are built during deno's bootstrap and never registered — behind which
+`create_blob` now stops on — an **ordinary function with no `[[SourceText]]`**,
+because a call the host makes from Rust pushes a frame with no source and a
+closure created inside it has nothing to capture from — behind which
 is still the measured question of the graph reaching the **global object**, and
 behind that the method machinery ledger item 16's eighth part names.**;
 (4) module resolver as a
@@ -3989,20 +4058,22 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's eight parts have landed — the format, the context table, the
+bridge. That item's nine parts have landed — the format, the context table, the
 external-reference table, a function, a bound function, the realm's named global
-functions, a class constructor and a host callback — so the blocker this
+functions, a class constructor, a host callback and an arrow — so the blocker this
 plan could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
-for every load, and a function, a bind, a class and a host callback all come back
+for every load, and a function, a bind, a class, an arrow and a host callback all
+come back
 callable or
 constructable. What is left
-before a snapshot comes back out is a **host-side table entry**: the walk now
-carries `Deno.core.callConsole` and refuses the next callback because the table
-deno hands the creator does not list it — and behind that the measured question
-of the walk
+before a snapshot comes back out is an **execution context's `source` on a call
+the host makes**: the walk now carries the realm's console and its arrows and
+stops on `async_op_0`, a function deno's own JS created inside a function the
+host called from Rust — no frame beneath it carries a source, so the closure has
+no `[[SourceText]]` — and behind that the measured question of the walk
 reaching the realm's global object, a realm the restore already rebuilt, so
 carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
 measurement
@@ -4027,22 +4098,24 @@ delete.
 1. **Weak persistent handles** — the last L2 item. Design sketched in
    `.notes/host-object-gc.md` §4.3; not started.
 2. **Snapshot format** — **v1 landed with its context table, external
-   references, a function, a bound function, a class constructor, a host callback
+   references, a function, a bound function, a class constructor, a host callback,
+   an arrow
    and the realm's
-   named global functions** (§7's last eight records, ledger item 16): a versioned
+   named global functions** (§7's last nine records, ledger item 16): a versioned
    blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
    pointers as indices into the host's table, a JavaScript function as the source
    it is re-parsed from, a bind as its target and bound state, a class
-   constructor as the class text the engine's own class evaluation re-runs, a host
+   constructor and an arrow as the expressions the engine's own evaluation
+   re-runs, a host
    callback as the entry of the host's table its call came from **and the data
    value it reads**, a
    refusal naming
-   anything uncarried. What this item still owns: the **host side of a callback
-   whose pointer the table does not hold** (the next step, and a host gap rather
-   than a record — ledger item 16's ninth part records the open question about
-   what V8 does with one), a host callback's **construct half**, the method
+   anything uncarried. What this item still owns: an **execution context's
+   `source` on a call the host makes** (the next step — a conformance bug the
+   snapshot exposed, §7's last record, not a missing record), a host callback's
+   **construct half**, the method
    machinery (the eighth part),
    the
    measured question of the walk reaching the **global object**, a

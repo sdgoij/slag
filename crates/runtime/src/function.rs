@@ -1559,6 +1559,7 @@ pub fn instantiate_arrow(
     enclosing_strict: bool,
     outer_chain: Vec<Vec<crux::AtomId>>,
     per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    span: crux::Span,
 ) -> Result<Value, JsError> {
     // Cut 43: the site's shared Block — every closure from the same arrow
     // node shares it (and, via `shared_compiled_body` below, one compiled
@@ -1571,6 +1572,13 @@ pub fn instantiate_arrow(
     let strict = body_is_strict(agent, &block, None) || enclosing_strict;
     let class_field_initializer = agent.field_initializer_depth > 0;
     let params = shared_params(&block, params);
+    // `[[SourceText]]` is the text matched by the ArrowFunction production, which
+    // is a complete expression — so it is what `Function.prototype.toString`
+    // answers (the same slot a function or class carries) and what lets a
+    // snapshot rebuild this closure from its own text rather than its compiled
+    // body. Captured at creation, like a function expression's: `None` when the
+    // creation site has no source text, which keeps the native form.
+    let source = capture_source(agent, span);
     let mut data = EcmaFunction {
         name: None,
         params,
@@ -1591,7 +1599,7 @@ pub fn instantiate_arrow(
         is_async,
         is_generator: false,
         class_field_initializer,
-        source: None,
+        source,
         declaring_module: None,
         ir: None,
         leaf_inline: false,
