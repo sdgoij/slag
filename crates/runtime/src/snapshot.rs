@@ -24,22 +24,23 @@
 //! the value it refused: a proxy, a typed array, a module namespace, a host
 //! object, an array with a hole, an indexed accessor, an array whose `length` is
 //! not an index, a host pointer the host's external-reference table does not
-//! have, a host callback (a built-in that is not an intrinsic), a bound
-//! function, and a function the engine kept no source text for — an arrow, a
-//! method or an accessor. Each entry is a subsystem to carry, and the walk
-//! refuses rather than writing something a restore would read back wrong.
+//! have, a host callback (a built-in that is not an intrinsic), and a function
+//! the engine kept no source text for — an arrow, a method or an accessor. Each
+//! entry is a subsystem to carry, and the walk refuses rather than writing
+//! something a restore would read back wrong.
 //!
-//! # A function
+//! # Functions
 //!
 //! A JavaScript function is written as the source text it can be re-parsed
 //! from, its [[Strict]], and its object part, and the restore evaluates that
 //! source in the realm's global environment. That is enough for a function
 //! whose body is self-contained and not for one that closed over a scope: a
 //! blob holds the value graph, not the environment chain a closure was
-//! compiled in, so a restored function resolves a free name globally. The
-//! format says so here rather than promising a closure it cannot rebuild; a
-//! host callback — a Rust closure in this engine — has no source at all and
-//! refuses by name.
+//! compiled in, so a restored function resolves a free name globally. A bind
+//! exotic is written as the three values it is made of — its target, its bound
+//! `this` and its bound arguments — so a chain of binds round trips and an
+//! intrinsic target is still written by name; a host callback — a Rust closure
+//! in this engine — has no source at all and refuses by name.
 //!
 //! Version 1. The format is ours to version, and its compatibility surface is
 //! the *names* it writes: an intrinsic name and a well-known symbol name have to
@@ -77,7 +78,6 @@ use crux::symbol::{self, Symbol};
 use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
-use crate::function::EcmaFunction;
 use crate::realm::Realm;
 
 /// The blob's first eight bytes, and its last eight: a blob that lost its head
@@ -107,6 +107,7 @@ const REC_OBJECT: u8 = 11;
 const REC_ARRAY: u8 = 12;
 const REC_EXTERNAL: u8 = 13;
 const REC_FUNCTION: u8 = 14;
+const REC_BOUND_FUNCTION: u8 = 15;
 
 const FLAG_ENUMERABLE: u8 = 1;
 const FLAG_CONFIGURABLE: u8 = 2;
@@ -175,8 +176,9 @@ pub enum DecodeError {
     Truncated,
     /// A record tag this version does not write.
     BadTag(u8),
-    /// A function record's source could not be rebuilt into a function in the
-    /// realm being restored.
+    /// A function record could not be rebuilt into a function in the realm being
+    /// restored: a body whose source will not parse or instantiate, or a bind
+    /// exotic whose target is not callable.
     UnrebuildableFunction(String),
     /// A blob names an intrinsic the reading realm does not have.
     UnknownIntrinsic(String),
@@ -277,6 +279,17 @@ enum Record {
     Function {
         source: Vec<u16>,
         strict: bool,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
+    /// A bind exotic: the target, the bound `this`, and the bound arguments,
+    /// plus its object part — which is where its `length` and `name` live, so
+    /// they are carried rather than computed back from the target.
+    BoundFunction {
+        target: u32,
+        bound_this: u32,
+        bound_args: Vec<u32>,
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
@@ -661,7 +674,22 @@ fn visit(
                         "the value was built in another context of this isolate, so the realm it is being written into cannot name its builtins",
                     ));
                 }
-                function_record(agent, &function)?;
+                // A bound function's own state is three language values, so the
+                // walk reaches them the same way it reaches a property's: the
+                // object part below is joined by the target, the bound `this`
+                // and the bound arguments.
+                if let Callable::Bound {
+                    target,
+                    bound_this,
+                    bound_args,
+                } = callable(agent, &function)?
+                {
+                    visit(agent, realm, externals, target, objects, serials)?;
+                    visit(agent, realm, externals, bound_this, objects, serials)?;
+                    for argument in bound_args {
+                        visit(agent, realm, externals, *argument, objects, serials)?;
+                    }
+                }
                 for child in children(&function.object)? {
                     visit(agent, realm, externals, child, objects, serials)?;
                 }
@@ -696,29 +724,47 @@ fn canonical(value: Value) -> Value {
     value
 }
 
-/// The record a function is written from, or the reason this format cannot
-/// carry it.
+/// The values a function is carried by, or the reason this format cannot carry
+/// it.
 ///
 /// A built-in that is not an intrinsic is a host callback, and in this engine a
 /// host callback is a Rust closure rather than an address or a name a blob could
-/// hold; a bound function is the target and arguments it closed over; an arrow,
-/// a method or an accessor has no standalone source text (`Function.prototype.
-/// toString` already answers the native form for them). Each is refused by the
-/// kind it is, because the fix differs: a callback wants the external-reference
-/// table's `function` field, an arrow wants the scope it closed over.
-fn function_record<'a>(
+/// hold. An arrow, a method or an accessor has no standalone source text
+/// (`Function.prototype.toString` already answers the native form for it). Both
+/// are refused by the kind they are, because the fix differs: a callback wants
+/// the external-reference table's `function` field, an arrow wants the scope it
+/// closed over.
+enum Callable<'a> {
+    /// A JavaScript function with a body: the source it is rebuilt from and its
+    /// [[Strict]].
+    Body { source: &'a JsString, strict: bool },
+    /// A bind exotic: the target, the bound `this`, and the bound arguments.
+    Bound {
+        target: Value,
+        bound_this: Value,
+        bound_args: &'a [Value],
+    },
+}
+
+/// What a function is carried by, or why it cannot be carried.
+fn callable<'a>(
     agent: &'a Agent,
-    function: &Handle<Function>,
-) -> Result<&'a EcmaFunction, Unsupported> {
+    function: &'a Handle<Function>,
+) -> Result<Callable<'a>, Unsupported> {
     match &function.kind {
         FunctionKind::Builtin { .. } => Err(Unsupported::new(
             "a built-in function",
             "a host callback is a Rust closure, not a name or an address a snapshot can carry",
         )),
-        FunctionKind::Bound { .. } => Err(Unsupported::new(
-            "a bound function",
-            "its target and bound arguments are not carried yet",
-        )),
+        FunctionKind::Bound {
+            target,
+            bound_this,
+            bound_args,
+        } => Ok(Callable::Bound {
+            target: *target,
+            bound_this: *bound_this,
+            bound_args,
+        }),
         FunctionKind::EcmaScript => {
             let data = agent
                 .ecma_functions
@@ -733,13 +779,16 @@ fn function_record<'a>(
                     "a method's source has no `function` keyword, so it cannot be re-parsed on its own",
                 ));
             }
-            if data.source.is_none() {
+            let Some(source) = data.source.as_ref() else {
                 return Err(Unsupported::new(
                     "a function",
                     "the engine kept no source text for it",
                 ));
-            }
-            Ok(data)
+            };
+            Ok(Callable::Body {
+                source,
+                strict: data.strict,
+            })
         }
     }
 }
@@ -977,7 +1026,12 @@ fn write_record(
             // The walk refuses a function it cannot carry before this, so
             // reaching here with one means the walk and the writer disagree
             // about a record rather than that a host's value is uncarried.
-            None => write_function(agent, realm, &function, serials, body)?,
+            None => match callable(agent, &function)? {
+                Callable::Body { source, strict } => {
+                    write_function(realm, &function, source, strict, serials, body)?
+                }
+                Callable::Bound { .. } => write_bound_function(realm, &function, serials, body)?,
+            },
         },
         ValueKind::Object(object) => match realm.intrinsics.name_of_value(&value) {
             Some(name) => {
@@ -1050,27 +1104,57 @@ fn write_object(
 /// for, and it is also the record's limit: what the source cannot say is the
 /// [[Environment]] the function closed over, so a restored function resolves a
 /// free name through the realm's global environment rather than through the
-/// scope it was compiled in. A function whose body is not self-contained — an
-/// arrow, or anything deno's bootstrap closed over — is refused upstream.
+/// scope it was compiled in. A function whose body is not self-contained is
+/// refused upstream.
 fn write_function(
-    agent: &Agent,
+    realm: &Handle<Realm>,
+    function: &Handle<Function>,
+    source: &JsString,
+    strict: bool,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    body.push(REC_FUNCTION);
+    body.push(u8::from(strict));
+    write_units(body, source.as_slice());
+    write_u32(body, prototype_serial(realm, &function.object, serials)?);
+    body.push(u8::from(function.object.extensible.get()));
+    write_properties(realm, &function.object, serials, body)?;
+    Ok(())
+}
+
+/// Write a bind exotic as the three values it is made of, plus the object part
+/// its `length` and `name` live on.
+///
+/// The target is an ordinary value reference, so a chain of binds round trips
+/// for as long as its innermost target is a function this format can carry, and
+/// an intrinsic target is written by name like any other reference.
+fn write_bound_function(
     realm: &Handle<Realm>,
     function: &Handle<Function>,
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
 ) -> Result<(), Unsupported> {
-    let data = function_record(agent, function)?;
-    // `function_record` refuses a function without source, so the read cannot
-    // miss; a record without one would be a blob this writer would not read.
-    let Some(source) = data.source.as_ref() else {
+    // The walk refuses a bound function whose state it cannot carry before this,
+    // so the match cannot miss; a miss would be a walk/writer disagreement.
+    let FunctionKind::Bound {
+        target,
+        bound_this,
+        bound_args,
+    } = &function.kind
+    else {
         return Err(Unsupported::new(
             "a function",
-            "the engine kept no source text for it",
+            "its kind is not the one this record is for",
         ));
     };
-    body.push(REC_FUNCTION);
-    body.push(u8::from(data.strict));
-    write_units(body, source.as_slice());
+    body.push(REC_BOUND_FUNCTION);
+    write_u32(body, serial_in(realm, serials, *target));
+    write_u32(body, serial_in(realm, serials, *bound_this));
+    write_u32(body, bound_args.len() as u32);
+    for argument in bound_args {
+        write_u32(body, serial_in(realm, serials, *argument));
+    }
     write_u32(body, prototype_serial(realm, &function.object, serials)?);
     body.push(u8::from(function.object.extensible.get()));
     write_properties(realm, &function.object, serials, body)?;
@@ -1233,6 +1317,26 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             Ok(Record::Function {
                 source,
                 strict,
+                proto,
+                extensible,
+                properties,
+            })
+        }
+        REC_BOUND_FUNCTION => {
+            let target = reader.u32().ok_or(DecodeError::Truncated)?;
+            let bound_this = reader.u32().ok_or(DecodeError::Truncated)?;
+            let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
+            let mut bound_args = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                bound_args.push(reader.u32().ok_or(DecodeError::Truncated)?);
+            }
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::BoundFunction {
+                target,
+                bound_this,
+                bound_args,
                 proto,
                 extensible,
                 properties,
@@ -1455,6 +1559,25 @@ impl Builder<'_> {
                 }
                 Built::Value(Value::Function(function))
             }
+            Record::BoundFunction {
+                target,
+                bound_this,
+                bound_args,
+                proto,
+                extensible,
+                properties,
+            } => {
+                let function =
+                    self.build_bound_function(*target, *bound_this, bound_args, *proto)?;
+                // A bind exotic has no registered body, so nothing defers its
+                // `prototype`: the record's own properties are the whole object
+                // part, and there is no lazy materialization to disarm.
+                self.remember(index, Built::Value(Value::Function(function)));
+                let object = function.object;
+                object.extensible.set(*extensible);
+                define_properties(self, object, properties)?;
+                Built::Value(Value::Function(function))
+            }
         };
         if self.made[index].is_none() {
             self.remember(index, built);
@@ -1514,6 +1637,32 @@ impl Builder<'_> {
         })?;
         value.as_function().ok_or_else(|| {
             DecodeError::UnrebuildableFunction("its source did not evaluate to a function".into())
+        })
+    }
+
+    /// A bind exotic record: its target, its bound `this` and its bound
+    /// arguments, rebuilt through the crux constructor the `bind` builtin
+    /// itself uses.
+    ///
+    /// Nothing is recomputed from the target, because nothing has to be: the
+    /// bound function's `length` and `name` are own properties, and the record
+    /// carries them like any other object part's.
+    fn build_bound_function(
+        &mut self,
+        target: u32,
+        bound_this: u32,
+        bound_args: &[u32],
+        proto: u32,
+    ) -> Result<Handle<Function>, DecodeError> {
+        let target = self.materialize(target)?;
+        let bound_this = self.materialize(bound_this)?;
+        let mut arguments = Vec::with_capacity(bound_args.len());
+        for argument in bound_args {
+            arguments.push(self.materialize(*argument)?);
+        }
+        let prototype = self.prototype(proto)?;
+        Function::bound_function_create(target, bound_this, arguments, prototype).map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!("its target is not callable: {error}"))
         })
     }
 
@@ -2539,11 +2688,6 @@ mod tests {
         let context = api::Context::new(&mut isolate).expect("a realm");
         let realm = *context.realm();
         for (source, expected, detail) in [
-            (
-                "(function () {}).bind(null)",
-                "a bound function",
-                "bound arguments",
-            ),
             ("(() => 1)", "a function", "no source text"),
             (
                 "({ m() { return 1; } }).m",
@@ -2585,5 +2729,128 @@ mod tests {
             .expect_err("the walk refuses");
         assert_eq!(error.type_name, "a built-in function");
         assert!(error.detail.contains("Rust closure"), "{}", error.detail);
+    }
+
+    /// A bind exotic is carried by its target, its bound `this` and its bound
+    /// arguments, and comes back callable — the value `deno_core`'s snapshot
+    /// reaches through its module map, and the kind that stopped its build.
+    #[test]
+    fn a_bound_function_round_trips_and_is_callable() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let bound = context
+            .try_eval("(function add(a, b) { return a + b; }).bind(null, 1)")
+            .expect("a bound function")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, bound);
+        let back = back.as_function().expect("a function");
+        assert_eq!(
+            call_restored(&isolate, &realm, Value::Function(back), "2").as_number(),
+            Some(3.0),
+            "the bound argument was still bound"
+        );
+        // `length` and `name` are the bound function's own properties, so they
+        // come back as the `bind` builtin left them rather than being computed
+        // again from the target.
+        let own = |name: &str| {
+            back.object
+                .get_own_property(&JsString::from_utf8(name))
+                .expect("read")
+                .and_then(|property| property.value())
+                .unwrap_or_else(|| panic!("{name} is missing"))
+        };
+        assert_eq!(own("length").as_number(), Some(1.0));
+        assert_eq!(
+            own("name").as_string().map(|text| text.to_string_lossy()),
+            Some("bound add".to_string())
+        );
+    }
+
+    /// The bound `this` and the bound arguments are values in the graph like any
+    /// other, so an object bound as a receiver comes back the object.
+    #[test]
+    fn a_bound_this_and_bound_arguments_ride_with_it() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let bound = context
+            .try_eval(
+                "var receiver = { tag: 7 }; var argument = { n: 5 }; \
+                 (function (a, b) { return this.tag + a.n + b; }).bind(receiver, argument)",
+            )
+            .expect("a bound function")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, bound);
+        assert_eq!(
+            call_restored(&isolate, &realm, back, "2").as_number(),
+            Some(14.0),
+            "the bound receiver and the bound argument came back"
+        );
+    }
+
+    /// A bind's target is an ordinary value reference, so a chain of binds
+    /// round trips — and reached through an object, which is the shape the value
+    /// arrives in from a host's own graph.
+    #[test]
+    fn a_chain_of_bound_functions_round_trips() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let holder = context
+            .try_eval(
+                "var f = function (a, b, c) { return a + b + c; }; \
+                 ({ nested: f.bind(null, 1).bind(null, 2) })",
+            )
+            .expect("an object")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, holder);
+        let nested = back
+            .as_object()
+            .expect("an object")
+            .get_own_property(&JsString::from_utf8("nested"))
+            .expect("read")
+            .and_then(|property| property.value())
+            .expect("the property");
+        assert!(
+            nested.as_function().is_some(),
+            "the nested value came back a function"
+        );
+        assert_eq!(
+            call_restored(&isolate, &realm, nested, "3").as_number(),
+            Some(6.0),
+            "both binds were still bound"
+        );
+    }
+
+    /// A bind whose target is a host callback is refused by what cannot be
+    /// carried — the target — rather than by the bind.
+    #[test]
+    fn a_bound_function_over_a_host_callback_is_refused_by_name() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let callback = Function::create_builtin(
+            Some(JsString::from_utf8("an_op")),
+            0,
+            Box::new(|_, _| Ok(Value::Undefined)),
+            None,
+            None,
+        )
+        .expect("a builtin");
+        let bound = Function::bound_function_create(
+            Value::Function(callback),
+            Value::Null,
+            Vec::new(),
+            None,
+        )
+        .expect("a bound function");
+
+        let error = encode(agent_of(&isolate), &realm, Value::Function(bound))
+            .expect_err("the walk refuses");
+        assert_eq!(error.type_name, "a built-in function");
     }
 }

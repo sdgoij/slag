@@ -632,6 +632,39 @@ mod tests {
         );
     }
 
+    /// A bound function comes back callable too, which is the value `deno_core`
+    /// reaches through the module map it attaches to its bootstrapped realm —
+    /// the kind that stopped its build before this.
+    #[test]
+    fn a_bound_function_round_trips_and_is_callable_from_a_script() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let bound = crate::test_support::eval(
+                scope,
+                "(function add(a, b) { return a + b; }).bind(null, 1)",
+            );
+            scope.add_context_data(context, bound);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let bound = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the bound function");
+        crate::test_support::bind(scope, "restored", bound);
+        assert_eq!(crate::test_support::eval_number(scope, "restored(2)"), 3.0);
+    }
+
     /// A host callback is a Rust closure rather than source text, so it still
     /// ends the build, by name: this is the function kind the external-reference
     /// table's `function` field is for, and it is not wired to real ops yet.
