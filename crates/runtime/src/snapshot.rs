@@ -24,10 +24,13 @@
 //! the value it refused: a proxy, a typed array, a module namespace, a host
 //! object, an array with a hole, an indexed accessor, an array whose `length` is
 //! not an index, a host pointer the host's external-reference table does not
-//! have, a host callback (a built-in that is not an intrinsic) when the host
-//! supplies none of its own, and a function
+//! not have, a host callback (a built-in that is not an intrinsic) when the host
+//! supplies none of its own, a function
 //! the engine kept no source text for — a class constructor defined where no
-//! frame carries the text its span belongs to, for one. A **method** and an
+//! frame carries the text its span belongs to, for one — and an environment
+//! record a function closed over that is neither declarative nor function: a
+//! lookup walks a record's own binding list and nothing else, so an object,
+//! module or global record is refused by kind. A **method** and an
 //! **accessor** both carry theirs now (the accessor's `[[SourceText]]` was the
 //! last one missing), so neither is on that list.
 //! Each entry is a subsystem to carry, and the walk refuses rather than writing
@@ -36,11 +39,9 @@
 //! # Functions
 //!
 //! A JavaScript function is written as the source text it can be re-parsed
-//! from, its [[Strict]], and its object part, and the restore evaluates that
-//! source in the realm's global environment. That is enough for a function
-//! whose body is self-contained and not for one that closed over a scope: a
-//! blob holds the value graph, not the environment chain a closure was
-//! compiled in, so a restored function resolves a free name globally. A bind
+//! from, its [[Strict]], the environment chain it closed over, and its object
+//! part, and the restore re-parses that source and instantiates it in that
+//! chain. A bind
 //! exotic is written as the three values it is made of — its target, its bound
 //! `this` and its bound arguments — so a chain of binds round trips and an
 //! intrinsic target is still written by name; a host callback — a Rust closure
@@ -72,6 +73,25 @@
 //! value the function reads — and the restore asks the host to make the call
 //! again. That is the `HostCallbacks` contract: a build that supplies none
 //! carries none, which is what the walk refused before this record existed.
+//!
+//! # The environment chain
+//!
+//! A closure's free names are resolved through the environment records it
+//! closed over, so those records travel with it. `REC_ENV` carries a
+//! **declarative** or **function** record — the outer link and the bindings —
+//! and, for a function record, the `this` value and this-binding status that
+//! decide whether the record has a `this` binding. What does *not* travel is a
+//! record's `[[FunctionObject]]` and its new-target: only an arrow reads those
+//! through a chain, and an arrow is rebuilt by **evaluating** its source in the
+//! reading realm rather than instantiated in a carried one, so nothing a
+//! restored chain is consulted for would read them. The record carries no
+//! declaration-time *behaviour* (no Annex B hoist list, no disposable-resource
+//! stack, no catch-parameter mark): those are read while a declaration is
+//! instantiated, which a restore does not do — it only puts the bindings back.
+//!
+//! The realm's own global environment writes no record at all (`NO_REF`):
+//! `Context::new` rebuilds that one, so the chain ends there and a name it
+//! cannot resolve resolves globally, exactly as the chain it came from did.
 //!
 //! Version 1. The format is ours to version, and its compatibility surface is
 //! the *names* it writes: an intrinsic name and a well-known symbol name have to
@@ -109,6 +129,7 @@ use crux::symbol::{self, Symbol};
 use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
+use crate::env::{Binding, DeclarativeEnv, EnvRecord, EnvRef, FunctionEnv, ThisBindingStatus};
 use crate::realm::Realm;
 
 /// The blob's first eight bytes, and its last eight: a blob that lost its head
@@ -142,6 +163,32 @@ const REC_BOUND_FUNCTION: u8 = 15;
 const REC_HOST_CALLBACK: u8 = 16;
 const REC_CLASS_METHOD: u8 = 17;
 const REC_MODULE: u8 = 18;
+const REC_ENV: u8 = 19;
+
+/// Which environment record an `REC_ENV` record is. Only these two are
+/// carried; an object, module or global record is refused by [`visit_env`].
+const ENV_DECLARATIVE: u8 = 0;
+const ENV_FUNCTION: u8 = 1;
+
+/// The environment's own flags: whether the record is transparent to the
+/// static context-chain walk (a per-iteration copy or a named function
+/// expression's self-binding scope), which a certified body's capture read
+/// skips.
+const ENV_FLAG_TRANSPARENT: u8 = 1;
+
+/// A binding's attributes, in the byte a binding carries. These are the
+/// binding's own bits, not a property's: the two encodings have the same
+/// shape (a flags byte between two serials) and different meanings.
+const BIND_MUTABLE: u8 = 1;
+const BIND_STRICT: u8 = 2;
+const BIND_DELETABLE: u8 = 4;
+const BIND_PARAMETER: u8 = 8;
+
+/// A function environment's [[ThisBindingStatus]] (spec 9.2.4), in the byte a
+/// function environment carries.
+const THIS_LEXICAL: u8 = 0;
+const THIS_UNINITIALIZED: u8 = 1;
+const THIS_INITIALIZED: u8 = 2;
 
 /// Which grammar a function record's source is read in. A class constructor's
 /// `[[SourceText]]` is the **class** it came from (spec 15.7.14 sets it that way
@@ -232,6 +279,10 @@ pub enum DecodeError {
     BadGrammar(u8),
     /// A blob carries a host callback and the load supplied no callbacks.
     NoHostCallback(usize),
+    /// An environment record this version cannot rebuild: a kind byte that is
+    /// not one of this format's, a this-binding status that is not one, or a
+    /// function record whose grammar the format does not give an environment.
+    UnrebuildableEnvironment(String),
     /// A blob names an entry the host's external-reference table does not have.
     ExternalIndexOutOfRange { index: usize, count: usize },
 }
@@ -277,6 +328,9 @@ impl std::fmt::Display for DecodeError {
                 f,
                 "snapshot names a host callback at external reference {index}, which the load's host did not supply"
             ),
+            Self::UnrebuildableEnvironment(reason) => {
+                write!(f, "snapshot environment could not be rebuilt: {reason}")
+            }
             Self::ExternalIndexOutOfRange { index, count } => write!(
                 f,
                 "snapshot names external reference {index}, the host's table has {count}"
@@ -298,6 +352,7 @@ enum Identity {
     Intrinsic(String),
     Object(u64),
     Module(u64),
+    Env(u64),
     Symbol(u64),
     String(Vec<u16>),
     BigInt(String),
@@ -336,12 +391,13 @@ enum Record {
     /// A host pointer, by its index in the host's external-reference table.
     External(u32),
     /// A function: which grammar its source is read in, that source, whether it
-    /// is strict, its [[HomeObject]] when the grammar is a method, and its object
-    /// part.
+    /// is strict, the environment chain it closed over, its [[HomeObject]] when
+    /// the grammar is a method, and its object part.
     Function {
         grammar: Grammar,
         source: Vec<u16>,
         strict: bool,
+        environment: u32,
         home: u32,
         heritage: u32,
         keys: Vec<u32>,
@@ -379,6 +435,18 @@ enum Record {
         name: Option<Vec<u16>>,
         source: Vec<u16>,
     },
+    /// An environment record a closure closed over: which of the two kinds it
+    /// is, whether a capture read skips it, its outer link, its bindings, and —
+    /// for a function record — the `this` value and this-binding status that
+    /// decide whether the record has a `this` binding at all.
+    Env {
+        kind: u8,
+        transparent: bool,
+        outer: u32,
+        bindings: Vec<CarriedBinding>,
+        this_value: u32,
+        this_status: u8,
+    },
     Object {
         proto: u32,
         extensible: bool,
@@ -409,6 +477,20 @@ struct StoredProperty {
     flags: u8,
     first: u32,
     second: u32,
+}
+
+/// A binding as read from a blob: its name, its attributes, and its value (a
+/// serial, or absent while the binding is uninitialized).
+///
+/// A binding is written in a property's four-field shape — a name serial, a
+/// flags byte, a value serial and one reserved — so that the reader above, which
+/// already consumes exactly those, is the one that reads it. The reserved field
+/// is left to that reader.
+#[derive(Clone, Copy)]
+struct CarriedBinding {
+    name: u32,
+    flags: u8,
+    value: u32,
 }
 
 /// A host callback the host built: the table entry its call comes from, and the
@@ -509,11 +591,12 @@ impl From<Value> for SnapshotItem {
 }
 
 /// What the walk carries for one serial: the value and the realm it belongs to,
-/// or a module.
+/// a module, or an environment record and the realm whose global ends its chain.
 #[derive(Clone, Copy)]
 enum Entry {
     Value(Value, Handle<Realm>),
     Module(Handle<crate::module::SourceTextModule>),
+    Env(EnvRef, Handle<Realm>),
 }
 
 /// Write the data a host attached to each context, as one blob.
@@ -688,6 +771,7 @@ pub fn decode_slot(
         made: vec![None; records.len()],
         pins: Vec::new(),
         class_prototypes: HashMap::new(),
+        unfilled_envs: Vec::new(),
     };
     let mut values = Vec::with_capacity(items.len());
     // The realm's own state first: a host's item that the global also holds is
@@ -925,7 +1009,24 @@ fn visit(
                             visit(agent, realm, externals, host, data, objects, serials)?;
                         }
                     }
-                    Callable::Body { home, .. } => {
+                    Callable::Body {
+                        home, environment, ..
+                    } => {
+                        // The chain a closure's free names resolve through, so
+                        // the walk owes it every record it is made of — a
+                        // binding's name and value, each outer, and a function
+                        // record's `this`.
+                        if let Some(environment) = environment {
+                            visit_env(
+                                agent,
+                                realm,
+                                externals,
+                                host,
+                                environment,
+                                objects,
+                                serials,
+                            )?;
+                        }
                         if let Some(home) = home {
                             visit(agent, realm, externals, host, home, objects, serials)?;
                         }
@@ -1003,6 +1104,134 @@ fn visit_module(
     serial
 }
 
+/// What an environment record contributes to a blob: the kind byte it is written
+/// under, whether a capture read skips it, and the bindings it holds.
+struct CarriedEnvironment {
+    kind: u8,
+    transparent: bool,
+    bindings: Vec<(JsString, Binding)>,
+}
+
+/// Read the declarative half of an environment record the format carries, with
+/// the kind byte it is written under and the attributes a restore puts back — or
+/// the reason this format cannot carry it.
+///
+/// A declarative record and a function record are the two a closure's names
+/// resolve through: a lookup walks the record's own binding list, so an object
+/// record (whose names live on a binding object), a module record (whose
+/// bindings are import indirections) and a global record (which the reading
+/// realm rebuilds) are refused by the kind they are.
+fn carried_environment(env: &EnvRef) -> Result<CarriedEnvironment, Unsupported> {
+    let (kind, declarative) = match &**env {
+        EnvRecord::Declarative(declarative) => (ENV_DECLARATIVE, declarative),
+        EnvRecord::Function(function) => (ENV_FUNCTION, &function.declarative),
+        EnvRecord::Object(_) => {
+            return Err(Unsupported::new(
+                "an object environment",
+                "its names live on a binding object, and a lookup here walks a record's own binding list",
+            ));
+        }
+        EnvRecord::Module(_) => {
+            return Err(Unsupported::new(
+                "a module environment",
+                "its bindings are import indirections the reading realm would have to have linked already",
+            ));
+        }
+        EnvRecord::Global(_) => {
+            return Err(Unsupported::new(
+                "a global environment",
+                "only the realm's own global environment is left out of a chain; another realm's is not this format's to rebuild",
+            ));
+        }
+    };
+    // The borrow is dropped before anything is visited or written: both allocate
+    // and can re-enter the agent, and a `RefCell` held across that is a
+    // collection the trace skips.
+    let bindings = declarative
+        .bindings
+        .borrow()
+        .iter()
+        .map(|(name, binding)| {
+            if binding.indirect.is_some() {
+                return Err(Unsupported::new(
+                    "a module import binding",
+                    "it resolves through the module that exported it, which the blob does not hold",
+                ));
+            }
+            Ok((name.clone(), binding.clone()))
+        })
+        .collect::<Result<Vec<_>, Unsupported>>()?;
+    Ok(CarriedEnvironment {
+        kind,
+        transparent: declarative.context_transparent.get(),
+        bindings,
+    })
+}
+
+/// Give an environment record its serial, and walk everything a restore needs to
+/// rebuild it: every binding's name and value, the outer link, and — for a
+/// function record — the `this` value a reader of the record's this-binding
+/// status could ask for.
+///
+/// The realm's own global environment is not carried at all: it answers
+/// `NO_REF`, which the reader resolves to the *reading* realm's global, so a
+/// chain that ended there ends in the realm the restore is rebuilding rather
+/// than in a copy of the realm that wrote the blob.
+fn visit_env(
+    agent: &Agent,
+    realm: &Handle<Realm>,
+    externals: &[usize],
+    host: Option<&dyn HostCallbacks>,
+    env: EnvRef,
+    objects: &mut Vec<Entry>,
+    serials: &mut HashMap<Identity, u32>,
+) -> Result<u32, Unsupported> {
+    if env.ptr_eq(realm.global_env) {
+        return Ok(NO_REF);
+    }
+    let key = Identity::Env(crux::handle::Handle::as_ptr(env) as usize as u64);
+    if let Some(serial) = serials.get(&key) {
+        return Ok(*serial);
+    }
+    // The whole record is read before its serial is registered, so an
+    // environment this format cannot carry refuses without leaving an entry the
+    // writer would later be asked for. The kind and the flag are the writer's;
+    // what the walk owes the graph is every binding's name and value.
+    let bindings = carried_environment(&env)?.bindings;
+    let serial = objects.len() as u32;
+    serials.insert(key, serial);
+    objects.push(Entry::Env(env, *realm));
+    for (name, binding) in bindings {
+        visit(
+            agent,
+            realm,
+            externals,
+            host,
+            Value::String(Handle::new(name)),
+            objects,
+            serials,
+        )?;
+        if let Some(value) = binding.value {
+            visit(agent, realm, externals, host, value, objects, serials)?;
+        }
+    }
+    if let Some(outer) = env.outer() {
+        visit_env(agent, realm, externals, host, outer, objects, serials)?;
+    }
+    if let EnvRecord::Function(function) = &*env {
+        visit(
+            agent,
+            realm,
+            externals,
+            host,
+            *function.this_value.borrow(),
+            objects,
+            serials,
+        )?;
+    }
+    Ok(serial)
+}
+
 /// The value a serial names, with a function's object part folded back into the
 /// function it belongs to.
 ///
@@ -1033,13 +1262,15 @@ fn canonical(value: Value) -> Value {
 /// closed over.
 enum Callable<'a> {
     /// A JavaScript function with a body: which grammar its source is read in,
-    /// the source itself, its [[Strict]], and — for the one grammar that has
-    /// one — its [[HomeObject]].
+    /// the source itself, its [[Strict]], its [[Environment]] when the format
+    /// carries one for that grammar, and — for the one grammar that has one —
+    /// its [[HomeObject]].
     Body {
         grammar: Grammar,
         source: &'a JsString,
         strict: bool,
         home: Option<Value>,
+        environment: Option<EnvRef>,
     },
     /// A bind exotic: the target, the bound `this`, and the bound arguments.
     Bound {
@@ -1111,6 +1342,15 @@ impl Grammar {
     /// byte: true for a method and for nothing else.
     fn carries_home(self) -> bool {
         self == Grammar::Method
+    }
+
+    /// Whether this grammar's record carries the [[Environment]] it closed
+    /// over: true for a function and a method, the two the restore
+    /// instantiates from their source. An arrow and a class constructor are
+    /// evaluated instead, so the environment they get is the reading realm's
+    /// global.
+    fn carries_environment(self) -> bool {
+        matches!(self, Grammar::Function | Grammar::Method)
     }
 }
 
@@ -1269,6 +1509,12 @@ fn callable<'a>(
                 source,
                 strict: data.strict,
                 home: grammar.carries_home().then_some(data.home_object).flatten(),
+                // The two grammars the restore *instantiates* keep the chain
+                // they closed over. An arrow and a class constructor are rebuilt
+                // by evaluating their source in the reading realm instead, so
+                // their environment is that realm's global by construction and
+                // carrying one would be a field no reader honours.
+                environment: grammar.carries_environment().then_some(data.environment),
             })
         }
     }
@@ -1701,6 +1947,7 @@ fn write_record(
                     source,
                     strict,
                     home,
+                    environment,
                 } => {
                     // `carries_home` is what says whether this grammar has a
                     // value beside the source at all — a plain function and an
@@ -1711,7 +1958,15 @@ fn write_record(
                         Carried::None
                     };
                     write_function(
-                        realm, &function, grammar, source, strict, carried, serials, body,
+                        realm,
+                        &function,
+                        grammar,
+                        source,
+                        strict,
+                        environment,
+                        carried,
+                        serials,
+                        body,
                     )?
                 }
                 Callable::Class {
@@ -1724,6 +1979,7 @@ fn write_record(
                     Grammar::Class,
                     source,
                     true,
+                    None,
                     Carried::Class { heritage, keys },
                     serials,
                     body,
@@ -1835,7 +2091,106 @@ fn write_carried(
             write_module(module, body);
             Ok(())
         }
+        Entry::Env(env, realm) => write_env(realm, *env, serials, body),
     }
+}
+
+/// The serial of an environment the walk registered, or `NO_REF` for the realm's
+/// own global environment, which the format leaves out of a chain.
+///
+/// A miss is a walk bug rather than a value the format cannot carry — every
+/// environment a record names was visited first — so it refuses loudly instead
+/// of writing `NO_REF`, which the reader would take as the realm's global.
+fn env_serial(
+    realm: &Handle<Realm>,
+    env: EnvRef,
+    serials: &HashMap<Identity, u32>,
+) -> Result<u32, Unsupported> {
+    if env.ptr_eq(realm.global_env) {
+        return Ok(NO_REF);
+    }
+    serials
+        .get(&Identity::Env(
+            crux::handle::Handle::as_ptr(env) as usize as u64
+        ))
+        .copied()
+        .ok_or(Unsupported::new(
+            "a function",
+            "its environment chain was not walked, so its record names no environment",
+        ))
+}
+
+/// Write an environment record: its kind, whether a capture read skips it, its
+/// outer link and its bindings — then, for a function record, the `this` value
+/// and this-binding status.
+///
+/// A binding is written in the shape a property is (a name serial, a flags byte,
+/// a value serial and one reserved) because the four-field reader is the same
+/// one: the bytes differ in meaning, not in layout. `NO_REF` where the value
+/// goes is the binding's TDZ — an uninitialized `let` or `const` has no value to
+/// write, and one that came back initialized would be a binding the writing
+/// realm's code would have thrown on.
+fn write_env(
+    realm: &Handle<Realm>,
+    env: EnvRef,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    let CarriedEnvironment {
+        kind,
+        transparent,
+        bindings,
+    } = carried_environment(&env)?;
+    body.push(REC_ENV);
+    body.push(kind);
+    body.push(if transparent { ENV_FLAG_TRANSPARENT } else { 0 });
+    write_u32(
+        body,
+        match env.outer() {
+            Some(outer) => env_serial(realm, outer, serials)?,
+            None => NO_REF,
+        },
+    );
+    write_u32(body, bindings.len() as u32);
+    for (name, binding) in &bindings {
+        write_u32(
+            body,
+            serial_in(realm, serials, Value::String(Handle::new(name.clone()))),
+        );
+        let mut flags = 0u8;
+        if binding.mutable {
+            flags |= BIND_MUTABLE;
+        }
+        if binding.strict {
+            flags |= BIND_STRICT;
+        }
+        if binding.deletable {
+            flags |= BIND_DELETABLE;
+        }
+        if binding.parameter {
+            flags |= BIND_PARAMETER;
+        }
+        body.push(flags);
+        write_u32(
+            body,
+            binding
+                .value
+                .map_or(NO_REF, |value| serial_in(realm, serials, value)),
+        );
+        write_u32(body, NO_REF);
+    }
+    if let EnvRecord::Function(function) = &*env {
+        write_u32(
+            body,
+            serial_in(realm, serials, *function.this_value.borrow()),
+        );
+        body.push(match function.this_binding_status.get() {
+            ThisBindingStatus::Lexical => THIS_LEXICAL,
+            ThisBindingStatus::Uninitialized => THIS_UNINITIALIZED,
+            ThisBindingStatus::Initialized => THIS_INITIALIZED,
+        });
+    }
+    Ok(())
 }
 
 /// Write a module record: the name it was compiled under, when it has one, and
@@ -1860,15 +2215,15 @@ fn write_module(module: &Handle<crate::module::SourceTextModule>, body: &mut Vec
 }
 
 /// Write a JavaScript function as the source text it can be rebuilt from, its
-/// [[Strict]], and its object part — the same prototype/extensible/properties
-/// triple an object gets, because a function's own keys are its own keys.
+/// [[Strict]], the environment chain it closed over, and its object part — the
+/// same prototype/extensible/properties triple an object gets, because a
+/// function's own keys are its own keys.
 ///
 /// The source is what makes this the one record a restore re-runs the parser
-/// for, and it is also the record's limit: what the source cannot say is the
-/// [[Environment]] the function closed over, so a restored function resolves a
-/// free name through the realm's global environment rather than through the
-/// scope it was compiled in. A function whose body is not self-contained is
-/// refused upstream.
+/// for. The environment is what makes a free name in that source resolve where
+/// it did the first time: it is written as the serial of the chain the walk gave
+/// the function, and `NO_REF` — the realm's own global environment, or a grammar
+/// the restore evaluates rather than instantiates — means the reader's global.
 #[allow(clippy::too_many_arguments)]
 fn write_function(
     realm: &Handle<Realm>,
@@ -1876,6 +2231,7 @@ fn write_function(
     grammar: Grammar,
     source: &JsString,
     strict: bool,
+    environment: Option<EnvRef>,
     carried: Carried<'_>,
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
@@ -1883,6 +2239,15 @@ fn write_function(
     body.push(REC_FUNCTION);
     body.push(grammar.byte());
     body.push(u8::from(strict));
+    // The environment is written here, before the grammar-conditional values, so
+    // a reader consumes it in the one position every grammar has.
+    write_u32(
+        body,
+        match environment {
+            Some(environment) => env_serial(realm, environment, serials)?,
+            None => NO_REF,
+        },
+    );
     match carried {
         Carried::None => {}
         Carried::Home(home) => {
@@ -2166,6 +2531,7 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             let byte = reader.u8().ok_or(DecodeError::Truncated)?;
             let grammar = Grammar::from_byte(byte).ok_or(DecodeError::BadGrammar(byte))?;
             let strict = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let environment = reader.u32().ok_or(DecodeError::Truncated)?;
             let home = if grammar.carries_home() {
                 reader.u32().ok_or(DecodeError::Truncated)?
             } else {
@@ -2190,12 +2556,46 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 grammar,
                 source,
                 strict,
+                environment,
                 home,
                 heritage,
                 keys,
                 proto,
                 extensible,
                 properties,
+            })
+        }
+        REC_ENV => {
+            let kind = reader.u8().ok_or(DecodeError::Truncated)?;
+            if kind != ENV_DECLARATIVE && kind != ENV_FUNCTION {
+                return Err(DecodeError::UnrebuildableEnvironment(format!(
+                    "environment kind byte {kind} is not one of this format's"
+                )));
+            }
+            let flags = reader.u8().ok_or(DecodeError::Truncated)?;
+            let outer = reader.u32().ok_or(DecodeError::Truncated)?;
+            // Which fields follow depends on the kind, so it is checked above
+            // rather than left to the reader's next byte.
+            let bindings = read_bindings(reader)?;
+            let (this_value, this_status) = if kind == ENV_FUNCTION {
+                let this_value = reader.u32().ok_or(DecodeError::Truncated)?;
+                let this_status = reader.u8().ok_or(DecodeError::Truncated)?;
+                if this_status > THIS_INITIALIZED {
+                    return Err(DecodeError::UnrebuildableEnvironment(format!(
+                        "this-binding status byte {this_status} is not one of this format's"
+                    )));
+                }
+                (this_value, this_status)
+            } else {
+                (NO_REF, THIS_LEXICAL)
+            };
+            Ok(Record::Env {
+                kind,
+                transparent: flags & ENV_FLAG_TRANSPARENT != 0,
+                outer,
+                bindings,
+                this_value,
+                this_status,
             })
         }
         REC_MODULE => {
@@ -2320,6 +2720,19 @@ fn read_properties(reader: &mut Reader<'_>) -> Result<Vec<StoredProperty>, Decod
     Ok(properties)
 }
 
+/// An environment's bindings, read in the shape a property's are: the same four
+/// fields, so the reader above is the one that consumes them.
+fn read_bindings(reader: &mut Reader<'_>) -> Result<Vec<CarriedBinding>, DecodeError> {
+    Ok(read_properties(reader)?
+        .into_iter()
+        .map(|property| CarriedBinding {
+            name: property.key,
+            flags: property.flags,
+            value: property.first,
+        })
+        .collect())
+}
+
 struct Builder<'a> {
     agent: &'a mut Agent,
     realm: &'a Handle<Realm>,
@@ -2348,6 +2761,16 @@ struct Builder<'a> {
     /// class's private brand belongs to. Kept pinned for the same reason `pins`
     /// is: a member record may be read after its class record is complete.
     class_prototypes: HashMap<u32, Handle<JsObject>>,
+    /// Environment records whose shell exists and whose bindings have not been
+    /// put back yet, by serial.
+    ///
+    /// A function record materializes its environment *before* the function can
+    /// exist — the instantiation takes it — so the environment has to be a shell
+    /// at that point: its own bindings may hold the very function whose build is
+    /// in progress. The shell's bindings are filled once that function has been
+    /// recorded in `made`, which is what makes a binding that holds it and the
+    /// function record resolve to **one** function rather than two.
+    unfilled_envs: Vec<u32>,
 }
 
 /// A record's value, before it is asked for as a language value: an object's
@@ -2358,6 +2781,7 @@ enum Built {
     Value(Value),
     Object(Handle<JsObject>),
     Module(Handle<crate::module::SourceTextModule>),
+    Env(EnvRef),
 }
 
 impl Builder<'_> {
@@ -2365,11 +2789,134 @@ impl Builder<'_> {
         match self.object(serial)? {
             Built::Value(value) => Ok(value),
             Built::Object(object) => Ok(Value::Object(object)),
-            // Only a slot's own item list can name a module, so a record field
-            // that does is a blob that disagrees with itself rather than a value
-            // to hand back.
+            // Only a slot's own item list can name a module, and only a function
+            // record can name an environment, so a field that does is a blob that
+            // disagrees with itself rather than a value to hand back.
             Built::Module(_) => Err(DecodeError::Truncated),
+            Built::Env(_) => Err(DecodeError::UnrebuildableEnvironment(format!(
+                "serial {serial} names an environment record where a value belongs"
+            ))),
         }
+    }
+
+    /// The environment record a serial names, for the function record that closes
+    /// over it — or the reading realm's global when it names none, which is the
+    /// chain every existing blob carries.
+    fn function_environment(&mut self, serial: u32) -> Result<EnvRef, DecodeError> {
+        match serial {
+            NO_REF => Ok(self.realm.global_env),
+            serial => self.env_ref(serial),
+        }
+    }
+
+    /// The environment record a serial names.
+    fn env_ref(&mut self, serial: u32) -> Result<EnvRef, DecodeError> {
+        match self.object(serial)? {
+            Built::Env(env) => Ok(env),
+            _ => Err(DecodeError::UnrebuildableEnvironment(format!(
+                "serial {serial} does not name an environment record"
+            ))),
+        }
+    }
+
+    /// Put back the bindings of every environment whose shell exists but is not
+    /// filled, and of every environment those reach.
+    ///
+    /// Called once a function record has been recorded in `made`, which is the
+    /// moment its own environment may be filled: a binding that holds that very
+    /// function then names it, rather than starting a second build of it. An
+    /// environment is reachable only from a function record or from another
+    /// environment, so the drain below settles the whole chain before the build
+    /// returns anything.
+    fn settle_envs(&mut self) -> Result<(), DecodeError> {
+        while let Some(serial) = self.unfilled_envs.pop() {
+            let Some(Built::Env(env)) = self.made.get(serial as usize).copied().flatten() else {
+                return Err(DecodeError::UnrebuildableEnvironment(format!(
+                    "serial {serial} does not name an environment record"
+                )));
+            };
+            let Some(Record::Env {
+                kind,
+                bindings,
+                this_value,
+                this_status,
+                ..
+            }) = self.records.get(serial as usize)
+            else {
+                return Err(DecodeError::Truncated);
+            };
+            // The bindings' values and the function record's own state are
+            // materialized **before** the binding list is borrowed: materializing
+            // allocates and re-enters the builder, and a `RefCell` held across
+            // that is a collection the trace skips. Shell-first is what makes the
+            // re-entry safe: an environment named here is already in `made`.
+            let mut carried = Vec::with_capacity(bindings.len());
+            for binding in bindings {
+                let name = self.materialize(binding.name)?;
+                let ValueKind::String(name) = name.kind() else {
+                    return Err(DecodeError::UnrebuildableEnvironment(
+                        "a binding's name is not a string".into(),
+                    ));
+                };
+                let value = match binding.value {
+                    NO_REF => None,
+                    serial => Some(self.materialize(serial)?),
+                };
+                carried.push((name, *binding, value));
+            }
+            let state = if *kind == ENV_FUNCTION {
+                let this_value = self.materialize(*this_value)?;
+                match *this_status {
+                    THIS_LEXICAL => (this_value, ThisBindingStatus::Lexical),
+                    THIS_UNINITIALIZED => (this_value, ThisBindingStatus::Uninitialized),
+                    THIS_INITIALIZED => (this_value, ThisBindingStatus::Initialized),
+                    other => {
+                        return Err(DecodeError::UnrebuildableEnvironment(format!(
+                            "this-binding status byte {other} is not one of this format's"
+                        )));
+                    }
+                }
+            } else {
+                (Value::Undefined, ThisBindingStatus::Lexical)
+            };
+            // The barriers run before the binding list is borrowed, for the same
+            // reason the materialization does.
+            for (_, _, value) in &carried {
+                if let Some(value) = value {
+                    crux::heap::write_barrier(&*env, *value);
+                }
+            }
+            let declarative = match &*env {
+                EnvRecord::Declarative(declarative) => declarative,
+                EnvRecord::Function(function) => &function.declarative,
+                _ => {
+                    return Err(DecodeError::UnrebuildableEnvironment(format!(
+                        "serial {serial} names an environment record this format does not carry"
+                    )));
+                }
+            };
+            {
+                let mut list = declarative.bindings.borrow_mut();
+                for (name, binding, value) in carried {
+                    list.push((
+                        (*name).clone(),
+                        Binding {
+                            value,
+                            mutable: binding.flags & BIND_MUTABLE != 0,
+                            strict: binding.flags & BIND_STRICT != 0,
+                            deletable: binding.flags & BIND_DELETABLE != 0,
+                            indirect: None,
+                            parameter: binding.flags & BIND_PARAMETER != 0,
+                        },
+                    ));
+                }
+            }
+            if let EnvRecord::Function(function) = &*env {
+                *function.this_value.borrow_mut() = state.0;
+                function.this_binding_status.set(state.1);
+            }
+        }
+        Ok(())
     }
 
     /// Put the carried realm global back where it belongs: **onto** the reading
@@ -2403,6 +2950,11 @@ impl Builder<'_> {
             Built::Value(value) => SnapshotItem::Value(value),
             Built::Object(object) => SnapshotItem::Value(Value::Object(object)),
             Built::Module(module) => SnapshotItem::Module(crate::api::Module::from_handle(module)),
+            Built::Env(_) => {
+                return Err(DecodeError::UnrebuildableEnvironment(format!(
+                    "serial {serial} names an environment record, which is not an item"
+                )));
+            }
         })
     }
 
@@ -2504,6 +3056,7 @@ impl Builder<'_> {
                 grammar,
                 source,
                 strict,
+                environment: environment_serial,
                 home,
                 heritage,
                 keys,
@@ -2511,12 +3064,28 @@ impl Builder<'_> {
                 extensible,
                 properties,
             } => {
+                // An environment is carried for the two grammars the restore
+                // *instantiates*: a record that names one for a grammar rebuilt by
+                // evaluation would be a field nothing honours, which this format
+                // refuses wherever it would otherwise drop it.
+                if !grammar.carries_environment() && *environment_serial != NO_REF {
+                    return Err(DecodeError::UnrebuildableEnvironment(format!(
+                        "a function record in grammar {} names an environment, which its restore does not give it",
+                        grammar.byte()
+                    )));
+                }
                 let function = match grammar {
-                    Grammar::Function => self.build_function(source, *strict, *proto)?,
-                    Grammar::Class => self.build_class_function(source, *heritage, keys, *proto)?,
-                    Grammar::Method => {
-                        self.build_method_function(source, *proto, *strict, *home)?
+                    Grammar::Function => {
+                        self.build_function(source, *strict, *environment_serial, *proto)?
                     }
+                    Grammar::Class => self.build_class_function(source, *heritage, keys, *proto)?,
+                    Grammar::Method => self.build_method_function(
+                        source,
+                        *proto,
+                        *strict,
+                        *home,
+                        *environment_serial,
+                    )?,
                     Grammar::Arrow => self.build_evaluated_function(source, *proto, *strict)?,
                 };
                 // A class's own evaluation made a `prototype` object whose members
@@ -2540,6 +3109,11 @@ impl Builder<'_> {
                 // `constructor`, for one — resolves to it rather than
                 // restarting the build.
                 self.remember(index, Built::Value(Value::Function(function)));
+                // The environment this record named has been waiting for the
+                // function to exist: its bindings may hold this very record, and
+                // filling them now is what makes the two one function rather than
+                // a function and a copy of it.
+                self.settle_envs()?;
                 let object = function.object;
                 define_properties(self, object, properties)?;
                 // Extensibility last, for the reason `Record::Object` states.
@@ -2585,6 +3159,63 @@ impl Builder<'_> {
                 })?;
                 self.remember(index, Built::Module(module));
                 Built::Module(module)
+            }
+            Record::Env {
+                kind,
+                transparent,
+                outer,
+                this_status,
+                ..
+            } => {
+                // The outer link first: an environment is a chain, and the link is
+                // materialized — as a shell of its own — before the record that
+                // names it exists. `NO_REF` is the realm's own global environment,
+                // which the reading realm has already rebuilt.
+                let outer = match *outer {
+                    NO_REF => None,
+                    serial => Some(self.env_ref(serial)?),
+                };
+                let env = match *kind {
+                    ENV_DECLARATIVE => {
+                        let declarative = DeclarativeEnv::new(outer);
+                        if *transparent {
+                            declarative.mark_context_transparent();
+                        }
+                        Handle::new(EnvRecord::Declarative(declarative))
+                    }
+                    ENV_FUNCTION => {
+                        // The function object and the new-target the record does
+                        // not carry stay undefined, which is what a chain is
+                        // consulted for nothing of: only an arrow reads those, and
+                        // an arrow is rebuilt by evaluation in the reading realm.
+                        // The this-binding status is known here because the
+                        // constructor uses it to decide whether the record has a
+                        // `this` binding at all.
+                        let function = FunctionEnv::new(
+                            outer,
+                            Value::Undefined,
+                            Value::Undefined,
+                            *this_status == THIS_LEXICAL,
+                        );
+                        if *transparent {
+                            function.declarative.mark_context_transparent();
+                        }
+                        Handle::new(EnvRecord::Function(function))
+                    }
+                    other => {
+                        return Err(DecodeError::UnrebuildableEnvironment(format!(
+                            "environment kind byte {other} is not one of this format's"
+                        )));
+                    }
+                };
+                // The shell is recorded before its bindings are put back, so a
+                // binding that holds a function whose [[Environment]] is this very
+                // record resolves to it rather than restarting the chain. The fill
+                // waits until the function that asked for the shell is itself
+                // recorded — see `settle_envs`.
+                self.remember(index, Built::Env(env));
+                self.unfilled_envs.push(index as u32);
+                Built::Env(env)
             }
             Record::ClassMethod {
                 class,
@@ -2792,13 +3423,15 @@ impl Builder<'_> {
     /// `[[SourceText]]` from — so `toString`, and a second snapshot of the restored
     /// method, are unaffected. Strictness is handed to the instantiation rather
     /// than written into the source as a directive, which is what keeps the spans
-    /// exactly the parsed text's.
+    /// exactly the parsed text's. The environment is the chain the record carried,
+    /// for the reason a function record's is.
     fn build_method_function(
         &mut self,
         source: &[u16],
         proto: u32,
         strict: bool,
         home: u32,
+        environment: u32,
     ) -> Result<Handle<Function>, DecodeError> {
         let proto = self.prototype(proto)?.ok_or_else(|| {
             DecodeError::UnrebuildableFunction("the record names no prototype".into())
@@ -2815,7 +3448,7 @@ impl Builder<'_> {
             DecodeError::UnrebuildableFunction("its source is not one method definition".into())
         })?;
         let realm = *self.realm;
-        let environment = realm.global_env;
+        let environment = self.function_environment(environment)?;
         let home = match home {
             NO_REF => None,
             home => Some(self.materialize(home)?),
@@ -3047,16 +3680,19 @@ impl Builder<'_> {
 
     /// A function record, rebuilt from the source text it carries.
     ///
-    /// The parse is what makes this record different from every other one, and
-    /// the realm's global environment is what it is instantiated in: a blob
-    /// holds the value graph, not the scope a closure was compiled in, so a free
-    /// name in the body resolves globally here. A source the parser cannot read
-    /// as a function expression, or a function whose scope the writing realm
-    /// had no source for, is refused by name rather than restored wrong.
+    /// The parse is what makes this record different from every other one. The
+    /// environment it is instantiated in is the chain the record carried, so a
+    /// free name in the body resolves where it resolved when the function was
+    /// created; a record that carried none — the realm's own global environment —
+    /// is instantiated in the reading realm's, which is also every blob written
+    /// before the chain was carried. A source the parser cannot read as a
+    /// function expression, or a function whose scope the writing realm had no
+    /// source for, is refused by name rather than restored wrong.
     fn build_function(
         &mut self,
         source: &[u16],
         strict: bool,
+        environment: u32,
         proto: u32,
     ) -> Result<Handle<Function>, DecodeError> {
         let proto = self.prototype(proto)?.ok_or_else(|| {
@@ -3077,6 +3713,7 @@ impl Builder<'_> {
             })?,
         };
         let realm = *self.realm;
+        let environment = self.function_environment(environment)?;
         // A bootstrap execution context makes the realm current and gives the
         // registration the running context it reads; it is popped on every
         // path, so a failed restore leaves the agent's stack as it found it.
@@ -3084,7 +3721,7 @@ impl Builder<'_> {
         let value = crate::function::instantiate_function_from_source(
             self.agent,
             &parsed,
-            realm.global_env,
+            environment,
             proto,
             Some(JsString::from_utf16(source)),
             strict,
@@ -3139,7 +3776,11 @@ impl Builder<'_> {
             // `%Function.prototype%` and the resumable kinds' prototypes are
             // callable and report no object side on the value's own accessor.
             Built::Value(value) => crate::context::as_object(&value),
-            Built::Module(_) => return Err(DecodeError::Truncated),
+            Built::Module(_) | Built::Env(_) => {
+                return Err(DecodeError::UnrebuildableEnvironment(format!(
+                    "serial {serial} names a record that is not a prototype object"
+                )));
+            }
         })
     }
 
@@ -3161,6 +3802,7 @@ impl Builder<'_> {
             Built::Value(value) => crux::heap::pin(*value),
             Built::Object(object) => crux::heap::pin_handle(*object),
             Built::Module(module) => crux::heap::pin_handle(*module),
+            Built::Env(env) => crux::heap::pin_handle(*env),
         };
         self.pins.push(pin);
         self.made[index] = Some(built);
@@ -4683,11 +5325,12 @@ mod tests {
         assert_eq!(own("tag").as_number(), Some(7.0));
     }
 
-    /// The restore instantiates in the **reading** realm's global environment,
-    /// so a free name in the body resolves there — the one promise a blob can
-    /// make, because it carries a value graph rather than the environment chain a
-    /// closure closed over. The realms differ here so that the answer can only be
-    /// the reading one's global.
+    /// A function that closed over nothing but the realm's global writes no
+    /// environment at all, so the restore instantiates it in the **reading**
+    /// realm's global environment and a free name in the body resolves there —
+    /// which is also what every blob written before the chain was carried gets.
+    /// The realms differ here so that the answer can only be the reading one's
+    /// global.
     #[test]
     fn a_functions_free_names_resolve_through_the_reading_realms_globals() {
         let mut isolate = api::Isolate::new();
@@ -4712,6 +5355,107 @@ mod tests {
             call_restored(&isolate, reader.realm(), item_value(items[0]), "5").as_number(),
             Some(105.0),
             "the free name resolved through the reading realm's global"
+        );
+    }
+
+    /// A closure's free names resolve through the environment chain it closed
+    /// over, and that chain travels with it: a value captured in an outer
+    /// function's scope is still there after a restore into a **different**
+    /// realm, no global of which has the name. deno's bootstrap installs every
+    /// one of its own helpers inside an IIFE, so every function it puts on its
+    /// realm is a closure of exactly this shape.
+    #[test]
+    fn a_closures_captured_binding_comes_back_with_it() {
+        let mut isolate = api::Isolate::new();
+        let writer = api::Context::new(&mut isolate).expect("a realm");
+        let function = writer
+            .try_eval(
+                "(function () { const captured = 41; return function () { return captured + 1; }; })()",
+            )
+            .expect("a closure")
+            .into_value();
+        let blob = encode(agent_of(&isolate), writer.realm(), function).expect("a blob");
+
+        let reader = api::Context::new(&mut isolate).expect("a second realm");
+        assert_eq!(
+            reader
+                .try_eval("typeof captured")
+                .expect("a check")
+                .into_value()
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("undefined".to_string()),
+            "the name is no global of the reading realm, so only the chain can answer"
+        );
+        let items = decode_slot(agent_mut(&isolate), reader.realm(), &blob, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        assert_eq!(
+            call_restored(&isolate, reader.realm(), item_value(items[0]), "").as_number(),
+            Some(42.0),
+            "the captured binding travelled with the closure"
+        );
+    }
+
+    /// The same promise where the enclosing body runs on the **environment**
+    /// path: a `with` statement keeps the compiler from certifying that body, so
+    /// the closure it returns closes over a function environment record rather
+    /// than a certified capture context — the other kind of record the chain
+    /// carries, whose own state is written beside the bindings.
+    #[test]
+    fn a_closures_captured_binding_survives_a_function_environment() {
+        let mut isolate = api::Isolate::new();
+        let writer = api::Context::new(&mut isolate).expect("a realm");
+        // The receiver is a plain object rather than the realm's global, so the
+        // enclosing record's `this` is a value the graph carries as itself.
+        let function = writer
+            .try_eval(
+                "(function (scope) { const captured = 41; with (scope) {} return function () { return captured + 1; }; }).call({ tag: 1 }, {})",
+            )
+            .expect("a closure")
+            .into_value();
+        let blob = encode(agent_of(&isolate), writer.realm(), function).expect("a blob");
+
+        let reader = api::Context::new(&mut isolate).expect("a second realm");
+        let items = decode_slot(agent_mut(&isolate), reader.realm(), &blob, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        assert_eq!(
+            call_restored(&isolate, reader.realm(), item_value(items[0]), "").as_number(),
+            Some(42.0),
+            "the captured binding travelled with the closure"
+        );
+    }
+
+    /// An environment whose binding holds the very function that closed over it
+    /// comes back as **one** function. The chain is a cycle — the function's
+    /// environment holds a binding whose value is that function — so the record
+    /// has to be a shell before its own bindings are put back, and the function
+    /// has to exist before those bindings are filled. A restore that ordered the
+    /// two the other way would answer two functions where the writing realm had
+    /// one.
+    #[test]
+    fn a_cycle_through_an_environment_comes_back_one_function() {
+        let mut isolate = api::Isolate::new();
+        let writer = api::Context::new(&mut isolate).expect("a realm");
+        let function = writer
+            .try_eval("(function () { const self = function () { return self; }; return self; })()")
+            .expect("a closure")
+            .into_value();
+        let blob = encode(agent_of(&isolate), writer.realm(), function).expect("a blob");
+        let items = decode_slot(agent_mut(&isolate), writer.realm(), &blob, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        assert_eq!(
+            run_restored(
+                &isolate,
+                writer.realm(),
+                item_value(items[0]),
+                "restored() === restored"
+            )
+            .as_boolean(),
+            Some(true),
+            "the binding holds the restored function itself, not a second one"
         );
     }
 

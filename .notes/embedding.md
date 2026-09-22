@@ -2888,6 +2888,86 @@ Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --
 
 *And the next thing is a different part of the realm.* Measured on deno with the binary rebuilt from this tree: the load gets past the missing `Deno` — `initialize_deno_core_namespace` is skipped as `InitMode::FromSnapshot` intends, and `bindings::get::<v8::Local<Object>>` for `Deno` answers where it used to panic "unable to convert" — and dies one step later in `initialize_deno_core_ops_bindings` (`bindings.rs:591`), where the engine's error channel reports **`ReferenceError: "ObjectDefineProperty" is not defined`**. deno's primordials are script-level `const` bindings from `00_primordials.js`, so they live in the realm's **global lexical environment**, not on the global object — and the global object is all this format carries. That is §12's eleventh item's new next part (carry the global *lexical* bindings, or state the limit), a mechanism of its own rather than more of this one.
 
+**What a host's closures cost — probed, and then carried: the environment chain.** The decision §12's eleventh item was waiting for, reached by measurement. The probe below adds no code and its numbers are the record; the part it justified is recorded at the end of this block.
+
+*The candidate that was implemented and reverted.* Extending the carried-global half of a slot with the realm's global **lexical** bindings looked like the next gap: deno's failure was `ReferenceError: "ObjectDefineProperty" is not defined`, and a bootstrap's helpers look like top-level `const`s. So it was named before the edit, implemented (a binding count and, per binding, a mutability byte, the name's units and the value's serial), and measured against the same deno run. **The error did not change at all**, and the reason is in deno's own source: `00_primordials.js` and `01_core.js` are each an IIFE, so the destructured helpers are closure variables of a function scope, not global lexical bindings. The carry was therefore **reverted rather than landed**: an unused field in a format whose compatibility surface is what it writes is a cost with no buyer. Nothing else in the tree changed, so no battery was re-run.
+
+*The probe, and what it says the work is.* A temporary counter in the walk (a thread-local tally of each non-intrinsic function's `[[Environment]]` and the chain behind it, removed once it answered), run in deno's snapshot build, where the walk covers the bootstrapped global and deno's five attached items:
+
+| | |
+|---|---|
+| functions the walk reaches | **191**, of which **191 are closures** (their `[[Environment]]` is not the realm's global) |
+| environment records behind them | **64** distinct |
+| bindings in those records | **407** |
+| chain depth | **4 hops at most** (283 total) |
+| kinds | declarative **52**, function **12**, object/module/global/with **0** |
+
+So the missing half is the **environment chain**, and for this host it is 64 records and 407 bindings — a bounded mechanism, not a heap image.
+
+**The environment chain — landed.** The mechanism §12's eleventh item named before the edit, and the
+part that closes the half the probe above measured: a closure's free names resolve through the
+environment records it closed over, so those records travel with it.
+
+*What the format gained.* `REC_ENV` (tag 19) carries a **declarative** or a **function** record: a
+kind byte, a flags byte for the one bit that changes a read (transparency to a certified capture
+walk), the outer link, and the bindings — each written in the same four-field shape a property is (a
+name serial, a flags byte of the binding's own attributes, a value serial, one reserved), so the
+reader that already consumes that shape is the one that reads them. `NO_REF` where the value goes is
+the binding's TDZ, and `NO_REF` for the outer link is the realm's own global environment, which every
+boot rebuilds rather than carries — which is also why every blob written before this part keeps its
+behavior. A function record adds its `this` value and this-binding status. What it does **not** carry
+is `[[FunctionObject]]` and the new-target: both are plain fields of the record that can only be set
+at construction, and a function environment has to exist *before* the function that closes over it is
+recorded (see below). Nothing a carried chain is consulted for reads them anyway: only an arrow reads
+`this`, `new target` or `super` through a chain, and an arrow is rebuilt by **evaluating** its source
+in the reading realm rather than instantiated in a carried one. An object, module or global record is
+refused by kind, and an import binding by name: a lookup walks a record's own binding list and
+nothing else.
+
+`REC_FUNCTION` gained an environment serial in the one position every grammar has (after the strict
+byte). The restore hands the rebuilt chain to the two grammars it *instantiates* — a function and a
+method — and keeps the reading realm's global for the two it *evaluates*, an arrow and a class
+constructor; a record that named an environment for one of those two is refused rather than quietly
+dropped.
+
+*The reader's one hard part.* A function record needs its environment before the function can exist
+(the instantiation takes it), while the environment's own bindings may hold that very function — the
+cycle `(function () { const self = function () { return self; }; return self; })()` is. So the
+environment is materialized **shell first** and its bindings are filled by `Builder::settle_envs`
+once the function that asked for it has been recorded, which is what makes a binding that holds the
+function and the function record resolve to **one** function rather than two.
+
+*Tests — three, each one mutated.* `a_closures_captured_binding_comes_back_with_it` (a closure over a
+local, round-tripped into a **different** realm, still reads the captured value; mutated to carry no
+environment it fails with deno's own `ReferenceError: "captured" is not defined`, and so does the
+reader-side mutation that hands the instantiation the reading realm's global instead);
+`a_closures_captured_binding_survives_a_function_environment` (the same promise where a `with`
+statement keeps the enclosing body off the certified path, so the chain is a **function** record —
+the probe in this part measured which kind each test reaches: one binding for the capture context,
+two for the function record); and `a_cycle_through_an_environment_comes_back_one_function` (mutated by
+settling the environment before recording the function, it answers two functions and fails on exactly
+that assertion).
+
+*And the deno measurement moved, to a named refusal.* Snapshot **creation** now walks the chain, so
+what it writes is the realm rather than a graph with every closure's state missing. What it refuses is
+the next mechanism, by name: `the engine cannot carry a typed array (a typed array's view and buffer
+are not carried yet)`. The probe that located it — a temporary kind test in `visit_env`, an engine
+edit made inside a measurement, stated here rather than smoothed over — says the typed arrays are
+**captured bindings**, not properties: `immediateInfo`, `tickInfo`, `callSiteRetBuf` and
+`callSiteRetBufU8` in `01_core.js`'s 207-binding IIFE scope, and `timerInfo` in another of 43
+bindings. They were invisible until this part, because the walk did not descend into a closure at all
+— which is why part 18's load reached `initialize_deno_core_ops_bindings` on a blob that could never
+have worked. Typed arrays are the next part.
+
+*Gates.* `cargo test --locked --workspace` green (runtime 869, test262 3,324, crux 248; the one
+documented aborting test skipped); `cargo fmt --all -- --check` clean;
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean; test262 `all` 48,464 pass /
+0 fail / 0 crash / 0 hang (158 skip) of 48,622, `intl402` 3,205 / 0 fail (152 skip); the eight wasm
+core suites 64,594 checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 tests / 0 fail. `snapshot::`
+goes from 64 tests to 67.
+
+*And the goal is the snapshot path, not the from-source one.* Booting deno with `startup_snapshot: None` **works** — measured end to end: deno's whole bootstrap runs on this engine, `example.js` loads, its `my:runtime` import resolves and calls the Rust op, and the run prints `Received this value from JS: Hello from example.js` and exits 0 — and it is explicitly **not** the goal: it skips the integration being tested, re-runs the host's JavaScript at every start, and is what a host falls back to when its snapshot is unusable. The next part is the environment record (design named in §12's eleventh item).
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -4529,6 +4609,44 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   needs is the method *parsed and instantiated* rather than evaluated, so the key
   expression is never evaluated at all. That is part 15.
 
+  **Seventeenth part — the environment chain, designed before it was written, and
+  landed.** The half part 18's measurement pointed at and §12's eleventh item
+  named. A closure's free names resolve through the records it closed over, and
+  deno's bootstrap reaches 191 functions that are all closures over 64 records
+  and 407 bindings (§7's probe), so those records travel with the function.
+  - **Format.** `REC_ENV` (tag 19): a kind byte (`0` declarative, `1` function), a
+    flags byte carrying transparency to the certified capture read, the `outer`
+    link, and the bindings. A binding is written in the four-field shape a
+    property is — name serial, the binding's own flag byte (mutable, strict,
+    deletable, parameter), value serial (`NO_REF` is the TDZ), one reserved — so
+    the reader that consumes that shape is the one that reads it. A function
+    record adds its `this` value and this-binding status after the bindings.
+    `REC_FUNCTION` gains an environment serial after its strict byte, where
+    `NO_REF` is the realm's own global environment — what every earlier blob
+    already meant.
+  - **Restore.** The chain is handed to the two grammars the restore
+    *instantiates* (a function and a method) in place of the reading realm's
+    global; an arrow and a class constructor keep the global, because they are
+    rebuilt by evaluating their source, and a record that named an environment
+    for them is refused rather than dropped. An environment is built **shell
+    first** and its bindings are filled by `settle_envs` once the function that
+    asked for it has been recorded — the only order that makes the cycle
+    `F -> E -> F` one function instead of two.
+  - **What this still does not carry:** `[[FunctionObject]]` and the new-target
+    (plain fields, settable only at construction, and read by nothing a carried
+    chain serves — only an arrow reads them, and an arrow is evaluated rather
+    than instantiated), an object, module or global record (refused by kind), and
+    an import binding (refused by name).
+  - **Acceptance tests.** Three in `crates/runtime/src/snapshot.rs`, each one
+    mutated: the captured local in another realm, the same promise through a
+    *function* record (the `with` that keeps the enclosing body uncertified), and
+    the environment cycle coming back one function. §7 has the mutations and the
+    battery, and the deno measurement that moved with the part: snapshot creation
+    now refuses the first thing the chain reaches that the format cannot carry —
+    a typed array in a captured binding (`01_core.js`'s `immediateInfo`,
+    `tickInfo`, `callSiteRetBuf`, `callSiteRetBufU8`, `timerInfo`), which is the
+    next part.
+
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -5002,6 +5120,48 @@ migrate, then delete.
    free names, one level up. So the next part is to carry a realm's global *lexical* bindings
    alongside its global object (or to state the limit and keep a host on the from-source path),
    a new mechanism rather than a larger version of this one.
+
+   **Measured, the limit was below that rather than above it.** Carrying the global *lexical*
+   bindings was implemented and moved deno's error not at all: `00_primordials.js` and
+   `01_core.js` are each an IIFE, so their names are closure variables rather than global lexical
+   bindings. It was reverted rather than landed — an unused field in a format whose compatibility
+   surface is what it writes is a cost with no buyer — and §7's record of the probe has the
+   numbers. The mechanism the load needed is the environment chain, one level *down*.
+
+   **The goal is the snapshot path; what it is missing is the environment chain.** Running deno
+   without a snapshot is not the goal — it skips the integration being tested and is what a host
+   falls back to when its snapshot is unusable — so the carried-heap path is the one to make work,
+   and it is blocked one level below the global: the format carries the value graph, not the
+   environment chain a closure was compiled in, and deno's bootstrap is IIFE-scoped
+   (`00_primordials.js` and `01_core.js` are each wrapped in one), so **every** function it installs
+   is a closure. Measured with a probe in the walk, against deno's own snapshot build: of the 191
+   non-intrinsic functions the walk reaches, **191 are closures**; their whole closure state is
+   **64 environment records, 407 bindings, 4 hops deep at most**, and every record is declarative
+   (52) or function (12) — no object, module, global or with environment among them. That is a
+   bounded mechanism rather than a heap image.
+
+   **The environment chain — landed** (named before the edit, §11's order), with §7's measurement,
+   tests and mutations. `REC_ENV` carries a **declarative** or a **function** record only: its kind,
+   its transparency, its outer link and its bindings, each binding in the four-field shape a property
+   already has (name serial, the binding's own flag byte, value serial where `NO_REF` is the TDZ, one
+   reserved), plus the `this` value and this-binding status of a function record. An object, module or
+   global record is refused by kind and an import binding by name; the realm's own global environment
+   is `NO_REF`, which is exactly what every earlier blob's absent environment means, so the format's
+   existing blobs keep their behavior. `[[FunctionObject]]` and the new-target do not travel: they are
+   plain fields of the record that can only be set at construction, and a function environment must
+   exist *before* the function that closes over it is recorded (shell first, filled by `settle_envs`
+   once that function is in `made`, which is the only order that makes the cycle `F -> E -> F` one
+   function). The restore passes the rebuilt chain to the two grammars it **instantiates** — a
+   function and a method — and keeps the reading realm's global for the two it **evaluates** (an arrow
+   and a class constructor), refusing a record that names one for those two rather than dropping it.
+   The global *lexical* bindings tried earlier stay reverted — they are not what a closure needs.
+
+   **And the next part is now named by a measurement.** With the chain carried, deno's snapshot
+   **creation** refuses the first thing it reaches that the format cannot carry: **a typed array in a
+   captured binding** — `01_core.js`'s `immediateInfo`, `tickInfo`, `callSiteRetBuf`,
+   `callSiteRetBufU8`, and `timerInfo` in another scope — which the walk could not see at all until it
+   descended into a closure. A typed array's view and buffer is therefore the next value record, and
+   the boundary's refusal inventory already lists it.
 
 12. **`Object.assign` and a function — landed, both roles fixed.** §7's
    measurement found it in passing: `Object.assign(function () {}, { tag: 7 })`
