@@ -3115,6 +3115,27 @@ change is in `runtime` — the realm constructor, which every runner links — a
 the numbers are unchanged from part 21's, which is what an inert seam should
 cost.
 
+*And the return value a property callback is given is real rather than refused.*
+The one design question the handler leaves open is what a `descriptor` answering
+`kYes` returns its descriptor *in*: a property operation has no call view to hold
+a slot, and `api::FunctionCallbackInfo` is `pub(crate)` and cannot be built
+outside a call. So the slot became the engine's own — `api::template.rs`'s
+`ReturnValue` is now `ReturnSlot`, with a `new` over storage the caller owns —
+and the bridge's `ReturnValue` carries either the engine's call view (a function
+callback) or one of those slots (a property callback, which the bridge reads once
+the callback returns). The engine's half is a rename plus one constructor, so the
+corpus and the wasm sweeps were re-run rather than argued about and reproduce
+their numbers; the bridge's half is the two constructor paths and setters that
+delegate to whichever slot they hold, and
+`function::tests::a_slot_backed_return_value_writes_where_the_caller_reads` pins
+that a write lands where the caller reads it (mutating `set_double`'s number
+fails it). The bridge's library tests go from 230 to 231 with it.
+What will read it is deno's own `descriptor` callback: its
+`rv.set(desc)` is a descriptor **object** in a `ReturnValue<Value>`, which the
+engine's `ToPropertyDescriptor` converts (`builtins/object.rs:272`), while its
+`query` puts attributes in a `ReturnValue<Integer>` — the encodings the handler
+has to honour.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)

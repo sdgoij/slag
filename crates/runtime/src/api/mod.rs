@@ -46,7 +46,7 @@ pub use script::Script;
 pub use stack_trace::StackFrame;
 pub use template::{
     FunctionCallback, FunctionCallbackInfo, FunctionTemplate, ObjectTemplate, PropertyAttributes,
-    ReturnValue,
+    ReturnSlot,
 };
 pub use try_catch::{Exception, TryCatch};
 #[cfg(feature = "wasm")]

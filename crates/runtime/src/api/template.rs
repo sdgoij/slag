@@ -66,16 +66,26 @@ impl FunctionCallbackInfo<'_> {
     }
 
     /// The host-side return-value slot (v8::FunctionCallbackInfo::GetReturnValue).
-    pub fn get_return_value(&self) -> ReturnValue<'_> {
-        ReturnValue(&self.return_value)
+    pub fn get_return_value(&self) -> ReturnSlot<'_> {
+        ReturnSlot(&self.return_value)
     }
 }
 
 /// The host-side return-value slot (v8::ReturnValue): set the callback's
 /// result. An unset slot yields *undefined*.
-pub struct ReturnValue<'a>(&'a RefCell<Option<Value>>);
+///
+/// A slot rather than a call view, because two kinds of callback have one: a
+/// function call, where [`FunctionCallbackInfo::get_return_value`] hands it out,
+/// and a property operation, where the host keeps the storage and reads it back
+/// to answer the engine — see [`ReturnSlot::new`].
+#[derive(Clone, Copy)]
+pub struct ReturnSlot<'a>(&'a RefCell<Option<Value>>);
 
-impl ReturnValue<'_> {
+impl<'a> ReturnSlot<'a> {
+    /// A slot over storage the caller owns.
+    pub fn new(storage: &'a RefCell<Option<Value>>) -> Self {
+        Self(storage)
+    }
     pub fn set(&self, value: Local) {
         *self.0.borrow_mut() = Some(value.into_value());
     }

@@ -166,10 +166,7 @@ impl FunctionCallbackInfo {
     }
 
     pub(crate) fn return_value(&self) -> ReturnValue<'_> {
-        ReturnValue {
-            info: self.info,
-            marker: PhantomData,
-        }
+        ReturnValue::from_call(self.engine())
     }
 
     pub(crate) fn length(&self) -> i32 {
@@ -279,9 +276,23 @@ impl<'s> FunctionCallbackArguments<'s> {
 /// Where a callback puts its result (v8::ReturnValue).
 ///
 /// Unset leaves `undefined`, as it does there.
+///
+/// Two callbacks have one, and only one of them has a call view: a function call
+/// (the engine's `FunctionCallbackInfo` owns the slot) and a property operation
+/// (a slot the caller keeps and reads back — see
+/// [`from_slot`](Self::from_slot)), so this carries either.
 pub struct ReturnValue<'s, T = Value> {
-    info: *const api::FunctionCallbackInfo<'static>,
+    target: ReturnTarget<'s>,
     marker: PhantomData<(&'s (), T)>,
+}
+
+/// What a [`ReturnValue`] writes through.
+#[derive(Clone, Copy)]
+enum ReturnTarget<'s> {
+    /// The engine's view of the call in progress.
+    Call(*const api::FunctionCallbackInfo<'static>),
+    /// A slot over storage the caller owns.
+    Slot(api::ReturnSlot<'s>),
 }
 
 impl<T> Clone for ReturnValue<'_, T> {
@@ -299,30 +310,57 @@ impl<T> std::fmt::Debug for ReturnValue<'_, T> {
 }
 
 impl<'s, T> ReturnValue<'s, T> {
+    /// The handle a function callback is given, over the engine's call view.
+    pub(crate) fn from_call(info: &api::FunctionCallbackInfo<'_>) -> Self {
+        Self {
+            // The pointer stays a pointer, and going through `*const ()` is
+            // what lets the engine's lifetime be erased here — the same route
+            // the call view's own constructor takes, for the same reason.
+            target: ReturnTarget::Call((info as *const _ as *const ()).cast()),
+            marker: PhantomData,
+        }
+    }
+
+    /// The handle a property callback is given, over storage the bridge keeps
+    /// and reads once the callback returns.
+    ///
+    /// The crate we stand in for hands one to a property callback, where there
+    /// is no call view to hold the slot; this is that handle's constructor, and
+    /// the property handler is what calls it.
+    pub fn from_slot(slot: &'s std::cell::RefCell<Option<crux::value::Value>>) -> Self {
+        Self {
+            target: ReturnTarget::Slot(api::ReturnSlot::new(slot)),
+            marker: PhantomData,
+        }
+    }
+
+    /// The slot this handle writes and reads.
+    fn slot(&self) -> api::ReturnSlot<'_> {
+        match self.target {
+            // SAFETY: as `from_call`: the view is live while the call runs.
+            ReturnTarget::Call(info) => unsafe { &*info }.get_return_value(),
+            ReturnTarget::Slot(slot) => slot,
+        }
+    }
+
     /// Set the call's result.
     pub fn set(&self, value: Local<'s, T>) {
-        // SAFETY: the callback is running, so the engine's call view is live.
-        unsafe { &*self.info }
-            .get_return_value()
-            .set(value.into_engine());
+        self.slot().set(value.into_engine());
     }
 
     /// Set the call's result to `undefined`.
     pub fn set_undefined(&self) {
-        // SAFETY: as `set`.
-        unsafe { &*self.info }.get_return_value().set_undefined();
+        self.slot().set_undefined();
     }
 
     /// Set the call's result to `null`.
     pub fn set_null(&self) {
-        // SAFETY: as `set`.
-        unsafe { &*self.info }.get_return_value().set_null();
+        self.slot().set_null();
     }
 
     /// Set the call's result to a boolean (`v8::ReturnValue::SetBool`).
     pub fn set_bool(&self, value: bool) {
-        // SAFETY: as `set`.
-        unsafe { &*self.info }.get_return_value().set_boolean(value);
+        self.slot().set_boolean(value);
     }
 
     /// Set the call's result to an `i32` (`v8::ReturnValue::SetInt32`).
@@ -331,31 +369,23 @@ impl<'s, T> ReturnValue<'s, T> {
     /// saying which range the value came from, and the value written is the
     /// same number either way.
     pub fn set_int32(&self, value: i32) {
-        // SAFETY: as `set`.
-        unsafe { &*self.info }
-            .get_return_value()
-            .set_number(value as f64);
+        self.slot().set_number(value as f64);
     }
 
     /// Set the call's result to a `u32` (`v8::ReturnValue::SetUint32`).
     pub fn set_uint32(&self, value: u32) {
-        // SAFETY: as `set`.
-        unsafe { &*self.info }
-            .get_return_value()
-            .set_number(value as f64);
+        self.slot().set_number(value as f64);
     }
 
     /// Set the call's result to a `f64` (`v8::ReturnValue::SetDouble`).
     pub fn set_double(&self, value: f64) {
-        // SAFETY: as `set`.
-        unsafe { &*self.info }.get_return_value().set_number(value);
+        self.slot().set_number(value);
     }
 
     /// Set the call's result to the empty string
     /// (`v8::ReturnValue::SetEmptyString`).
     pub fn set_empty_string(&self) {
-        // SAFETY: as `set`.
-        unsafe { &*self.info }.get_return_value().set_string("");
+        self.slot().set_string("");
     }
 }
 
@@ -504,6 +534,23 @@ mod tests {
     use super::*;
     use crate::data::Number;
     use crate::test_support::{bind, eval_number, in_context};
+
+    /// The return-value handle a *property* callback is given writes into storage
+    /// the caller keeps and reads back, which is the whole point of the second
+    /// backing: a property operation has no call view to hold a slot, so the
+    /// engine's own [`api::ReturnSlot`] is over storage the bridge owns.
+    #[test]
+    fn a_slot_backed_return_value_writes_where_the_caller_reads() {
+        let slot: std::cell::RefCell<Option<crux::value::Value>> = std::cell::RefCell::new(None);
+        let handle: ReturnValue<'_, Value> = ReturnValue::from_slot(&slot);
+        assert!(slot.borrow().is_none(), "a fresh slot is unset");
+        handle.set_double(7.0);
+        assert_eq!(
+            *slot.borrow(),
+            Some(crux::value::Value::Number(7.0)),
+            "the callback's result is where the caller reads it"
+        );
+    }
 
     /// A value set on a fresh object, for a function to carry as its data.
     ///
