@@ -163,6 +163,16 @@ pub fn parse_function_with_async(
     if is_async {
         parser.next()?; // `async`
     }
+    // This entry reads the `function` form, and `parse_function_expression`
+    // *consumes* the keyword without checking it — so a source that is not one
+    // would be read as an anonymous function with the keyword's place taken by
+    // whatever came first. A method definition's `m() {}` is that case: it parses
+    // that way, and silently, which is exactly the reconstruction this entry must
+    // not offer (a method needs its own grammar and its own home object).
+    if !parser.at_keyword(syntax::keywords::Keyword::Function)? {
+        let tok = parser.peek()?.clone();
+        return Err(parser.unexpected(&tok));
+    }
     let expr = expr::parse_function_expression(&mut parser, is_async)?;
     let tok = parser.peek()?.clone();
     if tok.kind != syntax::TokenKind::Eof {
@@ -1878,6 +1888,12 @@ mod tests {
         // Invalid bodies and parameter lists are syntax errors.
         assert!(parse_function("function f(a b) {}").is_err());
         assert!(parse_function("function f() { {").is_err());
+        // A source that is *not* the `function` form is refused rather than read
+        // as an anonymous function with the keyword's place taken by whatever
+        // came first — a method definition's text is the case that matters, and
+        // reading it here would silently lose the method-ness a record's own
+        // properties encode.
+        assert!(parse_function("m() { return 41; }").is_err());
     }
 
     #[test]

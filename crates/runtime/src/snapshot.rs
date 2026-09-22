@@ -149,6 +149,7 @@ const REC_HOST_CALLBACK: u8 = 16;
 const GRAMMAR_FUNCTION: u8 = 0;
 const GRAMMAR_CLASS: u8 = 1;
 const GRAMMAR_ARROW: u8 = 2;
+const GRAMMAR_METHOD: u8 = 3;
 
 const FLAG_ENUMERABLE: u8 = 1;
 const FLAG_CONFIGURABLE: u8 = 2;
@@ -331,11 +332,13 @@ enum Record {
     /// A host pointer, by its index in the host's external-reference table.
     External(u32),
     /// A function: which grammar its source is read in, that source, whether it
-    /// is strict, and its object part.
+    /// is strict, its [[HomeObject]] when the grammar is a method, and its object
+    /// part.
     Function {
         grammar: Grammar,
         source: Vec<u16>,
         strict: bool,
+        home: u32,
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
@@ -816,7 +819,11 @@ fn visit(
                             visit(agent, realm, externals, host, data, objects, serials)?;
                         }
                     }
-                    Callable::Body { .. } => {}
+                    Callable::Body { home, .. } => {
+                        if let Some(home) = home {
+                            visit(agent, realm, externals, host, home, objects, serials)?;
+                        }
+                    }
                 }
                 for child in children(&function.object)? {
                     visit(agent, realm, externals, host, child, objects, serials)?;
@@ -864,11 +871,13 @@ fn canonical(value: Value) -> Value {
 /// closed over.
 enum Callable<'a> {
     /// A JavaScript function with a body: which grammar its source is read in,
-    /// the source itself, and its [[Strict]].
+    /// the source itself, its [[Strict]], and — for the one grammar that has
+    /// one — its [[HomeObject]].
     Body {
         grammar: Grammar,
         source: &'a JsString,
         strict: bool,
+        home: Option<Value>,
     },
     /// A bind exotic: the target, the bound `this`, and the bound arguments.
     Bound {
@@ -891,6 +900,10 @@ enum Grammar {
     /// An arrow function's source, which is an expression rather than a form with
     /// a `function` keyword — so it is evaluated, not parsed.
     Arrow,
+    /// A method definition's source: `m() {}`, `get x() {}` — the production's
+    /// own text, which has no `function` keyword either. The one grammar whose
+    /// record also carries a [[HomeObject]].
+    Method,
 }
 
 impl Grammar {
@@ -899,6 +912,7 @@ impl Grammar {
             Grammar::Function => GRAMMAR_FUNCTION,
             Grammar::Class => GRAMMAR_CLASS,
             Grammar::Arrow => GRAMMAR_ARROW,
+            Grammar::Method => GRAMMAR_METHOD,
         }
     }
 
@@ -907,8 +921,15 @@ impl Grammar {
             GRAMMAR_FUNCTION => Some(Grammar::Function),
             GRAMMAR_CLASS => Some(Grammar::Class),
             GRAMMAR_ARROW => Some(Grammar::Arrow),
+            GRAMMAR_METHOD => Some(Grammar::Method),
             _ => None,
         }
+    }
+
+    /// Whether this grammar's record carries a [[HomeObject]] after its strict
+    /// byte: true for a method and for nothing else.
+    fn carries_home(self) -> bool {
+        self == Grammar::Method
     }
 
     /// How a message names this grammar's source text: `its class source …`.
@@ -917,6 +938,7 @@ impl Grammar {
             Grammar::Function => "function",
             Grammar::Class => "class",
             Grammar::Arrow => "arrow",
+            Grammar::Method => "method",
         }
     }
 }
@@ -1000,10 +1022,12 @@ fn callable<'a>(
                 // that refusal would be a false diagnosis for it.
                 Grammar::Class
             } else if data.is_method {
-                return Err(Unsupported::new(
-                    "a method",
-                    "a method's source has no `function` keyword, so it cannot be re-parsed on its own",
-                ));
+                // A method's source is the MethodDefinition it was written as, so
+                // it is evaluated where it is being restored rather than parsed —
+                // `parse_function` wants a `function` keyword a method has none
+                // of. Checked **after** the class constructor, which is a method
+                // definition too but whose source is the class.
+                Grammar::Method
             } else if data.this_mode == crate::function::ThisMode::Lexical {
                 // An arrow: its source is an expression, not a form a function
                 // parser can read, so it is carried the way a class is — evaluated
@@ -1017,6 +1041,7 @@ fn callable<'a>(
                 grammar,
                 source,
                 strict: data.strict,
+                home: grammar.carries_home().then_some(data.home_object).flatten(),
             })
         }
     }
@@ -1261,7 +1286,10 @@ fn write_record(
                     grammar,
                     source,
                     strict,
-                } => write_function(realm, &function, grammar, source, strict, serials, body)?,
+                    home,
+                } => write_function(
+                    realm, &function, grammar, source, strict, home, serials, body,
+                )?,
                 Callable::Bound { .. } => write_bound_function(realm, &function, serials, body)?,
                 Callable::HostCallback { pointer, data } => {
                     write_host_callback(realm, &function, pointer, data, externals, serials, body)?
@@ -1341,18 +1369,28 @@ fn write_object(
 /// free name through the realm's global environment rather than through the
 /// scope it was compiled in. A function whose body is not self-contained is
 /// refused upstream.
+#[allow(clippy::too_many_arguments)]
 fn write_function(
     realm: &Handle<Realm>,
     function: &Handle<Function>,
     grammar: Grammar,
     source: &JsString,
     strict: bool,
+    home: Option<Value>,
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
 ) -> Result<(), Unsupported> {
     body.push(REC_FUNCTION);
     body.push(grammar.byte());
     body.push(u8::from(strict));
+    // A method's [[HomeObject]], which `super` resolves through, is the one value
+    // the record carries beside the source; `NO_REF` when the engine kept none.
+    if grammar.carries_home() {
+        write_u32(
+            body,
+            home.map_or(NO_REF, |home| serial_in(realm, serials, home)),
+        );
+    }
     write_units(body, source.as_slice());
     write_u32(body, prototype_serial(realm, &function.object, serials)?);
     body.push(u8::from(function.object.extensible.get()));
@@ -1582,6 +1620,11 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             let byte = reader.u8().ok_or(DecodeError::Truncated)?;
             let grammar = Grammar::from_byte(byte).ok_or(DecodeError::BadGrammar(byte))?;
             let strict = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let home = if grammar.carries_home() {
+                reader.u32().ok_or(DecodeError::Truncated)?
+            } else {
+                NO_REF
+            };
             let source = reader.units().ok_or(DecodeError::Truncated)?;
             let proto = reader.u32().ok_or(DecodeError::Truncated)?;
             let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
@@ -1590,6 +1633,7 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 grammar,
                 source,
                 strict,
+                home,
                 proto,
                 extensible,
                 properties,
@@ -1822,14 +1866,15 @@ impl Builder<'_> {
                 grammar,
                 source,
                 strict,
+                home,
                 proto,
                 extensible,
                 properties,
             } => {
                 let function = match grammar {
                     Grammar::Function => self.build_function(source, *strict, *proto)?,
-                    Grammar::Class | Grammar::Arrow => {
-                        self.build_evaluated_function(source, *proto, *grammar)?
+                    Grammar::Class | Grammar::Arrow | Grammar::Method => {
+                        self.build_evaluated_function(source, *proto, *strict, *grammar, *home)?
                     }
                 };
                 // Recorded before the properties are defined, so an own
@@ -1952,26 +1997,33 @@ impl Builder<'_> {
     /// An evaluated-function record: the source is evaluated as an expression in
     /// the realm being restored, and the function it produces is the value.
     ///
-    /// A class constructor's `[[SourceText]]` is the class and an arrow's is the
-    /// arrow — both complete expressions, and neither parseable by
-    /// `parse_function`, which expects a `function` keyword. So both are rebuilt
-    /// the way they were created: by evaluating them, which is what brings back
-    /// what the engine's own creation path gives a closure — for a class its
-    /// `[[ConstructorKind]]`, home object, prototype object, fields and private
-    /// environment, for an arrow its lexical `[[ThisMode]]` and its deferred
-    /// absence of a `prototype` — rather than an approximation assembled from a
-    /// record.
+    /// A class constructor's `[[SourceText]]` is the class, an arrow's is the
+    /// arrow, and a method's is its MethodDefinition (`m() {}`, `get x() {}`) —
+    /// none of them parseable by `parse_function`, which expects a `function`
+    /// keyword. So all three are rebuilt the way they were created: by evaluating
+    /// them, which is what brings back what the engine's own creation path gives a
+    /// closure — for a class its `[[ConstructorKind]]`, home object, prototype
+    /// object, fields and private environment, for an arrow its lexical
+    /// `[[ThisMode]]` and its deferred absence of a `prototype`, for a method its
+    /// `[[HomeObject]]`, its absence of a `prototype`, and its strictness.
+    ///
+    /// A method needs the object the source sits in: an object literal's first own
+    /// property is the one the source defined, and its descriptor says which of
+    /// the three forms it is — a data property is the method, an accessor
+    /// property's `[[Get]]` or `[[Set]]` is the getter or the setter.
     ///
     /// The divergences are the module docs': a class's definition-time code (a
     /// computed key, a `static {}` block, a static field initializer) runs again
-    /// here, and the evaluation is the **reading** realm's, so an arrow's captured
-    /// `this` and any free name are that realm's global rather than the scope the
-    /// original closed over.
+    /// here, a method's computed property name is evaluated again, and the
+    /// evaluation is the **reading** realm's, so a captured `this` or free name is
+    /// that realm's global rather than the scope the original closed over.
     fn build_evaluated_function(
         &mut self,
         source: &[u16],
         proto: u32,
+        strict: bool,
         grammar: Grammar,
+        home: u32,
     ) -> Result<Handle<Function>, DecodeError> {
         let proto = self.prototype(proto)?.ok_or_else(|| {
             DecodeError::UnrebuildableFunction("the record names no prototype".into())
@@ -1982,28 +2034,59 @@ impl Builder<'_> {
         })?;
         let realm = *self.realm;
         // A bootstrap execution context makes the realm current, so the source is
-        // evaluated where the restore is materializing it, and it is wrapped in
-        // parentheses so it reads as an expression: for a class that keeps the
+        // evaluated where the restore is materializing it. A class's source is
+        // wrapped in parentheses so it reads as an expression — which keeps the
         // class name bound inside the class rather than in the reading realm's
-        // global scope, and for an arrow it is the parenthesis an arrow needs
-        // wherever it appears. Popped on every path.
+        // global scope — and an arrow's needs the parenthesis wherever it appears.
+        // A method's source is wrapped further, in the object literal it is a
+        // property of, which is the only form a MethodDefinition has. Popped on
+        // every path.
+        //
+        // The `strict` byte decides whether the wrapper is strict *code*: a class
+        // method is strict whatever its body says, an object method inherits the
+        // strictness of the code around it, and the evaluation has no other way to
+        // know. It is a prefix rather than a directive, so it shifts the text the
+        // method's own `[[SourceText]]` is sliced from — the slice is still the
+        // method, since the evaluation is what captures it.
+        let wrapper = match grammar {
+            Grammar::Method => ("({", "})"),
+            _ => ("(", ")"),
+        };
+        let prefix = if strict { "\"use strict\"; " } else { "" };
         self.agent.push_bootstrap_context(realm);
-        let value = self.agent.run_script(&format!("({text})"));
+        let value = self
+            .agent
+            .run_script(&format!("{prefix}{}{text}{}", wrapper.0, wrapper.1));
         self.agent.execution_context_stack.pop();
         let value = value.map_err(|error| {
             DecodeError::UnrebuildableFunction(format!(
                 "its {kind} source could not be evaluated: {error}"
             ))
         })?;
-        let function = value.as_function().ok_or_else(|| {
-            DecodeError::UnrebuildableFunction(format!(
-                "its source did not evaluate to {}",
-                match grammar {
-                    Grammar::Class => "a class",
-                    _ => "a function",
-                }
-            ))
-        })?;
+        let function = if grammar.carries_home() {
+            let method = self.method_of(value)?;
+            if home != NO_REF {
+                let home = self.materialize(home)?;
+                crate::function::make_method(self.agent, &Value::Function(method), home).map_err(
+                    |error| {
+                        DecodeError::UnrebuildableFunction(format!(
+                            "its [[HomeObject]] could not be set: {error}"
+                        ))
+                    },
+                )?;
+            }
+            method
+        } else {
+            value.as_function().ok_or_else(|| {
+                DecodeError::UnrebuildableFunction(format!(
+                    "its source did not evaluate to {}",
+                    match grammar {
+                        Grammar::Class => "a class",
+                        _ => "a function",
+                    }
+                ))
+            })?
+        };
         // The evaluation sets the function's own prototype link from what it
         // derived; the record's is what the blob was written with, so it wins.
         function
@@ -2015,6 +2098,54 @@ impl Builder<'_> {
                 ))
             })?;
         Ok(function)
+    }
+
+    /// The function a method record's object literal defined: its **first** own
+    /// property, whichever of the three method forms the source was.
+    ///
+    /// The source is one MethodDefinition, so the literal it is wrapped in has
+    /// exactly one property — but which *kind* of property depends on the source,
+    /// and that is what the descriptor tells us rather than the record: a data
+    /// property is a plain method, and an accessor property's `[[Get]]` or
+    /// `[[Set]]` is the getter or the setter. A setter's source (`set x(v) {}`)
+    /// wraps to an accessor with only `[[Set]]`, so the two are told apart by
+    /// which one is present, not by asking the engine which it meant.
+    fn method_of(&mut self, value: Value) -> Result<Handle<Function>, DecodeError> {
+        let object = value.as_object().ok_or_else(|| {
+            DecodeError::UnrebuildableFunction(
+                "its source did not evaluate to an object literal".into(),
+            )
+        })?;
+        let keys = object
+            .own_property_keys()
+            .map_err(|_| DecodeError::Truncated)?;
+        let key = keys.first().cloned().ok_or_else(|| {
+            DecodeError::UnrebuildableFunction(
+                "its source defined no property, so there is no method".into(),
+            )
+        })?;
+        let property = object
+            .get_own_property_key(&key)
+            .map_err(|_| DecodeError::Truncated)?
+            .ok_or_else(|| {
+                DecodeError::UnrebuildableFunction(
+                    "its source's own property could not be read back".into(),
+                )
+            })?;
+        let function = match &property.kind {
+            PropertyKind::Data { value, .. } => value.as_function(),
+            PropertyKind::Accessor { get, set } => {
+                get.as_ref()
+                    .or(set.as_ref())
+                    .and_then(|function| match function.kind() {
+                        ValueKind::Function(function) => Some(function),
+                        _ => None,
+                    })
+            }
+        };
+        function.ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("its source's first property is not a method".into())
+        })
     }
 
     /// A function record, rebuilt from the source text it carries.
@@ -3192,6 +3323,29 @@ mod tests {
         run_restored(isolate, realm, function, &format!("restored({arguments})"))
     }
 
+    /// Run `body` with `value` installed as `restored`, answering `"returned"`
+    /// when it completed and the thrown value's constructor name when it did not
+    /// — which is how a strictness difference shows up.
+    fn outcome_restored(
+        isolate: &api::Isolate,
+        realm: &Handle<Realm>,
+        value: Value,
+        body: &str,
+    ) -> String {
+        run_restored(
+            isolate,
+            realm,
+            value,
+            &format!(
+                "(function () {{ try {{ {body} return 'returned'; }} \
+                 catch (e) {{ return e.constructor.name; }} }})()"
+            ),
+        )
+        .as_string()
+        .map(|text| text.to_string_lossy())
+        .unwrap_or_default()
+    }
+
     /// A JavaScript function is carried as the source text it can be re-parsed
     /// from, and the restore makes a callable value of it — which is the whole
     /// of what a host does with one.
@@ -3593,6 +3747,153 @@ mod tests {
         );
     }
 
+    /// A method's `[[SourceText]]` is its MethodDefinition — `m() {}`, with no
+    /// `function` keyword — so it is carried as the method grammar and the restore
+    /// evaluates it as a property of an object literal rather than parsing it.
+    #[test]
+    fn a_method_round_trips_and_is_callable() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let method = context
+            .try_eval("({ m() { return 41; } }).m")
+            .expect("a method")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, method);
+        let back = back.as_function().expect("a function");
+        assert_eq!(
+            call_restored(&isolate, &realm, Value::Function(back), "").as_number(),
+            Some(41.0),
+            "the restored method runs its body"
+        );
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                Value::Function(back),
+                "restored.toString()"
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("m() { return 41; }".to_string()),
+            "and answers its own source, which the restore's own evaluation captured"
+        );
+        // A method has no own `prototype` and must not gain one: the deferred
+        // MakeConstructor a plain function gets would materialize here, which is
+        // what reading the source as a *function* would produce.
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                Value::Function(back),
+                "Object.getOwnPropertyDescriptor(restored, 'prototype') === undefined ? 1 : 0"
+            )
+            .as_number(),
+            Some(1.0),
+            "a restored method is a method, not a plain function"
+        );
+    }
+
+    /// A method's `[[HomeObject]]` is what `super` resolves through, and it is the
+    /// one value a method record carries beside its source: without it the restore
+    /// evaluates the method inside a temporary object literal, and `super` looks
+    /// in that instead of in the object the method was written in.
+    #[test]
+    fn a_method_reaches_super_through_its_carried_home_object() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let method = context
+            .try_eval(
+                "var proto = { greet() { return 41; } };\n\
+                 var holder = { __proto__: proto, m() { return super.greet(); } };\n\
+                 holder.m",
+            )
+            .expect("a method")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, method);
+        assert_eq!(
+            call_restored(&isolate, &realm, back, "").as_number(),
+            Some(41.0),
+            "super reached the home object's prototype, which the record carried"
+        );
+    }
+
+    /// The strict byte is not decoration. A class method is strict whatever its
+    /// own body says and an object method inherits the strictness of the code it
+    /// was written in, and the evaluation the restore runs is the only place that
+    /// can be told which — so the wrapper is strict code exactly when the record
+    /// says strict. The class half is also the shape deno's walk reaches next: a
+    /// class **with** a method, whose prototype's method is carried through the
+    /// class record's own graph.
+    #[test]
+    fn a_methods_strictness_survives_the_restore() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let class = context
+            .try_eval("(class { strict() { classLeak = 1; } ok() { return 41; } })")
+            .expect("a class")
+            .into_value();
+        let method = context
+            .try_eval("({ sloppy() { objectLeak = 1; return 41; } }).sloppy")
+            .expect("an object method")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, class);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "new restored().ok()").as_number(),
+            Some(41.0),
+            "a class's own method came back through the class's prototype"
+        );
+        // `strict` throws before it can answer anything, so the strictness is read
+        // from what the *call* threw rather than from what it returned.
+        assert_eq!(
+            outcome_restored(&isolate, &realm, back, "new restored().strict();"),
+            "ReferenceError",
+            "a class method is strict, and the restore made its code strict"
+        );
+
+        let back = round_trip(&isolate, &realm, method);
+        assert_eq!(
+            outcome_restored(&isolate, &realm, back, "restored();"),
+            "returned",
+            "an object method written in sloppy code comes back sloppy"
+        );
+    }
+
+    /// The same wrapper decides an arrow's strictness, which the tenth part had
+    /// been losing: an arrow written in strict code was restored as sloppy.
+    #[test]
+    fn an_arrows_strictness_survives_the_restore() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let strict = context
+            .try_eval("\"use strict\"; (() => { arrowLeak = 1; })")
+            .expect("a strict arrow")
+            .into_value();
+        let sloppy = context
+            .try_eval("(() => { otherLeak = 1; })")
+            .expect("a sloppy arrow")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, strict);
+        assert_eq!(
+            outcome_restored(&isolate, &realm, back, "restored();"),
+            "ReferenceError",
+            "an arrow from strict code is still strict after the restore"
+        );
+        let back = round_trip(&isolate, &realm, sloppy);
+        assert_eq!(
+            outcome_restored(&isolate, &realm, back, "restored();"),
+            "returned",
+            "and one from sloppy code is still sloppy"
+        );
+    }
+
     /// The class's private environment and its field initializer come back with
     /// it, because the restore re-runs the engine's own class evaluation: a
     /// public field that reads the class's own **private** field is the smallest
@@ -3657,41 +3958,33 @@ mod tests {
         );
     }
 
-    /// Each function the format cannot carry is refused by the kind it is: the
-    /// fix differs, so the message does. The source-less case is now the
-    /// **accessor** — a `get`/`set` body, for which the engine keeps no
-    /// `[[SourceText]]` at all (its frame carries the text it was parsed from;
-    /// its own text is method-form and is part of the method work) — and a
-    /// class or arrow defined inside a `Function`-built body is *carried* now,
-    /// because that body's frame carries the assembled text its spans belong to.
+    /// A function the format cannot carry is refused by the kind it is, so the
+    /// message names the fix. The source-less kind is now the **accessor** — a
+    /// `get`/`set` body, whose `[[SourceText]]` is method-form and which the engine
+    /// keeps none for, the second half of the method part — while a **method** is
+    /// carried now, and a class or arrow defined inside a `Function`-built body
+    /// with it, because that body's frame carries the assembled text their spans
+    /// belong to.
     #[test]
     fn an_uncarried_function_is_refused_by_kind() {
         let mut isolate = api::Isolate::new();
         let context = api::Context::new(&mut isolate).expect("a realm");
         let realm = *context.realm();
-        for (source, expected, detail) in [
-            (
-                "Object.getOwnPropertyDescriptor({ get x() { return 1; } }, 'x').get",
-                "a function",
-                "no source text",
-            ),
-            (
-                "({ m() { return 1; } }).m",
-                "a method",
-                "`function` keyword",
-            ),
-        ] {
-            let value = context
-                .try_eval(source)
-                .expect("a value to refuse")
-                .into_value();
-            let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
-            assert_eq!(
-                error.type_name, expected,
-                "{source} was refused as something else"
-            );
-            assert!(error.detail.contains(detail), "{source}: {}", error.detail);
-        }
+        let source = "Object.getOwnPropertyDescriptor({ get x() { return 1; } }, 'x').get";
+        let value = context
+            .try_eval(source)
+            .expect("a value to refuse")
+            .into_value();
+        let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
+        assert_eq!(
+            error.type_name, "a function",
+            "{source} was refused as something else"
+        );
+        assert!(
+            error.detail.contains("no source text"),
+            "{source}: {}",
+            error.detail
+        );
     }
 
     /// A host callback is a Rust closure in this engine rather than an address or

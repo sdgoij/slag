@@ -902,6 +902,41 @@ mod tests {
         );
     }
 
+    /// A method comes back callable, with the `[[HomeObject]]` its `super`
+    /// resolves through — the one value a method record carries beside its source,
+    /// and the shape a host's attached objects are usually made of.
+    #[test]
+    fn a_method_round_trips_and_reaches_super_from_a_script() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let method = crate::test_support::eval(
+                scope,
+                "var proto = { greet() { return 41; } };\n\
+                 var holder = { __proto__: proto, m() { return super.greet(); } };\n\
+                 holder.m",
+            );
+            scope.add_context_data(context, method);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let method = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the method");
+        crate::test_support::bind(scope, "restored", method);
+        assert_eq!(crate::test_support::eval_number(scope, "restored()"), 41.0);
+    }
+
     /// The console this bridge installs is the one host function no host had a
     /// chance to register — the bridge makes it for every context, including the
     /// ones a snapshot is taken of — so the bridge puts its callback in the table

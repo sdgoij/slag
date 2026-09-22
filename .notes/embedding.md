@@ -2740,6 +2740,22 @@ Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --
 
 *And the next value is a method.* Re-measured the same way, deno's `create_blob` now gets past `async_op_0` and stops on `v8::SnapshotCreator::create_blob: the engine cannot carry a method (a method's source has no `function` keyword, so it cannot be re-parsed on its own) yet` — ledger part 8, the kind the seventh and tenth parts both left named as open. A method's `[[SourceText]]` is method-form (`m() {}`) and needs a parse context of its own plus its carried `[[HomeObject]]`; the same context is what an accessor needs.
 
+**A method — landed, and deno's walk reaches the realm's own builtins.** The eighth part of ledger item 16, designed and implemented in one step because the measurement named it exactly.
+
+*What the value is, measured.* A probe in the walk's method refusal printed `name=None method=true ctor=false async=false gen=false strict=true lexical=false source=Some("__setTickInfo(buf) {\n      tickInfo = buf;\n    }") home=Some("object")` — an ordinary, strict object-literal method with an object home object and no `name` on the record (its `name` is an own property, which the property tail already carries). So the engine has kept the `[[SourceText]]` all along — a method's `toString` answers `m() {}` — and what the record lacked was the *grammar* to read it back by.
+
+*The grammar, and the value it carries with it.* `GRAMMAR_METHOD` (byte 3) and, because a method is the one callable whose `[[HomeObject]]` is part of what makes it one, a home-object serial in `REC_FUNCTION` written and read only when the grammar says so — the layout stays one reader and one writer with a grammar-conditional field. The walk's method refusal became `Grammar::Method` carrying `data.home_object`, and `visit` descends into the home object like every other value a carryable's state is made of, so a home the format cannot carry refuses by name as any other edge does. `build_evaluated_function` gained the method case: it evaluates `({<source>})` — the object literal a MethodDefinition is only valid inside — and takes the temporary object's **first own property descriptor**, which is what lets one path serve all three forms (a data property's value is the method, an accessor's `[[Get]]`/`[[Set]]` is the getter/setter), then `make_method` puts the record's home object back over the temporary one. The restored method's own source is re-captured by that evaluation, so it answers `m() {}` and a second round trip is stable.
+
+*The strict wrapper, which the evaluated grammars had been losing.* A class method is strict whatever its body says and an object method inherits the strictness of the code around it, so the record's `strict` byte decides whether the wrapper is strict *code* (`"use strict"; ({<source>})`). The span arithmetic is unaffected — the prefix shifts the text the method's own slice is taken from, and the slice is still the method — and the same one line closes the **arrow** record's version of the gap, which had been restoring a strict arrow sloppy since the tenth part.
+
+*And the parse entry had been lying about why.* Writing the mutation for the grammar choice is what showed it: with a method written through `Grammar::Function`, the method's `round_trip` *passed*. `parse_function_expression` consumes the `function` keyword without checking it, so `parse_function("m() { return 41; }")` reads the `m` as if it were the keyword and answers an *anonymous* function with the same body — which is why the grammar's own refusal message ("it cannot be re-parsed on its own") was not what happened. `parse_function_with_async` now checks for the keyword (the parser's own test pins it), which is the premise the grammar choice rests on, and reading a method as a function is now refused where it used to be silently wrong: it loses `[[HomeObject]]` — a body with `super` fails as an early error, `super is only valid inside class methods` — and gives the closure the deferred `prototype` a plain function gets, which a method must never have.
+
+*Tests.* Four engine (a method round trips, is callable, answers its source, and has **no** `prototype`; a method reads `super` through a home object set by `__proto__`, which is the test the serial exists for; a class **with** a method round trips, constructs, and its method is still strict — the shape deno reaches next — while an object method written in sloppy code comes back sloppy; and a strict arrow comes back strict while a sloppy one stays sloppy), one bridge (a method attached as context data, restored, reaching `super` from a script — the same restore path the engine mutation guards), and the refusal-by-kind test re-aimed to the **accessor** alone, since a method is positive coverage now. **Eight mutations, each caught**: the method grammar read as the function grammar, the home serial not written, not applied, not walked, read but ignored, the wrapper never strict, the wrapper always strict, and the parse entry's keyword check.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **848 → 852 passed / 0 failed**; `cargo test -p parser --lib` 86 passed / 0 failed; `cargo test -p v8 --features simdutf --lib -- --skip the_data_a_built_function_carries_survives_a_collection` **223 → 224 passed / 0 failed / 1 filtered**; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,224 → 5,229 passed / 0 failed / 4 ignored**. `crates/runtime` **and** `crates/parser` changed, so the battery ran: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail. One `all` run before the re-run reported crashes in a `decodeURIComponent` batch and two typed-array hangs and is recorded as **environment**: the disk was at 100% (18G free) during it, the named fixtures pass one by one and whole-batch, and every run since — including the last, with the release binaries rebuilt after the final source edit — reproduces the certified numbers exactly.
+
+*And the next value is the realm's own builtin functions.* Re-measured the same way, `create_blob` now carries the method and stops on `a built-in function (a host callback is a Rust closure, not a name or an address a snapshot can carry)` — with the probe saying `name=Some("abs") own_name=Some("abs") length=Some(1.0) construct=false host=true`, i.e. **`Math.abs`**, a value the host's table legitimately cannot hold because the *engine* made it. It is reached as a value rather than through `%Math%` (which the walk stops at, being named) because deno's `00_primordials.js` copies the realm's builtins into its primordials object — `MathAbs`, `MathMax`, `ArrayPrototypePush`, … — so the walk can meet *any* builtin the realm installs. What that wants is part 6's own mechanism applied past the ten globals: a builtin function the reading realm rebuilds should be written by **name**, which means the realm has to name the functions it installs on its intrinsic objects. That is the twelfth part, and it is the next value.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3924,6 +3940,98 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   native form. Bridge: the stack-trace test's expectation moves with the
   measurement.
 
+  **Eighth part — carrying a method, designed before it was written, and landed.**
+  Named in the seventh part and deferred twice, because the tenth and eleventh
+  parts were the kinds the measurements reached first. A probe on the walk's
+  method refusal says what the value is: `__setTickInfo(buf) {tickInfo = buf;}`, an
+  ordinary object-literal method, **strict**, not async and not a generator, with
+  an object home object and no `name` on the record (its `name` is an own
+  property, which the record's property tail already carries). The engine has kept
+  its `[[SourceText]]` all along — a method's `toString` answers `m() {}` — so
+  this is the first part whose text the engine has and whose *grammar* it lacks.
+
+  - **What the spec says the source is, per kind.** MethodDefinition,
+    GeneratorMethod, AsyncMethod and AsyncGeneratorMethod each set
+    `[[SourceText]]` to the source text matched by that production — the property
+    name and the parameter list, with no `function` keyword
+    (spec.html:24626-24715) — which is what the engine captures for a method
+    today. An **accessor** is a MethodDefinition alternative
+    (`get ClassElementName ( ) { FunctionBody }`), so its source is
+    `get x() {}` *including* the keyword (spec.html:24653-24670) — and that is the
+    half the engine keeps nothing for, because the AST nodes for `get`/`set`
+    carry no span covering the keyword. It is the **second half** of this part.
+  - **The parse entry had been doing the wrong thing quietly, and the mutation
+    sweep is what showed it.** `parse_function_expression` consumes the
+    `function` keyword *without checking it*, so `parse_function` reads a
+    method's `m() {}` as an *anonymous* function with the keyword's place taken
+    by whatever came first — the grammar refusal's own diagnosis ("it cannot be
+    re-parsed on its own") was not what the parser did. `parse_function_with_async`
+    now checks for the keyword first, which is the premise the grammar choice
+    rests on and the reason the method grammar is not merely a spelling of the
+    function one: reading a method as a function loses `[[HomeObject]]` (so
+    `super` cannot resolve — a body containing it is refused outright, as an
+    early error: `super is only valid inside class methods`) and gives the
+    closure the deferred `prototype` a plain function gets, which a method must
+    never have.
+  - **Format.** `GRAMMAR_METHOD` (byte 3), and — a method being the one callable
+    whose `[[HomeObject]]` is part of what makes it one — a **home-object serial**
+    in `REC_FUNCTION` when the grammar says so, `NO_REF` for a method the engine
+    kept none for. The serial follows the strict byte, so the layout stays one
+    reader and one writer with a grammar-conditional field; a layout change is
+    still part of v1.
+  - **The walk.** `callable()`'s method refusal becomes `Grammar::Method` carrying
+    `data.home_object`, and `visit` descends into the home object like every other
+    value a carryable's state is made of, so a home object the format cannot
+    carry refuses by name exactly as any other edge does. A *synthesized*
+    method-form body — a static block's closure, a field initializer's — has no
+    method-definition text; it is carried as a method too and refuses at
+    **restore**, as `UnrebuildableFunction`, the class and arrow records' own
+    precedent for a source that will not evaluate. Neither is reachable from a
+    host's graph: a class's field records are not carried, and a static block's
+    closure is nobody's property.
+  - **Restore.** Evaluate `({<source>})` — the object literal a MethodDefinition
+    is only valid inside, and the class and arrow records' path, so
+    `build_evaluated_function` gains the method case — and take the temporary
+    object's **first own property descriptor**: a data property's value is the
+    method, an accessor property's `[[Get]]` or `[[Set]]` is the getter or the
+    setter, which is what lets one path serve all three forms. Then
+    `function::make_method(closure, home)` puts the record's home object back over
+    the temporary one, which is the whole reason the serial exists. The
+    prototype/extensible/properties tail is unchanged, and the restored method's
+    own `[[SourceText]]` is re-captured from the evaluation — the slice of the
+    wrapped text at the method's span — so it answers `m() {}` and a second round
+    trip is stable.
+  - **Strictness, which the evaluated grammars had been losing.** A class method
+    is strict whatever its body says and an object method inherits the strictness
+    of the code around it, so the record's `strict` byte is not decoration: the
+    restore wraps the source in **strict code** when the record says strict
+    (`"use strict"; ({<source>})`) and in plain code when it does not. The span
+    arithmetic is unaffected — the wrapper shifts the text the method's own slice
+    is taken from, and the slice is still the method — and it closes the same gap
+    for the **arrow** record, which had been restoring a strict arrow sloppy since
+    the tenth part.
+
+  *What it still does not carry.* An **accessor**, until its half lands (the AST
+  span for the `get`/`set` keyword). A method's definition-time code: a computed
+  property name is re-evaluated at restore, the class record's stated divergence.
+  And a method's **scope**: like every function record, a free name in the body
+  resolves in the reading realm's global, which is where the measured deno
+  method's `tickInfo` will resolve rather than to the module that closed over it.
+
+  *Acceptance tests — all landed.* Four engine: an object-literal method round
+  trips, is callable, answers its own source and has **no** `prototype`; a method
+  reads `super` through a home object set by `__proto__`, which is the test the
+  serial exists for; a class **with** a method round trips, constructs and keeps
+  its method strict (an undeclared assignment throws after the restore) while an
+  object method written in sloppy code comes back sloppy; and a **strict arrow**
+  comes back strict while a sloppy one stays sloppy, which is the wrapper's other
+  half. One bridge: a method attached as context data, restored, reaching `super`
+  from a script. The refusal-by-kind test is re-aimed to the **accessor** alone,
+  because a method is positive coverage now. Eight mutations, each caught: the
+  method grammar read as the function grammar, the home serial not written, not
+  applied, not walked, read but ignored, the wrapper never strict, the wrapper
+  always strict, and the parse entry's keyword check.
+
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -4135,22 +4243,25 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's ten parts have landed — the format, the context table, the
-external-reference table, a function, a bound function, the realm's named global
-functions, a class constructor, a host callback, an arrow and the text a call
-frame runs — so the blocker this
-plan could name is
+bridge. That item's eleven parts have landed — the format, the context table,
+the external-reference table, a function, a bound function, the realm's named
+global functions, a class constructor, a host callback, an arrow, the text a call
+frame runs and **a method with its `[[HomeObject]]`** — so the blocker this plan
+could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
-for every load, a function, a bind, a class, an arrow and a host callback all
+for every load, a function, a bind, a class, an arrow, a host callback and a
+method all
 come back
 callable or
 constructable, and a closure deno's own JS creates inside a function the host
 calls from Rust carries its text. What is left — and it is the value the walk
-stops on now — is the **method machinery**: a method's source is method-form and
-`parse_function` cannot read it, which is the eighth part of the same item.
-Behind that sits the measured question of the walk
+stops on now — is the realm's **own builtin functions**: deno's
+`00_primordials.js` copies them out of `Math`, `Array.prototype`, `Object` and
+the rest into its primordials object, so the walk meets `Math.abs` as a value,
+and a builtin is carryable only if the realm names it. Behind that sits the
+**accessor** half of the method part, and then the measured question of the walk
 reaching the realm's global object, a realm the restore already rebuilt, so
 carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
 measurement
@@ -4177,8 +4288,10 @@ delete.
 2. **Snapshot format** — **v1 landed with its context table, external
    references, a function, a bound function, a class constructor, a host callback,
    an arrow, the realm's
-   named global functions
-   and the text a call frame runs** (§7's last ten records, ledger item 16): a versioned
+   named global functions,
+   the text a call frame runs
+   and a method with its [[HomeObject]]** (§7's last eleven records, ledger item
+   16): a versioned
    blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
@@ -4190,9 +4303,10 @@ delete.
    value it reads**, a
    refusal naming
    anything uncarried. What this item still owns: a host callback's
-   **construct half**, the method
-   machinery (the eighth part, and the **next measured step** — deno's walk now
-   stops on a method, §7's last record), the
+   **construct half**, the **realm's own builtin functions by name** (the next
+   measured step — deno's primordials hold them as values, and `Math.abs` is the
+   one the walk stops on now, §7's last record), the **accessor** half of the
+   method part, the
    measured question of the walk reaching the **global object**, a
    value shared between two contexts coming back one per context, compiled code
    for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
