@@ -3017,6 +3017,40 @@ suites 64,594 checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 tests / 0 fail
 never name `encode_slots`/`decode_slot`/`write_snapshot`/`read_snapshot`, checked by grep rather than
 assumed.
 
+**A hole in an array — landed, and the snapshot path works end to end.** The last thing deno's graph
+held that this format refused, and the part that takes the plan's goal: a host that boots from a blob
+instead of re-running its own bootstrap JavaScript.
+
+*The measurement — and it is the goal.* A probe in the walk (a temporary print in the one branch that
+reads an array's elements, removed once it answered) says deno's graph holds exactly **one** array with
+holes: a wholly empty array of **length 2048**, every index absent, nothing in the buffer — what a
+preallocated table is. With the holes carried, deno's snapshot **creation succeeds** and writes a
+**306,135-byte** blob where it used to refuse. Then the **load**: `JsRuntime::new` with
+`startup_snapshot: Some(RUNTIME_SNAPSHOT)` — the snapshot path, not the from-source fallback — runs
+`example.js` on the restored realm and prints `Received this value from JS: Hello from example.js`,
+exit 0. That the blob is what the load reads is measured rather than assumed: corrupting its magic (a
+host-side edit to deno's example, reverted after) turns the same run into a panic at
+`jsruntime.rs:2845`, so the realm comes from the blob — and it has to, because deno_core's
+`InitMode::FromSnapshot` skips the bootstrap sources, which is why the earlier parts' loads died with
+the ReferenceErrors they did.
+
+*Tests — one, and every one mutated.* `a_hole_comes_back_a_hole` replaces the test that asserted the
+refusal, and asks about **presence** rather than value, because the value is `undefined` either way:
+four arrays — a hole between two elements, a trailing hole, nothing but holes, and a *present*
+`undefined` beside a hole — each asserted by `in` plus the length. Two mutations, each caught: the
+restore materializing `undefined` for an absent element (the presence check fails), and the writer
+recording a hole as the serial of `undefined`. The second one **was not caught at first**: with the
+three original cases the serial map has no record for `undefined`, so `serial_in` answered `NO_REF` and
+the mutation was a no-op — the fourth case (a present `undefined` beside a hole, which puts that record
+in the map) is what makes the difference testable rather than incidental.
+
+*Gates.* `cargo test --locked --workspace` green (runtime 877, test262 3,324, crux 248; the one
+documented aborting test skipped); `cargo fmt --all -- --check` clean;
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean; test262 `all` 48,464 pass /
+0 fail / 0 crash / 0 hang (158 skip) of 48,622, `intl402` 3,205 / 0 fail (152 skip); the eight wasm core
+suites 64,594 checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 tests / 0 fail. `snapshot::` stays at
+75 tests — the refusal test became the absence test.
+
 *And the goal is the snapshot path, not the from-source one.* Booting deno with `startup_snapshot: None` **works** — measured end to end: deno's whole bootstrap runs on this engine, `example.js` loads, its `my:runtime` import resolves and calls the Rust op, and the run prints `Received this value from JS: Hello from example.js` and exits 0 — and it is explicitly **not** the goal: it skips the integration being tested, re-runs the host's JavaScript at every start, and is what a host falls back to when its snapshot is unusable. The next part is the environment record (design named in §12's eleventh item).
 
 ## 8. Parked: the C++ face
@@ -4757,6 +4791,38 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   the next thing the graph holds that this format cannot: **an array with a hole** — the next part, and
   one the format's refusal inventory already lists.
 
+  **Nineteenth part — a hole in an array, designed before it was written, and landed.** What the
+  frontier stopped on, and the one element case the format had always refused: an Array's element that
+  is not there.
+  - **What a hole is here.** A dense Array's elements are a buffer of values in which a hole is the
+    reserved `Value::hole()` marker, and an index beyond that buffer is a hole too — the `[[Length]]`
+    cell is authoritative and a trailing hole is simply a length longer than the buffer. Both answer
+    `get_own_property_key` with *absent*, which is the refusal the walk reads, so "there is no property
+    here" is already one fact in one place.
+  - **Format.** No new shape and no new tag: an element serial of `NO_REF` is a hole, the sentinel the
+    format already uses for absence (a null prototype, an accessor's missing half, a TDZ binding). The
+    array record's element list is unchanged, so a blob written before this part means what it always
+    meant — every element present — and one written after it is read by the same reader.
+  - **Restore.** The writer's loop with one branch: `array_create` makes an array of the recorded
+    length with **every** index a hole, so an index the record leaves absent stays absent, and
+    `create_data_property_index` fills the spans between present elements with holes by itself.
+    Nothing is written for a hole, which is the whole point: a hole is not `undefined`.
+  - **What it must not do.** Write `undefined` (or skip the length): `1 in [1, , 3]` is false where
+    `1 in [1, undefined, 3]` is true, and `[1].length = 3` keeps three absent indices rather than
+    materializing them. A record that lost either difference would hand a host an array it cannot tell
+    from the one it wrote, which is the failure this format refuses everywhere else.
+  - **Acceptance tests.** One, mutated: four arrays — a hole between two elements, a trailing hole,
+    an all-holes array, and a *present* `undefined` beside a hole — each asserted by `in` and the
+    length, because the value is `undefined` either way. The fourth case is the one that makes the
+    writer-side mutation testable: without a record for `undefined` in the serial map, writing
+    'undefined' for a hole is a no-op and the test cannot tell (measured by mutating).
+
+  *Landed, and the goal with it.* A probe says deno's graph holds one wholly empty array of length 2048;
+  creation writes a 306,135-byte blob; and **the load runs**: `JsRuntime::new` with
+  `startup_snapshot: Some(...)` runs deno's `example.js` on the restored realm and prints
+  `Received this value from JS: Hello from example.js`, exit 0. Corrupting the blob's magic (a reverted
+  host edit) turns the same run into a panic, so the blob is what the load reads — §7 has the details.
+
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -5302,6 +5368,29 @@ migrate, then delete.
    **And the measurement moved once more.** Snapshot creation now carries the five views and their
    buffers and refuses the next thing the graph holds that this format cannot — **an array with a
    hole** — which is the next part.
+
+   **An array with a hole — landed** (designed before the edit, §11's order; §7 and §9 have the
+   measurement, the test and the mutations). The walk refused a hole from the one place an array's
+   elements are read, and the engine already models the difference exactly: a dense array's elements
+   are a buffer of values in which a hole is the reserved `Value::hole()` marker, and an index beyond
+   that buffer is a hole too — the `[[Length]]` cell is authoritative — so `get_own_property_key`
+   answers *absent* for both. The record needed **no new shape**, which is why it took no new tag: an
+   element serial of `NO_REF` is a hole, the "absent" sentinel a null prototype, an accessor's absent
+   half and a TDZ binding already carry; `children` skips it, `write_array` writes it, and the restore
+   is the writer's loop with one branch — `array_create` makes an array of the recorded length with
+   every index a hole, so an absent index stays absent while `create_data_property_index` fills the
+   spans between present elements with holes itself. What it must not do is write `undefined`, and the
+   test that pins that is the one that asks about **presence** (`1 in [1, , 3]` false, `1 in
+   [1, undefined, 3]` true) rather than value — the value is `undefined` either way.
+
+   **And the plan's goal is met, measured.** With the holes carried, deno's snapshot creation writes a
+   306,135-byte blob, and the **load** runs: `JsRuntime::new` with `startup_snapshot: Some(...)`, the
+   snapshot path rather than the from-source fallback, runs deno's `example.js` on the restored realm
+   and prints `Received this value from JS: Hello from example.js`, exit 0. Corrupting the embedded
+   blob's magic (a host-side edit, reverted) turns the same run into a panic, so the realm really comes
+   from the blob — which it must, because `InitMode::FromSnapshot` skips deno's bootstrap sources. The
+   next step is a **larger host**: deno's CLI, or `deno_core`'s own suite, whose graph will name the next
+   mechanism the way every part above was named. Nothing is named from here without that measurement.
 
 12. **`Object.assign` and a function — landed, both roles fixed.** §7's
    measurement found it in passing: `Object.assign(function () {}, { tag: 7 })`

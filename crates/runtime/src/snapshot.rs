@@ -21,18 +21,23 @@
 //!   object — which is what a host's own bookkeeping depends on.
 //!
 //! What it does not carry yet ends the walk with [`Unsupported`], which names
-//! the value it refused: a proxy, a typed array, a module namespace, a host
-//! object, an array with a hole, an indexed accessor, an array whose `length` is
-//! not an index, a host pointer the host's external-reference table does not
-//! not have, a host callback (a built-in that is not an intrinsic) when the host
+//! the value it refused: a proxy, a module namespace, a host object, an indexed
+//! accessor, an array whose `length` is not an index, a `DataView`, a shared or
+//! detached buffer, a host pointer the host's external-reference table does not
+//! have, a host callback (a built-in that is not an intrinsic) when the host
 //! supplies none of its own, a function
 //! the engine kept no source text for — a class constructor defined where no
 //! frame carries the text its span belongs to, for one — and an environment
 //! record a function closed over that is neither declarative nor function: a
 //! lookup walks a record's own binding list and nothing else, so an object,
-//! module or global record is refused by kind. A **method** and an
-//! **accessor** both carry theirs now (the accessor's `[[SourceText]]` was the
-//! last one missing), so neither is on that list.
+//! module or global record is refused by kind. A **method**, an **accessor**, a
+//! **typed array** and the **buffer** it views are no longer on that list: each
+//! carries what it is made of now.
+//!
+//! An Array's element that is **absent** — a hole — travels as the absence it
+//! is, the serial `NO_REF` in the element list. So `1 in [1, , 3]` is still
+//! false of a restored array where `1 in [1, undefined, 3]` is still true, and
+//! an array whose `length` is longer than its elements stays that way.
 //! Each entry is a subsystem to carry, and the walk refuses rather than writing
 //! something a restore would read back wrong.
 //!
@@ -1852,14 +1857,10 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
                         children.extend(property_values(&property));
                     }
                     // A hole is not an element holding `undefined`: the two are
-                    // told apart by own-property presence, and this format
-                    // writes one of them until it carries the other.
-                    Ok(None) => {
-                        return Err(Unsupported::new(
-                            "an array",
-                            "an array with a hole is not carried yet",
-                        ));
-                    }
+                    // told apart by own-property presence, and the record says
+                    // which by the serial it writes (`NO_REF`). A hole has no value
+                    // to walk and no property to name.
+                    Ok(None) => {}
                     Err(_) => {
                         return Err(Unsupported::new("an array", "an element could not be read"));
                     }
@@ -2500,12 +2501,12 @@ fn write_array(
                 let value = property.value().unwrap_or(Value::Undefined);
                 write_u32(body, serial_in(realm, serials, value));
             }
-            Ok(None) => {
-                return Err(Unsupported::new(
-                    "an array",
-                    "an array with a hole is not carried yet",
-                ));
-            }
+            // A hole is the **absence** of an element, so the record says so with
+            // `NO_REF` — the same sentinel an absent accessor half and a null
+            // prototype use. What it must not write is `undefined`, which is an
+            // element that is there: `1 in [1, , 3]` is false and
+            // `1 in [1, undefined, 3]` is true.
+            Ok(None) => write_u32(body, NO_REF),
             Err(_) => return Err(Unsupported::new("an array", "an element could not be read")),
         }
     }
@@ -3342,6 +3343,12 @@ impl Builder<'_> {
                     .map_err(|_| DecodeError::Truncated)?;
                 self.remember(index, Built::Object(array));
                 for (position, element) in elements.iter().enumerate() {
+                    // A hole stays a hole: `array_create` made every index absent,
+                    // and writing `undefined` here would give this one a property
+                    // the writing realm's array never had.
+                    if *element == NO_REF {
+                        continue;
+                    }
                     let value = self.materialize(*element)?;
                     array
                         .create_data_property_index(position as u64, value)
@@ -4756,20 +4763,60 @@ mod tests {
         );
     }
 
+    /// A hole travels as the **absence** it is — `NO_REF` for an element the record
+    /// does not have — and it must not come back as `undefined`, which is an
+    /// element that is there: `1 in [1, , 3]` is false where
+    /// `1 in [1, undefined, 3]` is true. The length is the record's own too, so a
+    /// **trailing** hole keeps its index rather than being truncated away.
     #[test]
-    fn a_hole_is_refused_rather_than_written_as_undefined() {
+    fn a_hole_comes_back_a_hole() {
         let (isolate, realm) = fixture();
         let prototype = realm
             .intrinsics
             .array_prototype()
             .and_then(|value| value.as_object());
-        let array = JsObject::array_create(prototype, 2.0).expect("an array");
-        array
-            .create_data_property_index(1, Value::Number(1.0))
-            .expect("element");
-        let error = encode(agent_of(&isolate), &realm, Value::Object(array)).expect_err("refused");
-        assert_eq!(error.type_name, "an array");
-        assert!(error.detail.contains("hole"));
+        let present = |array: &Handle<JsObject>, index: u64| {
+            array
+                .get_own_property_key(&PropertyKey::String(string::index_atom(index)))
+                .expect("a read")
+                .is_some()
+        };
+        // A hole between two elements, a trailing hole, nothing but holes, and —
+        // the case that makes the difference testable rather than incidental — a
+        // *present* `undefined` beside a hole, where only presence tells them apart.
+        for (length, set, expected) in [
+            (
+                3.0,
+                vec![(0, Value::Number(1.0)), (2, Value::Number(3.0))],
+                vec![true, false, true],
+            ),
+            (3.0, vec![(0, Value::Number(1.0))], vec![true, false, false]),
+            (2.0, vec![], vec![false, false]),
+            (
+                3.0,
+                vec![(0, Value::Undefined), (2, Value::Undefined)],
+                vec![true, false, true],
+            ),
+        ] {
+            let array = JsObject::array_create(prototype, length).expect("an array");
+            for (index, value) in &set {
+                array
+                    .create_data_property_index(*index, *value)
+                    .expect("an element");
+            }
+
+            let back = round_trip(&isolate, &realm, Value::Object(array));
+            let back = back.as_object().expect("an array");
+            let found: Vec<bool> = (0..expected.len() as u64)
+                .map(|index| present(&back, index))
+                .collect();
+            assert_eq!(found, expected, "length {length}, elements {set:?}");
+            assert_eq!(
+                array_length(&back).expect("a length") as f64,
+                length,
+                "length {length}, elements {set:?}"
+            );
+        }
     }
 
     /// Each exotic kind is refused by name rather than written as the ordinary
