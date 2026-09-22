@@ -2810,6 +2810,20 @@ Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --
 
 *And the next value is an object-literal method with a computed key.* Re-measured, deno's blob reads past the class — the first time the class's own evaluation has succeeded — and the restore stops on `its method source could not be evaluated: ReferenceError: "SymbolIterator" is not defined`, whose probe says `home_owner=None`: the failing value's home object is a plain object, so it is an **object-literal method** with a computed key (`{ [SymbolIterator]() { return this; } }`), not a class member. Neither mechanism reaches it — there is no class to take it out of, and the method record's own source is what evaluates the key. It wants the third route: parse the MethodDefinition and **instantiate** the method rather than evaluate the source, so the key expression is never evaluated at all. That is part 15.
 
+**A method's source is instantiated rather than evaluated — landed, and deno's blob now reads through every value the walk carries.** The fifteenth part of ledger item 16, and the value the part-14 record's measurement named.
+
+*What the load stopped on, measured.* A probe in the restore's failure path printed the source of the value it could not rebuild: `[SymbolIterator]() { return this; }` — an **object-literal** method with a computed key, and the probe also printed its home object's owner: `home_owner=None`, so the home is a plain object. That is what rules out the two mechanisms already in the tree: there is no class to read the member out of (so no class-member record), and the home object's own property at that key *is* this record (so it cannot be read out of the object either). The method record rebuilt by evaluating `({<source>})`, and that evaluation evaluates the key expression, which the reading realm cannot resolve.
+
+*The key is not needed to instantiate a method.* A key is only what *installs* a method on an object; the record wants the method alone, and its property tail already carries the method's own `name`. So the rebuild parses the MethodDefinition and instantiates it from the AST: `instantiate_method` for `key(...) {}`, `instantiate_accessor` for `get`/`set` — the same two calls `build_class` makes for a class's elements. Nothing evaluates the key, so nothing needs the name it reads. The parse is `({<source>})` as a script, its one property taken from the AST rather than from an evaluated object; the bootstrap context carries that parsed text as its `source`, which is what `capture_source` resolves the method's `[[SourceText]]` from; and strictness is the record's byte handed to the instantiation rather than a `"use strict";` prefix, which keeps the spans exactly the parsed text's. A class keeps its own evaluation and an arrow keeps its own, so `build_evaluated_function` now serves the arrow alone and `method_of` is gone with the evaluated form.
+
+*And the defect it uncovered, fixed with it.* `define_properties` materialized a property's `get`/`set` serial unconditionally — but an accessor's **absent** half is the `NO_REF` sentinel, so a getter-only property sent it to `materialize`, which answered `Truncated` (`snapshot ends in the middle of a field`). **No test had ever carried an object with an accessor property**, which is why the reader kept it; deno's blob was the first graph to reach one, and only once the object-literal method above materialized. The reader now keeps an absent half absent, which is also what a re-define needs to leave it `undefined`.
+
+*Tests.* Two in `crates/runtime/src/snapshot.rs`: `a_method_with_a_computed_key_round_trips_without_evaluating_it` (called through the key the object holds it under, and still answering its own source) and `an_accessors_absent_half_stays_absent` (a getter-only and a setter-only property, whose present halves must be the reading realm's own — asserted on the *descriptor*'s identity, since reading a property whose getter is `Math.abs` calls it). Three mutations, each caught: the wrapper evaluated (the test fails with deno's own `SymbolIterator is not defined`), the evaluation's frame left without a source (the restored method answers the native form), and `make_method` dropped (the method part's `super` test fails); restoring the old accessor code fails the accessor test with the original `Truncated`.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **860 → 862 passed / 0 failed** (861 with the documented flake `certified_body_global_read_fast_path_stays_spec_exact` skipped); `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,238 → 5,240 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the battery ran with the release binaries rebuilt after the last engine edit: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail. One `all` run reported 34 crashes and 2 hangs and is recorded as **environment**, the same artifact the earlier records name: it was the run whose release build had just finished, and the immediate re-run reproduces the certified numbers exactly (0 fail / 0 crash / 0 hang).
+
+*And the next value is not the engine's.* Re-measured, deno's blob now reads through every value the walk carries — the engine's restore succeeds — and the load stops inside **deno_core's own extraction**: `load_snapshotted_data_from_snapshot` reads indices `0..data_count` (`data_count = 5`) and index 2 answers `None`, so it panics with `NoData { expected: "v8::data::Data" }`. The blob's slot holds **two** items. Measured on the write side: deno attached five, of which three are `Payload::Module` — a module record, which is not a language value — and the bridge's `items_of` maps through `engine_value`, which turns a `Data` into a `Value` or nothing, so it **dropped** them silently and the host's index numbering shifted instead of failing. That is a bridge defect with a design decision behind it (carry a module record by specifier, or refuse the attachment loudly), and it is part 16.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -4204,6 +4218,75 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   private name, or a class whose `prototype` was replaced) keeps today's refusal
   at restore rather than a silently wrong method.
 
+  **Fifteenth part — a method's source is instantiated rather than evaluated,
+  designed before it was written, and landed.** What the load stops on:
+  `[SymbolIterator]() { return this; }` — an **object-literal** method whose
+  computed key reads a binding of the module that defined it (measured:
+  `home_owner=None`, so the home object is a plain object and there is no class to
+  read the member out of; the home object's own property at that key *is* this
+  record). The method record rebuilds by evaluating `({<source>})`, and that
+  evaluation evaluates the key expression, which the reading realm cannot
+  resolve.
+
+  - **The key is not needed to instantiate a method.** A key is only what
+    *installs* a method on an object; the record wants the method alone, and its
+    property tail already carries the method's own `name`. So the rebuild parses
+    the MethodDefinition and instantiates it from the AST —
+    `instantiate_method` for `key(...) {}` and `instantiate_accessor` for
+    `get`/`set`, the same two calls `build_class` makes for a class's elements.
+    Nothing evaluates the key, so nothing needs the name it reads.
+  - **What the parse is.** `({<source>})` parsed as a script — the object literal a
+    MethodDefinition is only valid inside — with its one property taken from the
+    AST rather than from an evaluated object. A source that is not one method
+    definition refuses by name.
+  - **The frame.** `instantiate_method` captures the method's `[[SourceText]]`
+    from the enclosing frame, so the bootstrap context the instantiation runs
+    under carries the parsed text as its `source` — the class record's rule, and
+    what keeps `toString` and a second snapshot intact.
+  - **Strictness** is the record's byte handed to the instantiation rather than a
+    `"use strict";` prefix written into the source, which is also what keeps the
+    method's spans exactly the parsed text's.
+  - **What it does not change.** An arrow keeps the evaluation that makes it (an
+    arrow *is* an expression), and a class keeps its own — so after this part
+    `build_evaluated_function` serves the arrow alone.
+
+  *What it promises.* A method whose key expression reads a name the reading realm
+  does not have comes back callable, under the key the host's own object holds it
+  under (which the object's record restores).
+
+  - **The defect this uncovered, and fixed with it: an accessor's absent half was
+    never readable.** `define_properties` materialized a property's `get`/`set`
+    serial unconditionally, but an accessor's *absent* half is the `NO_REF`
+    sentinel — a getter-only property is one with no `[[Set]]` — so the sentinel
+    went to `materialize`, which answered `Truncated`. **No test had ever carried
+    an object with an accessor property**, which is why the reader kept it: deno's
+    blob was the first graph to reach one, once the method it used to stop on
+    materialized. The reader now keeps an absent half absent, and
+    `an_accessors_absent_half_stays_absent` carries a getter-only and a
+    setter-only property; restoring the old code fails it with the original
+    `Truncated`.
+
+  *Acceptance tests.* Two in `crates/runtime/src/snapshot.rs`:
+  `a_method_with_a_computed_key_round_trips_without_evaluating_it` (an
+  object-literal method whose computed key reads a module binding, called through
+  the key the object holds it under, and still answering its own source) and
+  `an_accessors_absent_half_stays_absent`. Three mutations, each caught: the
+  wrapper evaluated (the test fails with deno's own `SymbolIterator is not
+  defined`), the evaluation's frame left without a source (the restored method
+  answers the native form), and `make_method` dropped (the method part's own
+  `super` test fails); the accessor defect has its own mutation above.
+
+  **And the load is past the engine.** With this part deno's blob reads through
+  every value the walk carries, and deno_core's own extraction runs for the first
+  time — where it stops on something that is **not** the engine's: it attached
+  **five** items to its bootstrapped context and reads them back by index, while
+  the blob carries **two**. Measured: three of the five are `Payload::Module` (a
+  module record, which is not a language value), and the bridge's `items_of`
+  **drops** every item its `engine_value` cannot turn into a `Value` — silently,
+  so the host's indices shift rather than fail. That is a bridge defect and a
+  design decision (carry a module record by specifier, or refuse loudly), and it
+  is part 16.
+
   *Acceptance tests.* Three, all landed:
   `snapshot::tests::a_method_that_reads_a_private_name_round_trips_as_its_classs_member`
   (the measured deno shape — a public method calling a private one — carried as a
@@ -4443,14 +4526,17 @@ external references + per-isolate/context data slots — **the format landed wit
 its context table, the external-reference table, a function, a bound function, a
 class constructor, a host callback, an arrow, a method with its `[[HomeObject]]`,
 the realm's named global functions, the members of its own builtin objects, a
-method that reads a private name and a class's own definition-time inputs with it
-(§7's records for it; ledger item 16 has fourteen parts). What is left of
+method that reads a private name, a class's own definition-time inputs and a
+method instantiated from its parsed definition with it (§7's records for it;
+ledger item 16 has fifteen parts). What is left of
 this item is named rather than implied: `FunctionCodeHandling::Keep`'s compiled
 code (which waits on the code cache), the isolate-level data slots, continuation
-from an existing blob, and the step the **load** now stops on — an
-**object-literal method with a computed key**, which has no class to be read out
-of and whose own source is what re-evaluates the key (§7's last record; that is
-part 15, and parsing the MethodDefinition to *instantiate* it is the mechanism) —
+from an existing blob, and what the **load** now stops on — which is not the
+engine's at all: deno attached five context-data items of which three are module
+records, and the bridge's `items_of` drops anything that is not a `Value`
+silently, so the host's indices shift (§7's last record; that is part 16, and the
+decision behind it is carry a module record by specifier or refuse the
+attachment) —
 behind which is still the measured question of the graph reaching
 the **global object**, and behind that the accessor half of the method part.**;
 (4) module resolver as a
@@ -4513,29 +4599,30 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's fourteen parts have landed — the format, the context table,
+bridge. That item's fifteen parts have landed — the format, the context table,
 the external-reference table, a function, a bound function, the realm's named
 global functions, a class constructor, a host callback, an arrow, the text a call
 frame runs, **a method with its `[[HomeObject]]`**, **the members of the
 realm's own builtin objects by name**, **a method that reads a private name,
-as a member of its class** and **a class's own definition-time inputs** — so the
-blocker this plan
+as a member of its class**, **a class's own definition-time inputs** and **a
+method instantiated from its parsed definition** — so the blocker this plan
 could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
 for every load, a function, a bind, a class, an arrow, a host callback, a method,
-a builtin member, a private-name method and a class whose keys and heritage come
-from the module that defined it all
+a builtin member, a private-name method, a class whose keys and heritage come
+from the module that defined it and a method whose computed key does all
 come back
 callable or
 constructable, and a closure deno's own JS creates inside a function the host
 calls from Rust carries its text. **`create_blob` completes** — deno's
-snapshot build script runs to the end and writes its 226,426-byte blob — and the
-frontier is the **load**, which now reads past every value it used to stop on and
-fails on an **object-literal method with a computed key** instead: there is no
-class to read it out of, and its own source is what re-evaluates the key. That is
-part 15. Behind it sits the
+snapshot build script runs to the end and writes its blob — and the
+frontier is now **deno_core's own extraction**: the engine's restore reads
+through every value the walk carries, and the load stops because the bridge
+dropped three attached module records instead of failing. That is part 16, and it
+is the first frontier in this item that is the **bridge's** rather than the
+engine's. Behind it sits the
 **accessor** half of the method part, and then the measured question of the walk
 reaching the realm's global object, a realm the restore already rebuilt, so
 carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
@@ -4566,9 +4653,10 @@ migrate, then delete.
    the text a call frame runs,
    a method with its [[HomeObject]], the members of the realm's own builtin
    objects, a method that reads a private name, carried as a member of its
-   class, and a class's own definition-time inputs** (§7's records for it, ledger
+   class, a class's own definition-time inputs and a method instantiated from
+   its parsed definition** (§7's records for it, ledger
    item
-   16's fourteen parts): a versioned
+   16's fifteen parts): a versioned
    blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
@@ -4581,15 +4669,15 @@ migrate, then delete.
    refusal naming
    anything uncarried. And the format now **loads**: deno's blob, read back for
    the first time, restores contexts past every value it used to stop on — the
-   realm's own builtin members by name, a method that reads a private name, and a
-   class whose computed keys and heritage come from the module that defined it —
-   and stops on an **object-literal method with a computed key**: there is no
-   class to read it out of, and its own source is what re-evaluates the key (§7's
-   last record), which is part
-   15. What this item still owns: a host callback's
-   **construct half**, that **object-literal method** (part 15, whose mechanism is
-   parsing the MethodDefinition to instantiate it rather than evaluating the
-   source), the
+   realm's own builtin members by name, a method that reads a private name, a
+   class whose computed keys and heritage come from the module that defined it, and
+   a method whose computed key reads one — and stops inside **deno_core's own
+   extraction**: deno attached five context-data items and the bridge carried two,
+   because it drops anything that is not a `Value` silently (§7's last record),
+   which is part
+   16. What this item still owns: a host callback's
+   **construct half**, that **attached-data filter** (part 16, whose decision is
+   carry a module record by specifier or refuse the attachment), the
    **accessor**
    half of the method part, the
    measured question of the walk reaching the **global object**, a
@@ -4597,8 +4685,9 @@ migrate, then delete.
    for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
    existing blob. The realm's own builtin members by name — the value the walk
    met as `Math.abs` — are **carried** (the twelfth part), so is a method that
-   reads a private name (the thirteenth), and so are a class's computed keys and
-   its heritage (the fourteenth). The call-frame
+   reads a private name (the thirteenth), so are a class's computed keys and
+   its heritage (the fourteenth), and so is a method whose own source's key
+   expression cannot be evaluated (the fifteenth). The call-frame
    `source` the eleventh part closed was the conformance bug this item's walk
    exposed rather than a record it was missing.
 3. **Sealing `slag::api`** — the re-export exists (`crates/slag/src/lib.rs`, with a

@@ -1000,16 +1000,6 @@ impl Grammar {
     fn carries_home(self) -> bool {
         self == Grammar::Method
     }
-
-    /// How a message names this grammar's source text: `its class source …`.
-    fn source_kind(self) -> &'static str {
-        match self {
-            Grammar::Function => "function",
-            Grammar::Class => "class",
-            Grammar::Arrow => "arrow",
-            Grammar::Method => "method",
-        }
-    }
 }
 
 /// Which of the three forms a carried class member is.
@@ -1258,6 +1248,51 @@ fn class_member(
         }
     }
     None
+}
+
+/// The single method definition a parsed `(<source>)` or `({<source>})` holds.
+///
+/// A method record's source is one MethodDefinition — `m() {}`, `get x() {}`,
+/// `set x(v) {}` — and the three forms are the object literal's three property
+/// kinds. The parse is what tells them apart, which is the point: the AST is what
+/// the rebuild instantiates, so the source's key expression is never evaluated.
+enum MethodDefinition<'a> {
+    Method(&'a syntax::ast::Function),
+    Get(&'a syntax::ast::Block),
+    Set(
+        &'a syntax::ast::BindingPattern,
+        Option<&'a syntax::ast::Expr>,
+        &'a syntax::ast::Block,
+    ),
+}
+
+fn method_definition(program: &syntax::ast::Program) -> Option<MethodDefinition<'_>> {
+    let [statement] = program.body.as_slice() else {
+        return None;
+    };
+    let syntax::ast::StmtKind::Expr(expression) = &statement.kind else {
+        return None;
+    };
+    let mut expression = expression;
+    while let syntax::ast::ExprKind::Paren(inner) = &expression.kind {
+        expression = inner;
+    }
+    let syntax::ast::ExprKind::Object(literal) = &expression.kind else {
+        return None;
+    };
+    let [property] = literal.props.as_slice() else {
+        return None;
+    };
+    match property {
+        syntax::ast::ObjectProperty::Method { function, .. } => {
+            Some(MethodDefinition::Method(function))
+        }
+        syntax::ast::ObjectProperty::Get { body, .. } => Some(MethodDefinition::Get(body)),
+        syntax::ast::ObjectProperty::Set {
+            param, init, body, ..
+        } => Some(MethodDefinition::Set(param, init.as_ref(), body)),
+        _ => None,
+    }
 }
 
 /// The class a parsed `(<class source>)` names, if that is what it is: the one
@@ -2276,9 +2311,10 @@ impl Builder<'_> {
                 let function = match grammar {
                     Grammar::Function => self.build_function(source, *strict, *proto)?,
                     Grammar::Class => self.build_class_function(source, *heritage, keys, *proto)?,
-                    Grammar::Arrow | Grammar::Method => {
-                        self.build_evaluated_function(source, *proto, *strict, *grammar, *home)?
+                    Grammar::Method => {
+                        self.build_method_function(source, *proto, *strict, *home)?
                     }
+                    Grammar::Arrow => self.build_evaluated_function(source, *proto, *strict)?,
                 };
                 // A class's own evaluation made a `prototype` object whose members
                 // carry the class's private brand; the tail just below replaces it
@@ -2455,98 +2491,150 @@ impl Builder<'_> {
     /// An evaluated-function record: the source is evaluated as an expression in
     /// the realm being restored, and the function it produces is the value.
     ///
-    /// A class constructor's `[[SourceText]]` is the class, an arrow's is the
-    /// arrow, and a method's is its MethodDefinition (`m() {}`, `get x() {}`) —
-    /// none of them parseable by `parse_function`, which expects a `function`
-    /// keyword. So all three are rebuilt the way they were created: by evaluating
-    /// them, which is what brings back what the engine's own creation path gives a
-    /// closure — for a class its `[[ConstructorKind]]`, home object, prototype
-    /// object, fields and private environment, for an arrow its lexical
-    /// `[[ThisMode]]` and its deferred absence of a `prototype`, for a method its
-    /// `[[HomeObject]]`, its absence of a `prototype`, and its strictness.
+    /// An arrow's record: the source is evaluated as an expression in the realm it
+    /// is being restored into, because an arrow *is* an expression and the engine's
+    /// own evaluation is what gives a closure its lexical `[[ThisMode]]`, its
+    /// deferred absence of a `prototype`, and its strictness.
     ///
-    /// A method needs the object the source sits in: an object literal's first own
-    /// property is the one the source defined, and its descriptor says which of
-    /// the three forms it is — a data property is the method, an accessor
-    /// property's `[[Get]]` or `[[Set]]` is the getter or the setter.
-    ///
-    /// The divergences are the module docs': a class's definition-time code (a
-    /// computed key, a `static {}` block, a static field initializer) runs again
-    /// here, a method's computed property name is evaluated again, and the
-    /// evaluation is the **reading** realm's, so a captured `this` or free name is
-    /// that realm's global rather than the scope the original closed over.
+    /// The divergence is the module docs': the evaluation is the **reading**
+    /// realm's, so a captured `this` or a free name is that realm's global rather
+    /// than the scope the original closed over — the arrow record's stated limit.
     fn build_evaluated_function(
         &mut self,
         source: &[u16],
         proto: u32,
         strict: bool,
-        grammar: Grammar,
+    ) -> Result<Handle<Function>, DecodeError> {
+        let proto = self.prototype(proto)?.ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("the record names no prototype".into())
+        })?;
+        let text = String::from_utf16(source).map_err(|_| {
+            DecodeError::UnrebuildableFunction("its arrow source is not valid UTF-16".into())
+        })?;
+        let realm = *self.realm;
+        // An arrow's source is an expression, so it needs the parenthesis wherever
+        // it appears. The `strict` byte decides whether the evaluated code is
+        // strict — an arrow inherits the strictness of the code around it, and the
+        // evaluation has no other way to know. Popped on every path.
+        let prefix = if strict { "\"use strict\"; " } else { "" };
+        self.agent.push_bootstrap_context(realm);
+        let value = self.agent.run_script(&format!("{prefix}({text})"));
+        self.agent.execution_context_stack.pop();
+        let value = value.map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!(
+                "its arrow source could not be evaluated: {error}"
+            ))
+        })?;
+        let function = value.as_function().ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("its source did not evaluate to a function".into())
+        })?;
+        // The evaluation sets the function's own prototype link from what it
+        // derived; the record's is what the blob was written with, so it wins.
+        function
+            .object
+            .set_prototype_of(Some(proto))
+            .map_err(|error| {
+                DecodeError::UnrebuildableFunction(format!(
+                    "its prototype could not be set: {error}"
+                ))
+            })?;
+        Ok(function)
+    }
+
+    /// A method record, rebuilt by **instantiating** the MethodDefinition its source
+    /// is rather than by evaluating it.
+    ///
+    /// Evaluating `({<source>})` would evaluate the source's key expression, and a
+    /// computed key may read a name that exists only in the module which defined the
+    /// method, which the reading realm's global does not have. The key is not
+    /// needed to instantiate a method: a key is only what *installs* a method on an
+    /// object, and this record wants the method alone (its `name` arrives with the
+    /// record's own properties). So the AST is taken from the parse and the method
+    /// instantiated from it — the same `instantiate_method`/`instantiate_accessor`
+    /// calls `build_class` makes for a class's elements.
+    ///
+    /// The parse is a script, so the method's spans index the text the parse was
+    /// given; the bootstrap context the instantiation runs under carries that same
+    /// text as its `source`, which is what `capture_source` resolves the method's
+    /// `[[SourceText]]` from — so `toString`, and a second snapshot of the restored
+    /// method, are unaffected. Strictness is handed to the instantiation rather
+    /// than written into the source as a directive, which is what keeps the spans
+    /// exactly the parsed text's.
+    fn build_method_function(
+        &mut self,
+        source: &[u16],
+        proto: u32,
+        strict: bool,
         home: u32,
     ) -> Result<Handle<Function>, DecodeError> {
         let proto = self.prototype(proto)?.ok_or_else(|| {
             DecodeError::UnrebuildableFunction("the record names no prototype".into())
         })?;
-        let kind = grammar.source_kind();
         let text = String::from_utf16(source).map_err(|_| {
-            DecodeError::UnrebuildableFunction(format!("its {kind} source is not valid UTF-16"))
+            DecodeError::UnrebuildableFunction("its method source is not valid UTF-16".into())
+        })?;
+        // The object literal is the only form a MethodDefinition has.
+        let wrapped = format!("({{{text}}})");
+        let program = parser::parse_script(&wrapped).map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!("its method source does not parse: {error}"))
+        })?;
+        let definition = method_definition(&program).ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("its source is not one method definition".into())
         })?;
         let realm = *self.realm;
-        // A bootstrap execution context makes the realm current, so the source is
-        // evaluated where the restore is materializing it. A class's source is
-        // wrapped in parentheses so it reads as an expression — which keeps the
-        // class name bound inside the class rather than in the reading realm's
-        // global scope — and an arrow's needs the parenthesis wherever it appears.
-        // A method's source is wrapped further, in the object literal it is a
-        // property of, which is the only form a MethodDefinition has. Popped on
-        // every path.
-        //
-        // The `strict` byte decides whether the wrapper is strict *code*: a class
-        // method is strict whatever its body says, an object method inherits the
-        // strictness of the code around it, and the evaluation has no other way to
-        // know. It is a prefix rather than a directive, so it shifts the text the
-        // method's own `[[SourceText]]` is sliced from — the slice is still the
-        // method, since the evaluation is what captures it.
-        let wrapper = match grammar {
-            Grammar::Method => ("({", "})"),
-            _ => ("(", ")"),
+        let environment = realm.global_env;
+        let home = match home {
+            NO_REF => None,
+            home => Some(self.materialize(home)?),
         };
-        let prefix = if strict { "\"use strict\"; " } else { "" };
         self.agent.push_bootstrap_context(realm);
-        let value = self
-            .agent
-            .run_script(&format!("{prefix}{}{text}{}", wrapper.0, wrapper.1));
+        if let Some(context) = self.agent.execution_context_stack.last_mut() {
+            context.source = Some(JsString::from_utf8(&wrapped));
+        }
+        let value = match definition {
+            MethodDefinition::Method(function) => {
+                crate::function::instantiate_method(self.agent, function, environment, strict)
+            }
+            MethodDefinition::Get(body) => crate::function::instantiate_accessor(
+                self.agent,
+                Vec::new(),
+                body,
+                environment,
+                strict,
+            ),
+            // A setter's parameter list is the engine's own one-element form, the
+            // same shape `build_class` builds for a class setter.
+            MethodDefinition::Set(param, init, body) => crate::function::instantiate_accessor(
+                self.agent,
+                vec![syntax::ast::BindingElement {
+                    pattern: param.clone(),
+                    init: init.cloned(),
+                    rest: false,
+                    span: body.span,
+                }],
+                body,
+                environment,
+                strict,
+            ),
+        };
         self.agent.execution_context_stack.pop();
         let value = value.map_err(|error| {
             DecodeError::UnrebuildableFunction(format!(
-                "its {kind} source could not be evaluated: {error}"
+                "its method source could not be instantiated: {error}"
             ))
         })?;
-        let function = if grammar.carries_home() {
-            let method = self.method_of(value)?;
-            if home != NO_REF {
-                let home = self.materialize(home)?;
-                crate::function::make_method(self.agent, &Value::Function(method), home).map_err(
-                    |error| {
-                        DecodeError::UnrebuildableFunction(format!(
-                            "its [[HomeObject]] could not be set: {error}"
-                        ))
-                    },
-                )?;
-            }
-            method
-        } else {
-            value.as_function().ok_or_else(|| {
-                DecodeError::UnrebuildableFunction(format!(
-                    "its source did not evaluate to {}",
-                    match grammar {
-                        Grammar::Class => "a class",
-                        _ => "a function",
-                    }
-                ))
-            })?
-        };
-        // The evaluation sets the function's own prototype link from what it
-        // derived; the record's is what the blob was written with, so it wins.
+        let function = value.as_function().ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("its source did not make a method".into())
+        })?;
+        if let Some(home) = home {
+            crate::function::make_method(self.agent, &Value::Function(function), home).map_err(
+                |error| {
+                    DecodeError::UnrebuildableFunction(format!(
+                        "its [[HomeObject]] could not be set: {error}"
+                    ))
+                },
+            )?;
+        }
         function
             .object
             .set_prototype_of(Some(proto))
@@ -2643,54 +2731,6 @@ impl Builder<'_> {
                 ))
             })?;
         Ok(function)
-    }
-
-    /// The function a method record's object literal defined: its **first** own
-    /// property, whichever of the three method forms the source was.
-    ///
-    /// The source is one MethodDefinition, so the literal it is wrapped in has
-    /// exactly one property — but which *kind* of property depends on the source,
-    /// and that is what the descriptor tells us rather than the record: a data
-    /// property is a plain method, and an accessor property's `[[Get]]` or
-    /// `[[Set]]` is the getter or the setter. A setter's source (`set x(v) {}`)
-    /// wraps to an accessor with only `[[Set]]`, so the two are told apart by
-    /// which one is present, not by asking the engine which it meant.
-    fn method_of(&mut self, value: Value) -> Result<Handle<Function>, DecodeError> {
-        let object = value.as_object().ok_or_else(|| {
-            DecodeError::UnrebuildableFunction(
-                "its source did not evaluate to an object literal".into(),
-            )
-        })?;
-        let keys = object
-            .own_property_keys()
-            .map_err(|_| DecodeError::Truncated)?;
-        let key = keys.first().cloned().ok_or_else(|| {
-            DecodeError::UnrebuildableFunction(
-                "its source defined no property, so there is no method".into(),
-            )
-        })?;
-        let property = object
-            .get_own_property_key(&key)
-            .map_err(|_| DecodeError::Truncated)?
-            .ok_or_else(|| {
-                DecodeError::UnrebuildableFunction(
-                    "its source's own property could not be read back".into(),
-                )
-            })?;
-        let function = match &property.kind {
-            PropertyKind::Data { value, .. } => value.as_function(),
-            PropertyKind::Accessor { get, set } => {
-                get.as_ref()
-                    .or(set.as_ref())
-                    .and_then(|function| match function.kind() {
-                        ValueKind::Function(function) => Some(function),
-                        _ => None,
-                    })
-            }
-        };
-        function.ok_or_else(|| {
-            DecodeError::UnrebuildableFunction("its source's first property is not a method".into())
-        })
     }
 
     /// A class member, read out of the class the evaluation made.
@@ -2898,6 +2938,24 @@ fn define_properties(
         let value = builder.materialize(property.key)?;
         let key = property_key(&value).ok_or(DecodeError::Truncated)?;
         let accessor = property.flags & FLAG_ACCESSOR != 0;
+        // An accessor's **absent** half is the `NO_REF` sentinel, not a record: a
+        // getter with no setter is a property with no `[[Set]]`, and materializing
+        // the sentinel asks for a record that was never written. The half has to
+        // stay absent, which is also what a re-define needs to leave it undefined.
+        let half = |builder: &mut Builder<'_>, serial: u32| match serial {
+            NO_REF => Ok(None),
+            serial => Ok(Some(builder.materialize(serial)?)),
+        };
+        let get = if accessor {
+            half(builder, property.first)?
+        } else {
+            None
+        };
+        let set = if accessor {
+            half(builder, property.second)?
+        } else {
+            None
+        };
         let descriptor = PropertyDescriptor {
             value: if accessor {
                 None
@@ -2909,16 +2967,8 @@ fn define_properties(
             } else {
                 Some(property.flags & FLAG_WRITABLE != 0)
             },
-            get: if accessor {
-                Some(builder.materialize(property.first)?)
-            } else {
-                None
-            },
-            set: if accessor {
-                Some(builder.materialize(property.second)?)
-            } else {
-                None
-            },
+            get,
+            set,
             enumerable: Some(property.flags & FLAG_ENUMERABLE != 0),
             configurable: Some(property.flags & FLAG_CONFIGURABLE != 0),
         };
@@ -4708,6 +4758,103 @@ mod tests {
             run_restored(&isolate, &realm, back, "new restored()[Symbol.iterator]()").as_number(),
             Some(2.0),
             "the method came back under the carried key and reads the class's private field"
+        );
+    }
+
+    /// An accessor's **absent** half is the format's sentinel, not a record: a
+    /// getter-only property is one with no `[[Set]]`, and the restore has to leave
+    /// it absent rather than ask for a record that was never written. No test
+    /// carried an accessor property before this one, which is why the reader kept
+    /// the bug until deno's blob reached a getter-only accessor.
+    #[test]
+    fn an_accessors_absent_half_stays_absent() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { const object = {}; \
+                 Object.defineProperty(object, 'onlyGet', { get: Math.abs, configurable: true }); \
+                 Object.defineProperty(object, 'onlySet', { set: Math.abs, configurable: true }); \
+                 return object; })()",
+            )
+            .expect("an object with one-sided accessors")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "Object.getOwnPropertyDescriptor(restored, 'onlyGet').set === undefined ? 1 : 0",
+            )
+            .as_number(),
+            Some(1.0),
+            "the getter-only property came back with no setter"
+        );
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "Object.getOwnPropertyDescriptor(restored, 'onlySet').get === undefined ? 1 : 0",
+            )
+            .as_number(),
+            Some(1.0),
+            "and the setter-only property with no getter"
+        );
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "Object.getOwnPropertyDescriptor(restored, 'onlyGet').get === Math.abs ? 1 : 0",
+            )
+            .as_number(),
+            Some(1.0),
+            "the half that is present is the reading realm's own"
+        );
+    }
+
+    /// The measured deno shape: an **object-literal** method with a computed key
+    /// whose expression reads a binding of the module that defined it. Neither
+    /// carrying the class (there is none — the home object is a plain object) nor
+    /// carrying the key reaches it, because the record does not need a key at all:
+    /// the method is *instantiated* from its parsed definition instead of
+    /// evaluated, so the key expression is never evaluated.
+    #[test]
+    fn a_method_with_a_computed_key_round_trips_without_evaluating_it() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { const SymbolIterator = Symbol.iterator; \
+                 return { [SymbolIterator]() { return 41; } }; })()",
+            )
+            .expect("an object with a computed-key method")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored[Symbol.iterator]()").as_number(),
+            Some(41.0),
+            "the method came back under the key the object holds it under"
+        );
+        // Its own `[[SourceText]]` is re-captured from the parsed text, so a host
+        // that reads the method back sees the definition it was written as.
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "restored[Symbol.iterator].toString()",
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("[SymbolIterator]() { return 41; }".to_string()),
+            "the restored method answers its own source"
         );
     }
 
