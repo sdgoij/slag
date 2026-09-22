@@ -2406,12 +2406,19 @@ impl Builder<'_> {
             } => {
                 let prototype = self.prototype(*proto)?;
                 let object = JsObject::ordinary_object_create(prototype);
-                object.extensible.set(*extensible);
                 // The shell is recorded before the properties are defined, so a
                 // property that refers back to this object resolves to it
                 // rather than restarting the build.
                 self.remember(index, Built::Object(object));
                 define_properties(self, object, properties)?;
+                // Extensibility **last**: an object's own properties exist
+                // before it is made non-extensible, and `[[DefineOwnProperty]]`
+                // refuses to add one to an object that already is. Applying the
+                // record's flag first therefore drops every property of a
+                // non-extensible object — a host's frozen namespace is that
+                // case, and `define_properties` answering `Ok(false)` is the
+                // only sign of it.
+                object.extensible.set(*extensible);
                 Built::Object(object)
             }
             Record::Array {
@@ -2424,7 +2431,6 @@ impl Builder<'_> {
                 let prototype = self.prototype(*proto)?;
                 let array = JsObject::array_create(prototype, *length as f64)
                     .map_err(|_| DecodeError::Truncated)?;
-                array.extensible.set(*extensible);
                 self.remember(index, Built::Object(array));
                 for (position, element) in elements.iter().enumerate() {
                     let value = self.materialize(*element)?;
@@ -2433,6 +2439,8 @@ impl Builder<'_> {
                         .map_err(|_| DecodeError::Truncated)?;
                 }
                 define_properties(self, array, extras)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                array.extensible.set(*extensible);
                 Built::Object(array)
             }
             Record::Function {
@@ -2476,8 +2484,9 @@ impl Builder<'_> {
                 // restarting the build.
                 self.remember(index, Built::Value(Value::Function(function)));
                 let object = function.object;
-                object.extensible.set(*extensible);
                 define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
                 // An own `prototype` in the record means the writing realm had
                 // materialized the deferred one; clearing the flag keeps the
                 // first later observation from making a second over it. With no
@@ -2555,8 +2564,9 @@ impl Builder<'_> {
                     })?;
                 self.remember(index, Built::Value(Value::Function(function)));
                 let object = function.object;
-                object.extensible.set(*extensible);
                 define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
                 Built::Value(Value::Function(function))
             }
             Record::BoundFunction {
@@ -2574,8 +2584,9 @@ impl Builder<'_> {
                 // part, and there is no lazy materialization to disarm.
                 self.remember(index, Built::Value(Value::Function(function)));
                 let object = function.object;
-                object.extensible.set(*extensible);
                 define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
                 Built::Value(Value::Function(function))
             }
             Record::HostCallback {
@@ -2591,8 +2602,9 @@ impl Builder<'_> {
                 // properties are the whole object part.
                 self.remember(index, Built::Value(Value::Function(function)));
                 let object = function.object;
-                object.extensible.set(*extensible);
                 define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
                 Built::Value(Value::Function(function))
             }
         };
@@ -3222,6 +3234,120 @@ mod tests {
 
     fn number_of(value: Value) -> Option<f64> {
         value.as_number()
+    }
+
+    /// A non-extensible object's — or function's — properties come back.
+    ///
+    /// An object's own properties exist **before** it is made non-extensible, so
+    /// a record's flag has to be applied after its property list: the reader used
+    /// to apply it first, and `[[DefineOwnProperty]]` refuses to add a property to
+    /// an object that is already non-extensible — a refusal
+    /// (`define_property_key` answering `Ok(false)`) the reader discarded, so
+    /// every property of a frozen object was silently lost. A host's frozen
+    /// namespace is the case that found it (deno freezes `Deno.core` and
+    /// `Deno.core.ops`).
+    #[test]
+    fn a_non_extensible_values_properties_come_back() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+
+        // An object with data properties, frozen.
+        let frozen = context
+            .try_eval("Object.freeze({ a: 1, b: 2 })")
+            .expect("a frozen object")
+            .into_value();
+        let back = round_trip(&isolate, &realm, frozen);
+        let object = back.as_object().expect("an object");
+        assert!(
+            !object.extensible.get(),
+            "the object came back non-extensible"
+        );
+        let keys = object.own_property_keys().expect("its own keys");
+        assert_eq!(
+            keys.len(),
+            2,
+            "its properties came back, not just the shell"
+        );
+        assert_eq!(number_of_key(&object, "b"), Some(2.0));
+        assert_eq!(number_of_key(&object, "a"), Some(1.0));
+
+        // An array with an own extra property, frozen: the array arm applies the
+        // flag after its elements and extras for the same reason.
+        let frozen = context
+            .try_eval("(() => { const a = [1, 2]; a.tag = 7; Object.freeze(a); return a; })()")
+            .expect("a frozen array")
+            .into_value();
+        let back = round_trip(&isolate, &realm, frozen);
+        let array = back.as_object().expect("an array");
+        assert!(
+            !array.extensible.get(),
+            "the array came back non-extensible"
+        );
+        assert_eq!(array_length(&array).expect("a length") as u64, 2);
+        assert_eq!(number_of_key(&array, "tag"), Some(7.0));
+
+        // A function with an own property that the fresh function does not
+        // already have, made non-extensible: the function, bind and host-callback
+        // arms apply the flag after their properties for the same reason, and a
+        // property the rebuild must *add* is what tells the order apart (`name`
+        // and `length` already exist, so re-defining those is allowed either way).
+        let function = context
+            .try_eval("(function named() { return 1; })")
+            .expect("a function")
+            .into_value();
+        let object = match function.kind() {
+            ValueKind::Function(function) => function.object,
+            other => panic!("a function, not {other:?}"),
+        };
+        object
+            .create_data_property_key(
+                &PropertyKey::String(string::intern_utf8("tag")),
+                Value::Number(7.0),
+            )
+            .expect("the function's own property");
+        object.extensible.set(false);
+
+        let back = round_trip(&isolate, &realm, function);
+        let restored = crate::context::as_object(&back).expect("a function's object part");
+        assert!(
+            !restored.extensible.get(),
+            "the function came back non-extensible"
+        );
+        assert_eq!(
+            number_of_key(&restored, "tag"),
+            Some(7.0),
+            "the function's own property came back"
+        );
+        assert_eq!(
+            string_of_key(&restored, "name").as_deref(),
+            Some("named"),
+            "and its name came with it"
+        );
+    }
+
+    /// A named own property of an object, for the assertions above.
+    fn own_property(object: &Handle<JsObject>, name: &str) -> Property {
+        object
+            .get_own_property_key(&PropertyKey::String(string::intern_utf8(name)))
+            .expect("an own property read")
+            .unwrap_or_else(|| panic!("the own property {name}"))
+    }
+
+    fn number_of_key(object: &Handle<JsObject>, name: &str) -> Option<f64> {
+        match &own_property(object, name).kind {
+            PropertyKind::Data { value, .. } => value.as_number(),
+            PropertyKind::Accessor { .. } => None,
+        }
+    }
+
+    fn string_of_key(object: &Handle<JsObject>, name: &str) -> Option<String> {
+        match &own_property(object, name).kind {
+            PropertyKind::Data { value, .. } => {
+                value.as_string().map(|text| text.to_string_lossy())
+            }
+            PropertyKind::Accessor { .. } => None,
+        }
     }
 
     #[test]

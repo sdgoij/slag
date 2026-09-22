@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, **a module record — which is not a language value — as the name and source the engine's own compile path rebuilds it from, so a slot's items come back at the indices the host attached them under**, and **the realm's own global functions, the members of its own builtin objects by the spec's names and a method that reads a private name, as a member of its class**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time and now reads through every value the walk carries and every item its slots hold (§7); what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies, and what a host's own `FromSnapshot` path additionally expects — a **deserialized heap** — is not something a data-only blob carries, which is a decision rather than a gap (§7's last record, §12 item 11). What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, **a module record — which is not a language value — as the name and source the engine's own compile path rebuilds it from, so a slot's items come back at the indices the host attached them under**, and **the realm's own global functions, the members of its own builtin objects by the spec's names and a method that reads a private name, as a member of its class**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time and now reads through every value the walk carries and every item its slots hold (§7); what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies, and what a host's own `FromSnapshot` path additionally expects — its realm's bootstrapped global — was **measured**: a bootstrapped `globalThis` walks, restores into a fresh isolate and its bootstrap functions run (§7's last two records, §12 item 11), so the remaining work there is the load applying it rather than a gap in what can be carried. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2840,6 +2840,24 @@ Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --
 
 *And the next thing is not the engine's, and not a value either.* Re-measured the same way, deno_core's own extraction now runs to the end — all five indices read — and the load dies one step later, in `initialize_deno_core_ops_bindings` (`libs/core/runtime/jsruntime.rs:1087`): deno's `bindings::get::<v8::Local<v8::Object>>` panics "unable to convert" because `globalThis.Deno`, the first of the three objects it reads, is not there. That is the framework's own assumption rather than a missing record. On `InitMode::FromSnapshot` deno **skips its bootstrap because V8 deserializes the heap**: `jsruntime.rs:1080-1083` skip `initialize_deno_core_namespace` and `initialize_primordials_and_infra`, and `1264-1279` skip the virtual ops module and the builtin sources, so `Deno`, `Deno.core` and `Deno.core.ops` can only come from the image — and `store_js_callbacks` reads `Deno` unconditionally at `1282` as well. Deno's five attached items are not that state (the module map, the templates, two handles), so no further item carries it. What this engine *can* serve is the **from-source** path, and this run already shows it: the example's build phase (`create_snapshot` with `startup_snapshot: None`, so `InitMode::New`) ran the whole bootstrap on this engine — ops bound, builtin sources evaluated, the extension's `esm_entry_point` module instantiated — and wrote a 225,661-byte blob. So the next part is a decision rather than a record, and it is §12's eleventh item.
 
+*And that decision's first candidate was measured rather than argued.* Asked to explore **carrying the realm's global object**, the probe described below was run inside deno's own snapshot build — with the build's external-reference table and host, so the numbers are the real walk's conditions rather than a test's — and it **completed on both contexts**: slot 0, deno's empty default context, is 244 records / 6,912 bytes, and slot 1, the bootstrapped realm (`Deno`, `Deno.core`, the ops object, `callConsole`), is **2,833 records / 220,054 bytes, `Ok`**. Nothing reachable from a bootstrapped deno realm's global is one of the kinds the walk refuses — no proxy, no typed array, no host object — so the *write* half of that option is available today and costs about what the blob already costs (225,661 bytes for deno's five attached items). What that measurement could not settle is the **read** half, and the record below settles it — including the defect it had to fix on the way, which is a `runtime` edit made inside a measurement rather than named before it (§11's working rules ask for the other order; it is stated here rather than smoothed over).
+
+**Carrying a realm's global — measured end to end on deno, and the reader had been refusing a frozen object's properties.** The experiment §12's eleventh item called for: walk a bootstrapped global, write it, restore it into a **fresh isolate**, apply it to that realm's global, and call a restored bootstrap function. Probes in, numbers out, probes out again.
+
+*The write half.* With the build's own external-reference table and host, each context's `globalThis` walks to the end — slot 0, deno's empty default context, 244 records / 6,912 bytes; slot 1, the bootstrapped realm (`Deno`, `Deno.core`, the ops object, `callConsole`), **2,833 records / 220,054 bytes, `Ok`**. Nothing reachable from that global is a kind the walk refuses, and it costs about what the blob already costs (225,661 bytes for deno's five attached items).
+
+*The read half found the defect.* The first round trip restored `Deno` with a `Deno.core` of **0 own keys** where the writer's had **147** — while `Deno.core` and `__bootstrap.core` still aliased each other, so it was one object losing its properties, not a numbering slip. Measured in the format: the writer wrote all 147 (and 832 for `Deno.core.ops`) with `extensible=false` — deno **freezes** those objects — and the reader *refused* all 147 (`refused 147 of 147`), because it applied the record's `extensible` flag **before** defining the record's properties. `[[DefineOwnProperty]]` refuses to add a property to an object that is already non-extensible, `define_property_key` answers `Ok(false)`, and `define_properties` discarded that answer — `map_err(...)?` sees only `Err`. Fixed at **all six** reader arms that set the flag (`Record::Object`, `Record::Array`, and the four function-shaped ones), each with the reason in a comment. A function's `length` and `name` already exist on a fresh function, so only a property the rebuild has to *add* tells the order apart — which is what the test asserts.
+
+*And with that fixed, the read half works.* The graph restores into a fresh isolate with the writer's `Deno.core` (147 keys, the same names), the aliasing intact, and 72 of 72 properties applied to the realm's global. A restored *bootstrap* function then **runs**: `Deno.core.setUpAsyncStub('probe', () => {}, undefined)` answers deno's own `Error: Too many arguments for async op codegen (length of probe was -1)` — a complaint about the probe's dummy callback, not a `ReferenceError`. The inference §12's eleventh item recorded (that a restored bootstrap function would resolve its module bindings as globals and fail) is therefore **wrong for this graph**, and the measurement is what says so: deno's bootstrap reads its state through `globalThis.__bootstrap`, which a carried global contains. What is still *not* done is the integration — the load path applying a carried global before deno reads `Deno` — which is the next part rather than a measurement.
+
+*Two more things the experiment turned up, neither fixed here.* `Object.assign(function () {}, { tag: 7 })` throws `TypeError: assign target is not an object`: `object_assign` (`builtins/object.rs:1506-1523`) matches `ValueKind::Object` for the target, while `to_object` answers `Value::Function` for a function — and the same match **skips a function source** entirely, so its enumerable own properties are never copied. A function is an object in both roles, so this is a conformance divergence with no fixture over it; it is named in §12 rather than fixed inside a measurement. And an object literal's accessor, created in an eval'd script's argument position and then frozen, refused to encode (`a function — the engine kept no source text for it`); whether `Object.freeze` or the frame it was created in is responsible was **not isolated**, and the regression test carries data properties instead.
+
+*Tests.* One engine test, `snapshot::tests::a_non_extensible_values_properties_come_back`: a frozen object, a frozen array with an own extra property, and a function with an own property a fresh function does not have, each made non-extensible — every one restores non-extensible *with* its properties. Three mutations, each caught: the flag applied before the properties in the object arm ("its properties came back, not just the shell"), in the array arm, and in the plain-function arm ("the own property tag"). The test's first draft was **not** discriminating — it asserted a function's `name`, which a fresh function already has, so it passed under the mutation; it was rebuilt to assert a property the rebuild must add, which is the second time this plan's "a test that cannot fail" rule has been caught by mutating rather than by inspection.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **864 passed / 0 failed**; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,243 → 5,244 passed / 0 failed**, the one being this change's test. `crates/runtime` changed, so the battery ran with the release binaries rebuilt after the last engine edit: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+The probes, all removed once they had answered: a `probe_walk` beside `visit` (the walk's `Result` plus the record count it reached); a loop in `api::Context::write_snapshot` that encoded each context's global alone and reported the size; a `probe_realm` in the same file that dumped a realm's `globalThis`/`Deno`/`Deno.core`/`__bootstrap`/`__bootstrap.core` own keys, their `ObjectKind` and their intrinsic names; an `encode_slots` + `read_snapshot` round trip into a fresh `api::Isolate` whose realm then read `__slag_carried`, applied every property and called `Deno.core.setUpAsyncStub`; and four counters inside the format itself (`visit`, `write_properties`, `write_record`, `define_properties`).
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -4364,9 +4382,25 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   item carries it: deno's five attached items are its module map, its templates
   and two handles, not the global object. The **from-source** path is the one this
   engine serves, and this run shows it — the example's build phase
-  (`create_snapshot` with `startup_snapshot: None`, so `InitMode::New`) runs the
+  `create_snapshot` with `startup_snapshot: None`, so `InitMode::New`) runs the
   whole bootstrap on this engine and writes its blob. That is a decision rather
   than a record, and it is §12's eleventh item; §7's last record has the anchors.
+
+  **And a host's frozen namespace exposed a reader defect, fixed inside the
+  measurement.** The carried-global experiment §12's eleventh item called for
+  ended by finding a real bug rather than a design wall: deno **freezes**
+  `Deno.core` and `Deno.core.ops`, and the reader applied a record's `extensible`
+  flag **before** defining the record's properties, so
+  `[[DefineOwnProperty]]` refused every one of them (`refused 147 of 147`, then
+  `832 of 832`) and `define_properties` discarded the refusal — the objects came
+  back as shells. The flag is now applied **after** the property list at all six
+  reader arms that set it (`Record::Object`, `Record::Array`, and the four
+  function-shaped ones), one test covers a frozen object, a frozen array and a
+  non-extensible function, and three mutations (one per arm shape) are each
+  caught. **This is the deviation worth recording:** §11 asks for `runtime` edits
+  to be named *before* they are made, and this one was made inside a measurement.
+  §7's record states it too, so it is visible in both places rather than smoothed
+  over.
 
   *Acceptance tests.* Three, all landed:
   `snapshot::tests::a_method_that_reads_a_private_name_round_trips_as_its_classs_member`
@@ -4715,13 +4749,16 @@ used to stop on the dropped module records runs to the end (all five indices),
 and the load dies in `initialize_deno_core_ops_bindings` (`jsruntime.rs:1087`)
 on a missing `globalThis.Deno`, which `InitMode::FromSnapshot` expects a
 **deserialized heap** to provide (`1080-1083`, `1264-1279`; `1282` reads `Deno`
-unconditionally). No further item carries that state — deno's five are its
-module map, its templates and two handles — so the from-source path
-(`InitMode::New`, `startup_snapshot: None`) is what a host on this engine runs,
-and the example's own build phase already runs it to the end. Behind it sits the
-measured question of the walk
-reaching the realm's global object, a realm the restore already rebuilt, so
-carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
+unconditionally). No item deno attaches carries that state — its five are its
+module map, its templates and two handles — but §7's last record measured the
+state itself: a bootstrapped realm's `globalThis` **walks** (2,833 records /
+220,054 bytes, no refusal), a **fresh isolate restores it** with the writer's
+`Deno.core` (147 keys) and its bootstrap functions **run**. So the frontier is
+now the **integration** — the load applying a carried global to the realm it
+rebuilds, before the host reads its own names — with the from-source path
+(`InitMode::New`, `startup_snapshot: None`, which the example's own build phase
+already runs to the end) as the other measured answer. §12's eleventh item
+names both and is where the choice is recorded. The `ext`-crate frontier of §7's
 measurement
 (341 errors across eight crates, none of them `deno_core`) is still what stands
 between this and a `deno` binary, and
@@ -4872,18 +4909,51 @@ migrate, then delete.
      `esm_entry_point` module and writes its blob. A host's own source needs no
      change beyond not passing a snapshot it cannot use; what it gives up is V8's
      heap-image startup, which is the whole point of a snapshot.
-   - **Carry the realm's global object** as one more root — rejected on evidence:
-     the walk refuses the first proxy, `WeakMap` or typed array deno's bootstrap
-     installs, and what it could carry would be put back **on top of** a realm the
-     restore already rebuilt, with the host's bootstrapped closures resolving
-     their free names in the reading realm rather than the module that defined
-     them. Part 7's `[[SourceText]]` divergence is the small version of the same
-     wrongness.
+   - **Carry the realm's global object** as one more root — **measured end to end,
+     and it works.** §7 records the experiment in full, with the numbers and the
+     defect it had to fix. Its outcome: the walk carries a bootstrapped realm's
+     `globalThis` with **no refusal** (slot 1: 2,833 records / 220,054 bytes); a
+     **fresh isolate** restores it with the writer's `Deno.core` (147 own keys,
+     the same names) and 72 of 72 properties applied; and a restored *bootstrap*
+     function **runs** — `Deno.core.setUpAsyncStub` reaches deno's own argument
+     check rather than a `ReferenceError`, because deno's bootstrap reads its
+     state through `globalThis.__bootstrap`, which a carried global contains.
+     What that rules out is the earlier version of this bullet ("the walk refuses
+     the first proxy, `WeakMap` or typed array") **and** the inference that
+     followed it (a restored bootstrap function would resolve its module bindings
+     as globals and fail); both were reasoned about rather than measured, and §7
+     is where the measurement is.
 
-   What is *not* decided here: whether a Slag-backed host ships a snapshot at all,
-   and whether the engine should make the distinction visible (an
+     What is **not** done is the integration, and it is the part this item now
+     names: the load path has to *apply* a carried global to the realm it is
+     restoring into, before the host reads its own names off it. That is a bridge
+     change (`SnapshotRestore::restore` has the fresh realm and the decoded
+     items; deno's `create_context` has already made the context) plus whatever
+     the engine needs to make "this realm's global state is one of its slot's
+     items" a supported shape rather than a host's private convention — and the
+     measurement says nothing about *which* of the two a host should prefer, only
+     that both are reachable.
+
+   What is *not* decided here: whether a Slag-backed host ships a snapshot at all
+   (the from-source path needs no snapshot, and the carried-global path needs
+   one), and whether the engine should make the distinction visible (an
    `is_valid`-answering blob a host can check before trusting it, or a
    `slag`-level "data-only" snapshot a host opts into), which is a bridge and API
    question rather than this format's. Recorded so "deno on Slag" stops meaning
    "deno's prebuilt heap snapshot on Slag", which the measurement above rules out,
-   and starts meaning "deno's from-source boot on Slag", which it does not.
+   and starts meaning one of two measured paths: deno's from-source boot, or a
+   boot whose realm's global state came out of the blob.
+12. **`Object.assign` and a function — measured, named, not fixed.** §7's
+   measurement found it in passing: `Object.assign(function () {}, { tag: 7 })`
+   throws `TypeError: assign target is not an object`, because `object_assign`
+   (`crates/runtime/src/builtins/object.rs:1506-1523`) matches `ValueKind::Object`
+   for the target while `to_object` answers `Value::Function` for a function, and
+   the same match **skips a function source** entirely — so a function's own
+   enumerable properties are never copied either. A function is an object in both
+   roles (spec 20.1.2.1 coerces the target with ToObject, and a source is any
+   coercible value), so this is a conformance divergence with no fixture over it.
+   The fix is the engine's own coercion (`crate::context::as_object`, which the
+   snapshot reader and the builtins already use where a function must be treated
+   as an object) in the two matches, and it wants a test for each role plus a
+   sweep, which is why it is a named follow-up rather than a line taken inside a
+   measurement.
