@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, and **the realm's own global functions by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, and **the realm's own global functions and the members of its own builtin objects by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time (§7), where the next value, a method whose body reads a private name, is part 13; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2756,6 +2756,24 @@ Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --
 
 *And the next value is the realm's own builtin functions.* Re-measured the same way, `create_blob` now carries the method and stops on `a built-in function (a host callback is a Rust closure, not a name or an address a snapshot can carry)` — with the probe saying `name=Some("abs") own_name=Some("abs") length=Some(1.0) construct=false host=true`, i.e. **`Math.abs`**, a value the host's table legitimately cannot hold because the *engine* made it. It is reached as a value rather than through `%Math%` (which the walk stops at, being named) because deno's `00_primordials.js` copies the realm's builtins into its primordials object — `MathAbs`, `MathMax`, `ArrayPrototypePush`, … — so the walk can meet *any* builtin the realm installs. What that wants is part 6's own mechanism applied past the ten globals: a builtin function the reading realm rebuilds should be written by **name**, which means the realm has to name the functions it installs on its intrinsic objects. That is the twelfth part, and it is the next value.
 
+**The realm's own builtins by name — landed, and deno's blob both builds and is read for the first time.** The twelfth part of ledger item 16, and the value the method record's measurement named: `Math.abs`, a builtin the *engine* made, reached as a value because deno's `00_primordials.js` copies the realm's builtins into an object it attaches to the realm it snapshots.
+
+*The mechanism is the sixth part's, extended past the ten globals to what the realm's own objects hold.* `Intrinsics::name_members()` runs last in the bootstrap, after every install has declared its names, and derives a name for every **function** member of every registered intrinsic object and function: `%<owner-stem>.<key>%` for a data property, `%get …%`/`%set …%` for the halves of an accessor, and `%<stem>[Symbol.iterator]%` (no dot) for a well-known symbol key — the spellings the installs that declare a member already use (`%Array.prototype.at%`, `%get Error.prototype.stack%`). The name is derived rather than declared at each site because the derivation is a property of the realm's own structure — the owner's registered name and the member key — which is exactly what the writing and the reading realm share. Measured: **355 names** for a realm this engine boots.
+
+*Three rules the pass keeps.* It reads the name table into a scratch `Vec` before writing anything (`define` takes the `entries` borrow); it leaves a name already in the table alone, so a derivation can never displace a declared name; and it names only **functions**, because naming a random object would be a false intrinsic claim. `name_function` lifts the plain registration out of `define` so a derived name does no dispatch-handler lookups — it cannot need one, because a member's call reaches its handler through the names its *install* declared and the name table is per function.
+
+*And the pass that claimed to be idempotent was not, which a measurement showed.* The doc said "running the pass twice is a no-op"; a probe counting what each call added printed **355, then 120**. The second call had scanned the *first* call's derived names as owners — `%Array.prototype.constructor%` names `%Array%` — and minted second-order spellings (`%Array.prototype.constructor.from%`) beside the declared ones (`%Array.from%`). The pass now remembers the names it derived and skips them as owners, so it is idempotent as documented, and the test asserts it (a second call leaves `%Array.prototype.constructor.from%` absent); removing the skip reproduces exactly that name.
+
+*What it promises.* A named builtin comes back as the **reading realm's own** value — the same function object, not a copy — because the restore resolves the name against the realm it reads into. That is what makes deno's `uncurryThis` shape survive: `Function.prototype.call.bind(Math.max)` has a bind's *target* that is a named builtin.
+
+*Tests.* Two: `realm::tests::a_realm_names_the_members_of_its_own_builtin_objects` (Math.abs named by stem and key; an accessor's getter named with the `get` prefix; a name already present not displaced; and the idempotence assertion above) and `snapshot::tests::a_builtin_member_round_trips_as_the_realms_own` (Math.abs by name, with the blob asserted to carry `%Math.abs%`; a bind over `Math.max` restored and called; `Number.isFinite` on a function owner — a constructor's static, which nothing dispatches through, so no install names it of its own accord). Six mutations, each caught: the pass not run, the stem keeping its percents, accessors not named, function owners not scanned, the owner dropped from the name, and the idempotence skip.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **852 → 854 passed / 0 failed** (853 with the documented flake `certified_body_global_read_fast_path_stays_spec_exact` skipped); `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,231 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the battery ran with the release binaries rebuilt after the last engine edit: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*And deno's `create_blob` completes.* Re-measured with the build script's output forced (`touch libs/core/examples/snapshot/build.rs` — cargo caches build-script results), `cargo build --offline -p build-your-own-js-snapshot --features deno_core/v8` builds and its build script runs to the end, writing a 226,426-byte `RUNJS_SNAPSHOT.bin`. **This is the first time deno's `create_blob` has completed.**
+
+*And the next value is at the load, which had never been exercised against deno's blob.* `create_snapshot` writes the blob; `JsRuntime::new` with `startup_snapshot: Some(...)` reads it, and that is the example's own `check_output` test. It now reaches the restore and panics: `v8::Context::FromSnapshot: the snapshot could not be read for context 1: snapshot function could not be rebuilt: its method source could not be evaluated: SyntaxError: Private field access is only valid inside a class`. A **method whose body reads a private name** — deno's bootstrap copies such methods out of classes into its primordials — cannot be rebuilt by evaluating it in the object-literal context the method record uses, because a `#name` is only in scope inside a class body. That is part 13, and it is the next value.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -4032,6 +4050,66 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   applied, not walked, read but ignored, the wrapper never strict, the wrapper
   always strict, and the parse entry's keyword check.
 
+  **Twelfth part — the realm's own builtins by name, designed before it was
+  written, and landed.** The value the eighth part's measurement named:
+  `Math.abs`, a builtin the *engine* made, a value the host's table legitimately
+  cannot hold because the engine made it. It is reached as a value rather than
+  through `%Math%` (which the walk stops at, being named) because deno's
+  `00_primordials.js` copies the realm's builtins into its primordials object, so
+  the walk can meet *any* builtin the realm installs.
+
+  - **The mechanism is the sixth part's, applied past the ten globals.** That
+    part named the global object's ten function properties; this one names what
+    those objects and every other intrinsic object and function *hold*.
+    `Intrinsics::name_members()` runs last in `initialize_host_defined_realm`'s
+    bootstrap, after every install has declared its names, and derives a name for
+    every **function** member of every registered owner: `%<owner-stem>.<key>%`
+    for a data property, `%get …%`/`%set …%` for the halves of an accessor, and
+    `%<stem>[Symbol.x]%` (no dot) for a well-known symbol key — each the spelling
+    the installs that declare a member already use. Measured: **355 names** on a
+    realm this engine boots.
+  - **Derived, not declared, because the derivation is the shared fact.** The
+    writing and the reading realm both rebuild the same installs, so the owner's
+    registered name plus the member key is exactly what the two realms agree on
+    without a per-site name. The rules that keep it sound: the table is read into
+    a scratch `Vec` before anything is written (`define` takes the `entries`
+    borrow); an existing name is left alone, so a derivation never displaces a
+    declared one; and only functions are named — naming a random object would be
+    a false intrinsic claim. `name_function` lifts the plain registration out of
+    `define` so a derived name does no dispatch-handler lookups; it cannot need
+    one, because a member's call reaches its handler through the names its
+    *install* declared and the name table is per function.
+  - **And the pass was not idempotent, which a probe found.** The pass's own doc
+    claimed a second run is a no-op; counting what each call added printed
+    **355, then 120**. The second call scanned the first call's derived names as
+    owners — `%Array.prototype.constructor%` is one pass's spelling of `%Array%`
+    — and minted second-order names (`%Array.prototype.constructor.from%`) beside
+    the declared `%Array.from%`. The pass now remembers the names it derived and
+    skips them as owners, so the documented claim is true and a caller may run it
+    twice, which the test does to reach the accessor branch.
+  - **What it promises.** A named builtin comes back as the **reading realm's
+    own** value — the same function object, not a copy — because the restore
+    resolves the name in the realm it reads into. Deno's `uncurryThis` shape
+    (`Function.prototype.call.bind(Math.max)`) has a bind's *target* that is a
+    named builtin, so this is what makes that record resolve.
+
+  *Acceptance tests.* Two, both landed: `realm::tests::
+  a_realm_names_the_members_of_its_own_builtin_objects` (naming by stem and key,
+  the accessor prefix, no displacement, idempotence) and `snapshot::tests::
+  a_builtin_member_round_trips_as_the_realms_own` (Math.abs by name with the blob
+  asserted to spell it, a bind over `Math.max` restored and called, and a
+  constructor's static `Number.isFinite`, which no install names of its own
+  accord). Six mutations, each caught: the pass not run, the stem keeping its
+  percents, accessors not named, function owners not scanned, the owner dropped
+  from the name, and the idempotence skip.
+
+  **And the format now builds and loads.** With this part, deno's `create_blob`
+  completes — the example's build script runs to the end and writes a
+  226,426-byte blob, the first time it has. Reading it back, which had never been
+  exercised, restores contexts until it reaches a **method whose body reads a
+  private name** and panics: the object-literal context the method record
+  evaluates in cannot bring a `#name` into scope. That is part 13.
+
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -4173,16 +4251,16 @@ a frame view of the running stack. §7's survey already split the subsystem: the
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots — **the format landed with
 its context table, the external-reference table, a function, a bound function, a
-class constructor, a host callback, an arrow and
-the realm's named global functions with it (§7's last nine records, ledger item
-16). What is left of this item is named rather than implied:
-`FunctionCodeHandling::Keep`'s compiled code (which waits on the code cache), the
-isolate-level data slots, continuation from an existing blob, and the step deno's
-`create_blob` now stops on — an **ordinary function with no `[[SourceText]]`**,
-because a call the host makes from Rust pushes a frame with no source and a
-closure created inside it has nothing to capture from — behind which
-is still the measured question of the graph reaching the **global object**, and
-behind that the method machinery ledger item 16's eighth part names.**;
+class constructor, a host callback, an arrow, a method with its `[[HomeObject]]`,
+the realm's named global functions and the members of its own builtin objects
+with it (§7's records for it; ledger item 16 has twelve parts). What is left of
+this item is named rather than implied: `FunctionCodeHandling::Keep`'s compiled
+code (which waits on the code cache), the isolate-level data slots, continuation
+from an existing blob, and the step the **load** now stops on — a **method whose
+body reads a private name**, which the object-literal context the method record
+evaluates in cannot bring into scope (§7's last record; that is part 13) —
+behind which is still the measured question of the graph reaching the **global
+object**, and behind that the accessor half of the method part.**;
 (4) module resolver as a
 host trait (landed), **unbound scripts and script origins** (the bridge side
 landed — every Rust script handle is already context-unbound — and what the
@@ -4243,24 +4321,26 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's eleven parts have landed — the format, the context table,
+bridge. That item's twelve parts have landed — the format, the context table,
 the external-reference table, a function, a bound function, the realm's named
 global functions, a class constructor, a host callback, an arrow, the text a call
-frame runs and **a method with its `[[HomeObject]]`** — so the blocker this plan
+frame runs, **a method with its `[[HomeObject]]`** and **the members of the
+realm's own builtin objects by name** — so the blocker this plan
 could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
-for every load, a function, a bind, a class, an arrow, a host callback and a
-method all
+for every load, a function, a bind, a class, an arrow, a host callback, a method
+and a builtin member all
 come back
 callable or
 constructable, and a closure deno's own JS creates inside a function the host
-calls from Rust carries its text. What is left — and it is the value the walk
-stops on now — is the realm's **own builtin functions**: deno's
-`00_primordials.js` copies them out of `Math`, `Array.prototype`, `Object` and
-the rest into its primordials object, so the walk meets `Math.abs` as a value,
-and a builtin is carryable only if the realm names it. Behind that sits the
+calls from Rust carries its text. **`create_blob` now completes** — deno's
+snapshot build script runs to the end and writes its 226,426-byte blob — and the
+frontier is the **load**, which had never been exercised against that blob: it
+panics rebuilding a **method whose body reads a private name**, because the
+object-literal context the method record evaluates in cannot bring a `#name`
+into scope. That is part 13. Behind it sits the
 **accessor** half of the method part, and then the measured question of the walk
 reaching the realm's global object, a realm the restore already rebuilt, so
 carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
@@ -4269,7 +4349,6 @@ measurement
 between this and a `deno` binary, and
 deno's own runtime gaps (`queueMicrotask` among them) sit behind that; (4)
 migrate, then delete.
-delete.
 
 ## 11. Working rules
 
@@ -4289,9 +4368,10 @@ delete.
    references, a function, a bound function, a class constructor, a host callback,
    an arrow, the realm's
    named global functions,
-   the text a call frame runs
-   and a method with its [[HomeObject]]** (§7's last eleven records, ledger item
-   16): a versioned
+   the text a call frame runs,
+   a method with its [[HomeObject]] and the members of the realm's own builtin
+   objects** (§7's records for it, ledger item
+   16's twelve parts): a versioned
    blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
@@ -4302,16 +4382,21 @@ delete.
    callback as the entry of the host's table its call came from **and the data
    value it reads**, a
    refusal naming
-   anything uncarried. What this item still owns: a host callback's
-   **construct half**, the **realm's own builtin functions by name** (the next
-   measured step — deno's primordials hold them as values, and `Math.abs` is the
-   one the walk stops on now, §7's last record), the **accessor** half of the
-   method part, the
+   anything uncarried. And the format now **loads**: deno's blob, read back for
+   the first time, restores contexts until it reaches a **method whose body reads
+   a private name** — the object-literal context the method record evaluates in
+   cannot bring a `#name` into scope, so a method deno's bootstrap copies out of
+   a class refuses at restore (§7's last record), and that is the next measured
+   step. What this item still owns: a host callback's
+   **construct half**, that **private-name** method (part 13), the **accessor**
+   half of the method part, the
    measured question of the walk reaching the **global object**, a
    value shared between two contexts coming back one per context, compiled code
    for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
-   existing blob. The call-frame `source` the eleventh part closed was the
-   conformance bug this item's walk exposed rather than a record it was missing.
+   existing blob. The realm's own builtin members by name — the value the walk
+   met as `Math.abs` — are **carried** now (the twelfth part). The call-frame
+   `source` the eleventh part closed was the conformance bug this item's walk
+   exposed rather than a record it was missing.
 3. **Sealing `slag::api`** — the re-export exists (`crates/slag/src/lib.rs`, with a
    test that drives a module through it), so a host can depend on `slag` alone.
    Still open: `Local::value`, `Isolate::agent`, `Local::as_object` name

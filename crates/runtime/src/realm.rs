@@ -3,15 +3,15 @@
 //! SetDefaultGlobalBindings).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
 use crux::heap::{GcAny, Trace};
-use crux::object::JsObject;
-use crux::property::PropertyDescriptor;
+use crux::object::{JsObject, PropertyKind};
+use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 
@@ -97,6 +97,14 @@ pub struct Intrinsics {
     /// the identity-chain dispatchers resolve their callee's names once per
     /// call and compare strings instead of probing the table per arm.
     names: RefCell<HashMap<u64, Rc<Vec<Rc<str>>>>>,
+    /// The names `name_members` derived rather than an install declared. The
+    /// pass scans owners to derive their members, so a derived name must not be
+    /// scanned as an owner in turn: `%Array.prototype.constructor%` names
+    /// `%Array%`, and treating it as an owner would mint
+    /// `%Array.prototype.constructor.from%` for a member that already has the
+    /// declared spelling `%Array.from%`. Skipping them is what makes the pass
+    /// idempotent, which the pass's own contract promises.
+    derived: RefCell<HashSet<Rc<str>>>,
     /// Cut 26: the realm's %Object.prototype% handle, cached after the first
     /// resolution — the intrinsics table is populated at bootstrap and never
     /// reassigned, so the handle is stable for the realm's life. Object
@@ -346,19 +354,110 @@ impl Intrinsics {
         Some(value)
     }
 
-    pub fn define(&self, name: &str, value: Value) {
-        self.cache_barrier(value);
-        let key: Rc<str> = Rc::from(name);
-        self.entries.borrow_mut().insert(Rc::clone(&key), value);
-        if let Some(function) = value.as_function() {
-            let mut names = self.names.borrow_mut();
-            match names.get_mut(&function.id()) {
-                Some(aliases) => Rc::make_mut(aliases).push(Rc::clone(&key)),
-                None => {
-                    names.insert(function.id(), Rc::new(vec![Rc::clone(&key)]));
+    /// Name the members of the realm's own builtin objects — `%Math.abs%`,
+    /// `%Object.keys%`, `%get RegExp.prototype.global%`.
+    ///
+    /// A builtin the realm installs is a value a host's graph can hold: deno's own
+    /// `00_primordials.js` copies the realm's builtins into an object it attaches
+    /// to the realm it snapshots. A snapshot carries such a value by **name**,
+    /// because the reading realm rebuilds the same builtins and a name is what the
+    /// two realms share. The table already names the intrinsics themselves and,
+    /// since Phase 6, the ten function properties of the global object; what it
+    /// did not name is what those objects *hold* — every `Math` method, every
+    /// prototype method the identity-chain dispatchers have no name for, every
+    /// accessor getter and setter.
+    ///
+    /// The name is derived rather than declared at each install site because the
+    /// derivation is a property of the realm's own structure, which is exactly
+    /// what the writing and the reading realm share: the owner's registered name
+    /// and the member key, in the convention the installs that *do* name an
+    /// accessor already use (`%set Error.prototype.stack%`). A derived name that
+    /// is already in the table is left alone, so a derivation can never displace a
+    /// declared name and running the pass twice is a no-op.
+    pub fn name_members(&self) {
+        // The table is read in full before anything is written to it: `define`
+        // takes the `entries` borrow.
+        let owners: Vec<(Rc<str>, Value)> = self
+            .entries
+            .borrow()
+            .iter()
+            .filter(|(name, _)| !self.derived.borrow().contains(*name))
+            .map(|(name, value)| (Rc::clone(name), *value))
+            .collect();
+        for (owner, value) in owners {
+            // An intrinsic's name is `%…%`; the member's name keeps that shape
+            // with the owner's own percents dropped, which is the convention the
+            // installs that declare a member by name already use
+            // (`%Array.prototype.at%`, `%get ArrayBuffer.prototype.byteLength%`).
+            let Some(stem) = owner
+                .strip_prefix('%')
+                .and_then(|rest| rest.strip_suffix('%'))
+            else {
+                continue;
+            };
+            let Some(object) = member_holder(&value) else {
+                continue;
+            };
+            let Ok(keys) = object.own_property_keys() else {
+                continue;
+            };
+            for key in keys {
+                // The member's spelling: `.abs` for a string key, and the shape the
+                // installs that declare a symbol member already use
+                // (`%Array.prototype[Symbol.iterator]%`) for a well-known symbol —
+                // with no dot, because that is how they spell it. A key that is not
+                // a well-known symbol has no such spelling and is left to the
+                // install that declared it.
+                let member = match &key {
+                    PropertyKey::String(atom) => {
+                        format!(".{}", crux::lookup(*atom).to_string_lossy())
+                    }
+                    PropertyKey::Symbol(symbol) => match crux::symbol::WELL_KNOWN_SYMBOLS
+                        .iter()
+                        .find(|name| crux::symbol::well_known(name).id == symbol.id)
+                    {
+                        Some(name) => format!("[Symbol.{name}]"),
+                        None => continue,
+                    },
+                };
+                let Ok(Some(property)) = object.get_own_property_key(&key) else {
+                    continue;
+                };
+                match &property.kind {
+                    PropertyKind::Data { value, .. } => {
+                        self.name_member(&format!("%{stem}{member}%"), *value)
+                    }
+                    PropertyKind::Accessor { get, set } => {
+                        if let Some(get) = get {
+                            self.name_member(&format!("%get {stem}{member}%"), *get);
+                        }
+                        if let Some(set) = set {
+                            self.name_member(&format!("%set {stem}{member}%"), *set);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Register `name` for `member`, when it is a function the table does not
+    /// already answer to that name with.
+    ///
+    /// The registration is a plain one — no dispatch handler lookup: a member's
+    /// name needs none, since a call reaches its handler through the names the
+    /// *install* declared (the name table is per function, so the two are the same
+    /// function's names). Doing the lookup here would run twelve namespace tables
+    /// over the ~355 derived names on every realm a host creates, for a miss.
+    fn name_member(&self, name: &str, member: Value) {
+        if member.as_function().is_none() || self.entries.borrow().contains_key(name) {
+            return;
+        }
+        self.derived.borrow_mut().insert(Rc::from(name));
+        self.name_function(name, member);
+    }
+
+    pub fn define(&self, name: &str, value: Value) {
+        self.name_function(name, value);
         // Register an agent-dependent builtin's native handler so a warm
         // call dispatches in O(1) (see `builtins::array::handler_for`);
         // functions without a registered handler (prototypes, plain
@@ -401,6 +500,24 @@ impl Intrinsics {
         }
     }
 
+    /// A plain name registration: the barrier, the name, and the function's name
+    /// list — everything `define` does *except* the dispatch handler lookups,
+    /// which only a name an install declares can need (see `name_member`).
+    fn name_function(&self, name: &str, value: Value) {
+        self.cache_barrier(value);
+        let key: Rc<str> = Rc::from(name);
+        self.entries.borrow_mut().insert(Rc::clone(&key), value);
+        if let Some(function) = value.as_function() {
+            let mut names = self.names.borrow_mut();
+            match names.get_mut(&function.id()) {
+                Some(aliases) => Rc::make_mut(aliases).push(Rc::clone(&key)),
+                None => {
+                    names.insert(function.id(), Rc::new(vec![Rc::clone(&key)]));
+                }
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.borrow().is_empty()
     }
@@ -424,6 +541,16 @@ fn as_object(value: &Value) -> Option<Handle<JsObject>> {
 /// InitializeHostDefinedRealm (spec 9.3.4): CreateIntrinsics, the global
 /// object, NewGlobalEnvironment, and SetDefaultGlobalBindings. The caller
 /// pushes the bootstrap execution context.
+/// The object a value's own members live on: an object's own box, or a
+/// function's object part — a builtin constructor's statics are properties of
+/// the function.
+fn member_holder(value: &Value) -> Option<Handle<JsObject>> {
+    if let ValueKind::Function(function) = value.kind() {
+        return function.object.handle();
+    }
+    value.as_object()
+}
+
 pub fn initialize_host_defined_realm(agent: &Agent) -> Result<Handle<Realm>, JsError> {
     let intrinsics = Intrinsics::default();
     // The global object's prototype is %Object.prototype% once the intrinsic
@@ -612,6 +739,11 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
             }
         }
     }
+    // The last thing the table gets: a name for every function the realm's own
+    // builtin objects hold, so a host's graph can hold a builtin the same way it
+    // holds an intrinsic — by name, which the reading realm resolves from its own
+    // installs (see `Intrinsics::name_members`).
+    realm.intrinsics.name_members();
     Ok(())
 }
 
@@ -628,6 +760,75 @@ mod tests {
         intrinsics.define("%Object.prototype%", Value::Undefined);
         assert!(!intrinsics.is_empty());
         assert_eq!(intrinsics.get("%Object.prototype%"), Some(Value::Undefined));
+    }
+
+    /// A builtin the realm installs on one of its own objects is **nameable** by
+    /// the table — the name a snapshot writes such a value as — derived from the
+    /// owner's own name and the member key, in the convention the installs that
+    /// declare a member already use.
+    #[test]
+    fn a_realm_names_the_members_of_its_own_builtin_objects() {
+        let agent = Agent::new();
+        let realm = initialize_host_defined_realm(&agent).unwrap();
+        let math = realm
+            .global_object
+            .get(&JsString::from_utf8("Math"))
+            .unwrap()
+            .as_object()
+            .expect("%Math% is an object");
+        let abs = math.get(&JsString::from_utf8("abs")).unwrap();
+        assert!(abs.as_function().is_some(), "Math.abs is a function");
+        assert_eq!(
+            realm.intrinsics.get("%Math.abs%"),
+            Some(abs),
+            "a namespace object's method is named by the object's name and the key"
+        );
+
+        // The two halves of an accessor are two names, distinguished the way the
+        // installs that declare one distinguish them (`%get %TypedArray%…`), and a
+        // member the table already answers to is left alone rather than renamed.
+        let getter = Function::create_builtin(
+            Some(JsString::from_utf8("get x")),
+            0,
+            Box::new(|_, _| Ok(Value::Number(1.0))),
+            None,
+            None,
+        )
+        .unwrap();
+        math.define_property(
+            &JsString::from_utf8("x"),
+            &PropertyDescriptor {
+                value: None,
+                writable: None,
+                get: Some(Value::Function(getter)),
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )
+        .unwrap();
+        realm.intrinsics.name_members();
+        assert_eq!(
+            realm.intrinsics.get("%get Math.x%"),
+            Some(Value::Function(getter)),
+            "an accessor's getter is named with the `get` prefix convention"
+        );
+
+        // A derived name is not an owner in turn. `%Array.prototype.constructor%`
+        // is one pass's spelling of `%Array%`; if it were scanned as an owner the
+        // next pass would mint `%Array.prototype.constructor.from%` beside the
+        // declared `%Array.from%`, and no pass would ever be the last.
+        assert_eq!(
+            realm.intrinsics.get("%Array.prototype.constructor.from%"),
+            None,
+            "a derived name never becomes an owner, so the pass is idempotent"
+        );
+        assert!(realm.intrinsics.get("%Array.from%").is_some());
+        assert_eq!(
+            realm.intrinsics.get("%Math.abs%"),
+            Some(abs),
+            "and a name already in the table is not displaced"
+        );
     }
 
     #[test]

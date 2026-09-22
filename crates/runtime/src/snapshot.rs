@@ -3278,6 +3278,60 @@ mod tests {
         );
     }
 
+    /// A builtin function the realm installs is a value a host's graph can hold:
+    /// deno's own `00_primordials.js` copies them into an object it attaches to
+    /// the realm it snapshots. It comes back as the name the **reading realm**
+    /// answers to, which is the realm's own builtin rather than a copy of one —
+    /// and the `uncurryThis` shape deno actually holds is a bind over one.
+    #[test]
+    fn a_builtin_member_round_trips_as_the_realms_own() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let abs = context
+            .try_eval("Math.abs")
+            .expect("a builtin member")
+            .into_value();
+        let blob = encode_value(&isolate, &realm, abs);
+        assert!(
+            blob.windows(10).any(|window| window == b"%Math.abs%"),
+            "the builtin is in the blob by the name the realm derives for it"
+        );
+        let back = decode(agent_mut(&isolate), &realm, &blob).expect("decode");
+        assert_eq!(
+            back.as_function().map(|function| function.id()),
+            abs.as_function().map(|function| function.id()),
+            "the restored value is the realm's own Math.abs"
+        );
+
+        // `Function.prototype.call.bind(Math.max)` is deno's `uncurryThis`: a bind
+        // whose *target* is a builtin, which is the record the name has to serve.
+        let bound = context
+            .try_eval("Function.prototype.call.bind(Math.max)")
+            .expect("a bound builtin")
+            .into_value();
+        let back = round_trip(&isolate, &realm, bound);
+        assert_eq!(
+            call_restored(&isolate, &realm, back, "null, 1, 2").as_number(),
+            Some(2.0),
+            "a bind over a named builtin comes back callable"
+        );
+
+        // A static of a builtin *constructor* lives on the function rather than on
+        // an object, and is the same kind of member — and one the installs do not
+        // name of their own accord, since nothing dispatches through it.
+        let is_finite = context
+            .try_eval("Number.isFinite")
+            .expect("a static")
+            .into_value();
+        let back = round_trip(&isolate, &realm, is_finite);
+        assert_eq!(
+            call_restored(&isolate, &realm, back, "1").as_boolean(),
+            Some(true),
+            "a constructor's static comes back as the realm's own"
+        );
+    }
+
     /// Two references to one object come back as one object, rather than as two
     /// equal ones — the property a host's own bookkeeping depends on.
     #[test]
