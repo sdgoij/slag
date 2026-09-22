@@ -1404,7 +1404,7 @@ fn check_object_literal(
                 }
                 check_function(function)?;
             }
-            ObjectProperty::Get { key, body } | ObjectProperty::Set { key, body, .. } => {
+            ObjectProperty::Get { key, body, .. } | ObjectProperty::Set { key, body, .. } => {
                 if let PropertyName::Computed(computed) = key {
                     check_expr(computed, labels)?;
                 }
@@ -1819,7 +1819,8 @@ fn check_private_expr(
                         check_private_property_name(key, env)?;
                         check_private_function(function, env)?;
                     }
-                    ObjectProperty::Get { key, body } | ObjectProperty::Set { key, body, .. } => {
+                    ObjectProperty::Get { key, body, .. }
+                    | ObjectProperty::Set { key, body, .. } => {
                         check_private_property_name(key, env)?;
                         check_private_stmts(&body.stmts, env)?;
                     }

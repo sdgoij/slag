@@ -2734,11 +2734,11 @@ Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **840 �
 
 *What it makes visible.* `is_frame` counts a context with a source as a frame, and that criterion was written when a source meant a script, a module or eval — the certified push's context is the only frame an ordinary call has, so a trace now reports one frame per call rather than only the calls that read a spec-only slot. Two consequences are stated rather than hidden: those frames carry **no name** (the certified push keeps `context.function` gated on its one reader, a sloppy mapped `arguments`, so `GetFunctionName` answers `None` for them), and `Error.stack`, which names its lines from that same slot, reads exactly as it did. A **leaf-inlined** call still pushes nothing, by design and soundly — leafhood excludes closure creation, calls and a sloppy `arguments` — and it is not observable from JavaScript at all: reaching a trace means calling, and a call disqualifies leafhood.
 
-*Tests.* Four in `crates/runtime/src/api/mod.rs` (the callee's text over six call shapes — certified, arrow, env-path, `Function`-built, and both tails; the three suspended bodies; the construct path; a **module** function the host calls with no module frame beneath it) and two in `snapshot.rs` (the host-call shape round-tripping through the format, which is what deno's walk refused; a class defined in a `Function`-built body, which the walk used to refuse and now carries). Two existing tests were **re-aimed rather than deleted**, because part 11 removed the constructions they used: the class-source refusal (its `new Function` shape is carried now) became that positive test, and the arrow case of the refusal-by-kind test became the **accessor** — the kind that still has no `[[SourceText]]` at all, and now the only source-less refusal the engine's tests reach. The bridge's `a_capture_reports_the_engines_contexts_not_the_call_stack` pins the new frame list. **Twelve mutations, each caught**: the certified call push, the certified construct push, the slow call push, the three suspended pushes, the certified tail push, the slow tail push, the arrow's `parse_text`, the registration walk, the dynamic path's explicit text, and the module declaration pass's.
+*Tests.* Four in `crates/runtime/src/api/mod.rs` (the callee's text over six call shapes — certified, arrow, env-path, `Function`-built, and both tails; the three suspended bodies; the construct path; a **module** function the host calls with no module frame beneath it) and two in `snapshot.rs` (the host-call shape round-tripping through the format, which is what deno's walk refused; a class defined in a `Function`-built body, which the walk used to refuse and now carries). Two existing tests were **re-aimed rather than deleted**, because part 11 removed the constructions they used: the class-source refusal (its `new Function` shape is carried now) became that positive test, and the arrow case of the refusal-by-kind test became the **accessor** — the kind that still had no `[[SourceText]]` at all, and then the only source-less refusal the engine's tests reached (part 17 gave the accessor its source too, so that refusal is positive coverage now and no function kind is source-less). The bridge's `a_capture_reports_the_engines_contexts_not_the_call_stack` pins the new frame list. **Twelve mutations, each caught**: the certified call push, the certified construct push, the slow call push, the three suspended pushes, the certified tail push, the slow tail push, the arrow's `parse_text`, the registration walk, the dynamic path's explicit text, and the module declaration pass's.
 
 Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **843 → 848 passed / 0 failed**; `cargo test -p v8 --features simdutf --lib -- --skip the_data_a_built_function_carries_survives_a_collection` **223 passed / 0 failed / 1 filtered**; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,219 → 5,224 passed / 0 failed / 4 ignored** (one earlier run of it reported a single failure whose name was not captured; the two runs after it, one of them the counted one, were clean). `crates/runtime` changed, so the battery ran, twice — once mid-work and once against the tree as it stands, with the release binaries rebuilt after the last engine edit (a file mtime newer than `target/release/sweep.exe` was caught and is why the second run exists): test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
 
-*And the next value is a method.* Re-measured the same way, deno's `create_blob` now gets past `async_op_0` and stops on `v8::SnapshotCreator::create_blob: the engine cannot carry a method (a method's source has no `function` keyword, so it cannot be re-parsed on its own) yet` — ledger part 8, the kind the seventh and tenth parts both left named as open. A method's `[[SourceText]]` is method-form (`m() {}`) and needs a parse context of its own plus its carried `[[HomeObject]]`; the same context is what an accessor needs.
+*And the next value is a method.* Re-measured the same way, deno's `create_blob` now gets past `async_op_0` and stops on `v8::SnapshotCreator::create_blob: the engine cannot carry a method (a method's source has no `function` keyword, so it cannot be re-parsed on its own) yet` — ledger part 8, the kind the seventh and tenth parts both left named as open. A method's `[[SourceText]]` is method-form (`m() {}`) and needs a parse context of its own plus its carried `[[HomeObject]]`; the same context is what an accessor needs (and got, in part 17, by the same `({ … })` wrapper).
 
 **A method — landed, and deno's walk reaches the realm's own builtins.** The eighth part of ledger item 16, designed and implemented in one step because the measurement named it exactly.
 
@@ -2857,6 +2857,22 @@ Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --
 Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **864 passed / 0 failed**; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,243 → 5,244 passed / 0 failed**, the one being this change's test. `crates/runtime` changed, so the battery ran with the release binaries rebuilt after the last engine edit: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
 
 The probes, all removed once they had answered: a `probe_walk` beside `visit` (the walk's `Result` plus the record count it reached); a loop in `api::Context::write_snapshot` that encoded each context's global alone and reported the size; a `probe_realm` in the same file that dumped a realm's `globalThis`/`Deno`/`Deno.core`/`__bootstrap`/`__bootstrap.core` own keys, their `ObjectKind` and their intrinsic names; an `encode_slots` + `read_snapshot` round trip into a fresh `api::Isolate` whose realm then read `__slag_carried`, applied every property and called `Deno.core.setUpAsyncStub`; and four counters inside the format itself (`visit`, `write_properties`, `write_record`, `define_properties`).
+
+**Every function kind the format carries a source for, and `Object.assign` treats a function as an object — landed.** The seventeenth part of ledger item 16, and the two side findings the carried-global experiment above turned up: §12's items 12 and 13 named each fix before the edit (§11's order), and this record closes them.
+
+*The accessor was the last source-less kind, and closing it is a conformance fix as well as a format one.* `instantiate_accessor` took `params` and `body` and registered the function with `source: None`, while `instantiate_method` had captured `capture_source(agent, f.span)` since the method part — so a getter or setter's `Function.prototype.toString` answered the native form where spec 15.4.3 gives it the MethodDefinition's own text, and the snapshot walk refused it with "the engine kept no source text for it". The instantiation now takes a sixth parameter, `source: Option<JsString>`, and the **parser** records what the callers pass: `ObjectProperty::{Get,Set}` and `ClassElement::{Get,Set}` carry a `span` for the whole `get key() { … }`, captured from the `get`/`set` keyword before it is consumed. Every instantiation site hands it over — `class.rs` for a class's two accessor forms, `expr.rs` for the tree-walker's object literal, and `ir.rs` for the compiled path, where the span rides on `Step::ObjectAccessorName`/`ObjectAccessorComputed` (the JIT passes the step **index** to its helper, so `crates/jit` needed no change). The snapshot's rebuild passes the record's **own** text rather than resolving a span, because the `({ … })` wrapper it parses is not the text the accessor's span indexes — the class-constructor shape, for the same reason.
+
+*A consequence for the refusal list: no function kind is source-less now.* The format's own module docs listed "a method or an accessor" as kinds it refused for want of source; both carry theirs (parts 15 and 17), and what remains is a class constructor defined where no frame holds the text its span belongs to — the `new Function` case the class part already re-aimed. So the engine's source-less refusal test (`an_uncarried_function_is_refused_by_kind`) had nothing left to refuse by kind and was **replaced** by positive coverage: `an_accessor_round_trips_with_its_source` round-trips an object with a getter **and** a setter (the setter writes, the getter reads the same restored property back), asserts each half answers its own definition, and reads a class accessor through `new restored().c`.
+
+*`Object.assign` and a function, both roles.* `object_assign` matched `ValueKind::Object` for the target and for each source while `to_object` answers `Value::Function` for a function, so a function **target** threw "assign target is not an object" and a function **source** was skipped entirely — a conformance divergence with no fixture over it. Both ends go through the engine's coercion (`as_object`) now, and the source's properties are read with the coerced source as the receiver, so a getter sees the function rather than its object part.
+
+*The walker arm is parity, and that is measured rather than assumed.* `expr.rs`'s `eval_object_literal` captures the span too, but it is the **tree-walker**'s arm, and the walker is dead in normal execution. Probes in `evaluate_body` and in `eval_statement_list` (the walker's two entries — `ordinary_call`'s `None` arm and `ordinary_construct`'s) fire **0** times across the whole `cargo test -p runtime --lib` suite, while a control probe in `eval_program` fires 2,967 — so `register_function`'s "every body compiles to the step IR" is literally true, and that arm is uncovered by any test and cannot be made discriminating without forcing the walker. It is kept as parity (if the walker ever runs an object literal, its accessor keeps its source) and recorded as uncovered rather than presented as covered.
+
+*Tests.* `builtins::function::tests::function_to_string_renders_source_or_native` gains a getter, a setter, a class getter, and a getter inside a `new Function` body — the last reaches the compiled path through `instantiate_dynamic_function` rather than the walker, which is what the probes settled. `snapshot::tests::an_accessor_round_trips_with_its_source` replaces the refusal test, as above. `builtins::object::tests::assign_treats_a_function_as_an_object` covers both roles and the enumerable-only rule (a function source's non-enumerable `name` does not travel).
+
+*Six mutations, each caught.* The accessor's `source` argument dropped in `instantiate_accessor` (both tests fail); the compiled path's capture dropped in `ir.rs`'s `object_accessor` (both fail — the object-literal assertions are its guard, including the `new Function` one); the class path's capture dropped in `class.rs`'s getter (both fail on the class assertion); the snapshot rebuild's `Some(text)` replaced by `None` in the getter and the setter arm (only `an_accessor_round_trips_with_its_source` fails — the discrimination the replaced refusal test never had); and `object_assign`'s **target** then **source** coercion reverted to the `ValueKind::Object` match (the first throws "assign target is not an object", the second drops a function source's property).
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **865 passed / 0 failed**; `cargo test -p parser --lib` 86 / 0 and `cargo test -p test262` 3,324 / 0 (2 ignored) plus 3 / 0; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,244 → 5,245 passed / 0 failed** (the one net-new test; the replaced refusal test nets zero). `crates/{runtime,parser,syntax}` changed, so the battery ran with the release binaries rebuilt: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
 
 ## 8. Parked: the C++ face
 
@@ -3721,7 +3737,8 @@ a frame view of the running stack. §7's survey already split the subsystem: the
      are the eighth part, and they are a different mechanism — a method's source
      is method-form (`m() {}`) and needs a parse context of its own plus its
      carried `[[HomeObject]]`; the same context is what an accessor
-     (`get x() {}`, source-less today) needs.
+     (`get x() {}`, source-less when this was written) needed — part 17 closed
+     that, and the accessor is carried by the same method record now.
 
   *Acceptance tests — all landed.* Engine: a class constructor round trips and
   constructs (`new restored().x` answering a field's value, and a bare
@@ -4943,7 +4960,7 @@ migrate, then delete.
    "deno's prebuilt heap snapshot on Slag", which the measurement above rules out,
    and starts meaning one of two measured paths: deno's from-source boot, or a
    boot whose realm's global state came out of the blob.
-12. **`Object.assign` and a function — measured, named, not fixed.** §7's
+12. **`Object.assign` and a function — landed, both roles fixed.** §7's
    measurement found it in passing: `Object.assign(function () {}, { tag: 7 })`
    throws `TypeError: assign target is not an object`, because `object_assign`
    (`crates/runtime/src/builtins/object.rs:1506-1523`) matches `ValueKind::Object`
@@ -4951,9 +4968,46 @@ migrate, then delete.
    the same match **skips a function source** entirely — so a function's own
    enumerable properties are never copied either. A function is an object in both
    roles (spec 20.1.2.1 coerces the target with ToObject, and a source is any
-   coercible value), so this is a conformance divergence with no fixture over it.
-   The fix is the engine's own coercion (`crate::context::as_object`, which the
+   coercible value), so it was a conformance divergence with no fixture over it.
+   The fix was the engine's own coercion (`crate::context::as_object`, which the
    snapshot reader and the builtins already use where a function must be treated
-   as an object) in the two matches, and it wants a test for each role plus a
-   sweep, which is why it is a named follow-up rather than a line taken inside a
-   measurement.
+   as an object) in the two matches, with a test for each role and a sweep of a
+   corpus that has `Object.assign` in it.
+
+   **Landed** (named before the edit, §11's order). Both matches go through the
+   engine's coercion, and the source's properties are read with the coerced
+   source as the receiver, so a getter sees the function rather than its object
+   part. `builtins::object::tests::assign_treats_a_function_as_an_object` covers
+   both roles and the enumerable-only rule (a function source's non-enumerable
+   `name` does not travel); two mutations, each caught — the target coercion and
+   the source coercion reverted to the `ValueKind::Object` match. Part 17 of §7's
+   record; the corpus was re-swept because `Object.assign` is in it.
+13. **An accessor had no `[[SourceText]]` — landed, and it was a conformance
+   gap rather than only a snapshot one.** Found while fixing the
+   first: a getter created by an object literal in an eval'd script refused to
+   encode (`a function — the engine kept no source text for it`). The reason was
+   in the instantiation: `instantiate_method` (`function.rs:1023`) called
+   `capture_source(agent, f.span)` and handed it to `register_function`, while
+   `instantiate_accessor` (`function.rs:1051`) took `params` and `body` with **no
+   span at all** and registered the function with `source: None`. §7's part-8
+   measurement already named the shape ("the same context is what an accessor
+   needs"), and §7's part-11 record re-aimed the refusal test onto the accessor as
+   the kind that still had no `[[SourceText]]` at all — so this was a documented
+   gap being closed, not a new discovery.
+
+   It mattered beyond the snapshot: spec 15.4.3 gives a getter or setter defined
+   by a `MethodDefinition` the definition's text, so its
+   `Function.prototype.toString` must answer `get b() { return 2; }` — and the
+   corpus cannot see the difference, because test262's
+   `assertToStringOrNativeFunction` accepts the native branch (the same reason the
+   class-constructor and arrow gaps before it were invisible to it). **Landed:**
+   the accessor instantiation takes the definition's span and captures the source
+   like the method path, and every caller passes the span the parser now records
+   for the whole definition — `class.rs`, `expr.rs` and `ir.rs` (the span rides on
+   the two `ObjectAccessor*` steps, and the JIT passes the step index to its
+   helper, so `crates/jit` is unchanged) — while the snapshot's rebuild hands over
+   the record's own text. A getter or setter is carriable by the same method record
+   an accessor's half already uses, and the engine's source-less refusal test had
+   nothing left to refuse by kind, so it became positive coverage
+   (`an_accessor_round_trips_with_its_source`). Six mutations, each caught; the
+   corpus was re-swept because `toString` is in it. Part 17 of §7's record.

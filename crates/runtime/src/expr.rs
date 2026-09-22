@@ -725,12 +725,18 @@ fn eval_object_literal(
                 crate::function::set_function_name(&closure, &property_key_display(&key), None)?;
                 object.create_data_property_key(&key, closure)?;
             }
-            ObjectProperty::Get { key, body } => {
+            ObjectProperty::Get { key, body, span } => {
                 // PropertyDefinition : get PropertyName ( ) { FunctionBody }
                 let key = eval_property_name(agent, key, strict)?;
                 let env = agent.running_context()?.lexical_environment;
-                let getter =
-                    crate::function::instantiate_accessor(agent, Vec::new(), body, env, strict)?;
+                let getter = crate::function::instantiate_accessor(
+                    agent,
+                    Vec::new(),
+                    body,
+                    env,
+                    strict,
+                    crate::function::capture_source(agent, *span),
+                )?;
                 crate::function::make_method(agent, &getter, Value::Object(object))?;
                 crate::function::set_function_name(
                     &getter,
@@ -754,6 +760,7 @@ fn eval_object_literal(
                 param,
                 init,
                 body,
+                span,
             } => {
                 // PropertyDefinition : set PropertyName ( BindingElement ) { FunctionBody }
                 let key = eval_property_name(agent, key, strict)?;
@@ -769,6 +776,7 @@ fn eval_object_literal(
                     body,
                     env,
                     strict,
+                    crate::function::capture_source(agent, *span),
                 )?;
                 crate::function::make_method(agent, &setter, Value::Object(object))?;
                 crate::function::set_function_name(

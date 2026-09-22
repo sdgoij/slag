@@ -2017,18 +2017,25 @@ fn parse_object_literal_inner(parser: &mut Parser) -> Result<Expr, JsError> {
         }
         // `get` name() {}` / `set name(p) {}` accessors.
         if parser.at_contextual("get")? && is_property_name_start(parser.peek2()?.kind.clone()) {
+            let accessor_start = parser.peek()?.span.start; // `get`
             parser.next()?; // `get`
             let key = parser.parse_property_name()?;
             parser.expect_punct(TokenKind::LeftParen)?;
             parser.expect_punct(TokenKind::RightParen)?;
             let body = parse_function_body_block(parser, false, false, &[], true, false, false)?;
-            props.push(ObjectProperty::Get { key, body: body.0 });
+            let span = Span::new(accessor_start, body.0.span.end);
+            props.push(ObjectProperty::Get {
+                key,
+                body: body.0,
+                span,
+            });
             if !parser.eat_punct(TokenKind::Comma)? {
                 break;
             }
             continue;
         }
         if parser.at_contextual("set")? && is_property_name_start(parser.peek2()?.kind.clone()) {
+            let accessor_start = parser.peek()?.span.start; // `set`
             parser.next()?; // `set`
             let key = parser.parse_property_name()?;
             parser.expect_punct(TokenKind::LeftParen)?;
@@ -2052,11 +2059,13 @@ fn parse_object_literal_inner(parser: &mut Parser) -> Result<Expr, JsError> {
                 false,
                 false,
             )?;
+            let span = Span::new(accessor_start, body.0.span.end);
             props.push(ObjectProperty::Set {
                 key,
                 param: param_element.pattern,
                 init: param_element.init,
                 body: body.0,
+                span,
             });
             if !parser.eat_punct(TokenKind::Comma)? {
                 break;

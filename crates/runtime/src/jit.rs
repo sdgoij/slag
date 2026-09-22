@@ -3023,6 +3023,7 @@ extern "C" fn object_accessor_name(ctx: *mut c_void, object: u64, step: u64) -> 
         get,
         param,
         body,
+        span,
     }) = step_at(ctx, step)
     else {
         unreachable!("object_accessor_name on a non-ObjectAccessorName step");
@@ -3036,6 +3037,7 @@ extern "C" fn object_accessor_name(ctx: *mut c_void, object: u64, step: u64) -> 
         param.as_ref(),
         body,
         strict,
+        *span,
     ) {
         Ok(()) => object.bits(),
         Err(error) => slow_error(ctx, error),
@@ -3047,7 +3049,12 @@ extern "C" fn object_accessor_computed(ctx: *mut c_void, object: u64, key: u64, 
     let agent = unsafe { &mut *ctx.agent };
     let object = Value::from_bits(object);
     let key = Value::from_bits(key);
-    let Some(crate::ir::Step::ObjectAccessorComputed { get, param, body }) = step_at(ctx, step)
+    let Some(crate::ir::Step::ObjectAccessorComputed {
+        get,
+        param,
+        body,
+        span,
+    }) = step_at(ctx, step)
     else {
         unreachable!("object_accessor_computed on a non-ObjectAccessorComputed step");
     };
@@ -3056,7 +3063,16 @@ extern "C" fn object_accessor_computed(ctx: *mut c_void, object: u64, key: u64, 
         Ok(key) => key,
         Err(error) => return slow_error(ctx, error),
     };
-    match crate::ir::object_accessor(agent, &object, key, *get, param.as_ref(), body, strict) {
+    match crate::ir::object_accessor(
+        agent,
+        &object,
+        key,
+        *get,
+        param.as_ref(),
+        body,
+        strict,
+        *span,
+    ) {
         Ok(()) => object.bits(),
         Err(error) => slow_error(ctx, error),
     }

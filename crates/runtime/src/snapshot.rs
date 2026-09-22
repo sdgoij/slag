@@ -26,9 +26,10 @@
 //! not an index, a host pointer the host's external-reference table does not
 //! have, a host callback (a built-in that is not an intrinsic) when the host
 //! supplies none of its own, and a function
-//! the engine kept no source text for — a method or an accessor, whose source is
-//! method-form and needs a parse context of its own, or a function created where
-//! there is no source text at all (a `Function`-built body, for one).
+//! the engine kept no source text for — a class constructor defined where no
+//! frame carries the text its span belongs to, for one. A **method** and an
+//! **accessor** both carry theirs now (the accessor's `[[SourceText]]` was the
+//! last one missing), so neither is on that list.
 //! Each entry is a subsystem to carry, and the walk refuses rather than writing
 //! something a restore would read back wrong.
 //!
@@ -2771,12 +2772,17 @@ impl Builder<'_> {
             MethodDefinition::Method(function) => {
                 crate::function::instantiate_method(self.agent, function, environment, strict)
             }
+            // An accessor's source is the record's own text — the accessor
+            // definition, which is what the writer captured — so the rebuild hands
+            // it over directly rather than resolving a span against the wrapper
+            // it parsed.
             MethodDefinition::Get(body) => crate::function::instantiate_accessor(
                 self.agent,
                 Vec::new(),
                 body,
                 environment,
                 strict,
+                Some(JsString::from_utf8(&text)),
             ),
             // A setter's parameter list is the engine's own one-element form, the
             // same shape `build_class` builds for a class setter.
@@ -2791,6 +2797,7 @@ impl Builder<'_> {
                 body,
                 environment,
                 strict,
+                Some(JsString::from_utf8(&text)),
             ),
         };
         self.agent.execution_context_stack.pop();
@@ -5322,32 +5329,71 @@ mod tests {
         );
     }
 
-    /// A function the format cannot carry is refused by the kind it is, so the
-    /// message names the fix. The source-less kind is now the **accessor** — a
-    /// `get`/`set` body, whose `[[SourceText]]` is method-form and which the engine
-    /// keeps none for, the second half of the method part — while a **method** is
-    /// carried now, and a class or arrow defined inside a `Function`-built body
-    /// with it, because that body's frame carries the assembled text their spans
-    /// belong to.
+    /// An accessor is carried by the same method record a method uses: the engine
+    /// gives a getter or setter the `[[SourceText]]` the spec gives it (15.4.3 —
+    /// the accessor instantiation takes the span the parser records for the whole
+    /// definition and captures it), so the walk has the source the record needs.
+    ///
+    /// This test was the **refusal** for that kind until then — the last function
+    /// kind with no source text — and its subject is positive coverage now.
     #[test]
-    fn an_uncarried_function_is_refused_by_kind() {
+    fn an_accessor_round_trips_with_its_source() {
         let mut isolate = api::Isolate::new();
         let context = api::Context::new(&mut isolate).expect("a realm");
         let realm = *context.realm();
-        let source = "Object.getOwnPropertyDescriptor({ get x() { return 1; } }, 'x').get";
-        let value = context
-            .try_eval(source)
-            .expect("a value to refuse")
+        let object = context
+            .try_eval(
+                "({ backing: 0, get x() { return this.backing; }, \
+                 set x(v) { this.backing = v; } })",
+            )
+            .expect("an object with an accessor")
             .into_value();
-        let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
+        let back = round_trip(&isolate, &realm, object);
+
+        // The restored halves are the writer's: the setter writes and the getter
+        // reads the same restored property back.
         assert_eq!(
-            error.type_name, "a function",
-            "{source} was refused as something else"
+            run_restored(&isolate, &realm, back, "restored.x = 41; restored.x").as_number(),
+            Some(41.0)
         );
-        assert!(
-            error.detail.contains("no source text"),
-            "{source}: {}",
-            error.detail
+        // And each half answers its own definition as its source.
+        let getter = run_restored(
+            &isolate,
+            &realm,
+            back,
+            "Object.getOwnPropertyDescriptor(restored, 'x').get.toString()",
+        );
+        assert_eq!(
+            getter
+                .as_string()
+                .map(|text| text.to_string_lossy())
+                .as_deref(),
+            Some("get x() { return this.backing; }")
+        );
+        let setter = run_restored(
+            &isolate,
+            &realm,
+            back,
+            "Object.getOwnPropertyDescriptor(restored, 'x').set.toString()",
+        );
+        assert_eq!(
+            setter
+                .as_string()
+                .map(|text| text.to_string_lossy())
+                .as_deref(),
+            Some("set x(v) { this.backing = v; }")
+        );
+
+        // A class's accessor takes the same path with the class arm's span, so a
+        // restored class reads through its own getter.
+        let class = context
+            .try_eval("(class { get c() { return 3; } })")
+            .expect("a class with an accessor")
+            .into_value();
+        let back = round_trip(&isolate, &realm, class);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "new restored().c").as_number(),
+            Some(3.0)
         );
     }
 

@@ -518,7 +518,14 @@ pub enum ObjectProperty {
         function: Function,
     },
     /// `get key ( ) { body }`.
-    Get { key: PropertyName, body: Block },
+    Get {
+        key: PropertyName,
+        body: Block,
+        /// The whole `get key ( ) { body }`, which is the accessor's
+        /// `[[SourceText]]` (spec 15.4.3): the parser is the only place that
+        /// knows where `get` begins.
+        span: Span,
+    },
     /// `set key ( param ) { body }`. The parameter may carry a default
     /// initializer (`set x(v = 1) {}`).
     Set {
@@ -527,6 +534,8 @@ pub enum ObjectProperty {
         /// The setter parameter's initializer, if any.
         init: Option<Expr>,
         body: Block,
+        /// The whole `set key ( param ) { body }`; see `Get`.
+        span: Span,
     },
     /// `...expr`.
     Spread(Expr),
@@ -658,6 +667,9 @@ pub enum ClassElement {
         is_static: bool,
         name: ClassElementName,
         body: Block,
+        /// The whole `get name () { body }`, which is the accessor's
+        /// `[[SourceText]]`; see `ObjectProperty::Get`.
+        span: Span,
     },
     /// `set name ( param ) { body }`. The parameter may carry a default
     /// initializer (`set x(v = 1) {}`).
@@ -668,6 +680,8 @@ pub enum ClassElement {
         /// The setter parameter's initializer, if any.
         init: Option<Expr>,
         body: Block,
+        /// The whole `set name ( param ) { body }`; see `Get`.
+        span: Span,
     },
     /// A class field with an optional initializer.
     Field {

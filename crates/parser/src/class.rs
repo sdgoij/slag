@@ -272,6 +272,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
     }
     // `get name() {}` / `set name(p) {}`.
     if parser.at_contextual_unescaped("get")? && is_class_name_start(parser.peek2()?.kind.clone()) {
+        let accessor_start = parser.peek()?.span.start; // `get`
         parser.next()?; // `get`
         let name = parse_class_element_name(parser)?;
         check_special_constructor(parser, &name, is_static)?;
@@ -279,13 +280,16 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         parser.expect_punct(TokenKind::RightParen)?;
         let (body, _) = parse_function_body_block(parser, false, false, &[], true, false, false)?;
         declare_private_name(parser, &name, PrivateNameKind::Getter(is_static), is_static)?;
+        let span = Span::new(accessor_start, body.span.end);
         return Ok(Some(ClassElement::Get {
             is_static,
             name,
             body,
+            span,
         }));
     }
     if parser.at_contextual_unescaped("set")? && is_class_name_start(parser.peek2()?.kind.clone()) {
+        let accessor_start = parser.peek()?.span.start; // `set`
         parser.next()?; // `set`
         let name = parse_class_element_name(parser)?;
         check_special_constructor(parser, &name, is_static)?;
@@ -298,12 +302,14 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         parser.expect_punct(TokenKind::RightParen)?;
         let (body, _) = parse_function_body_block(parser, false, false, &[], true, false, false)?;
         declare_private_name(parser, &name, PrivateNameKind::Setter(is_static), is_static)?;
+        let span = Span::new(accessor_start, body.span.end);
         return Ok(Some(ClassElement::Set {
             is_static,
             name,
             param,
             init,
             body,
+            span,
         }));
     }
 

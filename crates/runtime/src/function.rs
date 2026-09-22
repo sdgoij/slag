@@ -1048,12 +1048,22 @@ pub fn instantiate_method(
 /// The accessor form of OrdinaryFunctionCreate (spec 15.4.3 getters and
 /// setters): an ordinary function with no `prototype` and no name until
 /// SetFunctionName.
+///
+/// `source` is the accessor definition's own text (`get key() { … }`), which the
+/// spec gives it as `[[SourceText]]` — so a getter's
+/// `Function.prototype.toString` answers its source, and the snapshot format can
+/// carry it by the same record a method uses. It is a parameter rather than a
+/// `capture_source` here because the callers differ in where they get it: the AST
+/// sites pass `capture_source(agent, span)` with the span the parser records, and
+/// the snapshot's rebuild passes the text its record already carries (the class
+/// constructor's shape, for the same reason).
 pub fn instantiate_accessor(
     agent: &mut Agent,
     params: Vec<BindingElement>,
     body: &Block,
     environment: EnvRef,
     enclosing_strict: bool,
+    source: Option<JsString>,
 ) -> Result<Value, JsError> {
     // Cut 48: the body `Rc` is shared per site (see `shared_accessor_body`),
     // so the compiled IR + JIT code compile once per getter/setter site
@@ -1068,7 +1078,7 @@ pub fn instantiate_accessor(
         environment,
         enclosing_strict,
         DefinitionKind::method(false, false),
-        None,
+        source,
         None,
         None,
         Vec::new(),

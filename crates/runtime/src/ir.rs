@@ -578,11 +578,16 @@ pub enum Step {
         get: bool,
         param: Option<BindingElement>,
         body: syntax::ast::Block,
+        /// The whole `get name() { body }`, which is the accessor's
+        /// `[[SourceText]]`; the AST node carries no span of its own.
+        span: crux::Span,
     },
     ObjectAccessorComputed {
         get: bool,
         param: Option<BindingElement>,
         body: syntax::ast::Block,
+        /// See `ObjectAccessorName`.
+        span: crux::Span,
     },
     ObjectSpread,
     PushStr(JsString),
@@ -7402,6 +7407,7 @@ impl Vm {
                     get,
                     param,
                     body,
+                    span,
                 } => {
                     let object = self.pop();
                     object_accessor(
@@ -7412,14 +7418,29 @@ impl Vm {
                         param.as_ref(),
                         body,
                         self.strict,
+                        *span,
                     )?;
                     self.stack.push(object);
                 }
-                Step::ObjectAccessorComputed { get, param, body } => {
+                Step::ObjectAccessorComputed {
+                    get,
+                    param,
+                    body,
+                    span,
+                } => {
                     let key = self.pop();
                     let object = self.pop();
                     let key = crate::context::to_property_key(agent, &key)?;
-                    object_accessor(agent, &object, key, *get, param.as_ref(), body, self.strict)?;
+                    object_accessor(
+                        agent,
+                        &object,
+                        key,
+                        *get,
+                        param.as_ref(),
+                        body,
+                        self.strict,
+                        *span,
+                    )?;
                     self.stack.push(object);
                 }
                 Step::ObjectSpread => {
@@ -13774,6 +13795,7 @@ pub(crate) fn object_accessor(
     param: Option<&BindingElement>,
     body: &syntax::ast::Block,
     strict: bool,
+    span: crux::Span,
 ) -> Result<(), JsError> {
     let ValueKind::Object(obj) = object.kind() else {
         return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
@@ -13784,7 +13806,14 @@ pub(crate) fn object_accessor(
     } else {
         Vec::new()
     };
-    let closure = crate::function::instantiate_accessor(agent, params, body, env, strict)?;
+    let closure = crate::function::instantiate_accessor(
+        agent,
+        params,
+        body,
+        env,
+        strict,
+        crate::function::capture_source(agent, span),
+    )?;
     crate::function::make_method(agent, &closure, Value::Object(obj))?;
     let prefix = if get { Some("get") } else { Some("set") };
     crate::function::set_function_name(&closure, &crate::expr::property_key_display(&key), prefix)?;
@@ -14130,7 +14159,7 @@ fn object_prop_contains_suspension(prop: &ObjectProperty) -> bool {
             property_name_contains_suspension(key) || expr_contains_suspension(value)
         }
         ObjectProperty::Method { key, .. } => property_name_contains_suspension(key),
-        ObjectProperty::Get { key, body } | ObjectProperty::Set { key, body, .. } => {
+        ObjectProperty::Get { key, body, .. } | ObjectProperty::Set { key, body, .. } => {
             property_name_contains_suspension(key)
                 || body.stmts.iter().any(stmt_contains_suspension)
         }
@@ -20756,14 +20785,15 @@ impl Compiler {
                         });
                     }
                 },
-                ObjectProperty::Get { key, body } => {
-                    self.compile_accessor(key, true, None, body)?;
+                ObjectProperty::Get { key, body, span } => {
+                    self.compile_accessor(key, true, None, body, *span)?;
                 }
                 ObjectProperty::Set {
                     key,
                     param,
                     init,
                     body,
+                    span,
                 } => {
                     let element = BindingElement {
                         pattern: param.clone(),
@@ -20771,7 +20801,7 @@ impl Compiler {
                         rest: false,
                         span: body.span,
                     };
-                    self.compile_accessor(key, false, Some(element), body)?;
+                    self.compile_accessor(key, false, Some(element), body, *span)?;
                 }
                 ObjectProperty::Spread(expr) => {
                     self.compile_expr(expr)?;
@@ -20788,6 +20818,7 @@ impl Compiler {
         get: bool,
         param: Option<BindingElement>,
         body: &syntax::ast::Block,
+        span: crux::Span,
     ) -> Result<(), JsError> {
         match key {
             PropertyName::Ident(id) => {
@@ -20796,6 +20827,7 @@ impl Compiler {
                     get,
                     param,
                     body: body.clone(),
+                    span,
                 });
             }
             PropertyName::Computed(key_expr) => {
@@ -20804,6 +20836,7 @@ impl Compiler {
                     get,
                     param,
                     body: body.clone(),
+                    span,
                 });
             }
             PropertyName::Str(text) => {
@@ -20813,6 +20846,7 @@ impl Compiler {
                     get,
                     param,
                     body: body.clone(),
+                    span,
                 });
             }
             PropertyName::Number(n) => {
@@ -20823,6 +20857,7 @@ impl Compiler {
                     get,
                     param,
                     body: body.clone(),
+                    span,
                 });
             }
         }

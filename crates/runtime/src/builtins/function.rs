@@ -907,6 +907,38 @@ mod tests {
         // limit — this test used to pin that gap.
         let text = value("var g = (x) => x; g.toString()");
         assert!(matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "(x) => x"));
+        // A getter and a setter render their definition's text on the same rule:
+        // spec 15.4.3 gives the accessor the MethodDefinition's source, so the
+        // native form was a gap rather than a limit — this test used to pin it,
+        // and the snapshot format's own refusal test carried the accessor as the
+        // last source-less function kind until the instantiation captured one.
+        let text =
+            value("Object.getOwnPropertyDescriptor({ get b() { return 2; } }, 'b').get.toString()");
+        assert!(
+            matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "get b() { return 2; }")
+        );
+        let text = value(
+            "Object.getOwnPropertyDescriptor({ set b(v) { this.v = v; } }, 'b').set.toString()",
+        );
+        assert!(
+            matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "set b(v) { this.v = v; }")
+        );
+        // A class's accessor carries its own definition's text as well.
+        let text = value(
+            "Object.getOwnPropertyDescriptor(class { get c() { return 3; } }.prototype, 'c').get.toString()",
+        );
+        assert!(
+            matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "get c() { return 3; }")
+        );
+        // A `Function`-built body has no compiled IR, so it runs on the walker,
+        // where the accessor's source comes from its AST span instead of the
+        // compiled step. Same text either way.
+        let text = value(
+            "new Function(\"return Object.getOwnPropertyDescriptor({ get d() { return 4; } }, 'd').get.toString();\")()",
+        );
+        assert!(
+            matches!(text.kind(), ValueKind::String(s) if s.to_string_lossy() == "get d() { return 4; }")
+        );
         // %Function.prototype% has an empty name.
         let text = value("Function.prototype.toString()");
         assert!(

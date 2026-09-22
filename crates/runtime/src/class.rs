@@ -432,11 +432,20 @@ fn build_class(
                     define_method_property(&home, &key, closure)?;
                 }
             }
-            ClassElement::Get { name, body, .. } => {
+            ClassElement::Get {
+                name, body, span, ..
+            } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 record_computed_key(&mut computed_keys, element, &key);
-                let getter = instantiate_accessor(agent, Vec::new(), body, class_env, true)?;
+                let getter = instantiate_accessor(
+                    agent,
+                    Vec::new(),
+                    body,
+                    class_env,
+                    true,
+                    crate::function::capture_source(agent, *span),
+                )?;
                 set_private_environment(agent, &getter, &class_private_env)?;
                 make_method(agent, &getter, home)?;
                 set_function_name(&getter, &element_name_text(name, key.as_ref()), Some("get"))?;
@@ -462,6 +471,7 @@ fn build_class(
                 param,
                 init,
                 body,
+                span,
                 ..
             } => {
                 let (private_id, key) =
@@ -478,6 +488,7 @@ fn build_class(
                     body,
                     class_env,
                     true,
+                    crate::function::capture_source(agent, *span),
                 )?;
                 set_private_environment(agent, &setter, &class_private_env)?;
                 make_method(agent, &setter, home)?;

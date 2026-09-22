@@ -1503,32 +1503,45 @@ fn object_group_by(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
 
 /// Object.assign (spec 20.1.2.1): copy the own enumerable properties of each
 /// source onto the target, in source order.
+///
+/// A **function** is an object in both roles, so each end goes through the
+/// engine's coercion rather than a `ValueKind::Object` match: a function target
+/// takes the copies (its object part is where its properties live) and a
+/// function source has its own enumerable properties copied. Matching the kind
+/// directly made `Object.assign(function () {}, { tag: 7 })` throw "assign target
+/// is not an object" — `to_object` answers `Value::Function` for a function —
+/// and skipped a function source's properties entirely.
 fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    let target = to_object(agent, &arg(args, 0))?;
+    let target_value = to_object(agent, &arg(args, 0))?;
+    // `to_object` answers an object for every input it does not throw on, so the
+    // only way to reach the error is a `to_object` that changes shape.
+    let target = as_object(&target_value).ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "assign target is not an object".into(),
+        )
+    })?;
     for source_value in &args[1..] {
         if matches!(source_value.kind(), ValueKind::Null | ValueKind::Undefined) {
             continue;
         }
-        let source = to_object(agent, source_value)?;
-        let ValueKind::Object(source_obj) = source.kind() else {
+        let source_value = to_object(agent, source_value)?;
+        let Some(source) = as_object(&source_value) else {
             continue;
         };
-        let ValueKind::Object(target_obj) = target.kind() else {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "assign target is not an object".into(),
-            ));
-        };
-        for key in source_obj.own_property_keys()? {
-            if let Some(prop) = source_obj.get_own_property_key(&key)?
+        for key in source.own_property_keys()? {
+            if let Some(prop) = source.get_own_property_key(&key)?
                 && prop.enumerable
             {
-                let value = crate::context::get_property_key(agent, &source, &key, source)?;
-                target_obj.set_key(&key, value, true)?;
+                // The receiver is the coerced source, so a getter sees the
+                // function rather than its object part.
+                let value =
+                    crate::context::get_property_key(agent, &source_value, &key, source_value)?;
+                target.set_key(&key, value, true)?;
             }
         }
     }
-    Ok(target)
+    Ok(target_value)
 }
 
 /// Object.fromEntries (spec 20.1.2.7): walk an iterable of [key, value]
@@ -1818,6 +1831,34 @@ mod tests {
         assert_eq!(
             run("let t = { a: 0 }; Object.assign(t, null, { b: 3 }); t.a + t.b").unwrap(),
             Value::Number(3.0)
+        );
+    }
+
+    /// A function is an object in **both** roles: as a target it takes the copies
+    /// and the answer is the function itself, and as a source its own enumerable
+    /// properties are copied. Matching `ValueKind::Object` directly made the first
+    /// role throw "assign target is not an object" (`to_object` answers
+    /// `Value::Function` for a function) and skipped the second's properties.
+    #[test]
+    fn assign_treats_a_function_as_an_object() {
+        assert_eq!(
+            run("let f = function () {}; Object.assign(f, { a: 1, b: 2 }); f.a + ',' + f.b")
+                .unwrap(),
+            str("1,2")
+        );
+        assert_eq!(
+            run("let f = function () {}; Object.assign(f, { a: 1 }) === f").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("let s = function () {}; s.tag = 7; Object.assign({}, s).tag").unwrap(),
+            Value::Number(7.0)
+        );
+        // Only the *enumerable* own properties of a function source travel: its
+        // `name`/`length`/`prototype` are non-enumerable.
+        assert_eq!(
+            run("let s = function () {}; Object.assign({}, s).name").unwrap(),
+            Value::Undefined
         );
     }
 
