@@ -167,6 +167,16 @@ pub struct EcmaFunction {
     pub private_environment: Option<Handle<PrivateEnvironment>>,
     /// The heritage constructor of a derived class (GetSuperConstructor).
     pub super_constructor: Option<Value>,
+    /// The computed public element keys `build_class` resolved, in source order
+    /// — one per computed public element, which is the order the class
+    /// evaluation indexes its `precomputed_keys` by.
+    ///
+    /// Kept because they cannot be recovered: a computed key's *expression* may
+    /// read a name that exists only in the module which defined the class, so a
+    /// snapshot has to carry the key rather than re-evaluate it. Empty for every
+    /// function that is not a class constructor, and for a class whose elements
+    /// are all static names.
+    pub computed_keys: Vec<crux::property::PropertyKey>,
     /// The synthesized `constructor(...args) { super(...args); }` — its
     /// [[Construct]] passes the arguments without the iterator protocol
     /// (spec 15.7.14 step 23 note).
@@ -261,6 +271,7 @@ impl Trace for EcmaFunction {
         self.private_methods.trace(visit);
         self.private_environment.trace(visit);
         self.super_constructor.trace(visit);
+        self.computed_keys.trace(visit);
         self.source.trace(visit);
         self.parse_text.trace(visit);
         self.declaring_module.trace(visit);
@@ -1254,6 +1265,7 @@ fn register_function(
         private_methods: Vec::new(),
         private_environment,
         super_constructor: None,
+        computed_keys: Vec::new(),
         default_derived: false,
         realm,
         is_async: kind.is_async,
@@ -1636,6 +1648,7 @@ pub fn instantiate_arrow(
         private_methods: Vec::new(),
         private_environment,
         super_constructor: None,
+        computed_keys: Vec::new(),
         default_derived: false,
         realm,
         is_async,

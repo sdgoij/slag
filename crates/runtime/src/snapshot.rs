@@ -340,6 +340,8 @@ enum Record {
         source: Vec<u16>,
         strict: bool,
         home: u32,
+        heritage: u32,
+        keys: Vec<u32>,
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
@@ -839,6 +841,26 @@ fn visit(
                             visit(agent, realm, externals, host, home, objects, serials)?;
                         }
                     }
+                    Callable::Class { heritage, keys, .. } => {
+                        // Both are values the record refers to by serial, so both
+                        // are walked: a heritage this format cannot carry refuses
+                        // here rather than becoming a reference no load could
+                        // resolve.
+                        if let Some(heritage) = heritage {
+                            visit(agent, realm, externals, host, heritage, objects, serials)?;
+                        }
+                        for key in keys {
+                            visit(
+                                agent,
+                                realm,
+                                externals,
+                                host,
+                                key_value(key),
+                                objects,
+                                serials,
+                            )?;
+                        }
+                    }
                     Callable::ClassMember {
                         class, key, home, ..
                     } => {
@@ -916,6 +938,14 @@ enum Callable<'a> {
     /// A host callback: the external-reference table pointer it was built from,
     /// and the data it reads when it is called.
     HostCallback { pointer: usize, data: Option<Value> },
+    /// A class constructor: the class source, and the definition-time **inputs**
+    /// the rebuild must not re-evaluate — the heritage value (`None` for a class
+    /// with no `extends` clause) and the computed element keys.
+    Class {
+        source: &'a JsString,
+        heritage: Option<Value>,
+        keys: &'a [PropertyKey],
+    },
     /// A method that reads a private name: the class whose declaration owns the
     /// name, the member's key, which of the three forms it is, and its
     /// [[HomeObject]]. Carried as a **member of that class** rather than by its
@@ -1104,11 +1134,18 @@ fn callable<'a>(
                 ));
             };
             let grammar = if data.is_class_constructor {
-                // A class constructor's source is the class it came from, so the
-                // class grammar reads it — checked **before** the method form,
-                // because a class constructor is a method definition too and
-                // that refusal would be a false diagnosis for it.
-                Grammar::Class
+                // A class constructor's source is the class it came from, and its
+                // definition-time **inputs** are carried beside it: the heritage
+                // value and the computed element keys were evaluated when the
+                // class was defined, and re-evaluating them at restore would
+                // resolve a name the reading realm's global may not have. The
+                // class grammar reads the source, and the record's own fields
+                // carry those inputs.
+                return Ok(Callable::Class {
+                    source,
+                    heritage: carried_heritage(agent, data),
+                    keys: &data.computed_keys,
+                });
             } else if data.is_method {
                 // A method's source is the MethodDefinition it was written as, so
                 // it is evaluated where it is being restored rather than parsed —
@@ -1221,6 +1258,51 @@ fn class_member(
         }
     }
     None
+}
+
+/// The class a parsed `(<class source>)` names, if that is what it is: the one
+/// expression statement's expression, through the grouping paren the wrapper put
+/// there. The parser keeps a paren (it affects `new` binding and
+/// `Function.prototype.toString`), so it is one node to step through.
+fn class_expression(program: &syntax::ast::Program) -> Option<&syntax::ast::Class> {
+    let [statement] = program.body.as_slice() else {
+        return None;
+    };
+    let syntax::ast::StmtKind::Expr(expression) = &statement.kind else {
+        return None;
+    };
+    class_of(expression)
+}
+
+fn class_of(expression: &syntax::ast::Expr) -> Option<&syntax::ast::Class> {
+    match &expression.kind {
+        syntax::ast::ExprKind::Class(class) => Some(class),
+        syntax::ast::ExprKind::Paren(inner) => class_of(inner),
+        _ => None,
+    }
+}
+
+/// The heritage a class record carries: the value the class was defined with, or
+/// `None` for a class with no `extends` clause.
+///
+/// `super_constructor` is the *resolved* heritage, and the one case where it is
+/// not the value itself is `extends null`, which resolves to
+/// `%Function.prototype%` as the super constructor with no proto parent. Carrying
+/// the value `null` back is exactly what `resolve_heritage` needs to reproduce it,
+/// and no other heritage resolves there: the language rejects
+/// `%Function.prototype%` itself as a heritage (it is not a constructor), and a
+/// heritage whose `prototype` *is* `%Function.prototype%` keeps itself as the
+/// super constructor.
+fn carried_heritage(agent: &Agent, data: &crate::function::EcmaFunction) -> Option<Value> {
+    let super_constructor = data.super_constructor?;
+    let function_prototype = agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.get("%Function.prototype%"));
+    if function_prototype == Some(super_constructor) {
+        return Some(Value::Null);
+    }
+    Some(super_constructor)
 }
 
 /// Whether a function is a class constructor: what tells a class prototype's
@@ -1472,8 +1554,32 @@ fn write_record(
                     source,
                     strict,
                     home,
+                } => {
+                    // `carries_home` is what says whether this grammar has a
+                    // value beside the source at all — a plain function and an
+                    // arrow have none.
+                    let carried = if grammar.carries_home() {
+                        Carried::Home(home)
+                    } else {
+                        Carried::None
+                    };
+                    write_function(
+                        realm, &function, grammar, source, strict, carried, serials, body,
+                    )?
+                }
+                Callable::Class {
+                    source,
+                    heritage,
+                    keys,
                 } => write_function(
-                    realm, &function, grammar, source, strict, home, serials, body,
+                    realm,
+                    &function,
+                    Grammar::Class,
+                    source,
+                    true,
+                    Carried::Class { heritage, keys },
+                    serials,
+                    body,
                 )?,
                 Callable::Bound { .. } => write_bound_function(realm, &function, serials, body)?,
                 Callable::HostCallback { pointer, data } => {
@@ -1550,6 +1656,21 @@ fn write_object(
     Ok(())
 }
 
+/// The grammar-conditional values a function record carries beside its source.
+///
+/// Which of them a record has is exactly what its grammar means: a method's
+/// `[[HomeObject]]`, which is the one value `super` resolves through, or a
+/// class's definition-time inputs, which are the values the rebuild must not
+/// re-evaluate.
+enum Carried<'a> {
+    None,
+    Home(Option<Value>),
+    Class {
+        heritage: Option<Value>,
+        keys: &'a [PropertyKey],
+    },
+}
+
 /// Write a JavaScript function as the source text it can be rebuilt from, its
 /// [[Strict]], and its object part — the same prototype/extensible/properties
 /// triple an object gets, because a function's own keys are its own keys.
@@ -1567,20 +1688,31 @@ fn write_function(
     grammar: Grammar,
     source: &JsString,
     strict: bool,
-    home: Option<Value>,
+    carried: Carried<'_>,
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
 ) -> Result<(), Unsupported> {
     body.push(REC_FUNCTION);
     body.push(grammar.byte());
     body.push(u8::from(strict));
-    // A method's [[HomeObject]], which `super` resolves through, is the one value
-    // the record carries beside the source; `NO_REF` when the engine kept none.
-    if grammar.carries_home() {
-        write_u32(
-            body,
-            home.map_or(NO_REF, |home| serial_in(realm, serials, home)),
-        );
+    match carried {
+        Carried::None => {}
+        Carried::Home(home) => {
+            write_u32(
+                body,
+                home.map_or(NO_REF, |home| serial_in(realm, serials, home)),
+            );
+        }
+        Carried::Class { heritage, keys } => {
+            write_u32(
+                body,
+                heritage.map_or(NO_REF, |heritage| serial_in(realm, serials, heritage)),
+            );
+            write_u32(body, keys.len() as u32);
+            for key in keys {
+                write_u32(body, serial_in(realm, serials, key_value(key)));
+            }
+        }
     }
     write_units(body, source.as_slice());
     write_u32(body, prototype_serial(realm, &function.object, serials)?);
@@ -1851,6 +1983,17 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             } else {
                 NO_REF
             };
+            let (heritage, keys) = if grammar == Grammar::Class {
+                let heritage = reader.u32().ok_or(DecodeError::Truncated)?;
+                let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
+                let mut keys = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    keys.push(reader.u32().ok_or(DecodeError::Truncated)?);
+                }
+                (heritage, keys)
+            } else {
+                (NO_REF, Vec::new())
+            };
             let source = reader.units().ok_or(DecodeError::Truncated)?;
             let proto = reader.u32().ok_or(DecodeError::Truncated)?;
             let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
@@ -1860,6 +2003,8 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 source,
                 strict,
                 home,
+                heritage,
+                keys,
                 proto,
                 extensible,
                 properties,
@@ -2122,13 +2267,16 @@ impl Builder<'_> {
                 source,
                 strict,
                 home,
+                heritage,
+                keys,
                 proto,
                 extensible,
                 properties,
             } => {
                 let function = match grammar {
                     Grammar::Function => self.build_function(source, *strict, *proto)?,
-                    Grammar::Class | Grammar::Arrow | Grammar::Method => {
+                    Grammar::Class => self.build_class_function(source, *heritage, keys, *proto)?,
+                    Grammar::Arrow | Grammar::Method => {
                         self.build_evaluated_function(source, *proto, *strict, *grammar, *home)?
                     }
                 };
@@ -2399,6 +2547,93 @@ impl Builder<'_> {
         };
         // The evaluation sets the function's own prototype link from what it
         // derived; the record's is what the blob was written with, so it wins.
+        function
+            .object
+            .set_prototype_of(Some(proto))
+            .map_err(|error| {
+                DecodeError::UnrebuildableFunction(format!(
+                    "its prototype could not be set: {error}"
+                ))
+            })?;
+        Ok(function)
+    }
+
+    /// A class record, rebuilt by the engine's own class evaluation with the
+    /// definition-time **inputs** the record carries.
+    ///
+    /// The source is parsed and handed to the evaluation rather than run as a
+    /// script, because the keys and the heritage have to be *supplied*: a computed
+    /// key's expression and an `extends` expression may read a name that exists
+    /// only in the module which defined the class, and a script would evaluate
+    /// them against the reading realm's global.
+    /// `class_definition_evaluation_with_keys` is the engine's own entry for
+    /// exactly that case — its resumable-VM path, where the definition-time
+    /// expressions were evaluated before the definition was built — and the class
+    /// scope, private environment and strictness it sets up are the ones a script
+    /// would have got.
+    ///
+    /// The parse is a script, so the class's spans index the text the parse was
+    /// given; the bootstrap context the evaluation runs under carries that same
+    /// text as its `source`, which is what `capture_source` resolves the class's
+    /// `[[SourceText]]` from — so `toString`, and a second snapshot of the
+    /// restored class, are unaffected by the evaluation having been driven here.
+    fn build_class_function(
+        &mut self,
+        source: &[u16],
+        heritage: u32,
+        keys: &[u32],
+        proto: u32,
+    ) -> Result<Handle<Function>, DecodeError> {
+        let proto = self.prototype(proto)?.ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("the record names no prototype".into())
+        })?;
+        let text = String::from_utf16(source).map_err(|_| {
+            DecodeError::UnrebuildableFunction("its class source is not valid UTF-16".into())
+        })?;
+        // Both are materialized before the evaluation, which can allocate.
+        let heritage = match heritage {
+            NO_REF => None,
+            heritage => Some(self.materialize(heritage)?),
+        };
+        let mut resolved = Vec::with_capacity(keys.len());
+        for serial in keys {
+            let value = self.materialize(*serial)?;
+            let key = crate::context::to_property_key(self.agent, &value).map_err(|error| {
+                DecodeError::UnrebuildableFunction(format!(
+                    "a computed key is not a property key: {error}"
+                ))
+            })?;
+            resolved.push(Some(key));
+        }
+        let realm = *self.realm;
+        // A class source is only valid as an expression, so it is wrapped — and
+        // the parser keeps the grouping paren, which `class_expression` steps
+        // through.
+        let wrapped = format!("({text})");
+        let program = parser::parse_script(&wrapped).map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!("its class source does not parse: {error}"))
+        })?;
+        let class = class_expression(&program).ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("its class source is not a class".into())
+        })?;
+        self.agent.push_bootstrap_context(realm);
+        if let Some(context) = self.agent.execution_context_stack.last_mut() {
+            context.source = Some(JsString::from_utf8(&wrapped));
+        }
+        let value = crate::class::class_definition_evaluation_with_keys(
+            self.agent, class, class.name, heritage, &resolved,
+        );
+        self.agent.execution_context_stack.pop();
+        let value = value.map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!(
+                "its class source could not be evaluated: {error}"
+            ))
+        })?;
+        let function = value.as_function().ok_or_else(|| {
+            DecodeError::UnrebuildableFunction(
+                "its class source did not evaluate to a class".into(),
+            )
+        })?;
         function
             .object
             .set_prototype_of(Some(proto))
@@ -4350,6 +4585,129 @@ mod tests {
             run_restored(&isolate, &realm, back, "new restored().x").as_number(),
             Some(42.0),
             "the private field and the initializer that reads it were both rebuilt"
+        );
+    }
+
+    /// A class's computed element keys are carried, so the restore does not
+    /// re-evaluate them: a key expression may read a name that exists only in the
+    /// module which defined the class, which the reading realm's global does not
+    /// have. The class source's `[[SourceText]]` is the other half of this test —
+    /// the frame the evaluation runs under has to carry the parsed text for
+    /// `toString`, and a second snapshot, to keep working.
+    #[test]
+    fn a_class_carries_its_computed_field_key() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { const SymbolIterator = Symbol.iterator; \
+                 class C { [SymbolIterator] = 7; } return C; })()",
+            )
+            .expect("a class with a computed field key")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "new restored()[Symbol.iterator]").as_number(),
+            Some(7.0),
+            "the field was installed under the key the class was defined with"
+        );
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("class C { [SymbolIterator] = 7; }".to_string()),
+            "the restored class still answers its class source"
+        );
+    }
+
+    /// A derived class's heritage is carried as the value the class was defined
+    /// with, so the restore does not re-resolve the `extends` expression — which
+    /// names a binding of the module that defined the class, not a global. The
+    /// observation is the **implicit constructor** calling `super()`: that is
+    /// `[[ConstructorKind]]`, which only the heritage decides. (The statics would
+    /// survive without it, because a class's own prototype link is carried by its
+    /// function record — so they do not prove the heritage.)
+    #[test]
+    fn a_class_carries_its_heritage() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { const Base = class { constructor() { this.tag = 'base'; } }; \
+                 class Derived extends Base {} return Derived; })()",
+            )
+            .expect("a derived class")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "new restored().tag")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("base".to_string()),
+            "the restored class is derived, so its implicit constructor calls super()"
+        );
+    }
+
+    /// `extends null` is the one heritage whose resolved form is not the value it
+    /// was written as — it resolves to `%Function.prototype%` as the super
+    /// constructor with no proto parent — so the record carries the value `null`
+    /// and the class comes back still **derived**, with a null prototype.
+    #[test]
+    fn a_class_carrying_a_null_heritage_stays_derived() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("(class extends null {})")
+            .expect("a class extending null")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "Object.getPrototypeOf(restored.prototype) === null ? 1 : 0",
+            )
+            .as_number(),
+            Some(1.0),
+            "the prototype's parent is null"
+        );
+        assert_eq!(
+            outcome_restored(&isolate, &realm, back, "new restored();"),
+            "TypeError",
+            "a class extending null is still derived, so its constructor reaches super()"
+        );
+    }
+
+    /// A computed **method** key needs both halves: the class carries the key (so
+    /// its own evaluation does not read the module name), and the method is carried
+    /// as a member of the class (so the method record's source is never
+    /// re-evaluated either).
+    #[test]
+    fn a_class_carries_a_computed_method_key() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { const SymbolIterator = Symbol.iterator; \
+                 class C { #n = 1; [SymbolIterator]() { return this.#n + 1; } } \
+                 return C; })()",
+            )
+            .expect("a class with a computed method key")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "new restored()[Symbol.iterator]()").as_number(),
+            Some(2.0),
+            "the method came back under the carried key and reads the class's private field"
         );
     }
 

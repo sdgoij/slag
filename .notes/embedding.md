@@ -2792,6 +2792,24 @@ Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --
 
 *And the next value is the class's own evaluation.* Re-measured, deno's blob now reads past the private-name method — the first time that value has been carried — and the restore stops on the **class**: `v8::Context::FromSnapshot: the snapshot could not be read for context 1: snapshot function could not be rebuilt: its class source could not be evaluated: ReferenceError: "SymbolIterator" is not defined`. That is part 7's stated divergence arriving as a hard failure: a class's definition-time code runs again at restore, so a **computed key** (or a static field initializer, or a `static {}` block) that reads a name from the module which defined the class finds the reading realm's global instead. The engine already has the mechanism that removes the re-evaluation — `class_definition_evaluation_with_scope` takes the element keys **precomputed** — so the next part is to carry them, which is part 14.
 
+**A class's definition-time inputs — landed, and deno's blob reads past the class.** The fourteenth part of ledger item 16, and the value the part-13 record's measurement named.
+
+*What the load stopped on, measured.* A probe in the restore's failure path printed the class the class record could not evaluate: `class SafeArrayIterator { #array; ... [SymbolIterator]() { return this; } }` → `ReferenceError: "SymbolIterator" is not defined`. A class is rebuilt by evaluating its source (part 7's design, and it stays: what a class *is* — `[[ConstructorKind]]`, fields, private methods and environment, prototype object, the constructor's body — is what only the engine's own class evaluation makes), and the definition-time code then runs again: part 7 stated that as a divergence. The load shows it is not benign — a **computed key** that reads a name from the module which defined the class cannot be evaluated at all in the reading realm.
+
+*What is carried is the input, not a re-derivation.* `build_class` already resolves every computed public element's key through `element_key_with`, in exactly the order the class evaluation's `precomputed_keys` are indexed by, so the constructor's record now keeps them (`EcmaFunction::computed_keys`). The heritage goes with them: `resolve_heritage` derives the proto parent from the heritage *value*'s `prototype`, so carrying the value reproduces the class exactly — and `extends null`, whose resolved form is `%Function.prototype%` as the super constructor with no proto parent, is carried as the value `null`, which the writer can tell apart because no other heritage resolves there.
+
+*Format.* The class grammar's record gains, in the grammar-conditional slot a method uses for its `home`, a heritage serial (`NO_REF` for a class with no `extends` clause) and a count-prefixed list of key serials; both are ordinary value slots, so a symbol key is the symbol it is.
+
+*Restore.* The source is parsed as `(<class source>)` — the expression form a class source is only valid as — the class expression taken from it, and the evaluation handed to `class_definition_evaluation_with_keys`, the engine's own entry for a class whose heritage and keys were evaluated elsewhere (its resumable-VM path). Nothing is re-evaluated. The parse is a script, so the class's spans index the text the parse was given, and the bootstrap context the evaluation runs under carries that text as its `source` — which is what keeps `capture_source` answering the class's `[[SourceText]]`, so `toString` and a second snapshot are unaffected.
+
+*What it still does not carry:* a `static {}` block and a static field initializer *execute* at restore, because they are effects rather than inputs. That stays part 7's stated divergence.
+
+*Tests.* Four in `crates/runtime/src/snapshot.rs`: a computed field key reading a module binding (plus the restored class's `toString`), the heritage (the implicit constructor calls `super()`, which only the heritage decides — said in the test because the statics would survive without it, carried by the class's own prototype link), `extends null` (the one heritage whose resolved form is not its written form), and a computed *method* key with a private element (both halves at once). Three mutations, each caught: the keys not written (both key tests fail with deno's own error), the heritage always `None` (both heritage tests fail — the class comes back a base class), and the evaluation's frame left without a source (the native form instead of the class source).
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **856 → 860 passed / 0 failed** (859 with the documented flake `certified_body_global_read_fast_path_stays_spec_exact` skipped); `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,234 → 5,238 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the battery ran with the release binaries rebuilt after the last engine edit: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*And the next value is an object-literal method with a computed key.* Re-measured, deno's blob reads past the class — the first time the class's own evaluation has succeeded — and the restore stops on `its method source could not be evaluated: ReferenceError: "SymbolIterator" is not defined`, whose probe says `home_owner=None`: the failing value's home object is a plain object, so it is an **object-literal method** with a computed key (`{ [SymbolIterator]() { return this; } }`), not a class member. Neither mechanism reaches it — there is no class to take it out of, and the method record's own source is what evaluates the key. It wants the third route: parse the MethodDefinition and **instantiate** the method rather than evaluate the source, so the key expression is never evaluated at all. That is part 15.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -4212,6 +4230,76 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   `class_definition_evaluation_with_scope` takes the element keys
   **precomputed** — so the next part is to carry them. That is part 14.
 
+  **Fourteenth part — a class's definition-time inputs are carried with it,
+  designed before it was written, and landed.** The class record rebuilds a
+  class by
+  evaluating its source, which is part 7's design and stays: what a class *is*
+  (its `[[ConstructorKind]]`, fields, private methods and environment, prototype
+  object, and the constructor's body) is what only the engine's own class
+  evaluation makes. Part 7 therefore recorded that the definition-time code runs
+  again — computed keys, `static {}` blocks, static field initializers — as a
+  stated divergence. The load shows the divergence is not benign: a **computed
+  key** that reads a name from the module which defined the class
+  (`[SymbolIterator]() { return this; }`) cannot be evaluated at all in the
+  reading realm, whose global has no such name, and the same is true of an
+  `extends` expression naming one.
+
+  - **What is carried is the *input*, not a re-derivation.** `build_class`
+    already resolves every computed public element's key through
+    `element_key_with`, and indexes them exactly as `precomputed_keys` does (one
+    per computed public element, in source order). The class's constructor
+    record gains `computed_keys: Vec<PropertyKey>` — those keys, as the engine
+    resolved them at definition — and the class record writes them. The heritage
+    goes with them: `resolve_heritage` derives the proto parent from the heritage
+    *value*'s `prototype`, so carrying that value reproduces the class exactly,
+    and `extends null` is carried as the value `null` — which the writer can tell
+    apart, because a null heritage is the one case whose super constructor is
+    `%Function.prototype%` with no proto parent.
+  - **Format.** The class grammar's record gains, in the grammar-conditional slot
+    a method uses for its `home`, a **heritage** serial (`NO_REF` for a class with
+    no `extends` clause) and a count-prefixed list of **key** serials. Both are
+    ordinary value slots, so a symbol key is written as the symbol it is.
+  - **Restore.** The source is parsed as `(<class source>)` — the expression form
+    a class source is only valid as — the class expression taken from it, and the
+    evaluation handed to `class_definition_evaluation_with_keys`, the engine's own
+    entry for a class whose heritage and keys were evaluated elsewhere. Nothing is
+    re-evaluated. The parse is a script, so the class's spans index the text the
+    parse was given, and the bootstrap context the restore pushes carries that
+    text as its `source` — which is what keeps `capture_source` able to answer the
+    class's `[[SourceText]]`, so `toString` and a second snapshot are unaffected.
+  - **What this still does not carry:** a `static {}` block and a static field
+    initializer *execute* at restore, because they are effects rather than inputs.
+    That stays the stated divergence it is; part 7 records it.
+
+  *What it promises.* A class whose definition-time code reads a name from the
+  module that defined it comes back defined, with the same keys and the same
+  heritage — so a carried method, a carried field's key, and a carried subclass
+  all resolve to what they did before.
+
+  *Acceptance tests.* Four in `crates/runtime/src/snapshot.rs`:
+  `a_class_carries_its_computed_field_key` (a computed field key reading a module
+  binding, and the class still answering its class source),
+  `a_class_carries_its_heritage` (the implicit constructor calls `super()`, which
+  only the heritage decides — stated in the test because the statics would
+  survive without it, carried by the class's own prototype link),
+  `a_class_carrying_a_null_heritage_stays_derived` (the one heritage whose
+  resolved form is not its written form), and a
+  `a_class_carries_a_computed_method_key` (both halves at once: the class carries
+  the key, and the method is a class member). Three mutations, each caught: the
+  keys not written (both key tests fail with deno's own `SymbolIterator is not
+  defined`), the heritage always `None` (both heritage tests fail — the class
+  comes back a base class), and the evaluation's frame left without a source
+  (the restored class answers the native form instead of its class source).
+
+  **And the load moves past the class.** With this part deno's blob reads past
+  the class it stopped on and stops on an **object-literal method with a computed
+  key** instead — `[SymbolIterator]() { return this; }`, whose home object is a
+  plain object (`home_owner=None`, measured), so there is no class for a
+  class-member record to belong to and the method record's own source is what
+  re-evaluates the key. The same mechanism does not reach it: what that value
+  needs is the method *parsed and instantiated* rather than evaluated, so the key
+  expression is never evaluated at all. That is part 15.
+
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -4354,17 +4442,16 @@ Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots — **the format landed with
 its context table, the external-reference table, a function, a bound function, a
 class constructor, a host callback, an arrow, a method with its `[[HomeObject]]`,
-the realm's named global functions, the members of its own builtin objects and a
-method that reads a private name with it (§7's records for it; ledger item 16 has
-thirteen parts). What is left of
+the realm's named global functions, the members of its own builtin objects, a
+method that reads a private name and a class's own definition-time inputs with it
+(§7's records for it; ledger item 16 has fourteen parts). What is left of
 this item is named rather than implied: `FunctionCodeHandling::Keep`'s compiled
 code (which waits on the code cache), the isolate-level data slots, continuation
-from an existing blob, and the step the **load** now stops on — a
-**computed key** in a class's own evaluation, which re-runs at restore and reads
-`SymbolIterator` from the module that defined the class where the reading realm's
-global is what it finds (§7's last record; that is part 14, and
-`class_definition_evaluation_with_scope` taking its keys **precomputed** is the
-mechanism) — behind which is still the measured question of the graph reaching
+from an existing blob, and the step the **load** now stops on — an
+**object-literal method with a computed key**, which has no class to be read out
+of and whose own source is what re-evaluates the key (§7's last record; that is
+part 15, and parsing the MethodDefinition to *instantiate* it is the mechanism) —
+behind which is still the measured question of the graph reaching
 the **global object**, and behind that the accessor half of the method part.**;
 (4) module resolver as a
 host trait (landed), **unbound scripts and script origins** (the bridge side
@@ -4426,27 +4513,29 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's thirteen parts have landed — the format, the context table,
+bridge. That item's fourteen parts have landed — the format, the context table,
 the external-reference table, a function, a bound function, the realm's named
 global functions, a class constructor, a host callback, an arrow, the text a call
 frame runs, **a method with its `[[HomeObject]]`**, **the members of the
-realm's own builtin objects by name** and **a method that reads a private name,
-as a member of its class** — so the blocker this plan
+realm's own builtin objects by name**, **a method that reads a private name,
+as a member of its class** and **a class's own definition-time inputs** — so the
+blocker this plan
 could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
 for every load, a function, a bind, a class, an arrow, a host callback, a method,
-a builtin member and a private-name method all
+a builtin member, a private-name method and a class whose keys and heritage come
+from the module that defined it all
 come back
 callable or
 constructable, and a closure deno's own JS creates inside a function the host
 calls from Rust carries its text. **`create_blob` completes** — deno's
 snapshot build script runs to the end and writes its 226,426-byte blob — and the
 frontier is the **load**, which now reads past every value it used to stop on and
-fails on a **class's own evaluation** instead: a computed key re-evaluates at
-restore and reads `SymbolIterator` from the module that defined the class, where
-the reading realm's global is what it finds. That is part 14. Behind it sits the
+fails on an **object-literal method with a computed key** instead: there is no
+class to read it out of, and its own source is what re-evaluates the key. That is
+part 15. Behind it sits the
 **accessor** half of the method part, and then the measured question of the walk
 reaching the realm's global object, a realm the restore already rebuilt, so
 carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
@@ -4476,9 +4565,10 @@ migrate, then delete.
    named global functions,
    the text a call frame runs,
    a method with its [[HomeObject]], the members of the realm's own builtin
-   objects and a method that reads a private name, carried as a member of its
-   class** (§7's records for it, ledger item
-   16's thirteen parts): a versioned
+   objects, a method that reads a private name, carried as a member of its
+   class, and a class's own definition-time inputs** (§7's records for it, ledger
+   item
+   16's fourteen parts): a versioned
    blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
@@ -4491,21 +4581,24 @@ migrate, then delete.
    refusal naming
    anything uncarried. And the format now **loads**: deno's blob, read back for
    the first time, restores contexts past every value it used to stop on — the
-   realm's own builtin members by name, then a method that reads a private name —
-   and stops on a **class's own evaluation**: a computed key re-evaluates at
-   restore and reads `SymbolIterator` from the module that defined the class where
-   the reading realm's global is what it finds (§7's last record), which is part
-   14. What this item still owns: a host callback's
-   **construct half**, that **class evaluation** (part 14, whose mechanism is
-   `class_definition_evaluation_with_scope` taking its keys precomputed), the
+   realm's own builtin members by name, a method that reads a private name, and a
+   class whose computed keys and heritage come from the module that defined it —
+   and stops on an **object-literal method with a computed key**: there is no
+   class to read it out of, and its own source is what re-evaluates the key (§7's
+   last record), which is part
+   15. What this item still owns: a host callback's
+   **construct half**, that **object-literal method** (part 15, whose mechanism is
+   parsing the MethodDefinition to instantiate it rather than evaluating the
+   source), the
    **accessor**
    half of the method part, the
    measured question of the walk reaching the **global object**, a
    value shared between two contexts coming back one per context, compiled code
    for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
    existing blob. The realm's own builtin members by name — the value the walk
-   met as `Math.abs` — are **carried** (the twelfth part), and so is a method that
-   reads a private name (the thirteenth). The call-frame
+   met as `Math.abs` — are **carried** (the twelfth part), so is a method that
+   reads a private name (the thirteenth), and so are a class's computed keys and
+   its heritage (the fourteenth). The call-frame
    `source` the eleventh part closed was the conformance bug this item's walk
    exposed rather than a record it was missing.
 3. **Sealing `slag::api`** — the re-export exists (`crates/slag/src/lib.rs`, with a

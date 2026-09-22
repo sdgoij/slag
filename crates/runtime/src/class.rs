@@ -390,6 +390,7 @@ fn build_class(
     agent.running_context_mut()?.lexical_environment = class_env;
     agent.running_context_mut()?.private_environment = Some(class_private_env);
     let mut computed_key_index = 0;
+    let mut computed_keys: Vec<PropertyKey> = Vec::new();
     for element in &class.elements {
         if matches!(
             element,
@@ -411,6 +412,7 @@ fn build_class(
             ClassElement::Method { name, function, .. } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
+                record_computed_key(&mut computed_keys, element, &key);
                 let closure = instantiate_method(agent, function, class_env, true)?;
                 set_private_environment(agent, &closure, &class_private_env)?;
                 make_method(agent, &closure, home)?;
@@ -433,6 +435,7 @@ fn build_class(
             ClassElement::Get { name, body, .. } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
+                record_computed_key(&mut computed_keys, element, &key);
                 let getter = instantiate_accessor(agent, Vec::new(), body, class_env, true)?;
                 set_private_environment(agent, &getter, &class_private_env)?;
                 make_method(agent, &getter, home)?;
@@ -463,6 +466,7 @@ fn build_class(
             } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
+                record_computed_key(&mut computed_keys, element, &key);
                 let setter = instantiate_accessor(
                     agent,
                     vec![BindingElement {
@@ -498,6 +502,7 @@ fn build_class(
             ClassElement::Field { name, init, .. } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
+                record_computed_key(&mut computed_keys, element, &key);
                 if let Some(name_id) = private_id {
                     let ClassElementName::Private(atom) = name else {
                         unreachable!("private id implies a private name");
@@ -557,6 +562,7 @@ fn build_class(
         data.fields = fields;
         data.private_methods = instance_private_methods;
         data.private_environment = Some(class_private_env);
+        data.computed_keys = computed_keys;
         // Cut 33: fields/private methods arrive after registration, so the
         // cached construct-inline verdict (computed with the empty vectors)
         // is stale — a constructor with fields/private methods must not
@@ -633,6 +639,25 @@ enum StaticElement {
         init: Option<Expr>,
     },
     Block(Block),
+}
+
+/// Record a computed public element's resolved key for the constructor's record.
+///
+/// A computed key is the class's definition-time **input** rather than something
+/// a rebuild can re-derive: its expression may read a name that exists only in
+/// the module which defined the class, so a snapshot carries the resolved key
+/// instead of re-evaluating it (see `EcmaFunction::computed_keys`). Called in the
+/// source order the class evaluation indexes `precomputed_keys` by.
+fn record_computed_key(
+    keys: &mut Vec<PropertyKey>,
+    element: &ClassElement,
+    key: &Option<PropertyKey>,
+) {
+    if has_computed_public_name(element)
+        && let Some(key) = key
+    {
+        keys.push(key.clone());
+    }
 }
 
 /// Whether a class element is the `constructor` method: a plain instance
