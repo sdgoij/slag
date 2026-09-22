@@ -665,6 +665,43 @@ mod tests {
         assert_eq!(crate::test_support::eval_number(scope, "restored(2)"), 3.0);
     }
 
+    /// A realm's global function property is carried by name rather than as a
+    /// callback, and is callable after the restore — the value deno's attached
+    /// graph reaches through `globalThis`.
+    #[test]
+    fn a_global_function_round_trips_and_is_callable_from_a_script() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let function = crate::test_support::eval(scope, "isFinite");
+            scope.add_context_data(context, function);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let function = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the global function");
+        crate::test_support::bind(scope, "restored", function);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restored(1) ? 1 : 0"),
+            1.0
+        );
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restored(Infinity) ? 1 : 0"),
+            0.0
+        );
+    }
+
     /// A host callback is a Rust closure rather than source text, so it still
     /// ends the build, by name: this is the function kind the external-reference
     /// table's `function` field is for, and it is not wired to real ops yet.

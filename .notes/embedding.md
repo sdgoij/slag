@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last five records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from** and **a bind as its target and bound state**, so a host's attached callbacks come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last six records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, and **the realm's own global functions by the spec's names**, so a host's attached callbacks and the builtins its graph reaches come back callable; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2656,7 +2656,23 @@ Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **829 p
 
 *Two things a probe settled, both of which change what the step after that is.* The refusing builtin is **not** a bind's target, so binds are genuinely carried now rather than being walked into their targets. And the walk **reaches the realm's global object** before it refuses: deno's attached graph holds a path to `globalThis`, so the blob now wants to carry every global the host installed during its bootstrap, of which the engine's own are nameable and the host's are ordinary values that would come back on top of a realm the restore rebuilt. That is the shape of the next slice's real question, and it is measured rather than inferred — the probe printed both facts and was removed again.
 
-Ledger item 16's sixth part names the naming step before it is written: a `%name%` entry for each of the realm's global function properties, so a reference is written by name and resolved in the reading realm that rebuilds them, and no callback is carried for them.
+*Ledger item 16's sixth part named the naming step before it was written: a `%name%` entry for each of the realm's global function properties, so a reference is written by name and resolved in the reading realm that rebuilds them, and no callback is carried for them. It lands in the record below, which is also where the corpus caught what registering them exposed.*
+
+**The realm's global function properties — landed, and deno's `create_blob` now stops on a class constructor.** The sixth part of ledger item 16, and the naming step the record above measured.
+
+*The spec names them, so the registry is the right home.* `builtins/global.rs::install` created the global function properties as builtins on the global object and never registered them, so `isFinite` was a built-in the walk could not name. It now registers each one under the spec's own well-known name — `%isFinite%`, `%isNaN%`, `%parseFloat%`, `%parseInt%`, `%encodeURI%`, `%encodeURIComponent%`, `%decodeURI%`, `%decodeURIComponent%`, and Annex B's `%escape%`/`%unescape%` — in the same table `%eval%` (`realm.rs:509`) already sits in. The names are the spec's, not invented: `spec.html` lists every one in the well-known intrinsics table and defines each as an intrinsic object ("This function is the %isFinite% intrinsic object", "It is the %escape% intrinsic object"), and the table's own documentation ("the intrinsic registry (spec 9.3.1): %-named values installed by each built-in phase") is exactly what these are. Nothing in the format moved: `REC_INTRINSIC` already carries a name, and the restore resolves it in the realm being rebuilt.
+
+*Tests.* One in the engine, over all ten names: the name is in the blob, and a restore **into a second realm** answers that realm's own function rather than the writer's — the strong form, since a copy would carry the writer's identity. (The reading realm is created *after* the value is in hand, because the api makes the last context created current and the evals have to run in the writer's; the reader's own function is read from its intrinsic table rather than by an eval for the same reason.) One in the bridge: `isFinite` attached as context data, called from a script after the restore. Two mutations: dropping the registration fails the ten-name test with the refusal this slice removes ("a built-in function"), and misspelling one name fails the *blob-content* assertion — the one that pins the name, which is the format's compatibility surface, since a name registered on both sides would otherwise round trip under any spelling.
+
+*And the corpus caught an interaction the engine had been hiding.* Registering these made `owning_realm` (which finds a builtin's realm by scanning a realm's intrinsic table) answer for ten more functions — a **more correct** GetFunctionRealm — and that exposed an over-broad path in `construct_inner`: its cross-realm block converted *any* kind-only error from a cross-realm callee into that callee's realm, including EvaluateNew's "not a constructor" TypeError, which spec 13.3.5.1.1 step 7 throws in the **caller's** realm. Measured rather than reasoned about: `language/expressions/new/non-ctor-err-realm.js` went 0 fail to 1 fail — "Expected a TypeError but got a TypeError", from `assert.throws(TypeError, ...)` over `new $262.createRealm().global.parseInt(0)`, which compares the thrown object against the *test's* `TypeError`. The fix gates the block on `is_constructor`: a callee that will never run has no realm to attribute an error to, and only the dispatch half of the block (running the constructor in its own realm) needs the callee at all. That also makes the same shape correct for a builtin that was *already* registered — `new otherRealm.Symbol()`, which used to get the callee's TypeError with no fixture pinning either answer.
+
+One engine test pins the boundary (`function.rs`), mutation-verified: with the guard removed it answers `false` where it should answer `true`. The battery re-ran after the fix and every number is unchanged.
+
+*And the message for the next value was wrong.* The refusal for the value deno now stops on reads "a method (a method's source has no `function` keyword, ...)", and a probe showed what the value actually is: a **class constructor** — `is_class_constructor` true, no source at all, a home object, no name. So the detail was asserting a fact about a different value's shape: a class constructor is refused because the engine kept no source text for it (its body is synthesized), not because a `function` keyword is missing. The check order is now source-first, and a class constructor is named as one. One engine test, mutation-verified by putting the method check back first — only that test fails, with `left: "a method"`.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **832 passed / 0 failed**; `cargo test -p v8 --features simdutf` **220 passed / 0 failed**; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,204 passed / 0 failed / 4 ignored**. `crates/runtime` changed, so the battery ran — and ran twice, because the first run *failed*: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*What is left, and it is a design question this time.* `create_blob` now gets through the global object's functions and stops on that **class constructor** — a value whose body is synthesized, so there is no source to re-parse, and the same is true of every class constructor in the engine. So carrying a class means carrying what a class is made of: the constructor's body, its `fields`, its `private_methods`, its `private_environment`, its `super_constructor` and its heritage. That is ledger item 16's seventh part, and it is the first of these steps whose answer is not "write one more record".
 
 ## 8. Parked: the C++ face
 
@@ -3393,20 +3409,40 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   name.
 
   **Sixth part — naming the realm's global function properties, named before it
-  is written.** The kind deno's `create_blob` stops on now: `isFinite`, a
-  standard global function the realm installs but does not name. The measurement
+  is written, and landed.** The kind deno's `create_blob` stopped on: `isFinite`,
+  a standard global function the realm installs but did not name. The measurement
   and its two probes are in §7's record above — the refusal is *not* a bind's
   target, and the walk reaches the realm's **global object** on the way. The
-  change is the one `%eval%` already models (`realm.rs:509`): give each of the
-  global function properties `builtins/global.rs::install` puts on the global
-  object (`isFinite`, `isNaN`, `parseFloat`, `parseInt`, `encodeURI`,
+  change is the one `%eval%` already models (`realm.rs:509`): each of the global
+  function properties `builtins/global.rs::install` puts on the global object
+  (`isFinite`, `isNaN`, `parseFloat`, `parseInt`, `encodeURI`,
   `encodeURIComponent`, `decodeURI`, `decodeURIComponent`, `escape`, `unescape`)
-  the `%name%` entry the intrinsic table needs, so a reference to one is written
+  is now registered under the spec's own well-known name (`%isFinite%`, ...),
+  which the spec's intrinsic table does define, so a reference to one is written
   by name and resolved in the reading realm that rebuilds them — no callback is
   carried for them, and the format's compatibility surface stays "the names it
-  writes". What that does *not* settle, and the next measurement will: the walk
-  reaching the global object means the blob now carries the host's global state,
-  and what stands behind the engine's own globals is not measured yet.
+  writes".
+
+  **Second half of the same part — the error realm the registration exposed,
+  named before it was fixed.** Registering these made `owning_realm` answer for
+  ten more builtins, and the corpus showed what that reached:
+  `construct_inner`'s cross-realm block was converting *any* kind-only error from
+  a cross-realm callee into that callee's realm, including EvaluateNew's
+  "not a constructor" TypeError, which the spec throws in the **caller's** realm
+  (`language/expressions/new/non-ctor-err-realm.js`, 0 fail to 1 fail on the
+  first battery run). It is now gated on `is_constructor`. Same part, because the
+  measurement that named it is the registration above — and it is a fix at the
+  root rather than a workaround for it, which is why the registration stays.
+
+  **Seventh part — carrying a class constructor, named before it is written.**
+  What deno's `create_blob` stops on now, measured: `is_class_constructor` true,
+  no source text, a home object, no name. A class constructor's body is
+  synthesized, so — like every class constructor in the engine — there is nothing
+  to re-parse, and carrying one means carrying what a class is made of: the
+  constructor's body, `fields`, `private_methods`, `private_environment`,
+  `super_constructor` and heritage. This is the first of these parts whose answer
+  is not "write one more record", so it gets its own design before it is
+  written.
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3546,14 +3582,15 @@ a frame view of the running stack. §7's survey already split the subsystem: the
 
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots — **the format landed with
-its context table, the external-reference table, a function and a bound function
-with it (§7's last five records, ledger item 16). What is left of this item is
-named rather than implied: `FunctionCodeHandling::Keep`'s compiled code (which
-waits on the code cache), the isolate-level data slots, continuation from an
-existing blob, and the step deno's `create_blob` now stops on — naming the
-realm's global function properties (`isFinite` and its siblings, ledger item 16's
-sixth part), behind which is the measured question of the graph reaching the
-**global object**.**; (4) module resolver as a
+its context table, the external-reference table, a function, a bound function and
+the realm's named global functions with it (§7's last six records, ledger item
+16). What is left of this item is named rather than implied:
+`FunctionCodeHandling::Keep`'s compiled code (which waits on the code cache), the
+isolate-level data slots, continuation from an existing blob, and the step deno's
+`create_blob` now stops on — a **class constructor**, whose design is the first
+here that is not "one more record" (ledger item 16's seventh part) — behind which
+is still the measured question of the graph reaching the **global object**.**;
+(4) module resolver as a
 host trait (landed), **unbound scripts and script origins** (the bridge side
 landed — every Rust script handle is already context-unbound — and what the
 engine still owes there is the *code cache*: serializing its compiled program, so
@@ -3647,17 +3684,18 @@ delete.
 1. **Weak persistent handles** — the last L2 item. Design sketched in
    `.notes/host-object-gc.md` §4.3; not started.
 2. **Snapshot format** — **v1 landed with its context table, external
-   references, a function and a bound function** (§7's last five records, ledger
-   item 16): a versioned blob over a value graph rooted at the data a host
-   attached to each of its contexts, written and read against each slot's own
-   realm, intrinsics by name, host pointers as indices into the host's table, a
-   JavaScript function as the source it is re-parsed from, a bind as its target
-   and bound state, a refusal naming anything uncarried. What this item still
-   owns: naming the realm's global function properties (the next step, and what
-   deno's build stops on), the measured question of the walk reaching the **global
-   object**, a value shared between two contexts coming back one per context,
-   compiled code for `FunctionCodeHandling::Keep`, isolate-level data, and
-   continuation from an existing blob.
+   references, a function, a bound function and the realm's named global
+   functions** (§7's last six records, ledger item 16): a versioned blob over a
+   value graph rooted at the data a host attached to each of its contexts,
+   written and read against each slot's own realm, intrinsics by name, host
+   pointers as indices into the host's table, a JavaScript function as the source
+   it is re-parsed from, a bind as its target and bound state, a refusal naming
+   anything uncarried. What this item still owns: carrying a **class
+   constructor** (the next step, and the first whose design is not "one more
+   record"), the measured question of the walk reaching the **global object**, a
+   value shared between two contexts coming back one per context, compiled code
+   for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
+   existing blob.
 3. **Sealing `slag::api`** — the re-export exists (`crates/slag/src/lib.rs`, with a
    test that drives a module through it), so a host can depend on `slag` alone.
    Still open: `Local::value`, `Isolate::agent`, `Local::as_object` name

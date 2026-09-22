@@ -773,18 +773,29 @@ fn callable<'a>(
                     "a function",
                     "its body is not registered on this agent",
                 ))?;
+            let Some(source) = data.source.as_ref() else {
+                // No source is the primary fact, and it is checked before the
+                // method form because a class constructor, an accessor and an
+                // arrow all reach here with no source of their own — the engine
+                // synthesizes their bodies and `Function.prototype.toString`
+                // already answers the native form for them. Blaming the method
+                // form for a class constructor would be a false diagnosis.
+                let type_name = if data.is_class_constructor {
+                    "a class constructor"
+                } else {
+                    "a function"
+                };
+                return Err(Unsupported::new(
+                    type_name,
+                    "the engine kept no source text for it",
+                ));
+            };
             if data.is_method {
                 return Err(Unsupported::new(
                     "a method",
                     "a method's source has no `function` keyword, so it cannot be re-parsed on its own",
                 ));
             }
-            let Some(source) = data.source.as_ref() else {
-                return Err(Unsupported::new(
-                    "a function",
-                    "the engine kept no source text for it",
-                ));
-            };
             Ok(Callable::Body {
                 source,
                 strict: data.strict,
@@ -2708,6 +2719,24 @@ mod tests {
         }
     }
 
+    /// A class constructor is refused as what it is: the engine synthesizes its
+    /// body, so there is no source to re-parse — and the message says that rather
+    /// than blaming the method form, which is a different fact about a different
+    /// value.
+    #[test]
+    fn a_class_constructor_is_refused_by_what_it_lacks() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("class C {} C")
+            .expect("a class")
+            .into_value();
+        let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
+        assert_eq!(error.type_name, "a class constructor");
+        assert!(error.detail.contains("no source text"), "{}", error.detail);
+    }
+
     /// A host callback is a Rust closure in this engine rather than an address or
     /// a name, so it refuses as such — the one function kind no source can come
     /// back from.
@@ -2824,6 +2853,61 @@ mod tests {
             Some(6.0),
             "both binds were still bound"
         );
+    }
+
+    /// The realm's global function properties are intrinsics the spec names
+    /// (`%isFinite%`, `%parseInt%`, ...), so a reference to one is written by
+    /// name rather than refused as a host callback or carried as a copy — and
+    /// a restore resolves the name against the realm it is rebuilding.
+    #[test]
+    fn a_global_function_property_is_written_by_name() {
+        let mut isolate = api::Isolate::new();
+        // The reading realm is made first, because the api makes the *last*
+        // context created the current one and the evals below have to run in
+        // the writer's.
+        let reader = api::Context::new(&mut isolate).expect("a realm to restore into");
+        let writer = api::Context::new(&mut isolate).expect("the realm the value comes from");
+        for name in [
+            "isFinite",
+            "isNaN",
+            "parseFloat",
+            "parseInt",
+            "encodeURI",
+            "encodeURIComponent",
+            "decodeURI",
+            "decodeURIComponent",
+            "escape",
+            "unescape",
+        ] {
+            let value = writer
+                .try_eval(name)
+                .expect("the global function")
+                .into_value();
+            let blob = encode(agent_of(&isolate), writer.realm(), value).expect("carried by name");
+            assert!(
+                blob.windows(name.len())
+                    .any(|window| window == name.as_bytes()),
+                "{name} is in the blob by name, not by structure"
+            );
+            let back = decode_slot(agent_mut(&isolate), reader.realm(), &blob, 0, &[])
+                .expect("a blob of this tree")
+                .expect("slot 0");
+            // The reading realm's own, by its intrinsic table rather than by an
+            // eval: the current realm is still the writer's.
+            let own = reader
+                .intrinsic(&format!("%{name}%"))
+                .expect("the reading realm registered it");
+            assert_eq!(
+                back[0].as_function().map(|function| function.id()),
+                own.as_function().map(|function| function.id()),
+                "{name} came back the reading realm's own function"
+            );
+            assert_ne!(
+                back[0].as_function().map(|function| function.id()),
+                value.as_function().map(|function| function.id()),
+                "{name} came back a copy of the writer's"
+            );
+        }
     }
 
     /// A bind whose target is a host callback is refused by what cannot be

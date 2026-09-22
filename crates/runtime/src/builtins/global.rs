@@ -51,8 +51,14 @@ fn to_number_agent(value: &Value) -> Result<f64, JsError> {
     crate::context::to_number(current_agent_mut()?, value)
 }
 
-/// Install the eight global function properties during
-/// SetDefaultGlobalBindings (spec 19.2).
+/// Install the global function properties during SetDefaultGlobalBindings
+/// (spec 19.2, and `escape`/`unescape` from B.2.1).
+///
+/// Each is registered in the realm's intrinsic table under the spec's own
+/// well-known name as well as defined on the global object: the spec names
+/// every one of them (`%isFinite%`, `%parseInt%`, `%escape%`, ...), and the
+/// registration is what makes a reference to one resolvable in a realm that
+/// has bootstrapped rather than a value something has to carry.
 pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     // CreateBuiltinFunction (spec 10.2.3 step 1): the [[Prototype]] defaults
     // to %Function.prototype%. The realm's post-pass only links intrinsics,
@@ -64,21 +70,32 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             ValueKind::Function(function) => function.object.handle(),
             _ => None,
         });
-    for (name, length, call) in [
+    for (name, intrinsic, length, call) in [
         (
             "isFinite",
+            "%isFinite%",
             1,
             is_finite as fn(&Value, &[Value]) -> Result<Value, JsError>,
         ),
-        ("isNaN", 1, is_nan),
-        ("parseFloat", 1, parse_float),
-        ("parseInt", 2, parse_int),
-        ("encodeURI", 1, |_, args| encode(args, false)),
-        ("encodeURIComponent", 1, |_, args| encode(args, true)),
-        ("decodeURI", 1, |_, args| decode(args, false)),
-        ("decodeURIComponent", 1, |_, args| decode(args, true)),
-        ("escape", 1, escape),
-        ("unescape", 1, unescape),
+        ("isNaN", "%isNaN%", 1, is_nan),
+        ("parseFloat", "%parseFloat%", 1, parse_float),
+        ("parseInt", "%parseInt%", 2, parse_int),
+        ("encodeURI", "%encodeURI%", 1, |_, args| encode(args, false)),
+        (
+            "encodeURIComponent",
+            "%encodeURIComponent%",
+            1,
+            |_, args| encode(args, true),
+        ),
+        ("decodeURI", "%decodeURI%", 1, |_, args| decode(args, false)),
+        (
+            "decodeURIComponent",
+            "%decodeURIComponent%",
+            1,
+            |_, args| decode(args, true),
+        ),
+        ("escape", "%escape%", 1, escape),
+        ("unescape", "%unescape%", 1, unescape),
     ] {
         let function = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -90,6 +107,9 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         if let Some(function_proto) = &function_proto {
             function.object.set_prototype_of(Some(*function_proto))?;
         }
+        realm
+            .intrinsics
+            .define(intrinsic, Value::Function(function));
         realm.global_object.define_property_or_throw(
             &JsString::from_utf8(name),
             &crux::property::PropertyDescriptor {

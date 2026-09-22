@@ -1999,7 +1999,15 @@ fn construct_inner(
 ) -> Result<Value, JsError> {
     // Cross-realm builtin constructors (`new $262.createRealm().global.Array`)
     // dispatch with their own realm current, like `call_inner`.
+    //
+    // Only a callee that will actually run is re-realmed this way. EvaluateNew's
+    // "not a constructor" TypeError (spec 13.3.5.1.1 step 7) is thrown by the
+    // *caller* — the callee never enters a context of its own — so it belongs to
+    // the current realm, and converting it here would hand the test realm's
+    // `assert.throws` another realm's TypeError object
+    // (`expressions/new/non-ctor-err-realm.js`).
     if let ValueKind::Function(function) = callee.kind()
+        && function.is_constructor()
         && let Some(owning) = owning_realm(agent, &function)
         && owning.global_object.id() != agent.current_realm()?.global_object.id()
     {
@@ -3700,6 +3708,35 @@ mod tests {
 
     fn run(source: &str) -> Result<Value, JsError> {
         evaluate(source)
+    }
+
+    /// `new` on a cross-realm non-constructor throws the **current** realm's
+    /// TypeError. The callee never enters a context of its own, so
+    /// EvaluateNew's step-7 throw (spec 13.3.5.1.1) is the caller's — the
+    /// cross-realm construct path re-realms a callee that will actually run, and
+    /// this pins that boundary (`expressions/new/non-ctor-err-realm.js`).
+    #[test]
+    fn new_on_a_cross_realm_non_constructor_throws_the_current_realms_error() {
+        let mut agent = Agent::new();
+        let caller = agent.initialize_host_defined_realm().unwrap();
+        let other = crate::realm::initialize_host_defined_realm(&agent).unwrap();
+        // The other realm's `parseInt`, a global function property rather than a
+        // constructor, reached from the caller's global scope.
+        let other_parse_int = other
+            .intrinsics
+            .get("%parseInt%")
+            .expect("the other realm's parseInt");
+        caller
+            .global_object
+            .create_data_property(&JsString::from_utf8("otherParseInt"), other_parse_int)
+            .unwrap();
+
+        // The script runs in the caller, so `TypeError` is the caller's and the
+        // answer is whether the thrown one is the same realm's object.
+        let caught = agent
+            .run_script("try { new otherParseInt(0); false } catch (e) { e instanceof TypeError }")
+            .unwrap();
+        assert_eq!(caught, Value::Boolean(true));
     }
 
     fn number(value: f64) -> Value {
