@@ -2966,6 +2966,57 @@ documented aborting test skipped); `cargo fmt --all -- --check` clean;
 core suites 64,594 checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 tests / 0 fail. `snapshot::`
 goes from 64 tests to 67.
 
+**A typed array and the buffer it views — landed.** The next thing the walk refused, and measured rather
+than guessed this time: with the environment chain carried, deno's snapshot creation died on the first
+typed array it reached, and a probe over the five typed arrays the frontier's carried environments hold
+said what they are.
+
+| binding | view | geometry | storage |
+|---|---|---|---|
+| `timerInfo` | Int32 x 1 | offset 0, 4 bytes | `ContextState` (borrowed) |
+| `tickInfo` | Uint8 x 2 | offset 0, 2 bytes | `ContextState` (borrowed) |
+| `immediateInfo` | Uint32 x 3 | offset 0, 12 bytes | `ContextState` (borrowed) |
+| `callSiteRetBuf` | Uint32 x 2 | offset 0, 8 bytes | engine-owned |
+| `callSiteRetBufU8` | Uint8 x 8 | offset 0, 8 bytes | engine-owned |
+
+All five are fixed-length views at offset 0 — none resizable, growable, shared, detached or immutable —
+and three are over **host memory**: `JsRuntime::new` wraps `ContextState::tick_info`/`immediate_info`/
+`timer_info` as backing stores (`jsruntime.rs:1773-1880`), unconditionally in `store_js_callbacks`,
+which runs on the from-snapshot path too, and the bridge turns such a store into a borrowed
+`SharedBuffer` (`crates/v8/array_buffer.rs:269`). So the host re-attaches its own memory at load, and
+the record carries a **copy** of the bytes — which is what V8's serializer does with a non-shared
+ArrayBuffer, and what makes the three views come back at all. The format, the restore and the refusals
+are §9's record for this part.
+
+*Tests — eight, and every one mutated.* In `crates/runtime/src/snapshot.rs`:
+`every_typed_array_kind_round_trips` (all twelve kinds with a value in each; mutated, `from_name`
+mapping `Float16` onto `Float32` is caught), `a_typed_array_round_trips_with_its_bytes_and_geometry`
+(the elements, the geometry, the kind — and a write through the restored view reaching the restored
+buffer, so a view over a *copy* of the block fails too), `two_views_over_one_buffer_come_back_one_buffer`
+(the shape deno's `callSiteRetBuf` pair has: one buffer, two views of it, read two ways),
+`a_views_offset_and_length_come_back_with_it` (a windowed view keeps its offset, and the bytes on both
+sides of the window come back), `a_resizable_buffer_comes_back_resizable` (the flags, the maximum, and a
+view that still tracks the buffer after `resize`), `a_buffer_over_host_memory_is_carried_as_its_bytes`,
+`a_null_prototype_view_comes_back_with_no_prototype`, and
+`a_view_or_buffer_this_format_cannot_rebuild_is_refused_by_name` (a `DataView`, a `SharedArrayBuffer`,
+a growable one, and a detached buffer). Mutations, each caught: the bytes not written back (five tests),
+the construction given the offset alone (the geometry check refuses it), the buffer's flags dropped,
+the auto-length flag dropped, the three refusals removed, and the null link not cleared.
+
+*And the measurement moved.* deno's snapshot creation now **carries all five views and their buffers**
+and refuses the next thing the graph holds that this format cannot: the walk's own words, `an array`
+with the detail `an array with a hole is not carried yet` — an array with a hole, which is the next part
+and is already on the format's refusal inventory.
+
+*Gates.* `cargo test --locked --workspace` green (runtime 877, test262 3,324, crux 248; the one
+documented aborting test skipped); `cargo fmt --all -- --check` clean;
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean; test262 `all` 48,464 pass /
+0 fail / 0 crash / 0 hang (158 skip) of 48,622, `intl402` 3,205 / 0 fail (152 skip); the eight wasm core
+suites 64,594 checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 tests / 0 fail. `snapshot::` goes from
+67 tests to 75. The sweeps are unaffected by this part's code: `test262`, `wasmtest`, `wasm` and `cli`
+never name `encode_slots`/`decode_slot`/`write_snapshot`/`read_snapshot`, checked by grep rather than
+assumed.
+
 *And the goal is the snapshot path, not the from-source one.* Booting deno with `startup_snapshot: None` **works** — measured end to end: deno's whole bootstrap runs on this engine, `example.js` loads, its `my:runtime` import resolves and calls the Rust op, and the run prints `Received this value from JS: Hello from example.js` and exits 0 — and it is explicitly **not** the goal: it skips the integration being tested, re-runs the host's JavaScript at every start, and is what a host falls back to when its snapshot is unusable. The next part is the environment record (design named in §12's eleventh item).
 
 ## 8. Parked: the C++ face
@@ -4647,6 +4698,65 @@ a frame view of the running stack. §7's survey already split the subsystem: the
     `tickInfo`, `callSiteRetBuf`, `callSiteRetBufU8`, `timerInfo`), which is the
     next part.
 
+  **Eighteenth part — a typed array and the buffer it views, designed before it was
+  written, and landed.** The next thing the walk refuses, and now measured rather than guessed:
+  with the environment chain carried, deno's snapshot creation dies on the first
+  typed array it reaches, and a probe over the five typed arrays the frontier's
+  carried environments hold says what they are.
+
+  | binding | view | geometry | storage |
+  |---|---|---|---|
+  | `timerInfo` | Int32 x 1 | offset 0, 4 bytes | `ContextState` (borrowed) |
+  | `tickInfo` | Uint8 x 2 | offset 0, 2 bytes | `ContextState` (borrowed) |
+  | `immediateInfo` | Uint32 x 3 | offset 0, 12 bytes | `ContextState` (borrowed) |
+  | `callSiteRetBuf` | Uint32 x 2 | offset 0, 8 bytes | engine-owned |
+  | `callSiteRetBufU8` | Uint8 x 8 | offset 0, 8 bytes | engine-owned |
+
+  All five are fixed-length views at offset 0 — none resizable, growable, shared,
+  detached or immutable — and three are over **host memory**: `JsRuntime::new`
+  wraps `ContextState::tick_info`/`immediate_info`/`timer_info` as backing stores
+  (`jsruntime.rs:1773-1880`, `new_backing_store_from_ptr`), unconditionally in
+  `store_js_callbacks`, which runs on the from-snapshot path too, and the bridge
+  turns such a store into a borrowed `SharedBuffer`
+  (`crates/v8/array_buffer.rs:269`).
+  - **Format.** `REC_ARRAY_BUFFER` (tag 20): a flags byte (resizable, immutable),
+    the byte length, the maximum when resizable, then **the bytes** — the first
+    bulk data this format carries — and the object part. `REC_TYPED_ARRAY`
+    (tag 21): the element type by its `ElementType::name` text, the viewed buffer
+    as a value serial, the byte offset, the auto-length flag, the byte length and
+    array length **only for a fixed view**, and the object part. That
+    conditionality is the engine's own: an auto-length view's length is the
+    buffer's, derived on every read and stale in the slots, so a record that
+    carried it would carry a number nothing honours. A view's index-keyed own
+    properties are skipped as an Array's are, because a view's indices are virtual.
+  - **Restore.** The buffer is a real ArrayBuffer through the engine's own
+    `allocate_array_buffer` (block, `BufferState` and the resizable mirror), with
+    the carried bytes written into the block and `immutable` mirrored. The view is
+    built through the engine's own `typed_array_buffer_path`, handed **the record's
+    own `[[Prototype]]`** (the kind's intrinsic only for a *null* link, which is the
+    one a construction cannot be handed and which is cleared afterwards), and the
+    built geometry is compared to the record's — a mismatch is refused, so the
+    blob's numbers are checked against the engine's own derivation rather than
+    trusted. `ElementType::from_name` in `crux` supplies the kind its name names.
+  - **What is refused by name:** a *shared* or growable buffer, a *detached*
+    buffer, and a **`DataView`** — which the walk writes as an ordinary object
+    today, so the restore hands back an object with no view at all. That last one
+    is a silent wrong answer this part closes while leaving the view's own state
+    uncarried and named.
+  - **A buffer over host memory is carried as its bytes.** That is what V8's
+    serializer does with a non-shared ArrayBuffer, and what this host needs:
+    `deno_core` re-creates those three backing stores from `ContextState` on every
+    runtime construction and hands them to JS again, so the restored copy is only
+    the state JS starts from. The identity of the host's allocation is what is not
+    carried, and a host that does not re-hand it reads the copy.
+  - **Engine edit this part names:** `ElementType::from_name` in `crux`, beside
+    the `name` it inverts, so the one table stays in one file.
+
+  *Landed, and what the measurement says.* Eight tests, each one mutated (§7 has them and the
+  mutations). And deno's snapshot creation now carries all five views and their buffers, and refuses
+  the next thing the graph holds that this format cannot: **an array with a hole** — the next part, and
+  one the format's refusal inventory already lists.
+
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -5162,6 +5272,36 @@ migrate, then delete.
    `callSiteRetBufU8`, and `timerInfo` in another scope — which the walk could not see at all until it
    descended into a closure. A typed array's view and buffer is therefore the next value record, and
    the boundary's refusal inventory already lists it.
+
+   **A typed array and the buffer it views — landed** (designed before the edit, §11's order; §7 has
+   the measurement, the tests and the mutations). `REC_ARRAY_BUFFER` (tag 20) carries a flags byte
+   (resizable, immutable), the byte length, the maximum when resizable, **the bytes themselves**, and
+   the object part; `REC_TYPED_ARRAY` (tag 21) carries the element type **by name** (`ElementType::name`:
+   `Uint8`, `Int32`, `BigInt64`, ... — so the format's compatibility surface is still the names it
+   writes), the viewed buffer as a value serial, the byte offset, the auto-length flag, the two lengths
+   **only for a fixed view** (an auto-length view's length is the buffer's, so a record that carried it
+   would carry a number nothing honours), and the object part. An index-keyed own property is skipped
+   for a view exactly as it is for an Array. The restore builds the buffer through the engine's own
+   `allocate_array_buffer` (writing the carried bytes into the block) and the view through the engine's
+   own `typed_array_buffer_path`, handed the record's own `[[Prototype]]` — the kind's intrinsic only
+   for a *null* link, which is the one a construction cannot be handed and which is cleared afterwards
+   — and then compares the built geometry to the record's, refusing a mismatch rather than trusting the
+   blob's numbers. What is refused **by name**: a *shared* or growable buffer (a restored copy cannot be
+   the memory another agent holds, and the sharing is the value), a *detached* buffer (no bytes to
+   carry, and the constructor path refuses a view over one), and a **`DataView`** — which the walk wrote
+   as an ordinary object, so the restore handed back an object with no view at all: a silent wrong
+   answer this part closes with a refusal while the view's own state stays uncarried. A buffer over
+   **host memory** (a v8 backing store over a Rust allocation — three of the frontier's five views are
+   exactly that, `ContextState`'s fields) is carried as a **copy** of its bytes, which is what V8's
+   serializer does with a non-shared ArrayBuffer, and which is what this host needs: `deno_core`
+   re-creates those backing stores from `ContextState` on every runtime construction and re-hands them
+   to JS, so the copy is only the state JS starts from. The identity of the host's allocation is what is
+   not carried, and that is stated. `ElementType::from_name` is the one `crux` edit, beside the `name`
+   it inverts.
+
+   **And the measurement moved once more.** Snapshot creation now carries the five views and their
+   buffers and refuses the next thing the graph holds that this format cannot — **an array with a
+   hole** — which is the next part.
 
 12. **`Object.assign` and a function — landed, both roles fixed.** §7's
    measurement found it in passing: `Object.assign(function () {}, { tag: 7 })`

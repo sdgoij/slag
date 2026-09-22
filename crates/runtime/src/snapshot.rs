@@ -126,9 +126,11 @@ use crux::object::{JsObject, ObjectKind, Property, PropertyKind};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::{self, JsString};
 use crux::symbol::{self, Symbol};
+use crux::typed_array::ElementType;
 use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
+use crate::builtins::array_buffer::BufferState;
 use crate::env::{Binding, DeclarativeEnv, EnvRecord, EnvRef, FunctionEnv, ThisBindingStatus};
 use crate::realm::Realm;
 
@@ -164,6 +166,15 @@ const REC_HOST_CALLBACK: u8 = 16;
 const REC_CLASS_METHOD: u8 = 17;
 const REC_MODULE: u8 = 18;
 const REC_ENV: u8 = 19;
+const REC_ARRAY_BUFFER: u8 = 20;
+const REC_TYPED_ARRAY: u8 = 21;
+
+/// An array buffer's own flags, in the byte its record carries: whether it is
+/// resizable (a `maxByteLength` was given) and whether it is immutable
+/// (`transferToImmutable`). A shared or detached buffer is refused by the walk
+/// rather than flagged, because neither can be rebuilt as what it was.
+const BUFFER_RESIZABLE: u8 = 1;
+const BUFFER_IMMUTABLE: u8 = 2;
 
 /// Which environment record an `REC_ENV` record is. Only these two are
 /// carried; an object, module or global record is refused by [`visit_env`].
@@ -283,6 +294,11 @@ pub enum DecodeError {
     /// not one of this format's, a this-binding status that is not one, or a
     /// function record whose grammar the format does not give an environment.
     UnrebuildableEnvironment(String),
+    /// An ArrayBuffer or typed array record this version cannot rebuild: an
+    /// element-type name no kind has, a view whose built geometry does not match
+    /// the numbers the record carries, or a buffer the engine will not allocate
+    /// the way the record describes.
+    UnrebuildableBuffer(String),
     /// A blob names an entry the host's external-reference table does not have.
     ExternalIndexOutOfRange { index: usize, count: usize },
 }
@@ -330,6 +346,9 @@ impl std::fmt::Display for DecodeError {
             ),
             Self::UnrebuildableEnvironment(reason) => {
                 write!(f, "snapshot environment could not be rebuilt: {reason}")
+            }
+            Self::UnrebuildableBuffer(reason) => {
+                write!(f, "snapshot buffer could not be rebuilt: {reason}")
             }
             Self::ExternalIndexOutOfRange { index, count } => write!(
                 f,
@@ -446,6 +465,31 @@ enum Record {
         bindings: Vec<CarriedBinding>,
         this_value: u32,
         this_status: u8,
+    },
+    /// An ArrayBuffer: its geometry, its own flags, the bytes it holds, and its
+    /// object part.
+    ArrayBuffer {
+        byte_length: u32,
+        resizable: bool,
+        immutable: bool,
+        max_byte_length: u32,
+        bytes: Vec<u8>,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
+    /// A typed array: which of the twelve kinds it is, the buffer it views, its
+    /// geometry, and its object part.
+    TypedArray {
+        element: ElementType,
+        buffer: u32,
+        byte_offset: u32,
+        byte_length: u32,
+        array_length: u32,
+        auto_length: bool,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
     },
     Object {
         proto: u32,
@@ -965,7 +1009,7 @@ fn visit(
                 if let ObjectKind::External(pointer) = &object.kind {
                     external_index(externals, *pointer)?;
                 }
-                for child in children(&object)? {
+                for child in children(agent, &object)? {
                     visit(agent, realm, externals, host, child, objects, serials)?;
                 }
             }
@@ -1065,7 +1109,7 @@ fn visit(
                         }
                     }
                 }
-                for child in children(&function.object)? {
+                for child in children(agent, &function.object)? {
                     visit(agent, realm, externals, host, child, objects, serials)?;
                 }
             }
@@ -1730,18 +1774,37 @@ fn named_by_another_realm(agent: &Agent, realm: &Handle<Realm>, value: &Value) -
     })
 }
 
+/// The ArrayBuffer state an object's identity names, when the object is one: an
+/// ArrayBuffer's data lives in the agent, keyed by the object, rather than in the
+/// object itself.
+fn array_buffer_state<'a>(
+    agent: &'a Agent,
+    object: &Handle<JsObject>,
+) -> Option<std::cell::Ref<'a, BufferState>> {
+    agent
+        .buffer_data
+        .get(&object.id())
+        .map(|state| state.borrow())
+}
+
+/// Whether this object is a DataView, whose view state the agent holds the same
+/// way it holds a buffer's.
+fn is_data_view(agent: &Agent, object: &Handle<JsObject>) -> bool {
+    agent.dataview_data.contains_key(&object.id())
+}
+
 /// Every value an object reaches: its prototype, its keys, and its values.
 ///
 /// An Array's elements are its values too, and its `length` is neither an
 /// element nor an ordinary property, so the two exotics are asked the question
-/// their kind makes meaningful. A host pointer has no children: what it names is
-/// the host's, written as an index into the table the host supplies. Every
-/// *other* exotic kind is refused here rather than walked: its own state is not
-/// in `properties`, so writing it as the ordinary object its shape would suggest
-/// would produce an object that is not the one that was written — a proxy
-/// without its traps, a typed array without its buffer, a `String` object
-/// without its string.
-fn children(object: &Handle<JsObject>) -> Result<Vec<Value>, Unsupported> {
+/// their kind makes meaningful — and a typed array is asked it the same way, its
+/// buffer being the one value it is made of. A host pointer has no children: what
+/// it names is the host's, written as an index into the table the host supplies.
+/// Every *other* exotic kind is refused here rather than walked: its own state is
+/// not in `properties`, so writing it as the ordinary object its shape would
+/// suggest would produce an object that is not the one that was written — a proxy
+/// without its traps, a `String` object without its string.
+fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsupported> {
     let mut children = Vec::new();
     if let Some(prototype) = object
         .get_prototype_of()
@@ -1749,6 +1812,30 @@ fn children(object: &Handle<JsObject>) -> Result<Vec<Value>, Unsupported> {
     {
         children.push(Value::Object(prototype));
     }
+    if is_data_view(agent, object) {
+        return Err(Unsupported::new(
+            "a data view",
+            "a data view's buffer and geometry are not carried yet, and an ordinary object is not what it is",
+        ));
+    }
+    if let Some(state) = array_buffer_state(agent, object) {
+        if state.is_shared || state.growable {
+            return Err(Unsupported::new(
+                "a shared array buffer",
+                "a restored copy cannot be the memory another agent holds, and being that memory is the whole of what it is",
+            ));
+        }
+        if state.detached {
+            return Err(Unsupported::new(
+                "a detached array buffer",
+                "it has no bytes to carry, and the engine's own view constructor refuses a view over one",
+            ));
+        }
+    }
+    // A view whose data the agent holds rather than the object: a DataView is not
+    // carried at all (writing it as the ordinary object it looks like would read
+    // back as one, with no view state), and a buffer this format cannot rebuild
+    // as what it was is refused here, where the walk names what it refuses.
     match &object.kind {
         ObjectKind::Ordinary => {}
         ObjectKind::Array(_) => {
@@ -1797,11 +1884,11 @@ fn children(object: &Handle<JsObject>) -> Result<Vec<Value>, Unsupported> {
                 "a proxy's traps and target are not carried yet",
             ));
         }
-        ObjectKind::IntegerIndexed(_) => {
-            return Err(Unsupported::new(
-                "a typed array",
-                "a typed array's view and buffer are not carried yet",
-            ));
+        ObjectKind::IntegerIndexed(slots) => {
+            // A view reads its elements out of the block its buffer holds, so the
+            // buffer is the one value it is made of. Its indices are virtual and
+            // `is_carried_key` skips them, exactly as it skips an Array's.
+            children.push(slots.buffer_object);
         }
         ObjectKind::ModuleNamespace(_) => {
             return Err(Unsupported::new(
@@ -1845,14 +1932,24 @@ fn children(object: &Handle<JsObject>) -> Result<Vec<Value>, Unsupported> {
 /// one of the slots an Array exotic keeps elsewhere: its indices are its
 /// elements, and its `length` is the exotic's own invariant.
 fn is_carried_key(object: &Handle<JsObject>, key: &PropertyKey) -> bool {
-    if !matches!(&object.kind, ObjectKind::Array(_)) {
+    // An Array's indices live in its slots and a view's are virtual (they read
+    // the block its buffer holds), so neither is an own property the record
+    // carries — the difference between them is `length`: it is an Array's one
+    // own non-index key, and a view's `length` is an accessor on its prototype.
+    let is_array = matches!(&object.kind, ObjectKind::Array(_));
+    if !is_array && !matches!(&object.kind, ObjectKind::IntegerIndexed(_)) {
         return true;
     }
     let PropertyKey::String(atom) = key else {
         return true;
     };
     let text = string::lookup(*atom);
-    canonical_index(&text).is_none() && text.as_slice() != LENGTH_UNITS
+    if canonical_index(&text).is_some() {
+        return false;
+    }
+    // `length` is an Array's own key; a view's is an accessor on its prototype,
+    // so it is an ordinary carried key there.
+    !(is_array && text.as_slice() == LENGTH_UNITS)
 }
 
 /// The index a property key spells, when it spells one canonically: the
@@ -2004,10 +2101,15 @@ fn write_record(
             None if matches!(&object.kind, ObjectKind::Array(_)) => {
                 write_array(realm, object, serials, body)?
             }
+            None if matches!(&object.kind, ObjectKind::IntegerIndexed(_)) => {
+                write_typed_array(realm, object, serials, body)?
+            }
             None => {
                 if let ObjectKind::External(pointer) = &object.kind {
                     body.push(REC_EXTERNAL);
                     write_u32(body, external_index(externals, *pointer)?);
+                } else if array_buffer_state(agent, &object).is_some() {
+                    write_array_buffer(agent, realm, &object, serials, body)?;
                 } else {
                     write_object(realm, object, serials, body)?;
                 }
@@ -2411,6 +2513,122 @@ fn write_array(
     Ok(())
 }
 
+/// A length the format writes as a `u32`, or the refusal that names it: every
+/// length field in this format is 32-bit, so a longer one refuses rather than
+/// silently truncating.
+fn length_as_u32(value: usize, type_name: &'static str) -> Result<u32, Unsupported> {
+    u32::try_from(value)
+        .map_err(|_| Unsupported::new(type_name, "its length is beyond what this format writes"))
+}
+
+/// Write an ArrayBuffer as its geometry, its own flags, and the bytes it holds.
+///
+/// The bytes are the record's substance: an ArrayBuffer *is* its data, and every
+/// view over it reads them out of the same block. A buffer whose storage is
+/// **host memory** — a v8 backing store over an allocation the host owns — is
+/// written the same way, as its bytes, which is what V8's own serializer does
+/// with a non-shared ArrayBuffer. What is not carried is the identity of the
+/// host's allocation: a host that wants the sharing re-establishes it on its load
+/// path, and `deno_core` does exactly that for the three `ContextState`-backed
+/// views it creates on every runtime construction.
+///
+/// A shared, growable or detached buffer is refused by the walk, so it cannot
+/// reach here.
+fn write_array_buffer(
+    agent: &Agent,
+    realm: &Handle<Realm>,
+    object: &Handle<JsObject>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    let Some(state) = array_buffer_state(agent, object) else {
+        return Err(Unsupported::new(
+            "an array buffer",
+            "its data is not on this agent",
+        ));
+    };
+    let byte_length = length_as_u32(state.byte_length, "an array buffer")?;
+    let max_byte_length = length_as_u32(
+        state.max_byte_length.unwrap_or(state.byte_length),
+        "an array buffer's maximum",
+    )?;
+    let mut flags = 0u8;
+    if state.resizable {
+        flags |= BUFFER_RESIZABLE;
+    }
+    if state.immutable {
+        flags |= BUFFER_IMMUTABLE;
+    }
+    let bytes = state
+        .shared
+        .read(0, state.byte_length)
+        .map_err(|_| Unsupported::new("an array buffer", "its bytes could not be read"))?;
+    drop(state);
+    body.push(REC_ARRAY_BUFFER);
+    body.push(flags);
+    write_u32(body, byte_length);
+    // Written only for a resizable buffer, and read under the same flag: the
+    // engine sets a maximum for a resizable or growable buffer and for no other,
+    // and a growable one is refused above.
+    if flags & BUFFER_RESIZABLE != 0 {
+        write_u32(body, max_byte_length);
+    }
+    body.extend_from_slice(&bytes);
+    write_u32(body, prototype_serial(realm, object, serials)?);
+    body.push(u8::from(object.extensible.get()));
+    write_properties(realm, object, serials, body)?;
+    Ok(())
+}
+
+/// Write a typed array as the kind it is, the buffer it views, its geometry, and
+/// its object part.
+///
+/// The elements are not written here: they are the **buffer's** bytes, and a view
+/// is a window onto them. So two views over one buffer write one buffer record —
+/// the serial map makes the shared object one serial, which is what keeps
+/// `a.buffer === b.buffer` true across a round trip — and what a view's own record
+/// adds is which elements those bytes are read as and where its window starts.
+fn write_typed_array(
+    realm: &Handle<Realm>,
+    object: Handle<JsObject>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    // The walk refuses every other kind, so the match cannot miss; a miss would
+    // be a walk/writer disagreement.
+    let ObjectKind::IntegerIndexed(slots) = &object.kind else {
+        return Err(Unsupported::new(
+            "a typed array",
+            "its kind is not the one this record is for",
+        ));
+    };
+    body.push(REC_TYPED_ARRAY);
+    write_text(body, slots.element_type.name());
+    write_u32(body, serial_in(realm, serials, slots.buffer_object));
+    write_u32(
+        body,
+        length_as_u32(slots.byte_offset, "a typed array's byte offset")?,
+    );
+    body.push(u8::from(slots.auto_length));
+    // A fixed view's length is its own; an auto-length view's is the buffer's,
+    // derived on every read and stale in the slots — so writing it would write a
+    // number nothing honours, and the restore derives it the same way.
+    if !slots.auto_length {
+        write_u32(
+            body,
+            length_as_u32(slots.byte_length, "a typed array's byte length")?,
+        );
+        write_u32(
+            body,
+            length_as_u32(slots.array_length, "a typed array's length")?,
+        );
+    }
+    write_u32(body, prototype_serial(realm, &object, serials)?);
+    body.push(u8::from(object.extensible.get()));
+    write_properties(realm, &object, serials, body)?;
+    Ok(())
+}
+
 /// Write an object's own properties: the count, then each one's key, its
 /// attributes and the serials of what it holds.
 fn write_properties(
@@ -2560,6 +2778,69 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 home,
                 heritage,
                 keys,
+                proto,
+                extensible,
+                properties,
+            })
+        }
+        REC_ARRAY_BUFFER => {
+            let flags = reader.u8().ok_or(DecodeError::Truncated)?;
+            let byte_length = reader.u32().ok_or(DecodeError::Truncated)?;
+            let max_byte_length = if flags & BUFFER_RESIZABLE != 0 {
+                reader.u32().ok_or(DecodeError::Truncated)?
+            } else {
+                byte_length
+            };
+            // The bytes are the record's own length, so a blob that declares more
+            // than it holds is refused here rather than read past its end.
+            let bytes = reader
+                .take(byte_length as usize)
+                .ok_or(DecodeError::Truncated)?
+                .to_vec();
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::ArrayBuffer {
+                byte_length,
+                resizable: flags & BUFFER_RESIZABLE != 0,
+                immutable: flags & BUFFER_IMMUTABLE != 0,
+                max_byte_length,
+                bytes,
+                proto,
+                extensible,
+                properties,
+            })
+        }
+        REC_TYPED_ARRAY => {
+            let name = reader.text().ok_or(DecodeError::Truncated)?;
+            let element = ElementType::from_name(&name).ok_or_else(|| {
+                DecodeError::UnrebuildableBuffer(format!(
+                    "`{name}` is not an element type this build has"
+                ))
+            })?;
+            let buffer = reader.u32().ok_or(DecodeError::Truncated)?;
+            let byte_offset = reader.u32().ok_or(DecodeError::Truncated)?;
+            let auto_length = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            // The two lengths are written only for a fixed view, and read under
+            // the same flag: an auto-length view has neither of its own.
+            let (byte_length, array_length) = if auto_length {
+                (0, 0)
+            } else {
+                (
+                    reader.u32().ok_or(DecodeError::Truncated)?,
+                    reader.u32().ok_or(DecodeError::Truncated)?,
+                )
+            };
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::TypedArray {
+                element,
+                buffer,
+                byte_offset,
+                byte_length,
+                array_length,
+                auto_length,
                 proto,
                 extensible,
                 properties,
@@ -2797,6 +3078,25 @@ impl Builder<'_> {
                 "serial {serial} names an environment record where a value belongs"
             ))),
         }
+    }
+
+    /// The prototype intrinsic of a typed array kind: the object the engine's own
+    /// view constructor is handed when the record names no `[[Prototype]]` of its
+    /// own, which is the one link a construction cannot express (it takes an
+    /// object, and a view whose link is *null* has none). The view's link is set
+    /// to null after the construction, so this is only ever its interim one.
+    fn typed_array_prototype(
+        &mut self,
+        element: ElementType,
+    ) -> Result<Handle<JsObject>, DecodeError> {
+        let name = format!("%{}Array.prototype%", element.name());
+        let value = self
+            .realm
+            .intrinsics
+            .get(&name)
+            .ok_or_else(|| DecodeError::UnknownIntrinsic(name.clone()))?;
+        crate::context::as_object(&value)
+            .ok_or_else(|| DecodeError::UnrebuildableBuffer(format!("{name} is not an object")))
     }
 
     /// The environment record a serial names, for the function record that closes
@@ -3159,6 +3459,163 @@ impl Builder<'_> {
                 })?;
                 self.remember(index, Built::Module(module));
                 Built::Module(module)
+            }
+            Record::ArrayBuffer {
+                byte_length,
+                resizable,
+                immutable,
+                max_byte_length,
+                bytes,
+                proto,
+                extensible,
+                properties,
+            } => {
+                let prototype = self.prototype(*proto)?;
+                let object = JsObject::ordinary_object_create(prototype);
+                // The engine's own AllocateArrayBuffer: the block, the state entry,
+                // and (for a resizable buffer) the capacity a later resize needs
+                // plus the flag crux's integer-indexed paths read.
+                crate::builtins::array_buffer::allocate_array_buffer(
+                    self.agent,
+                    &object,
+                    *byte_length as usize,
+                    *resizable,
+                    resizable.then_some(*max_byte_length as usize),
+                )
+                .map_err(|error| {
+                    DecodeError::UnrebuildableBuffer(format!(
+                        "the engine would not allocate it: {error}"
+                    ))
+                })?;
+                {
+                    let Some(cell) = self.agent.buffer_data.get(&object.id()) else {
+                        return Err(DecodeError::UnrebuildableBuffer(
+                            "the allocation left no buffer state".into(),
+                        ));
+                    };
+                    let mut state = cell.borrow_mut();
+                    state.shared.write(0, bytes).map_err(|_| {
+                        DecodeError::UnrebuildableBuffer(
+                            "its bytes do not fit the block it was allocated".into(),
+                        )
+                    })?;
+                    if *immutable {
+                        state.immutable = true;
+                        state.shared.mark_immutable();
+                    }
+                }
+                self.remember(index, Built::Object(object));
+                define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
+                Built::Object(object)
+            }
+            Record::TypedArray {
+                element,
+                buffer,
+                byte_offset,
+                byte_length,
+                array_length,
+                auto_length,
+                proto,
+                extensible,
+                properties,
+            } => {
+                // The buffer first: a view is a window onto its block, and the
+                // engine's own constructor path reads that block out of the
+                // buffer's state rather than out of the view.
+                let buffer_value = self.materialize(*buffer)?;
+                let Some(buffer_object) = buffer_value.as_object() else {
+                    return Err(DecodeError::UnrebuildableBuffer(
+                        "the view's buffer is not an object".into(),
+                    ));
+                };
+                if array_buffer_state(self.agent, &buffer_object).is_none() {
+                    return Err(DecodeError::UnrebuildableBuffer(
+                        "the view's buffer is not an ArrayBuffer".into(),
+                    ));
+                }
+                let prototype = self.typed_array_prototype(*element)?;
+                // The construction's `[[Prototype]]`: the record's own link when it
+                // has one, and the kind's intrinsic when it has none — a view whose
+                // link is *null* has no object to hand the constructor, and gets its
+                // null link back below.
+                let recorded_prototype = self.prototype(*proto)?;
+                let construction_prototype = recorded_prototype.unwrap_or(prototype);
+                // The engine's own view constructor: a byte offset, then the
+                // element count — which an auto-length view does not have, because
+                // its length is whatever the buffer's is.
+                let args = if *auto_length {
+                    vec![Value::Number(*byte_offset as f64)]
+                } else {
+                    vec![
+                        Value::Number(*byte_offset as f64),
+                        Value::Number(*array_length as f64),
+                    ]
+                };
+                let value = crate::builtins::typed_array::typed_array_buffer_path(
+                    self.agent,
+                    construction_prototype,
+                    *element,
+                    &buffer_value,
+                    &args,
+                )
+                .map_err(|error| {
+                    DecodeError::UnrebuildableBuffer(format!(
+                        "the engine would not make the view: {error}"
+                    ))
+                })?;
+                let Some(object) = value.as_object() else {
+                    return Err(DecodeError::UnrebuildableBuffer(
+                        "the view's construction did not answer an object".into(),
+                    ));
+                };
+                // A null link is the one the construction could not be handed, so
+                // it is the one that has to be set afterwards.
+                if recorded_prototype.is_none() {
+                    object.set_prototype_of(None).map_err(|error| {
+                        DecodeError::UnrebuildableBuffer(format!(
+                            "its prototype could not be cleared: {error}"
+                        ))
+                    })?;
+                }
+                // The engine derived the geometry from the buffer; the record says
+                // what it was. The two have to agree, or the blob describes a view
+                // this build cannot make and the numbers are what would be wrong.
+                let ObjectKind::IntegerIndexed(slots) = &object.kind else {
+                    return Err(DecodeError::UnrebuildableBuffer(
+                        "the view's construction did not answer a typed array".into(),
+                    ));
+                };
+                let geometry = [
+                    ("byteOffset", slots.byte_offset, *byte_offset as usize),
+                    ("byteLength", slots.byte_length, *byte_length as usize),
+                    ("length", slots.array_length, *array_length as usize),
+                ];
+                // An auto-length view's two lengths are the buffer's rather than the
+                // record's, so the record carries none for it and none is checked.
+                let checked = if *auto_length {
+                    &geometry[..1]
+                } else {
+                    &geometry[..]
+                };
+                for (what, built, recorded) in checked {
+                    if built != recorded {
+                        return Err(DecodeError::UnrebuildableBuffer(format!(
+                            "the view's {what} is {built}, the record says {recorded}"
+                        )));
+                    }
+                }
+                if slots.auto_length != *auto_length {
+                    return Err(DecodeError::UnrebuildableBuffer(
+                        "the view tracks the buffer, the record does not say so".into(),
+                    ));
+                }
+                self.remember(index, Built::Object(object));
+                define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
+                Built::Object(object)
             }
             Record::Env {
                 kind,
@@ -4326,7 +4783,6 @@ mod tests {
         let realm = *context.realm();
         for (source, expected) in [
             ("new Proxy({}, {})", "a proxy"),
-            ("new Uint8Array(2)", "a typed array"),
             ("new String('x')", "a string object"),
             (
                 "(function () { return arguments; })()",
@@ -5456,6 +5912,331 @@ mod tests {
             .as_boolean(),
             Some(true),
             "the binding holds the restored function itself, not a second one"
+        );
+    }
+
+    /// A view whose data the agent holds rather than the object — a `DataView` —
+    /// and a buffer this format cannot rebuild as what it was are refused by name.
+    /// The first is a *wrong answer* the walk used to give rather than a missing
+    /// feature: a DataView was written as the ordinary object it looks like, and
+    /// the restore handed back an object with no view state at all. The other two
+    /// are buffers whose *identity* is the value — the memory another agent holds,
+    /// and the absence a detach leaves behind.
+    #[test]
+    fn a_view_or_buffer_this_format_cannot_rebuild_is_refused_by_name() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        for (source, expected) in [
+            ("new DataView(new ArrayBuffer(8))", "a data view"),
+            ("new SharedArrayBuffer(8)", "a shared array buffer"),
+            (
+                "new SharedArrayBuffer(8, { maxByteLength: 16 })",
+                "a shared array buffer",
+            ),
+            (
+                "(function () { const b = new ArrayBuffer(8); b.transfer(); return b; })()",
+                "a detached array buffer",
+            ),
+        ] {
+            let value = context
+                .try_eval(source)
+                .expect("a value to refuse")
+                .into_value();
+            let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
+            assert_eq!(
+                error.type_name, expected,
+                "{source} was refused as something else"
+            );
+        }
+    }
+
+    /// A typed array is carried as the kind it is, the buffer it views, its
+    /// geometry and — through the buffer — its elements. A view whose elements are
+    /// not carried is a view of zeros, and one whose kind is not carried reads the
+    /// bytes as the wrong numbers, which is why the kind travels by name.
+    #[test]
+    fn a_typed_array_round_trips_with_its_bytes_and_geometry() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let view = context
+            .try_eval("new Uint8Array([1, 2, 3])")
+            .expect("a view")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, view);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "[restored[0], restored[1], restored[2], restored.length, restored.byteLength, \
+                 restored.byteOffset, restored.buffer.byteLength, restored.constructor.name, \
+                 Array.isArray(restored)].join(',')"
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("1,2,3,3,3,0,3,Uint8Array,false".to_string()),
+            "the elements, the geometry, the kind and the buffer"
+        );
+        // A view writes into its buffer's block, so a write through the restored
+        // view has to reach the restored buffer: a view over a copy of the block
+        // would answer the old element here.
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "restored[1] = 9; new Uint8Array(restored.buffer)[1]"
+            )
+            .as_number(),
+            Some(9.0),
+            "the view and its buffer share one block"
+        );
+    }
+
+    /// Two views over one buffer come back as two views over **one** buffer. The
+    /// buffer is a value in the graph like any other, so the serial map makes it
+    /// one record and the restore one object — which is the shape deno's
+    /// `callSiteRetBuf`/`callSiteRetBufU8` pair has, two views of one block.
+    #[test]
+    fn two_views_over_one_buffer_come_back_one_buffer() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let pair = context
+            .try_eval(
+                "(function () { const bytes = new Uint8Array(8); const words = new Uint32Array(bytes.buffer); \
+                 words[0] = 0x04030201; return { bytes, words }; })()",
+            )
+            .expect("two views")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, pair);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "[restored.bytes.buffer === restored.words.buffer, restored.bytes[0], \
+                 restored.words[0], restored.bytes.buffer.byteLength].join(',')"
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("true,1,67305985,8".to_string()),
+            "one buffer, two views of it, and the same bytes read two ways"
+        );
+    }
+
+    /// A view that neither starts at the beginning of its buffer nor runs to its
+    /// end keeps both: they are the record's own geometry, and — because the
+    /// elements belong to the buffer — the bytes outside the window come back too.
+    #[test]
+    fn a_views_offset_and_length_come_back_with_it() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let view = context
+            .try_eval(
+                "(function () { const buffer = new ArrayBuffer(8); const all = new Uint8Array(buffer); \
+                 all[0] = 9; all[7] = 7; return new Uint16Array(buffer, 2, 2); })()",
+            )
+            .expect("a window")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, view);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "[restored.byteOffset, restored.length, restored.byteLength, \
+                 new Uint8Array(restored.buffer)[0], new Uint8Array(restored.buffer)[7]].join(',')"
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("2,2,4,9,7".to_string()),
+            "the window, and the bytes on both sides of it"
+        );
+    }
+
+    /// A resizable buffer comes back resizable with its maximum, and a view that
+    /// tracks it still tracks it: an auto-length view's length is whatever the
+    /// buffer's is, so a count cannot describe one and the flag travels instead.
+    #[test]
+    fn a_resizable_buffer_comes_back_resizable() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let view = context
+            .try_eval(
+                "(function () { const buffer = new ArrayBuffer(4, { maxByteLength: 8 }); \
+                 const view = new Uint8Array(buffer); buffer.resize(6); view[5] = 5; return view; })()",
+            )
+            .expect("an auto-length view")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, view);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "[restored.buffer.resizable, restored.buffer.maxByteLength, \
+                 restored.buffer.byteLength, restored.length, restored[5]].join(',')"
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("true,8,6,6,5".to_string()),
+            "the flags, the maximum, the geometry and the element"
+        );
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "restored.buffer.resize(8); restored.length"
+            )
+            .as_number(),
+            Some(8.0),
+            "the restored view still tracks the buffer it views"
+        );
+    }
+
+    /// A buffer over the **host's** memory — the shape `deno_core` gives its three
+    /// `ContextState`-backed views — is carried as its bytes, which is what V8's
+    /// serializer does with a non-shared ArrayBuffer. What is not carried is the
+    /// identity of the host's allocation: the restored buffer is engine-owned, and
+    /// a host that wants the sharing re-establishes it.
+    #[test]
+    fn a_buffer_over_host_memory_is_carried_as_its_bytes() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        // The bytes are this test's own allocation, kept alive across the round
+        // trip, and the block borrows them the way a v8 backing store does.
+        let mut host = vec![1u8, 2, 3, 4];
+        let pointer = host.as_mut_ptr();
+        let view = {
+            let agent = agent_mut(&isolate);
+            // SAFETY: the block borrows the test's own `host` bytes, which outlive
+            // every clone of it, and it is the only thing that reads them.
+            let block = unsafe { crux::typed_array::SharedBuffer::borrowed(pointer, 4, None) };
+            let buffer = crate::builtins::array_buffer::array_buffer_from_block(agent, block, 4)
+                .expect("a buffer over the host's bytes");
+            let prototype = realm
+                .intrinsics
+                .get("%Uint8Array.prototype%")
+                .and_then(|value| crate::context::as_object(&value))
+                .expect("%Uint8Array.prototype%");
+            crate::builtins::typed_array::typed_array_buffer_path(
+                agent,
+                prototype,
+                ElementType::Uint8,
+                &buffer,
+                &[],
+            )
+            .expect("a view of the host's bytes")
+        };
+        assert_eq!(
+            host,
+            vec![1, 2, 3, 4],
+            "reading for the blob leaves the host's bytes alone"
+        );
+
+        let back = round_trip(&isolate, &realm, view);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "[restored[0], restored[3], restored.length, restored.buffer.byteLength].join(',')"
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("1,4,4,4".to_string()),
+            "the host's bytes came back as the restored buffer's"
+        );
+    }
+
+    /// A view whose `[[Prototype]]` is null — `Object.setPrototypeOf(view, null)`
+    /// — comes back with none: the record's link is what the view is built with,
+    /// and a null link is the one the construction cannot be handed.
+    #[test]
+    fn a_null_prototype_view_comes_back_with_no_prototype() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let view = context
+            .try_eval("Object.setPrototypeOf(new Uint8Array([1]), null)")
+            .expect("a linked-free view")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, view);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "[Object.getPrototypeOf(restored) === null, restored[0]].join(',')"
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("true,1".to_string()),
+            "no prototype, and the element"
+        );
+    }
+
+    /// Every one of the twelve kinds round-trips with a value in it. The kind
+    /// travels by name and the restore derives the intrinsic prototype from that
+    /// name, so this pins both name tables — and the derivation between them — for
+    /// all twelve rather than for the kinds the other tests happen to use.
+    #[test]
+    fn every_typed_array_kind_round_trips() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let views = context
+            .try_eval(
+                "(function () { const views = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, \
+                 Uint16Array, Int32Array, Uint32Array, Float16Array, Float32Array, Float64Array, \
+                 BigInt64Array, BigUint64Array].map((Kind) => new Kind(2)); \
+                 for (const view of views) view[0] = view.constructor.name.startsWith('Big') ? 7n : 7; \
+                 return views; })()",
+            )
+            .expect("one view of each kind")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, views);
+        let expected = [
+            "Int8Array",
+            "Uint8Array",
+            "Uint8ClampedArray",
+            "Int16Array",
+            "Uint16Array",
+            "Int32Array",
+            "Uint32Array",
+            "Float16Array",
+            "Float32Array",
+            "Float64Array",
+            "BigInt64Array",
+            "BigUint64Array",
+        ]
+        .map(|name| format!("{name}:2:7"))
+        .join(",");
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "restored.map((view) => view.constructor.name + ':' + view.length + ':' + \
+                 String(view[0])).join(',')"
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some(expected),
+            "every kind, its length, and an element of it"
         );
     }
 

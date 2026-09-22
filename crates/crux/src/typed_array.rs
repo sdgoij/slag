@@ -73,6 +73,27 @@ impl ElementType {
             ElementType::BigUint64 => "BigUint64",
         }
     }
+
+    /// The kind a [[TypedArrayName]] names — the inverse of [`Self::name`], for
+    /// a reader that holds the name and needs the kind. `None` for a name no
+    /// kind has, which is how a record written by another build refuses.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "Int8" => ElementType::Int8,
+            "Uint8" => ElementType::Uint8,
+            "Uint8Clamped" => ElementType::Uint8Clamped,
+            "Int16" => ElementType::Int16,
+            "Uint16" => ElementType::Uint16,
+            "Int32" => ElementType::Int32,
+            "Uint32" => ElementType::Uint32,
+            "Float16" => ElementType::Float16,
+            "Float32" => ElementType::Float32,
+            "Float64" => ElementType::Float64,
+            "BigInt64" => ElementType::BigInt64,
+            "BigUint64" => ElementType::BigUint64,
+            _ => return None,
+        })
+    }
 }
 
 /// The `[[ArrayBufferData]]` block and its geometry box live in the
