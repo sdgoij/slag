@@ -98,6 +98,13 @@ impl Module {
         Self { module }
     }
 
+    /// The engine record this handle names, for the one caller that writes a
+    /// module into a snapshot: the format keys a module by the box it lives at,
+    /// which is the identity [`PartialEq`](Self) compares, not by its text.
+    pub(crate) fn handle(&self) -> Handle<SourceTextModule> {
+        self.module
+    }
+
     /// Parse `source` as a module in `context`'s realm
     /// (v8::ScriptCompiler::CompileModule).
     pub fn compile(context: &Context, specifier: &str, source: &str) -> Result<Self, JsError> {

@@ -12,6 +12,11 @@
 //! restoring into — which is why a reference to a builtin is written as the
 //! builtin's name rather than as a copy of the builtin.
 //!
+//! An attached item is a language value or a module record, and a blob carries
+//! every one of them: a load hands a slot's items back by *index*, so an item
+//! that were left out would move every later one to an earlier number than the
+//! host stored it under.
+//!
 //! A JavaScript function is carried as the source text it can be re-parsed from,
 //! so a restored function is callable and a host's attached callbacks come back.
 //! A class constructor is one of those, with its class as the source — so a
@@ -49,7 +54,8 @@
 //! callers unwrap,
 //! so the loudest available message is the honest one; a blob that quietly lost
 //! part of a host's state would move that failure to where the host cannot see
-//! it.
+//! it. An attached item that is neither — a context, a script, a stack frame — is
+//! refused where the host attaches it, for the same reason.
 //!
 //! Neither `FunctionCodeHandling` mode carries compiled code, because a blob
 //! holds the source a function is rebuilt from rather than a compiled body:
@@ -145,9 +151,9 @@ pub(crate) struct SnapshotCreator {
     /// slot 1, 2, ... — V8's `kFirstAddtlContextIndex`.
     contexts: Vec<api::Context>,
     /// The data attached to each context, by the slot that context has in the
-    /// blob. Held persistently, because the blob is what reads it back and the
-    /// collector has to keep it until then.
-    attached: HashMap<usize, Vec<Global<Data>>>,
+    /// blob, in the order it was attached: the index a restore hands each one
+    /// back under.
+    attached: HashMap<usize, Vec<Attached>>,
     /// The host's external-reference table, which `create_blob` writes a host
     /// pointer as an index into. The host supplies it here and rebuilds it for
     /// every load, which is the whole point of an index: an address is a
@@ -222,16 +228,29 @@ impl SnapshotCreator {
     ///
     /// Panics when `context` is not one this snapshot carries — the statement
     /// V8's own check makes: data attached to a context a blob does not name
-    /// would have nowhere to be read back out of. Panics too when the isolate
-    /// did not come from `Isolate::snapshot_creator`.
+    /// would have nowhere to be read back out of. Panics too when the data is
+    /// something a blob has no item for, which is decided here rather than when
+    /// the blob is written: only the host knows what it attached, and a slot the
+    /// blob held fewer items for would move every later attach to an earlier
+    /// index. Panics too when the isolate did not come from
+    /// `Isolate::snapshot_creator`.
     pub(crate) fn add_context_data(&mut self, context: api::Context, data: Global<Data>) -> usize {
         let slot = self.slot_of(context).unwrap_or_else(|| {
             panic!(
                 "v8::Isolate::AddContextData: the context is not one this snapshot carries: call set_default_context or add_context for it first"
             )
         });
+        let index = self.attached.get(&slot).map_or(0, Vec::len);
+        let item = match data.payload_value() {
+            Payload::Value(value) => format::SnapshotItem::Value(*value.value()),
+            Payload::Module(module) => format::SnapshotItem::Module(module),
+            other => panic!(
+                "v8::Isolate::AddContextData: the data at slot {slot}, index {index} is {}; a snapshot carries values and module records",
+                other.kind()
+            ),
+        };
         let items = self.attached.entry(slot).or_default();
-        items.push(data);
+        items.push(Attached { item, held: data });
         items.len() - 1
     }
 
@@ -270,7 +289,7 @@ impl SnapshotCreator {
             self.default_context.is_some() || !self.contexts.is_empty(),
             "v8::SnapshotCreator::create_blob: a snapshot carries what a context holds, so the creator needs one"
         );
-        let mut slots: Vec<(usize, api::Context, Vec<api::Local>)> = Vec::new();
+        let mut slots: Vec<(usize, api::Context, Vec<format::SnapshotItem>)> = Vec::new();
         if let Some(default) = self.default_context {
             slots.push((0, default, self.items_of(0)));
         }
@@ -287,19 +306,28 @@ impl SnapshotCreator {
         }
     }
 
-    /// The engine values attached to one slot, in the order they were attached.
-    fn items_of(&self, slot: usize) -> Vec<api::Local> {
+    /// The items attached to one slot, in the order they were attached.
+    fn items_of(&self, slot: usize) -> Vec<format::SnapshotItem> {
         self.attached
             .get(&slot)
-            .map(|items| items.iter().filter_map(engine_value).collect())
+            .map(|items| items.iter().map(|held| held.item).collect())
             .unwrap_or_default()
     }
 }
 
-/// The engine value a persistent data handle names, or `None` when it is not a
-/// language value at all.
-fn engine_value(global: &Global<Data>) -> Option<api::Local> {
-    global.payload_value().as_value_opt().copied()
+/// One item a host attached, with the handle that keeps it alive until the blob
+/// is written.
+///
+/// The item is read out of the handle at attach time rather than when the blob is
+/// written, because that is where a handle a blob has no item for is refused (see
+/// [`SnapshotCreator::add_context_data`]).
+struct Attached {
+    item: format::SnapshotItem,
+    /// Held only for its pin: the blob reads the value this names, and a value in
+    /// host memory is not a root, so without this the collector could sweep it
+    /// before the blob is written.
+    #[allow(dead_code)]
+    held: Global<Data>,
 }
 
 /// This bridge as the engine's [`HostCallbacks`](format::HostCallbacks).
@@ -477,7 +505,11 @@ impl SnapshotRestore {
         };
         let mut held = Vec::with_capacity(items.len());
         for item in items {
-            let handle: Local<'_, Data> = Local::from_payload(Payload::Value(item.get()));
+            let payload = match item {
+                format::SnapshotItem::Value(value) => Payload::Value(value.into()),
+                format::SnapshotItem::Module(module) => Payload::Module(module),
+            };
+            let handle: Local<'_, Data> = Local::from_payload(payload);
             held.push(Some(Global::new(isolate, handle)));
         }
         self.items.insert(context_identity(context), held);
@@ -523,7 +555,7 @@ pub(crate) fn take_context_data(
 mod tests {
     use super::*;
     use crate::data::{Number, Value};
-    use crate::{Context, ContextOptions, Global, Isolate, Local, Object, OwnedIsolate};
+    use crate::{Context, ContextOptions, Global, Isolate, Local, Module, Object, OwnedIsolate};
 
     /// An isolate booted from `blob`.
     fn isolate_from(blob: StartupData) -> OwnedIsolate {
@@ -608,6 +640,73 @@ mod tests {
 
         let mut isolate = isolate_from(blob);
         assert_eq!(data(&mut isolate, 2), vec![Some(7.0), Some(42.0)]);
+    }
+
+    /// A module a host attached is an item a blob carries rather than one it
+    /// drops: it comes back as a module record at the index it was attached
+    /// under, and the item attached after it keeps its own index.
+    ///
+    /// This is the shape `deno_core` builds — it attaches the module records of
+    /// its ES module snapshot beside the values — and a dropped one would hand
+    /// every later item back under an earlier index than the host stored it
+    /// under.
+    #[test]
+    fn an_attached_module_round_trips_at_its_own_index() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let realm = crate::realm_of(scope);
+            let module =
+                api::Module::compile(&realm, "deno:core", "export const x = 1;").expect("a module");
+            scope.add_context_data(context, Local::<Module>::from_module(module));
+            let after: Local<Value> = Number::new(scope, 9.0).into();
+            scope.add_context_data(context, after);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let module = scope
+            .get_context_data_from_snapshot_once::<Module>(0)
+            .expect("the attached module");
+        assert!(
+            module.is_source_text_module(),
+            "the record came back a module, rebuilt from the source it was compiled from"
+        );
+        let after = scope
+            .get_context_data_from_snapshot_once::<Value>(1)
+            .expect("the item attached after it");
+        assert_eq!(
+            Local::<Number>::try_from(after)
+                .ok()
+                .map(|number| number.value()),
+            Some(9.0),
+            "the item after the module keeps its own index"
+        );
+    }
+
+    /// Attaching something a blob has no item for ends the attach, naming the
+    /// kind: a context is a `Data` the crate allows, and a build that stored one
+    /// would write a slot holding fewer items than the host put in it, moving
+    /// every later index.
+    #[test]
+    #[should_panic(expected = "is a context; a snapshot carries values and module records")]
+    fn a_context_attached_as_context_data_is_refused() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        crate::scope!(let scope, &mut isolate);
+        let context = Context::new(scope, Default::default());
+        let scope = &mut crate::ContextScope::new(scope, context);
+        scope.set_default_context(context);
+        let other = Context::new(scope, Default::default());
+        scope.add_context_data(context, other);
     }
 
     /// A graph comes back as a graph: a self-reference is still a

@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, and **the realm's own global functions, the members of its own builtin objects by the spec's names and a method that reads a private name, as a member of its class**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time and reads past every value it used to stop on (§7), where the next value is a class's own evaluation re-running definition-time code, part 14; what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, **a module record — which is not a language value — as the name and source the engine's own compile path rebuilds it from, so a slot's items come back at the indices the host attached them under**, and **the realm's own global functions, the members of its own builtin objects by the spec's names and a method that reads a private name, as a member of its class**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time and now reads through every value the walk carries and every item its slots hold (§7); what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies, and what a host's own `FromSnapshot` path additionally expects — a **deserialized heap** — is not something a data-only blob carries, which is a decision rather than a gap (§7's last record, §12 item 11). What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -2824,6 +2824,22 @@ Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --
 
 *And the next value is not the engine's.* Re-measured, deno's blob now reads through every value the walk carries — the engine's restore succeeds — and the load stops inside **deno_core's own extraction**: `load_snapshotted_data_from_snapshot` reads indices `0..data_count` (`data_count = 5`) and index 2 answers `None`, so it panics with `NoData { expected: "v8::data::Data" }`. The blob's slot holds **two** items. Measured on the write side: deno attached five, of which three are `Payload::Module` — a module record, which is not a language value — and the bridge's `items_of` maps through `engine_value`, which turns a `Data` into a `Value` or nothing, so it **dropped** them silently and the host's index numbering shifted instead of failing. That is a bridge defect with a design decision behind it (carry a module record by specifier, or refuse the attachment loudly), and it is part 16.
 
+**A module record is an item a slot carries — landed, and deno's blob now yields every item it attached.** The sixteenth part of ledger item 16, and the value the record above measured. It is the first part of this item whose defect is the **bridge's**: on the write side deno attached five items to its bootstrapped context — three of them `Payload::Module`, the ES module records its module map serializes, plus the promise-rejection callback and the `import.meta` prototype — and `items_of` mapped every `Global<Data>` through `engine_value`, which turns a `Data` into a `Value` or nothing, so a module became `None` and `filter_map` **dropped** it. The host's own loader reads its items back by index, so the blob did not merely lose a value: it handed index 2 the item that belonged to index 4, and the load panicked in deno's extraction rather than at the engine's boundary.
+
+*The decision is to carry the record, and the shape follows from what a module record keeps.* Refusing the attachment loudly was the alternative and it is the wrong one: deno attaches module records **on purpose** — its module map is one of the things it snapshots — so a refusal would cost the host its whole snapshot to report a value the engine can in fact rebuild. A `SnapshotItem::Module` therefore carries the two things the engine's own compile path needs, the module's **name** and its **source**, and those are what a record has: a `SourceTextModule` keeps the name it was compiled under and the text it was compiled from, and the **specifier is the host's**, not the record's (`Module::register` is what writes one into the realm's loaded-modules table, and a host re-registers a restored module under its own specifier, which is what deno's `update_with_snapshotted_data` does). What is not carried is not claimed: the restored module is fresh and unlinked, so its link status, bindings and namespace are the ones a newly parsed record has.
+
+*Format and engine.* `REC_MODULE` (tag 18) is a presence byte and the name's units, then the source's units. `SnapshotItem` is now `Value | Module`, so a slot's `items` is an **item** list rather than a value list — and the two paths that can only answer with a value refuse a module rather than guessing: `decode`, whose single-value form is slot 0's index 0, and `Builder::materialize`, which a record *field* uses, because only a slot's own item list can name a module. The restore compiles through `crate::module::parse_module` under a bootstrap context it pushes and pops on every path: the engine compiles a module in the agent's **current realm**, and the realm a slot's items belong to is the one being rebuilt. `remember` pins the module with `pin_handle` like any other record, which is what keeps it across a collection — it is not a language value, so no handle scope holds one.
+
+*The item names `api::Module`, and that is what keeps the bridge out of the engine's internals.* `SnapshotItem::Module` carries the engine's own handle type rather than a raw `Handle<SourceTextModule>`, so the bridge neither reads nor builds one: it hands over the `api::Module` its `Payload::Module` already holds and takes back the one the engine returns. The only engine addition is one `pub(crate) fn handle` on `api::Module`, for the identity the format keys a module by (`from_handle` was already there), and nothing new became public.
+
+*And the bridge stops dropping anything, at the point where the host can act.* `items_of`'s `filter_map` is gone, and the item is decided in `add_context_data` — the attach itself, which is where V8's own check lives and where a host has a frame it can act on. Anything that is neither a value nor a module is refused **by kind** and by position: a new `Payload::kind` answers "a context", "a script", "a stack frame" (a `Context` is a `Data` the crate's own tag checks allow, so this path is reachable), and the panic names the slot and the index. The attach stores an `Attached { item, held }` pair — the item read once, the handle kept for its pin — which is also what makes `items_of` total without a second refusal path.
+
+*Tests.* One in the engine: `a_module_is_an_item_like_any_other` — a module at index 0 and a number at index 1 of one slot, the module read back as a module with the source it was compiled from (asserted on `source_text`) and the number still at index 1, which is the index claim the defect broke. Two in the bridge: `an_attached_module_round_trips_at_its_own_index` — deno's shape, a module and then a value, each read back once through `get_context_data_from_snapshot_once` — and `a_context_attached_as_context_data_is_refused`, the refusal by kind. Four mutations, each caught: `materialize_item` refusing a module (the engine test fails with `Truncated`), answering `undefined` instead (it fails on "the module came back as a language value"), `items_of` filtering modules out again (the bridge test fails **exactly as deno's load did** — index 0 answers the number and the cast to `Module` refuses), and `Payload::kind`'s context arm answering "a value" (the refusal no longer names the kind).
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **863 passed / 0 failed**; `cargo test -p v8 --features simdutf --lib -- --skip the_data_a_built_function_carries_survives_a_collection` **227 passed / 0 failed / 1 filtered**; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,240 → 5,243 passed / 0 failed / 4 ignored**, the three being this part's three tests. `crates/runtime` changed, so the battery ran with the release binaries rebuilt after the last engine edit: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*And the next thing is not the engine's, and not a value either.* Re-measured the same way, deno_core's own extraction now runs to the end — all five indices read — and the load dies one step later, in `initialize_deno_core_ops_bindings` (`libs/core/runtime/jsruntime.rs:1087`): deno's `bindings::get::<v8::Local<v8::Object>>` panics "unable to convert" because `globalThis.Deno`, the first of the three objects it reads, is not there. That is the framework's own assumption rather than a missing record. On `InitMode::FromSnapshot` deno **skips its bootstrap because V8 deserializes the heap**: `jsruntime.rs:1080-1083` skip `initialize_deno_core_namespace` and `initialize_primordials_and_infra`, and `1264-1279` skip the virtual ops module and the builtin sources, so `Deno`, `Deno.core` and `Deno.core.ops` can only come from the image — and `store_js_callbacks` reads `Deno` unconditionally at `1282` as well. Deno's five attached items are not that state (the module map, the templates, two handles), so no further item carries it. What this engine *can* serve is the **from-source** path, and this run already shows it: the example's build phase (`create_snapshot` with `startup_snapshot: None`, so `InitMode::New`) ran the whole bootstrap on this engine — ops bound, builtin sources evaluated, the extension's `esm_entry_point` module instantiated — and wrote a 225,661-byte blob. So the next part is a decision rather than a record, and it is §12's eleventh item.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -4287,6 +4303,71 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   design decision (carry a module record by specifier, or refuse loudly), and it
   is part 16.
 
+  **Sixteenth part — a module record is an item a slot carries, designed before
+  it was written, and landed.** The first part of this item whose defect was the
+  bridge's rather than the engine's, and it is fixed where the host can act.
+
+  - **What the write side measured.** Deno attached **five** items to its
+    bootstrapped context, three of them `Payload::Module` (the ES module records
+    its module map serializes); `items_of` mapped each through `engine_value`,
+    which turns a `Data` into a `Value` or nothing, so `filter_map` dropped the
+    modules and the host's numbering shifted — its index 2 answered the item that
+    belonged to a later index. Nothing failed at the engine's boundary.
+  - **The decision: carry the record.** Refusing the attachment loudly would
+    cost deno its whole snapshot to report a value the engine can rebuild. The
+    item carries the module's **name** and **source**, because that is all a
+    record keeps: the specifier is the host's (`Module::register` is what writes
+    one into the realm), and a host re-registers a restored module under its own
+    — which is what deno's `update_with_snapshotted_data` does. Link status,
+    bindings and namespace are not carried and are not claimed; the restored
+    record is fresh and unlinked.
+  - **Format and restore.** `REC_MODULE` (tag 18): a presence byte and the name's
+    units, then the source's units. `SnapshotItem` is `Value | Module`, so a
+    slot's items are an **item** list rather than a value list; the two paths that
+    can only answer with a value — `decode`'s single-value form and
+    `Builder::materialize`, which a record *field* uses — refuse a module, because
+    only a slot's own item list can name one. The restore compiles through
+    `parse_module` under a bootstrap context it pushes and pops on every path (the
+    engine compiles in the agent's **current** realm) and pins the record with
+    `pin_handle`, a module being no language value a handle scope could hold.
+  - **No new public surface.** `SnapshotItem::Module` names `api::Module`, so the
+    bridge hands over what its `Payload::Module` already holds and takes back what
+    the engine returns; the engine grew one `pub(crate) fn handle`, for the
+    identity the format keys a module by.
+  - **The bridge's filter is gone, and the refusal moved to the attach.**
+    `add_context_data` decides the item, so a handle that is neither a value nor a
+    module is refused **by kind and position** (`Payload::kind`, new — "a
+    context", "a script", "a stack frame"; a `Context` is a `Data` the crate's
+    own tag checks allow) at the call the host can act on. `Attached
+    { item, held }` keeps the handle for its pin, which is also what makes
+    `items_of` total without a second refusal path.
+
+  *Acceptance tests.* Three, all landed:
+  `snapshot::tests::a_module_is_an_item_like_any_other` (a module at index 0 and a
+  number at index 1 of one slot, the module's source asserted and the number still
+  at index 1), the bridge's `an_attached_module_round_trips_at_its_own_index`
+  (deno's shape, each index read back once) and
+  `a_context_attached_as_context_data_is_refused` (the refusal by kind). Four
+  mutations, each caught: `materialize_item` refusing a module (fails with
+  `Truncated`), that arm answering `undefined` (fails on "the module came back as a
+  language value"), `items_of` filtering modules out again — which fails **exactly
+  as deno's load did** — and `Payload::kind`'s context arm answering "a value".
+
+  **And the load now stops on the framework's own assumption rather than on the
+  engine.** With this part deno_core's extraction runs to the end — all five
+  indices read — and the load dies in `initialize_deno_core_ops_bindings`
+  (`jsruntime.rs:1087`) on a missing `globalThis.Deno`: the state
+  `InitMode::FromSnapshot` expects **V8 to have deserialized**, since
+  `jsruntime.rs:1080-1083` skip `initialize_deno_core_namespace` and
+  `initialize_primordials_and_infra`, `1264-1279` skip the virtual ops module and
+  the builtin sources, and `1282` reads `Deno` unconditionally as well. No further
+  item carries it: deno's five attached items are its module map, its templates
+  and two handles, not the global object. The **from-source** path is the one this
+  engine serves, and this run shows it — the example's build phase
+  (`create_snapshot` with `startup_snapshot: None`, so `InitMode::New`) runs the
+  whole bootstrap on this engine and writes its blob. That is a decision rather
+  than a record, and it is §12's eleventh item; §7's last record has the anchors.
+
   *Acceptance tests.* Three, all landed:
   `snapshot::tests::a_method_that_reads_a_private_name_round_trips_as_its_classs_member`
   (the measured deno shape — a public method calling a private one — carried as a
@@ -4527,18 +4608,25 @@ its context table, the external-reference table, a function, a bound function, a
 class constructor, a host callback, an arrow, a method with its `[[HomeObject]]`,
 the realm's named global functions, the members of its own builtin objects, a
 method that reads a private name, a class's own definition-time inputs and a
-method instantiated from its parsed definition with it (§7's records for it;
-ledger item 16 has fifteen parts). What is left of
+method instantiated from its parsed definition, and **a module record as the
+name and source the engine's own compile path rebuilds it from** with it (§7's
+records for it;
+ledger item 16 has sixteen parts). What is left of
 this item is named rather than implied: `FunctionCodeHandling::Keep`'s compiled
 code (which waits on the code cache), the isolate-level data slots, continuation
-from an existing blob, and what the **load** now stops on — which is not the
-engine's at all: deno attached five context-data items of which three are module
-records, and the bridge's `items_of` drops anything that is not a `Value`
-silently, so the host's indices shift (§7's last record; that is part 16, and the
-decision behind it is carry a module record by specifier or refuse the
-attachment) —
+from an existing blob, and what the **load** now stops on — which is the
+framework's own assumption rather than the engine's: deno's `InitMode::FromSnapshot`
+path skips its bootstrap because it expects a **deserialized heap**, and reads
+`globalThis.Deno` (`jsruntime.rs:1080-1083` skip the namespace and primordials,
+`1282` reads `Deno` unconditionally, and `1087` is where the load now dies),
+while deno's five attached items are its module map, its templates and two
+handles rather than the global. No further item carries that state, so a data-only
+blob cannot stand in for a heap image on that path — and the **from-source** path
+this engine does serve is one the example's own build phase already runs to the
+end (§7's last record; §12's eleventh item is the decision) —
 behind which is still the measured question of the graph reaching
-the **global object**, and behind that the accessor half of the method part.**;
+the **global object**, and behind that the accessor half of the method part
+(**landed** with part 15, §7).**;
 (4) module resolver as a
 host trait (landed), **unbound scripts and script origins** (the bridge side
 landed — every Rust script handle is already context-unbound — and what the
@@ -4599,31 +4687,39 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's fifteen parts have landed — the format, the context table,
+bridge. That item's sixteen parts have landed — the format, the context table,
 the external-reference table, a function, a bound function, the realm's named
 global functions, a class constructor, a host callback, an arrow, the text a call
 frame runs, **a method with its `[[HomeObject]]`**, **the members of the
 realm's own builtin objects by name**, **a method that reads a private name,
-as a member of its class**, **a class's own definition-time inputs** and **a
-method instantiated from its parsed definition** — so the blocker this plan
+as a member of its class**, **a class's own definition-time inputs**, **a
+method instantiated from its parsed definition** and **a module record, as the
+name and source the engine's compile path rebuilds it from** — so the blocker
+this plan
 could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
 for every load, a function, a bind, a class, an arrow, a host callback, a method,
 a builtin member, a private-name method, a class whose keys and heritage come
-from the module that defined it and a method whose computed key does all
+from the module that defined it, a method whose computed key does all
 come back
 callable or
-constructable, and a closure deno's own JS creates inside a function the host
-calls from Rust carries its text. **`create_blob` completes** — deno's
+constructable, a closure deno's own JS creates inside a function the host
+calls from Rust carries its text, and every item a host attached to a context
+comes back at the index it attached it under. **`create_blob` completes** —
+deno's
 snapshot build script runs to the end and writes its blob — and the
-frontier is now **deno_core's own extraction**: the engine's restore reads
-through every value the walk carries, and the load stops because the bridge
-dropped three attached module records instead of failing. That is part 16, and it
-is the first frontier in this item that is the **bridge's** rather than the
-engine's. Behind it sits the
-**accessor** half of the method part, and then the measured question of the walk
+frontier is now **deno_core's own start-up assumption**: the extraction that
+used to stop on the dropped module records runs to the end (all five indices),
+and the load dies in `initialize_deno_core_ops_bindings` (`jsruntime.rs:1087`)
+on a missing `globalThis.Deno`, which `InitMode::FromSnapshot` expects a
+**deserialized heap** to provide (`1080-1083`, `1264-1279`; `1282` reads `Deno`
+unconditionally). No further item carries that state — deno's five are its
+module map, its templates and two handles — so the from-source path
+(`InitMode::New`, `startup_snapshot: None`) is what a host on this engine runs,
+and the example's own build phase already runs it to the end. Behind it sits the
+measured question of the walk
 reaching the realm's global object, a realm the restore already rebuilt, so
 carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
 measurement
@@ -4653,10 +4749,11 @@ migrate, then delete.
    the text a call frame runs,
    a method with its [[HomeObject]], the members of the realm's own builtin
    objects, a method that reads a private name, carried as a member of its
-   class, a class's own definition-time inputs and a method instantiated from
-   its parsed definition** (§7's records for it, ledger
+   class, a class's own definition-time inputs, a method instantiated from
+   its parsed definition and a module record as the name and source the engine's
+   compile path rebuilds it from** (§7's records for it, ledger
    item
-   16's fifteen parts): a versioned
+   16's sixteen parts): a versioned
    blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
@@ -4665,21 +4762,24 @@ migrate, then delete.
    constructor and an arrow as the expressions the engine's own evaluation
    re-runs, a host
    callback as the entry of the host's table its call came from **and the data
-   value it reads**, a
+   value it reads**, a module record as the **name and source** the engine's own
+   compile path rebuilds it from — so a slot's items are an item list rather than
+   a value list, and every item comes back at the index it was attached under — a
    refusal naming
    anything uncarried. And the format now **loads**: deno's blob, read back for
    the first time, restores contexts past every value it used to stop on — the
    realm's own builtin members by name, a method that reads a private name, a
-   class whose computed keys and heritage come from the module that defined it, and
-   a method whose computed key reads one — and stops inside **deno_core's own
-   extraction**: deno attached five context-data items and the bridge carried two,
-   because it drops anything that is not a `Value` silently (§7's last record),
-   which is part
-   16. What this item still owns: a host callback's
-   **construct half**, that **attached-data filter** (part 16, whose decision is
-   carry a module record by specifier or refuse the attachment), the
+   class whose computed keys and heritage come from the module that defined it, a
+   method whose computed key reads one, and the module records it attached — so
+   deno_core's own extraction runs to the end, and what the load then stops on is
+   the framework's start-up assumption rather than this format's: an
+   `InitMode::FromSnapshot` runtime expects a **deserialized heap** to carry
+   `globalThis.Deno` (`jsruntime.rs:1080-1083`, `1264-1279`; read at `1087` and
+   `1282`), which no attached item is. That is item 11 below. What this item
+   still owns: a host callback's
+   **construct half**, the
    **accessor**
-   half of the method part, the
+   half of the method part (**landed** with part 15), the
    measured question of the walk reaching the **global object**, a
    value shared between two contexts coming back one per context, compiled code
    for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
@@ -4750,3 +4850,40 @@ migrate, then delete.
    decision rather than a line: the engine's stack strings are what deno's CLI
    prints, so the change wants its own measurement rather than a ride on this
    one. §9's stack-trace bullet states the divergence meanwhile.
+11. **What a host's `startup_snapshot` means when the engine has no heap image —
+   open, measured, and the operator's call.** With the sixteenth part of item 16
+   deno_core's own extraction runs to the end and its load then dies in
+   `initialize_deno_core_ops_bindings` (`libs/core/runtime/jsruntime.rs:1087`) on
+   a missing `globalThis.Deno` — the state `InitMode::FromSnapshot` expects **V8
+   to have deserialized**: `1080-1083` skip `initialize_deno_core_namespace` and
+   `initialize_primordials_and_infra`, `1264-1279` skip the virtual ops module
+   and the builtin sources, and `1282` reads `Deno` unconditionally as well. The
+   engine's blob is a **value graph rooted at the data a host attached**, and
+   deno's five attached items are its module map (three module records in this
+   graph, §7), its function-template data and two handles — not the global
+   object, so no further item carries what is missing. Two paths exist and the
+   choice is silent no longer:
+
+   - **Boot from source (`InitMode::New`, `startup_snapshot: None`)** — the host's
+     own bootstrap runs on this engine and the data-only blob is not passed at
+     all. This is the path the engine already serves end to end: the example's
+     build phase *is* it (`create_snapshot` with `startup_snapshot: None`), and it
+     binds ops, evaluates the builtin sources, instantiates the extension's
+     `esm_entry_point` module and writes its blob. A host's own source needs no
+     change beyond not passing a snapshot it cannot use; what it gives up is V8's
+     heap-image startup, which is the whole point of a snapshot.
+   - **Carry the realm's global object** as one more root — rejected on evidence:
+     the walk refuses the first proxy, `WeakMap` or typed array deno's bootstrap
+     installs, and what it could carry would be put back **on top of** a realm the
+     restore already rebuilt, with the host's bootstrapped closures resolving
+     their free names in the reading realm rather than the module that defined
+     them. Part 7's `[[SourceText]]` divergence is the small version of the same
+     wrongness.
+
+   What is *not* decided here: whether a Slag-backed host ships a snapshot at all,
+   and whether the engine should make the distinction visible (an
+   `is_valid`-answering blob a host can check before trusting it, or a
+   `slag`-level "data-only" snapshot a host opts into), which is a bridge and API
+   question rather than this format's. Recorded so "deno on Slag" stops meaning
+   "deno's prebuilt heap snapshot on Slag", which the measurement above rules out,
+   and starts meaning "deno's from-source boot on Slag", which it does not.

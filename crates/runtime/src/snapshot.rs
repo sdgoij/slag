@@ -140,6 +140,7 @@ const REC_FUNCTION: u8 = 14;
 const REC_BOUND_FUNCTION: u8 = 15;
 const REC_HOST_CALLBACK: u8 = 16;
 const REC_CLASS_METHOD: u8 = 17;
+const REC_MODULE: u8 = 18;
 
 /// Which grammar a function record's source is read in. A class constructor's
 /// `[[SourceText]]` is the **class** it came from (spec 15.7.14 sets it that way
@@ -295,6 +296,7 @@ impl std::error::Error for DecodeError {}
 enum Identity {
     Intrinsic(String),
     Object(u64),
+    Module(u64),
     Symbol(u64),
     String(Vec<u16>),
     BigInt(String),
@@ -370,6 +372,12 @@ enum Record {
         extensible: bool,
         properties: Vec<StoredProperty>,
     },
+    /// A module record: the name it was compiled under, when it had one, and the
+    /// source text it is compiled from.
+    Module {
+        name: Option<Vec<u16>>,
+        source: Vec<u16>,
+    },
     Object {
         proto: u32,
         extensible: bool,
@@ -442,7 +450,7 @@ pub trait HostCallbacks {
 }
 
 /// One context's slot in a blob: the index the host gave it, the realm its
-/// values were built in, and the values themselves.
+/// values were built in, and the items themselves.
 ///
 /// The realm is not a hint. A value's builtins are its own realm's, so the walk
 /// recognizes an intrinsic — and so writes a reference to it as a name — only
@@ -454,11 +462,51 @@ pub struct Slot<'a> {
     /// convention: the default context is 0, the ones added after it are 1, 2,
     /// ...).
     pub index: usize,
-    /// The realm the slot's values belong to.
+    /// The realm the slot's items belong to.
     pub realm: Handle<Realm>,
-    /// The values the host attached to that context, in the order it attached
+    /// The items the host attached to that context, in the order it attached
     /// them: the indices a restore hands them back under.
-    pub items: &'a [Value],
+    pub items: &'a [SnapshotItem],
+}
+
+/// What a slot holds: an ordinary value, or a module record.
+///
+/// A module is not a language value — the host-facing handle type says so, with a
+/// payload variant of its own — but a host attaches one as context data all the
+/// same (the host this format was built for attaches the module records it
+/// stores), and a snapshot that simply skipped it would hand every **later**
+/// index back under the wrong number. So an item carries either, and the record
+/// for a module is what the engine's own compile path rebuilds one from: its
+/// source and its name.
+#[derive(Clone, Copy)]
+pub enum SnapshotItem {
+    Value(Value),
+    Module(crate::api::Module),
+}
+
+impl SnapshotItem {
+    /// The value this item is, or `None` when it is a module — which is not a
+    /// language value, so there is nothing to hand a caller that asked for one.
+    pub fn value(self) -> Option<Value> {
+        match self {
+            SnapshotItem::Value(value) => Some(value),
+            SnapshotItem::Module(_) => None,
+        }
+    }
+}
+
+impl From<Value> for SnapshotItem {
+    fn from(value: Value) -> Self {
+        SnapshotItem::Value(value)
+    }
+}
+
+/// What the walk carries for one serial: the value and the realm it belongs to,
+/// or a module.
+#[derive(Clone, Copy)]
+enum Entry {
+    Value(Value, Handle<Realm>),
+    Module(Handle<crate::module::SourceTextModule>),
 }
 
 /// Write the data a host attached to each context, as one blob.
@@ -479,21 +527,26 @@ pub fn encode_slots(
     externals: &[usize],
     host: Option<&dyn HostCallbacks>,
 ) -> Result<Vec<u8>, Unsupported> {
-    let mut objects: Vec<(Value, Handle<Realm>)> = Vec::new();
+    let mut objects: Vec<Entry> = Vec::new();
     let mut serials: HashMap<Identity, u32> = HashMap::new();
     let mut table: Vec<(usize, Vec<u32>)> = Vec::with_capacity(slots.len());
     for slot in slots {
         let mut items = Vec::with_capacity(slot.items.len());
         for item in slot.items {
-            items.push(visit(
-                agent,
-                &slot.realm,
-                externals,
-                host,
-                *item,
-                &mut objects,
-                &mut serials,
-            )?);
+            items.push(match item {
+                SnapshotItem::Value(value) => visit(
+                    agent,
+                    &slot.realm,
+                    externals,
+                    host,
+                    *value,
+                    &mut objects,
+                    &mut serials,
+                )?,
+                SnapshotItem::Module(module) => {
+                    visit_module(module.handle(), &mut objects, &mut serials)
+                }
+            });
         }
         table.push((slot.index, items));
     }
@@ -507,8 +560,8 @@ pub fn encode_slots(
         }
     }
     write_u32(&mut body, objects.len() as u32);
-    for (value, realm) in &objects {
-        write_record(agent, realm, externals, host, *value, &serials, &mut body)?;
+    for entry in &objects {
+        write_carried(agent, externals, host, entry, &serials, &mut body)?;
     }
 
     let mut blob = Vec::with_capacity(HEADER_LEN + body.len() + MAGIC.len());
@@ -530,7 +583,7 @@ pub fn encode_slots(
 /// A convenience for a caller with one value to carry and no host pointers in
 /// it; the table form is [`encode_slots`].
 pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u8>, Unsupported> {
-    let items = [root];
+    let items = [SnapshotItem::Value(root)];
     encode_slots(
         agent,
         &[Slot {
@@ -565,7 +618,7 @@ pub fn decode_slot(
     slot: usize,
     externals: &[usize],
     host: Option<&dyn HostCallbacks>,
-) -> Result<Option<Vec<Value>>, DecodeError> {
+) -> Result<Option<Vec<SnapshotItem>>, DecodeError> {
     let (body_len, context_count) = header(bytes)?;
     let mut body = Reader::new(&bytes[HEADER_LEN..HEADER_LEN + body_len]);
 
@@ -611,7 +664,7 @@ pub fn decode_slot(
     };
     let mut values = Vec::with_capacity(items.len());
     for serial in items {
-        values.push(builder.materialize(serial)?);
+        values.push(builder.materialize_item(serial)?);
     }
     Ok(Some(values))
 }
@@ -624,9 +677,12 @@ pub fn decode(
     realm: &Handle<Realm>,
     bytes: &[u8],
 ) -> Result<Value, DecodeError> {
-    decode_slot(agent, realm, bytes, 0, &[], None)?
-        .and_then(|items| items.first().copied())
-        .ok_or(DecodeError::Truncated)
+    match decode_slot(agent, realm, bytes, 0, &[], None)?.and_then(|items| items.first().copied()) {
+        Some(SnapshotItem::Value(value)) => Ok(value),
+        // A blob whose slot 0 holds a module is not one this single-value form can
+        // answer; a host that attached a module reads it through its own slot.
+        _ => Err(DecodeError::Truncated),
+    }
 }
 
 /// Whether `bytes` is a blob of this format, this version and this build's
@@ -774,7 +830,7 @@ fn visit(
     externals: &[usize],
     host: Option<&dyn HostCallbacks>,
     value: Value,
-    objects: &mut Vec<(Value, Handle<Realm>)>,
+    objects: &mut Vec<Entry>,
     serials: &mut HashMap<Identity, u32>,
 ) -> Result<u32, Unsupported> {
     let value = canonical(value);
@@ -784,7 +840,7 @@ fn visit(
     }
     serials.insert(key, objects.len() as u32);
     let serial = objects.len() as u32;
-    objects.push((value, *realm));
+    objects.push(Entry::Value(value, *realm));
 
     match value.kind() {
         ValueKind::Object(object) => {
@@ -889,6 +945,29 @@ fn visit(
         | ValueKind::Symbol(_) => {}
     }
     Ok(serial)
+}
+
+/// Give a module its serial: one record, written and read as the source and name
+/// the engine's own compile path rebuilds it from.
+///
+/// A module is deduplicated by its own identity — a host that attached the same
+/// record to two contexts gets one — because the walk's books are keyed by
+/// identity and a module is a heap box like any other. Nothing descends into it:
+/// what a module is *made of* that the language can reach (its namespace, its
+/// bindings) is not in the value graph, which is why this needs no children.
+fn visit_module(
+    module: Handle<crate::module::SourceTextModule>,
+    objects: &mut Vec<Entry>,
+    serials: &mut HashMap<Identity, u32>,
+) -> u32 {
+    let key = Identity::Module(crux::handle::Handle::as_ptr(module) as usize as u64);
+    if let Some(serial) = serials.get(&key) {
+        return *serial;
+    }
+    let serial = objects.len() as u32;
+    serials.insert(key, serial);
+    objects.push(Entry::Module(module));
+    serial
 }
 
 /// The value a serial names, with a function's object part folded back into the
@@ -1706,6 +1785,47 @@ enum Carried<'a> {
     },
 }
 
+/// Write one carried thing: the record a value gets, or a module's own record.
+fn write_carried(
+    agent: &Agent,
+    externals: &[usize],
+    host: Option<&dyn HostCallbacks>,
+    carried: &Entry,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    match carried {
+        Entry::Value(value, realm) => {
+            write_record(agent, realm, externals, host, *value, serials, body)
+        }
+        Entry::Module(module) => {
+            write_module(module, body);
+            Ok(())
+        }
+    }
+}
+
+/// Write a module record: the name it was compiled under, when it has one, and
+/// the source text it is rebuilt from.
+///
+/// Those two facts are the whole of what the engine's own compile path needs —
+/// `parse_module` takes a specifier, a name and a source — so a restored module is
+/// the same module the snapshot carried, as far as anything the blob can hold is
+/// concerned. What is not carried is what a module *is* beyond its text: its link
+/// status, its bindings and its namespace, none of which is in the value graph
+/// (a host that attached a module reaches it as a handle, not as a value).
+fn write_module(module: &Handle<crate::module::SourceTextModule>, body: &mut Vec<u8>) {
+    body.push(REC_MODULE);
+    match &module.name {
+        Some(name) => {
+            body.push(1);
+            write_units(body, name.as_slice());
+        }
+        None => body.push(0),
+    }
+    write_units(body, module.source.as_slice());
+}
+
 /// Write a JavaScript function as the source text it can be rebuilt from, its
 /// [[Strict]], and its object part — the same prototype/extensible/properties
 /// triple an object gets, because a function's own keys are its own keys.
@@ -2045,6 +2165,15 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 properties,
             })
         }
+        REC_MODULE => {
+            let name = if reader.u8().ok_or(DecodeError::Truncated)? == 1 {
+                Some(reader.units().ok_or(DecodeError::Truncated)?)
+            } else {
+                None
+            };
+            let source = reader.units().ok_or(DecodeError::Truncated)?;
+            Ok(Record::Module { name, source })
+        }
         REC_CLASS_METHOD => {
             let class = reader.u32().ok_or(DecodeError::Truncated)?;
             let key = reader.u32().ok_or(DecodeError::Truncated)?;
@@ -2195,20 +2324,29 @@ struct Builder<'a> {
 enum Built {
     Value(Value),
     Object(Handle<JsObject>),
-}
-
-impl Built {
-    fn value(&self) -> Value {
-        match self {
-            Built::Value(value) => *value,
-            Built::Object(object) => Value::Object(*object),
-        }
-    }
+    Module(Handle<crate::module::SourceTextModule>),
 }
 
 impl Builder<'_> {
     fn materialize(&mut self, serial: u32) -> Result<Value, DecodeError> {
-        Ok(self.object(serial)?.value())
+        match self.object(serial)? {
+            Built::Value(value) => Ok(value),
+            Built::Object(object) => Ok(Value::Object(object)),
+            // Only a slot's own item list can name a module, so a record field
+            // that does is a blob that disagrees with itself rather than a value
+            // to hand back.
+            Built::Module(_) => Err(DecodeError::Truncated),
+        }
+    }
+
+    /// The item a serial names, which a slot's own list needs: every record is a
+    /// value except a module's, which is not one.
+    fn materialize_item(&mut self, serial: u32) -> Result<SnapshotItem, DecodeError> {
+        Ok(match self.object(serial)? {
+            Built::Value(value) => SnapshotItem::Value(value),
+            Built::Object(object) => SnapshotItem::Value(Value::Object(object)),
+            Built::Module(module) => SnapshotItem::Module(crate::api::Module::from_handle(module)),
+        })
     }
 
     /// The value a serial names, made on first ask.
@@ -2355,6 +2493,32 @@ impl Builder<'_> {
                     data.prototype_pending = false;
                 }
                 Built::Value(Value::Function(function))
+            }
+            Record::Module { name, source } => {
+                // Compiled in the reading realm, exactly as the engine's own module
+                // path does it: a bootstrap context makes the realm current, and the
+                // specifier the record did not keep is the name (a host re-registers
+                // a restored module under its own specifier in any case).
+                let realm = *self.realm;
+                let source = JsString::from_utf16(source);
+                let name = name.as_ref().map(|units| JsString::from_utf16(units));
+                let specifier = name.clone().unwrap_or_else(|| JsString::from_utf8(""));
+                self.agent.push_bootstrap_context(realm);
+                let compiled = crate::module::parse_module(
+                    self.agent,
+                    &specifier,
+                    name.as_ref(),
+                    &source,
+                    &[],
+                );
+                self.agent.execution_context_stack.pop();
+                let module = compiled.map_err(|error| {
+                    DecodeError::UnrebuildableFunction(format!(
+                        "its module source could not be compiled: {error}"
+                    ))
+                })?;
+                self.remember(index, Built::Module(module));
+                Built::Module(module)
             }
             Record::ClassMethod {
                 class,
@@ -2900,6 +3064,7 @@ impl Builder<'_> {
             // `%Function.prototype%` and the resumable kinds' prototypes are
             // callable and report no object side on the value's own accessor.
             Built::Value(value) => crate::context::as_object(&value),
+            Built::Module(_) => return Err(DecodeError::Truncated),
         })
     }
 
@@ -2920,6 +3085,7 @@ impl Builder<'_> {
         let pin = match &built {
             Built::Value(value) => crux::heap::pin(*value),
             Built::Object(object) => crux::heap::pin_handle(*object),
+            Built::Module(module) => crux::heap::pin_handle(*module),
         };
         self.pins.push(pin);
         self.made[index] = Some(built);
@@ -3022,6 +3188,17 @@ mod tests {
 
     fn encode_value(isolate: &api::Isolate, realm: &Handle<Realm>, value: Value) -> Vec<u8> {
         encode(agent_of(isolate), realm, value).expect("encode")
+    }
+
+    /// A slot's item list from the values a test attaches — the shape these tests
+    /// have always written, now that a slot can hold a module too.
+    fn slot_items(values: &[Value]) -> Vec<SnapshotItem> {
+        values.iter().copied().map(SnapshotItem::from).collect()
+    }
+
+    /// The value an item is, for the tests that read a slot back as values.
+    fn item_value(item: SnapshotItem) -> Value {
+        item.value().expect("a value item")
     }
 
     fn round_trip(isolate: &api::Isolate, realm: &Handle<Realm>, value: Value) -> Value {
@@ -3356,8 +3533,8 @@ mod tests {
     #[test]
     fn two_slots_keep_their_own_items() {
         let (isolate, realm) = fixture();
-        let first = [Value::Number(1.0), Value::Number(2.0)];
-        let second = [Value::String(Handle::new(JsString::from_utf8("two")))];
+        let first = slot_items(&[Value::Number(1.0), Value::Number(2.0)]);
+        let second = slot_items(&[Value::String(Handle::new(JsString::from_utf8("two")))]);
         let slots = [
             Slot {
                 index: 0,
@@ -3378,14 +3555,56 @@ mod tests {
         };
         let zero = read(0).expect("slot 0");
         assert_eq!(zero.len(), 2);
-        assert_eq!(zero[1].as_number(), Some(2.0));
+        assert_eq!(item_value(zero[1]).as_number(), Some(2.0));
         let three = read(3).expect("slot 3");
         assert_eq!(three.len(), 1);
         assert_eq!(
-            three[0].as_string().map(|text| text.to_string_lossy()),
+            item_value(three[0])
+                .as_string()
+                .map(|text| text.to_string_lossy()),
             Some("two".to_string())
         );
         assert!(read(1).is_none(), "a slot the blob does not name");
+    }
+
+    /// A module a host attached is an item a blob carries rather than one it
+    /// skips, and the item attached after it keeps its own index.
+    ///
+    /// A module is not a language value, so there is no `Value` a slot's item list
+    /// could spell it with — which is exactly why the list is an item list and not
+    /// a value list: a skipped module would hand the host's own `get(index)` the
+    /// record that belongs to a later index.
+    #[test]
+    fn a_module_is_an_item_like_any_other() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let module =
+            api::Module::compile(&context, "deno:core", "export const x = 1;").expect("a module");
+        let items = [
+            SnapshotItem::Module(module),
+            SnapshotItem::Value(Value::Number(9.0)),
+        ];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+        }];
+        let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
+
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        assert_eq!(back.len(), 2, "a module is an item, not a gap");
+        match back[0] {
+            SnapshotItem::Module(module) => assert_eq!(
+                module.source_text().as_deref(),
+                Some("export const x = 1;"),
+                "the record carries the source the module was compiled from"
+            ),
+            SnapshotItem::Value(_) => panic!("the module came back as a language value"),
+        }
+        assert_eq!(item_value(back[1]).as_number(), Some(9.0));
     }
 
     /// Each slot is written against its own realm, so two realms' `%Object.prototype%`
@@ -3404,7 +3623,7 @@ mod tests {
             .intrinsic("%Object.prototype%")
             .and_then(|value| value.as_object())
             .expect("the second realm's object prototype");
-        let items = [value];
+        let items = slot_items(&[value]);
         let slots = [Slot {
             index: 1,
             realm: *second.realm(),
@@ -3416,7 +3635,7 @@ mod tests {
             .expect("a blob of this tree")
             .expect("slot 1");
         assert_eq!(
-            back[0]
+            item_value(back[0])
                 .as_object()
                 .expect("an object")
                 .get_prototype_of()
@@ -3440,7 +3659,7 @@ mod tests {
             .try_eval("({ n: 1 })")
             .expect("an object in the second realm")
             .into_value();
-        let items = [value];
+        let items = slot_items(&[value]);
         let slots = [Slot {
             index: 0,
             realm: *first.realm(),
@@ -3470,7 +3689,7 @@ mod tests {
         object
             .create_data_property(&JsString::from_utf8("host"), external)
             .expect("define");
-        let items = [Value::Object(object), external];
+        let items = slot_items(&[Value::Object(object), external]);
         let slots = [Slot {
             index: 0,
             realm,
@@ -3482,9 +3701,9 @@ mod tests {
         let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &table, None)
             .expect("a blob of this tree")
             .expect("slot 0");
-        let held = back[0].as_object().expect("an object");
+        let held = item_value(back[0]).as_object().expect("an object");
         assert_eq!(
-            api::External::from(back[1]).value(),
+            api::External::from(item_value(back[1])).value(),
             pointer,
             "the item came back as the pointer the table has"
         );
@@ -3512,7 +3731,7 @@ mod tests {
             .expect("an external")
             .as_value()
             .into_value();
-        let items = [external];
+        let items = slot_items(&[external]);
         let slots = [Slot {
             index: 0,
             realm,
@@ -3539,7 +3758,7 @@ mod tests {
             .expect("an external")
             .as_value()
             .into_value();
-        let items = [external];
+        let items = slot_items(&[external]);
         let slots = [Slot {
             index: 0,
             realm,
@@ -3551,12 +3770,12 @@ mod tests {
             encode_slots(agent_of(&isolate), &slots, &[first, pointer], None).expect("a blob");
 
         assert_eq!(
-            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[], None),
-            Err(DecodeError::ExternalIndexOutOfRange { index: 1, count: 0 })
+            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[], None).err(),
+            Some(DecodeError::ExternalIndexOutOfRange { index: 1, count: 0 })
         );
         assert_eq!(
-            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[first], None),
-            Err(DecodeError::ExternalIndexOutOfRange { index: 1, count: 1 })
+            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[first], None).err(),
+            Some(DecodeError::ExternalIndexOutOfRange { index: 1, count: 1 })
         );
         // And the host's table is what an index resolves against, entry by
         // entry, which is the contract: the blob carries the index, never the
@@ -3565,7 +3784,7 @@ mod tests {
             .expect("a blob of this tree")
             .expect("slot 0");
         assert_eq!(
-            api::External::from(back[0]).value() as usize,
+            api::External::from(item_value(back[0])).value() as usize,
             other,
             "the address is the table's entry at that index, not the blob's"
         );
@@ -3662,7 +3881,7 @@ mod tests {
             None,
         )
         .expect("a bind");
-        let items = [Value::Function(callback), Value::Function(bound)];
+        let items = slot_items(&[Value::Function(callback), Value::Function(bound)]);
         let slots = [Slot {
             index: 0,
             realm,
@@ -3682,13 +3901,13 @@ mod tests {
             "the restore asked the host for the entry's pointer"
         );
         assert_eq!(
-            call_restored(&isolate, &realm, back[0], "").as_number(),
+            call_restored(&isolate, &realm, item_value(back[0]), "").as_number(),
             Some(42.0),
             "the restored function calls the host's callback"
         );
         // The object part is the function's: what the host built it with comes
         // back as written, not recomputed.
-        let name = back[0]
+        let name = item_value(back[0])
             .as_function()
             .expect("a function")
             .object
@@ -3699,12 +3918,12 @@ mod tests {
             .map(|text| text.to_string_lossy());
         assert_eq!(name, Some("an_op".to_string()));
         assert_eq!(
-            call_restored(&isolate, &realm, back[1], "").as_number(),
+            call_restored(&isolate, &realm, item_value(back[1]), "").as_number(),
             Some(42.0),
             "a bind whose target is a host callback round trips too"
         );
         assert_eq!(
-            back[0]
+            item_value(back[0])
                 .as_function()
                 .expect("a function")
                 .object
@@ -3741,7 +3960,7 @@ mod tests {
         let mut host = FakeHost::new(0.0);
         host.made(&callback, pointer);
         host.data = Some(crate::api::Local(Value::Object(data)));
-        let items = [Value::Function(callback)];
+        let items = slot_items(&[Value::Function(callback)]);
         let slots = [Slot {
             index: 0,
             realm,
@@ -3760,7 +3979,7 @@ mod tests {
         )
         .expect("a blob of this tree")
         .expect("slot 0");
-        back[0].as_function().expect("a function");
+        item_value(back[0]).as_function().expect("a function");
         let handed = host.handed.borrow();
         let handed = handed.last().expect("the host was asked for a call");
         let handed = handed
@@ -3798,7 +4017,7 @@ mod tests {
         .expect("a builtin");
         let mut host = FakeHost::new(0.0);
         host.made(&callback, 0x1111);
-        let items = [Value::Function(callback)];
+        let items = slot_items(&[Value::Function(callback)]);
         let slots = [Slot {
             index: 0,
             realm,
@@ -3830,7 +4049,7 @@ mod tests {
         .expect("a builtin");
         let mut host = FakeHost::new(0.0);
         host.made(&callback, 0x1111);
-        let items = [Value::Function(callback)];
+        let items = slot_items(&[Value::Function(callback)]);
         let slots = [Slot {
             index: 0,
             realm,
@@ -3863,7 +4082,7 @@ mod tests {
         let other = 0x2222usize;
         let mut host = FakeHost::new(0.0);
         host.made(&callback, pointer);
-        let items = [Value::Function(callback)];
+        let items = slot_items(&[Value::Function(callback)]);
         let slots = [Slot {
             index: 0,
             realm,
@@ -3873,8 +4092,8 @@ mod tests {
         let blob = encode_slots(agent_of(&isolate), &slots, &table, Some(&host)).expect("a blob");
 
         assert_eq!(
-            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &table, None),
-            Err(DecodeError::NoHostCallback(1)),
+            decode_slot(agent_mut(&isolate), &realm, &blob, 0, &table, None).err(),
+            Some(DecodeError::NoHostCallback(1)),
             "the record's index, not the value's position"
         );
         let _ = context;
@@ -4201,7 +4420,7 @@ mod tests {
             .expect("a blob of this tree")
             .expect("slot 0");
         assert_eq!(
-            call_restored(&isolate, reader.realm(), items[0], "5").as_number(),
+            call_restored(&isolate, reader.realm(), item_value(items[0]), "5").as_number(),
             Some(105.0),
             "the free name resolved through the reading realm's global"
         );
@@ -4266,7 +4485,7 @@ mod tests {
         // Two items of one slot, rather than two elements of an array: an
         // array's elements are written from the serial map, which would answer
         // the same serial for both even if the walk had made two records.
-        let items = [function, function];
+        let items = slot_items(&[function, function]);
         let slots = [Slot {
             index: 0,
             realm,
@@ -4277,11 +4496,11 @@ mod tests {
             .expect("a blob of this tree")
             .expect("slot 0");
         assert_eq!(
-            back[0]
+            item_value(back[0])
                 .as_function()
                 .expect("the first item is a function")
                 .id(),
-            back[1]
+            item_value(back[1])
                 .as_function()
                 .expect("the second item is a function")
                 .id(),
@@ -5167,12 +5386,16 @@ mod tests {
                 .intrinsic(&format!("%{name}%"))
                 .expect("the reading realm registered it");
             assert_eq!(
-                back[0].as_function().map(|function| function.id()),
+                item_value(back[0])
+                    .as_function()
+                    .map(|function| function.id()),
                 own.as_function().map(|function| function.id()),
                 "{name} came back the reading realm's own function"
             );
             assert_ne!(
-                back[0].as_function().map(|function| function.id()),
+                item_value(back[0])
+                    .as_function()
+                    .map(|function| function.id()),
                 value.as_function().map(|function| function.id()),
                 "{name} came back a copy of the writer's"
             );

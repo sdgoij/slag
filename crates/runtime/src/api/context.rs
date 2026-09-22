@@ -9,7 +9,7 @@ use crate::agent::Agent;
 use crate::realm::Realm;
 
 use super::Isolate;
-use super::handle::{Global, Local, MaybeLocal};
+use super::handle::{Local, MaybeLocal};
 
 /// A realm on an isolate (v8::Context).
 ///
@@ -79,8 +79,12 @@ impl Context {
     /// error naming that rather than a blob that cannot be loaded. A value a
     /// slot's realm cannot name is an error naming it too — see
     /// [`crate::snapshot::Unsupported`].
+    ///
+    /// An item is a value or a module record ([`crate::snapshot::SnapshotItem`]):
+    /// a host attaches both, and a snapshot carries the *order* it attached them
+    /// in, because the load hands them back by index.
     pub fn write_snapshot(
-        slots: &[(usize, Context, Vec<Local>)],
+        slots: &[(usize, Context, Vec<crate::snapshot::SnapshotItem>)],
         externals: &[*mut std::ffi::c_void],
         host: Option<&dyn crate::snapshot::HostCallbacks>,
     ) -> Result<Vec<u8>, crate::snapshot::Unsupported> {
@@ -88,17 +92,11 @@ impl Context {
             return Err(crate::snapshot::Unsupported::empty_table());
         };
         first.with_agent(|agent| {
-            // The converted values are owned here rather than in the slot list
+            // The converted items are owned here rather than in the slot list
             // the encoder reads, which borrows them.
-            let owned: Vec<(usize, Handle<Realm>, Vec<Value>)> = slots
+            let owned: Vec<(usize, Handle<Realm>, Vec<crate::snapshot::SnapshotItem>)> = slots
                 .iter()
-                .map(|(index, context, items)| {
-                    (
-                        *index,
-                        *context.realm(),
-                        items.iter().map(|item| *item.value()).collect(),
-                    )
-                })
+                .map(|(index, context, items)| (*index, *context.realm(), items.clone()))
                 .collect();
             let engine_slots: Vec<crate::snapshot::Slot<'_>> = owned
                 .iter()
@@ -126,17 +124,10 @@ impl Context {
         slot: usize,
         externals: &[*mut std::ffi::c_void],
         host: Option<&dyn crate::snapshot::HostCallbacks>,
-    ) -> Result<Option<Vec<Global>>, crate::snapshot::DecodeError> {
+    ) -> Result<Option<Vec<crate::snapshot::SnapshotItem>>, crate::snapshot::DecodeError> {
         self.with_agent(|agent| {
             let table: Vec<usize> = externals.iter().map(|pointer| *pointer as usize).collect();
-            let items =
-                crate::snapshot::decode_slot(agent, &self.realm, bytes, slot, &table, host)?;
-            Ok(items.map(|items| {
-                items
-                    .into_iter()
-                    .map(|value| Global::new(Local(value)))
-                    .collect()
-            }))
+            crate::snapshot::decode_slot(agent, &self.realm, bytes, slot, &table, host)
         })
     }
 

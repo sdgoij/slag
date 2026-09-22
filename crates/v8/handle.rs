@@ -94,6 +94,23 @@ impl Payload {
         }
     }
 
+    /// What this handle names, in the words an error message needs. A host can
+    /// hand the bridge a `Data` handle of any of these kinds, so the one that
+    /// cannot be honoured has to be named rather than described as "not a
+    /// value".
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Value(_) => "a value",
+            Self::Context(_) => "a context",
+            Self::Module(_) => "a module record",
+            Self::Script { .. } => "a script",
+            Self::ModuleRequest { .. } => "a module request",
+            Self::ModuleRequests { .. } => "a module's request list",
+            Self::StackFrame { .. } => "a stack frame",
+            Self::TemplateMessage { .. } => "a message",
+        }
+    }
+
     /// The capture and the position in it a stack-frame handle names.
     pub(crate) fn as_stack_frame(&self) -> Option<(api::Local, u32)> {
         match self {
