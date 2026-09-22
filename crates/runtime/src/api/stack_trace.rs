@@ -39,29 +39,29 @@
 //! Each of those is stated rather than implied because a host can read the flag
 //! and act on it, and a wrong `false` is worse than a documented one.
 //!
-//! # What a frame is *not*: the call stack
+//! # What separates a frame from a non-frame
 //!
-//! The most important thing to know about this surface: `execution_context_stack`
-//! is the spec's **execution context** stack, and the engine does not push one
-//! per call. An ordinary call runs the body on the VM's own environment stack;
-//! a context is pushed where the spec needs one (a script, a module, eval, an
-//! async or generator resumption) and, on the call paths that need it, for a
-//! body that reads a spec-only component — the measured case is a sloppy
-//! `arguments`, and the engine says so where it makes the choice
-//! (`crates/runtime/src/function.rs:2271-2278`).
+//! `execution_context_stack` is the spec's **execution context** stack, and the
+//! engine pushes one context per ordinary call. The one context that is not a
+//! frame is the realm's **bootstrap context** — the only push with no function,
+//! no script or module and no source, made once and never popped. Everything
+//! else on the stack is code the engine is running: a script, a module, an eval
+//! (which shares its caller's script or module, as spec eval code does, and
+//! carries the eval text as its source), or a call.
 //!
-//! So a frame here is *not* a call, and a trace is coarser than V8's:
-//! `function inner() { return capture(); } inner();` reports one frame (the
-//! script), while the same call with a body that touches `arguments` reports two
-//! (the call, then the script). Measured, not assumed — the bridge's test is what
-//! pins it, and `.notes/embedding.md` §7 records the finding and what it means
-//! for the plan's own survey.
+//! A **leaf-inlined** call pushes no context at all — a leaf body is run in
+//! place on its caller's Vm by design, and leafhood excludes exactly what would
+//! need a frame (closure creation, calls, a sloppy `arguments`), so the omission
+//! is sound rather than a gap. It is also unobservable from JavaScript: reaching
+//! a trace means calling, and a call disqualifies leafhood.
 //!
-//! A host reading a trace for "which code am I in" gets a true answer either way,
-//! because the script or module a frame belongs to is exactly what it names. A
-//! host reading it for "how did I get here" gets the *activations* the engine
-//! tracks, which is a subset of the call chain. Closing that gap means the VM's
-//! own frames, which is the larger engine item §10 names.
+//! What a frame does **not** carry is a **name** for such a call: the certified
+//! push fills the context's `function` slot only for the one reader
+//! certification leaves in it — a sloppy body's mapped `arguments` — so
+//! `v8::StackFrame::GetFunctionName` answers nothing for a call that does not
+//! read one. That is a cost decision on the call path, stated in §9 rather than
+//! hidden, and it does not affect `Error.stack`, which names its lines from the
+//! same slot and therefore reads exactly as it did before.
 //!
 //! # Where a capture lives
 //!
@@ -164,8 +164,9 @@ pub(crate) fn stack_frames(agent: &Agent, limit: usize) -> Vec<StackFrame> {
 ///
 /// The realm's bootstrap context is the one context with no function, no script
 /// or module and no source; it is pushed once and never popped, so it would
-/// otherwise be the outermost frame of every trace. Eval code, which shares no
-/// such shape (`source` is set), stays a frame.
+/// otherwise be the outermost frame of every trace. Every other context is code
+/// the engine is running — a call, a script, a module — and a call's context is
+/// the only frame an ordinary call has, which is why a source of its own counts.
 fn is_frame(context: &ExecutionContext) -> bool {
     context.function.is_some() || context.script_or_module.is_some() || context.source.is_some()
 }
@@ -179,6 +180,9 @@ fn frame_of(context: &ExecutionContext) -> StackFrame {
             };
             function.name.as_ref().map(|name| name.to_string_lossy())
         }),
+        // No name for a call the certified push did not record a callee in —
+        // that slot is filled only for a sloppy mapped `arguments`; see the
+        // module header.
         script_name: script_name(context),
         // No position is tracked per activation; see the module header.
         line: 0,

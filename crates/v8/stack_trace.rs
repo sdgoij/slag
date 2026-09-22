@@ -1,15 +1,18 @@
 //! The running call stack (`v8::StackTrace`, `v8::StackFrame`).
 //!
 //! A capture is a snapshot of the activations that are on the stack when a host
-//! asks for one — the engine's **execution contexts**, which is a *subset* of
-//! V8's call stack: the engine does not push a context per call, so a trace here
-//! reports the script, module, eval and async activations (and the calls whose
-//! bodies need a spec context) rather than every call. That is measured, not
+//! asks for one — the engine's **execution contexts**, which is one per call
+//! except for a *leaf-inlined* one: a leaf body is run in place on its caller's
+//! Vm by design (a leaf creates no closures and reads no spec-only slot, both of
+//! which disqualify leafhood), so it pushes no context of its own. That is the
+//! only activation a trace can omit, and JavaScript cannot observe the omission,
+//! because reaching a trace at all means making a call. That is measured, not
 //! assumed — the test below pins it — and `runtime::api::stack_trace`'s module
 //! documentation is where it is spelled out. What each frame knows, and what it
 //! deliberately does not, is the engine's story too; `.notes/embedding.md` §9
-//! states the divergences (no line or column, `false` for eval/constructor/wasm,
-//! `true` for user JavaScript).
+//! states the divergences (no line or column, no function name for a call that
+//! does not read `arguments`, `false` for eval/constructor/wasm, `true` for user
+//! JavaScript).
 //!
 //! Two things are the bridge's own. A capture names an ordinary object it mints,
 //! because a handle has to name something the collector can see: a host that
@@ -147,8 +150,10 @@ impl<'s> LocalHandle<'s, StackFrame> {
     }
 
     /// The frame's function name (v8::StackFrame::GetFunctionName), or `None`
-    /// for a frame with no named function — a script's top level, or an
-    /// anonymous function.
+    /// for a frame with no named function — a script's top level, an anonymous
+    /// function, or a *call* the engine pushed a context for without recording
+    /// the callee in it: the frame's `function` slot is filled only for the one
+    /// reader certification leaves in it, a sloppy body's mapped `arguments`.
     pub fn get_function_name<'a>(
         &self,
         _scope: &PinScope<'a, '_>,
@@ -267,14 +272,14 @@ mod tests {
     }
 
     /// A capture reports the activations the engine tracks as **execution
-    /// contexts**, and that is not the same list as V8's call stack — this test
-    /// pins the difference, which is the most important thing to know about this
-    /// surface:
+    /// contexts**, which is one per call — this test pins what that means frame
+    /// by frame:
     ///
-    /// - a plain call adds no frame (the engine runs a body on the VM's own
-    ///   environment stack and pushes a spec context only where it needs one);
-    /// - a call whose body does need one — a sloppy `arguments` is the measured
-    ///   case — appears, named;
+    /// - a certified call is a frame (the engine pushes a context for it), and
+    ///   it is **unnamed**: the push fills the frame's `function` slot only for
+    ///   the one reader certification leaves in it, so a body that does not read
+    ///   a sloppy `arguments` reports no name;
+    /// - a call whose body does read one appears named;
     /// - the script the code came from is always a frame.
     ///
     /// See the module documentation and `.notes/embedding.md` §7/§9.
@@ -282,15 +287,15 @@ mod tests {
     fn a_capture_reports_the_engines_contexts_not_the_call_stack() {
         assert_eq!(
             capture_frames("function inner() { return capture(); } inner();"),
-            ["-@-"],
-            "a plain call is not an execution context"
+            ["-@-", "-@-"],
+            "a certified call is an activation: the frame is there, unnamed"
         );
         assert_eq!(
             capture_frames(
                 "function inner(a) { if (a) { return arguments; } return capture(); } inner(0);"
             ),
             ["inner@-", "-@-"],
-            "a call whose body needs a context is a frame, innermost first"
+            "a call whose body reads `arguments` names its frame, innermost first"
         );
     }
 

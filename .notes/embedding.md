@@ -2726,6 +2726,20 @@ Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **840 �
 
 *And the next value is a function the **engine** left without a source, for a reason that is a bug rather than a gap.* Re-measured, `create_blob` stops on `async_op_0` — an ordinary function `00_infra.js` defines, created by `setUpAsyncStub` when the **host** calls it from Rust. A probe in `capture_source` printed what the stack looked like at that moment: **two frames, none of them carrying a source**. The host call pushes the callee's execution context with `source: None` (the certified call path, whose own comment claims the slot "is never consulted here" — true for the body, false for a closure created *inside* it), and because the call came from Rust there is no script frame beneath it to fall back on. So `[[SourceText]]` is missing for **every** closure created inside a function a host calls, and the same absent slot is what `source_hash_at` warns about when it degrades a body-cache key to raw addresses. The fix is one slot per call frame — the **callee's** own source, which is by definition the text its spans refer to — and it is the next slice.
 
+**The text a call frame runs — landed, and deno's build stops on a method.** The eleventh part of ledger item 16. It closes the blocker the tenth part's measurement named (`async_op_0`, a closure created inside a function the host calls from Rust) and, while measuring, turned up a second defect of the same family that had been silent.
+
+*The fact the frame needed was not `[[SourceText]]`.* `EcmaFunction.source` is the function's own **slice** of some larger text — what `toString` answers — while a body's AST spans are offsets into the text it was parsed **from**. So the record gained `parse_text`, and the frame a call pushes runs that: `register_function` fills it from the walk `capture_source` already uses (`enclosing_source(body.span)`), a caller that parsed the body from a text it holds passes it (`instantiate_function_from_source` — CreateDynamicFunction and the restore), and the module's declaration pass, which registers under a **bootstrap** context with no text of its own, sets it from the module text it already slices `[[SourceText]]` out of, beside the `declaring_module` it already patched. `instantiate_arrow` computes it for the arrow's span. **Nine push sites** carry it: the certified call and construct, the certified and slow tails, the slow call and construct, and the async, generator and async-generator calls — the certified pair carried `None` and the rest the **caller's** text, which is right only when the two texts happen to be the same one. The certified call's fast-path tuple became a named `FastCall`, since the frame needs one more field than a four-tuple reads well with.
+
+*The defect it exposed was a wrong slice, and it was there before this change.* A closure created inside a `Function`-built body resolved its span against the *script* that called `new Function`, because the resolution's fit check (`end <= len`) passed coincidentally: `nction('return function stub()` — the script's text cut at the assembled text's offsets. The dynamic and restore paths now hand the record the text they parsed, so the walk is not consulted for them at all; the `makeDynamic` case of `a_called_body_runs_its_own_text_not_the_callers` fails on the wrong slice without it. That this was a *pre-existing* wrong answer rather than a missing one is why it stayed invisible: a wrong `[[SourceText]]` is a `toString` that returns text, and only a span past the end of the wrong text refuses.
+
+*What it makes visible.* `is_frame` counts a context with a source as a frame, and that criterion was written when a source meant a script, a module or eval — the certified push's context is the only frame an ordinary call has, so a trace now reports one frame per call rather than only the calls that read a spec-only slot. Two consequences are stated rather than hidden: those frames carry **no name** (the certified push keeps `context.function` gated on its one reader, a sloppy mapped `arguments`, so `GetFunctionName` answers `None` for them), and `Error.stack`, which names its lines from that same slot, reads exactly as it did. A **leaf-inlined** call still pushes nothing, by design and soundly — leafhood excludes closure creation, calls and a sloppy `arguments` — and it is not observable from JavaScript at all: reaching a trace means calling, and a call disqualifies leafhood.
+
+*Tests.* Four in `crates/runtime/src/api/mod.rs` (the callee's text over six call shapes — certified, arrow, env-path, `Function`-built, and both tails; the three suspended bodies; the construct path; a **module** function the host calls with no module frame beneath it) and two in `snapshot.rs` (the host-call shape round-tripping through the format, which is what deno's walk refused; a class defined in a `Function`-built body, which the walk used to refuse and now carries). Two existing tests were **re-aimed rather than deleted**, because part 11 removed the constructions they used: the class-source refusal (its `new Function` shape is carried now) became that positive test, and the arrow case of the refusal-by-kind test became the **accessor** — the kind that still has no `[[SourceText]]` at all, and now the only source-less refusal the engine's tests reach. The bridge's `a_capture_reports_the_engines_contexts_not_the_call_stack` pins the new frame list. **Twelve mutations, each caught**: the certified call push, the certified construct push, the slow call push, the three suspended pushes, the certified tail push, the slow tail push, the arrow's `parse_text`, the registration walk, the dynamic path's explicit text, and the module declaration pass's.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **843 → 848 passed / 0 failed**; `cargo test -p v8 --features simdutf --lib -- --skip the_data_a_built_function_carries_survives_a_collection` **223 passed / 0 failed / 1 filtered**; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,219 → 5,224 passed / 0 failed / 4 ignored** (one earlier run of it reported a single failure whose name was not captured; the two runs after it, one of them the counted one, were clean). `crates/runtime` changed, so the battery ran, twice — once mid-work and once against the tree as it stands, with the release binaries rebuilt after the last engine edit (a file mtime newer than `target/release/sweep.exe` was caught and is why the second run exists): test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*And the next value is a method.* Re-measured the same way, deno's `create_blob` now gets past `async_op_0` and stops on `v8::SnapshotCreator::create_blob: the engine cannot carry a method (a method's source has no `function` keyword, so it cannot be re-parsed on its own) yet` — ledger part 8, the kind the seventh and tenth parts both left named as open. A method's `[[SourceText]]` is method-form (`m() {}`) and needs a parse context of its own plus its carried `[[HomeObject]]`; the same context is what an accessor needs.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3848,6 +3862,68 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   position that depended on that length would name one entry when the blob was
   written and another when it is read. One entry covers every console method,
   because they are one callback under many names.
+
+  **Eleventh part — the text a call frame is running, designed before it was
+  written, and landed.** The blocker the tenth part's measurement named: `async_op_0`, a
+  closure created inside a function the **host** calls from Rust, where no frame
+  beneath the callee carries a source, so the closure has no `[[SourceText]]` at
+  all. The engine half is one slot per call frame; the format does not change.
+
+  - **The slot is the *parse* text, not `[[SourceText]]`.** `EcmaFunction.source`
+    is what `Function.prototype.toString` answers: the function's own **slice**
+    of some larger text. A body's AST spans are not offsets into that slice —
+    they are offsets into the text it was *parsed from* (the script, the module,
+    a `Function`-built body, an eval) — so a frame that carried the slice would
+    either fail `enclosing_source`'s fit check at a body span past its own end,
+    or, before the check, answer a wrong slice of an unrelated text. The record
+    therefore carries `parse_text: Option<JsString>` beside `source`, and it is
+    exactly what `enclosing_source` resolves.
+  - **Where it comes from.** `register_function` fills it from the same walk
+    `capture_source` already uses (`enclosing_source(agent, body.span)`), falling
+    back to the text the caller supplied — CreateDynamicFunction and the restore
+    parse the very string they pass as `source`, so there the two facts coincide
+    — and the module's declaration pass, which registers under a **bootstrap**
+    context with no source of its own, sets it from the module text it already
+    slices `[[SourceText]]` out of, the way it already patches
+    `declaring_module`. `instantiate_arrow` computes it for the arrow's span, the
+    span it captures `[[SourceText]]` from.
+  - **The call frames.** The certified call and construct, the certified and slow
+    tail paths, the slow call and construct, and the async, generator and
+    async-generator calls each push the callee's `parse_text` where they pushed
+    `None` (the certified pair) or the **caller's** text (the rest — right only
+    when the two texts happened to be the same one, and a silent wrong slice in a
+    `toString` when they were not). The slot stops being "never consulted": the
+    certified push's comment and `enclosing_source`'s doc say what it is for now
+    — every closure the body creates, and the body-cache key `source_hash_at`
+    derives from it.
+  - **What it makes visible, and why that is the honest reading.** `is_frame`
+    counts a context with a source as a frame, and it was written when a source
+    meant "a script, a module, or eval": the criterion was a *proxy* for "code,
+    not the realm's bootstrap context". A certified call is the only frame an
+    ordinary call has, and it is now a real activation, so a trace reports one
+    frame per call rather than only the calls that read a spec-only slot. The
+    residual gap is a **leaf-inlined** call, which pushes no context by design (a
+    leaf body creates no closures and reads no spec-only slot — both are
+    disqualifiers of leafhood), and it cannot be observed from JavaScript at all:
+    reaching a trace means calling, and a call disqualifies leafhood. What the
+    new frames do **not** carry is a **name** — the certified push keeps
+    `context.function` gated on its one reader, a sloppy body's mapped
+    `arguments` — so `get_function_name` answers `None` for them, and
+    `Error.stack`, which names frames from that same slot, is unchanged. Naming
+    them costs a value store on the call path and is a separate step, recorded
+    rather than taken here.
+
+  *Acceptance tests.* Engine: a closure created inside a function the **host**
+  calls keeps its source (`function_source` answers its own text rather than the
+  native form), and — the shape deno's walk actually refuses — that closure is
+  **carried by a snapshot** and comes back callable, which is what fails when the
+  creation site has no text. A second test pins the other half: the frame carries
+  the **callee's** text, not the caller's, when two scripts differ — a script's
+  factory called from a *second*, differently-sized script answers the closure's
+  own text, where the inherited caller's text fails the fit check and answers the
+  native form. Bridge: the stack-trace test's expectation moves with the
+  measurement.
+
 - **A callback scope's handles carry the lifetime of what the scope was opened
   from, not the borrow of its storage.** That is the crate we stand in for's own
   choice, and this bridge reproduces it because a host's helper has to be able to
@@ -3909,18 +3985,19 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   whole-line one that V8's *scanner* would reject as string content would be read
   as a comment. The first is the cost of having no lexer; the second is why the
   rule is line-anchored rather than a plain search.
-- **A stack trace reports the engine's execution contexts, which is a subset of
-  V8's call stack.** The engine pushes a spec execution context where the spec
-  needs one (a script, a module, eval, an async or generator resumption) and, on
-  the call paths that need it, for a body that reads a spec-only component — a
-  sloppy `arguments` is the measured case — while an ordinary call runs on the
-  VM's own environment stack with no context at all. So
-  `StackTrace::current_stack_trace` answers the activations the engine tracks,
-  innermost first, and *not* one frame per call: the numbers are in §7. A host
-  asking "which code am I in" gets a true answer; a host asking "how did I get
-  here" gets a subset, and closing that gap needs the VM's frames. V8 would not
-  answer either question with a subset, which is why this is a divergence rather
-  than a tier.
+- **A stack trace reports one frame per call, except for a leaf-inlined one.**
+  The engine pushes an execution context for every ordinary call, so a trace
+  reports the activations it runs: a script, a module, an eval, an async or
+  generator resumption, and each call. A **leaf-inlined** call is the one
+  omission — a leaf body is run in place on its caller's Vm by design, and
+  leafhood excludes exactly what would need a frame (closure creation, calls, a
+  sloppy `arguments`) — and JavaScript cannot observe the omission, because
+  reaching a trace means making a call. What a call's frame does not carry is a
+  **name**: the certified push fills `context.function` only for the one reader
+  certification leaves in it, so `GetFunctionName` answers nothing for a call
+  that does not read one, and `Error.stack` — which names its lines from the same
+  slot — reads as it did. V8 would answer the name; that is a value store on the
+  call path and is named in §12 rather than taken.
 - **Three frame flags answer `false` and one answers `true` for every frame.**
   `is_eval`, `is_constructor` and `is_wasm` are `false` because an execution
   context does not record them — eval code even inherits its caller's script or
@@ -4058,22 +4135,22 @@ and its deref table, which is when the tier §9 states stops being a tier;
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
-bridge. That item's nine parts have landed — the format, the context table, the
+bridge. That item's ten parts have landed — the format, the context table, the
 external-reference table, a function, a bound function, the realm's named global
-functions, a class constructor, a host callback and an arrow — so the blocker this
+functions, a class constructor, a host callback, an arrow and the text a call
+frame runs — so the blocker this
 plan could name is
 gone: the
 format carries a slot per context, `deno_core`'s data lives on the realm it
 added at slot 1, a host pointer is an index into the table the host rebuilds
-for every load, and a function, a bind, a class, an arrow and a host callback all
+for every load, a function, a bind, a class, an arrow and a host callback all
 come back
 callable or
-constructable. What is left
-before a snapshot comes back out is an **execution context's `source` on a call
-the host makes**: the walk now carries the realm's console and its arrows and
-stops on `async_op_0`, a function deno's own JS created inside a function the
-host called from Rust — no frame beneath it carries a source, so the closure has
-no `[[SourceText]]` — and behind that the measured question of the walk
+constructable, and a closure deno's own JS creates inside a function the host
+calls from Rust carries its text. What is left — and it is the value the walk
+stops on now — is the **method machinery**: a method's source is method-form and
+`parse_function` cannot read it, which is the eighth part of the same item.
+Behind that sits the measured question of the walk
 reaching the realm's global object, a realm the restore already rebuilt, so
 carrying the host's own globals would put them back on top of it. The `ext`-crate frontier of §7's
 measurement
@@ -4099,9 +4176,9 @@ delete.
    `.notes/host-object-gc.md` §4.3; not started.
 2. **Snapshot format** — **v1 landed with its context table, external
    references, a function, a bound function, a class constructor, a host callback,
-   an arrow
-   and the realm's
-   named global functions** (§7's last nine records, ledger item 16): a versioned
+   an arrow, the realm's
+   named global functions
+   and the text a call frame runs** (§7's last ten records, ledger item 16): a versioned
    blob over a
    value graph rooted at the data a host attached to each of its contexts,
    written and read against each slot's own realm, intrinsics by name, host
@@ -4112,16 +4189,15 @@ delete.
    callback as the entry of the host's table its call came from **and the data
    value it reads**, a
    refusal naming
-   anything uncarried. What this item still owns: an **execution context's
-   `source` on a call the host makes** (the next step — a conformance bug the
-   snapshot exposed, §7's last record, not a missing record), a host callback's
+   anything uncarried. What this item still owns: a host callback's
    **construct half**, the method
-   machinery (the eighth part),
-   the
+   machinery (the eighth part, and the **next measured step** — deno's walk now
+   stops on a method, §7's last record), the
    measured question of the walk reaching the **global object**, a
    value shared between two contexts coming back one per context, compiled code
    for `FunctionCodeHandling::Keep`, isolate-level data, and continuation from an
-   existing blob.
+   existing blob. The call-frame `source` the eleventh part closed was the
+   conformance bug this item's walk exposed rather than a record it was missing.
 3. **Sealing `slag::api`** — the re-export exists (`crates/slag/src/lib.rs`, with a
    test that drives a module through it), so a host can depend on `slag` alone.
    Still open: `Local::value`, `Isolate::agent`, `Local::as_object` name
@@ -4172,3 +4248,13 @@ delete.
    crate's own `.unwrap()` panics), because the engine's `create` cannot fail and
    a host that passes one gets a record whose cells are ambiguous rather than an
    error — a named follow-up, not a guess.
+10. **A call's frame carries no name — open, and its cost is measured.** The
+   certified push fills `context.function` only for the one reader certification
+   leaves in it (a sloppy body's mapped `arguments`), so every other call's frame
+   answers `None` to `v8::StackFrame::GetFunctionName` (and `Error.stack` names
+   none of them). Filling it unconditionally is one `Value` store per certified
+   call — comparable to the `parse_text` clone the eleventh part of item 16 added
+   to the same push — and it *changes* `Error.stack`'s text, which is why it is a
+   decision rather than a line: the engine's stack strings are what deno's CLI
+   prints, so the change wants its own measurement rather than a ride on this
+   one. §9's stack-trace bullet states the divergence meanwhile.

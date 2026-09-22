@@ -236,6 +236,164 @@ mod tests {
         );
     }
 
+    /// The text a call frame runs is the **callee's**, not the caller's: a body
+    /// whose span belongs to one script still hands its closures that text when
+    /// it is called from a *second*, differently-sized one.
+    ///
+    /// The caller's text is right only when the two happen to be the same one —
+    /// which every single-source program hides — and the difference is not
+    /// cosmetic: a closure's `Function.prototype.toString` is its span's slice,
+    /// and a span resolved against the wrong text is either a wrong slice or, as
+    /// here, past the end of it.
+    #[test]
+    fn a_called_body_runs_its_own_text_not_the_callers() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        // One shape per call path: a certified body (frame slots), an arrow
+        // (whose record carries the enclosing text of its own creation site),
+        // a body the scope analysis cannot certify (a default parameter),
+        // which takes the environment path, and a tail call, which replaces the
+        // running frame rather than pushing one.
+        context
+            .try_eval(
+                "globalThis.makeCertified = function () { return function stub() { return 41; }; };",
+            )
+            .expect("the certified factory's script");
+        context
+            .try_eval("globalThis.makeArrow = () => function stub() { return 41; };")
+            .expect("the arrow factory's script");
+        context
+            .try_eval(
+                "globalThis.makeEnv = function (a = 1) { return function stub() { return 41; }; };",
+            )
+            .expect("the env factory's script");
+        // A `Function`-built body: its frame carries the assembled string its
+        // spans belong to, which is the only text it has.
+        context
+            .try_eval(
+                "globalThis.makeDynamic = new Function('return function stub() { return 41; };');",
+            )
+            .expect("the dynamic factory's script");
+        // The two tail paths: a strict body whose last act is a call replaces
+        // the caller's frame instead of pushing onto it, and the callee may be
+        // either certified or an env-path body.
+        context
+            .try_eval(
+                "globalThis.makeTail = function () { 'use strict'; return tailCertified(); }; \
+                 globalThis.tailCertified = function () { return function stub() { return 41; }; }; \
+                 globalThis.makeTailEnv = function () { 'use strict'; return tailEnv(); }; \
+                 globalThis.tailEnv = function (a = 1) { return function stub() { return 41; }; };",
+            )
+            .expect("the tail factories' script");
+        for call in [
+            "makeCertified()",
+            "makeArrow()",
+            "makeEnv()",
+            "makeDynamic()",
+            "makeTail()",
+            "makeTailEnv()",
+        ] {
+            let made = context.try_eval(call).expect("the call");
+            assert_eq!(
+                isolate.function_source(&made).as_deref(),
+                Some("function stub() { return 41; }"),
+                "the span belongs to the factory's script, not the caller's: {call}"
+            );
+        }
+    }
+
+    /// The suspended bodies resume under the context their call pushed, so the
+    /// text an async function, a generator or an async generator captures at
+    /// call time is the text their bodies run under.
+    ///
+    /// Each is driven from a second script, which is what makes these three
+    /// paths distinguishable from the ordinary call above.
+    #[test]
+    fn a_suspended_bodys_frame_carries_its_own_text() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let cases: [(&str, &str); 3] = [
+            (
+                "globalThis.make = async function () { return function stub() { return 41; }; };",
+                "make().then(v => { globalThis.made = v; });",
+            ),
+            (
+                "globalThis.make = function* () { return function stub() { return 41; }; };",
+                "globalThis.made = make().next().value;",
+            ),
+            (
+                "globalThis.make = async function* () { return function stub() { return 41; }; };",
+                "make().next().then(r => { globalThis.made = r.value; });",
+            ),
+        ];
+        for (define, drive) in cases {
+            context.try_eval(define).expect("the definition");
+            context.try_eval(drive).expect("the drive");
+            context.run_microtasks().expect("the microtasks");
+            let made = context.try_eval("globalThis.made").expect("the closure");
+            assert_eq!(
+                isolate.function_source(&made).as_deref(),
+                Some("function stub() { return 41; }"),
+                "a resumed body's frame carries its own text: {define}"
+            );
+        }
+    }
+
+    /// A module function registered at link time carries its **module's** text,
+    /// so a closure it creates resolves its span even when the host calls it
+    /// directly — with no module frame beneath the call to widen to.
+    ///
+    /// Link runs under a context with no text of its own, so the module's text is
+    /// the one the declaration pass has to record; what the walk finds instead is
+    /// the function's own slice, which a nested closure's span runs past when the
+    /// function does not happen to start at the module's first offset.
+    #[test]
+    fn a_module_functions_frame_carries_the_module_text() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let module = Module::compile_with_name(
+            &context,
+            "entry",
+            Some("file:///app/main.js"),
+            "const pad = 0;\n\
+             function make() { return function stub() { return 41; }; }\n\
+             globalThis.make = make;\n\
+             export { make };",
+        )
+        .expect("compile");
+        module.instantiate(&context).expect("instantiate");
+        module.evaluate(&context).expect("evaluate");
+        let make = context.try_eval("globalThis.make").expect("the export");
+        let made = context
+            .try_call(&make, &Local::undefined(), &[])
+            .expect("the host's call");
+        assert_eq!(
+            isolate.function_source(&made).as_deref(),
+            Some("function stub() { return 41; }"),
+            "the closure's span belongs to the module's text"
+        );
+    }
+
+    /// A certified constructor's frame carries its own text too — the construct
+    /// path is a second push site with the same obligation.
+    #[test]
+    fn a_constructed_bodys_frame_carries_its_own_text() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        context
+            .try_eval("globalThis.C = function () { this.stub = function stub() { return 41; }; };")
+            .expect("the constructor's script");
+        context
+            .try_eval("globalThis.instance = new C();")
+            .expect("the construct");
+        let made = context.try_eval("instance.stub").expect("the closure");
+        assert_eq!(
+            isolate.function_source(&made).as_deref(),
+            Some("function stub() { return 41; }"),
+            "the constructed body's frame carries its own text"
+        );
+    }
+
     #[test]
     fn eval_failure_sets_the_pending_exception() {
         let mut isolate = isolate();

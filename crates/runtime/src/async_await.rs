@@ -136,10 +136,16 @@ pub fn call_async_function(
         lexical_environment: function_env,
         variable_environment: function_env,
         private_environment: data.private_environment,
-        source: agent
-            .running_context()
-            .ok()
-            .and_then(|context| context.source.clone()),
+        // The callee's own text, not the caller's: this body's spans are
+        // offsets into the text it was parsed from, so a closure created
+        // inside it resolves against that text (the caller's stands in only
+        // when the body has none).
+        source: data.parse_text.clone().or_else(|| {
+            agent
+                .running_context()
+                .ok()
+                .and_then(|context| context.source.clone())
+        }),
         annex_b_hoistable: Default::default(),
     };
     agent.execution_context_stack.push(context.clone());

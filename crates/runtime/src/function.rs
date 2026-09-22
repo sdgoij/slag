@@ -182,6 +182,14 @@ pub struct EcmaFunction {
     /// The exact source text of the definition (Function.prototype.toString,
     /// spec 20.2.3.5); `None` for synthesized/native callables.
     pub source: Option<JsString>,
+    /// The text this body's AST spans are offsets into — the script, module,
+    /// `Function`-built source or eval it was parsed from. Distinct from
+    /// `source`, which is this function's own *slice* of that text: a call
+    /// frame runs the whole thing, so a closure created inside the body
+    /// resolves its span against the text the span belongs to
+    /// (`enclosing_source`), and `source_hash_at` keys the body cache from it.
+    /// `None` when no text covered the creation site.
+    pub parse_text: Option<JsString>,
     /// The module this function's source text appears in (import.meta resolves
     /// lexically to it, spec 13.3.7.1); `None` for script and builtin code.
     pub declaring_module: Option<Handle<crate::module::SourceTextModule>>,
@@ -254,6 +262,7 @@ impl Trace for EcmaFunction {
         self.private_environment.trace(visit);
         self.super_constructor.trace(visit);
         self.source.trace(visit);
+        self.parse_text.trace(visit);
         self.declaring_module.trace(visit);
         // The compiled body embeds literal `Value`s (strings, bigints) in
         // its steps; they are heap edges.
@@ -754,6 +763,7 @@ pub fn instantiate_function_with_source(
         DefinitionKind::function(f.is_async, f.is_generator),
         source,
         None,
+        None,
         outer_chain,
         named_expression,
     )?;
@@ -814,15 +824,16 @@ fn source_hash(source: &JsString) -> usize {
 /// The source text a span refers to: the innermost enclosing execution context
 /// that carries a source covering the span.
 ///
-/// The running context's own source is the common case. The search widens
-/// outward because a *certified* body's context deliberately has none — the
-/// `ordinary_call` and `tail_prepare_ordinary` fast paths skip the `source`
-/// clone on the ground that a certified body reads only its lexical
-/// environment — and the source is not cosmetic: it decides
+/// The running context's own source is the common case — every frame a call
+/// pushes now carries the text its own code was parsed from — and the search
+/// widens outward for the contexts that have none: the realm's bootstrap
+/// context, a synthesized body, and a frame whose code the engine never held
+/// text for. The source is not cosmetic: it decides
 /// FunctionBodyContainsUseStrict's raw-text check (a cooked-but-not-raw
-/// `'use strict'` is not a directive) and `Function.prototype.toString` for
-/// every closure the body creates. The script a node belongs to is the
-/// innermost frame whose source covers the span.
+/// `'use strict'` is not a directive), `Function.prototype.toString` for every
+/// closure the body creates, and the body-cache key `source_hash_at` derives.
+/// The script a node belongs to is the innermost frame whose source covers the
+/// span.
 fn enclosing_source(agent: &Agent, span: crux::Span) -> Option<&JsString> {
     let (start, end) = (span.start as usize, span.end as usize);
     if start >= end {
@@ -1017,6 +1028,7 @@ pub fn instantiate_method(
         DefinitionKind::method(f.is_async, f.is_generator),
         source,
         None,
+        None,
         Vec::new(),
         false,
     )
@@ -1045,6 +1057,7 @@ pub fn instantiate_accessor(
         environment,
         enclosing_strict,
         DefinitionKind::method(false, false),
+        None,
         None,
         None,
         Vec::new(),
@@ -1120,6 +1133,7 @@ fn instantiate_class_constructor_with(
         },
         source,
         None,
+        None,
         Vec::new(),
         false,
     )?;
@@ -1182,6 +1196,11 @@ fn register_function(
     enclosing_strict: bool,
     kind: DefinitionKind,
     source: Option<JsString>,
+    // The text the body's spans index into, when the caller knows it because it
+    // parsed the body from that text (CreateDynamicFunction, the restore).
+    // `None` resolves it from the creating frame — the right answer for a body
+    // parsed as part of the code that is running.
+    parse_text: Option<JsString>,
     strict: Option<bool>,
     outer_chain: Vec<Vec<crux::AtomId>>,
     named_expression: bool,
@@ -1211,6 +1230,15 @@ fn register_function(
     // fast pointer it feeds — runs once per site instead of once per
     // closure. The pointer is captured before `body` moves into the record.
     let body_key = std::rc::Rc::as_ptr(&body) as usize;
+    // The text the body's spans index into: the caller's when it parsed the body
+    // from that text, else `capture_source`'s own walk, which is the answer for a
+    // body parsed as part of the code that is running. Not `source`, which is
+    // this function's own *slice* of such a text — a nested closure's span runs
+    // past it. The module's declaration pass, which registers under a bootstrap
+    // context with no text of its own, corrects it after registration.
+    let parse_text = parse_text
+        .or_else(|| enclosing_source(agent, body.span).cloned())
+        .or_else(|| source.clone());
     let mut data = EcmaFunction {
         name: name.clone(),
         params: params.clone(),
@@ -1232,6 +1260,7 @@ fn register_function(
         is_generator: kind.is_generator,
         class_field_initializer: false,
         source,
+        parse_text,
         declaring_module,
         ir: None,
         leaf_inline: false,
@@ -1342,9 +1371,15 @@ fn register_function(
 /// [`enclosing_source`]). Returns `None` when no enclosing context carries a
 /// source covering the span (synthesized/native callables).
 pub(crate) fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString> {
-    let (start, end) = (span.start as usize, span.end as usize);
     let source = enclosing_source(agent, span)?;
-    Some(JsString::from_utf16(&source.as_slice()[start..end]))
+    Some(span_slice(source, span))
+}
+
+/// The span's own text out of the text it was parsed from. Callers reach this
+/// through [`enclosing_source`], whose fit check is what makes the range
+/// sound.
+fn span_slice(source: &JsString, span: crux::Span) -> JsString {
+    JsString::from_utf16(&source.as_slice()[span.start as usize..span.end as usize])
 }
 
 /// OrdinaryFunctionCreate step: the [[Prototype]] intrinsic of a function's
@@ -1534,6 +1569,10 @@ pub fn instantiate_function_from_source(
         environment,
         false,
         DefinitionKind::function(f.is_async, f.is_generator),
+        source.clone(),
+        // The body was parsed from this very text — `parse_function` here, the
+        // `Function` constructor's assembled string for the sibling path — so its
+        // spans index into it, not into whatever the running frame has.
         source,
         Some(strict),
         Vec::new(),
@@ -1577,8 +1616,11 @@ pub fn instantiate_arrow(
     // answers (the same slot a function or class carries) and what lets a
     // snapshot rebuild this closure from its own text rather than its compiled
     // body. Captured at creation, like a function expression's: `None` when the
-    // creation site has no source text, which keeps the native form.
-    let source = capture_source(agent, span);
+    // creation site has no source text, which keeps the native form. The
+    // enclosing text itself is the record's `parse_text` — the same walk, and
+    // the one a closure created inside this arrow resolves its span against.
+    let parse_text = enclosing_source(agent, span).cloned();
+    let source = parse_text.as_ref().map(|text| span_slice(text, span));
     let mut data = EcmaFunction {
         name: None,
         params,
@@ -1600,6 +1642,7 @@ pub fn instantiate_arrow(
         is_generator: false,
         class_field_initializer,
         source,
+        parse_text,
         declaring_module: None,
         ir: None,
         leaf_inline: false,
@@ -1755,11 +1798,17 @@ pub(crate) fn call_inner(
                 let is_async_gen = data.is_some_and(|data| data.is_async && data.is_generator);
                 let is_async = data.is_some_and(|data| data.is_async);
                 let is_generator = data.is_some_and(|data| data.is_generator);
-                // The fast path reads the record's `ir`/`environment`/`realm`/
-                // `strict`; clone them while the borrow is live so
-                // `ordinary_call` skips its own lookup for certified bodies.
-                let fast =
-                    data.map(|data| (data.ir.clone(), data.environment, data.realm, data.strict));
+                // The fast path reads the record's `ir`/`environment`/
+                // `realm`/`strict`/`parse_text`; clone them while the borrow is
+                // live so `ordinary_call` skips its own lookup for certified
+                // bodies.
+                let fast = data.map(|data| FastCall {
+                    ir: data.ir.clone(),
+                    environment: data.environment,
+                    realm: data.realm,
+                    strict: data.strict,
+                    parse_text: data.parse_text.clone(),
+                });
                 let saved_depth = agent.field_initializer_depth;
                 agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
                 let result = if is_async_gen {
@@ -2252,12 +2301,17 @@ pub fn is_constructor(agent: &Agent, value: &Value) -> bool {
 /// The record fields the certified fast path reads, pre-fetched by
 /// `call_inner` so `ordinary_call` skips a second `ecma_functions` lookup.
 /// `None` only when the record is missing, which errors in `ordinary_call`.
-type FastCallData = Option<(
-    Option<std::rc::Rc<crate::ir::CompiledBody>>,
-    EnvRef,
-    Handle<Realm>,
-    bool,
-)>;
+struct FastCall {
+    ir: Option<std::rc::Rc<crate::ir::CompiledBody>>,
+    environment: EnvRef,
+    realm: Handle<Realm>,
+    strict: bool,
+    /// The body's own text, which the frame this call pushes runs
+    /// ([`EcmaFunction::parse_text`]).
+    parse_text: Option<JsString>,
+}
+
+type FastCallData = Option<FastCall>;
 
 /// PrepareForOrdinaryCall (spec 10.2.1.2) + OrdinaryCallBindThis (10.2.1.1)
 /// + OrdinaryCallEvaluateBody: the full `[[Call]]` of an ordinary function.
@@ -2277,8 +2331,14 @@ fn ordinary_call(
     // text, params, body AST, compiled IR — on every call); only the slots
     // each branch reads are cloned, and the slow path's `params`/`body` AST
     // clones are skipped entirely for a fast call.
-    let (ir, old_env, realm, strict) = match fast {
-        Some(fast) => fast,
+    let (ir, old_env, realm, strict, parse_text) = match fast {
+        Some(fast) => (
+            fast.ir,
+            fast.environment,
+            fast.realm,
+            fast.strict,
+            fast.parse_text,
+        ),
         None => {
             let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
                 JsError::new(
@@ -2291,6 +2351,7 @@ fn ordinary_call(
                 record.environment,
                 record.realm,
                 record.strict,
+                record.parse_text.clone(),
             )
         }
     };
@@ -2301,8 +2362,11 @@ fn ordinary_call(
         // body env), the realm (global access), and the frame for error
         // stacks — its certification excludes `this`/`arguments`/
         // `new.target`/eval/import/private names/Annex B, so the pushed
-        // context's `script_or_module`/`source`/`private_environment` (all
-        // cloned on the slow path) are never consulted here.
+        // context's `script_or_module`/`private_environment` (both cloned on
+        // the slow path) are never consulted here. Its `source` is: it is the
+        // text this body's spans are offsets into, so every closure the body
+        // creates resolves its own span against it (`enclosing_source`), and
+        // a host that captures a stack sees this call as the activation it is.
         //
         // Cut 3 continuation: a body whose closures capture bindings runs
         // with a capture context — a declarative environment holding the
@@ -2313,11 +2377,6 @@ fn ordinary_call(
             Some(context) => context,
             None => old_env,
         };
-        // The context's `function` is read only by a sloppy body's mapped
-        // `arguments` creation (`Step::CreateArguments`, for `callee`); every
-        // other certified-path reader is excluded by certification (SuperCall
-        // is derived-only), so the clone is skipped unless the body uses
-        // `arguments` in sloppy mode.
         // The context's `function` is read only by a sloppy body's mapped
         // `arguments` creation (`Step::CreateArguments`, for `callee`); every
         // other certified-path reader is excluded by certification (SuperCall
@@ -2336,7 +2395,7 @@ fn ordinary_call(
             lexical_environment: body_env,
             variable_environment: body_env,
             private_environment: None,
-            source: None,
+            source: parse_text,
             annex_b_hoistable: Default::default(),
         });
         // Cut 3 continuation (this slots): a non-arrow certified body gets
@@ -2395,6 +2454,7 @@ fn ordinary_call(
         body,
         declaring_module,
         ir,
+        parse_text,
     ) = {
         let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
             JsError::new(
@@ -2412,6 +2472,7 @@ fn ordinary_call(
             record.body.clone(),
             record.declaring_module,
             record.ir.clone(),
+            record.parse_text.clone(),
         )
     };
     let function_env = new_function_environment(
@@ -2431,6 +2492,18 @@ fn ordinary_call(
     let script_or_module = declaring_module
         .map(crate::context::ScriptOrModule::Module)
         .or(caller_script_or_module);
+    // The callee's own text, not the caller's: this body's spans are offsets
+    // into the text it was parsed from, so a closure it creates must resolve
+    // against that text and not against whatever text the caller happens to be
+    // running. The caller's is the fallback for a body the engine kept no text
+    // for — what this slot carried for every call before it carried the
+    // callee's.
+    let source = parse_text.or_else(|| {
+        agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.source.clone())
+    });
     agent.execution_context_stack.push(ExecutionContext {
         function: Some(function_value),
         realm,
@@ -2438,10 +2511,7 @@ fn ordinary_call(
         lexical_environment: function_env,
         variable_environment: function_env,
         private_environment,
-        source: agent
-            .running_context()
-            .ok()
-            .and_then(|context| context.source.clone()),
+        source,
         annex_b_hoistable: Default::default(),
     });
     let result = (|| -> Result<Value, JsError> {
@@ -3014,18 +3084,26 @@ fn ordinary_construct(
                 ir.scope
                     .as_ref()
                     .is_some_and(|scope| scope.context_names.is_empty())
-                    .then_some((ir, data.environment, data.realm, data.strict))
+                    .then_some((
+                        ir,
+                        data.environment,
+                        data.realm,
+                        data.strict,
+                        data.parse_text.clone(),
+                    ))
             })
         } else {
             None
         }
     };
-    if let Some((ir, environment, realm, strict)) = certified {
+    if let Some((ir, environment, realm, strict, parse_text)) = certified {
         let this = construct_this_object(agent, new_target)?;
         let function_value = function.self_value();
         // The body observes only the closure environment, the realm, and
-        // the frame — mirror the certified call's context (script_or_module,
-        // source, and private_environment are never consulted).
+        // the frame — mirror the certified call's context
+        // (script_or_module and private_environment are never consulted; the
+        // source is, for the closures the body creates and for a host's view
+        // of the call).
         // The context's `function` is read only by a sloppy body's mapped
         // `arguments` creation (Step::CreateArguments, for `callee`); every
         // other certified-path reader is excluded by certification, so the
@@ -3043,7 +3121,7 @@ fn ordinary_construct(
             lexical_environment: environment,
             variable_environment: environment,
             private_environment: None,
-            source: None,
+            source: parse_text,
             annex_b_hoistable: Default::default(),
         });
         let result = (|| -> Result<Value, JsError> {
@@ -3151,6 +3229,14 @@ fn ordinary_construct(
         .declaring_module
         .map(crate::context::ScriptOrModule::Module)
         .or(caller_script_or_module);
+    // The callee's own text; the caller's stands in only when the body has
+    // none (see `ordinary_call`'s slow path).
+    let source = data.parse_text.clone().or_else(|| {
+        agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.source.clone())
+    });
     agent.execution_context_stack.push(ExecutionContext {
         function: Some(function_value),
         realm: data.realm,
@@ -3158,10 +3244,7 @@ fn ordinary_construct(
         lexical_environment: function_env,
         variable_environment: function_env,
         private_environment: data.private_environment,
-        source: agent
-            .running_context()
-            .ok()
-            .and_then(|context| context.source.clone()),
+        source,
         annex_b_hoistable: Default::default(),
     });
     let result = (|| -> Result<Value, JsError> {
@@ -4722,13 +4805,12 @@ mod tests {
 
     #[test]
     fn a_certified_bodys_closure_keeps_its_source() {
-        // A certified body runs under a context with no `source`: the
-        // `ordinary_call`/`tail_prepare_ordinary` fast paths skip the clone on
-        // the ground that a certified body reads only its lexical environment.
-        // `capture_source` is a reader they miss, so the resolution must widen
-        // to the enclosing script — without it every closure such a body
-        // creates loses its text and `Function.prototype.toString` returns the
-        // synthetic `[native code]` form.
+        // A closed-over body created by a certified body keeps its text. This
+        // shape cannot tell *which* text answered — the callee and the script
+        // that calls it are the same text here, so the frame's own text and the
+        // widening search agree — and that is the point: it pins the answer for
+        // the common case. A call from a *different* text is what distinguishes
+        // them (`api::tests::a_called_body_runs_its_own_text_not_the_callers`).
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         let value = agent

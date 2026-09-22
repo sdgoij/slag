@@ -11833,7 +11833,7 @@ impl Vm {
         this: Value,
         args: &[Value],
     ) -> Result<Option<std::rc::Rc<CompiledBody>>, JsError> {
-        let (ir, old_env, realm, strict, is_marked) = {
+        let (ir, old_env, realm, strict, is_marked, parse_text) = {
             let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
                 JsError::new(
                     ErrorKind::TypeError,
@@ -11849,6 +11849,7 @@ impl Vm {
                 record.realm,
                 record.strict,
                 record.class_field_initializer,
+                record.parse_text.clone(),
             )
         };
         let Some(ir) = ir else {
@@ -11877,7 +11878,7 @@ impl Vm {
                     lexical_environment: body_env,
                     variable_environment: body_env,
                     private_environment: None,
-                    source: None,
+                    source: parse_text,
                     annex_b_hoistable: Default::default(),
                 });
             let this_value = if scope.this_slot.is_some() {
@@ -11916,7 +11917,7 @@ impl Vm {
         }
         // Slow path (uncertified): a function environment + declaration
         // instantiation, mirroring `ordinary_call`'s slow branch.
-        let (this_mode, params, body, declaring_module, private_environment) = {
+        let (this_mode, params, body, declaring_module, private_environment, parse_text) = {
             let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
                 JsError::new(
                     ErrorKind::TypeError,
@@ -11929,6 +11930,7 @@ impl Vm {
                 record.body.clone(),
                 record.declaring_module,
                 record.private_environment,
+                record.parse_text.clone(),
             )
         };
         let function_value = function.self_value();
@@ -11946,6 +11948,15 @@ impl Vm {
             .map(crate::context::ScriptOrModule::Module)
             .or(caller_script_or_module);
         agent.execution_context_stack.pop();
+        // The callee's own text; the stack is already the grandcaller's here,
+        // which is never the text this body's spans belong to. See
+        // `ordinary_call`'s slow path.
+        let source = parse_text.or_else(|| {
+            agent
+                .running_context()
+                .ok()
+                .and_then(|context| context.source.clone())
+        });
         agent
             .execution_context_stack
             .push(crate::context::ExecutionContext {
@@ -11955,10 +11966,7 @@ impl Vm {
                 lexical_environment: function_env,
                 variable_environment: function_env,
                 private_environment,
-                source: agent
-                    .running_context()
-                    .ok()
-                    .and_then(|context| context.source.clone()),
+                source,
                 annex_b_hoistable: Default::default(),
             });
         if this_mode != crate::function::ThisMode::Lexical {

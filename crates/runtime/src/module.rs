@@ -1299,11 +1299,16 @@ fn instantiate_module_declarations(
             )?;
             // The function's `import.meta` resolves lexically to this module
             // (spec 13.3.7.1); instantiation runs in the harness context, so
-            // record the declaring module explicitly.
+            // record the declaring module explicitly. The module text is also
+            // the text this body's spans are offsets into — registration had
+            // no frame carrying it, so the fallback above could only have named
+            // the function's own slice, which a nested closure's span would run
+            // past.
             if let ValueKind::Function(handle) = func.kind()
                 && let Some(record) = agent.ecma_functions.get_mut(&handle.id())
             {
                 record.declaring_module = Some(*module);
+                record.parse_text = Some(module.source.clone());
             }
             env.initialize_binding(&name, func)?;
         }

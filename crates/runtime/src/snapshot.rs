@@ -3227,6 +3227,43 @@ mod tests {
         );
     }
 
+    /// A closure created inside a function the **host** calls from Rust keeps its
+    /// own text, and is carried by a snapshot because of it.
+    ///
+    /// Nothing below that call is a script — the host is the caller — so the
+    /// only text the body's spans can be resolved against is the callee's own
+    /// frame. Without it `capture_source` finds nothing, the closure answers the
+    /// native form for `toString`, and the walk refuses it as a function with no
+    /// source: deno's `async_op_0` exactly, which is the shape this pins.
+    #[test]
+    fn a_closure_created_under_a_host_call_carries_its_source() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let factory = context
+            .try_eval("(function () { return function stub() { return 41; }; })")
+            .expect("a factory");
+        let made = context
+            .try_call(&factory, &api::Local::undefined(), &[])
+            .expect("the host's call");
+        assert_eq!(
+            isolate.function_source(&made).as_deref(),
+            Some("function stub() { return 41; }"),
+            "the closure's own text, captured inside a body no script frame encloses"
+        );
+
+        // The same closure through the format: a function is written as the
+        // source it can be re-parsed from, so one with no source is refused —
+        // which is where deno's `create_blob` stopped.
+        let back = round_trip(&isolate, &realm, made.into_value());
+        let back = back.as_function().expect("a function");
+        assert_eq!(
+            call_restored(&isolate, &realm, Value::Function(back), "").as_number(),
+            Some(41.0),
+            "the restored closure runs the body its text re-parses to"
+        );
+    }
+
     /// A function's own properties are its object part's, so they ride with it:
     /// the name and length the engine computed, and anything a host put there.
     #[test]
@@ -3598,28 +3635,35 @@ mod tests {
         );
     }
 
-    /// A class constructor whose class source the engine could not keep is
-    /// still refused as what it is — the case a class defined where there is no
-    /// source text reaches, so the branch stays honest rather than dead.
+    /// A class defined in a body the engine has no *script* frame for still keeps
+    /// its class source: `[[SourceText]]` is captured from the text the class's
+    /// spans belong to, which is the `Function`-built body's own assembled
+    /// string — carried by the frame that body runs under. So this class, which
+    /// the walk used to refuse as source-less, round trips.
     #[test]
-    fn a_class_constructor_without_its_class_source_is_refused() {
+    fn a_class_from_a_dynamic_function_carries_its_class_source() {
         let mut isolate = api::Isolate::new();
         let context = api::Context::new(&mut isolate).expect("a realm");
         let realm = *context.realm();
         let value = context
-            .try_eval("(new Function('return class C { x = 1; }'))()")
+            .try_eval("(new Function('return class C { x = 7; }'))()")
             .expect("a class")
             .into_value();
-        let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
-        assert_eq!(error.type_name, "a class constructor");
-        assert!(error.detail.contains("no source text"), "{}", error.detail);
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "new restored().x").as_number(),
+            Some(7.0),
+            "the class source came from the body it was defined in"
+        );
     }
 
     /// Each function the format cannot carry is refused by the kind it is: the
-    /// fix differs, so the message does. An **arrow** is carried by this format
-    /// now, so the source-less case here is one the engine has no text for at
-    /// all — a closure whose body was parsed from a `Function` constructor's own
-    /// string, which is not a script whose source the context has.
+    /// fix differs, so the message does. The source-less case is now the
+    /// **accessor** — a `get`/`set` body, for which the engine keeps no
+    /// `[[SourceText]]` at all (its frame carries the text it was parsed from;
+    /// its own text is method-form and is part of the method work) — and a
+    /// class or arrow defined inside a `Function`-built body is *carried* now,
+    /// because that body's frame carries the assembled text its spans belong to.
     #[test]
     fn an_uncarried_function_is_refused_by_kind() {
         let mut isolate = api::Isolate::new();
@@ -3627,7 +3671,7 @@ mod tests {
         let realm = *context.realm();
         for (source, expected, detail) in [
             (
-                "(new Function('return () => 1'))()",
+                "Object.getOwnPropertyDescriptor({ get x() { return 1; } }, 'x').get",
                 "a function",
                 "no source text",
             ),
