@@ -87,6 +87,7 @@ impl Context {
         slots: &[(usize, Context, Vec<crate::snapshot::SnapshotItem>)],
         externals: &[*mut std::ffi::c_void],
         host: Option<&dyn crate::snapshot::HostCallbacks>,
+        realm_global: bool,
     ) -> Result<Vec<u8>, crate::snapshot::Unsupported> {
         let Some((_, first, _)) = slots.first() else {
             return Err(crate::snapshot::Unsupported::empty_table());
@@ -104,6 +105,7 @@ impl Context {
                     index: *index,
                     realm: *realm,
                     items,
+                    realm_global,
                 })
                 .collect();
             let table: Vec<usize> = externals.iter().map(|pointer| *pointer as usize).collect();

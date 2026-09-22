@@ -468,6 +468,12 @@ pub struct Slot<'a> {
     /// The items the host attached to that context, in the order it attached
     /// them: the indices a restore hands them back under.
     pub items: &'a [SnapshotItem],
+    /// Whether the slot also carries the realm's **global object** — its state,
+    /// not only the values a host attached — so a restore puts back what the
+    /// writing realm installed on its global. A host that wants its own names
+    /// (`Deno`, an op table) to survive a restart sets this; `encode`/`decode`
+    /// do not, so the single-value form is unchanged.
+    pub realm_global: bool,
 }
 
 /// What a slot holds: an ordinary value, or a module record.
@@ -530,7 +536,7 @@ pub fn encode_slots(
 ) -> Result<Vec<u8>, Unsupported> {
     let mut objects: Vec<Entry> = Vec::new();
     let mut serials: HashMap<Identity, u32> = HashMap::new();
-    let mut table: Vec<(usize, Vec<u32>)> = Vec::with_capacity(slots.len());
+    let mut table: Vec<(usize, u32, Vec<u32>)> = Vec::with_capacity(slots.len());
     for slot in slots {
         let mut items = Vec::with_capacity(slot.items.len());
         for item in slot.items {
@@ -549,13 +555,31 @@ pub fn encode_slots(
                 }
             });
         }
-        table.push((slot.index, items));
+        // The realm's global is visited after its items so a value a host
+        // attached and a property of the global are **one** record when they are
+        // one object: identity is the serial map, so whichever the walk reaches
+        // first fixes the serial both are written under.
+        let global = if slot.realm_global {
+            visit(
+                agent,
+                &slot.realm,
+                externals,
+                host,
+                Value::Object(slot.realm.global_object),
+                &mut objects,
+                &mut serials,
+            )?
+        } else {
+            NO_REF
+        };
+        table.push((slot.index, global, items));
     }
 
     let mut body = Vec::new();
-    for (index, items) in &table {
+    for (index, global, items) in &table {
         write_u32(&mut body, *index as u32);
         write_u32(&mut body, items.len() as u32);
+        write_u32(&mut body, *global);
         for item in items {
             write_u32(&mut body, *item);
         }
@@ -591,6 +615,7 @@ pub fn encode(agent: &Agent, realm: &Handle<Realm>, root: Value) -> Result<Vec<u
             index: 0,
             realm: *realm,
             items: &items,
+            realm_global: false,
         }],
         &[],
         None,
@@ -623,22 +648,23 @@ pub fn decode_slot(
     let (body_len, context_count) = header(bytes)?;
     let mut body = Reader::new(&bytes[HEADER_LEN..HEADER_LEN + body_len]);
 
-    let mut wanted: Option<Vec<u32>> = None;
+    let mut wanted: Option<(u32, Vec<u32>)> = None;
     for _ in 0..context_count {
         let index = body.u32().ok_or(DecodeError::Truncated)? as usize;
         let count = body.u32().ok_or(DecodeError::Truncated)? as usize;
         if count > body.bytes.len() {
             return Err(DecodeError::Truncated);
         }
+        let global = body.u32().ok_or(DecodeError::Truncated)?;
         let mut items = Vec::with_capacity(count);
         for _ in 0..count {
             items.push(body.u32().ok_or(DecodeError::Truncated)?);
         }
         if index == slot {
-            wanted = Some(items);
+            wanted = Some((global, items));
         }
     }
-    let Some(items) = wanted else {
+    let Some((global, items)) = wanted else {
         return Ok(None);
     };
 
@@ -664,6 +690,12 @@ pub fn decode_slot(
         class_prototypes: HashMap::new(),
     };
     let mut values = Vec::with_capacity(items.len());
+    // The realm's own state first: a host's item that the global also holds is
+    // then the very object the global was given, because the builder caches by
+    // serial either way.
+    if global != NO_REF {
+        builder.apply_realm_global(global)?;
+    }
     for serial in items {
         values.push(builder.materialize_item(serial)?);
     }
@@ -2340,6 +2372,30 @@ impl Builder<'_> {
         }
     }
 
+    /// Put the carried realm global back where it belongs: **onto** the reading
+    /// realm's global.
+    ///
+    /// The record is not a value to hand a host, it is the state of a realm the
+    /// host never sees built. So its serial is recorded as the reading realm's
+    /// global *before* its properties are defined, which is what makes a
+    /// property that refers back to the global — `globalThis` is the ordinary
+    /// one — resolve to the real global rather than to a copy of it. Only the
+    /// properties are applied: the prototype and the extensibility are the
+    /// reading realm's, because `Context::new` rebuilt the realm around the
+    /// state and the state is all that travels. A property this realm already
+    /// has and refuses to redefine (a non-configurable builtin the writing realm
+    /// had replaced) is left as this realm's own, which is the same "the realm is
+    /// rebuilt either way" rule the format's header states.
+    fn apply_realm_global(&mut self, serial: u32) -> Result<(), DecodeError> {
+        let records = self.records;
+        let Some(Record::Object { properties, .. }) = records.get(serial as usize) else {
+            return Err(DecodeError::Truncated);
+        };
+        let global = self.realm.global_object;
+        self.remember(serial as usize, Built::Object(global));
+        define_properties(self, global, properties)
+    }
+
     /// The item a serial names, which a slot's own list needs: every record is a
     /// value except a module's, which is not one.
     fn materialize_item(&mut self, serial: u32) -> Result<SnapshotItem, DecodeError> {
@@ -3661,6 +3717,91 @@ mod tests {
         assert!(decode(agent_mut(&isolate), &realm, &blob).is_err());
     }
 
+    /// A slot asked to carry its realm's global restores that state **onto** the
+    /// reading realm's global: what the writer installed is back, and a property
+    /// that held the writer's global holds the reader's after the restore, which
+    /// is what makes `globalThis` a self-reference rather than a copy. A slot that
+    /// did not ask for it carries nothing, which is `encode`'s shape.
+    #[test]
+    fn a_carried_realm_global_lands_on_the_reading_realms_global() {
+        let mut writer = api::Isolate::new();
+        let writer_context = api::Context::new(&mut writer).expect("a realm");
+        let realm = *writer_context.realm();
+        writer_context
+            .try_eval("globalThis.__carried = { n: 7 }; globalThis.__self = globalThis;")
+            .expect("install a global");
+
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &[],
+            realm_global: true,
+        }];
+        let blob = encode_slots(agent_of(&writer), &slots, &[], None).expect("a blob");
+
+        let mut reader = api::Isolate::new();
+        let reader_context = api::Context::new(&mut reader).expect("a realm");
+        let reader_realm = *reader_context.realm();
+        let items = decode_slot(agent_mut(&reader), &reader_realm, &blob, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        assert!(items.is_empty(), "the slot attached no items of its own");
+
+        // The carried global **is** this realm's global rather than a copy of it:
+        // `globalThis`, and a property that held the writing realm's global, both
+        // name this realm's global object. The JavaScript reads below cannot tell
+        // a faithful copy from the object itself (they move together), so the
+        // identity is asserted against the realm handle.
+        let realm_global = Value::Object(reader_realm.global_object);
+        let global_id = reader_realm.global_object.id();
+        for key in ["globalThis", "__self"] {
+            let value = crate::context::get_property_key(
+                agent_mut(&reader),
+                &realm_global,
+                &PropertyKey::from_utf8(key),
+                realm_global,
+            )
+            .expect("a read");
+            assert_eq!(
+                value.as_object().map(|object| object.id()),
+                Some(global_id),
+                "{key} names the reading realm's global"
+            );
+        }
+
+        let back = reader_context
+            .try_eval("globalThis.__carried.n + ',' + (globalThis.__self === globalThis)")
+            .expect("the state came back")
+            .into_value();
+        assert_eq!(
+            back.as_string()
+                .map(|text| text.to_string_lossy())
+                .as_deref(),
+            Some("7,true")
+        );
+
+        // A slot that did not ask for the global carries none of it: the same
+        // writer value through `encode` leaves the reading global as it was.
+        let plain = encode_value(&writer, &realm, Value::Number(1.0));
+        let mut other = api::Isolate::new();
+        let other_context = api::Context::new(&mut other).expect("a realm");
+        let other_realm = *other_context.realm();
+        decode_slot(agent_mut(&other), &other_realm, &plain, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        let absent = other_context
+            .try_eval("typeof globalThis.__carried")
+            .expect("a read")
+            .into_value();
+        assert_eq!(
+            absent
+                .as_string()
+                .map(|text| text.to_string_lossy())
+                .as_deref(),
+            Some("undefined")
+        );
+    }
+
     /// The context table is structural: two slots keep their own items, and a
     /// slot the blob does not name answers `None` rather than an empty list.
     #[test]
@@ -3673,11 +3814,13 @@ mod tests {
                 index: 0,
                 realm,
                 items: &first,
+                realm_global: false,
             },
             Slot {
                 index: 3,
                 realm,
                 items: &second,
+                realm_global: false,
             },
         ];
         let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
@@ -3722,6 +3865,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
         let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
 
@@ -3761,6 +3905,7 @@ mod tests {
             index: 1,
             realm: *second.realm(),
             items: &items,
+            realm_global: false,
         }];
         let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
 
@@ -3797,6 +3942,7 @@ mod tests {
             index: 0,
             realm: *first.realm(),
             items: &items,
+            realm_global: false,
         }];
         let error = encode_slots(agent_of(&isolate), &slots, &[], None).expect_err("refused");
         assert_eq!(error.type_name, "a value from another realm");
@@ -3827,6 +3973,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
         let table = [0x9999usize, pointer as usize, other as usize];
         let blob = encode_slots(agent_of(&isolate), &slots, &table, None).expect("a blob");
@@ -3869,6 +4016,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
         let error = encode_slots(agent_of(&isolate), &slots, &[], None).expect_err("refused");
         assert_eq!(error.type_name, "a host pointer");
@@ -3896,6 +4044,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
         // The pointer sits at index 1 of a two-entry table, so an index that was
         // ignored would resolve to the wrong entry rather than to nothing.
@@ -4019,6 +4168,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
         // The pointer sits at index 1, so an index that was written or read
         // wrongly would resolve to the other entry rather than to nothing.
@@ -4098,6 +4248,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
         let blob =
             encode_slots(agent_of(&isolate), &slots, &[pointer], Some(&host)).expect("a blob");
@@ -4155,6 +4306,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
 
         let error =
@@ -4187,6 +4339,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
 
         let error =
@@ -4220,6 +4373,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
         let table = [other, pointer];
         let blob = encode_slots(agent_of(&isolate), &slots, &table, Some(&host)).expect("a blob");
@@ -4268,9 +4422,11 @@ mod tests {
         assert!(decode_it(&cut_short).is_err());
 
         let mut bad_tag = blob.clone();
-        // The body is the context table (slot index, item count, one item) then
-        // the object count, so the first record's tag follows those 16 bytes.
-        bad_tag[HEADER_LEN + 16] = 200;
+        // The body is the context table — slot index, item count, the carried
+        // global serial, one item — then the object count, so the first record's
+        // tag follows those 20 bytes (the global serial is `NO_REF` here, which
+        // is what `encode` carries, but it is written either way).
+        bad_tag[HEADER_LEN + 20] = 200;
         assert!(matches!(decode_it(&bad_tag), Err(DecodeError::BadTag(200))));
 
         assert_eq!(
@@ -4623,6 +4779,7 @@ mod tests {
             index: 0,
             realm,
             items: &items,
+            realm_global: false,
         }];
         let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
         let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[], None)

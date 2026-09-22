@@ -2588,7 +2588,7 @@ The battery ran on the tree as it stood when the format landed; the exotic gate 
 
 *The table is structural now, not a value graph.* Slice 1 built the table as an array of arrays — engine values, which is what made the realm question unavoidable: the array had to be made in *some* realm, and the first version's failure came from making it through the isolate's current one. A table is the format's own structure, so it is written as one: the header carries the context count and the body carries `(slot, item count, item serials)` per context, then the records. No scaffolding objects exist to be attributed to a realm.
 
-*Each slot is written and read against its own realm.* `encode_slots` takes `Slot { index, realm, items }` and walks each slot's items with that slot's realm; `decode_slot(realm, bytes, slot)` materializes that slot's items in the realm being restored into. The realm is not a hint: a value's builtins are its own realm's, and a reference to one is written as *the name its realm knows it by*. So every record remembers the realm it was first reached through — that is the realm whose `name_of_value` recognizes it — which is why `objects` carries `(Value, Handle<Realm>)` pairs rather than values.
+*Each slot is written and read against its own realm.* `encode_slots` takes `Slot { index, realm, items, realm_global }` and walks each slot's items with that slot's realm (the last field, part 18, adds the realm's **global object** to what a slot carries); `decode_slot(realm, bytes, slot)` materializes that slot's items in the realm being restored into. The realm is not a hint: a value's builtins are its own realm's, and a reference to one is written as *the name its realm knows it by*. So every record remembers the realm it was first reached through — that is the realm whose `name_of_value` recognizes it — which is why `objects` carries `(Value, Handle<Realm>)` pairs rather than values.
 
 *An intrinsic name is realm-agnostic, and that is the mechanism rather than a leak.* Two realms' `%Object.prototype%` are two objects with one name, so they share the identity key, share one record, and each restore resolves the name to the realm it is materializing in — which is the correct object for each slot. A value *shared* between two slots that is not an intrinsic comes back as one value per slot, because a restore makes values one slot at a time; a host that needs one object in both realms has a cross-realm reference, which V8's own snapshot would carry and this format does not claim to yet.
 
@@ -2873,6 +2873,20 @@ The probes, all removed once they had answered: a `probe_walk` beside `visit` (t
 *Six mutations, each caught.* The accessor's `source` argument dropped in `instantiate_accessor` (both tests fail); the compiled path's capture dropped in `ir.rs`'s `object_accessor` (both fail — the object-literal assertions are its guard, including the `new Function` one); the class path's capture dropped in `class.rs`'s getter (both fail on the class assertion); the snapshot rebuild's `Some(text)` replaced by `None` in the getter and the setter arm (only `an_accessor_round_trips_with_its_source` fails — the discrimination the replaced refusal test never had); and `object_assign`'s **target** then **source** coercion reverted to the `ValueKind::Object` match (the first throws "assign target is not an object", the second drops a function source's property).
 
 Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test -p runtime --lib` **865 passed / 0 failed**; `cargo test -p parser --lib` 86 / 0 and `cargo test -p test262` 3,324 / 0 (2 ignored) plus 3 / 0; `cargo test --locked --workspace -- --skip the_data_a_built_function_carries_survives_a_collection` **5,244 → 5,245 passed / 0 failed** (the one net-new test; the replaced refusal test nets zero). `crates/{runtime,parser,syntax}` changed, so the battery ran with the release binaries rebuilt: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+**A realm's global travels with its slot — landed, and deno's load reads its own `Deno`.** The eighteenth part of ledger item 16, and the integration §12's eleventh item named after the carried-global experiment measured it: the blob now carries each recorded context's **realm global object**, and the restore puts it back onto the reading realm's global.
+
+*The format.* A slot's table entry gains a `realm_global` serial after its item count (`NO_REF` when a host does not ask for one); `Slot` gained the flag, `api::Context::write_snapshot` gained the parameter the bridge passes `true`, and the walk visits the slot realm's global after its items so a value a host attached and a property of the global that are one object are written as **one** record. `encode`/`decode` (the single-value convenience) set the flag false, so their semantics are unchanged — which is why one engine test's field offset moved and nothing else did.
+
+*The restore puts it where it belongs rather than handing it over.* The carried global is not a value a host reads, it is the state of a realm `Context::new` already built — so `decode_slot` records the carried serial as the reading realm's global **before** defining the carried record's own properties onto it. That seed is the whole trick: a property that held the writing realm's global (a host's own alias, and `globalThis` itself) then resolves to the reading realm's global rather than to a second copy of it. Only properties are applied — the prototype and the extensibility stay the reading realm's — and a property this realm refuses to redefine (a non-configurable builtin the writer had replaced) is left as this realm's own, the same "the realm is rebuilt either way" rule the format's header states. The realm's state is applied before the slot's items are materialized, so a host's item the global also holds is the very object the global was given.
+
+*Tests.* Two. `snapshot::tests::a_carried_realm_global_lands_on_the_reading_realms_global` (the writer installs `globalThis.__carried` and `globalThis.__self`, the reader sees the value, `__self` **is** the reading realm's global, and a slot that did not ask — the same value through `encode` — carries none of it) and `a_hosts_installed_global_survives_the_blob` in the bridge, which is the host-facing claim: what a host installed is there after a blob round trip, with deno's `InitMode::FromSnapshot` shape in its doc comment. **Three mutations, each caught**: the seed dropped (`globalThis` names a copy — asserted against the realm handle, see below), the apply skipped (both tests fail), and the bridge's flag flipped to `false` (the bridge test fails, the engine test stands, which is the flag's own guard).
+
+*And one draft assertion was not discriminating, caught by mutating rather than by reading.* The first version asserted the identity in JavaScript (`__self === globalThis`), which passes without the seed: the apply overwrites the reading global's own `globalThis` with the copy, so both sides of the comparison move together. The assertion is now against the realm's global **handle**, which is the only thing a copy cannot mimic.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace --no-fail-fast -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,245 → 5,247 passed / 0 failed** (the two new tests). `crates/runtime` changed, so the battery ran with the release binaries rebuilt: test262 `all` 48,622 — **48,464 pass, 0 fail / 0 crash / 0 hang**, 158 skip; `intl402` 3,357 — 3,205 pass, 152 skip; the eight wasm core suites 64,594 checks / 0 fail / 0 pending; the JS-API sweep 1,001 tests / 0 fail.
+
+*And the next thing is a different part of the realm.* Measured on deno with the binary rebuilt from this tree: the load gets past the missing `Deno` — `initialize_deno_core_namespace` is skipped as `InitMode::FromSnapshot` intends, and `bindings::get::<v8::Local<Object>>` for `Deno` answers where it used to panic "unable to convert" — and dies one step later in `initialize_deno_core_ops_bindings` (`bindings.rs:591`), where the engine's error channel reports **`ReferenceError: "ObjectDefineProperty" is not defined`**. deno's primordials are script-level `const` bindings from `00_primordials.js`, so they live in the realm's **global lexical environment**, not on the global object — and the global object is all this format carries. That is §12's eleventh item's new next part (carry the global *lexical* bindings, or state the limit), a mechanism of its own rather than more of this one.
 
 ## 8. Parked: the C++ face
 
@@ -4960,6 +4974,35 @@ migrate, then delete.
    "deno's prebuilt heap snapshot on Slag", which the measurement above rules out,
    and starts meaning one of two measured paths: deno's from-source boot, or a
    boot whose realm's global state came out of the blob.
+   **Landed** (named before the edit, §11's order), and it is the second of the two measured
+   paths. The format's per-slot entry carries a `realm_global` serial (`NO_REF` when a host
+   does not ask for one); `Slot` gained the flag, `api::Context::write_snapshot` the parameter
+   the bridge passes `true`, and `decode_slot` seeds its builder so the carried global's
+   serial **is** the reading realm's global before defining the carried record's own
+   properties onto it — identity preserved, so `globalThis` and a property that held the
+   writing realm's global both name the reading realm's global rather than a copy. The
+   prototype and the extensibility stay the reading realm's, because `Context::new` rebuilt
+   the realm around the state and only the state travels. `encode` and `decode` (the
+   single-value convenience) do not carry it, so their semantics are unchanged. This is an
+   engine change rather than a bridge one because the engine is what built the reading realm's
+   global and what resolves a name against it; a bridge that merged two objects itself would
+   be the host's private convention this item rejected.
+
+   Measured on deno: the load now gets **past the missing `Deno`** — `initialize_deno_core_namespace`
+   is skipped as `InitMode::FromSnapshot` intends and `bindings::get::<v8::Local<Object>>` for
+   `Deno` answers, where before it panicked "unable to convert" — and dies one step later in
+   `initialize_deno_core_ops_bindings` (`bindings.rs:591`) with the engine reporting
+   **`ReferenceError: "ObjectDefineProperty" is not defined`**.
+
+   **And that is the next item, because it is a different part of the realm.** deno's
+   primordials are script-level `const` bindings from `00_primordials.js`, so they live in the
+   realm's **global lexical environment**, not on the global object — and the carried global
+   object is all this format carries. A restored bootstrap function that references one fails
+   with the `ReferenceError` above, which is the same limit the format states for a closure's
+   free names, one level up. So the next part is to carry a realm's global *lexical* bindings
+   alongside its global object (or to state the limit and keep a host on the from-source path),
+   a new mechanism rather than a larger version of this one.
+
 12. **`Object.assign` and a function — landed, both roles fixed.** §7's
    measurement found it in passing: `Object.assign(function () {}, { tag: 7 })`
    throws `TypeError: assign target is not an object`, because `object_assign`

@@ -298,7 +298,15 @@ impl SnapshotCreator {
             slots.push((slot, self.contexts[position], self.items_of(slot)));
         }
         let host = SnapshotCallbacks { callbacks };
-        match api::Context::write_snapshot(&slots, &engine_table(&self.externals), Some(&host)) {
+        // The realm's global state travels too: a host's snapshot is meant to put
+        // back what it installed on the global (`Deno`, an op table), which is
+        // what `InitMode::FromSnapshot` reads before it runs any bootstrap.
+        match api::Context::write_snapshot(
+            &slots,
+            &engine_table(&self.externals),
+            Some(&host),
+            true,
+        ) {
             Ok(bytes) => StartupData::new(bytes),
             Err(error) => {
                 panic!("v8::SnapshotCreator::create_blob: the engine cannot carry {error} yet")
@@ -640,6 +648,43 @@ mod tests {
 
         let mut isolate = isolate_from(blob);
         assert_eq!(data(&mut isolate, 2), vec![Some(7.0), Some(42.0)]);
+    }
+
+    /// What a host installed on its global survives the blob, and a property that
+    /// held the writing realm's global holds the **reading** realm's after the
+    /// restore — the identity `globalThis` is built on. This is the state
+    /// `deno_core`'s `InitMode::FromSnapshot` reads (`Deno`, the op table) before
+    /// it runs any bootstrap, so a blob without it cannot restore a host at all.
+    #[test]
+    fn a_hosts_installed_global_survives_the_blob() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            crate::test_support::eval(
+                scope,
+                "globalThis.__carried = { n: 7 }; globalThis.__self = globalThis;",
+            );
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        assert_eq!(
+            crate::test_support::eval(
+                scope,
+                "globalThis.__carried.n + ',' + (globalThis.__self === globalThis)",
+            )
+            .to_rust_string_lossy(scope),
+            "7,true"
+        );
     }
 
     /// A module a host attached is an item a blob carries rather than one it
