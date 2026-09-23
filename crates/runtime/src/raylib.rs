@@ -2716,9 +2716,107 @@ fn set_exit_key(args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Undefined)
 }
 
+// ---- cursor/DPI reconciliation ----
+
+/// GLFW's own content scale for the window that currently has the GL context.
+///
+/// Two raylib entry points get close and both fail here. `GetWindowScaleDPI`
+/// returns `(1, 1)` as soon as `FLAG_FULLSCREEN_MODE` is set
+/// (`rcore_desktop_glfw.c`) -- the exact case this is for. And `GetWindowHandle`
+/// returns NULL on Linux in this build, because its Wayland branch sits behind
+/// `_GLFW_WAYLAND`, a GLFW-internal macro raylib's own sources never define (so
+/// the function falls through to `return NULL;`). Passing that NULL on was a
+/// crash; libraylib bundles GLFW and exports `glfwGetCurrentContext` and
+/// `glfwGetWindowContentScale`, so the scale is read from those instead. The
+/// NULL guard means a missing context degrades to "no correction" rather than a
+/// dereference.
+fn window_content_scale() -> Vector2 {
+    unsafe extern "C" {
+        fn glfwGetCurrentContext() -> *mut core::ffi::c_void;
+        fn glfwGetWindowContentScale(
+            window: *mut core::ffi::c_void,
+            xscale: *mut f32,
+            yscale: *mut f32,
+        );
+    }
+    let mut scale = Vector2 { x: 1.0, y: 1.0 };
+    // SAFETY: GLFW is bundled into libraylib and initialised by `InitWindow`,
+    // which leaves the created window's context current on this thread, and the
+    // call only writes the two out-pointers.
+    unsafe {
+        let window = glfwGetCurrentContext();
+        if !window.is_null() {
+            glfwGetWindowContentScale(window, &mut scale.x, &mut scale.y);
+        }
+    }
+    scale
+}
+
+/// Whether the platform reports the cursor in logical (window) pixels rather
+/// than framebuffer pixels. Cached: the session type does not change under a
+/// running window. macOS cursors are in points; on Linux, GLFW prefers its
+/// Wayland backend whenever a compositor socket is in the environment, and that
+/// backend reports the cursor in logical pixels too. X11 and Windows report it
+/// in the same pixels raylib reports.
+fn cursor_is_logical() -> bool {
+    static LOGICAL: OnceLock<bool> = OnceLock::new();
+    *LOGICAL.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::env::var_os("WAYLAND_DISPLAY").is_some()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    })
+}
+
+/// Point the cursor's coordinate space at the screen's.
+///
+/// `init_window` sets `FLAG_WINDOW_HIGHDPI`, so on a scaled display raylib
+/// draws into the framebuffer while reporting the logical window as the screen,
+/// and the logical cursor agrees with it. Entering fullscreen flips
+/// `GetScreenWidth()` to the framebuffer's *physical* size and resets the cursor
+/// scale to 1, but the cursor stays logical. The scene draws against
+/// `GetScreenWidth()` while raygui hit-tests with `GetMousePosition()`, so on a
+/// display with a content scale above 1 the two spaces part company by exactly
+/// that scale and every `rl.gui*` control misses -- a menu whose items cannot be
+/// clicked. raylib's own correction lives behind `#if defined(_GLFW_WAYLAND)`,
+/// which its vendored GLFW never defines for raylib's sources, so it is
+/// compiled out; it is reapplied here each frame, before the UI reads the mouse.
+fn sync_cursor_space() {
+    if !cursor_is_logical() {
+        return;
+    }
+    // SAFETY: window-state reads on the installing thread (see `window_method`).
+    let framebuffer_screen = unsafe {
+        raylib_sys::GetScreenWidth() == raylib_sys::GetRenderWidth()
+            && raylib_sys::GetScreenHeight() == raylib_sys::GetRenderHeight()
+    };
+    // `screen` at the framebuffer size means fullscreen under raylib's HIGHDPI
+    // path; left logical, the cursor already matches.
+    let (scale_x, scale_y) = if framebuffer_screen {
+        let dpi = window_content_scale();
+        (dpi.x, dpi.y)
+    } else {
+        (1.0, 1.0)
+    };
+    // SAFETY: as above.
+    unsafe { raylib_sys::SetMouseScale(scale_x, scale_y) };
+}
+
 // ---- drawing ----
 
 fn begin_drawing(_args: &[Value]) -> Result<Value, JsError> {
+    // Keep the cursor in the space the UI is about to be drawn in (see
+    // `sync_cursor_space`); this has to run before the `rl.gui*` controls
+    // read the mouse.
+    sync_cursor_space();
     // SAFETY: draw state on the installing thread (see `window_method`).
     unsafe { raylib_sys::BeginDrawing() };
     Ok(Value::Undefined)
