@@ -3320,6 +3320,137 @@ of 48,622, `intl402` 3,205 / 0 fail (152 skip); the eight wasm core suites 64,59
 checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 / 0 fail. The sweeps were run
 because the change is in `runtime`'s snapshot module, and they reproduce.
 
+**The next part, named from the measurement: a realm's global lexical bindings.**
+The seven release failures are not seven mechanisms. The simplest reads
+straight: `will_snapshot2` evaluates `let a = 1 + 2` at a script's top level
+before the snapshot and asserts `a` after the restore (`runtime/tests/
+snapshot.rs:39-53`), and it fails with `ReferenceError: "a" is not defined` —
+because a top-level `let` is a **global lexical** binding: it lives in the global
+environment record's declarative half, not on the global object, and the blob
+carries the global object. `lazy_loaded_esm_not_snapshotted_but_metadata_survives`
+is that shape one level down (`"op_print" is not defined`: the ops module's
+export binding), and `dynamic_imports_snapshot`, `import_meta_snapshot` and
+`es_snapshot_without_runtime_module_loader` fail with `TypeError: undefined is
+not a function` — a restored binding that came back as nothing.
+
+So the mechanism is the one this record tried once and reverted for having no
+buyer ("an unused field in a format whose compatibility surface is what it
+writes") — **carry a realm's global lexical bindings with the carried global**.
+§12's eleventh item named it and then set it aside when deno's own primordials
+turned out to be IIFE closure variables; `will_snapshot2` is the buyer, and the
+shape is already in the tree:
+
+- The walk carries a *named binding list*: per entry a key serial, a flags byte
+  and two u32s (`write_properties`/`read_properties`, `crates/runtime/src/
+  snapshot.rs:2652` and `:3008`), which is what `read_bindings` reads an
+  environment record's bindings through — so this is that shape, not a new
+  record kind.
+- Write side: `encode_slots`'s per-slot loop (`:711`), where the carried global
+  is already visited under `Slot::realm_global`. The bindings live in
+  `slot.realm.global_env`'s `EnvRecord::Global(global).declarative.bindings`
+  (`env.rs:502`; `GlobalEnv.declarative` at `:1011`), each `Binding { value:
+  Option<Value>, mutable, strict, deletable }` (`env.rs:385`) — and `value:
+  None` is the TDZ, which the format already spells `NO_REF`.
+- Read side: `decode_slot` (`:840`) beside `apply_realm_global` (`:3254`):
+  after the global is applied, define what the list names into the reading
+  realm's global declarative record (`create_mutable_binding` /
+  `create_immutable_binding`, then `initialize_binding`).
+- One detail to settle by reading rather than guessing: a key is a *serial*, so
+  the builder must materialize a carried string the way `settle_envs` does for an
+  environment record's names.
+
+Not implemented here: this session ran out during reconnaissance, and a format
+addition has to land with its test, its battery and its measurement rather than
+half-written. Nothing in the tree changed this turn.
+
+**Landed, and `will_snapshot2` passes.** The mechanism the record above named is
+this one, with the buyer it was waiting for. A top-level `let`, `const` or
+`class` is a global *lexical* binding: it lives in the global environment
+record's declarative half, not on the global object the format carried.
+
+*The mechanism, on both sides.* The context table's per-slot entry grows by one
+field — a binding list in the shape a property list already has (a count, then
+per binding a name serial, the attributes byte, a value serial and one reserved,
+which `read_properties` already reads) — and the slot's `realm_global` flag is
+what turns it on, so no host API moved: `encode`/`decode` still carry nothing,
+and the bridge's `write_snapshot(..., true)` now carries both halves. The write
+side reads `realm.global_env`'s
+`EnvRecord::Global(global).declarative.bindings`, visits each name and value (so
+a binding whose value the global also holds is **one** record), and writes the
+attributes byte through `binding_flags` — the same byte `write_env` wrote, now
+spelled once for both. A value that is absent is `NO_REF`, the TDZ. The read side
+(`Builder::apply_realm_bindings`, beside `apply_realm_global`) pushes the
+bindings into the reading realm's global declarative record in one step, the way
+`settle_envs` restores an environment record's — so a `NO_REF` stays the TDZ
+rather than becoming `undefined` — and bumps the global object's generation: a
+declarative change does not touch the object, and a compiled global read
+validates against the object's generation alone
+(`GlobalEnv::bump_declarative_generation`), so a cell warmed in the agent before
+the restore could otherwise keep serving what it saw. A name the reading realm
+already declared lexically, and a binding that is a module import indirection,
+are refused by name.
+
+*Format version — unchanged, deliberately.* The row shape changed and
+`FORMAT_VERSION` stays **1**: nothing outside this tree has written a blob, so
+there is no released reader for a shape change to be distinguished from, and a
+version is a promise about blobs that exist. The version moves the day a released
+reader would misread what a released writer wrote. The module doc records the
+shape change instead of implying a version for it, and `header`'s refuse-any-other
+check is unchanged.
+
+*Two limits this makes loud instead of silent.* The bindings are part of the
+**walk**, so a global lexical binding the format cannot carry — a `Proxy` in a
+top-level `let` — now refuses the snapshot by name where it used to be dropped
+without a word, and so does a binding whose value the walk refuses. That is the
+policy the format already states; neither had a path to a host before.
+
+*The measurement.* deno's release snapshot suite goes **11 passed / 7 failed**
+to **12 passed / 6 failed**: `will_snapshot2` — `let a = 1 + 2` before the
+snapshot, `a` read after the restore — passes. The six that remain are the
+module-state question rather than this mechanism, and one of them is a corrected
+prediction: this part did **not** clear `lazy_loaded_esm_not_snapshotted_but_
+metadata_survives`, which still reports `"op_print" is not defined` — that is the
+**ops module's export binding**, one level down from a global lexical one.
+`dynamic_imports_snapshot` and `import_meta_snapshot` still fail on
+`TypeError: undefined is not a function`,
+`es_snapshot_without_runtime_module_loader` reports the same,
+`es_snapshot` shows a `ModuleRequest` whose `referrer_source_offset` differs (7
+against 26 — module metadata, not bindings), and `jsrealm::es_snapshot` still
+stops at `bindings.rs:316: unable to convert`.
+
+*Tests — three, each mutated.*
+`a_global_lexical_binding_travels_with_the_carried_global` declares
+`let carried = 41 + 1; const fixed = 7;` at a script's top level, snapshots the
+realm's global, restores it into a fresh realm, and asserts both values, that the
+`let` is still **writable with the write visible**, and that the `const` still
+throws on assignment.
+`a_carried_binding_in_the_temporal_dead_zone_stays_uninitialized` creates a
+binding through the engine's own `create_mutable_binding` (a script cannot leave
+one behind — its `let` is initialized by the time it returns) and asserts the
+restored name reads as "Cannot access … before initialization" rather than "is not
+defined": the two are different `ReferenceError`s, and the first draft of this
+test passed for the wrong reason without the message.
+`a_global_lexical_binding_the_format_cannot_carry_refuses_the_snapshot` puts a
+`Proxy` in a top-level `let` and asserts the refusal names it. Four mutations,
+each caught by a **different** assertion: the write side collecting no bindings
+(all three), the reader turning the TDZ's `NO_REF` into `undefined` (the TDZ
+test), the reader dropping the attributes byte (the `const` test), and the reader
+dropping only the mutable bit (the `let` write-back). *And one of them was a real
+defect:* the first pass left `deletable` and `parameter` hard-coded `false` on the
+read side after the mutation sweep, which **no** test caught (a global `let` is
+never deletable and never a parameter); it was found by reading the diff back,
+and the flags byte is now read field by field from what the write side wrote.
+
+*Gates.* `cargo test --locked --workspace` green (skipping the pre-existing
+aborting `function::tests::the_data_a_built_function_carries_survives_a_
+collection`, as the baseline does); runtime `--lib` **881** (was 878) and `v8`
+**235**; `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean; test262 `all` 48,464 pass / 0 fail / 0 crash
+/ 0 hang (158 skip) of 48,622 and `intl402` 3,205 / 0 fail (152 skip),
+unchanged; the eight wasm core suites 64,594 checks / 0 fail / 0 pending and
+`wasmtest jsapi` 1,001 / 0 fail, unchanged. The sweeps were re-run rather than
+argued about because `runtime`'s snapshot module is linked by every runner.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5624,6 +5755,21 @@ migrate, then delete.
    bindings. It was reverted rather than landed — an unused field in a format whose compatibility
    surface is what it writes is a cost with no buyer — and §7's record of the probe has the
    numbers. The mechanism the load needed is the environment chain, one level *down*.
+
+   **And it landed anyway, with a buyer the first attempt did not have.** `will_snapshot2` —
+   `let a = 1 + 2` at a script's top level before the snapshot, `a` after the restore — fails
+   without exactly this carry, and the name it needs is a script's own `let`, not an IIFE's
+   name. So "no buyer" was a verdict about deno's primordials rather than about the mechanism,
+   which is now carried: the context table's per-slot entry holds a binding list (a name serial,
+   the attributes byte, a value serial and one reserved, `NO_REF` for the TDZ), the read side
+   pushes the bindings into the reading realm's global declarative record and bumps the global
+   object's generation. `FORMAT_VERSION` stays 1: nothing is released, so a shape change has no
+   released reader to be distinguished from, and the module doc records it rather than a bump.
+   deno's
+   release snapshot suite went **11/7 → 12/6** on it; the six left are the module state described
+   here and below, and `lazy_loaded_esm`'s `"op_print"` did *not* clear — it is the ops module's
+   export binding, one level down from this record. §7 has the record, its three tests and the
+   four mutations.
 
    **The goal is the snapshot path; what it is missing is the environment chain.** Running deno
    without a snapshot is not the goal — it skips the integration being tested and is what a host

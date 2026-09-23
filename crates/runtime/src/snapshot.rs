@@ -96,13 +96,21 @@
 //!
 //! The realm's own global environment writes no record at all (`NO_REF`):
 //! `Context::new` rebuilds that one, so the chain ends there and a name it
-//! cannot resolve resolves globally, exactly as the chain it came from did.
+//! cannot resolve resolves globally, exactly as the chain it came from did. The
+//! names a script declared *into* that record — a top-level `let`, `const` or
+//! `class` — are the realm's own state rather than a closure's, so they travel
+//! beside the carried global rather than as an environment record.
 //!
-//! Version 1. The format is ours to version, and its compatibility surface is
-//! the *names* it writes: an intrinsic name and a well-known symbol name have to
-//! mean the same thing in the tree that reads a blob as in the tree that wrote
-//! it. A blob therefore carries the format version and the word size it was
-//! written with, and a reader refuses any other.
+//! Version 1, and the format has not been released: no blob exists outside this
+//! tree, so the version stays 1 while the *shape* moves — the binding list this
+//! format carries beside a realm's global was added to a context's entry in the
+//! table without bumping it, because there is no released reader for the change
+//! to be distinguishable from. The version moves the day a released reader would
+//! misread what a released writer wrote. The format is ours to version, and its
+//! compatibility surface is the *names* it writes: an intrinsic name and a
+//! well-known symbol name have to mean the same thing in the tree that reads a
+//! blob as in the tree that wrote it. A blob therefore carries the format version
+//! and the word size it was written with, and a reader refuses any other.
 //!
 //! # The context table
 //!
@@ -616,11 +624,12 @@ pub struct Slot<'a> {
     /// The items the host attached to that context, in the order it attached
     /// them: the indices a restore hands them back under.
     pub items: &'a [SnapshotItem],
-    /// Whether the slot also carries the realm's **global object** — its state,
-    /// not only the values a host attached — so a restore puts back what the
-    /// writing realm installed on its global. A host that wants its own names
-    /// (`Deno`, an op table) to survive a restart sets this; `encode`/`decode`
-    /// do not, so the single-value form is unchanged.
+    /// Whether the slot also carries the realm's **global state** — its global
+    /// object *and* the lexical bindings declared into the global environment
+    /// record — rather than only the values a host attached, so a restore puts
+    /// back what the writing realm installed. A host that wants its own names
+    /// (`Deno`, an op table, a bootstrap's helpers) to survive a restart sets
+    /// this; `encode`/`decode` do not, so the single-value form is unchanged.
     pub realm_global: bool,
 }
 
@@ -685,7 +694,8 @@ pub fn encode_slots(
 ) -> Result<Vec<u8>, Unsupported> {
     let mut objects: Vec<Entry> = Vec::new();
     let mut serials: HashMap<Identity, u32> = HashMap::new();
-    let mut table: Vec<(usize, u32, Vec<u32>)> = Vec::with_capacity(slots.len());
+    let mut table: Vec<(usize, u32, Vec<u32>, Vec<CarriedBinding>)> =
+        Vec::with_capacity(slots.len());
     for slot in slots {
         let mut items = Vec::with_capacity(slot.items.len());
         for item in slot.items {
@@ -721,17 +731,52 @@ pub fn encode_slots(
         } else {
             NO_REF
         };
-        table.push((slot.index, global, items));
+        // The realm's lexical bindings travel with its global, and only a slot
+        // that asked for the global is asked for them: they are part of the same
+        // "the realm's own state" the flag turns on.
+        let mut bindings = Vec::new();
+        if slot.realm_global {
+            for (name, binding) in carried_global_bindings(&slot.realm)? {
+                let name = visit(
+                    agent,
+                    &slot.realm,
+                    externals,
+                    host,
+                    Value::String(Handle::new(name)),
+                    &mut objects,
+                    &mut serials,
+                )?;
+                let value = match &binding.value {
+                    Some(value) => visit(
+                        agent,
+                        &slot.realm,
+                        externals,
+                        host,
+                        *value,
+                        &mut objects,
+                        &mut serials,
+                    )?,
+                    None => NO_REF,
+                };
+                bindings.push(CarriedBinding {
+                    name,
+                    flags: binding_flags(&binding),
+                    value,
+                });
+            }
+        }
+        table.push((slot.index, global, items, bindings));
     }
 
     let mut body = Vec::new();
-    for (index, global, items) in &table {
+    for (index, global, items, bindings) in &table {
         write_u32(&mut body, *index as u32);
         write_u32(&mut body, items.len() as u32);
         write_u32(&mut body, *global);
         for item in items {
             write_u32(&mut body, *item);
         }
+        write_bindings(&mut body, bindings);
     }
     write_u32(&mut body, objects.len() as u32);
     for entry in &objects {
@@ -797,7 +842,7 @@ pub fn decode_slot(
     let (body_len, context_count) = header(bytes)?;
     let mut body = Reader::new(&bytes[HEADER_LEN..HEADER_LEN + body_len]);
 
-    let mut wanted: Option<(u32, Vec<u32>)> = None;
+    let mut wanted: Option<(u32, Vec<u32>, Vec<CarriedBinding>)> = None;
     for _ in 0..context_count {
         let index = body.u32().ok_or(DecodeError::Truncated)? as usize;
         let count = body.u32().ok_or(DecodeError::Truncated)? as usize;
@@ -809,11 +854,15 @@ pub fn decode_slot(
         for _ in 0..count {
             items.push(body.u32().ok_or(DecodeError::Truncated)?);
         }
+        // Read for every row, not only the wanted one: the binding list is part
+        // of a row, so skipping it would leave the reader at the wrong offset
+        // for the next context.
+        let bindings = read_bindings(&mut body)?;
         if index == slot {
-            wanted = Some((global, items));
+            wanted = Some((global, items, bindings));
         }
     }
-    let Some((global, items)) = wanted else {
+    let Some((global, items, bindings)) = wanted else {
         return Ok(None);
     };
 
@@ -845,6 +894,9 @@ pub fn decode_slot(
     // serial either way.
     if global != NO_REF {
         builder.apply_realm_global(global)?;
+    }
+    if !bindings.is_empty() {
+        builder.apply_realm_bindings(&bindings)?;
     }
     for serial in items {
         values.push(builder.materialize_item(serial)?);
@@ -1232,6 +1284,43 @@ fn carried_environment(env: &EnvRef) -> Result<CarriedEnvironment, Unsupported> 
         transparent: declarative.context_transparent.get(),
         bindings,
     })
+}
+
+/// The bindings a realm's own global environment holds **lexically**: a
+/// top-level `let`, `const` or `class`, which lives in the global record's
+/// declarative half rather than on the global object.
+///
+/// The realm's global environment writes no environment record of its own —
+/// the chain ends in the reading realm's global — but the names a script
+/// declared there are the realm's state all the same, so they travel with the
+/// carried global instead. A binding is the same [`Binding`] a declarative
+/// record holds, so the flags and the TDZ mean what they mean there.
+fn carried_global_bindings(realm: &Handle<Realm>) -> Result<Vec<(JsString, Binding)>, Unsupported> {
+    let env = realm.global_env;
+    let EnvRecord::Global(global) = &*env else {
+        return Err(Unsupported::new(
+            "a global environment",
+            "the realm's global environment is not a global record",
+        ));
+    };
+    // The borrow is dropped before anything is visited or written: both allocate
+    // and can re-enter the agent, and a `RefCell` held across that is a
+    // collection the trace skips.
+    global
+        .declarative
+        .bindings
+        .borrow()
+        .iter()
+        .map(|(name, binding)| {
+            if binding.indirect.is_some() {
+                return Err(Unsupported::new(
+                    "a module import binding",
+                    "it resolves through the module that exported it, which the blob does not hold",
+                ));
+            }
+            Ok((name.clone(), binding.clone()))
+        })
+        .collect::<Result<Vec<_>, Unsupported>>()
 }
 
 /// Give an environment record its serial, and walk everything a restore needs to
@@ -2277,20 +2366,7 @@ fn write_env(
             body,
             serial_in(realm, serials, Value::String(Handle::new(name.clone()))),
         );
-        let mut flags = 0u8;
-        if binding.mutable {
-            flags |= BIND_MUTABLE;
-        }
-        if binding.strict {
-            flags |= BIND_STRICT;
-        }
-        if binding.deletable {
-            flags |= BIND_DELETABLE;
-        }
-        if binding.parameter {
-            flags |= BIND_PARAMETER;
-        }
-        body.push(flags);
+        body.push(binding_flags(binding));
         write_u32(
             body,
             binding
@@ -2311,6 +2387,40 @@ fn write_env(
         });
     }
     Ok(())
+}
+
+/// Write a binding list in the shape a property list is: the count, then each
+/// binding's name serial, its attributes byte, its value serial and one
+/// reserved. The four-field reader is the same one, so the bytes differ in
+/// meaning, not in layout — `NO_REF` where the value goes is the binding's TDZ,
+/// the same spelling an environment record's binding uses.
+fn write_bindings(body: &mut Vec<u8>, bindings: &[CarriedBinding]) {
+    write_u32(body, bindings.len() as u32);
+    for binding in bindings {
+        write_u32(body, binding.name);
+        body.push(binding.flags);
+        write_u32(body, binding.value);
+        write_u32(body, NO_REF);
+    }
+}
+
+/// A binding's attributes byte, spelled once so an environment record's binding
+/// and a realm's global lexical one cannot drift apart.
+fn binding_flags(binding: &Binding) -> u8 {
+    let mut flags = 0u8;
+    if binding.mutable {
+        flags |= BIND_MUTABLE;
+    }
+    if binding.strict {
+        flags |= BIND_STRICT;
+    }
+    if binding.deletable {
+        flags |= BIND_DELETABLE;
+    }
+    if binding.parameter {
+        flags |= BIND_PARAMETER;
+    }
+    flags
 }
 
 /// Write a module record: the name it was compiled under, when it has one, and
@@ -3259,6 +3369,79 @@ impl Builder<'_> {
         let global = self.realm.global_object;
         self.remember(serial as usize, Built::Object(global));
         define_properties(self, global, properties)
+    }
+
+    /// Put the carried global **lexical** bindings back into the reading realm's
+    /// global environment record.
+    ///
+    /// A top-level `let`, `const` or `class` is not a property of the global
+    /// object — it lives in the global record's declarative half — so it travels
+    /// beside the carried global rather than in it, and this is where it lands.
+    /// The bindings are pushed in one step, the way `settle_envs` restores an
+    /// environment record's, so a `NO_REF` value stays the TDZ rather than
+    /// becoming `undefined`, which a read of the name would answer instead of
+    /// throwing.
+    fn apply_realm_bindings(&mut self, bindings: &[CarriedBinding]) -> Result<(), DecodeError> {
+        // Names and values are materialized **before** the record is borrowed:
+        // materializing allocates and re-enters the builder, and a `RefCell` held
+        // across that is a collection the trace skips.
+        let mut carried = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let name = self.materialize(binding.name)?;
+            let ValueKind::String(name) = name.kind() else {
+                return Err(DecodeError::UnrebuildableEnvironment(
+                    "a binding's name is not a string".into(),
+                ));
+            };
+            let value = match binding.value {
+                NO_REF => None,
+                serial => Some(self.materialize(serial)?),
+            };
+            carried.push((name, *binding, value));
+        }
+        let env = self.realm.global_env;
+        for (_, _, value) in &carried {
+            if let Some(value) = value {
+                crux::heap::write_barrier(&*env, *value);
+            }
+        }
+        let EnvRecord::Global(global) = &*env else {
+            return Err(DecodeError::UnrebuildableEnvironment(
+                "the realm's global environment is not a global record".into(),
+            ));
+        };
+        {
+            let mut list = global.declarative.bindings.borrow_mut();
+            for (name, binding, value) in carried {
+                // A name this realm already declared lexically is a blob and a
+                // realm that disagree; it is refused by name rather than
+                // shadowing or replacing what the realm itself built.
+                if list.iter().any(|(existing, _)| *existing == *name) {
+                    return Err(DecodeError::UnrebuildableEnvironment(format!(
+                        "the reading realm already has a lexical binding named {:?}",
+                        name.to_string_lossy()
+                    )));
+                }
+                list.push((
+                    (*name).clone(),
+                    Binding {
+                        value,
+                        mutable: binding.flags & BIND_MUTABLE != 0,
+                        strict: binding.flags & BIND_STRICT != 0,
+                        deletable: binding.flags & BIND_DELETABLE != 0,
+                        indirect: None,
+                        parameter: binding.flags & BIND_PARAMETER != 0,
+                    },
+                ));
+            }
+        }
+        // A declarative binding changes what a name resolves to without touching
+        // the global object, and a compiled global read validates against that
+        // object's generation alone (see `GlobalEnv::bump_declarative_generation`)
+        // — so the counter is bumped, or a cell warmed in this agent before the
+        // restore could keep serving the value it saw.
+        self.realm.global_object.bump_generation();
+        Ok(())
     }
 
     /// The item a serial names, which a slot's own list needs: every record is a
@@ -4975,6 +5158,135 @@ mod tests {
         );
     }
 
+    /// A top-level `let`, `const` or `class` is a **global lexical** binding: it
+    /// lives in the global environment record's declarative half rather than on
+    /// the global object, so carrying the global object alone loses it. This is
+    /// `will_snapshot2`'s shape in the crate we stand in for — `let a = 1 + 2`
+    /// before the snapshot, `a` read after the restore.
+    #[test]
+    fn a_global_lexical_binding_travels_with_the_carried_global() {
+        let mut writer = api::Isolate::new();
+        let writer_context = api::Context::new(&mut writer).expect("a realm");
+        let realm = *writer_context.realm();
+        writer_context
+            .try_eval("let carried = 41 + 1; const fixed = 7;")
+            .expect("declare two global lexical bindings");
+
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &[],
+            realm_global: true,
+        }];
+        let blob = encode_slots(agent_of(&writer), &slots, &[], None).expect("a blob");
+
+        let mut reader = api::Isolate::new();
+        let reader_context = api::Context::new(&mut reader).expect("a realm");
+        let reader_realm = *reader_context.realm();
+        decode_slot(agent_mut(&reader), &reader_realm, &blob, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+
+        let read = |source: &str| {
+            reader_context
+                .try_eval(source)
+                .expect("a read")
+                .into_value()
+        };
+        assert_eq!(read("carried").as_number(), Some(42.0));
+        assert_eq!(read("fixed").as_number(), Some(7.0));
+
+        // The flags are the binding's own rather than a default: a `let` is
+        // still writable, and the write is **visible**, which a binding restored
+        // immutable — the mutability bit dropped — would not make.
+        reader_context
+            .try_eval("carried = 5")
+            .expect("a `let` is writable");
+        assert_eq!(read("carried").as_number(), Some(5.0));
+
+        // A `const` is still immutable: the format carries the attribute the
+        // writer's `CreateImmutableBinding` set, so the write throws rather than
+        // silently doing nothing.
+        match reader_context.try_eval("fixed = 8") {
+            Ok(_) => panic!("a restored `const` accepted an assignment"),
+            Err(error) => assert_eq!(error.kind, crux::error::ErrorKind::TypeError),
+        }
+        assert_eq!(read("fixed").as_number(), Some(7.0));
+    }
+
+    /// A binding in its temporal dead zone has no value to write, and the format
+    /// spells that `NO_REF`. A restore that gave it `undefined` instead would
+    /// answer a read where the writing realm's code would have thrown.
+    #[test]
+    fn a_carried_binding_in_the_temporal_dead_zone_stays_uninitialized() {
+        let mut writer = api::Isolate::new();
+        let writer_context = api::Context::new(&mut writer).expect("a realm");
+        let realm = *writer_context.realm();
+        // A script cannot leave this behind — its own `let` is initialized by the
+        // time it returns — but the engine's instantiation can: created, never
+        // initialized. That is the state the format's `NO_REF` names.
+        realm
+            .global_env
+            .create_mutable_binding(&JsString::from_utf8("pending"), false)
+            .expect("a binding in the temporal dead zone");
+
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &[],
+            realm_global: true,
+        }];
+        let blob = encode_slots(agent_of(&writer), &slots, &[], None).expect("a blob");
+
+        let mut reader = api::Isolate::new();
+        let reader_context = api::Context::new(&mut reader).expect("a realm");
+        let reader_realm = *reader_context.realm();
+        decode_slot(agent_mut(&reader), &reader_realm, &blob, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+
+        // The name has to exist *and* be uninitialized: a binding that did not
+        // travel at all throws the same error kind with a different reason, so
+        // the message is what tells "before initialization" from "not defined".
+        match reader_context.try_eval("pending") {
+            Ok(value) => panic!("a read answered {}", value.into_value()),
+            Err(error) => {
+                assert_eq!(error.kind, crux::error::ErrorKind::ReferenceError);
+                assert!(
+                    error.message.contains("before initialization"),
+                    "the binding came back uninitialized, not absent: {}",
+                    error.message
+                );
+            }
+        }
+    }
+
+    /// The bindings are part of the walk, not a side table: a global lexical
+    /// binding the format cannot carry refuses the snapshot by name rather than
+    /// being dropped and silently missing after the restore.
+    #[test]
+    fn a_global_lexical_binding_the_format_cannot_carry_refuses_the_snapshot() {
+        let mut writer = api::Isolate::new();
+        let writer_context = api::Context::new(&mut writer).expect("a realm");
+        let realm = *writer_context.realm();
+        writer_context
+            .try_eval("let trapped = new Proxy({}, {});")
+            .expect("a global the walk cannot carry");
+
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &[],
+            realm_global: true,
+        }];
+        let error =
+            encode_slots(agent_of(&writer), &slots, &[], None).expect_err("the walk refuses");
+        assert_eq!(
+            error.type_name, "a proxy",
+            "the refusal names what could not travel"
+        );
+    }
+
     /// The context table is structural: two slots keep their own items, and a
     /// slot the blob does not name answers `None` rather than an empty list.
     #[test]
@@ -5596,10 +5908,11 @@ mod tests {
 
         let mut bad_tag = blob.clone();
         // The body is the context table — slot index, item count, the carried
-        // global serial, one item — then the object count, so the first record's
-        // tag follows those 20 bytes (the global serial is `NO_REF` here, which
+        // global serial, one item, and the slot's binding list (empty here, which
+        // is still a count of zero) — then the object count, so the first record's
+        // tag follows those 24 bytes (the global serial is `NO_REF` here, which
         // is what `encode` carries, but it is written either way).
-        bad_tag[HEADER_LEN + 20] = 200;
+        bad_tag[HEADER_LEN + 24] = 200;
         assert!(matches!(decode_it(&bad_tag), Err(DecodeError::BadTag(200))));
 
         assert_eq!(
