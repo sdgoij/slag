@@ -689,6 +689,57 @@ mod tests {
         Some(Local::from_module(module.module()))
     }
 
+    /// A host's dynamic-import callback answers the `import()` expression.
+    ///
+    /// It is handed the four things the crate's callback takes — the referrer's
+    /// name, the specifier, the import attributes as key/value pairs, and a
+    /// host-defined options `PrimitiveArray` — and the promise it answers is what
+    /// the `import()` evaluates to. A script has no name in this engine, so the
+    /// referrer arrives as the empty string, which is what the crate sends for
+    /// code written with no origin name.
+    #[test]
+    fn a_hosts_dynamic_import_callback_answers_the_import() {
+        fn resolves<'s, 'i>(
+            scope: &mut PinScope<'s, 'i>,
+            options: Local<'s, crate::data::Data>,
+            resource_name: Local<'s, Value>,
+            specifier: Local<'s, crate::data::String>,
+            attributes: Local<'s, crate::data::FixedArray>,
+        ) -> Option<Local<'s, crate::data::Promise>> {
+            let options: Local<'_, crate::data::PrimitiveArray> = options.retag();
+            assert_eq!(
+                options.length(),
+                0,
+                "this engine keeps no host-defined options"
+            );
+            assert_eq!(resource_name.to_rust_string_lossy(scope), "");
+            assert_eq!(specifier.to_rust_string_lossy(scope), "./dep.js");
+            assert_eq!(attributes.length(), 0);
+
+            let resolver = crate::PromiseResolver::new(scope)?;
+            let promise = resolver.get_promise(scope);
+            let answer = crate::data::String::new(scope, "the host's answer")?;
+            resolver.resolve(scope, answer.into())?;
+            Some(promise)
+        }
+
+        in_context!(scope, {
+            scope.set_host_import_module_dynamically_callback(resolves);
+            let promise = Local::<crate::data::Promise>::try_from(crate::test_support::eval(
+                scope,
+                "import('./dep.js')",
+            ))
+            .expect("a promise");
+            scope.run_microtasks().expect("microtasks");
+            assert_eq!(promise.state(), crate::PromiseState::Fulfilled);
+            assert_eq!(
+                promise.result(scope).to_rust_string_lossy(scope),
+                "the host's answer",
+                "what the host answered is what the import() settled with"
+            );
+        });
+    }
+
     /// A host's `import.meta` callback runs when the engine makes the object, and
     /// what it writes is what the module's code reads — the seam
     /// `SetHostInitializeImportMetaObjectCallback` names, which this bridge used

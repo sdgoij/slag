@@ -106,6 +106,32 @@ pub trait HostHooks: std::fmt::Debug {
     ) -> Result<(), JsError> {
         Ok(())
     }
+
+    /// HostImportModuleDynamically (spec 13.3.10.2 step 12,
+    /// `v8::Isolate::SetHostImportModuleDynamicallyCallback`): resolve a dynamic
+    /// `import()` through the host's own loader, which is the only thing that can
+    /// rewrite a relative specifier — it is handed the **referrer's name**, the
+    /// name of the module or script the `import()` was written in, to resolve
+    /// against.
+    ///
+    /// `Ok(promise)` is what the `import()` expression answers. `None` means this
+    /// host resolves no dynamic imports and the engine falls back to its own
+    /// registry ([`crate::module::host_resolve_imported_module`]), which is the
+    /// path every host that installs no hook keeps.
+    ///
+    /// `attributes` is the validated import-attribute list as the host's own
+    /// callback takes it: key text and value, in source order. `phase` is the
+    /// api-facing phase, which is the vocabulary the host's callback is written
+    /// in.
+    fn import_module_dynamically(
+        &self,
+        _specifier: &JsString,
+        _referrer_name: Option<&JsString>,
+        _phase: crate::api::ModuleImportPhase,
+        _attributes: &[(JsString, JsString)],
+    ) -> Option<Result<crux::value::Value, JsError>> {
+        None
+    }
 }
 
 /// HostPromiseRejectionTracker dispatch: the agent's hooks if present, else
@@ -160,6 +186,22 @@ pub fn initialize_import_meta_object(
     match &agent.host_hooks {
         Some(hooks) => hooks.initialize_import_meta_object(module, meta),
         None => Ok(()),
+    }
+}
+
+/// The dynamic-import hook dispatch (see
+/// [`HostHooks::import_module_dynamically`]): the agent's hooks if they resolve
+/// dynamic imports, else `None` — the engine's own registry path.
+pub fn import_module_dynamically(
+    agent: &crate::agent::Agent,
+    specifier: &JsString,
+    referrer_name: Option<&JsString>,
+    phase: crate::api::ModuleImportPhase,
+    attributes: &[(JsString, JsString)],
+) -> Option<Result<crux::value::Value, JsError>> {
+    match &agent.host_hooks {
+        Some(hooks) => hooks.import_module_dynamically(specifier, referrer_name, phase, attributes),
+        None => None,
     }
 }
 

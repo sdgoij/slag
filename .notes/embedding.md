@@ -3595,6 +3595,62 @@ over `test262/test/intl402/**/*.js` and over `waspec/**/*.{js,wast,wat,mjs}` ans
 nothing — the same "checked by grep, not assumed" standard §7's microtask-policy
 record used.
 
+**The dynamic-import seam is closed, and the count moved: 12/6 → 14/4.** §7's
+`import.meta` record named this part, and §9 named the mechanism before the edit.
+`dynamic_imports_snapshot` — its buyer — passes, and `jsrealm::es_snapshot` passes
+with it: both were dying in the engine's own registry resolution, which is keyed by
+specifier *text* (`host_resolve_imported_module`) and so could answer neither
+`./b.js` nor deno's `import('mod:test')`.
+
+*The mechanism, both halves.* `HostHooks::import_module_dynamically(specifier,
+referrer_name, phase, attributes) -> Option<Result<Value, JsError>>` is the spec's
+HostImportModuleDynamically, and `module::dynamic_import` asks it **synchronously,
+before it enqueues its job**, because the referrer is the execution context at the
+`import()` site while the job runs without one — the same "capture before the job"
+the specifier text and the attributes already follow. `None` means "no host hook",
+so every build that installs none keeps today's registry path. The bridge stores
+both callbacks (the plain one and the with-phase one, the latter taking precedence
+as it does in the crate), and `BridgeHooks::import_module_dynamically` builds the
+four arguments the crate's callback takes: the referrer's name (the **empty
+string** when there is none — what V8 sends for code written with no origin name,
+and what deno's `"(no referrer)"` branch reads), the specifier, the attributes as
+**key/value pairs** (a dynamic import's shape; a static request's carry a source
+offset too), and an **empty host-defined options `PrimitiveArray`**, which is what
+the host's unchecked cast to one relies on.
+
+*Tests — two, each mutated.* `a_host_resolves_a_dynamic_import_itself` (runtime)
+installs hooks and asserts what they are handed — the specifier as written, the
+referrer of the `import()` site, the phase, the attributes as text pairs — and that
+what the hook answers is what the module's `await import(...)` settles with.
+`a_hosts_dynamic_import_callback_answers_the_import` (v8) does it through the
+bridge's own setter, with a real promise, asserting the four arguments and that the
+promise the host answered is the `import()` result. Three mutations, each caught by
+a different assertion: the engine never asking the host (both fail — the runtime
+test's `seen` stays unset, the bridge test's promise rejects with `Cannot find
+module ./dep.js`), the engine handing over no referrer (the runtime test's referrer
+assertion), and the bridge not storing the callback (the bridge test alone, its
+half being separate).
+
+*The measurement.* deno's release snapshot suite goes **12 passed / 6 failed → 14
+passed / 4 failed**. `dynamic_imports_snapshot` passes (this part's buyer) and
+`jsrealm::es_snapshot` — whose failure was `bindings.rs:316: unable to convert` —
+passes with it, deno's loader now answering `import('mod:test')`. The four left are
+the named ones: `import_meta_snapshot` (the blob refusing deno's
+`import_meta.resolve`, a host constructor), `es_snapshot` (its `ModuleRequest`
+source offsets), and `es_snapshot_without_runtime_module_loader` and
+`lazy_loaded_esm` (`Error` and `"op_print" is not defined` — both unchanged in text
+by this part).
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **883** (was
+882); v8 `--lib` **240** (was 239); `cargo fmt --all -- --check` clean; `cargo
+clippy --locked --workspace --all-targets -- -D warnings` clean; test262 `all`
+**48,464 pass / 0 fail / 0 crash / 0 hang** (158 skip) of 48,622 — the baseline,
+re-run because this changes the engine. `intl402`, the eight wasm core suites and
+`wasmtest jsapi` were not re-run: the change is reached only from source text that
+writes `import(`, and case-sensitive greps for it over `test262/test/intl402/**/*.js`
+and `waspec/**/*.js` answer nothing (the wasm core corpus is `.wast` text, which no
+JavaScript drives).
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3664,6 +3720,36 @@ if that proves possible.
   the bridge's half; §7's record has the measurement, and it moved
   `import_meta_snapshot`'s failure from the engine to the blob refusing deno's
   `import_meta.resolve`.
+- **The engine gains the dynamic-import host hook — named here before the edit,
+  the second of the two seams §7's `import.meta` record named.** Today the engine
+  resolves a dynamic `import()` itself, from `realm.loaded_modules` and
+  `agent.host_modules` **keyed by specifier text**
+  (`host_resolve_imported_module`), so a *relative* specifier cannot resolve and
+  the host's own loader is never consulted — measured: `dynamic_imports_snapshot`
+  reports `TypeError: Cannot find module ./b.js` while its module imports
+  `./b.js` against a referrer the host knows. V8 calls the host instead
+  (`SetHostImportModuleDynamicallyCallback`), handing it the **referrer's name**,
+  the specifier, the phase, the import attributes, and a `PrimitiveArray` of
+  host-defined options — always a `PrimitiveArray`, empty when the embedder set
+  none, which is what `deno_core`'s `read_host_defined_options_kind`'s unchecked
+  cast relies on (`runtime/host_defined_options.rs:59`) — and takes back a
+  promise. So `HostHooks` gains
+  `import_module_dynamically(&self, specifier, referrer_name, phase, attributes)
+  -> Option<Result<Value, JsError>>`, where `None` means "no host hook; resolve it
+  yourself" and keeps every non-host build on today's path, and
+  `module::dynamic_import` asks it **synchronously, before it enqueues its job**,
+  because the referrer is the execution context at the `import()` site and a job
+  runs without one. One measured gap is left named rather than discovered later:
+  the engine's scripts record **no name** (`ScriptRecord` has none; only a module
+  has one), so a *script*-level import offers no referrer — and the empty string
+  is the faithful value there rather than a convenience, because that is what V8
+  sends for a script with no origin name and what `deno_core`'s `"(no
+  referrer)"` branch is written to read, as
+  `es_snapshot_without_runtime_module_loader`'s own expected message shows. No
+  `ScriptRecord` change is needed for that test. **Landed** in the change that
+  follows it; §7's record has the measurement, and it moved deno's suite from
+  12/6 to 14/4 — `dynamic_imports_snapshot` (this part's buyer) and
+  `jsrealm::es_snapshot` both pass.
 - **The platform is a shape without a producer, and that is stated.** Slag posts
   no task, so `Platform`/`PlatformImpl`/`Task` exist so a host's initialization
   and its own implementation type-check, and the bridge's module docs say so

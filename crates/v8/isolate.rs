@@ -241,6 +241,12 @@ pub struct IsolateInner {
     /// installed one. The engine reaches it through this bridge's `HostHooks`
     /// when it makes a module's `import.meta`.
     import_meta: Option<HostInitializeImportMetaObjectCallback>,
+    /// The host's dynamic-import callbacks
+    /// (`v8::Isolate::SetHostImportModuleDynamicallyCallback`, and the
+    /// with-phase one), once it installed them. The engine reaches them through
+    /// this bridge's `HostHooks` when code evaluates `import(...)`.
+    import_dynamically: Option<ImportModuleDynamicallyCallback>,
+    import_dynamically_with_phase: Option<ImportModuleWithPhaseDynamicallyCallback>,
 }
 
 const _: () = assert!(std::mem::offset_of!(IsolateInner, engine) == 0);
@@ -287,6 +293,73 @@ fn host_streaming_callback<'a, 'i, 's, F>(
         + for<'x, 'y, 'z> Fn(&'z mut PinScope<'x, 'y>, Local<'x, Value>, WasmStreaming<false>),
 {
     (F::get())(scope, source, streaming)
+}
+
+/// The callback a dynamic `import()` runs, as the isolate keeps it
+/// (v8::Isolate::SetHostImportModuleDynamicallyCallback).
+type ImportModuleDynamicallyCallback = for<'a, 'i, 's> fn(
+    &'s mut PinScope<'a, 'i>,
+    Local<'a, Data>,
+    Local<'a, Value>,
+    Local<'a, crate::data::String>,
+    Local<'a, FixedArray>,
+) -> Option<Local<'a, Promise>>;
+
+/// The phase-aware one
+/// (v8::Isolate::SetHostImportModuleWithPhaseDynamicallyCallback).
+type ImportModuleWithPhaseDynamicallyCallback = for<'a, 'i, 's> fn(
+    &'s mut PinScope<'a, 'i>,
+    Local<'a, Data>,
+    Local<'a, Value>,
+    Local<'a, crate::data::String>,
+    crate::ModuleImportPhase,
+    Local<'a, FixedArray>,
+) -> Option<Local<'a, Promise>>;
+
+/// The concrete function that stands in for a host's dynamic-import callback: a
+/// generic type parameter cannot coerce to a function pointer, so the host's
+/// function item is reconstructed and called from one that can.
+fn host_import_module_dynamically<'a, 'i, 's, F>(
+    scope: &'s mut PinScope<'a, 'i>,
+    options: Local<'a, Data>,
+    resource_name: Local<'a, Value>,
+    specifier: Local<'a, crate::data::String>,
+    attributes: Local<'a, FixedArray>,
+) -> Option<Local<'a, Promise>>
+where
+    F: UnitType
+        + for<'x, 'y, 'z> FnOnce(
+            &'z mut PinScope<'x, 'y>,
+            Local<'x, Data>,
+            Local<'x, Value>,
+            Local<'x, crate::data::String>,
+            Local<'x, FixedArray>,
+        ) -> Option<Local<'x, Promise>>,
+{
+    (F::get())(scope, options, resource_name, specifier, attributes)
+}
+
+/// The same for the phase-aware callback.
+fn host_import_module_with_phase_dynamically<'a, 'i, 's, F>(
+    scope: &'s mut PinScope<'a, 'i>,
+    options: Local<'a, Data>,
+    resource_name: Local<'a, Value>,
+    specifier: Local<'a, crate::data::String>,
+    phase: crate::ModuleImportPhase,
+    attributes: Local<'a, FixedArray>,
+) -> Option<Local<'a, Promise>>
+where
+    F: UnitType
+        + for<'x, 'y, 'z> FnOnce(
+            &'z mut PinScope<'x, 'y>,
+            Local<'x, Data>,
+            Local<'x, Value>,
+            Local<'x, crate::data::String>,
+            crate::ModuleImportPhase,
+            Local<'x, FixedArray>,
+        ) -> Option<Local<'x, Promise>>,
+{
+    (F::get())(scope, options, resource_name, specifier, phase, attributes)
 }
 
 /// The callback an error's `stack` property would run
@@ -586,6 +659,8 @@ impl Isolate {
             promise_reject: None,
             wasm_streaming: None,
             import_meta: None,
+            import_dynamically: None,
+            import_dynamically_with_phase: None,
         });
         // SAFETY: the box's allocation is where the state lives and it outlives
         // every handle to it — `OwnedIsolate` keeps it alive.
@@ -1209,30 +1284,38 @@ impl Isolate {
         self.install_hooks();
     }
 
-    /// The callback a dynamic `import()` would run
+    /// The callback a dynamic `import()` runs
     /// (v8::Isolate::SetHostImportModuleDynamicallyCallback).
     ///
-    /// Accepted and not run, and this one is worth reading twice: the engine
-    /// resolves a dynamic import itself, from the modules the host registered
-    /// with it, so a host's loader is reached by *registration* rather than by
-    /// this callback. The header of this bridge's `module` module is where that
-    /// is spelled out.
-    pub fn set_host_import_module_dynamically_callback(
-        &mut self,
-        callback: impl HostImportModuleDynamicallyCallback,
-    ) {
-        let _ = callback;
+    /// Run: the engine asks this bridge's `HostHooks` when a module or a script
+    /// evaluates `import(...)`, and the bridge hands the host the four things
+    /// this crate's callback takes — the referrer's name (an empty string for
+    /// code written with no origin name), the specifier, the import attributes as
+    /// key/value pairs, and a host-defined options `PrimitiveArray` (empty, this
+    /// engine keeping none) — and returns the promise the host answers with. A
+    /// host that installs no callback leaves the engine's own registry resolution
+    /// in place, which is keyed by specifier text and so cannot rewrite a
+    /// relative specifier against its referrer.
+    pub fn set_host_import_module_dynamically_callback<F>(&mut self, _: F)
+    where
+        F: HostImportModuleDynamicallyCallback,
+    {
+        self.inner_mut().import_dynamically = Some(host_import_module_dynamically::<F>);
+        self.install_hooks();
     }
 
     /// The same for `import source` and `import defer`
     /// (v8::Isolate::SetHostImportModuleWithPhaseDynamicallyCallback).
     ///
-    /// Accepted and not run, for the reason above.
-    pub fn set_host_import_module_with_phase_dynamically_callback(
-        &mut self,
-        callback: impl HostImportModuleWithPhaseDynamicallyCallback,
-    ) {
-        let _ = callback;
+    /// When a host installs both, this is the one that runs, which is the
+    /// precedence the crate has.
+    pub fn set_host_import_module_with_phase_dynamically_callback<F>(&mut self, _: F)
+    where
+        F: HostImportModuleWithPhaseDynamicallyCallback,
+    {
+        self.inner_mut().import_dynamically_with_phase =
+            Some(host_import_module_with_phase_dynamically::<F>);
+        self.install_hooks();
     }
 
     /// The callback an asynchronous WebAssembly compilation would settle
@@ -1449,6 +1532,64 @@ impl runtime::HostHooks for BridgeHooks {
         // code could not.
         unsafe { callback(context_local, Local::from_module(*module), meta) };
         Ok(())
+    }
+
+    fn import_module_dynamically(
+        &self,
+        specifier: &crux::string::JsString,
+        referrer_name: Option<&crux::string::JsString>,
+        phase: crate::ModuleImportPhase,
+        attributes: &[(crux::string::JsString, crux::string::JsString)],
+    ) -> Option<Result<crux::value::Value, crux::error::JsError>> {
+        let engine = api::Isolate::get_current()?;
+        // SAFETY: as `wasm_streaming` — the engine hands back the isolate whose
+        // agent is running, and that address is the bridge's.
+        let isolate = unsafe { Isolate::from_engine_ptr(engine) };
+        let plain = isolate.inner().import_dynamically;
+        let with_phase = isolate.inner().import_dynamically_with_phase;
+        if plain.is_none() && with_phase.is_none() {
+            // No callback: `None` leaves the engine's own registry resolution in
+            // place, which is what a host that installs none expects.
+            return None;
+        }
+        let context = isolate.current_context()?;
+        let context_local = Local::<Context>::from_payload(Payload::Context(context));
+        crate::callback_scope!(unsafe scope, context_local);
+        // The four arguments this crate's callback takes. The options array is
+        // always a `PrimitiveArray` — empty, because this engine keeps no
+        // host-defined options — which is what the host's unchecked cast to one
+        // relies on.
+        let options: Local<'_, Data> = crate::data::PrimitiveArray::new(scope, 0).into();
+        // An empty name is what the crate sends for code written with no origin
+        // name, and what the host's "(no referrer)" branch is written to read.
+        let referrer = referrer_name
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        let resource_name: Local<'_, Value> =
+            Local::from(crate::data::String::new(scope, &referrer)?);
+        let specifier: Local<'_, crate::data::String> =
+            crate::data::String::new(scope, &specifier.to_string_lossy())?;
+        // Key/value pairs, which is the shape a *dynamic* import's attributes
+        // arrive in — a static request's carry a source offset as well.
+        let realm = crate::realm_of(scope);
+        let mut elements = Vec::with_capacity(attributes.len() * 2);
+        for (key, value) in attributes {
+            elements.push(api::Local::string(key.to_string_lossy()));
+            elements.push(api::Local::string(value.to_string_lossy()));
+        }
+        let attributes =
+            Local::<FixedArray>::from_engine(api::Array::new(&realm, &elements).ok()?).retag();
+        let promise = match (plain, with_phase) {
+            (_, Some(callback)) => {
+                callback(scope, options, resource_name, specifier, phase, attributes)
+            }
+            (Some(callback), None) => {
+                callback(scope, options, resource_name, specifier, attributes)
+            }
+            (None, None) => return None,
+        };
+        let promise = promise?;
+        Some(Ok(Local::<Value>::from(promise).into_engine().into_value()))
     }
 }
 

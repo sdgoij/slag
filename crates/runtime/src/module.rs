@@ -3214,6 +3214,10 @@ pub fn dynamic_import(
     // validation entirely (spec 13.3.10.2 step 4: "If options is not
     // undefined").
     let mut parsed_attributes: Vec<(AttributeKey, JsString)> = Vec::new();
+    // The same list in the shape a host's dynamic-import callback takes it: key
+    // text and value, no source offset, because a dynamic import has no
+    // declaration span to report.
+    let mut attribute_pairs: Vec<(JsString, JsString)> = Vec::new();
     if let Some(options) = options
         && !matches!(options.kind(), ValueKind::Undefined)
     {
@@ -3241,8 +3245,36 @@ pub fn dynamic_import(
                 )?;
                 return Ok(capability.promise);
             }
+            attribute_pairs.push((key.clone(), value.clone()));
             parsed_attributes.push((AttributeKey::Str(key), value));
         }
+    }
+    // The referrer is the code the `import()` is written in, read **here** rather
+    // than inside the job below: the load is asynchronous and its job runs
+    // without an execution context, and a host resolves a relative specifier
+    // against this name.
+    let referrer_name = match &agent.running_context()?.script_or_module {
+        Some(crate::context::ScriptOrModule::Module(module)) => module.name.clone(),
+        // A script records no name in this engine, so it offers none, which the
+        // host is told as an empty name — what V8 sends for a script written
+        // with no origin name.
+        _ => None,
+    };
+    // The hook takes the api-facing phase, which is the vocabulary a host's
+    // callback is written in; the engine's own use below keeps the syntax one.
+    let hook_phase = match phase {
+        ImportPhase::Import => crate::api::ModuleImportPhase::kEvaluation,
+        ImportPhase::Source => crate::api::ModuleImportPhase::kSource,
+        ImportPhase::Defer => crate::api::ModuleImportPhase::kDefer,
+    };
+    if let Some(answer) = crate::host::import_module_dynamically(
+        agent,
+        &specifier_text,
+        referrer_name.as_ref(),
+        hook_phase,
+        &attribute_pairs,
+    ) {
+        return answer;
     }
     // The load is asynchronous: the host completes it in a job, so the
     // module's evaluation never runs concurrently with the evaluation already
@@ -3865,6 +3897,76 @@ mod tests {
             IMPORT_META_MODULE.load(std::sync::atomic::Ordering::SeqCst),
             crux::handle::Handle::as_ptr(module) as u64,
             "and the hook is handed the module the object belongs to"
+        );
+    }
+
+    /// A host that resolves dynamic imports itself, checking the four things the
+    /// engine hands it: the specifier as written, the **referrer of the
+    /// `import()` site**, the phase, and the attributes as text pairs.
+    #[derive(Debug)]
+    struct ResolvesImports;
+
+    impl crate::host::HostHooks for ResolvesImports {
+        fn import_module_dynamically(
+            &self,
+            specifier: &JsString,
+            referrer_name: Option<&JsString>,
+            phase: crate::api::ModuleImportPhase,
+            attributes: &[(JsString, JsString)],
+        ) -> Option<Result<Value, JsError>> {
+            assert_eq!(specifier.to_string_lossy(), "./dep.js");
+            assert_eq!(
+                referrer_name.map(|name| name.to_string_lossy()).as_deref(),
+                Some("m.js"),
+                "the referrer is the module the import() is written in"
+            );
+            assert_eq!(phase, crate::api::ModuleImportPhase::kEvaluation);
+            assert_eq!(
+                attributes
+                    .iter()
+                    .map(|(key, value)| (key.to_string_lossy(), value.to_string_lossy()))
+                    .collect::<Vec<_>>(),
+                [("type".to_string(), "json".to_string())]
+            );
+            Some(Ok(Value::String(Handle::new(JsString::from_utf8(
+                "the host's answer",
+            )))))
+        }
+    }
+
+    /// A module's `import(...)` goes through the host when one has a hook: what
+    /// the hook answers is what the expression settles with, and the engine does
+    /// not consult its own registry for it. (The host's own contract is to answer
+    /// a promise; the engine hands it back as it is, which is what the crate we
+    /// stand in for does with the promise its callback returns.)
+    #[test]
+    fn a_host_resolves_a_dynamic_import_itself() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().expect("a realm");
+        agent.host_hooks = Some(Box::new(ResolvesImports));
+        agent.add_module(
+            "m.js",
+            "export var seen = await import('./dep.js', { with: { type: 'json' } });",
+        );
+        let module = host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js"), &[])
+            .expect("the module");
+        module_declaration_instantiation(&mut agent, &module).expect("instantiate");
+        module_evaluation(&mut agent, &module).expect("evaluate");
+        agent.run_jobs().expect("jobs");
+        let namespace = module_namespace(&mut agent, &module).expect("namespace");
+
+        assert_eq!(
+            crate::context::get_property(
+                &mut agent,
+                &namespace,
+                &JsString::from_utf8("seen"),
+                namespace
+            )
+            .expect("a read")
+            .as_string()
+            .map(|text| text.to_string_lossy())
+            .as_deref(),
+            Some("the host's answer")
         );
     }
 
