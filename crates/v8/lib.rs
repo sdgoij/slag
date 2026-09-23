@@ -38,6 +38,7 @@ mod function;
 mod handle;
 mod heap;
 pub mod inspector;
+mod interceptor;
 mod isolate;
 pub mod json;
 mod message;
@@ -80,6 +81,7 @@ pub use function::{
 };
 pub use handle::{Global, Handle, Local, MaybeLocal};
 pub use heap::HeapStatistics;
+pub use interceptor::{NamedPropertyHandlerConfiguration, PropertyCallbackArguments};
 pub use isolate::{
     CreateParams, HostImportModuleDynamicallyCallback,
     HostImportModuleWithPhaseDynamicallyCallback, HostInitializeImportMetaObjectCallback, Isolate,

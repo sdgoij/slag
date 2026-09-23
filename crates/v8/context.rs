@@ -61,11 +61,25 @@ impl Context {
     #[allow(clippy::new_ret_no_self)]
     pub fn new<'s>(
         scope: &PinScope<'s, '_, ()>,
-        _options: ContextOptions<'_>,
+        options: ContextOptions<'_>,
     ) -> Local<'s, Context> {
         let mut isolate = scope.isolate_ptr();
-        let context = api::Context::new(isolate.engine_mut())
-            .expect("bridge: creating a realm cannot fail outside OOM");
+        // A global template that carries a named property handler makes the
+        // realm's global object a host-defined one, so the engine's internal
+        // methods on it ask the host; without one the global stays ordinary.
+        let handler = options
+            .global_template
+            .and_then(|template| template.named_property_handler());
+        let context = match handler {
+            Some(handler) => api::Context::new_with_global_ops(
+                isolate.engine_mut(),
+                Some(std::rc::Rc::new(crate::interceptor::GlobalHandler::new(
+                    handler,
+                ))),
+            ),
+            None => api::Context::new(isolate.engine_mut()),
+        }
+        .expect("bridge: creating a realm cannot fail outside OOM");
         // The engine's isolate owns the realm, so this handle only names it;
         // recording it here is what lets a scope-less operation find it.
         isolate.set_current_context(Some(context));

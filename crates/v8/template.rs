@@ -346,6 +346,32 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
         self.object_template().internal_field_count()
     }
 
+    /// Ask the host about this template's instances' properties
+    /// (`v8::ObjectTemplate::SetNamedPropertyHandler`).
+    ///
+    /// The handler is kept with the template, and a realm made from it
+    /// ([`ContextOptions::global_template`](crate::ContextOptions)) builds its
+    /// global object out of it. Setting one replaces any already set, as there;
+    /// see [`crate::interceptor`] for what a handler does and does not do here.
+    pub fn set_named_property_handler(
+        &self,
+        config: crate::interceptor::NamedPropertyHandlerConfiguration,
+    ) {
+        self.object_template()
+            .set_host_state(std::rc::Rc::new(config));
+    }
+
+    /// The handler this template carries, if any — the accessor the context that
+    /// builds a global object out of the template reads.
+    pub(crate) fn named_property_handler(
+        &self,
+    ) -> Option<std::rc::Rc<crate::interceptor::NamedPropertyHandlerConfiguration>> {
+        self.object_template()
+            .host_state()?
+            .downcast::<crate::interceptor::NamedPropertyHandlerConfiguration>()
+            .ok()
+    }
+
     fn object_template(&self) -> &api::ObjectTemplate {
         let pointer = api::External::from(*self.engine().value()).value();
         // SAFETY: the handle was built from a template address the isolate took

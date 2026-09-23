@@ -431,6 +431,10 @@ pub struct ObjectTemplate {
     /// bridge's `set_internal_field_count`, which says the same where a host
     /// would look).
     internal_field_count: std::cell::Cell<usize>,
+    /// Host state the embedder attached. The engine never reads it: it is where
+    /// a bridge keeps its own view of a template, which then lives exactly as
+    /// long as the isolate that owns the template.
+    host_state: RefCell<Option<Rc<dyn std::any::Any>>>,
 }
 
 enum TemplateProperty {
@@ -493,6 +497,7 @@ impl ObjectTemplate {
             isolate,
             properties: RefCell::new(Vec::new()),
             internal_field_count: std::cell::Cell::new(0),
+            host_state: RefCell::new(None),
         })
     }
 
@@ -505,6 +510,17 @@ impl ObjectTemplate {
     /// The count recorded above (v8::ObjectTemplate::InternalFieldCount).
     pub fn internal_field_count(&self) -> usize {
         self.internal_field_count.get()
+    }
+
+    /// Attach host state to this template (this layer's own accessor; V8's
+    /// `ObjectTemplate` has no counterpart, and nothing here reads it back).
+    pub fn set_host_state(&self, state: Rc<dyn std::any::Any>) {
+        *self.host_state.borrow_mut() = Some(state);
+    }
+
+    /// The host state attached above, if any.
+    pub fn host_state(&self) -> Option<Rc<dyn std::any::Any>> {
+        self.host_state.borrow().clone()
     }
 
     /// Define a data property (v8::ObjectTemplate::Set).

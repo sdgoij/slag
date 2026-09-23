@@ -22,6 +22,11 @@ impl Default for PropertyDescriptor {
 }
 
 impl PropertyDescriptor {
+    /// A descriptor the engine handed over, for a callback that reads one
+    /// (v8's named property handler passes one to a `definer`).
+    pub(crate) fn from_engine(descriptor: crux::property::PropertyDescriptor) -> Self {
+        Self(descriptor)
+    }
     /// A descriptor that mentions nothing (`v8::PropertyDescriptor`).
     pub fn new() -> Self {
         Self(crux::property::PropertyDescriptor {

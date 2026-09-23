@@ -3155,6 +3155,62 @@ two — and colliding `NON_MASKING` with `HAS_NO_SIDE_EFFECT` fails it. The gate
 are unchanged by it (`crates/v8` is not reachable from the corpus or the wasm
 sweeps), and the workspace stays green in 38 binaries.
 
+**The named property handler — landed, and deno_core's test suite compiles.** The
+mechanism §9's item 17 named: the configuration, the callbacks, the template's
+storage for a handler and the wiring that invokes them. The vocabulary landed a
+part earlier.
+
+*The engine edit, named before it was made.* `api::ObjectTemplate` gains a
+**host-state slot** (`set_host_state`/`host_state`, an `Rc<dyn Any>` the engine
+never reads) — the second design, and the one that matters. The first keyed a
+handler on the template's *address* in the bridge isolate, which meant
+`set_named_property_handler` needed an entered realm to find that isolate, while
+deno sets a handler on a template *before* the context made from it exists; a
+test caught it ("bridge: operation needs an entered context"). Keeping the handler
+with the template also retires the address keying and the collision hazard it
+carried.
+
+*What the bridge does with it.* `crates/v8/interceptor.rs` holds the three typed
+callbacks (`descriptor`, `setter`, `definer`) and their raw shapes with
+`MapFnFrom` trampolines that mirror `FunctionCallback`'s, the three callback-info
+structs, `PropertyCallbackArguments`, `NamedPropertyHandlerConfiguration` (`new`,
+`flags`, the three `_raw` setters) and `GlobalHandler`, which implements
+`crux::host::HostOps` by calling the host back. `Context::new` reads the global
+template's handler and builds the realm's global object with
+`api::Context::new_with_global_ops`. The answers map onto the seam exactly:
+`kNo` is `None` (the ordinary internal method runs), `kYes`/`kYesKeepExisting` are
+the host's answer, and `kThrow` is refused by name because a `crux` internal
+method cannot carry a thrown *value* out. A `kYes` from `descriptor` reads the
+return slot and converts the descriptor **object** with the engine's own
+`crux::property::to_property_descriptor` — which corrects an earlier guess in
+this record: the carrier is a `ReturnValue<Value>` holding a descriptor object,
+not an attribute Integer.
+
+*The measurement — the gate the plan named, and it is passed.*
+`cargo test -p deno_core --features v8 --lib --no-run` goes from **5 errors to 0**:
+deno_core's test suite compiles, and its tests run for the first time. Running
+the snapshot ones is the next measurement, and it is **5 passed, 13 failed** —
+with every failure one mechanism rather than thirteen:
+`CoreError(NonEvaluatedModules(["ext:core/mod.js", "ext:core/ops"]))`, deno's
+module *evaluation* not completing. That is the next part, named by the
+measurement as every part above it has been.
+
+*Tests — two, each mutated.*
+`a_global_handler_is_consulted_and_k_no_gives_the_operation_back` builds the realm
+the way a host does (template → handler → `Context::new` → `ContextScope`) and
+asserts the three callbacks were consulted and that `kNo` left the ordinary
+operations running; `a_setter_answering_k_yes_keeps_the_engine_out_of_the_set`
+asserts that `kYes` means the value never lands. Mutations, each caught: the
+context ignoring the template's handler (both fail), and a `kYes` answering as
+`kNo` (the second fails).
+
+*Gates.* `cargo test --locked --workspace` green in 38 binaries; `cargo fmt --all
+-- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D
+warnings` clean; test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang (158 skip)
+of 48,622, `intl402` 3,205 / 0 fail (152 skip); the eight wasm core suites 64,594
+checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 / 0 fail. The sweeps were run
+because the engine change is in `api::template`, which every runner links.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5103,19 +5159,16 @@ a frame view of the running stack. §7's survey already split the subsystem: the
     bridge methods, and the global-object seam — `Some(ops)` builds the global
     with `host_object_create`, `None` with `ordinary_object_create`, so every
     existing caller is untouched and the corpus and the wasm sweeps reproduce
-    their numbers. Landed since: the return slot above, and the vocabulary — `Intercepted` and
-    `PropertyHandlerFlags` in `crates/v8/property.rs`. What remains is the
-    mechanism's configuration half and its wiring:
-    `NamedPropertyHandlerConfiguration` with the three callbacks the test
-    configures, `PropertyCallbackArguments`, the template's storage for a handler,
-    `ObjectTemplate::set_named_property_handler`, and a `HostOps` implementation
-    that builds each callback's scope from `crate::realm::current()` and calls
-    back. Two facts the next pass needs. The definer's argument needs a bridge
-    constructor for `PropertyDescriptor`, whose inner
-    `crux::property::PropertyDescriptor` is private to that module. And the engine
-    consults host ops **before** its own own-property lookup, so `NON_MASKING` is
-    accepted but not honoured: the handler is called for a name the prototype
-    chain also carries, which a `kNo` answer makes invisible in the result.
+    their numbers. **Landed** (§7's record, with its tests and mutations): the vocabulary, the
+    three callbacks with their trampolines, the configuration, the template's
+    storage for a handler — an engine-side host-state slot on
+    `api::ObjectTemplate`, named before it was made — and the `HostOps`
+    implementation that calls the host back. deno_core's test suite now
+    **compiles and runs**; the frontier it names next is
+    `NonEvaluatedModules(["ext:core/mod.js", "ext:core/ops"])`, deno's module
+    evaluation, rather than this item. Two divergences stand as recorded above:
+    `NON_MASKING` is accepted and not honoured, and `kThrow` is refused by
+    name.
 
 
 ## 10. Build order
