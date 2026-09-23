@@ -3534,6 +3534,67 @@ v8` both fail to match a package, so neither runner links this crate and the
 corpus cannot see a bridge-only change. `runtime` is untouched this time, which
 is why the four sweeps above are not repeated here.
 
+**The `import.meta` seam is closed, and two failures moved again.** §9's bullet
+named this before the edit: the engine made a module's `import.meta` and asked no
+host, so `import.meta.url` did not exist, and `deno_core`'s
+`host_initialize_import_meta_object_callback` — which it installs at
+`runtime/setup.rs:288-295` — was accepted and dropped by this bridge.
+
+*The mechanism, both halves.* `HostHooks` gains
+`initialize_import_meta_object(&self, module, meta)` (the spec's
+HostInitializeImportMetaObject), dispatched by
+`host::initialize_import_meta_object`, and `module::import_meta` calls it where it
+makes the object and **before** it caches — once per module record, which is when
+V8 calls the host's. The module handle is taken *out* of the running context first,
+because the hook runs host code that re-enters the engine and nothing derived from
+that borrow may be live across it. The bridge stores the callback
+(`IsolateInner::import_meta`) instead of dropping it, installs its `HostHooks`, and
+runs it with the context entered, with the module it was handed and the object the
+engine made. Engine files: `host.rs` (the trait method and the dispatch) and
+`module.rs` (the call site).
+
+*The evidence the hook runs.* `import_meta_snapshot`'s module body is
+`if (import.meta.url != 'file:///main_with_code.js') throw Error();`, and that
+exact string can only come from deno's own callback. Its build phase now returns
+`Ok` from `run_event_loop` — where it died with its own `Error` before — and fails
+one step later, inside `runtime.snapshot()`. So `url` was filled, and the failure
+moved to a mechanism of its own: **the blob cannot carry a host constructor**,
+because `globalThis.meta = import.meta` puts deno's `import_meta.resolve` (built
+by `v8::FunctionBuilder`) into the carried global. `dynamic_imports_snapshot`
+moved too, onto the seam the previous record named: its module is
+`await import("./b.js")` and it now reports the engine's own
+`TypeError: Cannot find module ./b.js`, because deno's dynamic-import callback is
+still accepted and never run (`set_host_import_module_dynamically_callback`). That
+is the next part. `es_snapshot`, `jsrealm::es_snapshot`,
+`es_snapshot_without_runtime_module_loader` and `lazy_loaded_esm` are unchanged.
+
+*The measurement — still 12/6, and again the count is not the result.* Three of the
+six have now moved twice, each time off a wrong error onto a real one, so the
+number is flat while the frontier is sharper: two named mechanisms (the host
+constructor a blob refuses; the dynamic-import seam) now stand where one bridge
+omission did.
+
+*Tests — two, each mutated.* `a_host_fills_import_meta_once_per_module` (runtime)
+installs hooks that write `url` and asserts what the module reads, that
+`import.meta === import.meta` is the filled object, that the hook ran **once**, and
+that the module it was handed is the record the object belongs to — which is what a
+host needs to look its own metadata up by, deno's `module_map.get_name_by_module`
+being exactly that lookup. `a_hosts_import_meta_callback_fills_the_object` (v8)
+does the same through the bridge's own setter. Mutations: the engine not calling
+the hook (both fail), and the bridge not storing the callback (the bridge test
+fails while the engine one passes, the two halves being separate).
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **882** (was
+881); v8 `--lib` **239** (was 238); `cargo fmt --all -- --check` and `cargo clippy
+--locked --workspace --all-targets -- -D warnings` clean; test262 `all` **48,464
+runnable of 48,622 at a 100.0% pass rate** — the baseline, re-run because this
+changes the engine. `intl402`, the eight wasm core suites and `wasmtest jsapi` were
+**not** re-run, and that is a reachability argument rather than a hope: the change
+is reached only from code that writes `import.meta`, and a grep for `import.meta`
+over `test262/test/intl402/**/*.js` and over `waspec/**/*.{js,wast,wat,mjs}` answers
+nothing — the same "checked by grep, not assumed" standard §7's microtask-policy
+record used.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3583,6 +3644,26 @@ if that proves possible.
   `Function::builder` shares, so it is not this console's alone. What a host can
   act on is the same in all three cases: the methods are callable, they are
   enumerable under their V8 names, and they do nothing.
+- **The engine gains the `import.meta` host hook, and it is the engine's change
+  rather than the bridge's — named here before the edit, per §11's order.** V8
+  fills a module's `import.meta` by calling the host's
+  `SetHostInitializeImportMetaObjectCallback` the first time the object is made;
+  this engine makes the object itself and calls no host (`module::import_meta`,
+  `crates/runtime/src/module.rs`), so a module body that reads `import.meta.url`
+  sees `undefined` — measured: deno's `import_meta_snapshot` fails on its own
+  `throw Error()` for exactly that reason. So `HostHooks` gains
+  `initialize_import_meta_object(&self, module, meta)` (the spec's
+  HostInitializeImportMetaObject), dispatched by
+  `host::initialize_import_meta_object`, and `module::import_meta` calls it where
+  it makes the object and **before** it caches — once per module, which is when
+  V8 calls it. The default does nothing, so an engine whose host installed no
+  callback keeps the empty object such a host should see. The bridge's half of the
+  same part is to stop dropping the callback it already accepts
+  (`crates/v8/isolate.rs`'s `set_host_initialize_import_meta_object_callback`,
+  which currently said "accepted and not run"). **Landed** in the same change as
+  the bridge's half; §7's record has the measurement, and it moved
+  `import_meta_snapshot`'s failure from the engine to the blob refusing deno's
+  `import_meta.resolve`.
 - **The platform is a shape without a producer, and that is stated.** Slag posts
   no task, so `Platform`/`PlatformImpl`/`Task` exist so a host's initialization
   and its own implementation type-check, and the bridge's module docs say so

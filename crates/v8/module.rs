@@ -689,6 +689,52 @@ mod tests {
         Some(Local::from_module(module.module()))
     }
 
+    /// A host's `import.meta` callback runs when the engine makes the object, and
+    /// what it writes is what the module's code reads — the seam
+    /// `SetHostInitializeImportMetaObjectCallback` names, which this bridge used
+    /// to accept and drop. It runs once per module, because the engine caches
+    /// the object it filled.
+    #[test]
+    fn a_hosts_import_meta_callback_fills_the_object() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        #[allow(improper_ctypes_definitions)] // as the callback type says.
+        extern "C" fn fills(context: Local<Context>, _module: Local<Module>, meta: Local<Object>) {
+            crate::callback_scope!(unsafe scope, context);
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let key = JsString::new(scope, "url").expect("string");
+            let value = JsString::new(scope, "file:///the-host.js").expect("string");
+            meta.set(scope, key.into(), value.into()).expect("set");
+        }
+
+        in_context!(scope, {
+            scope.set_host_initialize_import_meta_object_callback(fills);
+            let text = JsString::new(
+                scope,
+                "globalThis.__url = import.meta.url;\n\
+                 globalThis.__same = import.meta === import.meta;",
+            )
+            .expect("string");
+            let mut source = Source::new(text, None);
+            let module = compile_module(scope, &mut source).expect("compile");
+            module.evaluate(scope).expect("evaluate");
+
+            assert_eq!(
+                crate::test_support::eval(scope, "__url").to_rust_string_lossy(scope),
+                "file:///the-host.js"
+            );
+            assert_eq!(
+                crate::test_support::eval_number(scope, "__same ? 1 : 0"),
+                1.0
+            );
+            assert_eq!(
+                CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "once per module, because the engine caches what it filled"
+            );
+        });
+    }
+
     /// A module's requests are read one at a time, in source order, with the
     /// specifier, phase, source offset and attributes each was written with —
     /// which is the whole of what `deno_core` reads out of

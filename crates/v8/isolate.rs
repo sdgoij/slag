@@ -236,6 +236,11 @@ pub struct IsolateInner {
     /// The host's streaming-compilation callback
     /// (`v8::Isolate::SetWasmStreamingCallback`), once it installed one.
     wasm_streaming: Option<StreamingCallback>,
+    /// The host's `import.meta` callback
+    /// (`v8::Isolate::SetHostInitializeImportMetaObjectCallback`), once it
+    /// installed one. The engine reaches it through this bridge's `HostHooks`
+    /// when it makes a module's `import.meta`.
+    import_meta: Option<HostInitializeImportMetaObjectCallback>,
 }
 
 const _: () = assert!(std::mem::offset_of!(IsolateInner, engine) == 0);
@@ -580,6 +585,7 @@ impl Isolate {
             externals,
             promise_reject: None,
             wasm_streaming: None,
+            import_meta: None,
         });
         // SAFETY: the box's allocation is where the state lives and it outlives
         // every handle to it — `OwnedIsolate` keeps it alive.
@@ -1187,16 +1193,20 @@ impl Isolate {
         let _ = callback;
     }
 
-    /// The callback a module's first read of `import.meta` would run
+    /// The callback a module's first read of `import.meta` runs
     /// (v8::Isolate::SetHostInitializeImportMetaObjectCallback).
     ///
-    /// Accepted and not run: the engine builds `import.meta` when it loads a
-    /// module, so there is no seam for a host to fill.
+    /// Run, unlike the two dynamic-import setters below: the engine makes the
+    /// `import.meta` object and asks this bridge's `HostHooks` to fill it the
+    /// first time a module reads it, which is the moment V8 calls this callback.
+    /// A host that installs none gets the empty object the engine made, which is
+    /// what V8 hands out to one that installs none as well.
     pub fn set_host_initialize_import_meta_object_callback(
         &mut self,
         callback: HostInitializeImportMetaObjectCallback,
     ) {
-        let _ = callback;
+        self.inner_mut().import_meta = Some(callback);
+        self.install_hooks();
     }
 
     /// The callback a dynamic `import()` would run
@@ -1393,6 +1403,51 @@ impl runtime::HostHooks for BridgeHooks {
         };
         let source = Local::<Value>::from_engine(api::Local::from(*source));
         callback(scope, source, WasmStreaming(streaming.clone()));
+        Ok(())
+    }
+
+    fn initialize_import_meta_object(
+        &self,
+        module: &api::Module,
+        meta: &crux::value::Value,
+    ) -> Result<(), crux::error::JsError> {
+        let Some(engine) = api::Isolate::get_current() else {
+            return Ok(());
+        };
+        // SAFETY: as `wasm_streaming` — the engine hands back the isolate whose
+        // agent is running, and that address is the bridge's.
+        let isolate = unsafe { Isolate::from_engine_ptr(engine) };
+        let Some(callback) = isolate.inner().import_meta else {
+            return Ok(());
+        };
+        // The realm the engine is running in. `import.meta` is only made while a
+        // module's own code runs, so a realm is in reach; a module whose realm is
+        // somehow gone is a bridge bug rather than a state a host can act on.
+        let Some(context) = isolate.current_context() else {
+            return Err(crux::error::JsError::new(
+                crux::ErrorKind::TypeError,
+                "an import.meta object needs a realm in reach".into(),
+            ));
+        };
+        let context_local = Local::<Context>::from_payload(Payload::Context(context));
+        // The scope is what enters the context for the call, which is how the
+        // crate we stand in for invokes this callback; the callback itself is
+        // handed the context handle rather than a scope.
+        crate::callback_scope!(unsafe _scope, context_local);
+        let meta = Local::<Value>::from_engine(api::Local::from(*meta));
+        let Ok(meta) = Local::<Object>::try_from(meta) else {
+            // The engine makes this object itself, so anything else is a bridge
+            // bug and saying so beats handing the host something it cannot use.
+            return Err(crux::error::JsError::new(
+                crux::ErrorKind::TypeError,
+                "the import.meta the engine made is not an object".into(),
+            ));
+        };
+        // SAFETY: the host installed this callback for exactly this call, and
+        // the crate we stand in for declares it `unsafe extern "C"` because it
+        // receives handles rather than because it may do anything the host's own
+        // code could not.
+        unsafe { callback(context_local, Local::from_module(*module), meta) };
         Ok(())
     }
 }

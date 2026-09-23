@@ -88,6 +88,24 @@ pub trait HostHooks: std::fmt::Debug {
             "WebAssembly.compileStreaming is not implemented by this host".into(),
         ))
     }
+
+    /// HostInitializeImportMetaObject (spec 16.2.1.8,
+    /// `v8::Isolate::SetHostInitializeImportMetaObjectCallback`): lets the host
+    /// fill a module's `import.meta` when the engine first makes the object.
+    /// `meta` is the ordinary object the engine made and `module` is the record
+    /// it belongs to; the host sets on it what its own `import.meta` should
+    /// carry (`deno_core`'s callback puts `url`, `main` and `resolve` there).
+    ///
+    /// Called once per module record, on the first read of `import.meta` in it.
+    /// The default does nothing, so a host that installed no callback leaves the
+    /// empty object the engine made.
+    fn initialize_import_meta_object(
+        &self,
+        _module: &crate::api::Module,
+        _meta: &crux::value::Value,
+    ) -> Result<(), JsError> {
+        Ok(())
+    }
 }
 
 /// HostPromiseRejectionTracker dispatch: the agent's hooks if present, else
@@ -127,6 +145,21 @@ pub fn wasm_streaming(
             crux::ErrorKind::TypeError,
             "WebAssembly.compileStreaming needs a host streaming hook".into(),
         )),
+    }
+}
+
+/// The `import.meta` hook dispatch (see
+/// [`HostHooks::initialize_import_meta_object`]): the agent's hooks if it has
+/// any, else nothing — the object the engine made is then what the module's code
+/// sees.
+pub fn initialize_import_meta_object(
+    agent: &crate::agent::Agent,
+    module: &crate::api::Module,
+    meta: &crux::value::Value,
+) -> Result<(), JsError> {
+    match &agent.host_hooks {
+        Some(hooks) => hooks.initialize_import_meta_object(module, meta),
+        None => Ok(()),
     }
 }
 

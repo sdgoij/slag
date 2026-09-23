@@ -3369,27 +3369,39 @@ pub fn import_meta(agent: &mut Agent) -> Result<Value, JsError> {
     // [[ImportMeta]] (spec 16.2.1.8): one ordinary object per module record,
     // created on first access and cached — `import.meta` is the same object
     // for every access within a module and distinct across modules.
-    let context = agent.running_context()?;
-    if let Some(crate::context::ScriptOrModule::Module(module)) = &context.script_or_module {
-        if let Some(meta) = *module.import_meta.borrow() {
-            return Ok(meta);
-        }
-        let proto = agent
-            .current_realm()?
-            .intrinsics
-            .get("%Object.prototype%")
-            .and_then(|value| crate::context::as_object(&value));
-        let meta = Value::Object(JsObject::ordinary_object_create(proto));
-        crux::heap::write_barrier(&**module, meta);
-        module.import_meta.replace(Some(meta));
-        return Ok(meta);
-    }
+    //
+    // The module handle is taken *out* of the running context rather than
+    // borrowed from it: the host hook below runs host code that re-enters the
+    // engine, so nothing derived from that borrow may be live across it.
+    let module = match &agent.running_context()?.script_or_module {
+        Some(crate::context::ScriptOrModule::Module(module)) => Some(*module),
+        _ => None,
+    };
     let proto = agent
         .current_realm()?
         .intrinsics
         .get("%Object.prototype%")
         .and_then(|value| crate::context::as_object(&value));
-    Ok(Value::Object(JsObject::ordinary_object_create(proto)))
+    let Some(module) = module else {
+        return Ok(Value::Object(JsObject::ordinary_object_create(proto)));
+    };
+    if let Some(meta) = *module.import_meta.borrow() {
+        return Ok(meta);
+    }
+    let meta = Value::Object(JsObject::ordinary_object_create(proto));
+    // The host fills the object before it is cached, once per module record
+    // (spec 16.2.1.8's HostInitializeImportMetaObject, which V8 spells
+    // `SetHostInitializeImportMetaObjectCallback`): `deno_core`'s callback is
+    // what puts `url`, `main` and `resolve` on it, and a host that installed
+    // none leaves what the engine made.
+    crate::host::initialize_import_meta_object(
+        agent,
+        &crate::api::Module::from_handle(module),
+        &meta,
+    )?;
+    crux::heap::write_barrier(&*module, meta);
+    module.import_meta.replace(Some(meta));
+    Ok(meta)
 }
 
 /// The `with { ... }` attributes of an import.
@@ -3763,6 +3775,96 @@ mod tests {
         assert_eq!(
             namespace_read(&mut evaluated, "t").unwrap(),
             js_str("object")
+        );
+    }
+
+    static IMPORT_META_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static IMPORT_META_MODULE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A host that fills a module's `import.meta` (spec 16.2.1.8's
+    /// HostInitializeImportMetaObject), recording the module it was handed.
+    #[derive(Debug)]
+    struct FillsImportMeta;
+
+    impl crate::host::HostHooks for FillsImportMeta {
+        fn initialize_import_meta_object(
+            &self,
+            module: &crate::api::Module,
+            meta: &Value,
+        ) -> Result<(), JsError> {
+            IMPORT_META_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            IMPORT_META_MODULE.store(
+                crux::handle::Handle::as_ptr(module.handle()) as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let object = crate::context::as_object(meta).ok_or_else(|| {
+                JsError::new(ErrorKind::TypeError, "import.meta is not an object".into())
+            })?;
+            object.define_property(
+                &JsString::from_utf8("url"),
+                &crux::property::PropertyDescriptor {
+                    value: Some(Value::String(Handle::new(JsString::from_utf8(
+                        "file:///filled-by-the-host.js",
+                    )))),
+                    writable: Some(true),
+                    enumerable: Some(true),
+                    configurable: Some(true),
+                    get: None,
+                    set: None,
+                },
+            )?;
+            Ok(())
+        }
+    }
+
+    /// The engine makes a module's `import.meta` and asks the agent's hooks to
+    /// fill it **before** it caches the object — once per module record, which is
+    /// when V8 calls `SetHostInitializeImportMetaObjectCallback`. The module the
+    /// hook is handed is the record the object belongs to, which is what a host
+    /// needs to look its own metadata (deno's `url`) up by.
+    #[test]
+    fn a_host_fills_import_meta_once_per_module() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().expect("a realm");
+        agent.host_hooks = Some(Box::new(FillsImportMeta));
+        agent.add_module(
+            "m.js",
+            "export var url = import.meta.url; export var same = import.meta === import.meta;",
+        );
+        let module = host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js"), &[])
+            .expect("the module");
+        module_declaration_instantiation(&mut agent, &module).expect("instantiate");
+        module_evaluation(&mut agent, &module).expect("evaluate");
+        agent.run_jobs().expect("jobs");
+        let namespace = module_namespace(&mut agent, &module).expect("namespace");
+        let read = |agent: &mut Agent, name: &str| {
+            crate::context::get_property(agent, &namespace, &JsString::from_utf8(name), namespace)
+                .expect("a read")
+        };
+
+        assert_eq!(
+            read(&mut agent, "url")
+                .as_string()
+                .map(|text| text.to_string_lossy())
+                .as_deref(),
+            Some("file:///filled-by-the-host.js"),
+            "what the host wrote is what the module reads"
+        );
+        assert_eq!(
+            read(&mut agent, "same"),
+            Value::Boolean(true),
+            "the filled object is the one the module keeps reading"
+        );
+        assert_eq!(
+            IMPORT_META_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "once per module record, because the engine caches what it filled"
+        );
+        assert_eq!(
+            IMPORT_META_MODULE.load(std::sync::atomic::Ordering::SeqCst),
+            crux::handle::Handle::as_ptr(module) as u64,
+            "and the hook is handed the module the object belongs to"
         );
     }
 
