@@ -167,7 +167,7 @@ pub(crate) fn stack_frames(agent: &Agent, limit: usize) -> Vec<StackFrame> {
 /// otherwise be the outermost frame of every trace. Every other context is code
 /// the engine is running — a call, a script, a module — and a call's context is
 /// the only frame an ordinary call has, which is why a source of its own counts.
-fn is_frame(context: &ExecutionContext) -> bool {
+pub(crate) fn is_frame(context: &ExecutionContext) -> bool {
     context.function.is_some() || context.script_or_module.is_some() || context.source.is_some()
 }
 

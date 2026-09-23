@@ -69,14 +69,29 @@ impl Drop for TryCatch {
     }
 }
 
-/// v8::Exception: create a native error, throw it (set the pending
-/// exception), and return it.
+/// v8::Exception: create a native error from a realm's error constructor,
+/// optionally throwing it.
+///
+/// Making a value and throwing it are separate entry points because V8 separates
+/// them: `Exception::Error` and its siblings only *make* a value
+/// (`Isolate::ThrowException` is what throws), and a host that builds an error it
+/// will not throw — or that reads `Error.prototype` off one — must not have an
+/// unrelated pending exception replaced on the way. deno's
+/// `is_instance_of_error` does exactly that on every translation.
 pub struct Exception;
 
 impl Exception {
-    /// Create and throw an error from the realm's error constructor
-    /// `ctor_name` (e.g. `%TypeError%`).
-    fn throw_with(isolate: &mut Isolate, ctor_name: &str, message: &str) -> Result<Local, JsError> {
+    /// Create an error from the realm's error constructor `ctor_name` (e.g.
+    /// `%TypeError%`), leaving the pending exception alone (v8::Exception::Error
+    /// and friends).
+    ///
+    /// A realm whose `ctor_name` is not a constructor makes a string
+    /// `"<Name>: <message>"` instead, so a caller always has a throwable value.
+    pub fn create_with(
+        isolate: &mut Isolate,
+        ctor_name: &str,
+        message: &str,
+    ) -> Result<Local, JsError> {
         let agent = &mut isolate.agent;
         let realm = agent.current_realm()?;
         let ctor = realm.intrinsics.get(ctor_name).unwrap_or(Value::Undefined);
@@ -90,8 +105,14 @@ impl Exception {
                 message
             ))))
         };
-        isolate.set_pending_exception(value);
         Ok(Local(value))
+    }
+
+    /// Create an error and set it as the pending exception (Isolate::ThrowException).
+    fn throw_with(isolate: &mut Isolate, ctor_name: &str, message: &str) -> Result<Local, JsError> {
+        let value = Self::create_with(isolate, ctor_name, message)?;
+        isolate.set_pending_exception(value.into_value());
+        Ok(value)
     }
 
     pub fn throw_error(isolate: &mut Isolate, message: &str) -> Result<Local, JsError> {

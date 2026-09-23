@@ -1,7 +1,7 @@
 //! Native errors (`v8::Exception`).
 //!
-//! Creating one sets the isolate's pending exception, as it does in the crate
-//! we stand in for, where the caller throws what it made.
+//! Creating one makes the value and nothing else, as in the crate we stand in
+//! for: throwing is `scope.throw_exception`, which the caller does.
 
 use runtime::api;
 
@@ -29,7 +29,7 @@ impl Exception {
 
     /// A new `Error` (v8::Exception::Error).
     pub fn error<'s>(scope: &PinScope<'s, '_, ()>, message: Local<'_, String>) -> Local<'s, Value> {
-        Self::throw_with(scope, message, api::Exception::throw_error)
+        Self::create(scope, message, "%Error%")
     }
 
     /// A new `TypeError` (v8::Exception::TypeError).
@@ -37,7 +37,7 @@ impl Exception {
         scope: &PinScope<'s, '_, ()>,
         message: Local<'_, String>,
     ) -> Local<'s, Value> {
-        Self::throw_with(scope, message, api::Exception::throw_type_error)
+        Self::create(scope, message, "%TypeError%")
     }
 
     /// A new `RangeError` (v8::Exception::RangeError).
@@ -45,7 +45,7 @@ impl Exception {
         scope: &PinScope<'s, '_, ()>,
         message: Local<'_, String>,
     ) -> Local<'s, Value> {
-        Self::throw_with(scope, message, api::Exception::throw_range_error)
+        Self::create(scope, message, "%RangeError%")
     }
 
     /// A new `SyntaxError` (v8::Exception::SyntaxError).
@@ -53,7 +53,7 @@ impl Exception {
         scope: &PinScope<'s, '_, ()>,
         message: Local<'_, String>,
     ) -> Local<'s, Value> {
-        Self::throw_with(scope, message, api::Exception::throw_syntax_error)
+        Self::create(scope, message, "%SyntaxError%")
     }
 
     /// A new `ReferenceError` (v8::Exception::ReferenceError).
@@ -61,24 +61,45 @@ impl Exception {
         scope: &PinScope<'s, '_, ()>,
         message: Local<'_, String>,
     ) -> Local<'s, Value> {
-        Self::throw_with(scope, message, api::Exception::throw_reference_error)
+        Self::create(scope, message, "%ReferenceError%")
     }
 
-    fn throw_with<'s>(
+    fn create<'s>(
         scope: &PinScope<'s, '_, ()>,
         message: Local<'_, String>,
-        throw: fn(&mut api::Isolate, &str) -> Result<api::Local, crux::error::JsError>,
+        ctor_name: &str,
     ) -> Local<'s, Value> {
         // A message that is not text leaves the error without one; the error
         // itself is still the right error.
         let text = message.engine().as_string().unwrap_or_default();
         let mut isolate = scope.isolate_ptr();
-        match throw(isolate.engine_mut(), &text) {
+        match api::Exception::create_with(isolate.engine_mut(), ctor_name, &text) {
             Ok(value) => Local::from_engine(value),
             // The engine's constructors fall back to a plain string for a value
             // it cannot throw, so this is unreachable outside a realm with no
             // error constructors at all.
             Err(_) => Local::from_engine(api::Local::undefined()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::data::String as JsString;
+    use crate::test_support::in_context;
+
+    /// Making one is not throwing one (v8::Exception::Error and its siblings
+    /// only *make* the value). deno's `is_instance_of_error` builds an empty
+    /// `Error` to read `Error.prototype` while translating an exception, so a
+    /// create that also threw would replace the exception being translated.
+    #[test]
+    fn creating_an_error_leaves_the_isolate_alone() {
+        in_context!(scope, {
+            let boom = JsString::new(scope, "boom").expect("string");
+            let exception = super::Exception::type_error(scope, boom);
+            assert!(exception.is_object());
+            assert!(!scope.engine().has_pending_exception());
+            assert_eq!(exception.to_rust_string_lossy(scope), "TypeError: boom");
+        });
     }
 }

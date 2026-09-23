@@ -3847,7 +3847,10 @@ test passing there is correct, because the side-effect form does not go through
 *The measurement.* deno's release snapshot suite goes **16/2 → 17/1**. `es_snapshot` —
 this part's buyer — passes. One failure is left, and it is the named frontier:
 `es_snapshot_without_runtime_module_loader`, where the hand-off is correct and the
-bare `Error` comes after it, from deno's `buildCustomError` path.
+bare `Error` comes after it, from deno's `buildCustomError` path — **the second
+half of that is wrong, and the record below is what corrects it**: the probes
+find the builder is never called, and the `Error` traced back to the bridge's own
+throwing constructors and to the engine's bootstrap context in `Error.stack`.
 
 *Gates.* `cargo test --locked --workspace` green; runtime `--lib` **887** and v8
 `--lib` **241** (240 plus the re-export test); `cargo fmt --all -- --check` and `cargo
@@ -3859,6 +3862,66 @@ a reachability argument: the changed path is an import/export *declaration*, and
 over `waspec/**` for a line beginning `import`/`export` and for `import "…"`/`from
 "…"` answer only the spec's own build tooling (`.py`) and prose (`.bs`, `.ml`, `.md`)
 — no `.js`, `.mjs`, `.wast` or `.wat` fixture.
+
+**The rejection's error object — the bridge's throwing constructors, and the
+engine's bootstrap context in `Error.stack`.** §9 item 18 names both halves. The
+probe chain that opened it (three lines of `eprintln`, since reverted) also kills
+this section's own earlier attribution, which is the part worth reading:
+
+- `PROBE-LDI` fires with the referrer deno sends (`""`), `PROBE-VALIDATE` builds
+the right message, `PROBE-DRAIN-ERR` shows it arriving as
+`CoreError(JsBox(JsErrorBox { class: "TypeError", message: … }))`, and
+`PROBE-COREKIND` shows `to_v8_error` reading exactly that class and that message.
+The hand-off is correct, deno's `buildCustomError` is **never called** (the probe
+placed on it never fired), and the rejected `Error` was not built from that
+message at all.
+- `PROBE-THROW` shows the engine being handed `%TypeError%` and the full message,
+so the value was made correctly and then lost — by the bridge: `api::Exception`'s
+`throw_*` set the isolate's pending exception, and deno's `is_instance_of_error`
+(`libs/core/error.rs:1406`) calls `v8::Exception::error(scope, String::empty)` on
+every translation just to read `Error.prototype`, replacing that exception with a
+fresh empty `Error` each time.
+- `PROBE-STACK` shows the last delta: `execution_context_stack.len() == 1` with
+`function == None` at construction — the realm's never-popped bootstrap context —
+and `define_stack` reporting it as `at <anonymous>`.
+
+*What changed.* `api::Exception` gains `create_with` (make the value, touch
+nothing) and `throw_with` becomes create + `set_pending_exception`; the bridge's
+five `Exception::*` constructors route through `create_with` by `%`-name and no
+longer throw, as the crate they stand in for does not. `define_stack` filters the
+execution-context stack through `api::stack_trace::is_frame` — the rule that
+already existed for `capture_stack` and was missing here — so `Error.stack` no
+longer opens with the bootstrap line. Nothing else moved: `is_frame` became
+`pub(crate)` rather than being copied into a second predicate.
+
+*Tests — four added, each mutation-verified.* `creating_an_error_leaves_the_isolate_alone`
+(v8) asserts `!has_pending_exception()` and the rendered `TypeError: boom` after
+`Exception::type_error`; `creating_an_error_leaves_the_pending_exception_alone`
+(runtime) asserts the same split in `api` plus the value's `name` and `message`;
+`a_stack_with_no_frame_is_only_the_header` (runtime) makes an error with the
+bootstrap context as the only one on the stack and asserts the bare header;
+`a_scripts_own_context_is_still_a_frame` asserts a script's own context is still a
+line (two lines, not three). Four mutations, each caught: `create_with` setting
+the pending exception (the api test), the bridge setting it after the create (the
+v8 test), dropping the filter (both stack tests), and tightening it to
+`function.is_some()` (only the script test) — which is the mutation that shows the
+two stack tests are not the same test.
+
+*The measurement.* deno's release snapshot suite goes **17/1 → 18/0**. The frontier
+test — `es_snapshot_without_runtime_module_loader`, whose expected text is deno's
+own `TypeError: Importing ext: modules is only allowed from ext: and node:
+modules. Tried to import ext:module_snapshot/test.js from (no referrer)` — passes,
+and with it every snapshot test in `deno_core`'s suite.
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **890** (887 plus
+the three) and v8 `--lib` **242** (241 plus one); `cargo fmt --all -- --check` and
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean. The corpora
+**were** re-run rather than argued about, because `define_stack` is on every `Error`
+construction path: test262 `all` reproduces its baseline exactly — **48,464 pass, 0
+fail, 0 crash, 0 hang** (158 skip) of 48,622 — and the wasm sweeps reproduce
+theirs: core **20,662** plus the seven proposal suites (simd 25,990, relaxed-simd
+77, bulk-memory 7,485, exceptions 105, gc 654, memory64 8,709, multi-memory 912)
+for **64,594 / 0 fail / 0 pending**, and js-api **1,001 tests, 0 fail**.
 
 ## 8. Parked: the C++ face
 
@@ -6022,7 +6085,42 @@ a frame view of the running stack. §7's survey already split the subsystem: the
     evaluation, rather than this item. Two divergences stand as recorded above:
     `NON_MASKING` is accepted and not honoured, and `kThrow` is refused by
     name.
+18. **The rejection's error object — named before the edit, and it corrects §7's
+    last record.** The one failure left in deno's snapshot suite is
+    `es_snapshot_without_runtime_module_loader`, and §7 attributed its bare
+    `Error` to deno's `buildCustomError` path. Probes on the hand-off say
+    otherwise, and the correction matters because the two defects are one in the
+    bridge and one in the engine:
 
+    - **The bridge's `v8::Exception::error`/`type_error`/... also *throw*.**
+      `crates/v8/exception.rs` routes each one through `api::Exception::throw_*`,
+      which sets the isolate's pending exception. V8's `v8::Exception::Error`
+      only *makes* the value; the caller throws it (`scope.throw_exception`),
+      which every deno site does — including `is_instance_of_error`
+      (`libs/core/error.rs:1406`), which calls `v8::Exception::error(scope,
+      String::empty)` merely to read `Error.prototype` while translating an
+      exception. Measured: `CoreErrorKind::to_v8_error` builds the right
+      `TypeError` with the right message and the promise still rejects with a
+      fresh empty `Error`, because each translation clobbered the pending
+      exception on its way through. **The embedding API gains the split V8 has**
+      — `api::Exception::create_with` (make the value, touch nothing) beside
+      `throw_with` = create + `set_pending_exception` — and the bridge's
+      constructors become create-only. No throwing caller changes: the engine's
+      own `Exception::throw_*` keep their behaviour and their test.
+    - **The engine's `Error.stack` counts the realm's bootstrap context as a
+      frame.** With the class and the message right, the only delta left is a
+      spurious `at <anonymous>`. The probe names it exactly: at that moment
+      `agent.execution_context_stack` holds one context — the one
+      `push_bootstrap_context` makes, with no function, no script or module and
+      no source, pushed once and never popped. `api::stack_trace` already
+      encodes the rule for it (`is_frame`, whose comment says why every trace
+      would otherwise open with it) and `builtins::error::define_stack` does
+      not. **The engine edit is one predicate**: `define_stack` skips the
+      contexts `is_frame` refuses, and `is_frame` becomes `pub(crate)` on its
+      module rather than a second copy of the same three tests. Nothing else moves: a script's
+      own top-level context is a frame by that same rule (`script_evaluation`
+      sets both `script_or_module` and `source`), so only the never-popped line
+      disappears.
 
 ## 10. Build order
 

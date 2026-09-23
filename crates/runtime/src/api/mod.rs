@@ -25,7 +25,7 @@ mod module;
 mod object;
 mod promise;
 mod script;
-mod stack_trace;
+pub(crate) mod stack_trace;
 mod template;
 mod try_catch;
 #[cfg(feature = "wasm")]
@@ -446,6 +446,26 @@ mod tests {
         let error = Exception::throw_type_error(&mut isolate, "nope").unwrap();
         assert!(error.is_object());
         assert!(isolate.has_pending_exception());
+    }
+
+    #[test]
+    fn creating_an_error_leaves_the_pending_exception_alone() {
+        let mut isolate = isolate();
+        let _context = context(&mut isolate);
+        let error = Exception::create_with(&mut isolate, "%TypeError%", "nope").unwrap();
+        // A create is not a throw (V8's `Exception::TypeError` does not set a
+        // pending exception; `Isolate::ThrowException` does).
+        assert!(!isolate.has_pending_exception());
+        assert!(error.is_object());
+        let object = crate::context::as_object(error.value()).unwrap();
+        let name = object
+            .get(&crux::string::JsString::from_utf8("name"))
+            .unwrap();
+        let message = object
+            .get(&crux::string::JsString::from_utf8("message"))
+            .unwrap();
+        assert_eq!(name.to_string(), "TypeError");
+        assert_eq!(message.to_string(), "nope");
     }
 
     #[test]

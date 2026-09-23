@@ -541,7 +541,14 @@ fn define_stack(agent: &mut Agent, object: &JsObject, name: &str) -> Result<(), 
         format!("{name}: {message}")
     };
     let mut lines = vec![header];
-    for context in agent.execution_context_stack.iter().rev() {
+    // The realm's bootstrap context is not code the engine is running, so it is
+    // not a frame: the same rule every other frame view uses.
+    let frames = agent
+        .execution_context_stack
+        .iter()
+        .rev()
+        .filter(|context| crate::api::stack_trace::is_frame(context));
+    for context in frames {
         let frame = context
             .function
             .as_ref()
@@ -843,6 +850,33 @@ mod tests {
         assert_eq!(
             run("new Error('s').stack.length > 0").unwrap(),
             Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn a_stack_with_no_frame_is_only_the_header() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let error = to_throwable(
+            &mut agent,
+            &JsError::new(ErrorKind::TypeError, "boom".into()),
+        )
+        .unwrap();
+        // The realm's bootstrap context is the only one on the stack, and it is
+        // not code the engine is running, so there is no frame to name.
+        assert_eq!(
+            stack_getter(&mut agent, &error, &[]).unwrap(),
+            str("TypeError: boom")
+        );
+    }
+
+    #[test]
+    fn a_scripts_own_context_is_still_a_frame() {
+        // The script's top-level context is a frame, so a stack made inside one
+        // carries its line and only it — never the bootstrap context beneath.
+        assert_eq!(
+            run("new Error('s').stack.split('\\n').length").unwrap(),
+            Value::Number(2.0)
         );
     }
 }
