@@ -3813,6 +3813,53 @@ greps over `crates/test262/src`, `crates/wasmtest/src`, `crates/cli/src` and
 `crates/wasm/src` for `runtime::snapshot`, `runtime::api`, `slag::api`,
 `read_snapshot` and `create_blob` answer nothing.
 
+**A module request's offset is the specifier's, and deno's suite moves 16/2 →
+17/1.** §9 named this before the edit. `es_snapshot` was failing on deno's own
+comparison of the requests it reads back against its fixture: this engine reported
+`referrer_source_offset: Some(7)` where the fixture has `Some(26)`, for a module whose
+source is `\n      import { f0 } from "file:///0.js";` — index 7 is `import`, index 26
+is the specifier's opening quote, and deno's fixture formula (`25 + digits`) is that
+quote. The crate we stand in for reports the specifier's offset; this engine reported
+the declaration's.
+
+*The mechanism.* It was structural, not arithmetic: the AST recorded one span per
+declaration and the specifier carried none, which `runtime::module::ModuleRequest`
+stated in its own doc. `ImportDecl` and `ExportDecl::From` now record the specifier's
+span beside the declaration's, the parser fills it from the token it already consumed
+(`parse_module_specifier` returns the span with the text, and the side-effect form
+takes its span before `string_value`), the runtime's two request sites use it, and the
+two docs that argued for the declaration's offset — the runtime's and
+`api::ModuleRequest`'s — now state the specifier's.
+
+*Tests — one added, two updated.* `a_reexports_offset_names_its_specifier` (v8) is
+new: both re-export forms, whose spans come from a different parser site than an
+import's, asserted at 14 and 40 (the second line starts at 22). The two that asserted
+the old meaning are updated: `a_requests_offset_names_a_location` moves from column 0
+to column 7 for `import 'one';`, and `a_modules_requests_are_read_one_at_a_time` from
+offset 0 to 18 for `import { a } from 'one';`. Four mutations, each caught: the
+runtime reporting the declaration span again (the import test, (0,0) against (0,7)),
+the re-export site doing it (the re-export test, 0 against 14), the parser filling the
+re-export's span with the declaration's (the same test), and an off-by-one that points
+*inside* the quotes rather than at them (the re-export test, 15 against 14 — the import
+test passing there is correct, because the side-effect form does not go through
+`parse_module_specifier`).
+
+*The measurement.* deno's release snapshot suite goes **16/2 → 17/1**. `es_snapshot` —
+this part's buyer — passes. One failure is left, and it is the named frontier:
+`es_snapshot_without_runtime_module_loader`, where the hand-off is correct and the
+bare `Error` comes after it, from deno's `buildCustomError` path.
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **887** and v8
+`--lib` **241** (240 plus the re-export test); `cargo fmt --all -- --check` and `cargo
+clippy --locked --workspace --all-targets -- -D warnings` clean. The corpora **were**
+re-run, because this one reaches them — the parser is on every path — and test262
+`all` is the baseline: **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip) of 48,622,
+runnable 48,464/48,622 at a 100.0% pass rate. The wasm corpora were not, and that is
+a reachability argument: the changed path is an import/export *declaration*, and greps
+over `waspec/**` for a line beginning `import`/`export` and for `import "…"`/`from
+"…"` answer only the spec's own build tooling (`.py`) and prose (`.bs`, `.ml`, `.md`)
+— no `.js`, `.mjs`, `.wast` or `.wat` fixture.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -4037,6 +4084,27 @@ if that proves possible.
   test that asserts today's refusal becomes one that asserts the restored function
   both calls and constructs. **Landed** in the change that follows it; §7's record
   has the mechanism, the mutations and the measurement.
+- **A module request's offset is the specifier's, not the declaration's — named
+  here before the edit.** `es_snapshot` fails on deno's own `assert_eq!` of the
+  requests it reads back against its fixture: `left` (this engine's report) has
+  `referrer_source_offset: Some(7)` where `right` (the fixture) has `Some(26)`, for
+  a module whose source is `\n      import { f0 } from "file:///0.js";`. Index 7 is
+  `import`; index 26 is the opening quote of the specifier; and deno's own fixture
+  formula — `25 + prev.to_string().len()` — is that quote, since the digits shift
+  the specifier and nothing else. So the crate we stand in for reports the
+  **specifier's** offset, this engine reports the declaration's, and what deno
+  wants it for is the thing the offset is *for*: pointing an error at the specifier.
+  The cause is structural rather than arithmetic: `crates/syntax/src/ast.rs`'s
+  `ImportDecl` records one span — the declaration's — and
+  `crates/runtime/src/module.rs`'s `ModuleRequest` states the choice in its own doc
+  ("`span` is the requesting declaration's, not the specifier's: the AST records a
+  span for the declaration and the specifier carries none"), which is what
+  `api::ModuleRequest::source_offset` and the bridge's `get_source_offset` pass on.
+  So the AST records the specifier's span beside the declaration's — the parser
+  already holds the specifier token at both `ImportDecl` sites, and the same goes
+  for the re-export form — the runtime's two request sites and the api follow, and
+  the two docs that state the old choice flip. **Landed** in the change that
+  follows it; §7's record has the mechanism, the mutations and the measurement.
 - **The platform is a shape without a producer, and that is stated.** Slag posts
   no task, so `Platform`/`PlatformImpl`/`Task` exist so a host's initialization
   and its own implementation type-check, and the bridge's module docs say so

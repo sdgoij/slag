@@ -809,7 +809,9 @@ mod tests {
 
             assert_eq!(read(0).get_specifier().to_rust_string_lossy(scope), "one");
             assert_eq!(read(0).get_phase(), ModuleImportPhase::kEvaluation);
-            assert_eq!(read(0).get_source_offset(), 0);
+            // The specifier's own offset, not the declaration's: `import { a } from `
+            // is 18 characters, where the `import` itself starts at 0.
+            assert_eq!(read(0).get_source_offset(), 18);
             assert_eq!(read(0).get_import_attributes().length(), 0);
 
             assert_eq!(read(1).get_specifier().to_rust_string_lossy(scope), "two");
@@ -831,9 +833,31 @@ mod tests {
         });
     }
 
-    /// A request's source offset names the declaration that asked for it, and
-    /// `source_offset_to_location` converts it — 0-based, as the crate we stand
-    /// in for reports it.
+    /// A re-export's request names its specifier's offset too, in both forms that
+    /// carry one — the parser records those the same way it records an import's.
+    #[test]
+    fn a_reexports_offset_names_its_specifier() {
+        in_context!(scope, {
+            let module = compile_text(scope, "export * from 'four';\nexport { a } from 'five';");
+            let requests = module.get_module_requests();
+            assert_eq!(requests.length(), 2);
+            let offset = |index: usize| {
+                let element = requests.get(scope, index).expect("a request");
+                Local::<ModuleRequest>::try_from(element)
+                    .expect("a request")
+                    .get_source_offset()
+            };
+
+            // `export * from ` is 14 characters; the second line starts at 22, and
+            // `export { a } from ` is 18 of it.
+            assert_eq!(offset(0), 14);
+            assert_eq!(offset(1), 40);
+        });
+    }
+
+    /// A request's source offset names the **specifier** that asked for it, not
+    /// the declaration: `source_offset_to_location` converts it — 0-based, as the
+    /// crate we stand in for reports it.
     #[test]
     fn a_requests_offset_names_a_location() {
         in_context!(scope, {
@@ -846,12 +870,14 @@ mod tests {
                     .get_source_offset()
             };
 
+            // `import ` is seven characters, so the specifier starts at column seven
+            // of its line — the declaration's start would be column zero.
             let first = module.source_offset_to_location(offset(0));
-            assert_eq!((first.get_line_number(), first.get_column_number()), (0, 0));
+            assert_eq!((first.get_line_number(), first.get_column_number()), (0, 7));
             let second = module.source_offset_to_location(offset(1));
             assert_eq!(
                 (second.get_line_number(), second.get_column_number()),
-                (1, 0)
+                (1, 7)
             );
         });
     }

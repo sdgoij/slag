@@ -34,6 +34,10 @@ pub enum ModuleItem {
 pub struct ImportDecl {
     pub span: Span,
     pub specifier: JsString,
+    /// The specifier's own span — the string literal, not the declaration. A
+    /// request's reported offset is this one (see `ModuleRequest`), so an error
+    /// about a specifier can point at the specifier.
+    pub specifier_span: Span,
     pub entries: Vec<ImportEntry>,
     pub attributes: Vec<(AttributeKey, JsString)>,
     /// The import phase: the plain `import`, or the source (`import source
@@ -84,6 +88,8 @@ pub enum ExportDecl {
         /// `export * as ns from …`.
         namespace: Option<ExportName>,
         specifier: JsString,
+        /// The specifier's own span, as `ImportDecl`'s.
+        specifier_span: Span,
         attributes: Vec<(AttributeKey, JsString)>,
         span: Span,
     },

@@ -63,6 +63,7 @@ fn parse_import_declaration(parser: &mut Parser) -> Result<ImportDecl, JsError> 
     // `import "mod" with { … };` — a side-effect-only import.
     if matches!(parser.peek()?.kind, TokenKind::StringLiteral { .. }) {
         let tok = parser.next()?;
+        let specifier_span = tok.span;
         let specifier = string_value(tok);
         let attributes = parse_with_clause(parser)?;
         parser.expect_semicolon()?;
@@ -70,6 +71,7 @@ fn parse_import_declaration(parser: &mut Parser) -> Result<ImportDecl, JsError> 
         return Ok(ImportDecl {
             span: Span::new(start, end),
             specifier,
+            specifier_span,
             entries,
             attributes,
             phase,
@@ -134,13 +136,14 @@ fn parse_import_declaration(parser: &mut Parser) -> Result<ImportDecl, JsError> 
     }
 
     parser.expect_contextual("from")?;
-    let specifier = parse_module_specifier(parser)?;
+    let (specifier, specifier_span) = parse_module_specifier(parser)?;
     let attributes = parse_with_clause(parser)?;
     parser.expect_semicolon()?;
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(ImportDecl {
         span: Span::new(start, end),
         specifier,
+        specifier_span,
         entries,
         attributes,
         phase,
@@ -205,12 +208,15 @@ fn parse_imported_binding(parser: &mut Parser) -> Result<(AtomId, Span), JsError
     Ok((name, Span::new(start, tok.span.end)))
 }
 
-fn parse_module_specifier(parser: &mut Parser) -> Result<JsString, JsError> {
+/// The specifier's text and its own span — the string literal, which is where a
+/// request's reported offset belongs (see `runtime::module::ModuleRequest`).
+fn parse_module_specifier(parser: &mut Parser) -> Result<(JsString, Span), JsError> {
     let tok = parser.next()?;
+    let span = tok.span;
     let TokenKind::StringLiteral { value, .. } = tok.kind else {
         return Err(parser.unexpected(&tok));
     };
-    Ok(value)
+    Ok((value, span))
 }
 
 fn parse_module_export_name(parser: &mut Parser) -> Result<ExportName, JsError> {
@@ -287,7 +293,7 @@ fn parse_with_clause(parser: &mut Parser) -> Result<Vec<(AttributeKey, JsString)
         }
         seen.push(key_string);
         parser.expect_punct(TokenKind::Colon)?;
-        let value = parse_module_specifier(parser)?;
+        let (value, _) = parse_module_specifier(parser)?;
         out.push((key, value));
         if !parser.eat_punct(TokenKind::Comma)? {
             break;
@@ -312,7 +318,7 @@ fn parse_export_declaration(parser: &mut Parser) -> Result<ExportDecl, JsError> 
             None
         };
         parser.expect_contextual("from")?;
-        let specifier = parse_module_specifier(parser)?;
+        let (specifier, specifier_span) = parse_module_specifier(parser)?;
         let attributes = parse_with_clause(parser)?;
         parser.expect_semicolon()?;
         let end = parser.prev.as_ref().unwrap().span.end;
@@ -320,6 +326,7 @@ fn parse_export_declaration(parser: &mut Parser) -> Result<ExportDecl, JsError> 
             specifiers: Vec::new(),
             namespace,
             specifier,
+            specifier_span,
             attributes,
             span: Span::new(start, end),
         });
@@ -329,7 +336,7 @@ fn parse_export_declaration(parser: &mut Parser) -> Result<ExportDecl, JsError> 
     if parser.at_punct(TokenKind::LeftBrace)? {
         let specifiers = parse_export_specifier_list(parser)?;
         if parser.eat_contextual("from")? {
-            let specifier = parse_module_specifier(parser)?;
+            let (specifier, specifier_span) = parse_module_specifier(parser)?;
             let attributes = parse_with_clause(parser)?;
             parser.expect_semicolon()?;
             let end = parser.prev.as_ref().unwrap().span.end;
@@ -337,6 +344,7 @@ fn parse_export_declaration(parser: &mut Parser) -> Result<ExportDecl, JsError> 
                 specifiers,
                 namespace: None,
                 specifier,
+                specifier_span,
                 attributes,
                 span: Span::new(start, end),
             });

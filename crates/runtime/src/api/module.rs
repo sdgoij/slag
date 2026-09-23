@@ -62,9 +62,10 @@ pub enum ModuleImportPhase {
 /// One module request (v8::ModuleRequest): a specifier this module imports or
 /// re-exports, in source order.
 ///
-/// `source_offset` is the offset of the declaration that asked for it, not of
-/// the specifier: the engine's syntax tree records one span per declaration, so
-/// a location reported for a request points at its `import`/`export`.
+/// `source_offset` is the offset of the specifier itself, not of the declaration
+/// that asked for it: a location reported for a request points at the
+/// `import`/`export`'s specifier, which is where the crate we stand in for puts
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleRequest {
     pub specifier: String,

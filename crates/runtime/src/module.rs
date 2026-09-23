@@ -260,10 +260,10 @@ impl Agent {
 /// A module request (spec 16.2.1.17): one specifier a module imports or
 /// re-exports, with the attributes and phase that selected it, in source order.
 ///
-/// `span` is the requesting declaration's, not the specifier's: the AST
-/// records a span for the declaration and the specifier carries none, so an
-/// offset reported for a request points at the `import`/`export` that asked for
-/// it.
+/// `span` is the specifier's own — the string literal, not the declaration that
+/// asked for it. That is where an offset reported for a request belongs: an error
+/// about a specifier points at the specifier, which is what the crate we stand in
+/// for reports through `ModuleRequest::GetSourceOffset`.
 #[derive(Debug, Clone)]
 pub struct ModuleRequest {
     pub specifier: JsString,
@@ -651,7 +651,7 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                     specifier: import.specifier.clone(),
                     attributes: import.attributes.clone(),
                     phase: import.phase,
-                    span: import.span,
+                    span: import.specifier_span,
                 });
             }
             ModuleItem::Export(export) => match export {
@@ -752,8 +752,9 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                     specifiers,
                     namespace,
                     specifier,
+                    specifier_span,
                     attributes,
-                    span,
+                    ..
                 } => {
                     if let Some(namespace) = namespace {
                         // `export * as ns from ...`: a local namespace binding
@@ -798,7 +799,7 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                         specifier: specifier.clone(),
                         attributes: attributes.clone(),
                         phase: ImportPhase::Import,
-                        span: *span,
+                        span: *specifier_span,
                     });
                 }
                 ExportDecl::Declaration(stmt) => {
