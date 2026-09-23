@@ -4071,9 +4071,10 @@ impl<'a> Lowerer<'a> {
     /// (see the `emit_step` gate): count the ctx's per-run ticker down; on
     /// underflow reset it to [`JIT_GC_PROBE_INTERVAL`] and call the
     /// `gc_safepoint` helper, which runs the collection trigger when the
-    /// allocation budget is exceeded. The helper cannot set the pending
-    /// error (a collection runs no user code), so the raw call is safe and
-    /// no leaf-epoch bump is needed (the helper clears the leaf-call-cache
+    /// allocation budget is exceeded and bails the body out when a termination
+    /// request is outstanding — the one check point a compiled loop has, which is
+    /// why the call goes through `call_slow`: the pending byte is the channel.
+    /// No leaf-epoch bump is needed (the helper clears the leaf-call-cache
     /// records itself when it collects).
     fn emit_gc_probe(&mut self) -> Result<(), Unsupported> {
         let ctx = self.vm();
@@ -4098,7 +4099,7 @@ impl<'a> Lowerer<'a> {
         self.builder
             .ins()
             .store(MemFlagsData::new(), interval, ctx, offset);
-        self.emit_raw_call(self.sig_tdz, Helper::GcSafepoint, &[])?;
+        let _ = self.call_slow(self.sig_tdz, Helper::GcSafepoint, &[])?;
         self.builder.ins().jump(cont, &[]);
         self.builder.switch_to_block(cont);
         self.builder.seal_block(cont);

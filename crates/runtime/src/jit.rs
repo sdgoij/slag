@@ -1328,10 +1328,16 @@ extern "C" fn tdz_error(ctx: *mut c_void) -> u64 {
 /// pacing minors, most of them — keeps the verdicts, so an allocating compiled
 /// loop no longer re-probes its call sites on every budget crossing.
 extern "C" fn gc_safepoint(ctx: *mut c_void) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    // The termination request is read on every probe and before the budget: a
+    // compiled loop has no other check point, so the read cannot be conditional
+    // on a collection being due.
+    if unsafe { &*ctx.agent }.is_terminating() {
+        return slow_error(ctx, crate::agent::termination_error());
+    }
     if !crux::heap::allocation_budget_exceeded() {
         return 0;
     }
-    let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     agent.maybe_collect();
     if crux::heap::take_swept_since_check() > 0 {

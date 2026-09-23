@@ -258,6 +258,12 @@ fn unregister_live_agent(signifier: u64) {
 
 pub struct Agent {
     pub execution_context_stack: Vec<ExecutionContext>,
+    /// A termination request (v8::Isolate::TerminateExecution). The request has
+    /// to reach a running isolate from another thread while the isolate itself
+    /// cannot leave its own, so it is an atomic rather than agent state. It is
+    /// read at the points the engine already stops at — a loop's back edge, the
+    /// compiled loop's probe, and a call.
+    termination: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The IC caches shared by every Vm run in this agent (the global-var
     /// cells and the P3 member/element cells). They lived on the Vm before,
     /// so every function call and script evaluation started cold and
@@ -1034,11 +1040,41 @@ impl Drop for Agent {
 /// threshold` and `--nursery-stress` override it per agent.
 const DEFAULT_NURSERY_THRESHOLD: usize = 8192;
 
+/// The error a check point throws when a termination request is outstanding:
+/// V8's termination exception, which is a plain `Error` and not a NativeError.
+pub fn termination_error() -> JsError {
+    JsError::new(ErrorKind::Error, "execution terminated".into())
+}
+
 impl Agent {
+    /// The flag a termination request sets, for a handle that has to cross
+    /// threads to reach it (v8::IsolateHandle).
+    pub fn termination_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.termination)
+    }
+
+    /// Ask a running execution to stop (v8::Isolate::TerminateExecution).
+    pub fn request_termination(&self) {
+        self.termination
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Withdraw the request (v8::Isolate::CancelTerminateExecution).
+    pub fn cancel_termination(&self) {
+        self.termination
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a request is outstanding and not yet withdrawn.
+    pub fn is_terminating(&self) -> bool {
+        self.termination.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn new() -> Self {
         crate::function::ensure_ecma_hook();
         Self {
             execution_context_stack: Vec::new(),
+            termination: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             global_cells: [None; crate::ir::GLOBAL_CELLS],
             global_value_cells: Box::new(std::array::from_fn(|_| {
                 crate::jit::GlobalValueCell::empty()

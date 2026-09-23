@@ -380,8 +380,9 @@ pub struct JitHelpers {
     /// `unreachable` after the call).
     pub tdz_error: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     /// The compiled-loop safe point (see `JitCallContext::gc_ticks`): runs
-    /// the runtime's collection trigger when the allocation budget is
-    /// exceeded. Returns 0; never sets the pending error.
+    /// the runtime's collection trigger when the allocation budget is exceeded,
+    /// and sets the pending error when a termination request is outstanding.
+    /// Returns 0 when neither is due.
     pub gc_safepoint: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     /// `Get(o, name)`: `name` is an `AtomId`; returns the value.
     pub get_member_name: Option<extern "C" fn(vm: *mut c_void, object: u64, name: u64) -> u64>,

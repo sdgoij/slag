@@ -821,10 +821,12 @@ impl<'p, 'obj, P> PinnedRef<'p, TryCatch<'_, 'obj, P>> {
     /// Whether the caught exception is an execution termination
     /// (v8::TryCatch::HasTerminated).
     ///
-    /// Slag cannot terminate an execution, so nothing can have terminated one
-    /// and this answers `false`.
+    /// A termination is a *request* here rather than a mark on the exception: a
+    /// check point throws the same `Error` deno looks for while the request
+    /// stands, and a host that has cancelled it sees `false`. The two differ only
+    /// for a host that holds a caught termination past its own cancel.
     pub fn has_terminated(&self) -> bool {
-        false
+        self.catch().has_terminated()
     }
 
     /// The caught exception (v8::TryCatch::Exception).

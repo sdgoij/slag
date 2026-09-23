@@ -203,6 +203,32 @@ impl Isolate {
     pub fn take_pending_exception(&self) -> Option<Value> {
         self.pending_exception.borrow_mut().take()
     }
+
+    /// Ask a running execution to stop (v8::Isolate::TerminateExecution).
+    ///
+    /// The request is observed at the engine's check points rather than
+    /// interrupting anything: a loop's back edge, a compiled loop's probe, a
+    /// call, and this API's own entries.
+    pub fn terminate_execution(&self) {
+        self.agent.request_termination();
+    }
+
+    /// Withdraw the request (v8::Isolate::CancelTerminateExecution), which is
+    /// what lets the isolate run again.
+    pub fn cancel_terminate_execution(&self) {
+        self.agent.cancel_termination();
+    }
+
+    /// Whether a request is outstanding (v8::Isolate::IsExecutionTerminating).
+    pub fn is_execution_terminating(&self) -> bool {
+        self.agent.is_terminating()
+    }
+
+    /// The termination flag itself, for the handle that has to reach this
+    /// isolate from another thread (`Isolate` is thread-local; the flag is not).
+    pub fn termination_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.agent.termination_flag()
+    }
 }
 
 impl Default for Box<Isolate> {
@@ -410,6 +436,61 @@ mod tests {
             .get(&crux::string::JsString::from_utf8("name"))
             .unwrap();
         assert_eq!(name.to_string(), "TypeError");
+    }
+
+    #[test]
+    fn a_termination_request_stops_a_running_loop() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        // The request comes from another thread, which is the shape a host has:
+        // the isolate cannot leave its own thread, and a watchdog can.
+        let flag = isolate.termination_flag();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        // The loop is huge but finite, so a check point that did not observe the
+        // request runs it to completion and fails the assertion rather than
+        // hanging the suite — and the request lands at 50ms, long before.
+        assert!(
+            context.eval("for (var i = 0; i < 1e7; i++) {}").is_empty(),
+            "the loop stopped"
+        );
+        let exception = isolate.pending_exception().expect("the termination error");
+        let exception = crate::context::as_object(&exception).unwrap();
+        let name = exception
+            .get(&crux::string::JsString::from_utf8("name"))
+            .unwrap();
+        let message = exception
+            .get(&crux::string::JsString::from_utf8("message"))
+            .unwrap();
+        assert_eq!(name.to_string(), "Error");
+        assert_eq!(message.to_string(), "execution terminated");
+
+        // The request stands until it is withdrawn, and then the isolate runs
+        // again.
+        assert!(isolate.is_execution_terminating());
+        isolate.cancel_terminate_execution();
+        assert!(!context.eval("1 + 1").is_empty());
+        watchdog.join().unwrap();
+    }
+
+    #[test]
+    fn a_termination_request_is_seen_at_the_next_entry_and_by_a_try_catch() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        isolate.terminate_execution();
+        {
+            let try_catch = TryCatch::new(&mut isolate);
+            // A script with no loop and no call of its own has only the entry
+            // check point, and it is refused there.
+            assert!(context.eval("1 + 1").is_empty());
+            assert!(try_catch.has_caught());
+            assert!(try_catch.has_terminated());
+        }
+        isolate.cancel_terminate_execution();
+        assert!(!context.eval("1 + 1").is_empty(), "usable again");
     }
 
     #[test]

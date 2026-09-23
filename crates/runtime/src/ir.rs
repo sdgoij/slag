@@ -8261,8 +8261,13 @@ impl Vm {
                     // GC-5 safe point: a backward jump is a loop back-edge —
                     // pace the collection trigger on the allocation budget
                     // (a live-count read is too expensive per iteration).
-                    if *target < self.ip && crux::heap::allocation_budget_exceeded() {
-                        agent.maybe_collect();
+                    if *target < self.ip {
+                        if agent.is_terminating() {
+                            return Err(crate::agent::termination_error());
+                        }
+                        if crux::heap::allocation_budget_exceeded() {
+                            agent.maybe_collect();
+                        }
                     }
                     self.ip = *target
                 }
@@ -8422,6 +8427,9 @@ impl Vm {
                     // GC-5 safe point: the fused canonical loop head is the
                     // loop's back-edge (increment + re-test + jump back) —
                     // pace the collection trigger on the allocation budget.
+                    if agent.is_terminating() {
+                        return Err(crate::agent::termination_error());
+                    }
                     if crux::heap::allocation_budget_exceeded() {
                         agent.maybe_collect();
                     }

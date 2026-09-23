@@ -482,6 +482,7 @@ pub fn error_value(agent: &mut Agent, error: &JsError) -> Value {
 
 fn kind_name(kind: ErrorKind) -> &'static str {
     match kind {
+        ErrorKind::Error => "Error",
         ErrorKind::TypeError => "TypeError",
         ErrorKind::RangeError => "RangeError",
         ErrorKind::ReferenceError => "ReferenceError",

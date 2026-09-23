@@ -490,43 +490,44 @@ where
 ///
 /// The crate we stand in for hands out a reference-counted handle that reaches
 /// the isolate to terminate it or to run a callback at its next safepoint. Slag's
-/// isolate is thread-local and its engine has no termination request to set, so
-/// this handle reaches nothing: it exists so a host that keeps one across threads
-/// — a debugger's waker, a watchdog — can name the type and pass it around, and
-/// every request through it answers that it was not made.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IsolateHandle;
+/// isolate is thread-local and cannot leave its own thread, so this handle carries
+/// the one piece of isolate state that can: the termination request. A host that
+/// keeps one across threads — a watchdog — can stop a running execution with it;
+/// the interrupt request remains one it cannot make, because the engine runs to
+/// completion on the calling thread.
+#[derive(Clone, Debug)]
+pub struct IsolateHandle {
+    termination: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl IsolateHandle {
     /// Ask the isolate to stop executing
     /// (v8::IsolateHandle::TerminateExecution).
     ///
-    /// Answers `false`: no request was made, because Slag cannot stop a running
-    /// execution. The crate we stand in for answers whether the isolate was
-    /// still alive to receive the request; here the answer means "not made",
-    /// which is the direction a caller can act on — a host that ignores it
-    /// behaves as it does there, and a host that checks it learns to stop the
-    /// isolate some other way.
+    /// Answers `true` when the request was made. The running execution observes
+    /// it at its next check point — a loop's back edge, a compiled loop's probe,
+    /// or a call — and there throws `Error("execution terminated")`.
     pub fn terminate_execution(&self) -> bool {
-        false
+        self.termination
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// Withdraw a termination request
     /// (v8::IsolateHandle::CancelTerminateExecution).
     ///
-    /// Answers `false`, for the same reason as
-    /// [`terminate_execution`](Self::terminate_execution): there was no request
-    /// to withdraw.
+    /// Answers `true`: the request is withdrawn from whatever state it is in, and
+    /// the isolate runs again either way.
     pub fn cancel_terminate_execution(&self) -> bool {
-        false
+        self.termination
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// Whether the isolate is terminating an execution
     /// (v8::IsolateHandle::IsExecutionTerminating).
-    ///
-    /// `false`: nothing can set it.
     pub fn is_execution_terminating(&self) -> bool {
-        false
+        self.termination.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Ask the isolate to run `callback` when it next reaches a safepoint
@@ -924,36 +925,34 @@ impl Isolate {
 
     /// Whether the isolate is terminating an execution
     /// (`v8::Isolate::IsExecutionTerminating`).
-    ///
-    /// Slag cannot terminate an execution yet, so nothing can be terminating
-    /// one and this answers `false`.
     pub fn is_execution_terminating(&self) -> bool {
-        false
+        self.engine().is_execution_terminating()
     }
 
     /// A handle another thread may keep
-    /// (`v8::Isolate::GetThreadSafeHandle`) — see [`IsolateHandle`] for what it
-    /// can and cannot do here.
+    /// (`v8::Isolate::GetThreadSafeHandle`), which reaches this isolate's
+    /// termination request — see [`IsolateHandle`].
     pub fn thread_safe_handle(&self) -> IsolateHandle {
-        IsolateHandle
+        IsolateHandle {
+            termination: self.engine().termination_flag(),
+        }
     }
 
     /// Ask this isolate to stop executing
     /// (`v8::Isolate::TerminateExecution`).
     ///
-    /// Answers `false`: see [`IsolateHandle::terminate_execution`], which is the
-    /// same request from another thread.
+    /// Answers `true`: the request is made, and the execution that is running
+    /// observes it at its next check point.
     pub fn terminate_execution(&self) -> bool {
-        false
+        self.engine().terminate_execution();
+        true
     }
 
     /// Withdraw a termination request
     /// (`v8::Isolate::CancelTerminateExecution`).
-    ///
-    /// Answers `false`, for the same reason as
-    /// [`terminate_execution`](Self::terminate_execution).
     pub fn cancel_terminate_execution(&self) -> bool {
-        false
+        self.engine().cancel_terminate_execution();
+        true
     }
 
     pub(crate) fn engine(&self) -> &api::Isolate {
@@ -1665,19 +1664,20 @@ mod tests {
     use super::*;
     use crate::promise::PromiseState;
 
-    /// The termination requests answer, and the answer is that nothing was
-    /// requested: the engine cannot stop a running execution.
+    /// A termination request crosses threads and is observed at a check point,
+    /// and the isolate and its handle see the same one.
     #[test]
-    fn termination_requests_report_that_they_were_not_made() {
+    fn termination_requests_reach_the_isolate_from_either_side() {
         let isolate = &mut Isolate::new(CreateParams::default());
         assert!(!isolate.is_execution_terminating());
-        assert!(!isolate.terminate_execution());
-        assert!(!isolate.cancel_terminate_execution());
+
+        assert!(isolate.terminate_execution());
+        assert!(isolate.is_execution_terminating());
 
         let handle: IsolateHandle = isolate.thread_safe_handle();
-        assert!(!handle.terminate_execution());
-        assert!(!handle.cancel_terminate_execution());
-        assert!(!handle.is_execution_terminating());
+        assert!(handle.is_execution_terminating());
+        assert!(handle.cancel_terminate_execution());
+        assert!(!isolate.is_execution_terminating());
     }
 
     /// The heap limits a host sets are recorded and readable — and, as the field

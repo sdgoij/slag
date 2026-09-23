@@ -3986,6 +3986,67 @@ seven proposal suites — simd 25,990, relaxed-simd 77, bulk-memory 7,485,
 exceptions 105, gc 654, memory64 8,709, multi-memory 912 — for **64,594 / 0 fail /
 0 pending**, and js-api **1,001 tests, 0 fail**).
 
+**Execution termination — the L3 row's worst symptom, found by running deno's whole
+suite rather than a filter.** §9 item 20 names the part. The measurement that picked
+it: `cargo test -p deno_core --features v8 --lib` **hangs**, at
+`runtime::tests::misc::terminate_execution`, because
+`IsolateHandle::terminate_execution` answered `false` — the bridge's own doc said
+the engine "has no termination request to set" — so `for(;;) {}` never stopped.
+
+*The mechanism.* `Agent` carries the request as an `Arc<AtomicBool>` (the request has
+to cross a thread; the isolate cannot), with `request_termination`,
+`cancel_termination`, `is_terminating` and `termination_flag`. It is read at the
+interpreter's two loop back-edge safe points, at `crate::function::call_inner` — the
+one choke point every call passes, which is what covers a module body whose whole
+text is one statement — and at the API's `entered`, so a terminated isolate refuses
+the next script as well. The compiled loop's `gc_safepoint` probe reads it too and
+sets the pending error, and `emit_gc_probe` now calls that helper through
+`call_slow` rather than `emit_raw_call`: the difference between a compiled body
+bailing where it stands and reaching its loop's end first.
+
+*The error is a plain `Error`.* `crux::ErrorKind` gained the base `Error` — V8's
+termination exception is exactly `Error("execution terminated")`, and deno asserts
+that string — which is the arm added to the exhaustive matches in `builtins/error`,
+`promise`, `ffi` and `jsc` and to the harness's negative-type table.
+
+*The bridge.* `IsolateHandle` becomes a handle on that flag (Send + Sync, so it
+crosses a thread), `terminate_execution` and `cancel_terminate_execution` answer
+`true`, `TryCatch::HasTerminated` and `Isolate::IsExecutionTerminating` read it, and
+the bridge's own test that asserted all three answered `false` is re-aimed rather
+than deleted.
+
+*Tests — two added, four mutations, each caught.*
+`a_termination_request_stops_a_running_loop` (a watchdog thread sets the flag while
+`for (var i = 0; i < 1e7; i++) {}` runs, then asserts the pending exception is
+`Error: execution terminated`, that the request stands, and that the isolate runs
+again after a cancel) and
+`a_termination_request_is_seen_at_the_next_entry_and_by_a_try_catch`. The mutations:
+the interpreter's back-edge check (the loop test fails), the API's entry check (the
+entry test fails, the loop test stays green), a no-op `cancel_termination` (both
+"usable again" tails fail), and — **reported rather than claimed** — reverting
+`emit_gc_probe` to `emit_raw_call`, which *no* test catches: a compiled body's
+bounded loop either finishes, surfacing the pending error anyway, or is masked by a
+per-iteration checked operation, which is what two attempts to write that test
+showed. The `call_slow` change stays, because an *unbounded* compiled body has no
+other check point; it is recorded as a mechanism whose difference a test cannot
+bound.
+
+*The measurement.* deno's four `terminate` tests go from **three failing, one of them
+a hang** to **three passing, one hanging**: `terminate_during_module_eval`,
+`terminate_execution` and `terminate_execution_run_event_loop_js` pass, and
+`terminate_execution_webassembly` still hangs — the limit §9 item 20 named before the
+edit, since WebAssembly code has no check point and its compiled path makes that a
+second engine. deno's snapshot suite is unchanged at **18/0**.
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **894** (892 plus
+the two); `cargo fmt --all -- --check` and `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean. The corpora were re-run, because the change
+touches the interpreter's hottest back edge, every call, a new `ErrorKind` variant
+and the JIT's probe: test262 `all` reproduces its baseline exactly (**48,464 pass, 0
+fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce theirs
+(core 20,662 plus the seven proposal suites for **64,594 / 0 fail / 0 pending**, and
+js-api **1,001 tests, 0 fail**).
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -6219,6 +6280,44 @@ a frame view of the running stack. §7's survey already split the subsystem: the
       **The measurement this buys** is the two engine tests §7 records: a restored
       arrow resolving `super.m()` through the object it closed over, and one whose
       `new.target` is the function it was called in.
+  20. **Execution termination — named before the edit, from a measurement rather than
+      from the row.** Running deno's *whole* `deno_core` lib suite rather than the
+      snapshot filter **hangs**: `runtime::tests::misc::terminate_execution` runs
+      `for(;;) {}` and nothing stops it, because `IsolateHandle::terminate_execution`
+      answers `false` and the bridge's own doc says the engine "has no termination
+      request to set". §5's L3 row names termination among its three remaining items;
+      the measurement is what picks it, and it picks the worst symptom — a host cannot
+      stop a runaway script, and the test that says so never returns.
+
+      - **The engine gains one flag, checked where the engine already stops to
+        think.** `Agent` gains the request as an `Arc<AtomicBool>` (the one channel
+        that can cross a thread, since the isolate is thread-local) with
+        `request_termination` / `cancel_termination` / `is_terminating`. It is read
+        at the interpreter's two loop back-edge safe points, beside the GC budget
+        probe — the same shape of per-iteration check; at the compiled loop's
+        `gc_safepoint` probe, which exists for the GC already and whose helper the
+        JIT already allows to set the pending error, so that half is one call-site
+        change from `emit_raw_call` to `call_slow`; and at
+        `crate::function::call_inner`, the one choke point every call passes
+        through, which is what covers a module body whose whole text is one
+        statement. The API's own entries check it too, so a terminated isolate
+        refuses the next script rather than running it.
+      - **The error is a plain `Error`.** V8's termination exception *is*
+        `Error("execution terminated")` — deno asserts that exact string — so
+        `crux::ErrorKind` gains the base `Error`. The enum is "which constructor
+        builds the thrown value", and with no base variant a `JsError` could not
+        spell the one V8 throws. That is a mechanical arm in the exhaustive
+        `match`es (`ffi`, `jsc`, `runtime` twice) and in the harness's negative-type
+        table.
+      - **The bridge stops answering `false`.** `IsolateHandle` becomes a handle on
+        the flag (Send + Sync), so `terminate_execution` from another thread reaches
+        the running isolate and answers `true`; `cancel_terminate_execution` clears
+        it; `TryCatch::HasTerminated` and `Isolate::IsExecutionTerminating` read it.
+      - **Stated limits.** The request is observed at those points and nowhere else:
+        WebAssembly code has no such check, so deno's
+        `terminate_execution_webassembly` is not this part's; and the exception is an
+        ordinary `Error` a JS `try`/`catch` can swallow, where V8's is uncatchable.
+        Both are recorded rather than implied.
 
   ## 10. Build order
 

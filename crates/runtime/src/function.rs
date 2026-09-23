@@ -1767,6 +1767,12 @@ pub(crate) fn call_inner(
     this: Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
+    // A termination request is observed at a call as well as at a loop's back
+    // edge: a body with no loop of its own — a module whose whole text is one
+    // statement — has this as its only check point.
+    if agent.is_terminating() {
+        return Err(crate::agent::termination_error());
+    }
     // A realm's builtin called while another realm is current (the
     // `$262.createRealm` fixtures) must dispatch with its own realm current:
     // push it, re-enter, and restore. With a single realm the current realm

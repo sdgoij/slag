@@ -10886,6 +10886,7 @@ var $DONE = function (error) {
             .as_deref()
             .ok_or_else(|| "negative test lacks a type".to_string())?;
         match ty {
+            "Error" => Ok(ErrorKind::Error),
             "SyntaxError" => Ok(ErrorKind::SyntaxError),
             "TypeError" => Ok(ErrorKind::TypeError),
             "ReferenceError" => Ok(ErrorKind::ReferenceError),

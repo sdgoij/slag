@@ -39,6 +39,12 @@ impl TryCatch {
         unsafe { &*self.isolate }.has_pending_exception()
     }
 
+    /// Whether the isolate is terminating an execution
+    /// (v8::TryCatch::HasTerminated).
+    pub fn has_terminated(&self) -> bool {
+        unsafe { &*self.isolate }.is_execution_terminating()
+    }
+
     /// The caught exception value, if set (v8::TryCatch::Exception).
     pub fn exception(&self) -> Option<Local> {
         unsafe { &*self.isolate }.pending_exception().map(Local)

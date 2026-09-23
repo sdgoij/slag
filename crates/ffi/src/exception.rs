@@ -39,6 +39,7 @@ fn convert(isolate: *mut Isolate, error: &JsError) -> Value {
 
 fn kind_name(kind: crux::ErrorKind) -> &'static str {
     match kind {
+        crux::ErrorKind::Error => "Error",
         crux::ErrorKind::EvalError => "EvalError",
         crux::ErrorKind::RangeError => "RangeError",
         crux::ErrorKind::ReferenceError => "ReferenceError",

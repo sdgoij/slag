@@ -4,9 +4,12 @@ use std::fmt;
 
 use crate::span::Span;
 
-/// The six ECMAScript native error types (spec ch. 17, 20).
+/// The error constructors a `JsError` builds its thrown value from: the six
+/// ECMAScript native error types (spec ch. 17, 20) and the base `Error` they all
+/// derive from, which is the one V8's termination exception is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    Error,
     EvalError,
     RangeError,
     ReferenceError,
@@ -84,8 +87,9 @@ mod tests {
     }
 
     #[test]
-    fn error_kind_covers_all_native_errors() {
+    fn error_kind_covers_the_base_error_and_all_native_errors() {
         let kinds = [
+            ErrorKind::Error,
             ErrorKind::EvalError,
             ErrorKind::RangeError,
             ErrorKind::ReferenceError,
@@ -93,6 +97,6 @@ mod tests {
             ErrorKind::TypeError,
             ErrorKind::UriError,
         ];
-        assert_eq!(kinds.len(), 6);
+        assert_eq!(kinds.len(), 7);
     }
 }

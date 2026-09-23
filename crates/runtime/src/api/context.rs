@@ -167,6 +167,12 @@ impl Context {
         body: impl FnOnce(&mut Agent) -> Result<T, JsError>,
     ) -> Result<T, JsError> {
         let isolate = unsafe { &*self.isolate };
+        // A terminated isolate refuses the next entry rather than running it,
+        // which is the one check point a host's own call needs: a script of two
+        // statements has no loop and no call of its own.
+        if isolate.is_execution_terminating() {
+            return Err(crate::agent::termination_error());
+        }
         let depth = isolate.entry_depth.get() + 1;
         isolate.entry_depth.set(depth);
         let result = self.with_agent(body);

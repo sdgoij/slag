@@ -58,6 +58,7 @@ fn placeholder(name: &'static str) -> NativeFn {
 
 fn kind_name(kind: ErrorKind) -> &'static str {
     match kind {
+        ErrorKind::Error => "Error",
         ErrorKind::EvalError => "EvalError",
         ErrorKind::RangeError => "RangeError",
         ErrorKind::ReferenceError => "ReferenceError",
@@ -70,6 +71,7 @@ fn kind_name(kind: ErrorKind) -> &'static str {
 /// The intrinsic key of the constructor for an engine error kind.
 fn ctor_key(kind: ErrorKind) -> &'static str {
     match kind {
+        ErrorKind::Error => ERROR,
         ErrorKind::EvalError => EVAL_ERROR,
         ErrorKind::RangeError => RANGE_ERROR,
         ErrorKind::ReferenceError => REFERENCE_ERROR,
