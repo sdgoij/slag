@@ -63,14 +63,25 @@
 //! definition-time code again**: a computed key, a `static {}` block and a static
 //! field initializer execute, where V8's snapshot only restores objects.
 //!
-//! An **arrow** is carried the same way and for the same reason: its
-//! `[[SourceText]]` is the expression it was written as (`(a) => a + 1`), which
-//! is not a form `parse_function` can read, so the restore evaluates it in the
-//! reading realm instead. What that costs is the scope the arrow closed over: a
-//! restored arrow's `this` and its free names are the reading realm's global, the
-//! same limit the function record states for free names and a harder one here,
-//! because an arrow exists to capture `this`. Its kind survives — an async
-//! arrow's `[[Prototype]]` comes from the evaluation and from the record alike.
+//! An **arrow** is the one expression form the restore parses rather than
+//! evaluates: its `[[SourceText]]` is the expression it was written as
+//! (`(a) => a + 1`), which is not a form `parse_function` can read, so the record
+//! is wrapped in a parenthesis, parsed as a script, and **instantiated** in the
+//! environment chain it closed over — the route a method record takes. An arrow
+//! exists to capture its `this` and its free names, so evaluating it in the
+//! reading realm would hand back an arrow over that realm's global; nothing about
+//! a function record's environment is special to an arrow here. Its kind survives
+//! — an async arrow's `[[Prototype]]` comes from the instantiation and from the
+//! record alike.
+//!
+//! That chain is carried only when the format can carry it: a record a lookup
+//! cannot walk — a module's, an object record a `with` made, another realm's
+//! global — refuses by kind, and an arrow over one is written with `NO_REF`
+//! instead, which the reader answers with the reading realm's global. That is
+//! what every arrow got before this route existed, and it stays the arrow's
+//! limit. One thing a *carried* chain does not carry either is a function
+//! environment's `[[FunctionObject]]` and its `new.target`, so an arrow whose
+//! body reads `super` or `new.target` resolves neither.
 //!
 //! A host callback is the one kind the engine cannot rebuild alone: its body is
 //! the host's Rust closure, so the record carries what only the host has — the
@@ -383,6 +394,11 @@ impl std::error::Error for DecodeError {}
 enum Identity {
     Intrinsic(String),
     Object(u64),
+    /// A function, in the function's own id space. `JsObject::id` is a
+    /// thread-local counter and `Function::id` a process-wide one, so nothing
+    /// keeps the two numbers apart: one variant for both would give a live
+    /// object and an unrelated live function one identity.
+    Function(u64),
     Module(u64),
     Env(u64),
     Symbol(u64),
@@ -398,7 +414,7 @@ fn identity(realm: &Handle<Realm>, value: Value) -> Identity {
     }
     match value.kind() {
         ValueKind::Object(object) => Identity::Object(object.id()),
-        ValueKind::Function(function) => Identity::Object(function.id()),
+        ValueKind::Function(function) => Identity::Function(function.id()),
         ValueKind::Symbol(symbol) => Identity::Symbol(symbol.id),
         ValueKind::String(text) => Identity::String(text.as_slice().to_vec()),
         ValueKind::BigInt(number) => Identity::BigInt(bigint::to_string(&number, BIGINT_RADIX)),
@@ -1109,7 +1125,7 @@ fn visit(
                 // so what the walk owes it is the same table check a host
                 // pointer's own record gets — a callback the build's table does
                 // not hold is named here rather than written as a bad index.
-                match callable(agent, &function, host)? {
+                match callable(agent, realm, &function, host)? {
                     Callable::Bound {
                         target,
                         bound_this,
@@ -1284,6 +1300,32 @@ fn carried_environment(env: &EnvRef) -> Result<CarriedEnvironment, Unsupported> 
         transparent: declarative.context_transparent.get(),
         bindings,
     })
+}
+
+/// Whether the chain a record closed over is one this format can carry: every
+/// record from `env` up to the realm's own global is declarative or function.
+///
+/// The realm's global is answered `NO_REF` rather than carried (see [`visit_env`]),
+/// so a chain that reaches it is carriable. Anything else a lookup cannot walk —
+/// a module's record, an object record a `with` made, another realm's global — is
+/// what [`carried_environment`] refuses, and asking *before* the walk is what lets
+/// an arrow over one be written with `NO_REF` rather than refusing the whole
+/// snapshot. The same call answers both questions, so this cannot disagree with
+/// what the walk will accept.
+fn carriable_environment(realm: &Handle<Realm>, env: EnvRef) -> bool {
+    let mut env = env;
+    loop {
+        if env.ptr_eq(realm.global_env) {
+            return true;
+        }
+        if carried_environment(&env).is_err() {
+            return false;
+        }
+        match env.outer() {
+            Some(outer) => env = outer,
+            None => return true,
+        }
+    }
 }
 
 /// The bindings a realm's own global environment holds **lexically**: a
@@ -1465,7 +1507,8 @@ enum Grammar {
     /// A class expression: a class constructor's `[[SourceText]]`.
     Class,
     /// An arrow function's source, which is an expression rather than a form with
-    /// a `function` keyword — so it is evaluated, not parsed.
+    /// a `function` keyword — so the restore parses the parenthesis and
+    /// instantiates the arrow in the chain the record carries.
     Arrow,
     /// A method definition's source: `m() {}`, `get x() {}` — the production's
     /// own text, which has no `function` keyword either. The one grammar whose
@@ -1499,13 +1542,14 @@ impl Grammar {
         self == Grammar::Method
     }
 
-    /// Whether this grammar's record carries the [[Environment]] it closed
-    /// over: true for a function and a method, the two the restore
-    /// instantiates from their source. An arrow and a class constructor are
-    /// evaluated instead, so the environment they get is the reading realm's
-    /// global.
+    /// Whether this grammar's record may name the [[Environment]] it closed
+    /// over: true for the three the restore *instantiates* from their source — a
+    /// function, a method and an arrow. A class constructor is the one evaluated
+    /// instead, so the environment it gets is the reading realm's global. The
+    /// writer decides per record whether a chain it *can* carry is written, so a
+    /// record may still answer `NO_REF` here (see `callable`).
     fn carries_environment(self) -> bool {
-        matches!(self, Grammar::Function | Grammar::Method)
+        matches!(self, Grammar::Function | Grammar::Method | Grammar::Arrow)
     }
 }
 
@@ -1548,6 +1592,7 @@ impl Form {
 /// name exactly as it did before the record existed.
 fn callable<'a>(
     agent: &'a Agent,
+    realm: &Handle<Realm>,
     function: &'a Handle<Function>,
     host: Option<&dyn HostCallbacks>,
 ) -> Result<Callable<'a>, Unsupported> {
@@ -1664,12 +1709,24 @@ fn callable<'a>(
                 source,
                 strict: data.strict,
                 home: grammar.carries_home().then_some(data.home_object).flatten(),
-                // The two grammars the restore *instantiates* keep the chain
-                // they closed over. An arrow and a class constructor are rebuilt
-                // by evaluating their source in the reading realm instead, so
-                // their environment is that realm's global by construction and
-                // carrying one would be a field no reader honours.
-                environment: grammar.carries_environment().then_some(data.environment),
+                // The grammars the restore *instantiates* keep the chain they
+                // closed over — a function, a method and an arrow. A class
+                // constructor is the one evaluated instead, so its environment is
+                // the reading realm's global by construction and carrying one
+                // would be a field no reader honours.
+                //
+                // An arrow's is written only when the format can carry it: a chain
+                // holding a record a lookup cannot walk refuses (see `visit_env`),
+                // and an arrow over one is the *documented* case of a restore that
+                // answers the reading realm's global, so it is written with no
+                // chain at all rather than refusing the snapshot.
+                environment: match grammar {
+                    Grammar::Class => None,
+                    Grammar::Arrow => {
+                        carriable_environment(realm, data.environment).then_some(data.environment)
+                    }
+                    Grammar::Function | Grammar::Method => Some(data.environment),
+                },
             })
         }
     }
@@ -1804,6 +1861,38 @@ fn method_definition(program: &syntax::ast::Program) -> Option<MethodDefinition<
         syntax::ast::ObjectProperty::Set {
             param, init, body, ..
         } => Some(MethodDefinition::Set(param, init.as_ref(), body)),
+        _ => None,
+    }
+}
+
+/// The arrow a parsed `(<arrow source>)` is, if that is what it is: what
+/// [`crate::function::instantiate_arrow`] needs to make it again. The wrapper's
+/// paren is one node to step through, as it is for a class expression.
+type ArrowParts<'a> = (
+    bool,
+    &'a [syntax::ast::BindingElement],
+    &'a syntax::ast::ArrowBody,
+    crux::Span,
+);
+
+fn arrow_expression(program: &syntax::ast::Program) -> Option<ArrowParts<'_>> {
+    let [statement] = program.body.as_slice() else {
+        return None;
+    };
+    let syntax::ast::StmtKind::Expr(expression) = &statement.kind else {
+        return None;
+    };
+    arrow_of(expression)
+}
+
+fn arrow_of(expression: &syntax::ast::Expr) -> Option<ArrowParts<'_>> {
+    match &expression.kind {
+        syntax::ast::ExprKind::Arrow {
+            is_async,
+            params,
+            body,
+        } => Some((*is_async, params.as_slice(), body, expression.span)),
+        syntax::ast::ExprKind::Paren(inner) => arrow_of(inner),
         _ => None,
     }
 }
@@ -2145,7 +2234,7 @@ fn write_record(
             // The walk refuses a function it cannot carry before this, so
             // reaching here with one means the walk and the writer disagree
             // about a record rather than that a host's value is uncarried.
-            None => match callable(agent, &function, host)? {
+            None => match callable(agent, realm, &function, host)? {
                 Callable::Body {
                     grammar,
                     source,
@@ -3593,7 +3682,9 @@ impl Builder<'_> {
                         *home,
                         *environment_serial,
                     )?,
-                    Grammar::Arrow => self.build_evaluated_function(source, *proto, *strict)?,
+                    Grammar::Arrow => {
+                        self.build_arrow_function(source, *proto, *strict, *environment_serial)?
+                    }
                 };
                 // A class's own evaluation made a `prototype` object whose members
                 // carry the class's private brand; the tail just below replaces it
@@ -3849,12 +3940,15 @@ impl Builder<'_> {
                     }
                     ENV_FUNCTION => {
                         // The function object and the new-target the record does
-                        // not carry stay undefined, which is what a chain is
-                        // consulted for nothing of: only an arrow reads those, and
-                        // an arrow is rebuilt by evaluation in the reading realm.
-                        // The this-binding status is known here because the
-                        // constructor uses it to decide whether the record has a
-                        // `this` binding at all.
+                        // not carry stay undefined. `this` does not come from
+                        // either of them: it is carried, and `settle_envs` fills
+                        // it, which is what an arrow instantiated in this chain
+                        // reads. The two that stay absent are what an arrow's
+                        // `super` and `new.target` would resolve through, so an
+                        // arrow whose body reads one has neither — the limit the
+                        // format's arrow paragraph states. The this-binding status
+                        // is known here because the constructor uses it to decide
+                        // whether the record has a `this` binding at all.
                         let function = FunctionEnv::new(
                             outer,
                             Value::Undefined,
@@ -4027,22 +4121,28 @@ impl Builder<'_> {
         Ok(function)
     }
 
-    /// An evaluated-function record: the source is evaluated as an expression in
-    /// the realm being restored, and the function it produces is the value.
+    /// An arrow record, rebuilt by **instantiating** its expression in the
+    /// environment the record carried rather than by evaluating the source.
     ///
-    /// An arrow's record: the source is evaluated as an expression in the realm it
-    /// is being restored into, because an arrow *is* an expression and the engine's
-    /// own evaluation is what gives a closure its lexical `[[ThisMode]]`, its
-    /// deferred absence of a `prototype`, and its strictness.
+    /// An arrow is an expression, so the parenthesis is what lets a script parse
+    /// read it; instantiating rather than evaluating is what keeps the scope it
+    /// closed over, and an arrow exists to capture its `this` and its free names —
+    /// evaluating it in the reading realm would hand back an arrow over that
+    /// realm's global instead. The record's `environment` is the chain the writer
+    /// walked, the same one a function record carries, or `NO_REF` for the reading
+    /// realm's global when the writer could not carry that chain.
     ///
-    /// The divergence is the module docs': the evaluation is the **reading**
-    /// realm's, so a captured `this` or a free name is that realm's global rather
-    /// than the scope the original closed over — the arrow record's stated limit.
-    fn build_evaluated_function(
+    /// The parse is a script, so the arrow's spans index the text the parse was
+    /// given; the bootstrap context the instantiation runs under carries that same
+    /// text as its `source`, which is what `capture_source` resolves the arrow's
+    /// `[[SourceText]]` from — so `toString`, and a second snapshot of the restored
+    /// arrow, are unaffected.
+    fn build_arrow_function(
         &mut self,
         source: &[u16],
         proto: u32,
         strict: bool,
+        environment: u32,
     ) -> Result<Handle<Function>, DecodeError> {
         let proto = self.prototype(proto)?.ok_or_else(|| {
             DecodeError::UnrebuildableFunction("the record names no prototype".into())
@@ -4050,25 +4150,41 @@ impl Builder<'_> {
         let text = String::from_utf16(source).map_err(|_| {
             DecodeError::UnrebuildableFunction("its arrow source is not valid UTF-16".into())
         })?;
+        let wrapped = format!("({text})");
+        let program = parser::parse_script(&wrapped).map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!("its arrow source does not parse: {error}"))
+        })?;
+        let (is_async, params, body, span) = arrow_expression(&program).ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("its source is not one arrow expression".into())
+        })?;
         let realm = *self.realm;
-        // An arrow's source is an expression, so it needs the parenthesis wherever
-        // it appears. The `strict` byte decides whether the evaluated code is
-        // strict — an arrow inherits the strictness of the code around it, and the
-        // evaluation has no other way to know. Popped on every path.
-        let prefix = if strict { "\"use strict\"; " } else { "" };
+        let environment = self.function_environment(environment)?;
         self.agent.push_bootstrap_context(realm);
-        let value = self.agent.run_script(&format!("{prefix}({text})"));
+        if let Some(context) = self.agent.execution_context_stack.last_mut() {
+            context.source = Some(JsString::from_utf8(&wrapped));
+        }
+        let value = crate::function::instantiate_arrow(
+            self.agent,
+            is_async,
+            params,
+            body,
+            environment,
+            strict,
+            Vec::new(),
+            Vec::new(),
+            span,
+        );
         self.agent.execution_context_stack.pop();
         let value = value.map_err(|error| {
             DecodeError::UnrebuildableFunction(format!(
-                "its arrow source could not be evaluated: {error}"
+                "its arrow source could not be instantiated: {error}"
             ))
         })?;
         let function = value.as_function().ok_or_else(|| {
-            DecodeError::UnrebuildableFunction("its source did not evaluate to a function".into())
+            DecodeError::UnrebuildableFunction("its source did not make a function".into())
         })?;
-        // The evaluation sets the function's own prototype link from what it
-        // derived; the record's is what the blob was written with, so it wins.
+        // The instantiation derives a prototype link of its own; the record's is
+        // what the blob was written with, so it wins.
         function
             .object
             .set_prototype_of(Some(proto))
@@ -6757,6 +6873,42 @@ mod tests {
         );
     }
 
+    /// A function is keyed in its own id space, not beside an object's.
+    ///
+    /// `JsObject::id` is minted from a thread-local counter and `Function::id`
+    /// from a process-wide one, so the two spaces are independent and a real
+    /// graph does hold an object and an unrelated function carrying the same
+    /// number. One key for both would hand them one serial — whichever the walk
+    /// reached first would own the record, and the other value would come back as
+    /// that record — so the key has to name the kind.
+    ///
+    /// The collision itself is not built here: in any process the counters are far
+    /// enough apart that closing the gap would cost as many allocations as the
+    /// process has already made, and a test that only fires when the environment
+    /// cooperates is worse than one that pins the shape the collision needs. What
+    /// proves the behaviour is the host that surfaced it — a snapshot of deno's
+    /// realm, where `globalThis.Deno` and a function shared id 1142.
+    #[test]
+    fn a_function_is_keyed_in_its_own_id_space() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let object = context.try_eval("({})").expect("an object").into_value();
+        let function = context
+            .try_eval("(() => 0)")
+            .expect("a function")
+            .into_value();
+
+        assert!(
+            matches!(identity(&realm, object), Identity::Object(_)),
+            "an object is keyed in the object space"
+        );
+        assert!(
+            matches!(identity(&realm, function), Identity::Function(_)),
+            "and a function in the function space, which the object space is not"
+        );
+    }
+
     /// A class constructor is carried by its class's `[[SourceText]]` — the
     /// spec's own slot for it — and the restore evaluates that text as a class
     /// expression, so the constructor it built comes back a constructor: it
@@ -6853,7 +7005,105 @@ mod tests {
         );
     }
 
-    /// An async arrow keeps its kind: the evaluation derives the same
+    /// An arrow that closes over a **non-global** binding keeps it.
+    ///
+    /// This is the shape `deno_core`'s `01_core.js` has everywhere —
+    /// `print: (msg, isErr) => op_print(msg, isErr)`, with `op_print` a destructured
+    /// binding of that file's IIFE — and it is exactly what the record lost while
+    /// the restore evaluated the source in the reading realm, where the name is not
+    /// a global at all.
+    #[test]
+    fn an_arrow_keeps_the_scope_it_closed_over() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("(() => { let captured = 21; return () => captured; })()")
+            .expect("an arrow over a closure binding")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            call_restored(&isolate, &realm, back, "").as_number(),
+            Some(21.0),
+            "the restored arrow reads the binding it closed over"
+        );
+        // The parse is the wrapped expression, so a span still resolves to the
+        // arrow's own text — `toString`, and a second snapshot, are unaffected.
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("() => captured".to_string()),
+            "and it answers its own source, not the wrapper's text"
+        );
+    }
+
+    /// An arrow's `this` is lexical, so a restored arrow is the value where the
+    /// carried environment decides what `this` *is*: it comes from the function
+    /// environment the record carries, not from the realm the restore runs in.
+    #[test]
+    fn an_arrow_keeps_the_this_it_captured() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("({ tag: 7, make() { return () => this.tag; } }).make()")
+            .expect("an arrow over a receiver")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            call_restored(&isolate, &realm, back, "").as_number(),
+            Some(7.0),
+            "the restored arrow's `this` is the receiver it captured"
+        );
+    }
+
+    /// An arrow whose chain the format cannot carry is written with no chain at
+    /// all rather than refusing the snapshot.
+    ///
+    /// A `with` record is one a lookup cannot walk — its names live on a binding
+    /// object — so this arrow's chain is not carriable. The write has to answer
+    /// `NO_REF`, which the reader resolves to the reading realm's global: the
+    /// arrow's documented limit, and what every arrow got before a record carried a
+    /// chain at all. What it must **not** do is refuse the write, which is what the
+    /// first attempt did and what `snapshot_with_additional_extensions` measured.
+    #[test]
+    fn an_arrow_over_a_chain_the_format_cannot_carry_still_round_trips() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { const box = { captured: 21 }; with (box) {\n                 return () => captured; } })()",
+            )
+            .expect("an arrow over a with record")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert!(
+            back.as_function().is_some(),
+            "the record still restores as the arrow it was"
+        );
+        // `captured` lived in the `with` record, which is not carried, so the name
+        // is not a global of the reading realm either — the limit, stated rather
+        // than traded for a refusal.
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "try { restored(); 'no' } catch (e) { e.constructor.name }"
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("ReferenceError".to_string()),
+            "the name it could not carry is not one the reading realm has"
+        );
+    }
+
+    /// An async arrow keeps its kind: the instantiation derives the same
     /// `[[Prototype]]` the record carries (%AsyncFunction.prototype%), and a call
     /// still answers a promise.
     #[test]

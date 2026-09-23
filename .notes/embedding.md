@@ -3651,6 +3651,122 @@ writes `import(`, and case-sensitive greps for it over `test262/test/intl402/**/
 and `waspec/**/*.js` answer nothing (the wasm core corpus is `.wast` text, which no
 JavaScript drives).
 
+**A function's snapshot identity is its own, and the collision the arrow part hit
+is gone.** This is the enabling fix §9's arrow record asked for. The writer keyed
+an object and a function under one `Identity::Object(id)`, and the two ids are
+minted by **independent** counters — `JsObject::id` from `next_object_id()`, a
+thread-local `Cell` starting at 1 (`crates/crux/src/object.rs:29-39,51`), and
+`Function::id` from a process-wide `NEXT_FUNCTION_ID`
+(`crates/crux/src/function.rs:26`) — so a live object and an unrelated live
+function can carry the same number. Both then collapse onto one serial: whichever
+the walk reaches first owns the record, and every reference to the other is
+written as that serial.
+
+*The mechanism.* `Identity` gains a `Function(u64)` variant and `identity()`
+answers it for `ValueKind::Function`, so the key names the kind. `canonical()` is
+what keeps the split sound — an object that is a function's *object part* folds to
+the function before the key is computed — and that fold already has its own test
+(`a_function_reached_as_a_prototype_comes_back_a_function`), so the split cannot
+quietly undo it. Nothing else builds the object key: `Identity::Object` is
+constructed in exactly one place.
+
+*Tests — one, mutated.* `a_function_is_keyed_in_its_own_id_space` (runtime) pins
+the shape: an object's key is the object space, and a function's is not. The
+collision itself is **not** constructed, and the test says so — in any process the
+two counters are far enough apart that closing the gap would cost as many
+allocations as the process has already made, and a test that only fires when the
+environment cooperates is worse than one that pins the shape the collision needs.
+Reversing the one line under test fails it, on the second assertion.
+
+*The measurement.* deno's release snapshot suite is **14/4, unchanged**, with the
+same four failures as the commit before it (`import_meta_snapshot`, `es_snapshot`,
+`es_snapshot_without_runtime_module_loader`, `lazy_loaded_esm`) — this part moves
+nothing on its own, because the defect needs a graph wide enough to hold a
+colliding pair and today's walk is not. The behaviour is proved instead by
+**activating the trigger**: with `carries_environment` answering true for
+`Grammar::Arrow` — the one-line writer half of the arrow part, the exact condition
+under which `dynamic_imports_snapshot` failed before this fix —
+**`dynamic_imports_snapshot` passes**, and the two failures left are the named,
+separate ones (`snapshot_with_additional_extensions`'s module-environment refusal,
+and `lazy_loaded_esm`, which needs the reader half). The trigger was reverted
+after measuring; §9's arrow record still holds both blockers.
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **884** (was
+883); v8 `--lib` **240** (unchanged); `cargo fmt --all -- --check` and `cargo
+clippy --locked --workspace --all-targets -- -D warnings` clean. The corpora were
+**not** re-run, and that is a reachability argument rather than a hope: the change
+is in the snapshot writer, and case-sensitive greps over `crates/test262/src`,
+`crates/wasmtest/src`, `crates/cli/src` and `crates/wasm/src` for
+`runtime::snapshot`, `runtime::api`, `slag::api`, `read_snapshot` and `create_blob`
+answer nothing.
+
+*A note, recorded and not acted on.* `crates/crux/src/object.rs:29-39` documents
+the object id and the wrapper-id queue together, and says of the ids that they are
+"process-global and never reused" — which `Cell::new(1)` per thread makes untrue
+for object ids. The queue is per-thread as well, so nothing here turns on it, and
+this part's fix does not depend on the comment being right; correcting it belongs
+with whoever next touches that file.
+
+**An arrow carries its closure, and deno's suite moves 14/4 → 15/4.** §9's arrow
+record named the gap, then the decision the first attempt left open, then the
+identity split the attempt was blocked on; this lands all three.
+
+*The mechanism, both halves.* The record takes the route a method's does: wrap the
+source as `format!("({text})")`, `parser::parse_script` it, take the arrow out of
+the parse (`arrow_expression`, mirroring the class route's paren-stepping), and
+**instantiate** it in the carried chain — `instantiate_arrow(agent, is_async,
+params, body, environment, strict, empty, empty, span)` — under a bootstrap context
+whose `source` is the wrapped text, which is what `capture_source` resolves a span
+against, so `toString` and a second snapshot of the restored arrow are unaffected.
+`Grammar::Arrow` joins `carries_environment`, and `build_evaluated_function` — the
+evaluate-in-the-reading-realm route — is gone.
+
+*The decision.* `callable()` writes an arrow's chain only when the chain is one this
+format can carry, and `NO_REF` otherwise. `carriable_environment` walks the chain
+asking every record up to the realm's own global the same question
+`carried_environment` answers, so the writer's decision cannot disagree with what
+`visit_env` will accept. `NO_REF` is the reading realm's global — the limit an
+arrow's restore already had, and what the write answered before a record carried a
+chain at all — so a module-scope arrow keeps its documented behaviour instead of
+newly refusing the snapshot, which is what the first attempt did and what
+`snapshot_with_additional_extensions` measured as a regression. One limit is stated
+rather than carried: a function environment's `[[FunctionObject]]` and its
+`new.target` are not part of an env record, so an arrow whose body reads `super` or
+`new.target` resolves neither. The reader's env arm and the format's arrow paragraph
+both say so now, and that is the arrow's named remaining gap.
+
+*Tests — three, mutated five ways.* `an_arrow_keeps_the_scope_it_closed_over` (a
+closure binding, plus its own source text through `toString`),
+`an_arrow_keeps_the_this_it_captured` (a receiver), and
+`an_arrow_over_a_chain_the_format_cannot_carry_still_round_trips` (a `with` record,
+whose refusal is the same class deno reported, and which asserts the fallback's
+ReferenceError rather than a refusal). The mutations, each caught: an arrow never
+carrying a chain (the two scope tests), the carriable check dropped (the fallback
+test, with `an object environment` as the encode error), the reader answering
+`NO_REF` (the two scope tests), `carries_environment` dropping the grammar (both
+scope tests, refused by the reader's gate as *a function record in grammar 2 names
+an environment*), and the bootstrap context losing its source (one assertion only,
+`function () { [native code] }` against `() => captured`). The three arrow tests
+already there — its source text, its kind, its strictness — pass unchanged.
+
+*The measurement.* deno's release snapshot suite goes **14/4 → 15/4**.
+`lazy_loaded_esm_not_snapshotted_but_metadata_survives` — the part's buyer, which
+was `ReferenceError: "op_print" is not defined` — passes, and
+`snapshot_with_additional_extensions` passes again. `dynamic_imports_snapshot`
+stays green under the wider walk, which is the identity record above doing its job.
+The three left are the named ones: `import_meta_snapshot` (the host constructor a
+blob refuses), `es_snapshot` (its `ModuleRequest` source offsets), and
+`es_snapshot_without_runtime_module_loader`.
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **887** (was 884,
+which was 883 before the identity fix); v8 `--lib` **240** (unchanged); `cargo fmt
+--all -- --check` and `cargo clippy --locked --workspace --all-targets -- -D
+warnings` clean. The corpora were not re-run, for the same reachability reason the
+identity record gives: the whole route lives in the snapshot module, and greps over
+`crates/test262/src`, `crates/wasmtest/src`, `crates/cli/src` and `crates/wasm/src`
+for `runtime::snapshot`, `runtime::api`, `slag::api`, `read_snapshot` and
+`create_blob` answer nothing.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3750,6 +3866,109 @@ if that proves possible.
   follows it; §7's record has the measurement, and it moved deno's suite from
   12/6 to 14/4 — `dynamic_imports_snapshot` (this part's buyer) and
   `jsrealm::es_snapshot` both pass.
+- **The engine carries an arrow with its environment instead of evaluating it —
+  named here before the edit.** `callable()` writes `Grammar::Arrow` for a function
+  whose `[[ThisMode]]` is lexical, and the restore's arm calls
+  `build_evaluated_function(source, proto, strict)`, which evaluates `("<source>")`
+  as a **script in the reading realm** — so the restored arrow's `this` and free
+  names are that realm's global. The record's `environment` serial is already
+  carried and the other two grammars pass it; the arrow arm simply does not, which
+  is the whole of the gap. Measured, it costs
+  `lazy_loaded_esm_not_snapshotted_but_metadata_survives`: deno's `01_core.js:1109`
+  is `print: (msg, isErr) => op_print(msg, isErr)` with `op_print` a destructured
+  binding of that file's IIFE, so the restored arrow runs and cannot see it
+  (`ReferenceError: "op_print" is not defined`). So an arrow joins the method and
+  the accessor, which already take the third route: wrap the source as
+  `format!("({text})")`, `parser::parse_script` it, take the arrow AST out, and
+  **instantiate** it in the carried environment
+  (`instantiate_arrow(agent, is_async, params, body, env, strict, empty, empty,
+  span)`) with the bootstrap context carrying the parsed text as its `source` —
+  which is what `capture_source` resolves a span against, so `toString` and a
+  second snapshot are unaffected — and the record's prototype set afterwards. The
+  format's own arrow paragraph changes with it: an arrow is no longer "carried by
+  evaluating its source".
+  **Attempted, measured, and not landed.** Both halves were implemented with five
+  tests — an arrow over a closure binding, an arrow's captured `this`, its own
+  source text, an async arrow's prototype, a strict arrow — and three mutations
+  that each fail them; the workspace, `runtime` (885 lib tests) and `v8` (240)
+  were green and fmt/clippy clean. It buys its named test (`lazy_loaded_esm`
+  passes) but the deno suite goes **14/4 → 13/5**, so it is a net regression and
+  the code is reverted:
+
+  - `snapshot_with_additional_extensions` — an arrow written at *module* top level
+    closes over the module environment record, which `carried_environment`
+    refuses by kind, so the write now refuses where it previously answered
+    `NO_REF`. This part owes a decision the attempt did not take: carry a chain
+    only when it *is* carriable (every record declarative or function, or the
+    realm's own global) and otherwise write `NO_REF`, which the reader resolves
+    to the reading realm's global — the limit an arrow's restore already had. Not
+    fixed, because it is not the only break.
+  - `dynamic_imports_snapshot` — **root-caused, and not this part's fault.** The
+    restore gave `globalThis.Deno` a non-object value. The chain is the writer's
+    identity: `identity()` keys an object and a function under the **same**
+    variant — `ValueKind::Object(o) => Identity::Object(o.id())` and
+    `ValueKind::Function(f) => Identity::Object(f.id())` — while `JsObject::id`
+    comes from `next_object_id()`, a thread-local `Cell`
+    (`crates/crux/src/object.rs:51`), and `Function::id` from a separate
+    `NEXT_FUNCTION_ID: AtomicU64` (`crates/crux/src/function.rs:26,315`). The two
+    counters are independent, so a live object and an unrelated live function can
+    carry the same number and collapse onto one serial: whichever the walk
+    reaches first owns the record, and every reference to the other is written as
+    that serial. Probed on the failing case, `globalThis.Deno` is an object with
+    id 1142 and serial 373 — the serial its own property was written with — holds
+    a function with id 1142. This part only widens the walk enough (carrying ~79
+    environments, the largest a 207-binding function record) that such a pair
+    first lands in it; the defect is latent, data-dependent, and reachable by any
+    host's snapshot. The enabling fix is therefore its own part, to be named
+    before it is made: give a function an `Identity` variant of its own, which
+    `canonical()` already makes safe — an object that is a function's object part
+    folds to the function before the key is computed, so the split only separates
+    values that are genuinely different, and the round trip of a graph that
+    reaches a function through its object part is the test that would catch a
+    hole in that.
+
+  Both blockers were named, and neither was in the arrow logic. The re-attempt
+  landed the identity split first, then the carriable decision, then the two
+  halves: deno's release snapshot suite is **15/4**, and §7 has both records.
+- **A function keys under its own id space in the snapshot writer — named here
+  before the edit.** `identity()` answers `Identity::Object(object.id())` for an
+  object and `Identity::Object(function.id())` for a function, and the two ids
+  come from **independent** counters: `JsObject::id` from `next_object_id()`, a
+  *thread-local* `Cell` that starts at 1 (`crates/crux/src/object.rs:29-39,51`),
+  and `Function::id` from a process-wide `NEXT_FUNCTION_ID`
+  (`crates/crux/src/function.rs:26`). Neither crate promises the spaces are
+  disjoint — they are two agent-side table keys (per-object state, and the
+  ECMAScript body), not one identity — so a live object and an unrelated live
+  function can hold the same number. The walk then gives both one serial:
+  whichever it reaches first owns the record, and every reference to the other is
+  written as that serial, so a host's value comes back as a different value's
+  record. This is what the arrow part surfaced (§9 above): probed, deno's
+  `globalThis.Deno` is an object with id 1142 while serial 373 — the serial its
+  own property was written with — holds a function with id 1142. The fix is the
+  writer's: a function gets an `Identity::Function(id)` variant of its own.
+  `canonical()` keeps that safe, because an object that is a function's *object
+  part* folds to the function before the key is computed, and
+  `a_function_reached_as_a_prototype_comes_back_a_function` already covers that
+  fold. **Landed** in the change that follows it; §7's record has the mechanism,
+  the gates, and the trigger activation that proves the behaviour.
+- **The arrow part is re-attempted with the carriable decision — named here
+  before the edit.** The two halves above are rebuilt as they were, and the one
+  decision the attempt left open is taken: `callable()` carries an arrow's chain
+  only when every record in it is one a restore can rebuild (declarative or
+  function, up to the realm's own global), and answers `NO_REF` otherwise — which
+  the reader resolves to the reading realm's global, the limit an arrow's restore
+  already had, and what the write answered *before* this part existed. So a
+  module-scope arrow stops refusing the snapshot and keeps its documented
+  behaviour instead of losing it. The question is asked by a predicate
+  (`carriable_environment`) that consults the same `carried_environment` the walk
+  will, so the decision cannot disagree with what `visit_env` accepts; it is a
+  per-record judgement made by the writer, which is why `carries_environment()`
+  keeps its meaning ("this record may name a chain") and the reader's gate is
+  unchanged. One limit is stated rather than carried: a function environment's
+  `[[FunctionObject]]` and `new.target` are not part of an env record, so an
+  arrow whose body reads `super` or `new.target` resolves neither. **Landed** in
+  the change that follows it; §7's record has the mechanism, the mutations and the
+  measurement.
 - **The platform is a shape without a producer, and that is stated.** Slag posts
   no task, so `Platform`/`PlatformImpl`/`Task` exist so a host's initialization
   and its own implementation type-check, and the bridge's module docs say so
