@@ -3211,6 +3211,115 @@ of 48,622, `intl402` 3,205 / 0 fail (152 skip); the eight wasm core suites 64,59
 checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 / 0 fail. The sweeps were run
 because the engine change is in `api::template`, which every runner links.
 
+**The next measurement, and it is deno's own debug assertion rather than a bridge
+bug.** With the handler landed, `cargo test -p deno_core --features v8 --lib`
+compiles and its tests run: **5 passed, 13 failed**. The thirteen are one
+mechanism's worth of noise. deno's `check_all_modules_evaluated`
+(`modules/map.rs:198`, a `#[cfg(debug_assertions)]` sanity check that every
+module it registered reports `Evaluated`) fails in the runtime **restored from
+the blob**. Two probes settled it, and the numbers are worth keeping: the check
+runs twice per test, on **two different module maps** (`0x20e5ffdf7d8`, the
+snapshot-creation runtime, where both modules report `Evaluated` and the check
+passes; `0x20e6099f148`, the runtime created from the blob, where the same two
+specifiers report `Uninstantiated` and the one that was `synthetic=true` reports
+`synthetic=false`). So the format is behaving as designed: a host-attached module
+handle travels as the record's **name and source** (part 16) and the restore
+*rebuilds* it, which is necessarily an unevaluated record — what V8's heap image
+would have carried here is module *state*, not a value. `InitMode::FromSnapshot`
+skips deno's bootstrap for exactly that reason (`jsruntime.rs:1080-1083`), so the
+assertion cannot be satisfied by a data-only blob without lying about it.
+
+*What the release run says, with the assertion compiled out — the useful number.*
+**10 passed / 8 failed**, and the eight name the real frontier:
+
+- `test_snapshot_creator_warmup`: `create_blob` **refuses by name** — "the engine
+  cannot carry a built-in function (a host callback is a Rust closure, not a name
+  or an address a snapshot can carry) yet" (`crates/v8/snapshot.rs:312`). A
+  *template-made* function whose callback is a Rust closure minted at runtime,
+  which the host's external-reference table cannot name. The walk is doing the
+  right thing and naming the next kind, and this is the mechanical part.
+- `will_snapshot2`: `ReferenceError: "a" is not defined` in the restored realm —
+  a binding the write side had and the read side does not, which is the
+  carried-global area rather than the module format.
+- the rest — `dynamic_imports_snapshot`, `import_meta_snapshot`,
+  `jsrealm::es_snapshot`, both `es_snapshot`s and
+  `lazy_loaded_esm_not_snapshotted_but_metadata_survives` — are the restored
+  module map again.
+
+So what the frontier stops on next is a **decision rather than a mechanism**:
+either the format grows module *state* (a heap-image direction, with the
+evaluate-on-restore hazard deno's own skip exists to avoid — re-running
+`ext:core/mod.js` at restore would duplicate what the carried global already
+holds), or the divergence is declared, because a data-only blob cannot satisfy a
+heap-image assertion and a host that needs one needs the other thing. §12's
+eleventh item already holds that choice and this is the measurement it was
+waiting for. The `create_blob` refusal does not depend on the choice.
+
+**The `create_blob` refusal, measured down to one function.** Two probes in the
+bridge's snapshot callbacks — one where the write side asks what a function was
+built from, one where the load asks for a table entry — say what the release
+run's refusal is: the *restore* rebuilds the functions (23-plus `callback_at`
+calls, most carrying data), and the *second* write meets exactly **one** function
+it cannot identify. `callback_of` misses once (`id=3750`) and `create_blob`
+refuses on it. The reason is in the code rather than inferred:
+`callback_of` answers from `IsolateInner::callbacks`, a map keyed by the **engine
+function id**, which `materialize` fills when a *template* makes a function;
+the restore builds its functions through `api::host_function`
+(`crates/runtime/src/snapshot.rs:3810`) and never records them — so a snapshot
+written *of a restored runtime* (deno's warmup test, and any second-generation
+blob) cannot name what it restored.
+
+The fix is two small edits and a test, and it is the next part.
+`format::HostCallbacks` gains the hook the engine calls where it has both — after
+`host_function` returns in `build_host_callback`, "this function was rebuilt from
+the entry at this index, with this data" — and the bridge implements it by
+recording into the isolate's own table (`Global` for the data, as
+`template_callback` does), so the write side finds a restored function the way it
+finds a template-made one. The engine side is a default no-op method, so nothing
+else moves. Not implemented here: the session ended first, and what is left is
+the hook, its implementation and a test that round-trips a host callback and
+writes a second snapshot.
+
+**A snapshot of a load — landed, and deno's warmup gets past the refusal.** The
+`create_blob` refusal was one function short of identifiable, and this is the hook
+that fixes it (the measurement above: the load rebuilds 23-plus callbacks, and
+the second write missed exactly one, `id=3750`).
+
+*The mechanism.* `format::HostCallbacks` gains `callback_rebuilt(&self, function,
+pointer, data)`, called by the engine right after `api::host_function` returns in
+`build_host_callback` — where the engine holds both the function it just made and
+the table entry it came from. The default does nothing, so no host that never
+writes a second blob changes. The bridge implements it by recording into the
+isolate's own `callbacks` table (keyed by the engine function id, with the data
+pinned as a `Global`): the same table `materialized` fills when a *template* makes
+a function, and the same one `create_blob` takes. So a snapshot written *of a
+load* names what the load restored. The load-side `SnapshotCallbacks` carries the
+isolate to record into; the write side does not.
+
+*The measurement.* deno's release snapshot suite goes from **10 passed / 8 failed**
+to **11 passed / 7 failed**: `test_snapshot_creator_warmup` — the test whose
+refusal this part was — passes. What is left is the seven recorded above, and one
+of them got a sharper name: `lazy_loaded_esm_not_snapshotted_but_metadata_survives`
+fails with `ReferenceError: "op_print" is not defined` in the restored realm,
+which is the ops module the restored map does not provide — the module-state
+question again rather than a new mechanism.
+
+*Tests — one, and it is the shape.*
+`a_snapshot_of_a_load_carries_what_the_load_rebuilt` writes a blob from a
+template-built function, loads it into a creator continuing from that blob, reads
+the function back, re-attaches it, and writes a **second** blob, which a fresh
+isolate then boots from and calls. Mutating the record away — the bridge's
+`record_rebuilt_callback` returning early — reproduces deno's own error text
+exactly ("the engine cannot carry a built-in function..."), which is what makes it
+the cause rather than a coincidence.
+
+*Gates.* `cargo test --locked --workspace` green in 38 binaries; `cargo fmt --all
+-- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D
+warnings` clean; test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang (158 skip)
+of 48,622, `intl402` 3,205 / 0 fail (152 skip); the eight wasm core suites 64,594
+checks / 0 fail / 0 pending; `wasmtest jsapi` 1,001 / 0 fail. The sweeps were run
+because the change is in `runtime`'s snapshot module, and they reproduce.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)

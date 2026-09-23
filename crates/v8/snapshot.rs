@@ -297,7 +297,10 @@ impl SnapshotCreator {
             let slot = position + 1;
             slots.push((slot, self.contexts[position], self.items_of(slot)));
         }
-        let host = SnapshotCallbacks { callbacks };
+        let host = SnapshotCallbacks {
+            callbacks,
+            record_into: None,
+        };
         // The realm's global state travels too: a host's snapshot is meant to put
         // back what it installed on the global (`Deno`, an op table), which is
         // what `InitMode::FromSnapshot` reads before it runs any bootstrap.
@@ -348,13 +351,20 @@ struct Attached {
 /// the isolate it runs on.
 struct SnapshotCallbacks {
     callbacks: HashMap<u64, BuiltCallback>,
+    /// The isolate a *load* records what it rebuilt into, so a snapshot written
+    /// of that load can name it. `None` on the write side, which was handed the
+    /// table it writes against.
+    record_into: Option<Isolate>,
 }
 
 impl SnapshotCallbacks {
-    /// The read half, which answers for any entry the load's table holds.
-    fn none() -> Self {
+    /// The read half, which answers for any entry the load's table holds and
+    /// records the functions it rebuilds into `isolate` — the identity a second
+    /// snapshot asks with.
+    fn for_load(isolate: Isolate) -> Self {
         Self {
             callbacks: HashMap::new(),
+            record_into: Some(isolate),
         }
     }
 }
@@ -375,6 +385,17 @@ impl format::HostCallbacks for SnapshotCallbacks {
                 .as_ref()
                 .map(|pinned| *pinned.handle().engine()),
         })
+    }
+
+    fn callback_rebuilt(
+        &self,
+        function: &crux::handle::Handle<crux::function::Function>,
+        pointer: usize,
+        data: Option<api::Local>,
+    ) {
+        if let Some(isolate) = self.record_into {
+            isolate.record_rebuilt_callback(function.id(), pointer, data);
+        }
     }
 
     fn callback_at(
@@ -503,7 +524,7 @@ impl SnapshotRestore {
     /// from source" branch with no way to learn why.
     fn restore(&mut self, isolate: &Isolate, context: api::Context, slot: usize) -> bool {
         let table = engine_table(isolate.externals());
-        let host = SnapshotCallbacks::none();
+        let host = SnapshotCallbacks::for_load(*isolate);
         let items = match context.read_snapshot(self.blob.bytes(), slot, &table, Some(&host)) {
             Ok(Some(items)) => items,
             Ok(None) => return false,
@@ -1222,6 +1243,87 @@ mod tests {
             .expect("the host callback");
         crate::test_support::bind(scope, "restored", function);
         assert_eq!(crate::test_support::eval_number(scope, "restored()"), 7.0);
+    }
+
+    /// A snapshot written **of a load**: the second blob carries the callback the
+    /// first one did.
+    ///
+    /// A function a load rebuilt is the load's rather than the host's template's,
+    /// so unless the load is told what it made, the write side cannot say which
+    /// table entry it came from and the second `create_blob` refuses it. deno's
+    /// warmup test is exactly this shape.
+    #[test]
+    fn a_snapshot_of_a_load_carries_what_the_load_rebuilt() {
+        use crate::support::MapFnTo;
+        use std::borrow::Cow;
+
+        fn an_op(
+            _scope: &mut crate::scope::PinScope<'_, '_>,
+            args: crate::function::FunctionCallbackArguments,
+            rv: crate::function::ReturnValue,
+        ) {
+            rv.set(args.data());
+        }
+        let references = vec![crate::ExternalReference {
+            function: an_op.map_fn_to(),
+        }];
+
+        // The first blob, carrying a function built from a template.
+        let mut creator = Isolate::snapshot_creator(Some(Cow::Owned(references.clone())), None);
+        {
+            crate::scope!(let scope, &mut creator);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let template = crate::FunctionTemplate::builder(an_op)
+                .constructor_behavior(crate::ConstructorBehavior::Throw)
+                .data(crate::Number::new(scope, 7.0).into())
+                .build(scope);
+            let function = template.get_function(scope).expect("function");
+            scope.add_context_data(context, function.cast::<Value>());
+        }
+        let blob = creator
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        // The load: a creator continuing from the blob, the way a host that
+        // re-snapshots a restored runtime does. Reading the item is what makes
+        // the load rebuild the callback.
+        let mut warm = Isolate::snapshot_creator_from_existing_snapshot(
+            blob,
+            Some(Cow::Owned(references.clone())),
+            None,
+        );
+        {
+            crate::scope!(let scope, &mut warm);
+            let context = Context::from_snapshot(scope, 0, Default::default()).expect("slot 0");
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let function = scope
+                .get_context_data_from_snapshot_once::<Value>(0)
+                .expect("the host callback");
+            crate::test_support::bind(scope, "restored", function);
+            assert_eq!(crate::test_support::eval_number(scope, "restored()"), 7.0);
+            // Re-attach what was restored, which is what a host that snapshots
+            // again does and what makes the second blob carry it.
+            scope.add_context_data(context, function);
+        }
+        let second = warm
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a second blob");
+
+        // And the second blob stands on its own: a fresh isolate boots from it
+        // and the callback still answers what it was built with.
+        let mut isolate = isolate_from_with(second, references);
+        let context = restored_context(&mut isolate, 0).expect("the second blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let function = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the host callback");
+        crate::test_support::bind(scope, "again", function);
+        assert_eq!(crate::test_support::eval_number(scope, "again()"), 7.0);
     }
 
     /// A host callback whose pointer the build's table does not hold still ends

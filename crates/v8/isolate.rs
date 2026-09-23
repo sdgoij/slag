@@ -928,6 +928,26 @@ impl Isolate {
         }
     }
 
+    /// Record that a *load* rebuilt the function identified by `function` from
+    /// the table entry at `pointer`, with `data` — the same entry shape
+    /// [`materialized`](Self::materialized) keeps for a template's function, so
+    /// the write side finds a restored function the way it finds a built one.
+    pub(crate) fn record_rebuilt_callback(
+        &self,
+        function: u64,
+        pointer: usize,
+        data: Option<api::Local>,
+    ) {
+        let data = data.map(|value| Global::new(self, Local::from_engine(value)));
+        self.inner().callbacks.borrow_mut().insert(
+            function,
+            BuiltCallback {
+                callback: pointer,
+                data,
+            },
+        );
+    }
+
     /// Every callback the host built a function from, by that function's
     /// identity, taken: what `create_blob` writes as indices into the host's
     /// table. Taken rather than cloned because the values are pins, and because

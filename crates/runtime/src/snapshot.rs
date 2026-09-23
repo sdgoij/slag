@@ -579,6 +579,23 @@ pub trait HostCallbacks {
         pointer: usize,
         data: Option<crate::api::Local>,
     ) -> Option<crate::api::FunctionCallback>;
+
+    /// Told that `function` was rebuilt from the table entry at `pointer`, with
+    /// `data` — the write side's counterpart to
+    /// [`callback_of`](Self::callback_of).
+    ///
+    /// A load that can be written again has to be able to say what it restored.
+    /// The function is the load's rather than the host's template's, so being
+    /// told here is the only thing that makes it identifiable to a later
+    /// `callback_of`; a host that never writes a second blob has no use for it,
+    /// which is why the default does nothing.
+    fn callback_rebuilt(
+        &self,
+        _function: &Handle<Function>,
+        _pointer: usize,
+        _data: Option<crate::api::Local>,
+    ) {
+    }
 }
 
 /// One context's slot in a blob: the index the host gave it, the realm its
@@ -3796,9 +3813,13 @@ impl Builder<'_> {
             NO_REF => None,
             serial => Some(self.materialize(serial)?),
         };
+        // The value the load hands the host twice: once to build the callback
+        // from, and once to record the function it rebuilt. `api::Local` is a
+        // copy, so this binding is what keeps the two the same value.
+        let host_data = data.map(crate::api::Local);
         let callback = self
             .host
-            .and_then(|host| host.callback_at(pointer, data.map(crate::api::Local)))
+            .and_then(|host| host.callback_at(pointer, host_data))
             .ok_or(DecodeError::NoHostCallback(index as usize))?;
         let prototype = self.prototype(proto)?;
         // SAFETY: `api::Isolate` is `repr(C)` with the agent at offset 0, so the
@@ -3807,13 +3828,20 @@ impl Builder<'_> {
         // callback scope is built from it — the same identity
         // `api::Isolate::get_current` relies on.
         let isolate = self.agent as *mut Agent as *mut crate::api::Isolate;
-        crate::api::host_function(isolate, std::rc::Rc::new(callback), None, prototype).map_err(
-            |error| {
-                DecodeError::UnrebuildableFunction(format!(
-                    "the host could not make a function for external reference {index}: {error}"
-                ))
-            },
-        )
+        let function =
+            crate::api::host_function(isolate, std::rc::Rc::new(callback), None, prototype)
+                .map_err(|error| {
+                    DecodeError::UnrebuildableFunction(format!(
+                        "the host could not make a function for external reference {index}: {error}"
+                    ))
+                })?;
+        // Tell the host what it just made: this pair is how the write side names
+        // a function, so a snapshot written *of this load* can carry what it
+        // restored rather than refusing it.
+        if let Some(host) = self.host {
+            host.callback_rebuilt(&function, pointer, host_data);
+        }
+        Ok(function)
     }
 
     /// An evaluated-function record: the source is evaluated as an expression in
