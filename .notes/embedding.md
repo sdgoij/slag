@@ -74,7 +74,7 @@ below it.
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
 | **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **nothing landed, corrected 2026-09-21.** This row read "edges and finalization landed" and named three tests; neither exists. `HostOps` (`crates/crux/src/host.rs`) has no `trace` and no `finalize`, `ObjectKind::Host` is still `Rc<dyn HostOps>` (`crates/crux/src/object.rs:469`) and its `Trace` impl deliberately contributes no edges (`crates/crux/src/object.rs:750-762`), so a value a host object holds is still invisible to the collector — the defect `.notes/host-object-gc.md` §1(a) describes. `grep -rn 'a_host_objects_retained_edge_roots_its_value\|run_finalizers\|a_swept_host_object\|host_object_retain\|PENDING_FINALIZERS' crates/` returns nothing. `.notes/host-object-gc.md` §6 describes that work as shipped; it was written, reviewed, and reverted, and the note now records that. Weak persistent handles: also not landed, as this row said |
-| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, **a module record — which is not a language value — as the name and source the engine's own compile path rebuilds it from, so a slot's items come back at the indices the host attached them under**, and **the realm's own global functions, the members of its own builtin objects by the spec's names and a method that reads a private name, as a member of its class**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time and now reads through every value the walk carries and every item its slots hold (§7); what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies, and what a host's own `FromSnapshot` path additionally expects — its realm's bootstrapped global — was **measured**: a bootstrapped `globalThis` walks, restores into a fresh isolate and its bootstrap functions run (§7's last two records, §12 item 11), so the remaining work there is the load applying it rather than a gap in what can be carried. What remains on this row: the task runner, termination, and the host-memory accounting half. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
+| **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, **a module record — which is not a language value — as the name and source the engine's own compile path rebuilds it from, so a slot's items come back at the indices the host attached them under**, and **the realm's own global functions, the members of its own builtin objects by the spec's names and a method that reads a private name, as a member of its class**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time and now reads through every value the walk carries and every item its slots hold (§7); what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies, and what a host's own `FromSnapshot` path additionally expects — its realm's bootstrapped global — was **measured**: a bootstrapped `globalThis` walks, restores into a fresh isolate and its bootstrap functions run (§7's last two records, §12 item 11), so the remaining work there is the load applying it rather than a gap in what can be carried. What remains on this row: the task runner and the host-memory accounting half — **termination landed for every engine there is** (§7's wasm record): one request, read by the JS interpreter and JIT as item 20 left them and by the wasm interpreter and its compiled backend here. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
 collector moves objects and must rewrite handles; Slag's arena keeps stable
@@ -4047,6 +4047,86 @@ fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce their
 (core 20,662 plus the seven proposal suites for **64,594 / 0 fail / 0 pending**, and
 js-api **1,001 tests, 0 fail**).
 
+*Wasm termination — §9 item 21, the second engine item 20's own limit named, and the
+other half of the L3 row's termination item.* Both wasm engines now read the one
+request:
+
+- *The channel.* `wasm::Store` gains `termination: Option<Arc<AtomicBool>>` with
+  `with_termination(flag)` beside `new()`, and `termination_flag_ptr()`, which answers
+  the attached flag's address or the never-set `TERMINATION_NEVER` static when a store
+  has none. The static is what makes the compiled probe null-free: a store with no host
+  channel still hands the machine code a valid address to read, so the probe needs no
+  null compare and a test with no channel can exist at all.
+- *The interpreter.* `Engine::branch_to` — the one choke point every `Br`, `BrIf`,
+  `BrTable`, `BrOnNull`, `BrOnNonNull` and `BrOnCast` passes — checks the flag on its
+  first line and answers the new `ExecFail::Terminated`.
+- *The compiled backend.* The caller-owned scratch region gains `TERMINATION_SLOT`
+  beside `ENTRIES_SLOT` (so `SCRATCH_WORDS` is now `SCRATCH_SLOTS + 2`), written at
+  both sites that already write the entries pointer (`Store::start_owned` and
+  `run_native_callee`). `Lowerer::emit_termination_probe` emits at a loop's header —
+  the one block every iteration, the entry edge and each back-edge alike, passes
+  through — a load of the flag address, a one-byte load of the flag, and a branch to a
+  block that returns the new `TRAP_TERMINATED`; the loop body continues in a fresh
+  block that takes the header's parameters, so the loop keeps its shape. `run_compiled`
+  maps that code to `ExecFail::Terminated` before `trap_of`, because it is not a
+  `Trap`. A per-iteration helper *call* was rejected on cost, which is why this is a
+  load and a branch.
+- *The runtime.* `Agent::new` builds the flag first and attaches it to the wasm store
+  (`wasm::Store::with_termination`), so the `IsolateHandle` a host already holds is the
+  one request both engines read; and `run_failure` maps `Terminated` to
+  `crate::agent::termination_error()` — the same `Error("execution terminated")` item
+  20's JS check points throw, not a `WebAssembly.RuntimeError`.
+
+*Tests — five, each verified by mutating the code it guards and watching it fail.*
+Three in `wasm`'s compile tests, over one finite counting loop: the compiled probe
+(making the flag compare constant leaves the loop to finish and fails it), the
+interpreter's `branch_to` check (a `termination_requested` that always answers `false`
+fails it), and a store with no channel, which proves the never-set static keeps the
+probe from dereferencing a null slot *and* from terminating spuriously (a probe that
+always fires fails it). Two in `runtime`'s wasm tests: the request reaches the *agent's
+own* store — driven directly, with no JS call in between, so nothing but the wasm
+engine's own check can stop it (wiring the store with `Store::new()` instead of
+`with_termination` fails it) — and a `Terminated` failure renders as
+`Error: execution terminated` (dropping the `run_failure` arm fails it, answering
+`TypeError: wasm execution failed: Terminated`). The compiled test asserts the body
+compiled, because an interpreted body would pass it through the interpreter's check and
+make it vacuous.
+
+*The measurement.* deno's `terminate` filter is now **4 passing, 0 failing, no hang**
+(was 3 passing, 1 hanging): `terminate_execution_webassembly`, the test §9 item 21 was
+named for, passes in 1.06 s. deno's snapshot suite is unchanged at **18/0**.
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **896** (894 plus the
+two); wasm `--lib` **121** (118 plus the three); `cargo fmt --all -- --check` and
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean. Both corpora
+re-run, because the probe is on every compiled wasm loop and `Agent::new` is every
+agent: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0
+hang**, 158 skip of 48,622) and the wasm sweeps reproduce theirs (core **20,662**, the
+seven proposal suites, **64,594 / 0 fail / 0 pending**, js-api **1,001 tests, 0 fail**) —
+totals unchanged, which is the point: the probe is a check, not a behaviour.
+
+*One stated limit, and one thing the fix revealed.* The compiled probe reads the flag
+as a plain byte load of the address a host publishes with a relaxed store — what a
+machine-level relaxed load is on every target this compiles to, but not a Rust-atomic
+read; the interpreter reads the same flag with `load(Relaxed)`. That is recorded rather
+than implied, and the alternative (an atomic load, or a helper call) was rejected on
+cost and on §9 item 21's own terms. And running deno's *whole* `deno_core` lib suite —
+which item 20 could not, because it hung at `terminate_execution` — no longer hangs at
+any termination test: it now runs past them to `test_heap_limit_cb_multiple` and hangs
+there (`test_heap_limits` hangs too). That hang is **pre-existing and unrelated**: both
+tests build a runtime with `heap_limits(0, 5MB)` and expect the near-heap-limit callback
+to stop a `while(true) { s += "Hello"; }` loop, so an engine that never fires the
+callback leaves the string to grow without bound. It is the host-memory item §5's L3 row
+and §10 still carry; §12's fourteenth item names it as the next deno blocker. The same
+run also reports failing (not hanging) tests —
+`runtime::ops::tests::test_op_result_void_switch`, `runtime::tests::error::test_error_builder`,
+`runtime::tests::jsrealm::test_set_format_exception_callback_realms`,
+`runtime::tests::misc::eval_context_with_code_cache`, `runtime::tests::misc::inspector` and
+`runtime::tests::misc::test_dynamic_import_module_error_stack` — none of which touches
+the wasm or termination path this change owns; they are recorded here as the suite's
+current state, not A/B'd against a pre-change binary, because the earlier hang meant
+this run was the first to reach them.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -6318,6 +6398,65 @@ a frame view of the running stack. §7's survey already split the subsystem: the
         `terminate_execution_webassembly` is not this part's; and the exception is an
         ordinary `Error` a JS `try`/`catch` can swallow, where V8's is uncatchable.
         Both are recorded rather than implied.
+  21. **WebAssembly termination — named before the edit, and it is the second engine
+      item 20's own limit names.** deno's `terminate_execution_webassembly` still
+      hangs after item 20: a wasm module runs an infinite loop and neither wasm
+      engine reads the request. The shape is probed, so this is one part and not a
+      survey:
+
+      - **The channel.** `wasm::Store` has no link to the agent — it is a
+        self-contained interpreter — so `Store` gains the flag
+        (`Option<Arc<AtomicBool>>`, set once where `Agent::new` builds the store, with
+        a `with_termination` constructor). This is a second *reader* of the one
+        request, not a second request.
+      - **The interpreter.** `Engine::branch_to` (`crates/wasm/src/exec.rs`) is the
+        wasm interpreter's single choke point for control transfer — every `Br`,
+        `BrIf`, `BrTable`, `BrOnNull`, `BrOnNonNull` and `BrOnCast` goes through it —
+        so one check there is the back-edge check every wasm loop reaches. It answers
+        through the engine's existing `ExecFail` channel, and the runtime maps that
+        failure to the same `Error("execution terminated")` item 20 throws, so JS
+        sees one error shape from either engine.
+      - **The compiled backend decides the measurement — and it says the backend is
+        the part.** The interpreter half was implemented and measured: the store's
+        channel (`termination` + `with_termination`, wired from `Agent::new`), the
+        `branch_to` check, a new `ExecFail::Terminated`, and the runtime mapping it
+        to the same `Error("execution terminated")` item 20 throws. deno's test
+        **still hangs**: the lazy tier compiled the module's body on first execution,
+        so `branch_to` — the interpreter's choke point — never runs. The compiled
+        half is therefore required rather than a limit, and that half was **reverted
+        rather than landed untested**, because a termination covering only
+        interpreted wasm leaves the very hang it was written for. Where it goes, now
+        that the channel is known — the plumbing is mapped, so the edit is
+        mechanical: a compiled body already returns a **trap code** that
+        `run_compiled` maps to an `ExecFail` (`if code != TRAP_NONE { return
+        Err(ExecFail::Trap(trap_of(code))) }`, `trap_of` being the code→`Trap` map),
+        and the compiled entry's ABI already reaches the store (`CompiledRuntime`
+        carries its raw `*mut Store`), so the backend needs (a) the flag's
+        **address** in the caller-owned scratch metadata area — the region whose slot
+        `ENTRIES_SLOT` (`SCRATCH_SLOTS`) is where the store writes an instance's
+        direct-call table, so a `TERMINATION_SLOT` beside it is written at the same
+        site and grows `SCRATCH_WORDS` by one — read as one byte at a `Loop`
+        control's header (the block `frame_target` returns) and branched to a block
+        that returns a new termination code, and (b) `trap_of`/`run_compiled`
+        mapping that code to `ExecFail::Terminated`. A per-iteration helper *call*
+        was rejected on cost, which is why this is a load-and-branch rather than a
+        helper entry.
+      - **Landed**, in the shape above with one addition. `Store` carries the flag as
+        `Option<Arc<AtomicBool>>` and `with_termination` is its constructor, but the
+        compiled probe needs a valid address even for a store no host attached a channel
+        to, so `termination_flag_ptr()` answers the never-set `TERMINATION_NEVER` static
+        instead of a null — which is what keeps the probe a load-and-branch rather than a
+        load, a null compare and a branch. The rest is as this item predicted: the
+        `branch_to` check, `ExecFail::Terminated`, `TRAP_TERMINATED` (22) beside
+        `TRAP_PENDING_ERROR`, `TERMINATION_SLOT` (`SCRATCH_SLOTS + 1`) beside
+        `ENTRIES_SLOT` with `SCRATCH_WORDS` grown to `SCRATCH_SLOTS + 2`, the header probe
+        in `Lowerer::emit_termination_probe`, `run_compiled` mapping the code before
+        `trap_of` is reached, `Agent::new` attaching the flag to the store, and
+        `run_failure` answering the one termination error. §7 has the tests, the five
+        mutations, the gates and the measurement (deno's `terminate` filter **4 passing /
+        0 hanging**, snapshot suite unchanged at 18/0); its stated limit is the compiled
+        probe's plain byte load of a relaxed-published flag, and it unmasked a pre-existing
+        heap-limit hang (§12 item 14).
 
   ## 10. Build order
 
@@ -6354,7 +6493,9 @@ that the bytes a host stores are worth storing; §7's record and the ledger's it
 11 state why the bridge hands out the source text meanwhile). Then, in the order
 the
 shim histogram implies: **structured frames and termination** — the frame
-accessor landed (§7, and the ledger's item 12), while what a *stack trace* still
+accessor landed (§7, and the ledger's item 12) and **termination landed for both
+engines** (§7's wasm record; the request reaches JS as item 20 built it and wasm
+through the store's slot), while what a *stack trace* still
 needs is the VM's own frames: the engine's execution contexts are not a call
 stack (measured in §7), so a per-call view means recording activations in the
 interpreter and the JIT, and the per-activation source positions that every
@@ -6853,3 +6994,17 @@ migrate, then delete.
    nothing left to refuse by kind, so it became positive coverage
    (`an_accessor_round_trips_with_its_source`). Six mutations, each caught; the
    corpus was re-swept because `toString` is in it. Part 17 of §7's record.
+14. **The near-heap-limit callback — the next hang the deno suite exposes, named and
+   not chased.** §7's wasm-termination record found it: deno's whole `deno_core` lib
+   suite used to hang at `terminate_execution` and now runs past every termination test
+   to `runtime::tests::misc::test_heap_limit_cb_multiple`, which hangs (`test_heap_limits`
+   hangs too). Neither is about termination: both build a runtime with
+   `heap_limits(0, 5MB)`, install a near-heap-limit callback that calls
+   `terminate_execution()` and doubles the limit, then run
+   `while(true) { s += "Hello"; }` — the callback is the only thing that can stop it, so
+   an engine that never fires it leaves the string to grow without bound. The missing
+   part is therefore the heap-limit API (`create_params().heap_limits`, and the
+   near-heap-limit callback a bridge would hold and fire), which is the host-memory item
+   §5's L3 row and §10 already carry. One caveat on the classification: it is measured as
+   a hanging test, not A/B'd against a pre-change binary, so it is recorded as
+   *revealed* (the earlier termination hang masked it) rather than proven unrelated.

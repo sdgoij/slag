@@ -16,6 +16,8 @@
 //! memory operations (a separate proposal outside the pinned corpus).
 
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use byteblock::SharedBuffer;
 
@@ -38,6 +40,11 @@ pub enum ExecFail {
     /// pool. Only the outermost invocation edge sees this — the run loop
     /// converts it into a branch whenever a matching catch clause exists.
     Exception(usize),
+    /// The attached termination flag was set: the host asked a running
+    /// execution to stop (see [`Store::with_termination`]). Neither engine
+    /// maps this onto a JS-visible wasm trap; the runtime turns it into the
+    /// same `Error("execution terminated")` a JS termination produces.
+    Terminated,
 }
 
 impl From<Trap> for ExecFail {
@@ -70,6 +77,9 @@ impl From<ExecFail> for InstantiateError {
             ExecFail::Unsupported(reason) => InstantiateError::Unsupported(reason),
             ExecFail::Exception(_) => {
                 InstantiateError::Unsupported("exception during instantiation")
+            }
+            ExecFail::Terminated => {
+                InstantiateError::Unsupported("terminated during instantiation")
             }
         }
     }
@@ -464,6 +474,11 @@ pub struct Store {
     /// Runs suspended at an external-host-call boundary, innermost last
     /// ([`Store::start`] parks here; [`Store::resume`] pops and continues).
     suspended: Vec<Suspended>,
+    /// A termination request channel: the flag the host sets to stop a
+    /// running execution, shared with the agent that owns the run. `None`
+    /// for a store no host attached one to, whose compiled bodies point
+    /// their probe at [`TERMINATION_NEVER`] instead.
+    termination: Option<Arc<AtomicBool>>,
     /// Cut 11 test hook: when true, even compiled bodies run on the
     /// interpreter (lets the equivalence tests compare both paths).
     #[cfg(feature = "compile")]
@@ -494,6 +509,11 @@ impl Default for Store {
         Self::new()
     }
 }
+
+/// The flag a store with no host-supplied termination channel points its
+/// compiled scratch slot at. Never set, so such a store's compiled loops
+/// branch to [`ExecFail::Terminated`] only when a request exists.
+static TERMINATION_NEVER: AtomicBool = AtomicBool::new(false);
 
 /// Cut 11: the `memory.grow` runtime helper called from compiled bodies
 /// through a helper-signature `call_indirect` (its address rides the entry
@@ -992,9 +1012,11 @@ unsafe fn run_native_callee(
     if frame.scratch.len() < crate::compile::SCRATCH_WORDS {
         frame.scratch.resize(crate::compile::SCRATCH_WORDS, 0);
     }
-    // A frame is reused across callees, so re-point its metadata slot at
-    // whichever instance this call targets.
+    // A frame is reused across callees, so re-point its metadata slots at
+    // whichever instance this call targets and at this store's termination
+    // flag (the compiled loop header's probe reads it).
     frame.scratch[crate::compile::ENTRIES_SLOT] = store_ref.instances[own].entries.as_ptr() as u64;
+    frame.scratch[crate::compile::TERMINATION_SLOT] = store_ref.termination_flag_ptr();
     let runtime = crate::compile::CompiledRuntime {
         store: store as u64,
         instance: own as u64,
@@ -2863,6 +2885,7 @@ impl Store {
             exceptions: Vec::new(),
             objects: Vec::new(),
             suspended: Vec::new(),
+            termination: None,
             #[cfg(feature = "compile")]
             compile_off: false,
             #[cfg(feature = "compile")]
@@ -2872,6 +2895,34 @@ impl Store {
             #[cfg(feature = "compile")]
             native_frames: Vec::new(),
         }
+    }
+
+    /// A store whose running executions read `flag` at each loop back edge
+    /// (the interpreter) and each loop header (the compiled backend), so a
+    /// host that sets it from another thread stops a wasm loop. `Agent::new`
+    /// attaches the agent's own termination request this way.
+    pub fn with_termination(flag: Arc<AtomicBool>) -> Self {
+        Self {
+            termination: Some(flag),
+            ..Self::new()
+        }
+    }
+
+    /// The address the compiled backend's termination probe reads: the
+    /// attached flag, or [`TERMINATION_NEVER`] when the store has none.
+    pub fn termination_flag_ptr(&self) -> u64 {
+        match &self.termination {
+            Some(flag) => Arc::as_ptr(flag) as usize as u64,
+            None => &TERMINATION_NEVER as *const AtomicBool as usize as u64,
+        }
+    }
+
+    /// Whether a termination request is outstanding. Read at
+    /// [`Engine::branch_to`], the interpreter's control-transfer choke point.
+    fn termination_requested(&self) -> bool {
+        self.termination
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     /// Park a non-trap error for the running compiled call to drain.
@@ -3881,8 +3932,10 @@ impl Store {
             // 7-11).
             // The body's direct-call table rides the scratch metadata slot.
             let entries_ptr = self.instances[instance].entries.as_ptr() as u64;
+            let termination_ptr = self.termination_flag_ptr();
             let mut scratch = vec![0u64; crate::compile::SCRATCH_WORDS];
             scratch[crate::compile::ENTRIES_SLOT] = entries_ptr;
+            scratch[crate::compile::TERMINATION_SLOT] = termination_ptr;
             let runtime = crate::compile::CompiledRuntime {
                 store: self as *mut Store as u64,
                 instance: instance as u64,
@@ -5973,6 +6026,9 @@ impl<'a> Engine<'a> {
     /// Branch to `label` in the top frame. Returns `true` when the target is
     /// the function label (i.e. the function must return).
     fn branch_to(&mut self, label: usize) -> Result<bool, ExecFail> {
+        if self.store.termination_requested() {
+            return Err(ExecFail::Terminated);
+        }
         let frame_index = self.frames.len() - 1;
         let (pos, is_loop, arity, height, open, is_func) = {
             let frame = &self.frames[frame_index];

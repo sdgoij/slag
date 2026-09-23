@@ -3216,6 +3216,7 @@ fn run_failure(agent: &mut Agent, fail: wasm::ExecFail) -> Result<JsError, JsErr
             let value = exception_object(agent, cell, args)?;
             Ok(JsError::new(ErrorKind::TypeError, "wasm exception".into()).with_value(value))
         }
+        wasm::ExecFail::Terminated => Ok(crate::agent::termination_error()),
         other => Ok(JsError::new(
             ErrorKind::TypeError,
             format!("wasm execution failed: {other:?}"),
@@ -3630,6 +3631,56 @@ mod tests {
             literal.push_str(&byte.to_string());
         }
         literal
+    }
+
+    /// Encode `.wat` module text to wasm bytes through the same in-process
+    /// encoder the JS-API tests use, for the paths that want an engine
+    /// [`wasm::Module`] rather than a JS byte literal.
+    fn wat_module(source: &str) -> wasm::Module {
+        let buffer = wast::parser::ParseBuffer::new(source).expect("wat parse buffer");
+        let mut module: wast::Wat = wast::parser::parse(&buffer).expect("wat parse");
+        let bytes = module.encode().expect("wat encode");
+        wasm::decode(&bytes).expect("module decodes")
+    }
+
+    /// The termination request reaches the *agent's own* wasm store. The
+    /// engine-level tests prove the check points; this proves `Agent::new`
+    /// wires the request into the store a host's JS actually runs on. The
+    /// store is driven directly, with no JS call in between, so nothing but
+    /// the wasm engine's own check can stop the loop.
+    #[test]
+    fn a_termination_request_reaches_the_agents_wasm_store() {
+        let agent = crate::agent::Agent::new();
+        let flag = agent.termination_flag();
+        // A finite loop, so a store that ignored the request runs it out and
+        // fails the assertion instead of hanging the suite.
+        let module = wat_module(
+            "(module (func (export \"spin\") (local $i i32) \
+             (loop $l local.get $i i32.const 1 i32.add local.set $i \
+             local.get $i i32.const 1000000 i32.lt_s br_if $l)))",
+        );
+        let instance = agent
+            .wasm_store
+            .borrow_mut()
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = agent.wasm_store.borrow_mut().invoke(instance, 0, &[]);
+        assert!(
+            matches!(outcome, Err(wasm::ExecFail::Terminated)),
+            "the agent's wasm store ignored the request: {outcome:?}"
+        );
+    }
+
+    /// A wasm termination failure surfaces as the engine's one termination
+    /// error — the same `Error("execution terminated")` a JS termination
+    /// throws — rather than as a `WebAssembly.RuntimeError` the host would
+    /// have to special-case.
+    #[test]
+    fn a_wasm_termination_failure_is_the_termination_error() {
+        let mut agent = crate::agent::Agent::new();
+        let error = super::run_failure(&mut agent, wasm::ExecFail::Terminated).expect("a JS error");
+        assert_eq!(error.to_string(), "Error: execution terminated");
     }
 
     #[test]

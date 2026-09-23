@@ -1007,6 +1007,7 @@ impl From<ExecFail> for ActOutcome {
         match fail {
             ExecFail::Trap(trap) => ActOutcome::Trap(trap),
             ExecFail::Exception(_) => ActOutcome::Exception,
+            ExecFail::Terminated => ActOutcome::Unsupported("terminated by the host"),
             ExecFail::Unsupported(reason) => ActOutcome::Unsupported(reason),
         }
     }

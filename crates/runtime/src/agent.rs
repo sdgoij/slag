@@ -1072,9 +1072,12 @@ impl Agent {
 
     pub fn new() -> Self {
         crate::function::ensure_ecma_hook();
+        // Built before the struct so the wasm store can share the very flag a
+        // host's `IsolateHandle` sets: one request, two engines reading it.
+        let termination = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
             execution_context_stack: Vec::new(),
-            termination: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            termination: std::sync::Arc::clone(&termination),
             global_cells: [None; crate::ir::GLOBAL_CELLS],
             global_value_cells: Box::new(std::array::from_fn(|_| {
                 crate::jit::GlobalValueCell::empty()
@@ -1218,7 +1221,9 @@ impl Agent {
             #[cfg(feature = "wasm")]
             wasm_modules: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
-            wasm_store: std::cell::RefCell::new(wasm::Store::new()),
+            wasm_store: std::cell::RefCell::new(wasm::Store::with_termination(
+                std::sync::Arc::clone(&termination),
+            )),
             #[cfg(feature = "wasm")]
             wasm_exports: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]

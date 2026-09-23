@@ -140,6 +140,10 @@ pub const TRAP_UNKNOWN_FUNCTION: i32 = 20;
 /// `run_compiled` drains it so the caller sees the identical error the
 /// interpreter would have produced.
 pub const TRAP_PENDING_ERROR: i32 = 21;
+/// The compiled loop header's termination probe saw the flag set. Unlike the
+/// other codes this is not a [`Trap`]: `run_compiled` maps it to
+/// [`ExecFail::Terminated`] before `trap_of` is reached.
+pub const TRAP_TERMINATED: i32 = 22;
 
 /// Caller-owned scratch slots (u64s) for call argument/result marshaling
 /// (entry ABI param 11). A compiled call site spills `params` into slots
@@ -155,9 +159,16 @@ pub const SCRATCH_SLOTS: usize = 256;
 /// direct-callable makes no call at all, so it never reads it.
 pub const ENTRIES_SLOT: usize = SCRATCH_SLOTS;
 
+/// The scratch region's termination-probe slot: the address of the running
+/// store's termination flag, written beside [`ENTRIES_SLOT`] by whoever owns
+/// the scratch region. Every compiled loop header loads one byte from it and
+/// returns [`TRAP_TERMINATED`] when it is set, so a host can stop a compiled
+/// loop from another thread without a per-iteration helper call.
+pub const TERMINATION_SLOT: usize = SCRATCH_SLOTS + 1;
+
 /// Words to allocate for a scratch region: the argument/result area plus the
-/// metadata slot.
-pub const SCRATCH_WORDS: usize = SCRATCH_SLOTS + 1;
+/// two metadata slots.
+pub const SCRATCH_WORDS: usize = SCRATCH_SLOTS + 2;
 
 /// Map a [`Trap`] back to the interpreter's code used to report it from a
 /// compiled entry.
@@ -410,6 +421,9 @@ pub fn run_compiled(
             return Err(error);
         }
         return Err(ExecFail::Unsupported("pending error in a compiled call"));
+    }
+    if code == TRAP_TERMINATED {
+        return Err(ExecFail::Terminated);
     }
     if code != TRAP_NONE {
         return Err(ExecFail::Trap(trap_of(code)));
@@ -2813,8 +2827,12 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().jump(header, &payload);
         self.builder.switch_to_block(header);
         let header_params = self.builder.block_params(header).to_vec();
+        // The termination probe sits at the header, which every iteration
+        // (the entry edge and each back-edge) passes through.
+        let body = self.emit_termination_probe(params, &header_params);
+        let body_params = self.builder.block_params(body).to_vec();
         self.stack.truncate(height);
-        self.stack.extend(header_params);
+        self.stack.extend(body_params);
         // The header is NOT sealed here: every back-edge (`br` to this loop
         // label) is a new predecessor, which may only target an unsealed
         // block. The header is sealed when the loop's `end` closes it, once
@@ -2833,6 +2851,47 @@ impl<'a> Lowerer<'a> {
             after_used: false,
             catches: Vec::new(),
         });
+    }
+
+    /// Emit the compiled termination probe at the current block (a loop
+    /// header) and return the block the loop body continues in. Every
+    /// iteration reaches it, so one byte load of the flag address the caller
+    /// keeps in the scratch region's [`TERMINATION_SLOT`] is the compiled
+    /// back-edge check: a set byte returns [`TRAP_TERMINATED`], which
+    /// `run_compiled` maps to [`ExecFail::Terminated`]. `header_params` are
+    /// the values flowing into `params` (the header's block parameters),
+    /// forwarded to the continuation so the loop keeps its shape.
+    fn emit_termination_probe(&mut self, params: &[ValType], header_params: &[ClifValue]) -> Block {
+        let slot = self
+            .builder
+            .ins()
+            .iadd_imm_s(self.scratch, 8 * TERMINATION_SLOT as i64);
+        let flag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), slot, Offset32::new(0));
+        let byte = self
+            .builder
+            .ins()
+            .load(types::I8, MemFlagsData::new(), flag, Offset32::new(0));
+        let zero = self.iconst(types::I8, 0);
+        let terminating = self.builder.ins().icmp(IntCC::NotEqual, byte, zero);
+        let exit = self.builder.create_block();
+        let body = self.builder.create_block();
+        for ty in params {
+            self.builder.append_block_param(
+                body,
+                carrier_type(self.module, *ty).expect("carried block parameter"),
+            );
+        }
+        let args: Vec<BlockArg> = header_params.iter().map(|value| (*value).into()).collect();
+        self.builder.ins().brif(terminating, exit, &[], body, &args);
+        self.builder.switch_to_block(exit);
+        let code = self.iconst(types::I32, i64::from(TRAP_TERMINATED));
+        self.builder.ins().return_(&[code]);
+        self.builder.switch_to_block(body);
+        self.builder.seal_block(body);
+        body
     }
 
     fn open_if(&mut self, params: &[ValType], results: &[ValType]) -> Result<(), String> {
@@ -5914,6 +5973,96 @@ mod tests {
                 "paths diverge for {args:?}: compiled={via_compiled:?} interpreter={via_interpreter:?}"
             );
         }
+    }
+
+    /// A `(param $n i32) (result i32)` body with one local that counts up to
+    /// `n` through a `loop`/`br 0` back edge — the shape a termination check
+    /// has to interrupt, and a finite one, so a missing check fails the test
+    /// rather than hanging it.
+    fn counting_loop_module() -> Module {
+        module_with(
+            vec![
+                Instr::Block(BlockType::Empty),
+                Instr::Loop(BlockType::Empty),
+                Instr::LocalGet(1),
+                Instr::LocalGet(0),
+                Instr::Num(NumOp::I32GeS),
+                Instr::BrIf(1),
+                Instr::LocalGet(1),
+                Instr::I32Const(1),
+                Instr::Num(NumOp::I32Add),
+                Instr::LocalSet(1),
+                Instr::Br(0),
+                Instr::End,
+                Instr::End,
+                Instr::LocalGet(1),
+            ],
+            vec![ValType::I32],
+            vec![ValType::I32],
+            vec![ValType::I32],
+        )
+    }
+
+    fn store_with_flag(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Store {
+        Store::with_termination(std::sync::Arc::clone(flag))
+    }
+
+    /// The termination request reaches a *compiled* loop: the loop header's
+    /// probe reads the flag the store carries and returns the termination
+    /// failure instead of running the loop out.
+    #[test]
+    fn a_termination_request_stops_a_compiled_loop() {
+        let module = counting_loop_module();
+        // Without this gate an interpreted body would pass the test through
+        // the interpreter's own check: the compiled probe is the subject.
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "the termination test's body did not compile; it exercises the interpreter"
+        );
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut store = store_with_flag(&flag);
+        let instance = store
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = store.invoke(instance, 0, &[Value::I32(1000)]);
+        assert!(
+            matches!(outcome, Err(ExecFail::Terminated)),
+            "a compiled loop ignored the request: {outcome:?}"
+        );
+    }
+
+    /// The same request reaches the interpreter, whose check sits at its own
+    /// control-transfer choke point rather than a loop header.
+    #[test]
+    fn a_termination_request_stops_an_interpreted_loop() {
+        let module = counting_loop_module();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut store = store_with_flag(&flag);
+        store.set_compile(false);
+        let instance = store
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = store.invoke(instance, 0, &[Value::I32(1000)]);
+        assert!(
+            matches!(outcome, Err(ExecFail::Terminated)),
+            "an interpreted loop ignored the request: {outcome:?}"
+        );
+    }
+
+    /// With no attached request the probe reads the never-set static a store
+    /// without a channel points at, so the loop must run to completion. This
+    /// is also what keeps the probe from dereferencing a null slot.
+    #[test]
+    fn a_loop_without_a_request_runs_to_completion() {
+        let module = counting_loop_module();
+        let mut store = Store::new();
+        let instance = store
+            .instantiate(&module, &mut |_, _| None)
+            .expect("module instantiates");
+        let outcome = store.invoke(instance, 0, &[Value::I32(1000)]);
+        assert_eq!(outcome.ok(), Some(vec![Value::I32(1000)]));
     }
 
     fn i32_pairs() -> Vec<Vec<Value>> {
