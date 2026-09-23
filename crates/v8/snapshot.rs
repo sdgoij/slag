@@ -457,13 +457,19 @@ fn addresses(references: &[crate::ExternalReference]) -> Vec<*mut std::ffi::c_vo
 ///
 /// What goes in is what the *bridge* installs and the host cannot know about: the
 /// console methods, which are one callback under many names
-/// ([`console_callback`](crate::context::console_callback)), built for every
-/// context this bridge makes — including the ones a snapshot is taken of, whose
-/// global object the walk reaches.
+/// ([`console_callback`](crate::context::console_callback)), and the
+/// continuation-preserved embedder data accessors
+/// ([`get_continuation_data_callback`](crate::context::get_continuation_data_callback)),
+/// all built for every context this bridge makes — including the ones a snapshot
+/// is taken of, whose global object the walk reaches.
 fn engine_table(references: &[crate::ExternalReference]) -> Vec<*mut std::ffi::c_void> {
-    let console = crate::context::console_callback() as *mut std::ffi::c_void;
-    let mut table = Vec::with_capacity(references.len() + 1);
-    table.push(console);
+    let bridge = [
+        crate::context::console_callback(),
+        crate::context::get_continuation_data_callback(),
+        crate::context::set_continuation_data_callback(),
+    ];
+    let mut table = Vec::with_capacity(references.len() + bridge.len());
+    table.extend(bridge.map(|callback| callback as *mut std::ffi::c_void));
     table.extend_from_slice(&addresses(references));
     table
 }
@@ -1145,6 +1151,47 @@ mod tests {
                  return restored.method.call(c); })()",
             ),
             5.0
+        );
+    }
+
+    /// The continuation-preserved embedder data accessors are the bridge's own
+    /// callbacks too, so a blob of one comes back a function rather than a
+    /// pointer the host's table does not have — and it reads the slot of the
+    /// isolate it was restored **into**, which no blob carries.
+    #[test]
+    fn the_bridges_continuation_data_accessors_round_trip_through_the_blob() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let extras = context.get_extras_binding_object(scope);
+            let key = crate::String::new(scope, "getContinuationPreservedEmbedderData").unwrap();
+            let getter = extras.get(scope, key.into()).expect("the accessor");
+            scope.add_context_data(context, getter);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let getter = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the accessor");
+        crate::test_support::bind(scope, "restored_getter", getter);
+
+        // The restored isolate's own slot, not the writing isolate's: that is
+        // per-isolate state, and no blob carries it.
+        let value = crate::test_support::eval(scope, "'the restored isolate'");
+        scope.set_continuation_preserved_embedder_data(value);
+        assert_eq!(
+            crate::test_support::eval(scope, "restored_getter()").to_rust_string_lossy(scope),
+            "the restored isolate"
         );
     }
 

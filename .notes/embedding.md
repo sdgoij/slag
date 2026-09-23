@@ -3451,6 +3451,89 @@ unchanged; the eight wasm core suites 64,594 checks / 0 fail / 0 pending and
 `wasmtest jsapi` 1,001 / 0 fail, unchanged. The sweeps were re-run rather than
 argued about because `runtime`'s snapshot module is linked by every runner.
 
+**The realm's rejection path was one bridge omission — found by probe, not by
+reading.** The three failures whose text was `undefined is not a function` were
+not three mechanisms. A probe at the engine's five `{} is not a function` sites
+tagged the message, and the tag came back from `Vm::fast_call_core`; a second
+probe printing a Rust backtrace there named the caller chain exactly:
+`JsRuntime::poll_event_loop_inner` (`deno/libs/core/runtime/jsruntime.rs:2512`) →
+`v8::Function::call` → deno's `__handleRejections` (`01_core.js:476`) →
+`getAsyncContext()`. And `01_core.js:993-996` is
+`const getAsyncContext = getContinuationPreservedEmbedderData`, destructured from
+`op_get_extras_binding_object()` at load (`:117-120`). Our extras binding object
+carried `console` alone, so that `const` was `undefined` and **every** rejection
+deno dispatches threw before its reason could be reported. §9's bullet had
+recorded exactly that omission as deliberate, on the grounds that "nothing in the
+frontier reads them"; it now carries the correction, because that verdict has a
+shelf life.
+
+*The mechanism — bridge-only, over a slot that already existed.* The extras
+binding object gains `getContinuationPreservedEmbedderData` and
+`setContinuationPreservedEmbedderData` (`crates/v8/context.rs`), with the arities
+V8's have (0 and 1), over `IsolateInner::continuation_data` — the **same** slot
+`HandleScope::set_continuation_preserved_embedder_data` writes, so a host that
+restores an async context from Rust and reads it back from JavaScript sees one
+value. No engine change: the infrastructure was there, only unexposed.
+
+*The regression the measurement caught, and the trap it names.* The first
+attempt broke every snapshot-creating deno test — `test_snapshot_creator`,
+`will_snapshot*`, `test_from_snapshot`, 13 failures where 6 had been — because a
+function the bridge installs itself is a host callback the engine cannot
+identify, and `create_blob` refused it ("the engine cannot carry a host
+pointer"). The console had already solved that by putting its own callback in
+`crates/v8/snapshot.rs`'s `engine_table`, which is why the fix is that table
+carrying all three. The rule it makes explicit: **any function this bridge
+installs on every realm must be in `engine_table`, or a snapshot of a realm that
+has one refuses.**
+
+*The measurement — the count does not move, and that is the result.* deno's
+release snapshot suite stays **12 passed / 6 failed**, and all three failures
+this part was named for changed text: `import_meta_snapshot` and
+`dynamic_imports_snapshot` now report the bare `Error` their own `throw Error()`
+makes (the module body's throw, surfaced at last), and
+`es_snapshot_without_runtime_module_loader` reports `Error` where it reported
+`undefined is not a function`. So the omission is closed and verified — the
+rejection's reason is no longer lost — while each of the three still needs a
+mechanism of its own, which is what the sharper text now says. `es_snapshot`
+(request offsets), `jsrealm::es_snapshot` (`unable to convert`) and
+`lazy_loaded_esm` (`"op_print" is not defined`) are unchanged.
+
+*What the sharper errors name next.* `import_meta_snapshot`'s module body is
+`if (import.meta.url != 'file:///main_with_code.js') throw Error();`, and the
+engine builds `import.meta` as an **empty object** (`module::import_meta`,
+`crates/runtime/src/module.rs:3368`) — `url` is `undefined`, so the test's own
+throw fires. V8 fills that object through
+`Isolate::SetHostInitializeImportMetaObjectCallback`, which deno sets
+(`deno/libs/core/runtime/setup.rs:288-295`) and this bridge accepts and never
+runs (`crates/v8/isolate.rs:1193`); the dynamic-import callback beside it
+(`:1201`) is accepted and never run for the same stated reason, which is what
+`es_snapshot_without_runtime_module_loader` now shows — deno's
+`validate_ext_module_import` never sees the request. Those two seams are the
+next parts, and they are the engine's `host_initialize_import_meta_object_callback`
+and `host_import_module_dynamically_callback` rather than this format's.
+
+*Tests — three, each mutated.*
+`the_extras_binding_object_carries_the_continuation_data_functions` reads both
+names off the object the way `01_core.js` does, asserts the getter answers
+*undefined* before anything stores one, and round-trips a value through both.
+`the_continuation_data_the_scope_writes_is_what_javascript_reads` asserts the
+slot is shared in **both** directions, which is the whole point of the functions
+being here at all.
+`the_bridges_continuation_data_accessors_round_trip_through_the_blob` pins the
+engine-table trap: a blob of the accessor comes back a function, and it reads the
+**restored** isolate's slot rather than the writing one's. Three mutations, each
+caught by a different assertion: not installing them (both context tests), the
+getter answering `undefined` instead of the slot (both), and the setter not
+storing (the round-trip and the JavaScript-to-Rust direction).
+
+*Gates.* `cargo test --locked --workspace` green (v8 `--lib` **238**, was 235);
+`cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean. No sweep was re-run, and that is measured
+rather than assumed: `cargo tree -p test262 -i v8` and `cargo tree -p wasmtest -i
+v8` both fail to match a package, so neither runner links this crate and the
+corpus cannot see a bridge-only change. `runtime` is untouched this time, which
+is why the four sweeps above are not repeated here.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3482,8 +3565,16 @@ if that proves possible.
   `console` — the one property `deno_core` reads — and V8's object also carries
   `isTraceCategoryEnabled`, `trace`, and (when the build enables them)
   `getContinuationPreservedEmbedderData`/`setContinuationPreservedEmbedderData`.
-  None of those is here, because nothing in the frontier reads them and an inert
-  function that looks like a working feature is worse than an absent one. The
+  `isTraceCategoryEnabled` and `trace` are not here, because nothing in the
+  frontier reads them and an inert function that looks like a working feature is
+  worse than an absent one. **The two continuation-preserved accessors were left
+  out on that same "nothing reads them" verdict and it was wrong** —
+  `01_core.js` reads both at load and calls the getter on *every* rejection it
+  dispatches, so a realm without them lost the rejection's reason to a
+  `undefined is not a function`; they landed when the probe named it (§7's
+  record), over the isolate slot the scope API already kept. The lesson the
+  bullet now carries: "nothing in the frontier reads it" is a claim with a shelf
+  life, so a reader that goes looking must re-measure rather than trust it. The
   console itself carries V8's method set but not its `Symbol.toStringTag`, for the
   reason the `get_constructor_name` bullet records: a symbol-keyed define means
   reaching past the engine's string-keyed object API. And V8 builds those methods

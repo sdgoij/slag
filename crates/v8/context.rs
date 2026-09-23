@@ -6,7 +6,7 @@ use runtime::api;
 
 use crate::MapFnTo;
 use crate::String as JsString;
-use crate::data::{Context, Function, Object, ObjectTemplate};
+use crate::data::{Context, Function, Object, ObjectTemplate, Value};
 use crate::function::{ConstructorBehavior, FunctionCallbackArguments, ReturnValue};
 use crate::handle::{Local, LocalHandle, Payload};
 use crate::scope::PinScope;
@@ -14,6 +14,20 @@ use crate::scope::PinScope;
 /// The property V8 installs the console under, on the extras binding object and
 /// on the global object.
 const CONSOLE_PROPERTY: &str = "console";
+
+/// The properties V8 installs the continuation-preserved embedder data under,
+/// on the extras binding object.
+///
+/// `deno_core`'s `01_core.js` destructures both names out of
+/// `op_get_extras_binding_object()` at load (`:117-120`), binds them to its
+/// async-context accessors (`:993-996`), and calls the getter on **every**
+/// rejection it dispatches (`__handleRejections`, `:476-496`, on the path
+/// `poll_event_loop_inner` reaches at `jsruntime.rs:2512`). A realm without them
+/// therefore throws `undefined is not a function` the first time a rejection is
+/// dispatched and the rejection's own reason is lost — measured, not inferred:
+/// see `.notes/embedding.md` §7's record of the probe.
+const CONTINUATION_DATA_GETTER: &str = "getContinuationPreservedEmbedderData";
+const CONTINUATION_DATA_SETTER: &str = "setContinuationPreservedEmbedderData";
 
 /// The methods V8 installs on the console it hands out
 /// (`Genesis::InitializeConsole`, `v8/src/init/bootstrapper.cc:5617`), in the
@@ -90,7 +104,7 @@ impl Context {
         // V8 fills a new context's extras binding object, and its global
         // object, as it creates the context (`Genesis::InitializeConsole`), so
         // a host finds the console without asking for either.
-        install_console(scope, handle);
+        install_extras(scope, handle);
         handle
     }
 
@@ -127,8 +141,9 @@ impl Context {
 }
 
 /// Fill a new context as V8 fills it: the extras binding object carries a
-/// console, and the global object names the same one.
-fn install_console<'s>(scope: &PinScope<'s, '_, ()>, context: Local<'s, Context>) {
+/// console and the continuation-preserved embedder data functions, and the
+/// global object names the same one of the console.
+fn install_extras<'s>(scope: &PinScope<'s, '_, ()>, context: Local<'s, Context>) {
     let extras = context.get_extras_binding_object(scope);
     let console = console_object(scope).unwrap_or_else(|| {
         // The same invariant the extras binding object's own creation states: a
@@ -152,6 +167,89 @@ fn install_console<'s>(scope: &PinScope<'s, '_, ()>, context: Local<'s, Context>
             panic!("bridge: defining the console failed: {error}");
         }
     }
+    // The two functions are the extras object's alone: `deno_core` reads them
+    // from there (`01_core.js:117-120`) and V8's global object does not carry
+    // them.
+    if install_continuation_data_functions(scope, extras).is_none() {
+        panic!("bridge: installing the continuation-preserved embedder data functions failed");
+    }
+}
+
+/// Put `getContinuationPreservedEmbedderData` and
+/// `setContinuationPreservedEmbedderData` on a context's extras binding object,
+/// over the isolate's continuation slot — the same one
+/// [`crate::HandleScope::set_continuation_preserved_embedder_data`] writes, so a
+/// value stored from Rust and one stored from JavaScript are one value.
+///
+/// Each is named after the property and takes the arity V8's does (0 and 1);
+/// nothing in the frontier reads either attribute, so the shape is the console
+/// property's rather than a claim about V8's own attributes.
+fn install_continuation_data_functions<'s>(
+    scope: &PinScope<'s, '_, ()>,
+    extras: Local<'s, Object>,
+) -> Option<()> {
+    let realm = crate::realm_of(scope);
+    let functions = [
+        (
+            CONTINUATION_DATA_GETTER,
+            get_continuation_data_callback(),
+            0,
+        ),
+        (
+            CONTINUATION_DATA_SETTER,
+            set_continuation_data_callback(),
+            1,
+        ),
+    ];
+    for (name, callback, length) in functions {
+        let template = Function::builder_raw(callback)
+            .length(length)
+            .constructor_behavior(ConstructorBehavior::Throw)
+            .into_template(scope);
+        template.set_class_name(JsString::new(scope, name)?);
+        let function = template.get_function(scope)?;
+        match api::Object::define(
+            &realm,
+            extras.engine(),
+            name,
+            function.engine(),
+            true,
+            false,
+            true,
+        ) {
+            Ok(()) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+
+/// `getContinuationPreservedEmbedderData()`: the isolate's value from
+/// [`crate::HandleScope::set_continuation_preserved_embedder_data`], or
+/// *undefined* when nothing stored one.
+fn get_continuation_data(
+    scope: &mut PinScope<'_, '_>,
+    _args: FunctionCallbackArguments,
+    rv: ReturnValue,
+) {
+    let value: Local<'_, Value> =
+        Local::from_payload(scope.isolate_ptr().continuation_data_payload());
+    rv.set(value);
+}
+
+/// `setContinuationPreservedEmbedderData(value)`, the setter of the same slot.
+///
+/// No argument stores *undefined*, which is what V8's own does and what
+/// `01_core.js` relies on: its `setAsyncContext(undefined)` is how it clears the
+/// async context after a rejection.
+fn set_continuation_data(
+    scope: &mut PinScope<'_, '_>,
+    args: FunctionCallbackArguments,
+    rv: ReturnValue,
+) {
+    let mut isolate = scope.isolate_ptr();
+    isolate.set_continuation_data(args.get(0));
+    rv.set_undefined();
 }
 
 /// The console V8 puts on a context's extras binding object
@@ -217,6 +315,23 @@ fn console_method(
 /// only in the property name they are defined under.
 pub(crate) fn console_callback() -> crate::function::FunctionCallback {
     console_method.map_fn_to()
+}
+
+/// The callback `getContinuationPreservedEmbedderData` is built from, as the
+/// address a snapshot's external-reference table names.
+///
+/// The same reason [`console_callback`] exists: the bridge installs it on every
+/// context it makes, so the host that hands over a blob never had a chance to
+/// register it, and the bridge puts it in the table itself (see
+/// [`engine_table`](crate::snapshot::engine_table)).
+pub(crate) fn get_continuation_data_callback() -> crate::function::FunctionCallback {
+    get_continuation_data.map_fn_to()
+}
+
+/// The callback `setContinuationPreservedEmbedderData` is built from, as the
+/// address a snapshot's external-reference table names.
+pub(crate) fn set_continuation_data_callback() -> crate::function::FunctionCallback {
+    set_continuation_data.map_fn_to()
 }
 
 impl<'s> LocalHandle<'s, Context> {
@@ -314,7 +429,7 @@ mod tests {
     use std::ffi::c_void;
 
     use super::CONSOLE_METHODS;
-    use crate::data::Object;
+    use crate::data::{Object, Value};
     use crate::handle::Local;
     use crate::scope::PinScope;
     use crate::test_support::in_context;
@@ -400,6 +515,83 @@ mod tests {
             let on_global = "Object.getOwnPropertyDescriptor(globalThis, 'console')";
             assert_eq!(descriptor_field(scope, on_global, "enumerable"), "false");
             assert_eq!(descriptor_field(scope, on_global, "writable"), "true");
+        });
+    }
+
+    /// The extras binding object carries the continuation-preserved embedder
+    /// data functions.
+    ///
+    /// `deno_core`'s `01_core.js` destructures both names at load and binds its
+    /// async-context accessors to them, then calls the getter on every rejection
+    /// it dispatches — so a realm without them throws `undefined is not a
+    /// function` and the rejection's own reason is lost.
+    #[test]
+    fn the_extras_binding_object_carries_the_continuation_data_functions() {
+        in_context!(scope, {
+            let extras = scope.get_current_context().get_extras_binding_object(scope);
+            crate::test_support::bind(scope, "extras", Local::<Value>::from(extras));
+            assert_eq!(
+                evaluated(scope, "typeof extras.getContinuationPreservedEmbedderData"),
+                "function"
+            );
+            assert_eq!(
+                evaluated(scope, "typeof extras.setContinuationPreservedEmbedderData"),
+                "function"
+            );
+            // Nothing stored yet answers *undefined* rather than throwing, which
+            // is the state `01_core.js` reads before anything stores one.
+            assert_eq!(
+                evaluated(
+                    scope,
+                    "String(extras.getContinuationPreservedEmbedderData())"
+                ),
+                "undefined"
+            );
+            // A round trip through both functions, and the setter's own answer.
+            assert_eq!(
+                evaluated(
+                    scope,
+                    "extras.setContinuationPreservedEmbedderData('carried'); \
+                     extras.getContinuationPreservedEmbedderData()"
+                ),
+                "carried"
+            );
+            assert_eq!(
+                evaluated(
+                    scope,
+                    "String(extras.setContinuationPreservedEmbedderData('again'))"
+                ),
+                "undefined"
+            );
+        });
+    }
+
+    /// The slot the JavaScript functions read is the one the scope API writes.
+    ///
+    /// That is the point of them being here rather than private state: a host
+    /// restores an async context from Rust and reads it back from JavaScript, so
+    /// the two routes have to be one value.
+    #[test]
+    fn the_continuation_data_the_scope_writes_is_what_javascript_reads() {
+        in_context!(scope, {
+            let extras = scope.get_current_context().get_extras_binding_object(scope);
+            crate::test_support::bind(scope, "extras", Local::<Value>::from(extras));
+
+            let value = crate::test_support::eval(scope, "'from-rust'");
+            scope.set_continuation_preserved_embedder_data(value);
+            assert_eq!(
+                evaluated(scope, "extras.getContinuationPreservedEmbedderData()"),
+                "from-rust"
+            );
+
+            // And back the other way.
+            evaluated(
+                scope,
+                "extras.setContinuationPreservedEmbedderData('from-js')",
+            );
+            let back = scope.get_continuation_preserved_embedder_data();
+            crate::test_support::bind(scope, "cped_back", back);
+            assert_eq!(evaluated(scope, "cped_back"), "from-js");
         });
     }
 
