@@ -1238,7 +1238,7 @@ pub fn get_super_constructor(agent: &Agent) -> Result<Value, JsError> {
             "super() is only valid inside a derived constructor".into(),
         ));
     };
-    let ValueKind::Function(function) = function_env.function_object.kind() else {
+    let ValueKind::Function(function) = function_env.function_object.get().kind() else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "super() is only valid inside a derived constructor".into(),
@@ -1283,7 +1283,7 @@ pub fn get_super_base(agent: &Agent) -> Result<Value, JsError> {
             "super is only valid inside methods".into(),
         ));
     };
-    let ValueKind::Function(function) = function_env.function_object.kind() else {
+    let ValueKind::Function(function) = function_env.function_object.get().kind() else {
         return Ok(Value::Undefined);
     };
     let Some(home) = agent

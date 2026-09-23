@@ -67,8 +67,11 @@
 //! evaluates: its `[[SourceText]]` is the expression it was written as
 //! (`(a) => a + 1`), which is not a form `parse_function` can read, so the record
 //! is wrapped in a parenthesis, parsed as a script, and **instantiated** in the
-//! environment chain it closed over — the route a method record takes. An arrow
-//! exists to capture its `this` and its free names, so evaluating it in the
+//! environment chain it closed over — the route a method record takes. A body
+//! that reads `super` or `new.target` cannot be parsed that way — both are
+//! refused outside a method — so it is retried inside one
+//! (`({ m() { return (<source>); } })`) and taken back out of that parse. An
+//! arrow exists to capture its `this` and its free names, so evaluating it in the
 //! reading realm would hand back an arrow over that realm's global; nothing about
 //! a function record's environment is special to an arrow here. Its kind survives
 //! — an async arrow's `[[Prototype]]` comes from the instantiation and from the
@@ -79,9 +82,8 @@
 //! global — refuses by kind, and an arrow over one is written with `NO_REF`
 //! instead, which the reader answers with the reading realm's global. That is
 //! what every arrow got before this route existed, and it stays the arrow's
-//! limit. One thing a *carried* chain does not carry either is a function
-//! environment's `[[FunctionObject]]` and its `new.target`, so an arrow whose
-//! body reads `super` or `new.target` resolves neither.
+//! limit. A body that *calls* `super()` is refused as well: a SuperCall is legal
+//! only in a derived-class constructor, which is not the context a restore has.
 //!
 //! A host callback is the one kind the engine cannot rebuild alone: its body is
 //! the host's Rust closure, so the record carries what only the host has — the
@@ -96,11 +98,13 @@
 //! closed over, so those records travel with it. `REC_ENV` carries a
 //! **declarative** or **function** record — the outer link and the bindings —
 //! and, for a function record, the `this` value and this-binding status that
-//! decide whether the record has a `this` binding. What does *not* travel is a
-//! record's `[[FunctionObject]]` and its new-target: only an arrow reads those
-//! through a chain, and an arrow is rebuilt by **evaluating** its source in the
-//! reading realm rather than instantiated in a carried one, so nothing a
-//! restored chain is consulted for would read them. The record carries no
+//! decide whether the record has a `this` binding, beside the `[[FunctionObject]]`
+//! and `[[NewTarget]]` an arrow reads `super` and `new.target` through: the
+//! function is what holds the home object a `super` lookup walks. None of the
+//! three can be filled where the record's shell is made — the function that owns
+//! the record is usually built *after* the closure that closed over it, which is
+//! the `F -> E -> F` cycle `settle_envs` breaks — so the shell starts empty and
+//! all three are filled once that function exists. The record carries no
 //! declaration-time *behaviour* (no Annex B hoist list, no disposable-resource
 //! stack, no catch-parameter mark): those are read while a declaration is
 //! instantiated, which a restore does not do — it only puts the bindings back.
@@ -486,7 +490,9 @@ enum Record {
     /// An environment record a closure closed over: which of the two kinds it
     /// is, whether a capture read skips it, its outer link, its bindings, and —
     /// for a function record — the `this` value and this-binding status that
-    /// decide whether the record has a `this` binding at all.
+    /// decide whether the record has a `this` binding at all, beside the
+    /// `[[FunctionObject]]` and `[[NewTarget]]` that `super` and `new.target`
+    /// resolve through.
     Env {
         kind: u8,
         transparent: bool,
@@ -494,6 +500,8 @@ enum Record {
         bindings: Vec<CarriedBinding>,
         this_value: u32,
         this_status: u8,
+        function_object: u32,
+        new_target: u32,
     },
     /// An ArrayBuffer: its geometry, its own flags, the bytes it holds, and its
     /// object part.
@@ -1426,6 +1434,27 @@ fn visit_env(
             objects,
             serials,
         )?;
+        // The function this invocation runs and the new-target it was entered
+        // with: what `super` and `new.target` resolve through, so an arrow over
+        // this chain reaches them the same way it reaches a binding.
+        visit(
+            agent,
+            realm,
+            externals,
+            host,
+            function.function_object.get(),
+            objects,
+            serials,
+        )?;
+        visit(
+            agent,
+            realm,
+            externals,
+            host,
+            function.new_target.get(),
+            objects,
+            serials,
+        )?;
     }
     Ok(serial)
 }
@@ -1895,6 +1924,25 @@ fn arrow_of(expression: &syntax::ast::Expr) -> Option<ArrowParts<'_>> {
         syntax::ast::ExprKind::Paren(inner) => arrow_of(inner),
         _ => None,
     }
+}
+
+/// The arrow a parsed `({ m() { return (<arrow source>); } })` holds.
+///
+/// `super` and `new.target` are refused outside a method whatever the runtime
+/// would do with them, so a body that reads either cannot be parsed as a
+/// standalone expression — the wrapper is what gives it the context, and this is
+/// the way back out: through the literal's one method and its one `return`.
+fn arrow_in_a_method(program: &syntax::ast::Program) -> Option<ArrowParts<'_>> {
+    let Some(MethodDefinition::Method(function)) = method_definition(program) else {
+        return None;
+    };
+    let [statement] = function.body.stmts.as_slice() else {
+        return None;
+    };
+    let syntax::ast::StmtKind::Return(Some(expression)) = &statement.kind else {
+        return None;
+    };
+    arrow_of(expression)
 }
 
 /// The class a parsed `(<class source>)` names, if that is what it is: the one
@@ -2478,6 +2526,11 @@ fn write_env(
             ThisBindingStatus::Uninitialized => THIS_UNINITIALIZED,
             ThisBindingStatus::Initialized => THIS_INITIALIZED,
         });
+        write_u32(
+            body,
+            serial_in(realm, serials, function.function_object.get()),
+        );
+        write_u32(body, serial_in(realm, serials, function.new_target.get()));
     }
     Ok(())
 }
@@ -3096,6 +3149,17 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             } else {
                 (NO_REF, THIS_LEXICAL)
             };
+            // The two fields an arrow reads `super` and `new.target` through. A
+            // record whose value the walk could not carry writes `NO_REF` there,
+            // which is the absent field it was before this travelled at all.
+            let (function_object, new_target) = if kind == ENV_FUNCTION {
+                (
+                    reader.u32().ok_or(DecodeError::Truncated)?,
+                    reader.u32().ok_or(DecodeError::Truncated)?,
+                )
+            } else {
+                (NO_REF, NO_REF)
+            };
             Ok(Record::Env {
                 kind,
                 transparent: flags & ENV_FLAG_TRANSPARENT != 0,
@@ -3103,6 +3167,8 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 bindings,
                 this_value,
                 this_status,
+                function_object,
+                new_target,
             })
         }
         REC_MODULE => {
@@ -3368,6 +3434,8 @@ impl Builder<'_> {
                 bindings,
                 this_value,
                 this_status,
+                function_object: function_serial,
+                new_target: new_target_serial,
                 ..
             }) = self.records.get(serial as usize)
             else {
@@ -3407,12 +3475,27 @@ impl Builder<'_> {
             } else {
                 (Value::Undefined, ThisBindingStatus::Lexical)
             };
+            // `[[FunctionObject]]` and `[[NewTarget]]` are filled here for the same
+            // reason `this` is: both name values that may not exist yet when the
+            // record's shell does — the function that owns this record is often
+            // materialized *after* the closure that closed over it.
+            let function_state = if *kind == ENV_FUNCTION {
+                (
+                    self.materialize(*function_serial)?,
+                    self.materialize(*new_target_serial)?,
+                )
+            } else {
+                (Value::Undefined, Value::Undefined)
+            };
             // The barriers run before the binding list is borrowed, for the same
             // reason the materialization does.
             for (_, _, value) in &carried {
                 if let Some(value) = value {
                     crux::heap::write_barrier(&*env, *value);
                 }
+            }
+            for value in [function_state.0, function_state.1] {
+                crux::heap::write_barrier(&*env, value);
             }
             let declarative = match &*env {
                 EnvRecord::Declarative(declarative) => declarative,
@@ -3442,6 +3525,8 @@ impl Builder<'_> {
             if let EnvRecord::Function(function) = &*env {
                 *function.this_value.borrow_mut() = state.0;
                 function.this_binding_status.set(state.1);
+                function.function_object.set(function_state.0);
+                function.new_target.set(function_state.1);
             }
         }
         Ok(())
@@ -3950,16 +4035,15 @@ impl Builder<'_> {
                         Handle::new(EnvRecord::Declarative(declarative))
                     }
                     ENV_FUNCTION => {
-                        // The function object and the new-target the record does
-                        // not carry stay undefined. `this` does not come from
-                        // either of them: it is carried, and `settle_envs` fills
-                        // it, which is what an arrow instantiated in this chain
-                        // reads. The two that stay absent are what an arrow's
-                        // `super` and `new.target` would resolve through, so an
-                        // arrow whose body reads one has neither — the limit the
-                        // format's arrow paragraph states. The this-binding status
-                        // is known here because the constructor uses it to decide
-                        // whether the record has a `this` binding at all.
+                        // The shell starts with the function object, the new-target
+                        // and `this` all absent, because none of the three can be
+                        // named yet: the function that owns this record is often
+                        // materialized *after* the closure that closed over it, so
+                        // the cycle `F -> E -> F` is what forbids filling them
+                        // here. `settle_envs` fills all three once that function is
+                        // in `made`. The this-binding status is known here because
+                        // the constructor uses it to decide whether the record has
+                        // a `this` binding at all.
                         let function = FunctionEnv::new(
                             outer,
                             Value::Undefined,
@@ -4168,11 +4252,30 @@ impl Builder<'_> {
         let text = String::from_utf16(source).map_err(|_| {
             DecodeError::UnrebuildableFunction("its arrow source is not valid UTF-16".into())
         })?;
-        let wrapped = format!("({text})");
-        let program = parser::parse_script(&wrapped).map_err(|error| {
-            DecodeError::UnrebuildableFunction(format!("its arrow source does not parse: {error}"))
-        })?;
-        let (is_async, params, body, span) = arrow_expression(&program).ok_or_else(|| {
+        // The plain parse goes first, so a body that reads neither `super` nor
+        // `new.target` is parsed exactly as it always was. A body that reads one
+        // is refused there — both are *syntactic* contexts a standalone
+        // expression has not got, whatever the runtime does with them — and is
+        // retried inside a method, which is where they are legal.
+        let plain = format!("({text})");
+        let in_method = format!("({{ m() {{ return ({text}); }} }})");
+        let (wrapped, program, needs_context) = match parser::parse_script(&plain) {
+            Ok(program) => (plain, program, false),
+            Err(plain_error) => match parser::parse_script(&in_method) {
+                Ok(program) => (in_method, program, true),
+                Err(method_error) => {
+                    return Err(DecodeError::UnrebuildableFunction(format!(
+                        "its arrow source does not parse: {plain_error}; not inside a method either: {method_error}"
+                    )));
+                }
+            },
+        };
+        let parts = if needs_context {
+            arrow_in_a_method(&program)
+        } else {
+            arrow_expression(&program)
+        };
+        let (is_async, params, body, span) = parts.ok_or_else(|| {
             DecodeError::UnrebuildableFunction("its source is not one arrow expression".into())
         })?;
         let realm = *self.realm;
@@ -7139,6 +7242,80 @@ mod tests {
             call_restored(&isolate, &realm, back, "").as_number(),
             Some(7.0),
             "the restored arrow's `this` is the receiver it captured"
+        );
+    }
+
+    /// An arrow's `super` belongs to the method it closed over, and what carries it
+    /// across a restore is the function environment record's `[[FunctionObject]]`:
+    /// the lookup walks that function's home object.
+    #[test]
+    fn an_arrow_resolves_the_super_of_the_method_it_closed_over() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "({ __proto__: { m() { return 'm'; } }, make() { return () => super.m(); } }).make()",
+            )
+            .expect("an arrow over a method's super")
+            .into_value();
+        let rendered = |value: Value| {
+            run_restored(
+                &isolate,
+                &realm,
+                value,
+                "(() => { try { return restored(); } catch (e) { return e.constructor.name; } })()",
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy())
+        };
+
+        // The same call before the snapshot, so the test cannot pass on a body
+        // that resolves nothing even freshly.
+        assert_eq!(
+            rendered(value),
+            Some("m".to_string()),
+            "the fresh arrow resolves `super` through the method it was written in"
+        );
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            rendered(back),
+            Some("m".to_string()),
+            "and the restored arrow resolves it through the environment the record carries"
+        );
+    }
+
+    /// The same for `new.target`, which the environment's own new-target carries.
+    #[test]
+    fn an_arrow_resolves_the_new_target_of_the_function_it_closed_over() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval("(new (function F() { return () => new.target; })())")
+            .expect("an arrow over new.target")
+            .into_value();
+        let rendered = |value: Value| {
+            run_restored(
+                &isolate,
+                &realm,
+                value,
+                "(() => { const t = restored(); return typeof t + '/' + (t ? t.name : ''); })()",
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy())
+        };
+
+        assert_eq!(
+            rendered(value),
+            Some("function/F".to_string()),
+            "the fresh arrow's `new.target` is the function it was called in"
+        );
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            rendered(back),
+            Some("function/F".to_string()),
+            "and the restored arrow's is the one the environment carries"
         );
     }
 

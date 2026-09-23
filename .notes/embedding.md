@@ -2918,9 +2918,10 @@ boot rebuilds rather than carries — which is also why every blob written befor
 behavior. A function record adds its `this` value and this-binding status. What it does **not** carry
 is `[[FunctionObject]]` and the new-target: both are plain fields of the record that can only be set
 at construction, and a function environment has to exist *before* the function that closes over it is
-recorded (see below). Nothing a carried chain is consulted for reads them anyway: only an arrow reads
-`this`, `new target` or `super` through a chain, and an arrow is rebuilt by **evaluating** its source
-in the reading realm rather than instantiated in a carried one. An object, module or global record is
+recorded (see below). **Both travel now** (§7's record for the arrow's `super` and `new.target`, §9
+item 19), so what follows held only while they did not — and so did the clause above that says
+an arrow is rebuilt by **evaluating** its source in the reading realm: an arrow is instantiated in a
+carried chain now, which is precisely why its `super` and `new.target` need the two fields. An object, module or global record is
 refused by kind, and an import binding by name: a lookup walks a record's own binding list and
 nothing else.
 
@@ -3729,11 +3730,13 @@ asking every record up to the realm's own global the same question
 arrow's restore already had, and what the write answered before a record carried a
 chain at all — so a module-scope arrow keeps its documented behaviour instead of
 newly refusing the snapshot, which is what the first attempt did and what
-`snapshot_with_additional_extensions` measured as a regression. One limit is stated
+`snapshot_with_additional_extensions` measured as a regression. One limit was stated
 rather than carried: a function environment's `[[FunctionObject]]` and its
 `new.target` are not part of an env record, so an arrow whose body reads `super` or
-`new.target` resolves neither. The reader's env arm and the format's arrow paragraph
-both say so now, and that is the arrow's named remaining gap.
+`new.target` resolves neither. **That limit is carried now, and the probe that
+lifted it found the observable was worse than this sentence says — the restore
+refused the snapshot outright rather than resolving nothing** (§7's record for the
+arrow's `super` and `new.target`; §9 item 19).
 
 *Tests — three, mutated five ways.* `an_arrow_keeps_the_scope_it_closed_over` (a
 closure binding, plus its own source text through `toString`),
@@ -3922,6 +3925,66 @@ fail, 0 crash, 0 hang** (158 skip) of 48,622 — and the wasm sweeps reproduce
 theirs: core **20,662** plus the seven proposal suites (simd 25,990, relaxed-simd
 77, bulk-memory 7,485, exceptions 105, gc 654, memory64 8,709, multi-memory 912)
 for **64,594 / 0 fail / 0 pending**, and js-api **1,001 tests, 0 fail**.
+
+**An arrow's `super` and `new.target` — a refusal, and the two mechanisms that
+lift it.** §9 item 19 names the part; the probe is what shaped it, and it
+corrected a limit this file had recorded twice.
+
+*The probe.* Two tests written for the recorded limit — a restored arrow
+resolving `super.m()` through the object it closed over, and one whose
+`new.target` is the function it was called in — do not reach the limit at all.
+Both die in `decode`, with `UnrebuildableFunction("its arrow source does not
+parse: SyntaxError: super is only valid inside class methods")` and
+`new.target is not allowed here`. So the observable was worse than "resolves
+neither": the restore **refused the whole snapshot**, before any environment was
+consulted. The cause is the arrow route's parse — it wraps the recorded
+expression in a parenthesis and parses it standalone, and `super` and
+`new.target` are *syntactic* contexts a standalone expression has not got.
+
+*The mechanism, both halves.* `build_arrow_function` keeps the plain parse first
+and retries a refused body inside an object-literal method
+(`({ m() { return (<source>); } })`), taking the arrow back out of that AST with
+`arrow_in_a_method` — `method_definition` already steps exactly this wrapper for a
+method record, and the wrapper's body is one `StmtKind::Return`. What stays
+refused is a body that *calls* `super()`: a SuperCall needs a derived-class
+constructor, which is not a context a restore has, and the module docs now say so.
+
+The second half is the recorded limit. `FunctionEnv`'s `function_object` and
+`new_target` become `Cell<Value>`, the treatment `this_value` already had, so
+`settle_envs` can fill them once the function that owns the record is in `made` —
+the order the `F -> E -> F` cycle needs. `REC_ENV`'s function form gained the two
+serials beside `this_value`, `visit_env` visits both exactly as it already visited
+`this_value`, and the reader fills them behind a write barrier like the binding
+values'. `Trace` needed no change: `Cell<T>` traces by value, with no abort path.
+The format is still version 1.
+
+*Tests — two added, four mutations, each caught.* `an_arrow_resolves_the_super_of_the_method_it_closed_over`
+and `an_arrow_resolves_the_new_target_of_the_function_it_closed_over` (both in
+`snapshot.rs`) each assert the call **before** the snapshot too, so neither can
+pass on a body that resolves nothing freshly. The mutations: dropping the retry
+(both tests refuse again — the probe's own failure), skipping the
+`function_object` fill (**only** the `super` test fails), skipping the
+`new_target` fill (**only** the `new.target` test fails), and writing `NO_REF`
+where the walk's serial belongs (both fail as `decode: Truncated` — the evidence
+that the reader materializes what the writer visited, so the walk is load-bearing
+rather than decorative).
+
+*The measurement.* deno's release snapshot suite stays **18/0**: no record the
+format carries changed shape, and the two sensitive tests
+(`lazy_loaded_esm_not_snapshotted_but_metadata_survives`,
+`snapshot_with_additional_extensions`) still pass. This part's buyer is therefore
+its own two tests rather than a deno test — no deno test in the tree restores an
+arrow that reads either name.
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **892** (890 plus
+the two); `cargo fmt --all -- --check` and `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean. The corpora were re-run because
+`FunctionEnv` is read by every `super` and every `new.target` in them: test262
+`all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**,
+158 skip of 48,622) and the wasm sweeps reproduce theirs (core 20,662 plus the
+seven proposal suites — simd 25,990, relaxed-simd 77, bulk-memory 7,485,
+exceptions 105, gc 654, memory64 8,709, multi-memory 912 — for **64,594 / 0 fail /
+0 pending**, and js-api **1,001 tests, 0 fail**).
 
 ## 8. Parked: the C++ face
 
@@ -4120,11 +4183,11 @@ if that proves possible.
   will, so the decision cannot disagree with what `visit_env` accepts; it is a
   per-record judgement made by the writer, which is why `carries_environment()`
   keeps its meaning ("this record may name a chain") and the reader's gate is
-  unchanged. One limit is stated rather than carried: a function environment's
+  unchanged. One limit was stated rather than carried: a function environment's
   `[[FunctionObject]]` and `new.target` are not part of an env record, so an
-  arrow whose body reads `super` or `new.target` resolves neither. **Landed** in
-  the change that follows it; §7's record has the mechanism, the mutations and the
-  measurement.
+  arrow whose body reads `super` or `new.target` resolves neither. **Carried
+  now** (§7's record for the arrow's `super` and `new.target`; §9 item 19), and
+  the probe that lifted it found the refusal came first, which that record states.
 - **A host callback's `[[Construct]]` is carried, by the host making it again —
   named here before the edit.** The writer refuses a built-in whose
   `FunctionKind::Builtin { construct }` is `Some`, on the grounds that the construct
@@ -6121,8 +6184,43 @@ a frame view of the running stack. §7's survey already split the subsystem: the
       own top-level context is a frame by that same rule (`script_evaluation`
       sets both `script_or_module` and `source`), so only the never-popped line
       disappears.
+  19. **An arrow whose body reads `super` or `new.target` — named before the edit,
+      and the probe corrects the recorded limit.** §9's arrow record and §7's
+      paragraph say a function environment's `[[FunctionObject]]` and its
+      new-target "are not part of an env record, so an arrow whose body reads
+      `super` or `new.target` resolves neither". Probing it answers worse, and
+      earlier: the restore **refuses the whole snapshot**, before the environment is
+      consulted at all — `decode: UnrebuildableFunction("its arrow source does not
+      parse: SyntaxError: super is only valid inside class methods")`, and
+      `new.target is not allowed here` likewise. The arrow route parses the recorded
+      expression **standalone** (`({text})`), and both of those are *syntactic*
+      contexts a standalone parse has not got. So this part is two mechanisms, and
+      neither alone restores a working arrow:
 
-## 10. Build order
+      - **The parse gets a context.** `build_arrow_function` retries a body whose
+        plain parse is refused inside an object-literal method —
+        `({ m() { return (<text>); } })` — and takes the arrow out of that AST
+        (`method_definition` already steps exactly this wrapper for a method record,
+        and the wrapper's body is one `StmtKind::Return`). The plain path stays
+        first, so nothing that parses today parses differently and only what is
+        refused today changes. A body that calls `super()` stays refused, because a
+        SuperCall needs a derived-class-constructor context the wrapper does not
+        have; that limit is stated rather than implied.
+      - **The environment carries both fields.** `FunctionEnv`'s `function_object`
+        and `new_target` become `Cell<Value>` — the treatment `this_value` already
+        has — so `settle_envs` can fill them once the function that owns the record
+        is in `made`, which is the order the `F -> E -> F` cycle needs; `Trace`
+        needs no change, because `Cell<T>` traces by value. `REC_ENV`'s function
+        form gains the two serials beside `this_value`, `visit_env` visits both
+        exactly as it already visits `this_value`, and the reader fills them in
+        `settle_envs` behind a write barrier like the binding values'. The format
+        stays version 1: nothing has been released.
+
+      **The measurement this buys** is the two engine tests §7 records: a restored
+      arrow resolving `super.m()` through the object it closed over, and one whose
+      `new.target` is the function it was called in.
+
+  ## 10. Build order
 
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
 external references + per-isolate/context data slots — **the format landed with
@@ -6501,10 +6599,11 @@ migrate, then delete.
    reserved), plus the `this` value and this-binding status of a function record. An object, module or
    global record is refused by kind and an import binding by name; the realm's own global environment
    is `NO_REF`, which is exactly what every earlier blob's absent environment means, so the format's
-   existing blobs keep their behavior. `[[FunctionObject]]` and the new-target do not travel: they are
-   plain fields of the record that can only be set at construction, and a function environment must
+   its existing blobs keep their behavior. `[[FunctionObject]]` and the new-target travel now, and they are
+   the reason the shell cannot be built whole: a function environment must
    exist *before* the function that closes over it is recorded (shell first, filled by `settle_envs`
    once that function is in `made`, which is the only order that makes the cycle `F -> E -> F` one
+   function instead of two) — §7's record for the arrow's `super` and `new.target`.
    function). The restore passes the rebuilt chain to the two grammars it **instantiates** — a
    function and a method — and keeps the reading realm's global for the two it **evaluates** (an arrow
    and a class constructor), refusing a record that names one for those two rather than dropping it.

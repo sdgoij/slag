@@ -300,7 +300,7 @@ impl EnvRecord {
     /// Record; an error elsewhere (only function bodies may use new.target).
     pub fn get_new_target(&self) -> Result<Value, JsError> {
         match self {
-            EnvRecord::Function(e) => Ok(e.new_target),
+            EnvRecord::Function(e) => Ok(e.new_target.get()),
             _ => Err(JsError::new(
                 ErrorKind::ReferenceError,
                 "new.target is only valid inside functions".into(),
@@ -933,10 +933,14 @@ pub enum ThisBindingStatus {
 #[derive(Debug)]
 pub struct FunctionEnv {
     pub declarative: DeclarativeEnv,
-    pub function_object: Value,
+    /// `[[FunctionObject]]`: the function this invocation is running, which is
+    /// what `super` resolves the home object through. A cell because a snapshot
+    /// reader fills it once the function that owns the record exists.
+    pub function_object: Cell<Value>,
     pub this_value: RefCell<Value>,
     pub this_binding_status: Cell<ThisBindingStatus>,
-    pub new_target: Value,
+    /// `[[NewTarget]]`: what `new.target` answers. Also filled by a reader.
+    pub new_target: Cell<Value>,
 }
 
 impl FunctionEnv {
@@ -953,10 +957,10 @@ impl FunctionEnv {
         };
         Self {
             declarative: DeclarativeEnv::new(outer),
-            function_object,
+            function_object: Cell::new(function_object),
             this_value: RefCell::new(Value::Undefined),
             this_binding_status: Cell::new(status),
-            new_target,
+            new_target: Cell::new(new_target),
         }
     }
 
@@ -982,7 +986,7 @@ impl FunctionEnv {
     fn function_object_has_home_object(&self, agent: &Agent) -> bool {
         // spec 9.2.1.10: `[[FunctionObject]].[[HomeObject]]` is not
         // *undefined* — the function was defined as a method.
-        let ValueKind::Function(function) = self.function_object.kind() else {
+        let ValueKind::Function(function) = self.function_object.get().kind() else {
             return false;
         };
         agent
