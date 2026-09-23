@@ -653,6 +653,7 @@ impl ObjectTemplate {
                             name.to_string_lossy()
                         ))),
                         function_prototype,
+                        false,
                     )?;
                     let set = match setter {
                         Some(setter) => Some(
@@ -664,6 +665,7 @@ impl ObjectTemplate {
                                     name.to_string_lossy()
                                 ))),
                                 function_prototype,
+                                false,
                             )?
                             .self_value(),
                         ),
@@ -744,23 +746,59 @@ fn run_callback(
 /// The one place a host callback becomes a callable, so a function a template
 /// materializes and one a snapshot restores are the same shape: the same call
 /// view, the same return-value slot, the same pending-exception translation.
+///
+/// `constructible` gives the function the `[[Construct]]` a snapshot recorded it
+/// with. The half is the *shape* a template's is — the ordinary object
+/// `newTarget.prototype` names, the callback run with `is_construct_call()` true,
+/// and the instance unless the callback returned an object — and it is built here
+/// rather than shared with `FunctionTemplate::get_function` because a template
+/// adds its instance properties to that object, which a function a snapshot
+/// restores has no template behind to add.
 pub(crate) fn host_function(
     isolate: *mut Isolate,
     callback: Rc<FunctionCallback>,
     name: Option<JsString>,
     prototype: Option<Handle<JsObject>>,
+    constructible: bool,
 ) -> Result<Handle<Function>, JsError> {
-    let call: NativeFn = Box::new(move |this, args| {
+    let call: NativeFn = {
+        let callback = Rc::clone(&callback);
+        Box::new(move |this, args| {
+            let info = FunctionCallbackInfo {
+                this: *this,
+                args,
+                new_target: None,
+                isolate,
+                return_value: RefCell::new(None),
+            };
+            run_callback(&callback, &info)
+        })
+    };
+    let construct: NativeCtor = Box::new(move |new_target, args| {
+        let instance = match prototype_object_of(new_target) {
+            Some(prototype) => JsObject::ordinary_object_create(Some(prototype)),
+            None => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "host constructor has no .prototype".into(),
+                ));
+            }
+        };
         let info = FunctionCallbackInfo {
-            this: *this,
+            this: Value::Object(instance),
             args,
-            new_target: None,
+            new_target: Some(*new_target),
             isolate,
             return_value: RefCell::new(None),
         };
-        run_callback(&callback, &info)
+        let result = run_callback(&callback, &info)?;
+        if result.is_object() {
+            Ok(result)
+        } else {
+            Ok(Value::Object(instance))
+        }
     });
-    Function::create_builtin(name, 0, call, None, prototype)
+    Function::create_builtin(name, 0, call, constructible.then_some(construct), prototype)
 }
 
 /// The `.prototype` property of the `newTarget` — the instance's prototype.

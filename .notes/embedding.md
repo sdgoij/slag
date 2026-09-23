@@ -3767,6 +3767,52 @@ identity record gives: the whole route lives in the snapshot module, and greps o
 for `runtime::snapshot`, `runtime::api`, `slag::api`, `read_snapshot` and
 `create_blob` answer nothing.
 
+**A host callback's `[[Construct]]` is carried, and deno's suite moves 15/4 →
+16/2.** §9 named this before the edit. It is the refusal `import_meta_snapshot` died
+on: deno puts `import.meta` on the global, and `import_meta.resolve` is built through
+the bridge's builder, so the blob refused a host constructor.
+
+*The mechanism.* The refusal rested on the claim that the construct half is "the
+template the host built the function with, which a blob does not carry". The
+engine's own template path shows the half is two recoverable things — the instance,
+an ordinary object from `newTarget.prototype`, which is an own property and so
+already travelled in the record's property list, and the callback, which is *one*
+`api::FunctionCallback` that `FunctionCallbackInfo::is_construct_call()` tells
+apart, exactly as `FunctionTemplate` already does it. So `REC_HOST_CALLBACK` gains a
+construct bit written from the engine's own `construct.is_some()` (`callable`'s
+Builtin arm stops refusing, and `Callable::HostCallback` and `Record::HostCallback`
+carry it), and `api::template::host_function` gains a `constructible` mode that
+builds the construct half `FunctionTemplate::get_function` builds. That shape is
+written there rather than shared with it because a template adds its instance
+properties to the object at call time and a function a snapshot restores has no
+template behind it. The two accessor sites in `ObjectTemplate::apply` stay
+call-only, which is what a getter is.
+
+*Tests — one, replaced, mutated three ways.*
+`a_host_constructors_construct_half_survives_the_round_trip` replaces
+`a_host_constructor_is_refused_rather_than_carried`: it restores a constructor and a
+plain callback in one blob, asserts the first kept its `[[Construct]]` and the second
+did not gain one, and then **constructs** the restored one — asserting the instance
+inherits from the function's own `.prototype`, which is the property the refusal said
+a blob could not carry. Mutations, each caught: the flag always false (the first
+assertion), the flag always true (the second), and the reader ignoring the bit (the
+first again). The count is unchanged because the test replaced the refusal's.
+
+*The measurement.* deno's release snapshot suite goes **15/4 → 16/2**.
+`import_meta_snapshot` — this part's buyer, whose failure was `create_blob` refusing
+`import_meta.resolve` — passes. The two left are the named ones: `es_snapshot` (its
+`ModuleRequest` source offsets) and `es_snapshot_without_runtime_module_loader`.
+
+*Gates.* `cargo test --locked --workspace` green, 38 test binaries;
+runtime `--lib` **887** (unchanged — the test replaced one); v8 `--lib` **240**
+(unchanged); `cargo fmt --all -- --check` and `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean (`write_host_callback` takes the file's existing
+`too_many_arguments` allow, as `write_class_method` does). The corpora were not
+re-run: the route lives in the snapshot module and the template constructor, and
+greps over `crates/test262/src`, `crates/wasmtest/src`, `crates/cli/src` and
+`crates/wasm/src` for `runtime::snapshot`, `runtime::api`, `slag::api`,
+`read_snapshot` and `create_blob` answer nothing.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -3969,6 +4015,28 @@ if that proves possible.
   arrow whose body reads `super` or `new.target` resolves neither. **Landed** in
   the change that follows it; §7's record has the mechanism, the mutations and the
   measurement.
+- **A host callback's `[[Construct]]` is carried, by the host making it again —
+  named here before the edit.** The writer refuses a built-in whose
+  `FunctionKind::Builtin { construct }` is `Some`, on the grounds that the construct
+  half is "the template the host built it with, which a blob does not carry". That
+  is the refusal `import_meta_snapshot` dies on: deno puts `import.meta` on the
+  global, and `import_meta.resolve` is built through the bridge's builder, so it is
+  a host constructor. The half is recoverable, and this engine is where that shows:
+  `api::template::FunctionTemplate::get_function` builds a constructible host
+  function from **one** callback — a `NativeCtor` closure that makes the instance
+  from `new_target.prototype` and is handed to `Function::create_builtin` beside
+  the call half — and `FunctionCallbackInfo` already carries `new_target` and
+  answers `is_construct_call()`. What refuses is only the *record*-building path:
+  `api::template::host_function`, which `build_host_callback` uses, hardcodes
+  `create_builtin(name, 0, call, None, prototype)`. So: `REC_HOST_CALLBACK` gains a
+  construct bit written from the engine's own `construct.is_some()` (no new host
+  method — the host's promise stays the one it already makes), `host_function` gains
+  a constructible mode that builds the same construct half `get_function` builds,
+  and `callable` stops refusing. The instance's prototype is `new_target.prototype`,
+  an ordinary property, so it already travels in the record's property list, and the
+  test that asserts today's refusal becomes one that asserts the restored function
+  both calls and constructs. **Landed** in the change that follows it; §7's record
+  has the mechanism, the mutations and the measurement.
 - **The platform is a shape without a producer, and that is stated.** Slag posts
   no task, so `Platform`/`PlatformImpl`/`Task` exist so a host's initialization
   and its own implementation type-check, and the bridge's module docs say so

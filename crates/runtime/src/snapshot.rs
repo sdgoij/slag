@@ -533,10 +533,11 @@ enum Record {
         extras: Vec<StoredProperty>,
     },
     /// A host callback: the external-reference table entry it was built from,
-    /// the data it reads, and its object part.
+    /// the data it reads, whether it had a `[[Construct]]`, and its object part.
     HostCallback {
         index: u32,
         data: u32,
+        construct: bool,
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
@@ -566,8 +567,8 @@ struct CarriedBinding {
     value: u32,
 }
 
-/// A host callback the host built: the table entry its call comes from, and the
-/// data it was built with.
+/// A host callback the host built: the table entry its calls come from, whether
+/// the host's function had a `[[Construct]]`, and the data it was built with.
 ///
 /// The data is a *value*, so a blob carries it beside the index rather than
 /// trusting the load to have the same one — which is what makes a callback that
@@ -1137,7 +1138,7 @@ fn visit(
                             visit(agent, realm, externals, host, *argument, objects, serials)?;
                         }
                     }
-                    Callable::HostCallback { pointer, data } => {
+                    Callable::HostCallback { pointer, data, .. } => {
                         external_index(externals, pointer)?;
                         if let Some(data) = data {
                             visit(agent, realm, externals, host, data, objects, serials)?;
@@ -1476,8 +1477,12 @@ enum Callable<'a> {
         bound_args: &'a [Value],
     },
     /// A host callback: the external-reference table pointer it was built from,
-    /// and the data it reads when it is called.
-    HostCallback { pointer: usize, data: Option<Value> },
+    /// the data it reads when it is called, and whether it is a constructor.
+    HostCallback {
+        pointer: usize,
+        data: Option<Value>,
+        construct: bool,
+    },
     /// A class constructor: the class source, and the definition-time **inputs**
     /// the rebuild must not re-evaluate — the heritage value (`None` for a class
     /// with no `extends` clause) and the computed element keys.
@@ -1605,22 +1610,17 @@ fn callable<'a>(
                     "a host callback is a Rust closure, not a name or an address a snapshot can carry",
                 ));
             };
-            // The call half can come back because the host can make another;
-            // the construct half cannot, because it is the *template* the host
-            // built the function with — the instance it creates, the instance
-            // template it applies, what a non-object return value means — and a
-            // blob carries no template. Writing the call half of something whose
-            // construct half would silently vanish is the "read back wrong" this
-            // format refuses everywhere else.
-            if construct.is_some() {
-                return Err(Unsupported::new(
-                    "a host constructor",
-                    "its [[Construct]] is the template the host built it with, which a blob does not carry",
-                ));
-            }
+            // Both halves come back the same way, because both are the host making
+            // the function again: the construct half is what the record's bit says,
+            // and the instance it makes is an ordinary object from
+            // `newTarget.prototype`, which the record's property list carries like
+            // any other own property. Writing the call half of something whose
+            // construct half would silently vanish would be the "read back wrong"
+            // this format refuses everywhere else, which is why this bit exists.
             Ok(Callable::HostCallback {
                 pointer: callback.pointer,
                 data: callback.data.map(|data| *data.value()),
+                construct: construct.is_some(),
             })
         }
         FunctionKind::Bound {
@@ -2278,9 +2278,13 @@ fn write_record(
                     body,
                 )?,
                 Callable::Bound { .. } => write_bound_function(realm, &function, serials, body)?,
-                Callable::HostCallback { pointer, data } => {
-                    write_host_callback(realm, &function, pointer, data, externals, serials, body)?
-                }
+                Callable::HostCallback {
+                    pointer,
+                    data,
+                    construct,
+                } => write_host_callback(
+                    realm, &function, pointer, data, construct, externals, serials, body,
+                )?,
                 Callable::ClassMember {
                     class,
                     key,
@@ -2637,11 +2641,13 @@ fn write_class_method(
 /// which entry of *its* table the host put the same callback in. The data is a
 /// language value all the same, so it is carried as one. That is also why the
 /// record carries no `[[Construct]]` — see [`callable`].
+#[allow(clippy::too_many_arguments)]
 fn write_host_callback(
     realm: &Handle<Realm>,
     function: &Handle<Function>,
     pointer: usize,
     data: Option<Value>,
+    construct: bool,
     externals: &[usize],
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
@@ -2655,6 +2661,9 @@ fn write_host_callback(
             None => NO_REF,
         },
     );
+    // The construct bit: whether the host's function had a [[Construct]], which
+    // the restore builds it with again.
+    body.push(u8::from(construct));
     write_u32(body, prototype_serial(realm, &function.object, serials)?);
     body.push(u8::from(function.object.extensible.get()));
     write_properties(realm, &function.object, serials, body)?;
@@ -3127,12 +3136,14 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
         REC_HOST_CALLBACK => {
             let index = reader.u32().ok_or(DecodeError::Truncated)?;
             let data = reader.u32().ok_or(DecodeError::Truncated)?;
+            let construct = reader.u8().ok_or(DecodeError::Truncated)? != 0;
             let proto = reader.u32().ok_or(DecodeError::Truncated)?;
             let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
             let properties = read_properties(reader)?;
             Ok(Record::HostCallback {
                 index,
                 data,
+                construct,
                 proto,
                 extensible,
                 properties,
@@ -4038,11 +4049,12 @@ impl Builder<'_> {
             Record::HostCallback {
                 index: external,
                 data,
+                construct,
                 proto,
                 extensible,
                 properties,
             } => {
-                let function = self.build_host_callback(*external, *data, *proto)?;
+                let function = self.build_host_callback(*external, *data, *proto, *construct)?;
                 // As for a bind exotic: a host callback has no registered body,
                 // so nothing defers its `prototype` — the record's own
                 // properties are the whole object part.
@@ -4077,6 +4089,7 @@ impl Builder<'_> {
         index: u32,
         data: u32,
         proto: u32,
+        construct: bool,
     ) -> Result<Handle<Function>, DecodeError> {
         let pointer =
             *self
@@ -4105,13 +4118,18 @@ impl Builder<'_> {
         // callback scope is built from it — the same identity
         // `api::Isolate::get_current` relies on.
         let isolate = self.agent as *mut Agent as *mut crate::api::Isolate;
-        let function =
-            crate::api::host_function(isolate, std::rc::Rc::new(callback), None, prototype)
-                .map_err(|error| {
-                    DecodeError::UnrebuildableFunction(format!(
-                        "the host could not make a function for external reference {index}: {error}"
-                    ))
-                })?;
+        let function = crate::api::host_function(
+            isolate,
+            std::rc::Rc::new(callback),
+            None,
+            prototype,
+            construct,
+        )
+        .map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!(
+                "the host could not make a function for external reference {index}: {error}"
+            ))
+        })?;
         // Tell the host what it just made: this pair is how the write side names
         // a function, so a snapshot written *of this load* can carry what it
         // restored rather than refusing it.
@@ -5917,36 +5935,100 @@ mod tests {
         let _ = context;
     }
 
-    /// A host callback whose `[[Construct]]` the host built is refused rather
-    /// than restored without one: a template is what makes a host constructor,
-    /// and a blob carries no template.
+    /// A host callback's `[[Construct]]` is carried, because the host can make the
+    /// function again: the construct half is the record's own bit, and the instance
+    /// it makes is an ordinary object from `newTarget.prototype` — an own property,
+    /// so it already travels in the record's property list. One callback expresses
+    /// both halves the way the engine's template path already does it, through
+    /// `FunctionCallbackInfo::is_construct_call`. A function the host built
+    /// *without* a construct half stays without one.
     #[test]
-    fn a_host_constructor_is_refused_rather_than_carried() {
+    fn a_host_constructors_construct_half_survives_the_round_trip() {
         let mut isolate = api::Isolate::new();
         let context = api::Context::new(&mut isolate).expect("a realm");
         let realm = *context.realm();
-        let callback = Function::create_builtin(
+        let function_prototype = context
+            .intrinsic("%Function.prototype%")
+            .and_then(|value| crate::context::as_object(&value))
+            .expect("the realm's function prototype");
+        let constructor = Function::create_builtin(
             Some(JsString::from_utf8("a_host_ctor")),
             1,
             Box::new(|_, _| Ok(Value::Undefined)),
             Some(Box::new(|_, _| Ok(Value::Undefined))),
-            None,
+            Some(function_prototype),
         )
         .expect("a builtin");
-        let mut host = FakeHost::new(0.0);
-        host.made(&callback, 0x1111);
-        let items = slot_items(&[Value::Function(callback)]);
+        // The `.prototype` a constructor hands its instances, which is what the
+        // refusal claimed a blob could not carry: it is an ordinary own property.
+        let instance_prototype = JsObject::ordinary_object_create(None);
+        constructor
+            .object
+            .create_data_property(
+                &JsString::from_utf8("prototype"),
+                Value::Object(instance_prototype),
+            )
+            .expect("a .prototype");
+        let plain = Function::create_builtin(
+            Some(JsString::from_utf8("an_op")),
+            0,
+            Box::new(|_, _| Ok(Value::Number(1.0))),
+            None,
+            Some(function_prototype),
+        )
+        .expect("a builtin");
+        let mut host = FakeHost::new(7.0);
+        host.made(&constructor, 0x1111);
+        host.made(&plain, 0x2222);
+        let items = slot_items(&[Value::Function(constructor), Value::Function(plain)]);
         let slots = [Slot {
             index: 0,
             realm,
             items: &items,
             realm_global: false,
         }];
+        let table = [0x1111usize, 0x2222usize];
+        let blob = encode_slots(agent_of(&isolate), &slots, &table, Some(&host)).expect("a blob");
 
-        let error =
-            encode_slots(agent_of(&isolate), &slots, &[0x1111], Some(&host)).expect_err("refused");
-        assert_eq!(error.type_name, "a host constructor");
-        assert!(error.detail.contains("[[Construct]]"), "{}", error.detail);
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &table, Some(&host))
+            .expect("a load")
+            .expect("the slot");
+        let restored = |index: usize| {
+            back[index]
+                .value()
+                .expect("a value")
+                .as_function()
+                .expect("a function")
+        };
+        assert!(
+            crux::value::is_constructor(&Value::Function(restored(0))),
+            "the restored function kept its [[Construct]]"
+        );
+        assert!(
+            !crux::value::is_constructor(&Value::Function(restored(1))),
+            "and one the host built without one did not gain one"
+        );
+        // The half works, not just exists: `new` makes the instance from the
+        // function's own `.prototype`, and the host's one callback ran for it.
+        let made = crate::function::construct(
+            agent_mut(&isolate),
+            &Value::Function(restored(0)),
+            &[],
+            &Value::Function(restored(0)),
+        )
+        .expect("a construct");
+        let prototype = restored(0)
+            .get(&JsString::from_utf8("prototype"))
+            .expect("its .prototype");
+        assert_eq!(
+            made.as_object()
+                .expect("an instance")
+                .get_prototype_of()
+                .expect("its prototype")
+                .map(|prototype| prototype.id()),
+            prototype.as_object().map(|prototype| prototype.id()),
+            "the instance inherits from the constructor's own .prototype"
+        );
         let _ = context;
     }
 
