@@ -3136,6 +3136,25 @@ engine's `ToPropertyDescriptor` converts (`builtins/object.rs:272`), while its
 `query` puts attributes in a `ReturnValue<Integer>` — the encodings the handler
 has to honour.
 
+*And the vocabulary of the handler arrived, which is where the compile gate
+stands now.* `crates/v8/property.rs` gains `Intercepted` — the four answers, with
+the crate's own spelled names and the `non_camel_case_types` allowance that costs
+— and `PropertyHandlerFlags` (`NONE`, `ALL_CAN_READ`, `NON_MASKING`,
+`ONLY_INTERCEPT_STRINGS`, `HAS_NO_SIDE_EFFECT`, composing like the flag sets the
+same file already had). They are the two types a host's handler code names, at the
+root (`v8::Intercepted`), and they are pure vocabulary: the configuration, the
+callback signatures, the template's storage and the engine wiring that invokes
+them are still to come, so **the suite still does not compile**. The measurement
+is the proof they are the right two: `cargo test -p deno_core --features v8 --lib
+--no-run` goes from **13 errors to 5**, and the five are the mechanism's
+configuration half (`PropertyCallbackArguments` ×3,
+`NamedPropertyHandlerConfiguration`, `set_named_property_handler`). One test,
+mutated: `property::tests::handler_flags_compose` pins that the flags are
+distinct bits that compose — the pair deno's `vm` installs carries exactly its
+two — and colliding `NON_MASKING` with `HAS_NO_SIDE_EFFECT` fails it. The gates
+are unchanged by it (`crates/v8` is not reachable from the corpus or the wasm
+sweeps), and the workspace stays green in 38 binaries.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5084,14 +5103,19 @@ a frame view of the running stack. §7's survey already split the subsystem: the
     bridge methods, and the global-object seam — `Some(ops)` builds the global
     with `host_object_create`, `None` with `ordinary_object_create`, so every
     existing caller is untouched and the corpus and the wasm sweeps reproduce
-    their numbers. What remains of this item is the handler itself: the four
-    callback types, the configuration, the template's storage for it, the
-    `HostOps` implementation that calls the host back, and the one design
-    question the measurement leaves open — a `descriptor` answering `kYes` has
-    nowhere to put its descriptor, because `api::FunctionCallbackInfo` (the only
-    return-value slot the bridge has) is `pub(crate)` and `HostOps` carries no
-    value out, so that answer is refused by name unless an engine return slot is
-    added for it.
+    their numbers. Landed since: the return slot above, and the vocabulary — `Intercepted` and
+    `PropertyHandlerFlags` in `crates/v8/property.rs`. What remains is the
+    mechanism's configuration half and its wiring:
+    `NamedPropertyHandlerConfiguration` with the three callbacks the test
+    configures, `PropertyCallbackArguments`, the template's storage for a handler,
+    `ObjectTemplate::set_named_property_handler`, and a `HostOps` implementation
+    that builds each callback's scope from `crate::realm::current()` and calls
+    back. Two facts the next pass needs. The definer's argument needs a bridge
+    constructor for `PropertyDescriptor`, whose inner
+    `crux::property::PropertyDescriptor` is private to that module. And the engine
+    consults host ops **before** its own own-property lookup, so `NON_MASKING` is
+    accepted but not honoured: the handler is called for a name the prototype
+    chain also carries, which a `kNo` answer makes invisible in the result.
 
 
 ## 10. Build order

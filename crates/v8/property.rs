@@ -114,6 +114,79 @@ impl BitOrAssign for PropertyFilter {
     }
 }
 
+/// How a named property handler's callback answers (`v8::Intercepted`).
+///
+/// A host installs a handler on an object template and each of its callbacks
+/// answers with one of these; the bridge is what reads the answer. This type
+/// and [`PropertyHandlerFlags`] are the vocabulary of that mechanism: the
+/// configuration, the callbacks' signatures, the template's storage for a
+/// handler and the engine-side wiring that invokes them are the rest of it, and
+/// are not in this bridge yet.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The variant names are the crate we stand in for's, so the lint is the price
+// of a host's code naming `v8::Intercepted::kYes` unchanged.
+#[allow(non_camel_case_types)]
+pub enum Intercepted {
+    /// The callback did the operation, and the engine must not.
+    kYes,
+    /// The callback did not do the operation; the engine's own runs.
+    kNo,
+    /// The callback did not do the operation, and the engine must keep the
+    /// property as it already is rather than running its own.
+    kYesKeepExisting,
+    /// The operation throws: the callback left a pending exception.
+    kThrow,
+}
+
+/// Which operations a named property handler is consulted for
+/// (`v8::PropertyHandlerFlags`).
+///
+/// Flags are a set, and a host's are what it was handed: deno's own `vm` module
+/// installs one with `NON_MASKING | HAS_NO_SIDE_EFFECT`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PropertyHandlerFlags(u32);
+
+impl PropertyHandlerFlags {
+    /// No flags.
+    pub const NONE: Self = Self(0);
+    /// The handler is consulted for properties the object does not own
+    /// (`kAllCanRead`).
+    pub const ALL_CAN_READ: Self = Self(1 << 0);
+    /// A property on the prototype chain takes precedence over the handler
+    /// (`kNonMasking`); without it the handler is consulted first.
+    pub const NON_MASKING: Self = Self(1 << 1);
+    /// Only string keys reach the handler (`kOnlyInterceptStrings`).
+    pub const ONLY_INTERCEPT_STRINGS: Self = Self(1 << 2);
+    /// The callbacks have no side effects, so the engine may skip calling them
+    /// (`kHasNoSideEffect`).
+    pub const HAS_NO_SIDE_EFFECT: Self = Self(1 << 3);
+
+    /// Whether every flag in `that` is set here.
+    pub fn has(&self, that: Self) -> bool {
+        let Self(lhs) = self;
+        let Self(rhs) = that;
+        lhs & rhs == rhs
+    }
+}
+
+impl BitOr for PropertyHandlerFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        let Self(lhs) = self;
+        let Self(rhs) = rhs;
+        Self(lhs | rhs)
+    }
+}
+
+impl BitOrAssign for PropertyHandlerFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs;
+    }
+}
+
 /// How far an enumeration reaches (`v8::KeyCollectionMode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -214,5 +287,31 @@ impl GetPropertyNamesArgsBuilder {
     pub fn key_conversion(&mut self, key_conversion: KeyConversionMode) -> &mut Self {
         self.key_conversion = key_conversion;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A handler's flags are a set: the pair deno's `vm` installs carries both of
+    /// its bits, and neither of the two it left out.
+    #[test]
+    fn handler_flags_compose() {
+        let mut flags = PropertyHandlerFlags::NON_MASKING;
+        assert!(flags.has(PropertyHandlerFlags::NON_MASKING));
+        assert!(!flags.has(PropertyHandlerFlags::HAS_NO_SIDE_EFFECT));
+        flags |= PropertyHandlerFlags::HAS_NO_SIDE_EFFECT;
+        assert!(flags.has(PropertyHandlerFlags::NON_MASKING));
+        assert!(flags.has(PropertyHandlerFlags::HAS_NO_SIDE_EFFECT));
+        assert!(!flags.has(PropertyHandlerFlags::ONLY_INTERCEPT_STRINGS));
+        assert!(!flags.has(PropertyHandlerFlags::ALL_CAN_READ));
+        // `NONE` is no flags at all, and every set contains it.
+        assert!(PropertyHandlerFlags::NONE.has(PropertyHandlerFlags::NONE));
+        assert!(!PropertyHandlerFlags::NONE.has(PropertyHandlerFlags::NON_MASKING));
+        assert_eq!(
+            PropertyHandlerFlags::NONE | PropertyHandlerFlags::ALL_CAN_READ,
+            PropertyHandlerFlags::ALL_CAN_READ
+        );
     }
 }
