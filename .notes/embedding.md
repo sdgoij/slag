@@ -4427,6 +4427,16 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,334 passed / 0 failed** (5,332 plus this change's two tests); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **892 passed / 0 failed** — unchanged, because `api::wasm` is wasm-gated — and `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because a JS-API operation was added to the namespace: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce every certified number — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending — and js-api **1,001 tests, 0 fail**, unchanged because the corpus carries no `instantiateStreaming` fixture at all (checked by grep, not assumed), which is why the deno test is the only thing that exercises it.
 
+*Termination is observed at every call — §9's bullet that named it, and it corrects item 20's own claim rather than extending it.* Item 20 read at its edit as "`crate::function::call_inner`, the one choke point every call passes through". It is not one, and the leaf-inline cuts (25/34/35) are why: the interpreter has four call entries that run a call *without* reaching `call_inner` — `Vm::fast_call_core` inlines a certified leaf onto the running Vm and runs a registered builtin's handler directly, both returning before the `call_inner` at its end; `do_call_fast_global` and `do_call_fast_slot` each hold a call-site leaf cache whose hit returns inside the condition that reads it; and `tail_call_shared` inlines its leaf or replaces the frame on its own. So a host callback that requests termination and returns left the *next* evaluation to run, and the measurement is `test_promise_rejection_handler::case_04_exception_false::module_2_false`: its handler is `(promise, rejection) => { … try { throwError(); } catch (e) { Deno.core.reportUnhandledException(e); } return test.endsWith("_true"); }`, `reportUnhandledException` ends in `scope.terminate_execution()`, and the suite reported `Uncaught (in promise) Error: fail` where the first dispatch's `boom` belongs — `test.endsWith("_true")` ran, returned `false`, the first dispatch was cleared and the second won. V8 refuses at that point and no other: `Execution::Call`/`InvokeWithTryCatch` answer a *termination* rather than the caught exception once `is_execution_terminating()` (`v8/src/execution/execution.cc:535-571`), and `v8::Function::Call` reports it through the invocation's own try-catch (`v8/src/api/api.cc:3160`), which is the answer deno's `dispatch_rejections` (`libs/core/runtime/jsruntime.rs:3664-3674`) is built on. **Measured before the edit rather than recalled**: two probes (`eprintln!` in `request_termination` and in `call_inner`'s refusal branch) printed the request twice and a refusal **zero** times during that test — the second dispatch ran — and one check at `fast_call_core`'s top made the test pass. The change is one check per call *entry*, which is what V8's single funnel is: `fast_call_core`'s top (the only place the leaf inline, a registered builtin's handler and the general `call_inner` are all below), `tail_call_shared`'s top (one dispatch — the two gates the previous cut had split across its leaf and frame arms are one check now), and a term in each call-site leaf cache's condition, because a hit returns before the core is entered and would otherwise be the one call shape a request does not stop. The JIT adds nothing, and that is measured rather than assumed: a compiled body's per-loop `GcSafepoint` probe already reads the flag, a compiled call site is only *probed* cold, and the gate that was written in `leaf_call_probe` was reverted — no test could reach it, and an unexercised check is a claim rather than a fix.
+
+*Tests — five, one per call entry, and four mutations, each caught, with the attribution the interesting part.* `a_termination_request_stops_the_next_call` is item 20's own shape, a plain call to a host callback; `a_termination_request_stops_a_leaf_call_in_the_fast_core` is a certified leaf with a **cold** call-site cache, which is what puts the request in front of the core rather than in front of a cached entry; `a_termination_request_stops_a_global_call_a_warm_leaf_cache_would_inline` warms that entry first and leaves the global object alone afterwards, because any write to it moves its generation and sends the call down the cold path instead; `a_termination_request_stops_a_slot_call_a_warm_leaf_cache_would_inline` does the same for a parameter slot, with the request raised *inside* the callee — a request raised before the outer call would refuse that call at its own entry, and the slot entry would never be read; and `a_termination_request_stops_a_tail_call` puts a `"use strict"` prologue on the body, without which the compiler emits no proper tail call at all (the eligibility rule requires `self.strict`) and the shape would test nothing. Every one observes the refusal through a **store a refused call never reaches**, never through a JS `catch`, so what they pin is that the call did not run rather than whether the termination error is catchable — item 20's other stated limit, left where it stands.
+
+*Four mutations, each caught.* Two replace a check with `if false` (`fast_call_core`'s top, `tail_call_shared`'s top) and two replace a cache term with `&& true` (`do_call_fast_global`'s, `do_call_fast_slot`'s). Each of the two cache mutations fails exactly one test — its own — which is also the proof that the entry is genuinely *hit* rather than merely warmed. The core mutation fails **three** tests (the cold leaf and both cache tests) and leaves `a_termination_request_stops_the_next_call` **green**: the cache conditions decline into a fall-through that reaches the core, and the host callback's call ends at `call_inner`, which refuses it there. That is the one place item 20's check still answers for a call the fast entries do not carry, and this record says so rather than claiming that test pins the core.
+
+*The measurement.* deno's `runtime::tests::misc::test_promise_rejection_handler::case_04_exception_false::module_2_false` **passes** (`module_1_true` beside it unchanged), and the whole `deno_core --lib` suite moves **451 passed / 8 failed → 452 passed / 7 failed**: the one test flipped, none newly red, and the 7 left are §9's four inspector cases, the two Windows `uv_compat` pipe-busy ones, and `test_dynamic_import_module_error_stack` — now the last real failure, and it is §12 item 20's async stack trace rather than a termination.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,340 passed / 0 failed** (`runtime` 928, `v8` 256, `crux` 249, `test262` 3324 — these five tests replace the three the previous cut left, so the tree gains two); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **897 passed / 0 failed**, `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because the call path every corpus uses moved: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce every certified number — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending (64,594 checks) — and js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -6907,9 +6917,13 @@ a frame view of the running stack. §7's survey already split the subsystem: the
         `gc_safepoint` probe, which exists for the GC already and whose helper the
         JIT already allows to set the pending error, so that half is one call-site
         change from `emit_raw_call` to `call_slow`; and at
-        `crate::function::call_inner`, the one choke point every call passes
-        through, which is what covers a module body whose whole text is one
-        statement. The API's own entries check it too, so a terminated isolate
+        `crate::function::call_inner`, the choke point a call that does not inline a
+        leaf, hit a call-site leaf cache or take a tail dispatch passes through, which
+        is what covers a module body whose whole text is one statement. (**Item 25
+        corrects the claim this line first made** — that `call_inner` was "the one
+        choke point every call passes through" — because the leaf-inline cuts had
+        already given the interpreter four entries that run a call without reaching
+        it.) The API's own entries check it too, so a terminated isolate
         refuses the next script rather than running it.
       - **The error is a plain `Error`.** V8's termination exception *is*
         `Error("execution terminated")` — deno asserts that exact string — so
@@ -7072,6 +7086,34 @@ a frame view of the running stack. §7's survey already split the subsystem: the
         carry `span: _`). A tail call is not a site either — the step replaced the frame,
         and the tail forms have no span field. Both are recorded, not implied; the
         interpreter is the engine every deno case in the frontier goes through.
+
+  25. **Termination is observed at every call — named before the edit, and it corrects
+      item 20's own shape rather than extending it.** Item 20 read at its edit as
+      "`crate::function::call_inner`, the one choke point every call passes through"; the
+      leaf-inline cuts (25/34/35) had already given the interpreter four entries that run a
+      call without reaching it — `fast_call_core` (a certified leaf inlined, a registered
+      builtin's handler run), the two call-site leaf caches (a hit returns inside the
+      condition that reads it), and `tail_call_shared` — so a host callback that requested
+      termination and returned left the next evaluation to run. The measurement is deno's
+      `test_promise_rejection_handler::case_04_exception_false::module_2_false`, whose
+      handler evaluates `test.endsWith("_true")` after
+      `Deno.core.reportUnhandledException` terminated and therefore let the second dispatch
+      win, where V8 answers a *termination* from `Execution::Call`/`InvokeWithTryCatch`
+      instead (`v8/src/execution/execution.cc:535-571`, `v8/src/api/api.cc:3160`, and deno's
+      `dispatch_rejections` at `libs/core/runtime/jsruntime.rs:3664-3674` is built on that
+      answer).
+
+      - **One check per call entry**, because four entries is what the engine has: the top
+        of `fast_call_core`, the top of `tail_call_shared`, and a term in each call-site
+        leaf cache's condition. The JIT needs none, measured rather than assumed: a
+        compiled body's per-loop `GcSafepoint` probe already reads the flag, and a compiled
+        call site is only *probed* cold, so a check in `leaf_call_probe` was written,
+        measured as unreachable by any test, and reverted rather than landed unexercised.
+      - **Item 20's `call_inner` sentence is corrected where it stands**, and its two
+        stated limits are unchanged: the WebAssembly one item 21 closed, and the
+        termination error being a catchable plain `Error` where V8's is uncatchable —
+        which is why this part's tests observe a refusal through a store a refused call
+        never reaches rather than through a JS `catch`.
 
   ## 10. Build order
 

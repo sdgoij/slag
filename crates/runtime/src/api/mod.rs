@@ -282,6 +282,195 @@ mod tests {
         Context::new(isolate).unwrap()
     }
 
+    thread_local! {
+        static MARKED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Install `stop` and `mark` on the realm's global: `stop` asks the running
+    /// execution to stop (what `deno_core`'s `reportUnhandledException` ends in),
+    /// `mark` records that it ran. Both are returned as values, so a test can also
+    /// hand them to a JS function as arguments — which is the shape that lowers to
+    /// the fast slot call a host's `Deno.core.ops` call takes.
+    fn install_termination_pair(isolate: &mut Isolate) -> (Value, Value) {
+        fn stop(_this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+            let agent = crux::function::current_agent();
+            assert!(!agent.is_null(), "a builtin runs inside an agent window");
+            // SAFETY: the engine recorded this agent for the duration of the call.
+            unsafe { &*(agent as *const crate::agent::Agent) }.request_termination();
+            Ok(Value::Undefined)
+        }
+        fn mark(_this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+            MARKED.with(|marked| marked.set(true));
+            Ok(Value::Undefined)
+        }
+
+        MARKED.with(|marked| marked.set(false));
+        let realm = isolate.agent.current_realm().expect("a realm");
+        let mut values = Vec::new();
+        for (name, call) in [
+            (
+                "stop",
+                stop as fn(&Value, &[Value]) -> Result<Value, JsError>,
+            ),
+            ("mark", mark),
+        ] {
+            let function = crux::function::Function::create_builtin(
+                Some(crux::string::JsString::from_utf8(name)),
+                0,
+                Box::new(call),
+                None,
+                None,
+            )
+            .expect("a builtin");
+            let value = Value::Function(function);
+            realm
+                .global_object
+                .define_property_or_throw(
+                    &crux::string::JsString::from_utf8(name),
+                    &crux::property::PropertyDescriptor {
+                        value: Some(value),
+                        writable: Some(true),
+                        get: None,
+                        set: None,
+                        enumerable: Some(false),
+                        configurable: Some(true),
+                    },
+                )
+                .expect("defined");
+            values.push(value);
+        }
+        (values[0], values[1])
+    }
+
+    /// A request stops the next call — here a plain call to a host callback,
+    /// which is the shape a host's own op call takes.
+    #[test]
+    fn a_termination_request_stops_the_next_call() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        install_termination_pair(&mut isolate);
+
+        let _ = context.eval(
+            "try { stop(); } catch (error) {}\n\
+             try { mark(); } catch (error) {}",
+        );
+        assert!(
+            !MARKED.with(|marked| marked.get()),
+            "the call after the request is refused"
+        );
+    }
+
+    /// The shared fast core is its own check point: a certified leaf is run
+    /// inline on the spot, so a call to one never reaches `call_inner` — the
+    /// check at the end of the core is too late for it. A cold leaf cache is
+    /// what puts the request in front of the core rather than in front of a
+    /// cached entry (the warm case is its own test below).
+    #[test]
+    fn a_termination_request_stops_a_leaf_call_in_the_fast_core() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        install_termination_pair(&mut isolate);
+
+        let _ = context.eval(
+            "function leafOf(n) { return n; }\n\
+             globalThis.ranLeaf = 0;\n\
+             stop();\n\
+             globalThis.ranLeaf = leafOf(1);",
+        );
+        isolate.cancel_terminate_execution();
+        assert_eq!(
+            context
+                .eval("globalThis.ranLeaf")
+                .to_local_checked()
+                .as_number(),
+            Some(0.0),
+            "the leaf call after the request is refused"
+        );
+    }
+
+    /// A **warm** leaf cache is a check point of its own: the hit is taken
+    /// before the shared core is entered. The earlier call warms the site's
+    /// entry, and the global object is left alone afterwards — any write to it
+    /// would move its generation and send the call down the cold path instead.
+    #[test]
+    fn a_termination_request_stops_a_global_call_a_warm_leaf_cache_would_inline() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        install_termination_pair(&mut isolate);
+
+        let _ = context.eval(
+            "function leafOf(n) { return n; }\n\
+             globalThis.ranCache = 0;\n\
+             leafOf(7);\n\
+             stop();\n\
+             globalThis.ranCache = leafOf(1);",
+        );
+        isolate.cancel_terminate_execution();
+        assert_eq!(
+            context
+                .eval("globalThis.ranCache")
+                .to_local_checked()
+                .as_number(),
+            Some(0.0),
+            "the cached leaf call after the request is refused"
+        );
+    }
+
+    /// The same for a **slot** callee: `outer`'s parameter resolved to a
+    /// certified leaf on the earlier call, so the cached slot entry is a second
+    /// call entry that the shared core never sees. The request is raised inside
+    /// `outer`, which is what makes the slot call — not the call to `outer` —
+    /// the next call.
+    #[test]
+    fn a_termination_request_stops_a_slot_call_a_warm_leaf_cache_would_inline() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        install_termination_pair(&mut isolate);
+
+        let _ = context.eval(
+            "function leafOf(n) { return n; }\n\
+             function outer(f, go) { if (go) stop(); return f(1); }\n\
+             outer(leafOf, false);\n\
+             globalThis.ranSlot = 0;\n\
+             globalThis.ranSlot = outer(leafOf, true);",
+        );
+        isolate.cancel_terminate_execution();
+        assert_eq!(
+            context
+                .eval("globalThis.ranSlot")
+                .to_local_checked()
+                .as_number(),
+            Some(0.0),
+            "the cached slot call after the request is refused"
+        );
+    }
+
+    /// A tail call is a call: its dispatch inlines a certified leaf or replaces
+    /// the frame for anything else, and both start new execution. The body is
+    /// strict because a proper tail call is compiled only there.
+    #[test]
+    fn a_termination_request_stops_a_tail_call() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        install_termination_pair(&mut isolate);
+
+        let _ = context.eval(
+            "function leafOf(n) { return n; }\n\
+             function caller() { 'use strict'; stop(); return leafOf(1); }\n\
+             globalThis.ranTail = 0;\n\
+             globalThis.ranTail = caller();",
+        );
+        isolate.cancel_terminate_execution();
+        assert_eq!(
+            context
+                .eval("globalThis.ranTail")
+                .to_local_checked()
+                .as_number(),
+            Some(0.0),
+            "the tail call after the request is refused"
+        );
+    }
+
     #[test]
     fn eval_returns_the_completion_value() {
         let mut isolate = isolate();

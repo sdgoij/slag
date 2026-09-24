@@ -11774,6 +11774,12 @@ impl Vm {
         direct_eval: bool,
         body: &CompiledBody,
     ) -> Result<TailOutcome, JsError> {
+        // A termination request stops the next call, and a tail call is one:
+        // every arm below starts new execution — the direct eval, the leaf
+        // inline, and the frame replacement.
+        if agent.is_terminating() {
+            return Err(crate::agent::termination_error());
+        }
         // A direct eval in tail position (`return eval(x)`) is a host
         // operation that must run with the caller's environment intact: the
         // eval'd script inherits the caller's lexical/private environment and
@@ -12193,6 +12199,10 @@ impl Vm {
             if self.global_matches(agent, global_id, global_generation)?
                 && self.can_inline_leaf()
                 && agent.realm_count.get() == 1
+                // A termination request stops the next call: the cached leaf
+                // must not run, and the general core below is the one that
+                // refuses it (it checks at its own top).
+                && !agent.is_terminating()
             {
                 if agent.jit_hook.is_some() {
                     if self.try_jit_leaf(
@@ -12265,6 +12275,9 @@ impl Vm {
             && cell.payload == payload
             && self.can_inline_leaf()
             && agent.realm_count.get() == 1
+            // A termination request stops the next call: the cached leaf must
+            // not run, and the general core below is the one that refuses it.
+            && !agent.is_terminating()
         {
             let entry = cell.entry.clone();
             if agent.jit_hook.is_some() {
@@ -12699,6 +12712,14 @@ impl Vm {
         below: usize,
         leaf_cache: LeafCacheSite,
     ) -> Result<(), JsError> {
+        // A termination request stops the next call. Every arm below starts
+        // new execution — the leaf inline, a registered builtin's handler —
+        // and none of them may start once the request is up; the general
+        // path ends at `call_inner`, whose own check point is too late for
+        // the arms that return before it.
+        if agent.is_terminating() {
+            return Err(crate::agent::termination_error());
+        }
         let n = self.stack.len();
         let arg_start = n - argc;
         // Cut 25: inline a certified leaf call onto this Vm. The eligibility
