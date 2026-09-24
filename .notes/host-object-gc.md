@@ -1,18 +1,22 @@
 # Host objects and L2: traced host state, finalizers, weak handles
 
-**Status correction (2026-09-21): none of this is in the tree.** This note
-formerly opened by saying slices 1-3 had shipped, and its §6 described them in
-the past tense with named tests. All of it was written, reviewed, and reverted,
-and the tree says so:
+**Status (2026-09-24): slice 1 is in the tree; slices 2-4 are not.** Slice 1 — the
+`ffi` handle-table rooting, §4.4 and the urgent part — landed with this note's own
+regression tests (`ffi`'s `a_retained_value_survives_a_collection` and
+`a_retained_string_survives_a_collection`, `crux`'s
+`a_registered_root_source_keeps_its_boxes_alive`); `.notes/embedding.md` §7 has the
+record and §9 its item 27. The rest was written, reviewed, and reverted: read every
+other "landed" below as "designed and specified", and the tree agrees:
 `grep -rn 'host_object_retain\|host_object_release\|run_finalizers\|request_finalize\|PENDING_FINALIZERS\|HostObject\|a_host_objects_retained_edge_roots_its_value' crates/`
 returns nothing, `ObjectKind::Host` is still `Rc<dyn HostOps>`
 (`crates/crux/src/object.rs:469`), and `HostOps` still has no `trace` and no
 `finalize`. `.notes/embedding.md` §5's L2 row and §4's acceptance test carried the
-same false claim and are corrected the same way.
+same false claim about *those* slices and are corrected the same way, with slice 1
+named as landed in both.
 
-What is below is therefore a *design*: the problem (§1), what L2 has to provide
-(§2), the options (§3), the design of the chosen one (§4), the acceptance criteria
-(§5) and the slices (§6). Read every "landed" in §6 as "designed and specified".
+What is below is the design: the problem (§1), what L2 has to provide (§2), the
+options (§3), the design of the chosen one (§4), the acceptance criteria (§5) and
+the slices (§6).
 
 L2 is the ladder level where "the host owns objects JS retains, and those objects
 reference JS values" (`.notes/embedding.md` §5).
@@ -243,20 +247,27 @@ surface and its compat test asserts the old behaviour, so wiring it to
 weak machinery (`Agent::weak_ref_targets`, `heap::note_ephemeron`) and the GC-4
 rule that the dead set comes from the *precise* mark. Not started.
 
-### Slice 1 — designed; reverted, not in the tree
+### Slice 1 — landed
 
 The slice registers the `ffi` tables as a root source so a value a host holds
-through them is marked rather than swept. **Not in the tree**: `crux::heap` has
-`pin`/`pinned_roots` and nothing else, and `crux::heap::pin` is called from
-`runtime`'s `api::Global` and `api::Module` only (`grep -rn 'heap::pin' crates/`).
+through them is marked rather than swept. `crux::heap` gained the registry —
+`RootSource`, `register_root_source` (idempotent by address), consulted by
+`pinned_roots` beside the pins, which all three collection entry points already go
+through — and `ffi::tables` registers one `'static` source visiting both tables
+through the `Trace` each entry implements, at the first retention on a thread. A
+source reads a table and cannot call back into the registry, which is why the
+registry borrow is held across the visit; a table's own borrow cannot be live
+either, because nothing in `insert`/`get`/`remove` allocates in the arena and so
+nothing can collect inside them.
 
-**The defect it would demonstrate.** Removing the registration is the mutation
-check: `a_retained_value_survives_a_collection` would fail with the aliasing §1(a)
-predicts — the retained ref resolving to whatever object reused the swept slot.
-The mechanism itself is covered precisely (with the collector's own liveness flag)
-in `crux`'s `a_registered_root_source_keeps_its_boxes_alive`; the `ffi` test is
-the end-to-end one and shares the weaker slot-reuse detector with the L1 notes
-rather than the flag.
+**The defect it demonstrates, measured before the fix.** Removing the registration
+*is* the mutation check: with it removed, `a_retained_value_survives_a_collection`
+reports `a value the host still holds was swept: [2814056702016]` and the string
+test reports its rope's three part boxes — the aliasing §1(a) predicted, and the
+reason this note writes the test first. The mechanism itself is covered precisely
+(with the collector's own swept set) in `crux`'s
+`a_registered_root_source_keeps_its_boxes_alive`; the `ffi` tests are the
+end-to-end ones.
 
 Re-certified after the change (`crux::heap` is in the sweep graph, so unlike the
 façade work this required a re-sweep): test262 48,464 + 3,205 = **51,669 pass of

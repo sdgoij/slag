@@ -1361,13 +1361,58 @@ pub fn pin_handle<T: Trace>(handle: crate::handle::Handle<T>) -> Pin {
     Pin { any: Some(any) }
 }
 
-/// The precise roots for a collection: the caller's, plus every pin.
+/// A source of precise roots the collector consults at every collection.
 ///
-/// Every collection entry point seeds its mark through this, so a pin cannot be
-/// lost by taking a path that collects.
+/// A handle table that lives outside the heap — a C surface's thread-local
+/// tables, most of all — keeps its boxes alive through this, without the engine
+/// having to own the table: the source reports the boxes it holds and the mark
+/// starts from them like from any other root. A source must not call back into
+/// the registry, and must not allocate in the arena, because it runs while a
+/// collection is starting.
+pub trait RootSource {
+    /// Report the boxes this source holds, as roots.
+    fn roots(&self, visit: &mut dyn FnMut(GcAny));
+}
+
+thread_local! {
+    /// The root sources registered on this thread, in registration order. A
+    /// `Value` is neither `Send` nor `Sync`, so a source's data is per-thread
+    /// and so is the registry: a worker thread's tables root that thread's
+    /// heap, and nothing else.
+    static ROOT_SOURCES: RefCell<Vec<&'static dyn RootSource>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Register `source` as a source of precise roots for this thread.
+///
+/// Registering the same source twice is a no-op, so a table can register at
+/// first use without having to remember whether it already did.
+pub fn register_root_source(source: &'static dyn RootSource) {
+    ROOT_SOURCES.with(|sources| {
+        let mut sources = sources.borrow_mut();
+        if sources
+            .iter()
+            .any(|registered| std::ptr::eq(*registered, source))
+        {
+            return;
+        }
+        sources.push(source);
+    });
+}
+
+/// The precise roots for a collection: the caller's, plus every pin, plus
+/// everything a registered [`RootSource`] holds.
+///
+/// Every collection entry point seeds its mark through this, so neither a pin
+/// nor a registered table can be lost by taking a path that collects.
 fn pinned_roots(roots: &[GcAny]) -> Vec<GcAny> {
     let mut all = roots.to_vec();
     PINNED.with(|pinned| all.extend(pinned.borrow().iter().copied()));
+    ROOT_SOURCES.with(|sources| {
+        for source in sources.borrow().iter() {
+            source.roots(&mut |any| all.push(any));
+        }
+    });
     all
 }
 
@@ -2978,6 +3023,59 @@ mod tests {
             crate::value::ValueKind::String(handle) => handle.as_any().addr(),
             other => panic!("expected a string value, got {other:?}"),
         }
+    }
+
+    /// A registered root source keeps its boxes alive exactly as a pin does. It
+    /// is the mechanism a handle table outside the heap uses — the `ffi` tables a
+    /// `JSValueRef` is an id into — and it is pinned precisely: `Heap::collect`
+    /// does not scan, so the only questions are membership in the swept set, and
+    /// the registry is consulted rather than remembered.
+    #[test]
+    fn a_registered_root_source_keeps_its_boxes_alive() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        thread_local! {
+            static SOURCE_ROOTS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+        }
+        struct TestSource;
+        impl RootSource for TestSource {
+            fn roots(&self, visit: &mut dyn FnMut(GcAny)) {
+                SOURCE_ROOTS.with(|roots| {
+                    for value in roots.borrow().iter() {
+                        value.trace(visit);
+                    }
+                });
+            }
+        }
+        static TEST_SOURCE: TestSource = TestSource;
+        register_root_source(&TEST_SOURCE);
+
+        let sourced = Value::String(Handle::new(JsString::from_utf8("sourced")));
+        let peer = Value::String(Handle::new(JsString::from_utf8("peer")));
+        let sourced_box = string_box_addr(sourced);
+        let peer_box = string_box_addr(peer);
+        SOURCE_ROOTS.with(|roots| roots.borrow_mut().push(sourced));
+
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            !swept.contains(&sourced_box),
+            "a registered source's box was swept: {swept:?}"
+        );
+        assert!(
+            swept.contains(&peer_box),
+            "a box no source holds survived: {swept:?}"
+        );
+
+        // Emptying the source puts the box back where an unsourced collection
+        // can reach it: what the collector consults is the source's *answer*.
+        SOURCE_ROOTS.with(|roots| roots.borrow_mut().clear());
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&sourced_box),
+            "an emptied source still rooted the box: {swept:?}"
+        );
     }
 
     /// A handle a host keeps in its own memory is invisible to the conservative
