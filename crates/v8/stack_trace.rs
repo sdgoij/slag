@@ -257,10 +257,14 @@ mod tests {
                     .unwrap_or_else(|| "-".into());
                 assert!(!frame.is_eval() && !frame.is_constructor() && !frame.is_wasm());
                 assert!(frame.is_user_javascript());
-                assert_eq!(frame.get_line_number(), 0, "no position is tracked");
-                assert_eq!(frame.get_column(), 0);
                 assert_eq!(frame.get_script_id(), 0);
-                format!("{function}@{script}")
+                // The site is part of the record now: `line:column`, 1-based,
+                // which is what a host reads a frame's position from.
+                format!(
+                    "{function}@{script}:{}:{}",
+                    frame.get_line_number(),
+                    frame.get_column()
+                )
             })
             .collect();
         FRAMES.with(|seen| *seen.borrow_mut() = frames);
@@ -280,23 +284,48 @@ mod tests {
     ///   because the reader that wants it is a host's error stack (§7's frames
     ///   record), not only a sloppy body's mapped `arguments`;
     /// - a call whose body reads `arguments` names its frame the same way;
-    /// - the script the code came from is always a frame.
+    /// - the script the code came from is always a frame;
+    /// - every frame is *at* a site — the call it is about to make — so the frame
+    ///   carries a line and a column rather than V8's own `kNoLineNumberInfo`.
     ///
     /// See the module documentation and `.notes/embedding.md` §7/§9.
     #[test]
     fn a_capture_reports_the_engines_contexts_not_the_call_stack() {
+        let frames = capture_frames("function inner() { return capture(); } inner();");
         assert_eq!(
-            capture_frames("function inner() { return capture(); } inner();"),
-            ["inner@-", "-@-"],
-            "a certified call is an activation, and it is named"
+            frames.len(),
+            2,
+            "a certified call and the script: {frames:?}"
+        );
+        assert_frame(&frames[0], "inner", 1);
+        assert_frame(&frames[1], "-", 1);
+        let frames = capture_frames(
+            "function inner(a) { if (a) { return arguments; } return capture(); } inner(0);",
         );
         assert_eq!(
-            capture_frames(
-                "function inner(a) { if (a) { return arguments; } return capture(); } inner(0);"
-            ),
-            ["inner@-", "-@-"],
-            "a call whose body reads `arguments` names its frame too"
+            frames.len(),
+            2,
+            "a certified call and the script: {frames:?}"
         );
+        assert_frame(&frames[0], "inner", 1);
+        assert_frame(&frames[1], "-", 1);
+    }
+
+    /// One recorded frame: the function that named it, the line it is at, and the
+    /// name of the code it runs — which is unnamed here, because the source this
+    /// file compiles carries no origin name. The column is asserted to be present
+    /// rather than counted: what it must *be* is the site of the call the frame is
+    /// at, and the source that states it sits in the test above.
+    fn assert_frame(frame: &str, function: &str, line: usize) {
+        let (name, rest) = frame.split_once('@').expect("function@script");
+        let mut parts = rest.split(':');
+        let script = parts.next().expect("a script name");
+        let frame_line: usize = parts.next().expect("a line").parse().expect("a line");
+        let column: usize = parts.next().expect("a column").parse().expect("a column");
+        assert_eq!(name, function, "the frame's function name: {frame}");
+        assert_eq!(script, "-", "the code's name: {frame}");
+        assert_eq!(frame_line, line, "the line the frame is at: {frame}");
+        assert!(column > 0, "and the column of the site it is at: {frame}");
     }
 
     /// The frames a source produces when it calls `capture()`.
@@ -349,10 +378,15 @@ mod tests {
         });
 
         FRAMES.with(|seen| {
+            let seen = seen.borrow();
             assert_eq!(
-                seen.borrow().as_slice(),
-                &["-@file:///app/main.js".to_owned()],
-                "the module's top level is a frame, named by its host"
+                seen.len(),
+                1,
+                "the module's top level is the frame: {seen:?}"
+            );
+            assert!(
+                seen[0].starts_with("-@file:///app/main.js:"),
+                "named by its host, and at the site it runs: {seen:?}"
             );
         });
     }

@@ -156,7 +156,7 @@ pub(crate) fn stack_frames(agent: &Agent, limit: usize) -> Vec<StackFrame> {
         .rev()
         .filter(|context| is_frame(context))
         .take(limit)
-        .map(frame_of)
+        .map(|context| frame_of(agent, context))
         .collect()
 }
 
@@ -172,7 +172,8 @@ pub(crate) fn is_frame(context: &ExecutionContext) -> bool {
 }
 
 /// The frame an execution context reports.
-fn frame_of(context: &ExecutionContext) -> StackFrame {
+fn frame_of(agent: &Agent, context: &ExecutionContext) -> StackFrame {
+    let site = frame_site(context);
     StackFrame {
         function_name: context.function.as_ref().and_then(|value| {
             let ValueKind::Function(function) = value.kind() else {
@@ -183,10 +184,9 @@ fn frame_of(context: &ExecutionContext) -> StackFrame {
         // No name for a call the certified push did not record a callee in —
         // that slot is filled only for a sloppy mapped `arguments`; see the
         // module header.
-        script_name: script_name(context),
-        // No position is tracked per activation; see the module header.
-        line: 0,
-        column: 0,
+        script_name: script_name(agent, context),
+        line: site.map(|(line, _)| line).unwrap_or(0),
+        column: site.map(|(_, column)| column).unwrap_or(0),
         is_eval: false,
         is_constructor: false,
         is_wasm: false,
@@ -194,19 +194,60 @@ fn frame_of(context: &ExecutionContext) -> StackFrame {
     }
 }
 
-/// The name of the code a frame is running.
+/// The code a frame is running.
 ///
-/// A module carries the name its host compiled it under; a classic script
-/// carries none, because the engine parses one from text alone (`parse_script`
-/// takes a source and a realm) and the host's `ScriptOrigin` is not threaded
-/// through the eval path — an engine gap, recorded in `.notes/embedding.md`.
-fn script_name(context: &ExecutionContext) -> Option<String> {
-    match &context.script_or_module {
-        Some(ScriptOrModule::Module(module)) => {
-            module.name.as_ref().map(|name| name.to_string_lossy())
-        }
-        Some(ScriptOrModule::Script(_)) | None => None,
+/// A context carries a script or module when it *is* that code — a module's
+/// body, a script, an eval — and a call's context carries one only when the call
+/// took the slow path (`ordinary_call`, which computes the callee's or the
+/// caller's). A *certified* call pushes a context with neither, so a call falls
+/// back to the code its callee was created in, read off the function record:
+/// the same value the slow path would have written there.
+pub(crate) fn frame_code(agent: &Agent, context: &ExecutionContext) -> Option<ScriptOrModule> {
+    context.script_or_module.clone().or_else(|| {
+        let ValueKind::Function(function) = context.function.as_ref()?.kind() else {
+            return None;
+        };
+        agent
+            .ecma_functions
+            .get(&function.id())
+            .and_then(|record| record.declaring_script_or_module.clone())
+    })
+}
+
+/// The name of the code a frame is running (v8::StackFrame::GetScriptName): the
+/// name its host compiled it under, or `None` when it has none.
+///
+/// A module carries the name its host gave it. A classic script carries one too
+/// when the host named it — the `ScriptOrigin` name an `execute_script` takes —
+/// and an **empty** name is no name, which is what a host that compiles without
+/// an origin sends and what V8 answers *undefined* for; deno compiles its own
+/// test scripts that way.
+pub(crate) fn script_name(agent: &Agent, context: &ExecutionContext) -> Option<String> {
+    match frame_code(agent, context)? {
+        ScriptOrModule::Module(module) => module.name.as_ref().map(|name| name.to_string_lossy()),
+        ScriptOrModule::Script(script) => script
+            .name
+            .as_ref()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string_lossy()),
     }
+}
+
+/// The site a frame is at — the call it is about to make, or the throw it
+/// raised — as a 1-based line and column, or `None` when the frame records no
+/// site.
+///
+/// `SourceText` counts UTF-16 units, which is what V8's columns count, and the
+/// site comes from the context's own `position`, which [`set_site`] publishes
+/// before every call the body makes (`ir.rs`).
+///
+/// [`set_site`]: crate::ir::Vm::set_site
+pub(crate) fn frame_site(context: &ExecutionContext) -> Option<(usize, usize)> {
+    let span = context.position?;
+    let source = context.source.as_ref()?;
+    let text = syntax::SourceText::from_utf8(&source.to_string_lossy());
+    let location = text.line_column(span.start);
+    Some((location.line as usize, location.column as usize))
 }
 
 #[cfg(test)]

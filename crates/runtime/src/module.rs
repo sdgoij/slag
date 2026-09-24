@@ -4009,14 +4009,12 @@ mod tests {
             vec!["boom", ""],
             "innermost first, and the module's own top level has no function name"
         );
-        // The module's own body is the frame that names the module a host
-        // compiled it under: a call inside it records no script or module of its
-        // own, which is the same hole the engine's rendering has, and deno's
-        // source-map lookup reads the name off the frame that has one.
-        assert_eq!(
-            seen[1].script_name.as_deref(),
-            Some("file:///m.js"),
-            "the module body's frame names the module"
+        assert!(
+            seen.iter()
+                .all(|frame| frame.script_name.as_deref() == Some("file:///m.js")),
+            "every frame names the module: the module body from its own context, \
+             and the certified call from the code its callee was created in \
+             ({seen:?})"
         );
         assert_eq!(seen[0].line, 1, "the site the throw came from");
         assert_eq!(seen[1].line, 2, "and the module body's own site");

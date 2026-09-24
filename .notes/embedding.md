@@ -4310,6 +4310,16 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` green (`runtime` **911**, `v8` **248**, `crux` 249, `test262` 3324, 0 failed anywhere). The corpora were re-run because the capture sits on every error construction: the wasm sweeps reproduce their baselines exactly — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail** — and test262 `all` re-ran clean on this tree with the baseline's skip summary (48,464 pass, 0 fail, 0 crash, 0 hang, 158 skip of 48,622), confirmed by the operator: the run's own summary line was cut from this session's capture after the sweep had already finished, and the lesson is to keep the line rather than re-run a green sweep to re-read it.
 
+*A frame knows the code it runs and the site it is at — §9's bullet that named it, and §12 item 16's naming half.* Two frame views disagreed with V8 in the same two ways, so the rule moved into one place. `define_stack` named a frame's file only for a *module*, and `api::stack_trace::frame_of` — the view `v8::StackTrace` and `v8::StackFrame` are — answered line 0 and column 0 "always" and named modules only. Both now ask `api::stack_trace` for the same three things: `frame_code` (the context's own script or module, or — for a *certified* call, whose push in `ir.rs` carries neither — the code the callee was created in, read off the function record's `declaring_script_or_module`), `script_name` (a module's host-given name, or a script's, with an **empty** name meaning no name, which is how deno's own harness compiles the scripts whose lines must keep reading `at <anonymous>:4:7`), and `frame_site` (the context's `position` resolved against its `source`, which is what `set_site` publishes before every call). One rule, one place, two readers.
+
+*The measurement.* deno's suite moves **440 passed / 19 failed → 441 passed / 18 failed**: `runtime::tests::misc::test_resolve_promise::case_3` passes, and no test is newly red. `Error.stack` now reads `at file:///filename.js:5:7` where it read `at <anonymous>:5:7`. `test_call_site` does **not** pass, and the measurement says why in one line: its three assertions are `fileName`, `lineNumber` and `columnNumber`, and the first two now hold while the third reads 18 where V8 answers 28 — the `c` of `currentUserCallSite` in `      const cs = Deno.core.currentUserCallSite();`. A *plain* call agrees (`assert(...)` at `5:7`), so the divergence is the member form alone: V8's `CallProperty` bytecode carries the property token's position, this engine's `Step::CallFast`/`Call` carries `call.span`, the whole expression, and the parser's `MemberExpr` keeps only that span. Carrying a property span through the parser, the AST and the lowering is a parser change rather than a line, so it is §12 item 17 rather than a ride on this one.
+
+*And §12 item 16's own cause was wrong, which the measurement corrected.* It said `test_dynamic_import_module_error_stack` wanted a frame of a call inside a module. It wants **any frame at all**: the error reads `Uncaught (in promise) TypeError: foo` with an empty stack, because an async op's rejection is turned into a JS error by deno's Rust code while no execution context is on the stack — the suspended module body's context lives in its async state, not on the stack. That is V8's *async stack traces*, the awaiting chain V8 attaches to a promise, and `test_stalled_tla` and `test_promise_rejection_handler::case_04` are the same shape. Corrected in place there, and left as its own item.
+
+*Tests — two mutations, each caught.* The two engine tests from the previous part already assert names and sites on the frames a host is handed, so they pin this rule directly: dropping the callee fallback from `frame_code` fails both (`a script the host named gives that name to its frames`, `every frame names the module: ... and the certified call from the code its callee was created in`), and making `frame_site` answer `None` fails both on the site (`left: 0, right: 1` / `and the frame is at the call site, not at column zero`). The bridge's `stack_trace` tests pinned the *old* rule — `assert_eq!(frame.get_line_number(), 0, "no position is tracked")` — and now record the site in the frame string and assert it: `a_capture_reports_the_engines_contexts_not_the_call_stack` asserts each frame's function, the line it is at, and that a column is present, and `a_modules_frames_carry_the_name_it_was_compiled_under` asserts the module frame's name plus its site. The api view's own mapping (`frame_of` reading those helpers) is pinned by deno's `test_call_site` rather than by an engine test: reaching it needs a live stack inside a realm, and the previous session's `record_stack` hook lives in the bridge, where the same helpers are exercised through `v8::StackTrace`.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` **5,315 passed / 0 failed** (`runtime` 908, `v8` 249, `crux` 249). The corpora were re-run because the change moves text a host prints and positions a frame reports: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622), and the wasm sweeps reproduce theirs — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7308,6 +7318,34 @@ migrate, then delete.
   V8 method left out: nothing in an execution context records the activation's
   receiver, so there is no honest value to answer, and only a host that patches
   call sites itself would reach for it.
+- **A frame knows the code it runs and the site it is at — named here before the
+  edit, and it is §12 item 16 measured twice.** Two frame views exist and they
+  disagree with V8 in the same two ways. The **error-stack** view
+  (`define_stack`) names a frame's file only for a module, so a call inside a
+  module reads `at greet:2:9` where V8 reads `at greet (file:///test.js:2:9)`,
+  and a call site built from it answers `getFileName` with *undefined* for the
+  frame nearest the error — which is what deno's `apply_source_map` keys on, so
+  the frame the four source-map tests needed was the module body's, the only one
+  with a name. The **host-facing** frame view (`api::stack_trace::frame_of`,
+  which `v8::StackTrace` and `v8::StackFrame` are) answers line 0 and column 0
+  "always" and names modules only, and deno reads exactly that:
+  `op_current_user_call_site` (`libs/core/ops_builtin_v8.rs:1513`) takes the
+  first frame of `v8::StackTrace::current_stack_trace` whose `get_script_name`
+  starts with `file:` and answers its `get_line_number`/`get_column`, so deno's
+  `test_call_site` — whose script asserts `fileName === "file:///filename.js"`,
+  `lineNumber === 2`, `columnNumber === 28` — fails on the *first* of the three
+  (`cs.fileName` reads `[unknown]`). Both views are answered from the same
+  contexts, so the fix is one rule in one place: a frame's code is the context's
+  own script or module, or — for a call, whose context carries neither — the one
+  its callee was created in (the function record's
+  `declaring_script_or_module`, the referrer work's field), and a frame's site
+  is the context's `position` resolved against its `source`, which is what
+  `set_site` publishes before every call. A script's name comes from its
+  `ScriptRecord`'s `name`, which the referrer work added, and an **empty** name
+  is no name: deno's `execute_script("")` is how its own harness compiles the
+  scripts whose stack lines must keep reading `at <anonymous>:4:7`. The rendered
+  text then gains a file exactly where V8 prints one — a change to `Error.stack`
+  for named scripts and for calls inside modules, measured as such.
 
 ## 11. Working rules
 
@@ -7730,4 +7768,38 @@ migrate, then delete.
    measured, not A/B'd against a pre-change binary, so it was recorded as *revealed* (the
    earlier termination hang masked it) rather than proven unrelated.
 15. **`prepareStackTrace`: an error's `stack` is the host's to format — landed.** §7's record has the shapes, the two mutations and the gates. Deno installs the isolate-level callback (`libs/core/runtime/setup.rs:287`, `crate::error::prepare_stack_trace_callback`), and it used to be accepted and not run (`crates/v8/isolate.rs`, "Accepted and not run: the engine builds an error's stack itself, with no host hook in the path"). That was the whole of the source-map cluster's remaining half: deno reads `#callSiteEvals` (a private name, which landed) and, when it is empty, keeps the engine's own `Error.stack` string verbatim, so the generated position showed where the mapped one belonged. The parts, as measured: (a) the engine's `%get Error.prototype.stack%` accessor (`crates/runtime/src/builtins/error.rs`) asks the host hook and answers its value, as V8 does, and its default `None` keeps the engine's own rendering; (b) the engine's `define_stack` captures the frames beside the string it renders (`Agent::error_stack`'s `ErrorStack`), because a read may come long after the stack moved on; (c) the bridge builds the call-site objects V8 hands the hook — a prototype per isolate with the fifteen method functions, one object per frame carrying its data in private names, and the host callback stored as a monomorphic fn item, the `set_wasm_streaming_callback` pattern, since the crate's `PrepareStackTraceCallback<'s>` alias names the caller's scope lifetime and cannot be a field. `getThis` is the one V8 method left out: nothing in an execution context records the activation's receiver, so there is no honest value to answer.
-16. **A call frame records no script or module of its own — open, measured.** The module's own body context carries the module; a call *inside* it does not, so a frame for a call answers `getFileName` with *undefined* where V8 names the module, and the engine's rendered line shows the same hole (`Error.stack` reads `at greet:2:9` and `at <anonymous> (file:///test.js:5:1)` for one throw). Deno's source-map lookup reads the name off the frame that has one, which is why the four source-map tests do not wait on it, but its `test_dynamic_import_module_error_stack` wants an `at async file:///import.js:1:43` for a frame of exactly this shape, and a host formatter that keys on the frame's own file name gets nothing for the frame nearest the error. The data exists — the function record's `declaring_script_or_module` (the referrer work) names the code a function was made in, and `context.function` is on every certified call — so the fix is to read the frame's code from the context or the function, whichever has it. It is a decision rather than a line for the same reason §12 item 10 was: it changes `Error.stack`'s text for every call inside a module.
+16. **A frame knows the code it runs and the site it is at — landed, with one
+   convention left open (§17).** Two frame views disagreed with V8 in the same
+   two ways and are now answered by one rule: `api::stack_trace::frame_code`,
+   `script_name` and `frame_site`, shared with `define_stack`. A frame's code is
+   the context's own script or module, or — for a *certified* call, whose push
+   carries neither — the code its callee was created in (the function record's
+   `declaring_script_or_module`), and its site is the context's `position`
+   resolved against its `source`. A script's name comes from its `ScriptRecord`
+   (the referrer work's field), and an empty name is no name: deno's
+   `execute_script("")` compiles its own harness scripts that way. Measured,
+   deno's `test_resolve_promise::case_3` flips (440/19 → 441/18) and `Error.stack`
+   reads `at file:///filename.js:5:7` where it read `at <anonymous>:5:7`.
+   **The cause this item first stated was wrong, and the measurement corrected
+   it.** `test_dynamic_import_module_error_stack` does not want a *named* frame —
+   it has **no frames at all**: the error reads `Uncaught (in promise) TypeError:
+   foo` with an empty stack, because an async op's rejection is turned into a JS
+   error by deno's Rust code while **no execution context is on the stack** (the
+   suspended module body's context lives in its async state, not on the stack).
+   What it wants is V8's *async stack traces* — the awaiting chain V8 attaches to
+   a promise — and `test_stalled_tla` and
+   `test_promise_rejection_handler::case_04` are the same shape. That is a
+   larger, separate item.
+17. **A member call's column is V8's name token, not the call's start — open,
+   measured.** deno's `test_call_site` asserts that `currentUserCallSite()`
+   answers `fileName === "file:///filename.js"`, `lineNumber === 2`,
+   `columnNumber === 28` for the call written `      const cs =
+   Deno.core.currentUserCallSite();` — column 28 is the `c` of the property name,
+   where this engine reports the call expression's start (column 18). The other
+   two now pass, and a *plain* call agrees (`assert(...)` at `5:7`, V8's own
+   value). The divergence is the member form alone: V8's `CallProperty` bytecode
+   carries the property token's position, while `Step::CallFast`/`Call` carries
+   `call.span` — the whole expression — and the parser's `MemberExpr` keeps only
+   that span. Closing it means carrying the property's own span through the
+   parser, the AST and the lowering, so it wants its own §9 bullet and a corpus
+   re-sweep.

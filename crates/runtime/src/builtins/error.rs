@@ -617,26 +617,12 @@ fn define_stack(
                 _ => None,
             })
             .map(|name| name.to_string_lossy());
-        // A module frame names its file; a script frame has none to give (the
-        // engine's scripts record no name), so the two shapes differ.
-        let file = match context.script_or_module.as_ref() {
-            Some(crate::context::ScriptOrModule::Module(module)) => {
-                module.name.as_ref().map(|name| name.to_string_lossy())
-            }
-            _ => None,
-        };
-        // The frame's own site — the call it is at, or the throw it raised —
-        // resolved against the text of the code running in it. V8's shape for a
-        // frame with no file name is `at name:line:column`, and the offsets its
-        // spans count are UTF-16 units, which is what `SourceText` counts.
-        let site = match (context.position, context.source.as_ref()) {
-            (Some(span), Some(source)) => {
-                let text = syntax::SourceText::from_utf8(&source.to_string_lossy());
-                let location = text.line_column(span.start);
-                Some((location.line as usize, location.column as usize))
-            }
-            _ => None,
-        };
+        // The code the frame runs: a module names the name its host gave it, a
+        // script its origin's name when it has one, and a call the code its
+        // callee was created in — the same rule the host-facing frame view
+        // answers (`api::stack_trace`), so a call site and this line agree.
+        let file = crate::api::stack_trace::script_name(agent, context);
+        let site = crate::api::stack_trace::frame_site(context);
         // The line the trace shows: the frame's own name, `<anonymous>` when its
         // function has none (a module's top level among them), then the site in
         // parentheses when there is one.

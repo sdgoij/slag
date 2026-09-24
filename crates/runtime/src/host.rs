@@ -376,9 +376,13 @@ mod tests {
             "innermost first, and the script's own top level has no function name"
         );
         assert!(
-            seen.iter().all(|frame| frame.script_name.is_none()),
-            "a classic script carries no name (the engine parses one from text \
-             alone), so its frames name none: {seen:?}"
+            seen.iter()
+                .all(|frame| frame.script_name.as_deref() == Some("file:///host.js")),
+            "a script the host named gives that name to its frames: {seen:?}"
+        );
+        assert_eq!(
+            seen[0].column, 26,
+            "and the frame is at the call site, not at column zero"
         );
         assert_eq!(seen[0].line, 1, "the frame sits on the line it threw from");
         assert!(seen[0].column > 0, "and at the site, not at column zero");
