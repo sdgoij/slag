@@ -4349,6 +4349,14 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,319 passed / 0 failed** (`runtime` 912, `v8` 251, `crux` 249, `test262` 3324). The corpora were re-run for the engine change and reproduce their baselines exactly: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622, and the wasm sweeps core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail**. The one edit made after that sweep run is a `#[cfg(test)]` function and the doc comments around it, so the release binaries the sweeps and deno link are the ones those numbers came from.
 
+*A supplied code cache is consumed when it is the source it was made from — §9's bullet that named it, and the last half of §12 item 11.* The bridge's cache bytes are the code's own source text (there is no compiled form to serialize), which makes validity checkable in the one sense that matters, and the first cut did not check it: `CachedData` was constructed refused and never changed its answer, so a host that handed a cache back was always told it had been refused. V8's flag is the *compile*'s answer (`cached-data.h`: `bool rejected_ = false;`), so the compile is where the answer is made now: `Source::consume_cached_data` compares the bytes the source was handed with the text being compiled — `compile_function` with the text it wraps, which is what `Function::create_code_cache` reads back — and `CachedData::record_consumption` records a refusal when they differ. Equal bytes are a consumed cache. The engine parses the source it was handed either way, so nothing about a compile changes; what changes is a host's bookkeeping, and that is what the two failures were: `deno_core` asks the flag to decide whether to *re-produce* a cache, so an always-refused answer made it rewrite the cache it had just handed in.
+
+*The measurement.* deno's suite moves **442 passed / 17 failed → 444 passed / 15 failed**: `modules::tests::test_load_with_code_cache` — a runtime given every module's cache must produce none of its own — and `runtime::tests::misc::eval_context_with_code_cache`, the same question for an eval context, both pass, and no test is newly red. The remaining 15 are the set the previous record listed.
+
+*Tests — three, and two mutations, each caught.* `a_matching_cache_is_consumed_and_other_code_is_refused` (`crates/v8/script_compiler.rs`) pins both directions of the compile's answer: data that is the text compiled is consumed, data made from other code is refused, and the compile succeeds either way. `a_code_cache_round_trips_through_the_next_compile` pins the producers against the comparison — a script's and a module's `create_code_cache` bytes are consumed by the next compile of the same code, which is deno's shape — and `a_scripts_cache_is_its_source_and_a_compile_consumes_it` (`crates/v8/unbound_script.rs`) replaces the test that pinned the old policy. Two mutations, each caught: recording every consumption as a refusal fails both new tests (`the compile consumed data that is the text it compiled`, `the cache a script produced is consumed by the next compile`), and recording every consumption as a use fails on the refusal (`data that is not the text compiled is refused`).
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,320 passed / 0 failed**. The corpora were not re-run, and that is a measurement rather than an omission: `crates/v8` is the bridge, and neither runner links it — `cargo tree --locked -p test262 -e normal` and the same for `wasmtest` each answer no `v8 v150` — so no sweep binary contains this change, unlike the engine edits the preceding records re-ran the battery for.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -5228,13 +5236,17 @@ if that proves possible.
   **Decision: `create_code_cache` answers `Some(CachedData)` whose bytes are the
   code's own source text.** The engine keeps no compiled form to serialize — it
   parses and evaluates in one pass — and V8's own contract makes the bytes
-  opaque to a host, while `CachedData::rejected()` answers `true` here always
-  (`crates/v8/script_compiler.rs`), so the flag keeps its meaning: a host that
-  trusts it re-produces, and nothing is ever believed that was not checked. The
-  cost is stated rather than hidden: a host's cache database holds a copy of the
-  source and the round trip saves nothing. A cache that saves something means
-  serializing the engine's compiled program, which §10 lists as engine-side
-  build-order work — not something a bridge can fake into being faster.
+  opaque to a host. The flag follows V8's shape rather than the first cut's:
+  `CachedData` starts **unrejected** (`cached-data.h`: `bool rejected_ =
+  false;`) and the *compile* is what refuses it — here by comparing the bytes it
+  was handed with the text it is compiling, so a host's cache for this code is
+  consumed and a cache for other code is refused. The first cut answered `true`
+  always, which made `deno_core` rewrite a cache it had just handed in (two of
+  its tests measure that; §7's last record has the numbers). The cost is stated
+  rather than hidden: a host's cache database holds a copy of the source and the
+  round trip saves nothing. A cache that saves something means serializing the
+  engine's compiled program, which §10 lists as engine-side build-order work —
+  not something a bridge can fake into being faster.
 
   **Engine change, named — two exposures, no new state:**
   `api::Isolate::function_source(function)` reads the definition text
@@ -5257,7 +5269,9 @@ if that proves possible.
   **Landed, 12 → 6** (§7 records it): the six sites resolve, six bridge tests
   guard the six mutations that would silently break them, and the engine's two
   exposures changed no behaviour (the battery ran anyway and reproduced every
-  certified number).
+  certified number). **The consumption half landed after that**, in the shape
+  above: the compile records whether the data it was handed is the text it
+  compiled, which moved `deno_core`'s suite from 442 passed / 17 failed to 444 / 15.
 12. **The stack-trace frames — the plan's named next engine item, and its survey
   splits it in two.** `StackTrace::current_stack_trace` (2 sites:
   `libs/core/ops_builtin_v8.rs:1518`, `libs/core/modules/import_graph.rs:164`) needs
@@ -7435,6 +7449,22 @@ migrate, then delete.
   `define_stack`, the engine's own rendering), so host and engine agree on what
   a frame is called. The *site* half stays open: a class method's frame carries
   none, and it is item 19's remaining measurement.
+- **A supplied code cache is consumed when it is the source it was made from —
+  named here before the edit, and it supersedes the "inert" policy above.**
+  This bridge's bytes *are* the code's own source text, which makes validity
+  checkable in the only sense that matters: the compile compares the bytes it
+  was handed with the text it is compiling (for `compile_function`, the text it
+  wraps). Equal bytes are a consumed cache — `CachedData::rejected()` answers
+  `false` after the compile — and unequal bytes are a refusal. That is V8's own
+  shape, which the old policy inverted: V8's `CachedData` starts unrejected
+  (`cached-data.h`: `bool rejected_ = false;`) and the *compile* refuses it,
+  where this bridge started every cache refused and never changed the answer.
+  The engine parses the source it was handed either way, so the flag changes
+  only a host's bookkeeping — and that bookkeeping is what the two tests
+  measure: `deno_core`'s module map and its eval-context path ask the flag to
+  decide whether to *re-produce* a cache, so answering "refused" always made a
+  host rewrite a cache it had just handed in
+  (`modules/tests.rs:2577`, `runtime/tests/misc.rs:1692`).
 
 ## 11. Working rules
 

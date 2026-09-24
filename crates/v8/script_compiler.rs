@@ -13,14 +13,15 @@
 //!   function;
 //! - a code cache round-trips — it is stored, handed back, and readable — and
 //!   [`create_code_cache`](crate::UnboundScript::create_code_cache) produces
-//!   one, but nothing *consumes* it: [`CachedData::rejected`] answers `true`
-//!   always, so a host that trusts it re-produces its cache. That is the safe
-//!   direction: it costs a re-parse, where believing a cache the engine cannot
-//!   use would cost correctness. What the produced bytes are is stated where
-//!   they are made (`crates/v8/unbound_script.rs`), and why they have to exist
-//!   at all is recorded in `.notes/embedding.md` (the ledger's item 11):
-//!   `deno_core`'s module map asks for one on every load and turns `None` into
-//!   a failed load.
+//!   one, whose bytes are the code's own source text. A compile given one
+//!   *checks* it rather than believing it: the data is consumed
+//!   ([`CachedData::rejected`] answers `false`) when its bytes are the text
+//!   being compiled, and refused when they are not — which is V8's own shape,
+//!   the compile refusing data it cannot use. So a host's cache is a copy of
+//!   the source, the round trip saves nothing, and no cache is ever trusted
+//!   about code it does not spell out. What a real one would save means
+//!   serializing the engine's compiled program, which `.notes/embedding.md`
+//!   §10 lists as engine-side build-order work.
 
 use std::cell::Cell;
 use std::ops::Deref;
@@ -88,6 +89,21 @@ impl Source {
     pub fn get_cached_data(&self) -> Option<&CachedData<'_>> {
         self.cached_data.as_ref()
     }
+
+    /// Whether `text` — the text this source is being compiled *as* — is what
+    /// the data it was given was made from, recorded on the data the way V8's
+    /// compile records a refusal (`CachedData::rejected_`).
+    ///
+    /// The two compiles that take the text as they find it pass their own;
+    /// [`compile_function`] wraps its text first and passes the wrapped form,
+    /// because that is what the function it produces is made of, which is also
+    /// what [`Function::create_code_cache`](crate::Function::create_code_cache)
+    /// reads back.
+    fn consume_cached_data(&self, text: &[u8]) {
+        if let Some(cached_data) = &self.cached_data {
+            cached_data.record_consumption(text);
+        }
+    }
 }
 
 /// The text a string handle holds.
@@ -124,7 +140,7 @@ impl<'a> CachedData<'a> {
     pub fn new(data: &'a [u8]) -> UniqueRef<Self> {
         UniqueRef::new(Self {
             data: CacheBytes::Borrowed(data),
-            rejected: Cell::new(true),
+            rejected: Cell::new(false),
         })
     }
 
@@ -135,7 +151,7 @@ impl<'a> CachedData<'a> {
     pub(crate) fn owned(data: Vec<u8>) -> UniqueRef<Self> {
         UniqueRef::new(Self {
             data: CacheBytes::Owned(data),
-            rejected: Cell::new(true),
+            rejected: Cell::new(false),
         })
     }
 
@@ -147,13 +163,25 @@ impl<'a> CachedData<'a> {
         }
     }
 
-    /// Whether the engine refused this data
+    /// Whether the compile refused this data
     /// (`v8::ScriptCompiler::CachedData::rejected`).
     ///
-    /// Nothing here consumes it, so it is refused from the start; see the
-    /// module documentation.
+    /// V8's flag is unset until a compile sets it (`cached-data.h`:
+    /// `bool rejected_ = false;`), and so is this one. What refusing means here
+    /// is stated by [`Source::consume_cached_data`]: the bytes are not the text
+    /// being compiled. So a host that hands back the cache for the code it is
+    /// compiling is told the data was used, and one that hands back a cache for
+    /// other code is told it was refused — where a cache is refused, the host
+    /// re-produces it, and where it is consumed, V8 leaves the host's copy
+    /// alone for the same reason.
     pub fn rejected(&self) -> bool {
         self.rejected.get()
+    }
+
+    /// Record whether `text` is what this data was made from — the compile's
+    /// answer, which V8 writes the same way (`CachedData::rejected_`).
+    pub(crate) fn record_consumption(&self, text: &[u8]) {
+        self.rejected.set(self.bytes() != text);
     }
 }
 
@@ -215,6 +243,7 @@ pub fn compile<'s>(
     _options: CompileOptions,
     _no_cache_reason: NoCacheReason,
 ) -> Option<Local<'s, Script>> {
+    source.consume_cached_data(source.text.as_bytes());
     match Script::parse(scope, &source.text, source.origin.name.clone()) {
         Ok(script) => Some(script),
         Err(error) => {
@@ -252,6 +281,7 @@ pub fn compile_module2<'s>(
 ) -> Option<Local<'s, Module>> {
     let realm = crate::realm_of(scope);
     let name = source.origin.name.clone();
+    source.consume_cached_data(source.text.as_bytes());
     match api::Module::compile_with_name(&realm, "", name.as_deref(), &source.text) {
         Ok(module) => Some(Local::from_module(module)),
         Err(error) => {
@@ -285,6 +315,7 @@ pub fn compile_function<'s>(
         .collect::<Vec<_>>()
         .join(", ");
     let text = format!("(function ({parameters}) {{\n{}\n}})", source.text);
+    source.consume_cached_data(text.as_bytes());
     let realm = crate::realm_of(scope);
     let value = match realm.try_eval_named(
         &text,
@@ -306,9 +337,10 @@ pub fn compile_function<'s>(
 /// The tag a host stores beside a code cache to know whether it is still valid
 /// (`v8::ScriptCompiler::CachedDataVersionTag`).
 ///
-/// One tag, not V8's version: nothing here produces or reads the data, so a
-/// host that compares tags against this one will re-produce its cache, which is
-/// what the module documentation describes.
+/// One tag, not V8's version: what this bridge's data carries is the source
+/// text, which does not depend on the engine build, so a host that compares
+/// this tag against its own gets a stable answer. The tag a stale cache
+/// answers to is `rejected`, which is about the text.
 pub fn cached_data_version_tag() -> u32 {
     /// This bridge's tag. A host that stores it beside a cache and compares it
     /// will discard caches from a different build, which is the direction the
@@ -370,21 +402,23 @@ mod tests {
         });
     }
 
-    /// A code cache round-trips through a source, and is refused — which is what
-    /// tells a host to produce a fresh one.
+    /// A cache round-trips through a source, and the compile is what has an
+    /// opinion about it: data that is the text being compiled is consumed, and
+    /// data made from other code is refused — which is what tells a host to
+    /// produce a fresh one.
     #[test]
-    fn a_code_cache_is_carried_and_refused() {
+    fn a_matching_cache_is_consumed_and_other_code_is_refused() {
         let bytes = [1u8, 2, 3];
-        let cache = CachedData::new(&bytes);
-        assert!(cache.rejected());
-        assert_eq!(&**cache, &bytes[..]);
-
         in_context!(scope, {
-            let text = String::new(scope, "1").expect("string");
+            let text = String::new(scope, "1 + 2").expect("string");
+            let cache = CachedData::new(&bytes);
+            assert!(
+                !cache.rejected(),
+                "a cache is not refused before a compile has seen it"
+            );
             let mut source = Source::new_with_cached_data(text, None, cache);
             let carried = source.get_cached_data().expect("cached data");
-            assert!(carried.rejected());
-            assert_eq!(&**carried, &bytes[..]);
+            assert_eq!(carried.to_vec(), bytes);
             assert!(
                 compile(
                     scope,
@@ -393,6 +427,97 @@ mod tests {
                     NoCacheReason::NoReason,
                 )
                 .is_some()
+            );
+            assert!(
+                source.get_cached_data().expect("cached data").rejected(),
+                "data that is not the text compiled is refused"
+            );
+        });
+
+        in_context!(scope, {
+            let text = String::new(scope, "1 + 2").expect("string");
+            let cache = CachedData::new(b"1 + 2");
+            let mut source = Source::new_with_cached_data(text, None, cache);
+            assert!(
+                compile(
+                    scope,
+                    &mut source,
+                    CompileOptions::ConsumeCodeCache,
+                    NoCacheReason::NoReason,
+                )
+                .is_some()
+            );
+            assert!(
+                !source.get_cached_data().expect("cached data").rejected(),
+                "the compile consumed data that is the text it compiled"
+            );
+        });
+    }
+
+    /// The round trip a host makes: the cache `create_code_cache` answers is
+    /// consumed by the next compile of the same code, for a script and for a
+    /// module alike — the bytes have to be what the compile compares.
+    #[test]
+    fn a_code_cache_round_trips_through_the_next_compile() {
+        in_context!(scope, {
+            let text = String::new(scope, "1 + 2").expect("string");
+            let mut source = Source::new(text, None);
+            let script = compile(
+                scope,
+                &mut source,
+                CompileOptions::NoCompileOptions,
+                NoCacheReason::NoReason,
+            )
+            .expect("compile");
+            let cache = script
+                .get_unbound_script(scope)
+                .create_code_cache()
+                .expect("cache");
+            let bytes = cache.to_vec();
+
+            let text = String::new(scope, "1 + 2").expect("string");
+            let mut source = Source::new_with_cached_data(text, None, CachedData::new(&bytes));
+            let script = compile(
+                scope,
+                &mut source,
+                CompileOptions::ConsumeCodeCache,
+                NoCacheReason::NoReason,
+            )
+            .expect("compile");
+            assert!(
+                !source.get_cached_data().expect("cached data").rejected(),
+                "the cache a script produced is consumed by the next compile"
+            );
+            assert_eq!(
+                Local::<Number>::try_from(script.run(scope).expect("run"))
+                    .expect("number")
+                    .value(),
+                3.0
+            );
+        });
+
+        in_context!(scope, {
+            let text = String::new(scope, "export const x = 1;").expect("string");
+            let mut source = Source::new(text, None);
+            let module = compile_module(scope, &mut source).expect("compile");
+            let cache = module
+                .get_unbound_module_script(scope)
+                .create_code_cache()
+                .expect("cache");
+            let bytes = cache.to_vec();
+
+            let text = String::new(scope, "export const x = 1;").expect("string");
+            let mut source = Source::new_with_cached_data(text, None, CachedData::new(&bytes));
+            let module = compile_module2(
+                scope,
+                &mut source,
+                CompileOptions::ConsumeCodeCache,
+                NoCacheReason::NoReason,
+            );
+            assert!(module.is_some());
+            assert!(
+                !source.get_cached_data().expect("cached data").rejected(),
+                "the cache a module produced is consumed by the next compile"
             );
         });
     }

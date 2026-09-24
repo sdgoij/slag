@@ -22,13 +22,13 @@
 //! it answers instead is the code's own source text.
 //!
 //! That is a real answer to the question a host asks — "give me something I can
-//! store and hand back" — and it is inert rather than wrong, because
-//! [`CachedData::rejected`] answers `true` always: a host that trusts the flag
-//! re-produces its cache, and the engine re-parses source it already reads.
-//! Nothing is ever believed that was not checked. The cost is stated here
-//! rather than hidden: a host's cache database holds a copy of the source, and
-//! the round trip saves nothing. A cache that saves something means serializing
-//! the engine's compiled program, which `.notes/embedding.md` §10 lists as
+//! store and hand back" — and the next compile *checks* it rather than believing
+//! it: the data is consumed when its bytes are the text being compiled and
+//! refused when they are not ([`CachedData::rejected`]), so a cache is never
+//! trusted about code it does not spell out. The cost is stated here rather
+//! than hidden: a host's cache database holds a copy of the source, and the
+//! round trip saves nothing. A cache that saves something means serializing the
+//! engine's compiled program, which `.notes/embedding.md` §10 lists as
 //! engine-side build-order work.
 
 use runtime::api;
@@ -186,10 +186,11 @@ mod tests {
     }
 
     /// An unbound script is the script itself here, so the cache a host stores is
-    /// the source text — refused on the way back in, which is what tells the host
-    /// to produce a fresh one — and binding it is the identity.
+    /// the source text — which the next compile of that source consumes, so a
+    /// host that hands it back is not told to produce a fresh one — and binding
+    /// it is the identity.
     #[test]
-    fn a_scripts_cache_is_its_source_and_is_refused() {
+    fn a_scripts_cache_is_its_source_and_a_compile_consumes_it() {
         in_context!(scope, {
             let script = compile_script(scope, "1 + 1");
             let unbound = script.get_unbound_script(scope);
@@ -197,8 +198,8 @@ mod tests {
             let cache = unbound.create_code_cache().expect("a cache");
             assert_eq!(&**cache, b"1 + 1");
             assert!(
-                cache.rejected(),
-                "the engine refuses a cache it cannot consume"
+                !cache.rejected(),
+                "a cache is not refused before a compile has seen it"
             );
 
             let bound = unbound.bind_to_current_context(scope);
