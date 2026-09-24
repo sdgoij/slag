@@ -459,10 +459,11 @@ impl<'s> LocalHandle<'s, Module> {
     /// way out of its event loop, to explain why a program is still pending.
     ///
     /// The message carries the crate's `kTopLevelAwaitStalled` text and is
-    /// identified by the module it reports on. V8's carries a location as well
-    /// — the module's script and the offset the await suspended at — which the
-    /// engine has no record of, so the two position answers are the ones the
-    /// bridge gives any message with no recorded position: nothing.
+    /// identified by the module it reports on, and it carries the location V8's
+    /// does: the module's name and the offset the await suspended at, which the
+    /// engine records when the body comes to rest (`SourceTextModule`'s
+    /// `stalled_await`). So `get_script_resource_name`, `get_line_number` and
+    /// `get_start_column` answer for it rather than answering nothing.
     pub fn get_stalled_top_level_await_message(
         &self,
         _scope: &PinScope<'s, '_, ()>,
@@ -1287,6 +1288,40 @@ mod tests {
             other.evaluate(scope).expect("evaluate");
             let (_, other_message) = other.get_stalled_top_level_await_message(scope)[0];
             assert!(message != other_message, "one message per stalled module");
+        });
+    }
+
+    /// The message minted for a stalled top-level await answers the location V8
+    /// fills in: the module's own name and the `await` its body is suspended at,
+    /// where a message with no recorded position answers nothing.
+    #[test]
+    fn a_stalled_modules_message_answers_the_await_it_is_at() {
+        in_context!(scope, {
+            let realm = crate::realm_of(scope);
+            let module = api::Module::compile_with_name(
+                &realm,
+                "entry",
+                Some("file:///test.js"),
+                "const a = 1;\nawait new Promise(() => {});",
+            )
+            .expect("compile");
+            let module = Local::<Module>::from_module(module);
+            let _promise = module.evaluate(scope).expect("evaluate");
+
+            let (_, message) = module.get_stalled_top_level_await_message(scope)[0];
+            assert_eq!(
+                message
+                    .get_script_resource_name(scope)
+                    .map(|name| name.to_rust_string_lossy(scope)),
+                Some("file:///test.js".to_string()),
+                "the message names the module's script"
+            );
+            assert_eq!(message.get_line_number(scope), Some(2), "the await's line");
+            assert_eq!(
+                message.get_start_column(),
+                0,
+                "and its column, counted from zero"
+            );
         });
     }
 }

@@ -12,6 +12,7 @@ use crux::handle::Handle;
 use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::PropertyKey;
+use crux::span::Span;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 
@@ -103,6 +104,14 @@ pub struct SourceTextModule {
     /// [[PendingAsyncDependencies]]: the async dependency modules still being
     /// evaluated before this module's body can run.
     pub pending_async: RefCell<u32>,
+    /// Where the body came to rest, for a module that stopped at a top-level
+    /// await: the `await` expression's own span, published as the site by the
+    /// suspension step. It is what the message a host reports for a stalled
+    /// module answers its position from
+    /// (`v8::Module::GetStalledTopLevelAwaitMessage`), because the suspension is
+    /// the only place the engine knows where the body is. `None` while the body
+    /// is running or after it has settled.
+    pub stalled_await: RefCell<Option<Span>>,
     pub requested_modules: Vec<ModuleRequest>,
     /// (module specifier, entry, phase) of each import.
     pub import_entries: Vec<ModuleImport>,
@@ -377,6 +386,7 @@ pub fn parse_module(
         cycle_root: RefCell::new(None),
         async_parents: RefCell::new(Vec::new()),
         pending_async: RefCell::new(0),
+        stalled_await: RefCell::new(None),
     });
     Ok(module)
 }
@@ -466,6 +476,7 @@ pub fn synthetic_module_create(
         cycle_root: RefCell::new(None),
         async_parents: RefCell::new(Vec::new()),
         pending_async: RefCell::new(0),
+        stalled_await: RefCell::new(None),
     });
     Ok(module)
 }
@@ -1748,6 +1759,15 @@ fn execute_module_body(
             ));
         }
         Ok(VmOutcome::Suspended(Suspension::Await(value))) => {
+            // The body has come to rest at a top-level await, and where it rests
+            // is what the message a host reports for a stalled module answers
+            // from: the suspension step published the await's own span as the
+            // site, so the body context's position is it.
+            let site = agent
+                .execution_context_stack
+                .last()
+                .and_then(|context| context.position);
+            module.stalled_await.replace(site);
             agent.execution_context_stack.pop();
             crate::async_await::attach_await(agent, &state, value)?;
         }
@@ -1798,6 +1818,8 @@ pub(crate) fn finish_module_evaluation(
     state: &Rc<RefCell<AsyncFunctionState>>,
     completion: Completion,
 ) -> Result<(), JsError> {
+    // The body is no longer suspended on anything, so it has no site to report.
+    module.stalled_await.replace(None);
     let (resolve, reject) = {
         let state = state.borrow();
         (state.resolve, state.reject)

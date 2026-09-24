@@ -336,7 +336,7 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::ForOfClose | Step::EnterPerIteration { .. } | Step::PerIteration { .. } => {}
             // Suspension (Cut 58): `Yield`/`Await` pop the value into the
             // suspension payload (the saved region is what's below).
-            Step::Yield { .. } | Step::Await => depth = depth.saturating_sub(1),
+            Step::Yield { .. } | Step::Await { .. } => depth = depth.saturating_sub(1),
             // Destructuring (Cut 59): `DestructureBegin`/`DestructureObjCoercible`
             // pop the value onto the Vm's pattern stacks; `DestructureNext`/
             // `DestructureRest`/`DestructureObjKey`/`DestructureObjKeyGet`/
@@ -907,7 +907,7 @@ impl<'a> Lowerer<'a> {
         let has_suspension = body
             .steps
             .iter()
-            .any(|step| matches!(step, Step::Yield { .. } | Step::Await));
+            .any(|step| matches!(step, Step::Yield { .. } | Step::Await { .. }));
         // Route B: the compiler marks a loop-carried Number slot on the loop's
         // `FastLoopBind`/`FastLoopStore`; the JIT keeps it in an f64 register
         // for the loop's duration (seeded at the bind, flushed at the store).
@@ -927,7 +927,7 @@ impl<'a> Lowerer<'a> {
             .collect();
         let mut suspension_targets = Vec::new();
         for (index, step) in body.steps.iter().enumerate() {
-            if matches!(step, Step::Yield { .. } | Step::Await) {
+            if matches!(step, Step::Yield { .. } | Step::Await { .. }) {
                 // The continuation is the next step (possibly the
                 // past-the-end block when the suspension is last).
                 suspension_targets.push(index + 1);
@@ -5938,7 +5938,7 @@ impl<'a> Lowerer<'a> {
                 )?;
                 self.builder.ins().return_(&[res]);
             }
-            Step::Await => {
+            Step::Await { span: _ } => {
                 let value = self.pop();
                 let sp = self.builder.use_var(self.sp_var);
                 let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);

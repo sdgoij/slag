@@ -286,6 +286,24 @@ impl Module {
             .collect()
     }
 
+    /// The name this module was compiled under — the host's origin name, or the
+    /// specifier a host-provided source was resolved under — or `None` when it
+    /// has none. This is the name a stack frame and a message report as the
+    /// module's script name.
+    pub fn name(&self) -> Option<String> {
+        self.module.name.as_ref().map(|name| name.to_string_lossy())
+    }
+
+    /// The offset in this module's source of the top-level `await` its body is
+    /// suspended at, or `None` when the body is not suspended — which is every
+    /// module that is still running or has settled. It is what the message
+    /// `v8::Module::GetStalledTopLevelAwaitMessage` reports answers its line and
+    /// column from, resolved through
+    /// [`source_offset_to_location`](Self::source_offset_to_location).
+    pub fn stalled_top_level_await_offset(&self) -> Option<u32> {
+        self.module.stalled_await.borrow().map(|span| span.start)
+    }
+
     /// Where `offset` into this module's source is
     /// (v8::Module::SourceOffsetToLocation), as a 1-based line and column
     /// (the crate we stand in for's `Location` is 0-based; its callers add
@@ -725,5 +743,52 @@ mod tests {
         let stalled = graph.stalled_top_level_await_modules();
         assert_eq!(stalled.len(), 1);
         assert!(stalled[0] == waiting);
+    }
+
+    /// A module suspended on its own top-level await knows where its body came
+    /// to rest — the offset of the `await` it is at, which is what the message a
+    /// host reports for a stalled module answers its position from — and a
+    /// module that has settled answers none.
+    #[test]
+    fn a_stalled_module_records_the_await_it_is_suspended_at() {
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+
+        let done = Module::compile(&context, "done", "export const x = 1;").expect("done");
+        done.register(&context, "done").expect("register");
+        done.instantiate(&context).expect("instantiate");
+        done.evaluate(&context).expect("evaluate");
+        assert_eq!(
+            done.stalled_top_level_await_offset(),
+            None,
+            "a module that settled is not suspended anywhere"
+        );
+        assert_eq!(
+            done.name(),
+            None,
+            "and a module compiled with no host name has none"
+        );
+
+        let waiting = Module::compile_with_name(
+            &context,
+            "waiting",
+            Some("file:///test.js"),
+            "const a = 1;\nawait new Promise(() => {});",
+        )
+        .expect("waiting");
+        waiting.register(&context, "waiting").expect("register");
+        waiting.instantiate(&context).expect("instantiate");
+        waiting.evaluate(&context).expect("evaluate");
+        assert_eq!(
+            waiting.stalled_top_level_await_offset(),
+            Some(13),
+            "the body is at the `await` that opens the second line"
+        );
+        assert_eq!(
+            waiting.source_offset_to_location(13).line,
+            2,
+            "and the offset resolves to it"
+        );
+        assert_eq!(waiting.name().as_deref(), Some("file:///test.js"));
     }
 }

@@ -1089,7 +1089,9 @@ pub enum Step {
     Yield {
         delegate: bool,
     },
-    Await,
+    Await {
+        span: crux::Span,
+    },
     YieldStarBegin,
     YieldStarNext {
         done: usize,
@@ -8716,7 +8718,12 @@ impl Vm {
                         delegate: *delegate,
                     }));
                 }
-                Step::Await => {
+                Step::Await { span } => {
+                    // The suspension is a site like a call's: an error raised
+                    // while nothing is on the stack is reported against the
+                    // await the code is at, which is what the message a stalled
+                    // module answers its position from (`module.rs`).
+                    self.set_site(agent, *span);
                     let value = self.pop();
                     return Ok(VmOutcome::Suspended(Suspension::Await(value)));
                 }
@@ -16328,7 +16335,12 @@ impl Compiler {
                     // (AsyncGeneratorCompleteStep does not unwrap);
                     // `return;` completes with `undefined` without
                     // awaiting.
-                    self.emit(Step::Await);
+                    //
+                    // There is no `await` token to site the suspension at, so
+                    // the statement is the site: the returned expression's own
+                    // start, which is where the code is.
+                    let span = expr.as_ref().map_or(stmt.span, |expr| expr.span);
+                    self.emit(Step::Await { span });
                 }
                 self.emit(Step::Return);
             }
@@ -19012,7 +19024,9 @@ impl Compiler {
             }
             ExprKind::Await(argument) => {
                 self.compile_expr(argument)?;
-                self.emit(Step::Await);
+                // The `await` keyword's own start: it is where the suspension
+                // is, which is the position a stalled module reports.
+                self.emit(Step::Await { span: expr.span });
                 Ok(())
             }
             ExprKind::ImportCall {
@@ -21478,7 +21492,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::DestructureObjEnd
                 // Suspension.
                 | Step::Yield { .. }
-                | Step::Await
+                | Step::Await { .. }
                 | Step::YieldStarBegin
                 | Step::YieldStarNext { .. }
                 | Step::YieldStarResume { .. }

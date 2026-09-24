@@ -2448,7 +2448,9 @@ left to wait for), so the walk is the shape `module_graph_has_tla` already had:
 the root first, then the *evaluation*-phase requests that were linked, stopping
 at a module it reports. The message has no exception behind it, so the bridge
 mints one — `Payload::TemplateMessage { module }`, whose text is the crate's
-`kTopLevelAwaitStalled` template and whose identity is the module it reports on.
+`kTopLevelAwaitStalled` template, whose identity is the module it reports on,
+and — as the bullet below records — whose location is the `await` the body came
+to rest at.
 
 Five new tests, each verified by mutating the code it guards: taking the
 non-empty branch unconditionally fails both deferred-import tests (`left:
@@ -4356,6 +4358,14 @@ js-api **1,001 tests, 0 fail**.
 *Tests — three, and two mutations, each caught.* `a_matching_cache_is_consumed_and_other_code_is_refused` (`crates/v8/script_compiler.rs`) pins both directions of the compile's answer: data that is the text compiled is consumed, data made from other code is refused, and the compile succeeds either way. `a_code_cache_round_trips_through_the_next_compile` pins the producers against the comparison — a script's and a module's `create_code_cache` bytes are consumed by the next compile of the same code, which is deno's shape — and `a_scripts_cache_is_its_source_and_a_compile_consumes_it` (`crates/v8/unbound_script.rs`) replaces the test that pinned the old policy. Two mutations, each caught: recording every consumption as a refusal fails both new tests (`the compile consumed data that is the text it compiled`, `the cache a script produced is consumed by the next compile`), and recording every consumption as a use fails on the refusal (`data that is not the text compiled is refused`).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,320 passed / 0 failed**. The corpora were not re-run, and that is a measurement rather than an omission: `crates/v8` is the bridge, and neither runner links it — `cargo tree --locked -p test262 -e normal` and the same for `wasmtest` each answer no `v8 v150` — so no sweep binary contains this change, unlike the engine edits the preceding records re-ran the battery for.
+
+*A stalled module's message knows where its body came to rest — §9's bullet that named it.* A message minted for a stalled top-level await had no value behind it, so reading it as one tripped the bridge's own invariant: `Payload::as_value` panicked inside `Message::get_script_resource_name`, which is exactly what `deno_core` does with it (`find_and_report_stalled_level_await_in_any_realm` → `JsStackFrame::from_v8_message`). V8's message carries a location — the module's script and the offset the await suspended at — and the bridge's own documentation had named that as the gap. Two engine additions record what the engine had in hand and threw away. The **await's own span** is now stamped on the suspension step (`Step::Await` gains `span`, published through the same `set_site` the call and throw steps use; the async generator's implicit `return` await sites at the returned expression, since there is no `await` token in that source), and the module body records that site when it suspends — `SourceTextModule::stalled_await`, cleared when the body settles through `finish_module_evaluation` — exposed as `api::Module::stalled_top_level_await_offset`, with `api::Module::name` beside it for the resource name. The bridge resolves the offset through the `Module::SourceOffsetToLocation` it already had and answers the three questions from the module instead of from a value it does not have.
+
+*The measurement.* deno's suite moves **444 passed / 15 failed → 445 passed / 14 failed**: `runtime::tests::misc::test_stalled_tla` passes — it asserts the message's own text, one frame, and that frame's `file_name`/`line_number`/`column_number` as `file:///test.js` 1 1 — and no test is newly red.
+
+*Tests — two, and two mutations, each caught.* `a_stalled_module_records_the_await_it_is_suspended_at` (`crates/runtime/src/api/module.rs`) pins the engine's half on a source whose await is *not* at the start (`const a = 1;\nawait new Promise(() => {});` answers `13`, the second line, where the operand's `new` is at 19), and that a module that settled answers none and a module compiled without a host name has none. `a_stalled_modules_message_answers_the_await_it_is_at` (`crates/v8/module.rs`) pins the host's view: the module's own name, line 2, and column `0` — V8's columns count from zero where the engine's count from one. Two mutations, each caught: dropping the recording at suspension fails the engine test with `left: None, right: Some(13)` and the bridge test with `left: None, right: Some(2)` for the line, and dropping the site on the await step fails them with `left: Some(19), right: Some(13)` and `left: 6, right: 0` — the operand's construct, which is the position the engine published before, and the reason the await needed a site of its own.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,322 passed / 0 failed**. The engine moved, so the battery was re-run and reproduced every certified number: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622; the wasm sweeps core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending; js-api **1,001 tests, 0 fail**. One thing observed and not fixed, and not this change's: `cargo test -p jit` alone fails to compile `runtime`, because `crates/runtime/src/host.rs` names `crate::api::WasmStreaming` while the `wasm` feature — the only thing that exports it — is off under that crate's own dependency set. The workspace gates unify features and are green, so nothing had run it before.
 
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
@@ -7465,6 +7475,28 @@ migrate, then delete.
   decide whether to *re-produce* a cache, so answering "refused" always made a
   host rewrite a cache it had just handed in
   (`modules/tests.rs:2577`, `runtime/tests/misc.rs:1692`).
+- **A stalled module's message knows where the body came to rest — named here,
+  and the gap was the bridge's own documented one before that.**
+  `crates/v8/module.rs` said of `get_stalled_top_level_await_message` that V8's
+  message "carries a location as well — the module's script and the offset the
+  await suspended at — which the engine has no record of, so the two position
+  answers are the ones the bridge gives any message with no recorded position:
+  nothing". Nothing was a panic, in fact: a minted message has no value behind
+  it, so `Payload::as_value` tripped the moment a host read one (`deno_core`'s
+  `find_and_report_stalled_level_await_in_any_realm` does, through
+  `JsStackFrame::from_v8_message`). Two engine additions, both recording
+  something the engine had in hand and threw away: the compile stamps the
+  **await's own span** on the suspension step (`Step::Await` gains `span`,
+  published through the same `set_site` the call and throw steps use), and the
+  module body records that site when it suspends
+  (`SourceTextModule::stalled_await`, cleared when the body settles), exposed as
+  `api::Module::stalled_top_level_await_offset` and resolved by the bridge
+  through the `Module::SourceOffsetToLocation` it already had. The offset is the
+  `await` keyword's start, not its operand's — deno's own expectations measure
+  it: `await …` at offset 0 answers column 1, and
+  `const { … } = Deno.core.ops; await op()` answers column 43, the `await`.
+  `api::Module::name` is the second exposure, the name a message reports as the
+  module's script.
 
 ## 11. Working rules
 

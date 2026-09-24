@@ -66,11 +66,17 @@ impl LocalHandle<'_, Message> {
     ///
     /// `None` for an error with no recorded position — every runtime error, and
     /// a compile whose host passed no origin — and for one whose origin named
-    /// the script with something other than a string.
+    /// the script with something other than a string. A message minted for a
+    /// stalled top-level await answers the module's own name instead, which is
+    /// what V8 fills that message with.
     pub fn get_script_resource_name<'a>(
         &self,
         scope: &PinScope<'a, '_>,
     ) -> Option<Local<'a, Value>> {
+        if let Payload::TemplateMessage { module } = self.payload() {
+            let name = module.name()?;
+            return Some(Local::from_engine(api::Local::string(&name)));
+        }
         let name = recorded(scope, self.engine())?.name?;
         Some(Local::from_engine(api::Local::string(&*name)))
     }
@@ -79,8 +85,12 @@ impl LocalHandle<'_, Message> {
     /// (v8::Message::GetLineNumber).
     ///
     /// `None` when the bridge recorded no position, which is also what the crate
-    /// we stand in for answers when it cannot name a line.
+    /// we stand in for answers when it cannot name a line. A message minted for a
+    /// stalled top-level await answers the line the suspended body is at.
     pub fn get_line_number(&self, scope: &PinScope<'_, '_>) -> Option<usize> {
+        if let Payload::TemplateMessage { module } = self.payload() {
+            return stalled_location(module).map(|location| location.line as usize);
+        }
         Some(recorded(scope, self.engine())?.line as usize)
     }
 
@@ -90,6 +100,12 @@ impl LocalHandle<'_, Message> {
     /// `Message::kNoColumnInfo` — 0 — when no position was recorded, which the
     /// crate we stand in for declares as 0.
     pub fn get_start_column(&self) -> usize {
+        if let Payload::TemplateMessage { module } = self.payload() {
+            // The engine's columns are 1-based and this answer is V8's, which
+            // counts from zero.
+            return stalled_location(module)
+                .map_or(0, |location| location.column.saturating_sub(1) as usize);
+        }
         // The crate we stand in for declares this one without a scope, so the
         // isolate it asks is the one whose realm this thread has entered; with
         // none entered there is no record to find.
@@ -108,6 +124,20 @@ impl LocalHandle<'_, Message> {
     pub fn get_stack_trace<'a>(&self, _scope: &PinScope<'a, '_>) -> Option<Local<'a, StackTrace>> {
         None
     }
+}
+
+/// The position a message minted for a stalled top-level await reports: the
+/// module's own script and the offset its body is suspended at, which is what
+/// V8 fills that message with (the language a host prints is
+/// `Top-level await promise never resolved`, and the position is the failing
+/// `await`).
+///
+/// `None` for a module that is not suspended, which a minted message only exists
+/// for while it is.
+fn stalled_location(module: &api::Module) -> Option<crux::SourceLocation> {
+    module
+        .stalled_top_level_await_offset()
+        .map(|offset| module.source_offset_to_location(offset))
 }
 
 /// The position recorded for the exception a message names, if any.
