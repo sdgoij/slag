@@ -94,6 +94,9 @@ pub(crate) fn parse_element(parser: &mut Parser<'_>) -> Result<Expr, JsError> {
             callee: Box::new(callee),
             args,
             optional: false,
+            // The lowering builds this call, so there is no argument list in the
+            // source to name: it reports the span it was built with.
+            args_paren: Span::new(start, end),
             span: Span::new(start, end),
         }),
     })

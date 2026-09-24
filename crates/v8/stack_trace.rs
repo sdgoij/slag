@@ -353,6 +353,65 @@ mod tests {
         assert_eq!(column, 60, "the site is the property token: {frames:?}");
     }
 
+    /// The shapes V8 reports at the argument list's `(` — a keyed member, a
+    /// parenthesised callee, and an optional call — where a plain callee reports
+    /// itself and a named member its property token (the test above). The
+    /// expected columns are measured with node against these exact sources.
+    ///
+    /// A *private* method call is the fifth shape and the same code path as the
+    /// keyed one, but it cannot be pinned here: a class method's call pushes no
+    /// frame at all (§12 item 19), so there is no frame to read a site from.
+    #[test]
+    fn a_calls_site_is_the_arguments_paren_for_the_other_shapes() {
+        let base = "const o = { m: function inner() { return capture(); } }; ";
+        let cases = [
+            ("o[\"m\"]();", 64),
+            ("(o.m)();", 63),
+            ("o.m?.();", 63),
+            ("(o.m)?.();", 65),
+        ];
+        for (tail, column) in cases {
+            let frames = capture_frames(&format!("{base}{tail}"));
+            assert_eq!(
+                frames.len(),
+                2,
+                "{tail}: the call and the script: {frames:?}"
+            );
+            assert_frame(&frames[0], "inner", 1);
+            let (name, _, line, site) = frame_parts(&frames[1]);
+            assert_eq!((name, line), ("-", 1), "{tail}: {frames:?}");
+            assert_eq!(
+                site, column,
+                "{tail}: the site is the argument list's `(`: {frames:?}"
+            );
+        }
+    }
+
+    /// A method's frame is unnamed, and a class method's call is no frame at all.
+    /// Measured while pinning the private call-site shape, which is why that
+    /// shape has no test here: `const o = { m() { return capture(); } }; o.m()`
+    /// records two frames and the inner one has no function name (where
+    /// `function inner() { … }` in the same place does), and
+    /// `class C { m() { return capture(); } } new C().m()` records only the host
+    /// callback's frame and the script's. Recorded as §12 item 19.
+    #[test]
+    fn a_method_frame_is_unnamed_and_a_class_methods_is_absent() {
+        let methods = capture_frames("const o = { m() { return capture(); } }; o.m();");
+        assert_eq!(methods.len(), 2, "the method and the script: {methods:?}");
+        assert_eq!(
+            frame_parts(&methods[0]).0,
+            "-",
+            "a method's frame carries no function name: {methods:?}"
+        );
+        let class = capture_frames("class C { m() { return capture(); } } new C().m();");
+        assert_eq!(
+            class.len(),
+            2,
+            "a class method's call is no frame: its activation is missing \
+             ({class:?})"
+        );
+    }
+
     /// The frames a source produces when it calls `capture()`.
     fn capture_frames(source: &str) -> Vec<String> {
         FRAMES.with(|seen| seen.borrow_mut().clear());

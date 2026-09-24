@@ -571,6 +571,14 @@ pub struct CallExpr {
     pub args: Vec<Argument>,
     /// True when this link used `?.(…)`; later chain links short-circuit too.
     pub optional: bool,
+    /// The span of the `(` that opens the argument list.
+    ///
+    /// Kept because it is what V8 reports as a *call's* site whenever the callee
+    /// is not a plain name — a keyed or private member, a parenthesised callee, and
+    /// any optional call (`ir.rs`'s call site). A call the parser builds from
+    /// something that is not a source-level argument list carries its own span
+    /// here.
+    pub args_paren: Span,
     pub span: Span,
 }
 

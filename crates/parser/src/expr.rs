@@ -144,6 +144,7 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
                                         kind: ExprKind::Ident(intern_utf8("async")),
                                     }),
                                     args: Vec::new(),
+                                    args_paren: Span::new(start, end),
                                     optional: false,
                                     span: Span::new(start, end),
                                 }),
@@ -161,6 +162,7 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
                                         kind: ExprKind::Ident(intern_utf8("async")),
                                     }),
                                     args,
+                                    args_paren: Span::new(start, end),
                                     optional: false,
                                     span: Span::new(start, end),
                                 }),
@@ -896,6 +898,7 @@ fn parse_super(parser: &mut Parser) -> Result<Expr, JsError> {
                     "super() is only valid inside the constructor of a derived class",
                 ));
             }
+            let paren = parser.peek()?.span;
             let args = parse_arguments(parser)?;
             let end = parser.prev.as_ref().unwrap().span.end;
             Ok(Expr {
@@ -904,6 +907,7 @@ fn parse_super(parser: &mut Parser) -> Result<Expr, JsError> {
                     callee: Box::new(super_expr),
                     args,
                     optional: false,
+                    args_paren: paren,
                     span: Span::new(start, end),
                 }),
             })
@@ -1002,6 +1006,7 @@ pub(crate) fn parse_subscripts(
                 };
             }
             TokenKind::LeftParen if !no_calls => {
+                let paren = parser.peek()?.span;
                 let args = parse_arguments(parser)?;
                 let end = parser.prev.as_ref().unwrap().span.end;
                 let start = expr.span.start;
@@ -1011,6 +1016,7 @@ pub(crate) fn parse_subscripts(
                         callee: Box::new(expr),
                         args,
                         optional: false,
+                        args_paren: paren,
                         span: Span::new(start, end),
                     }),
                 };
@@ -1080,6 +1086,7 @@ fn parse_optional_link(parser: &mut Parser, expr: Expr) -> Result<Expr, JsError>
             })
         }
         TokenKind::LeftParen => {
+            let paren = parser.peek()?.span;
             let args = parse_arguments(parser)?;
             let end = parser.prev.as_ref().unwrap().span.end;
             Ok(Expr {
@@ -1088,6 +1095,7 @@ fn parse_optional_link(parser: &mut Parser, expr: Expr) -> Result<Expr, JsError>
                     callee: Box::new(expr),
                     args,
                     optional: true,
+                    args_paren: paren,
                     span: Span::new(start, end),
                 }),
             })

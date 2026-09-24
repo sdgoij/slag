@@ -4328,6 +4328,17 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` **5,316 passed / 0 failed** (`runtime` 908, `v8` 250, `crux` 249). The corpora were re-run because the parser and the lowering moved: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622 — twice, once as JSON and once as text, on a quiet machine), and the wasm sweeps reproduce theirs — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail**.
 
+*And the shapes V8 reports at the argument list's `(` — §9's bullet that named it, finishing §12 item 17.* The previous record shipped the named member half and left three shapes as a documented gap, because the `(` no node carried is what V8 reports for them. `CallExpr` now carries `args_paren` — the token `parse_arguments` consumes, captured from the lookahead at each source-level call site, with a call the parser *builds* (an `async(…)` rewrite, the JSX lowering) carrying its own span — and `call_site` reads it for a keyed or private member callee, for any optional call, and for a parenthesised callee; the named and plain shapes keep what they had, and the six `compile_optional_call_tail` sites moved onto the site with them. Measured against node, `super.mm()` is a **named** member access and reports the property token, so the super branch's own call steps take the site as well.
+
+*The measurement, and the honest headline: no count moves.* deno's suite stays at **442 passed / 17 failed** — the same 17, `test_call_site` still passing, nothing newly red. That was expected and stated when the work was chosen: the three shapes are V8-faithful now but no deno test reads a keyed, private, optional or parenthesised call site, so what pins them is the bridge's own tests, and what the change buys is the rule being finished rather than a step of it — a host that reads a call's column no longer gets a wrong answer for four ordinary shapes.
+
+*Tests — two mutations, and two findings that came out of writing them.* `a_calls_site_is_the_arguments_paren_for_the_other_shapes` walks four sources whose expected columns were **measured with node against those exact strings** (keyed 64, parenthesised 63, optional call 63, optional call behind parentheses 65) and asserts the script frame's site each time; reverting `call_site` to the call expression's span fails it on the first case (`left: 58, right: 64`). Pinning the *private* shape is where the findings appeared, and neither is this part's:
+
+- **A method's frame is unnamed, and a class method's call is no frame at all.** `const o = { m() { return capture(); } }; o.m();` records two frames and the inner one has no function name, where a `function inner() { … }` in the same place records `inner` — the activation is pushed (its site is the `capture()` call inside the method) and the callee slot is what is empty. `class C { m() { return capture(); } } new C().m();` records only the host callback's frame and the script's: the method's activation is missing entirely. Recorded as §12 item 19 with the measurements, and it is why the private call-site shape is covered by the rule but not by a test — there is no frame to read a site from.
+- The two tests that came out of that, `a_method_frame_is_unnamed_and_a_class_methods_is_absent`, pin both as the engine behaves today so the next part finds them by failing.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` **5,318 passed / 0 failed**. The corpora were re-run because the parser and the lowering moved: the wasm sweeps reproduce their baselines exactly — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail** — and test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) when the machine is not building. The two runs that did hang on the `copyWithin/*-detached*` fixtures were both made immediately after a release build, which is now a *repeatable* pattern rather than a suspicion (§12 item 18): build-then-sweep costs a 15s per-batch deadline, and the same binary on an idle machine reports the baseline.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7377,6 +7388,27 @@ migrate, then delete.
   own span, the token for a name or private and the key expression for a
   computed one — because only the parser knows it, and the lowering reads it
   where the call site is published (`ir.rs`).
+- **And the shapes V8 reports at the argument list's `(` — named here before the
+  edit, and it finishes §12 item 17.** The bullet above shipped the named member
+  half and named the rest as a gap: a keyed member (`o["mm"]()`), a private one
+  (`this.#mm()`), an optional call (`o.mm?.()`) and a **parenthesised** callee
+  (`(o.mm)()`, and `(f)()` — a parenthesised plain name too) are each reported by
+  V8 at the `(` that opens the argument list, which no node carried. Measured
+  again with node v24.12.0: `(w)()` 16 and `(f)()` 16 = the call's `(`, `f?.()`
+  16 = the call's `(` — so an *optional call* is the paren whatever its callee —
+  and `(f)?.()` 18 = the call's `(`; against the named rule, `o?.mm()` 16 = `mm`,
+  the property token, which is what the shipped half already does (the check is
+  the **call**'s `optional`, not the member link's). `super.mm()` is the property
+  token too (40 in `class D extends B { go(){ return super.mm(); } }`), so the
+  super branch's call steps take the site as well. The rule the lowering now
+  reads, in full: a non-optional call whose callee is a dot access to a name
+  publishes the property token; a call whose callee is any other member access, a
+  call that is itself optional, and a callee wrapped in parentheses publish the
+  argument list's `(`; and a plain callee publishes itself, which is where the
+  call expression starts. `CallExpr` therefore gains `args_paren` — the `(` the
+  parser consumes when it parses the arguments — and a call the parser builds
+  from something that is not a source-level argument list (an `async(…)`
+  rewrite, the JSX lowering) keeps its own span.
 
 ## 11. Working rules
 
@@ -7843,8 +7875,13 @@ migrate, then delete.
    carries — a measured, documented gap rather than a guess, and no test waits
    on those three. Measured: deno's suite moves 441 passed / 18 failed →
    **442 passed / 17 failed**, `test_call_site` passing and no test newly red.
-   Carrying the argument list's `(` is the follow-on, and it is the same shape
-   of change: one field the parser can set and the lowering can read.
+   **The follow-on landed**, and §7 has its record: `CallExpr` carries
+   `args_paren` — the `(` the parser consumes — and the lowering publishes the
+   argument list's `(` for a keyed or private member callee, for any optional
+   call and for a parenthesised callee, where the named and plain shapes keep
+   what they had. That finishes the rule; no deno test waits on those three, so
+   the suite stays at 442 passed / 17 failed, and the shapes are pinned by the
+   bridge's own tests instead.
 18. **The three `TypedArray/copyWithin/coerced-values-*-detached*` fixtures are
    deadline-loud under load — observed, not a regression.** A full-corpus sweep
    at `--jobs 8 --batch 32 --timeout 15 --recheck-timeout 15` reported those
@@ -7855,4 +7892,24 @@ migrate, then delete.
    quiet machine. They are detached-buffer fixtures, so they are the corpus's
    slow end by nature. Recorded because a sweep verdict that moves without the
    tree moving is worth knowing about, and because the sweep's own `--fast`
-   help text warns that verdicts wobble on 5-15s fixtures under load.
+   help text warns that verdicts wobble on 5-15s fixtures under load. The
+   pattern is now repeatable rather than a one-off: a full sweep run immediately
+   after a release build hung on two of those three fixtures **twice**, and a run
+   on the same binary with the machine idle reported the baseline **twice** —
+   which is what `cargo build`-then-`sweep` does to a 15s per-batch deadline.
+   The lesson for want of a rule: run the sweep when nothing else is building.
+19. **A method's frame is unnamed, and a class method's call is no frame at all —
+   measured, not yet explained.** Both surfaced while pinning the private
+   call-site shape for §12 item 17. `const o = { m() { return capture(); } };
+   o.m();` records two frames and the inner one carries **no function name**,
+   where `function inner() { return capture(); }` written in the same place
+   records `inner`; the frame exists (its site is the `capture()` call inside the
+   method), so the method's activation *is* pushed and it is the callee slot that
+   is empty. And `class C { m() { return capture(); } } new C().m();` records only
+   the host callback's own frame and the script's — the method's activation is
+   missing entirely, so there is no frame to read a name or a site from. Neither
+   is V8's answer (it names a method's frame, and deno renders
+   `Object.w [as m]` from it), and neither is this part's, which is why the
+   private shape has no call-site test until they are understood. The next probe
+   is the two callee shapes' lowering: an object-literal method and a method off
+   a `new` expression.

@@ -20308,17 +20308,17 @@ impl Compiler {
                     }
                 }
                 if call.optional {
-                    self.compile_optional_call_tail(&call.args, call.span)?;
+                    self.compile_optional_call_tail(&call.args, site)?;
                 } else {
                     match self.compile_arguments(&call.args, true)? {
                         Some(argc) => self.emit(Step::CallFast {
                             argc: argc as u8,
                             direct_eval: false,
-                            span: call.span,
+                            span: site,
                         }),
                         None => self.emit(Step::Call {
                             direct_eval: false,
-                            span: call.span,
+                            span: site,
                         }),
                     }
                 }
@@ -20341,7 +20341,7 @@ impl Compiler {
                 self.emit(Step::Dup);
                 self.compile_member_property_guarded(member)?;
                 if call.optional {
-                    self.compile_optional_call_tail(&call.args, call.span)?;
+                    self.compile_optional_call_tail(&call.args, site)?;
                 } else {
                     self.compile_call_args_guarded(&call.args, false, site)?;
                 }
@@ -20356,7 +20356,7 @@ impl Compiler {
                 self.compile_member_property_guarded(member)?;
                 if call.optional {
                     // The callee is on top: nullish → undefined.
-                    self.compile_optional_call_tail(&call.args, call.span)?;
+                    self.compile_optional_call_tail(&call.args, site)?;
                 } else {
                     // The member chain may still have short-circuited
                     // upstream (`a?.b.m(args)`): skip the argument
@@ -20401,7 +20401,7 @@ impl Compiler {
             }
             self.emit(Step::ClearChainShort);
             if call.optional {
-                self.compile_optional_call_tail(&call.args, call.span)?;
+                self.compile_optional_call_tail(&call.args, site)?;
             } else {
                 self.tail = tail;
                 self.compile_call_args_guarded(&call.args, false, site)?;
@@ -20422,7 +20422,7 @@ impl Compiler {
             self.emit(Step::GetVarReferenceThis);
             self.emit(Step::GetVarReference);
             if call.optional {
-                self.compile_optional_call_tail(&call.args, call.span)?;
+                self.compile_optional_call_tail(&call.args, site)?;
             } else {
                 self.tail = tail;
                 self.compile_call_args_guarded(&call.args, direct_eval, site)?;
@@ -20609,7 +20609,7 @@ impl Compiler {
         self.emit(Step::Push(Value::Undefined));
         self.compile_expr(&call.callee)?;
         if call.optional {
-            self.compile_optional_call_tail(&call.args, call.span)?;
+            self.compile_optional_call_tail(&call.args, site)?;
         } else {
             // An upstream `?.` in the callee (`(a?.b)()`) skips the arguments.
             self.tail = tail;
@@ -20946,24 +20946,27 @@ impl Compiler {
 
 /// The site a call publishes for the frame it runs in.
 ///
-/// V8 reports three different things depending on the callee's shape, measured
-/// against node v24.12.0 (`.notes/embedding.md` §9 has the table): a plain
-/// callee's own start, a **named** member callee's property token (`o.m()` is at
-/// the column of `m`), and the argument list's `(` for a keyed member, a private
-/// member, an optional call and a parenthesised callee. This returns the middle
-/// one where the AST can answer it — a non-optional call whose callee is a dot
-/// access to a name — and the call expression's own start otherwise, because the
-/// argument list's `(` is a span no node carries; those shapes are a measured,
-/// documented gap rather than a guess.
+/// V8 reports four different things depending on the callee's shape, measured
+/// against node v24.12.0 (`.notes/embedding.md` §9 has the table):
+///
+/// - a plain callee reports itself, which is where the call expression starts;
+/// - a **named** member callee reports the property token (`o.m()` is at the
+///   column of `m`, and `super.m()` with it) — unless the call is itself
+///   optional, since the call's `?.` is what V8's bytecode records then;
+/// - a call whose callee is any *other* member access — keyed, private — reports
+///   the argument list's `(`;
+/// - so does a **parenthesised** callee, plain name included, because V8 loses
+///   the reference through the parentheses;
+/// - and so does any call the source wrote as optional.
 fn call_site(call: &syntax::ast::CallExpr) -> crux::Span {
-    if call.optional {
-        return call.span;
-    }
     match &call.callee.kind {
-        ExprKind::Member(member) => match (&member.property, member.property_token) {
-            (MemberProperty::Name(_), Some(token)) => token,
-            _ => call.span,
-        },
+        ExprKind::Member(member) if !call.optional => {
+            match (&member.property, member.property_token) {
+                (MemberProperty::Name(_), Some(token)) => token,
+                _ => call.args_paren,
+            }
+        }
+        ExprKind::Member(_) | ExprKind::Paren(_) => call.args_paren,
         _ => call.span,
     }
 }
