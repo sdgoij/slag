@@ -4399,6 +4399,14 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,328 passed / 0 failed** (`runtime` 917, `v8` 255, `crux` 249, `test262` 3324 — 5,325 plus this change's three tests). The wasm-free shapes CI gates both hold: `cargo test -p runtime --no-default-features --lib` **888 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit`. The experimental shapes compile too, because the change touches cfg'd code: `cargo test -p byteblock --features workers --lib` (2 passed) and `cargo check -p slag --features workers`. The corpora were re-run because the engine's block layout, the JIT's inline element store and the whole buffer-table path moved: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce every certified number — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending (64,594 checks) — and js-api **1,001 tests, 0 fail**.
 
+*The engine does not veto a dynamic import's attributes before the host sees them — §9's bullet that named it.* The three hypotheses the last handoff had eliminated by reading were the right eliminations and pointed at the right place: the callback *is* reached by deno's own dynamic-import path (`bindings.rs:1256-1275` rejects the resolver itself), the error the callback throws *is* a `%TypeError%`, and a host's out-of-band `throw_exception` *is* visible to `has_caught`. What none of them could see from the reading side is that the engine never let the callback run: `module::dynamic_import` parsed the `with { … }` attributes and then applied the engine's **own** module-kind rule — the key must be `type`, its value one of `json`/`text`/`bytes`/`js` — rejecting the capability with the bare string `Unsupported import attribute` before `host::import_module_dynamically` was consulted at all. The probe that named it is two lines: a `HostHooks` whose hook records that it ran, an `import('./x.js', { with: { unsupported: 'value' } })` whose rejection the script stringifies, and the run printed `hook_ran=false e=Some("false:Unsupported import attribute")` — the hook never asked, the rejection a string rather than a TypeError. V8 does neither: `GetImportAttributesFromArgument` (`v8/src/execution/isolate.cc:7413-7514`) validates only the argument's *shape* (options not an object, `with` not an object, a non-string attribute value — each a `TypeError`) and then hands the flat key/value list to `HostImportModuleDynamically` (`Isolate::RunHostImportModuleDynamicallyCallback`, `:7308-7400`) to decide, which is precisely the list `HostHooks::import_module_dynamically` already receives. So the rule moved to where the engine is the one resolving: after the hook has answered `None`, i.e. on the registry path. The rejection gave up the bare string for an error object on the way — `promise::error_value` of a `TypeError`, which is what every neighbouring rejection in the function builds and what V8's own no-callback path mints (`:7318-7323`).
+
+*Tests — two, and two mutations, each caught.* `a_dynamic_imports_attributes_reach_the_host_before_the_engines_rule` is the fix: a hook that records the pairs it was handed and answers a value, and the agent asserts both that it saw `[("unsupported", "value")]` — the very attribute the engine's rule refuses — and that the expression settled with the hook's answer. `the_engines_own_rule_rejects_with_an_error_when_no_host_resolves_it` pins the other half: with no hook, the rejection is a `TypeError` whose message is still `Unsupported import attribute`. Two mutations, each caught: reinstating the rule *before* the hook fails the first with `left: []` (the hook was never reached — the deno failure in miniature), and deleting the rule from the registry path fails the second with `left: Some("Cannot find module ./x.js")`, the resolution failure that would otherwise stand in for the rejection.
+
+*The measurement.* deno's `modules::tests::test_validate_import_attributes_callback_dynamic_import` **passes**, and the whole `deno_core --lib` suite moves **448 passed / 11 failed → 449 passed / 10 failed**: the one test flipped, none newly red, and the 10 left are the same set (§9's four inspector cases, the two Windows `uv_compat` pipe-busy ones, and the four the earlier records name — `test_dynamic_import_module_error_stack`, `test_nexttick_before_queue_microtask`, `test_promise_rejection_handler::case_04`, `wasm_streaming_op_invocation_in_import`).
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,330 passed / 0 failed** (5,328 plus this change's two tests); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **890 passed / 0 failed**, `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because the dynamic-import path moved: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) — the corpus never names an attribute other than `type`, which is why the old rule hid behind it — and the wasm sweeps reproduce every certified number: core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, and js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7591,6 +7599,28 @@ migrate, then delete.
   live: a wasm `Memory.prototype.buffer` materialised before a grow reads the
   grown bytes) and the four flags become per buffer object, renewed wherever the
   runtime wraps a block in a buffer that did not create it.
+- **A host's dynamic-import hook decides which import attributes are
+  supported — named here with the edit, and it was preempted.** `import()` parsed
+  its `with { … }` attributes and then applied the engine's *own* module-kind rule
+  (a `type` key whose value must be `json`/`text`/`bytes`/`js`) before consulting
+  the host, rejecting the capability with a bare string when the rule failed. A
+  host that installs a hook therefore never saw the attributes, so
+  `deno_core`'s `validate_import_attributes_cb` — whose whole job is to decide,
+  and whose *static* twin does decide (`modules/tests.rs:1092-1181` vs
+  `:1229-1280`) — could not reject, and the test's
+  `import('./target.js', { with: { unsupported: 'value' } })` settled with the
+  string `Unsupported import attribute` where the callback's `TypeError` belongs.
+  V8 does no such thing: it validates only the argument's *shape* — options not an
+  object, `with` not an object, a non-string attribute value, each a `TypeError`
+  (`Isolate::GetImportAttributesFromArgument`,
+  `v8/src/execution/isolate.cc:7413-7514`) — and hands the flat key/value list to
+  `HostImportModuleDynamically` to decide
+  (`Isolate::RunHostImportModuleDynamicallyCallback`, `:7308-7400`, whose
+  `import_attributes_array` is exactly the pairs `HostHooks::import_module_dynamically`
+  already receives). The engine's rule now applies only where the engine resolves
+  the import itself — the hook answered `None` — and it rejects with an error
+  *object* rather than a string, which is what V8's own no-callback path mints
+  (`:7318-7323`).
 
 ## 11. Working rules
 

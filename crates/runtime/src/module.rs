@@ -3271,21 +3271,6 @@ pub fn dynamic_import(
             }
         };
         for (key, value) in attributes {
-            let key_text = key.to_string_lossy();
-            let value_text = value.to_string_lossy();
-            if key_text != "type"
-                || !matches!(value_text.as_str(), "json" | "text" | "bytes" | "js")
-            {
-                crate::function::call(
-                    agent,
-                    &reject,
-                    Value::Undefined,
-                    &[Value::String(Handle::new(JsString::from_utf8(
-                        "Unsupported import attribute",
-                    )))],
-                )?;
-                return Ok(capability.promise);
-            }
             attribute_pairs.push((key.clone(), value.clone()));
             parsed_attributes.push((AttributeKey::Str(key), value));
         }
@@ -3317,6 +3302,22 @@ pub fn dynamic_import(
         &attribute_pairs,
     ) {
         return answer;
+    }
+    // Which attributes a dynamic import *supports* is the host's to decide — V8
+    // validates only the argument's shape and hands the pairs over — so the
+    // engine's own rule below belongs on the engine's own resolution path alone,
+    // where the hook has just answered `None`.
+    for (key, value) in &attribute_pairs {
+        let key_text = key.to_string_lossy();
+        let value_text = value.to_string_lossy();
+        if key_text != "type" || !matches!(value_text.as_str(), "json" | "text" | "bytes" | "js") {
+            let rejection = crate::promise::error_value(
+                agent,
+                &JsError::new(ErrorKind::TypeError, "Unsupported import attribute".into()),
+            );
+            crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+            return Ok(capability.promise);
+        }
     }
     // The load is asynchronous: the host completes it in a job, so the
     // module's evaluation never runs concurrently with the evaluation already
@@ -4118,6 +4119,107 @@ mod tests {
     /// none, which is what a host reads as "no referrer".
     #[derive(Debug)]
     struct RecordsReferrer;
+
+    /// A host that resolves dynamic imports itself is handed the attributes and
+    /// decides which it supports: the engine's own `type`-only rule must not veto
+    /// the import before the hook is asked (`.notes/embedding.md` §9, the
+    /// dynamic-import-attributes bullet).
+    #[test]
+    fn a_dynamic_imports_attributes_reach_the_host_before_the_engines_rule() {
+        thread_local! {
+            static SEEN: std::cell::RefCell<Vec<(String, String)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        #[derive(Debug)]
+        struct RecordsAttributes;
+
+        impl crate::host::HostHooks for RecordsAttributes {
+            fn import_module_dynamically(
+                &self,
+                _specifier: &JsString,
+                _referrer_name: Option<&JsString>,
+                _phase: crate::api::ModuleImportPhase,
+                attributes: &[(JsString, JsString)],
+            ) -> Option<Result<Value, JsError>> {
+                SEEN.with(|seen| {
+                    *seen.borrow_mut() = attributes
+                        .iter()
+                        .map(|(key, value)| (key.to_string_lossy(), value.to_string_lossy()))
+                        .collect();
+                });
+                Some(Ok(Value::String(Handle::new(JsString::from_utf8(
+                    "the host's answer",
+                )))))
+            }
+        }
+
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().expect("a realm");
+        agent.host_hooks = Some(Box::new(RecordsAttributes));
+        agent
+            .run_script(
+                "globalThis.seen = 'unset';\
+                 (async () => {\
+                   globalThis.seen = await import('./x.js', { with: { unsupported: 'value' } });\
+                 })();",
+            )
+            .expect("script");
+        agent.run_jobs().expect("jobs");
+
+        assert_eq!(
+            SEEN.with(|seen| seen.borrow().clone()),
+            [("unsupported".to_string(), "value".to_string())],
+            "the hook is handed the attribute the engine's own rule refuses"
+        );
+        assert_eq!(
+            agent
+                .run_script("globalThis.seen")
+                .expect("a read")
+                .as_string()
+                .map(|text| text.to_string_lossy())
+                .as_deref(),
+            Some("the host's answer"),
+            "and what it answers is what the expression settles with"
+        );
+    }
+
+    /// With no hook the engine resolves the import itself, so its own rule stands
+    /// — and it rejects with an error object rather than a bare string, which is
+    /// what a rejection is for.
+    #[test]
+    fn the_engines_own_rule_rejects_with_an_error_when_no_host_resolves_it() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().expect("a realm");
+        agent
+            .run_script(
+                "globalThis.e = 'unset';\
+                 import('./x.js', { with: { unsupported: 'value' } })\
+                   .catch((error) => { globalThis.e = error; });",
+            )
+            .expect("script");
+        agent.run_jobs().expect("jobs");
+
+        assert!(
+            matches!(
+                agent
+                    .run_script("globalThis.e instanceof TypeError")
+                    .expect("a read")
+                    .kind(),
+                ValueKind::Boolean(true)
+            ),
+            "the engine's own rejection is a TypeError"
+        );
+        assert_eq!(
+            agent
+                .run_script("globalThis.e.message")
+                .expect("a read")
+                .as_string()
+                .map(|text| text.to_string_lossy())
+                .as_deref(),
+            Some("Unsupported import attribute")
+        );
+    }
 
     impl crate::host::HostHooks for RecordsReferrer {
         fn import_module_dynamically(
