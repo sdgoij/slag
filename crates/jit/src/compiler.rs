@@ -2431,25 +2431,25 @@ impl<'a> Lowerer<'a> {
             slots_ptr,
             Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, auto_length) as i32),
         );
-        const STATE_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
-            + std::mem::offset_of!(crux::typed_array::SharedBuffer, state);
-        let state_addr = self.builder.ins().load(
+        const FLAGS_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
+            + std::mem::offset_of!(crux::typed_array::SharedBuffer, flags);
+        let flags_addr = self.builder.ins().load(
             types::I64,
             MemFlagsData::new(),
             slots_ptr,
-            Offset32::new(STATE_OFFSET as i32),
+            Offset32::new(FLAGS_OFFSET as i32),
         );
         let detached = self.builder.ins().load(
             types::I8,
             MemFlagsData::new(),
-            state_addr,
-            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, detached) as i32),
+            flags_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, detached) as i32),
         );
         let resizable = self.builder.ins().load(
             types::I8,
             MemFlagsData::new(),
-            state_addr,
-            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, resizable) as i32),
+            flags_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, resizable) as i32),
         );
         let arr_len = self.builder.ins().load(
             types::I64,
@@ -2862,11 +2862,19 @@ impl<'a> Lowerer<'a> {
         );
         const STATE_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
             + std::mem::offset_of!(crux::typed_array::SharedBuffer, state);
+        const FLAGS_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
+            + std::mem::offset_of!(crux::typed_array::SharedBuffer, flags);
         let state_addr = self.builder.ins().load(
             types::I64,
             MemFlagsData::new(),
             slots_ptr,
             Offset32::new(STATE_OFFSET as i32),
+        );
+        let flags_addr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(FLAGS_OFFSET as i32),
         );
         let data = self.builder.ins().load(
             types::I64,
@@ -2877,20 +2885,20 @@ impl<'a> Lowerer<'a> {
         let detached = self.builder.ins().load(
             types::I8,
             MemFlagsData::new(),
-            state_addr,
-            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, detached) as i32),
+            flags_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, detached) as i32),
         );
         let immutable = self.builder.ins().load(
             types::I8,
             MemFlagsData::new(),
-            state_addr,
-            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, immutable) as i32),
+            flags_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, immutable) as i32),
         );
         let resizable = self.builder.ins().load(
             types::I8,
             MemFlagsData::new(),
-            state_addr,
-            Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, resizable) as i32),
+            flags_addr,
+            Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, resizable) as i32),
         );
         let arr_len = self.builder.ins().load(
             types::I64,

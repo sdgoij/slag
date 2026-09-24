@@ -602,7 +602,8 @@ mod tests {
 
     /// A shared buffer over a store reads the store's bytes, and the store says
     /// it is shared afterwards — which is the line the bridge adds, because the
-    /// engine's host-facing constructor records only the buffer.
+    /// engine's host-facing constructor records only the buffer — and the buffer's
+    /// own block is marked by the engine, because it is a separate block now.
     #[test]
     fn a_shared_buffer_over_a_store_shares_its_bytes() {
         in_context!(scope, {
@@ -616,6 +617,10 @@ mod tests {
             assert!(
                 store.is_shared(),
                 "the block is marked shared with the buffer"
+            );
+            assert!(
+                shared.get_backing_store().is_shared(),
+                "and the buffer's own block is too: its flags are the buffer's,\n                 not the store's (`.notes/embedding.md` §9)"
             );
 
             // A write through the buffer is a write into the store, which is what
@@ -921,6 +926,72 @@ mod tests {
             let undefined = eval(scope, "undefined");
             assert_eq!(buffer.detach(Some(undefined)), Some(true));
             assert!(buffer.was_detached());
+        });
+    }
+
+    /// A host builds a view over a buffer that came from a store it filled —
+    /// deno's `slice_to_uint8array` step for step: a fresh store, the bytes
+    /// copied in through it, `make_shared`, a buffer over the store, and a view
+    /// over that buffer.
+    #[test]
+    fn a_view_over_a_store_the_host_filled_reads_its_bytes() {
+        in_context!(scope, {
+            let bytes = [5u8, 10, 15];
+            let store = ArrayBuffer::new_backing_store(scope, bytes.len());
+            write_byte(&store, 0, bytes[0]);
+            write_byte(&store, 1, bytes[1]);
+            write_byte(&store, 2, bytes[2]);
+
+            let buffer = ArrayBuffer::with_backing_store(scope, &store.make_shared());
+            bind(scope, "ab", buffer.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "new Uint8Array(ab)[0]"),
+                5.0,
+                "the constructor path reads the store"
+            );
+
+            let view = Uint8Array::new(scope, buffer, 0, bytes.len()).expect("view");
+            assert_eq!(view.byte_length(), 3);
+            bind(scope, "v", view.into());
+            assert_eq!(eval_number(scope, "v.byteLength"), 3.0);
+            assert_eq!(
+                eval_number(scope, "v[0]"),
+                5.0,
+                "the host-built view reads it too"
+            );
+            assert_eq!(eval_number(scope, "v[1]"), 10.0);
+        });
+    }
+
+    /// A store taken from a buffer keeps its bytes after the buffer is
+    /// detached, and a buffer built over that store is a live buffer — which is
+    /// deno's `to_v8_slice_detachable` hand-over: read the store, detach, hand
+    /// the store's bytes to a new view.
+    #[test]
+    fn a_store_outlives_the_buffer_it_came_from() {
+        in_context!(scope, {
+            Local::<Uint8Array>::try_from(eval(
+                scope,
+                "globalThis.a = new Uint8Array([5,10,15]); a.subarray(0,3)",
+            ))
+            .expect("view");
+            let buffer = Local::<ArrayBuffer>::try_from(eval(scope, "a.buffer")).expect("buffer");
+            let store = buffer.get_backing_store();
+            assert_eq!(byte_of(&store, 0), 5);
+
+            assert_eq!(buffer.detach(None), Some(true));
+            assert_eq!(byte_of(&store, 0), 5, "the store outlives the detach");
+
+            let rebuilt = ArrayBuffer::with_backing_store(scope, &store);
+            let view = Uint8Array::new(scope, rebuilt, 0, 3).expect("view");
+            bind(scope, "v", view.into());
+            assert_eq!(eval_number(scope, "v.byteLength"), 3.0);
+            assert_eq!(
+                eval_number(scope, "v[0]"),
+                5.0,
+                "a buffer over the store is not the detached one"
+            );
+            assert_eq!(eval_number(scope, "v[1]"), 10.0);
         });
     }
 

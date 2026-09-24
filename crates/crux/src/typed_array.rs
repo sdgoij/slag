@@ -96,12 +96,14 @@ impl ElementType {
     }
 }
 
-/// The `[[ArrayBufferData]]` block and its geometry box live in the
+/// The `[[ArrayBufferData]]` block and its boxes live in the
 /// dependency-free `byteblock` crate, so the WebAssembly engine can share a
 /// linear memory with an aliased `Memory.prototype.buffer` without depending
 /// on the JS value model (`.notes/wasm-analysis.md` §7 item 8). Re-exported
-/// under their historical paths, including for the JIT's `offset_of!` reads.
-pub use byteblock::{AtomicOp, BlockState, SharedBuffer, WORKERS};
+/// under their historical paths, including for the JIT's `offset_of!` reads —
+/// `BlockState` is the shared byte base and `BufferFlags` the per-buffer mirror
+/// of the buffer's own flags.
+pub use byteblock::{AtomicOp, BlockState, BufferFlags, SharedBuffer, WORKERS};
 
 /// The leaf crate reports an out-of-bounds block access with its own error
 /// type, so its API carries no `JsError`; the built-ins keep using `?`.

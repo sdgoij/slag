@@ -4391,6 +4391,14 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` **5,325 passed / 0 failed**. `current_realm`'s fallback is on every path that asks for a realm, so the battery was re-run on rebuilt binaries and reproduced every certified number, deno included: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622; the wasm sweeps core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending; js-api **1,001 tests, 0 fail**.
 
+*A buffer's flags are the buffer's, not the bytes it looks at — §9's bullet that named it, and the defect the probe left behind it.* The last part's probe named `test_op_detached_buffer` (`runtime::tests::ops`) as newly seen and guessed the shape wrong: it read `a3.byteLength === 3` with `a3[0]` `undefined` as a typed array over a host store that our `ArrayBuffer::with_backing_store` path did not cover. That path **worked** — a host-built view over a store the host filled reads its bytes — so the probe was re-run with deno's own sequence, which is the one thing it had not done: take the store, *detach the buffer*, then wrap the store. That fails. The cause is one line and it is not in the bridge: `detach_array_buffer` (`runtime/src/builtins/array_buffer.rs`) sets `BufferState.detached` **and** calls `SharedBuffer::mark_detached`, and `mark_detached` flagged the `BlockState` that every block over those bytes shares (`crates/byteblock/src/lib.rs`). So a second buffer object wrapped over that storage inherited a detach that was never its own: its own `BufferState` made `byteLength` 3 while every element read went through the flagged block and answered `undefined`. V8 keeps the two apart and this follows it: the storage and its live base are shared, the four flags are per buffer object. `BlockState` keeps only `data`; the flags move to a new `BufferFlags` box, `SharedBuffer` gains `flags` beside `state`, `SharedBuffer::for_new_buffer` returns a block over the same bytes with fresh flags, and the runtime calls it in `array_buffer_from_block`/`shared_array_buffer_from_block` — the two places a block is wrapped in a buffer that did not create it (a host store, a wasm memory's `buffer`). The JIT's two inline sites read the flags from the new field (`SharedBuffer.flags` + the `BufferFlags` offsets) and the base from `state` as before, which is what keeps a resize picking up the moved base for every block over the storage — the invariant `SharedBuffer::data_ptr`'s doc states. The clone a detached buffer's views hold still shares that buffer's flags, which is what the engine test pins.
+
+*Tests — one engine, three bridge, and two mutations each caught.* `a_buffer_wrapped_over_a_detached_buffers_block_is_live` (`crates/runtime/src/builtins/array_buffer.rs`) is deno's shape at the engine's own level: wrap a block, take the clone a store would hold, detach, wrap that clone again, and assert the new buffer is not detached, that its flags are its own, and that both clones still read `[5, 10, 15]`. The bridge tests are `a_store_outlives_the_buffer_it_came_from` (`crates/v8/array_buffer.rs`, the whole hand-over end to end: detach, wrap, `v.byteLength` 3, `v[0]` 5), `a_view_over_a_store_the_host_filled_reads_its_bytes` (which is the probe, kept because it is the half that *does* work and the next reader should not have to re-derive it), and a new assertion in `a_shared_buffer_over_a_store_shares_its_bytes` — the buffer's **own** store must report shared now that it is a different object from the store that was passed. Two mutations, each caught: restoring the inherit (`BufferState::fixed(shared, …)` instead of `shared.for_new_buffer()`) fails the engine test on "its flags are its own" and the bridge test with `v[0]` `undefined`, which is the deno failure verbatim; and dropping the `mark_shared` the host-facing constructor now needs fails the new bridge assertion and nothing else, which is why the assertion was added — the mutation was silent without it.
+
+*The measurement.* deno's `runtime::tests::ops::test_op_detached_buffer` **passes** — both scripts, the wasm-memory half included — and the whole `deno_core --lib` suite moves **447 passed / 12 failed → 448 passed / 11 failed**: the one test flipped, none newly red, and the 11 left are the same set (§9's four inspector cases, the two Windows `uv_compat` pipe-busy ones, and the five the earlier records name).
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,328 passed / 0 failed** (`runtime` 917, `v8` 255, `crux` 249, `test262` 3324 — 5,325 plus this change's three tests). The wasm-free shapes CI gates both hold: `cargo test -p runtime --no-default-features --lib` **888 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit`. The experimental shapes compile too, because the change touches cfg'd code: `cargo test -p byteblock --features workers --lib` (2 passed) and `cargo check -p slag --features workers`. The corpora were re-run because the engine's block layout, the JIT's inline element store and the whole buffer-table path moved: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce every certified number — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending (64,594 checks) — and js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7562,6 +7570,27 @@ migrate, then delete.
   became a gate instead of a claim: CI runs the engine's suite wasm-free
   (`cargo test -p runtime --no-default-features --lib`, 884 tests) and the
   interpreter-only check beside it.
+- **A buffer's flags are the buffer's, not the bytes it looks at — named here
+  with the edit.** `SharedBuffer` carries a mirror of the four flags
+  `BufferState` owns (`detached`, `immutable`, `resizable`, `is_shared`) because
+  crux's integer-indexed access and the JIT's inline element store read them
+  without reaching the agent, and every clone of a block shares that mirror —
+  which is what makes a view see its own buffer's detach. It is wrong the moment
+  two buffer *objects* look at one storage, which is precisely what a host store
+  exists to do: `deno_core`'s `to_v8_slice_detachable`
+  (`libs/core/runtime/ops.rs:383-416`) reads a typed array's store, detaches the
+  buffer, and hands the store's bytes to a *new* buffer — which then reported
+  `byteLength` 3 (its own `BufferState`) while reading `a3[0]` as `undefined`,
+  because the mirror it inherited still said detached. V8 keeps the two apart
+  and so must this: detachment belongs to the *buffer* —
+  `JSArrayBuffer::DetachInternal` (`v8/src/objects/js-array-buffer.cc:217-245`)
+  sets `was_detached` on it and hands it the empty backing store, while a
+  `SharedRef` taken first keeps the bytes — and reaches the *views* through them
+  (`JSTypedArray::MarkDetached`, `:178-190`), never the storage. So the byte base
+  stays shared by every block over one storage (a resize must keep every base
+  live: a wasm `Memory.prototype.buffer` materialised before a grow reads the
+  grown bytes) and the four flags become per buffer object, renewed wherever the
+  runtime wraps a block in a buffer that did not create it.
 
 ## 11. Working rules
 
@@ -7642,11 +7671,16 @@ migrate, then delete.
    fix is a holey array of that length — `length` is a property the engine
    writes — and it needs a decision, not a drive-by.
 6. **`shared_array_buffer_from_block` records sharing on the buffer and not on the
-   block.** The language-facing constructor in the same file does both
-   (`SharedBuffer::mark_shared`), so the two disagree about what a store built over
-   one of these blocks reports. The bridge compensates where it builds a shared
-   buffer; the engine fix is one line but touches wasm memory, workers and the
-   test262 runner, so it is the operator's call rather than a drive-by.
+   block — resolved, and its shape changed with §9's buffer-flags bullet.** The
+   language-facing constructor in the same file does both (`SharedBuffer::mark_shared`),
+   so the two disagreed about what a store built over one of these blocks reports;
+   the bridge compensated where it builds a shared buffer. Now the host-facing
+   constructor marks **its own** block (the flags are per buffer object), so its
+   store reports shared and so does the buffer's own — both are pinned by
+   `a_shared_buffer_over_a_store_shares_its_bytes`, which asserts the input store
+   *and* the buffer's store. The bridge's compensating line is still needed and
+   still right: it marks the store the host passed, which is a different object
+   from the buffer's block now.
 7. **The bridge's position table has no way to forget an entry.**
    `IsolateInner::positions` (and `runtime`'s own `error_data` / `error_stack`)
    is keyed by object identity, which only a collection can retire, and the

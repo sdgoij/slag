@@ -890,7 +890,12 @@ fn shared_array_buffer_construct(
 
 /// Wrap an existing shared byte block as a SharedArrayBuffer object in this
 /// agent (used by the worker machinery to hand a block shared with another
-/// agent to a fresh realm; spec 25.3.2.1 with a supplied [[ArrayBufferData]]).
+/// agent to a fresh realm, and by a wasm shared memory's `buffer`; spec 25.3.2.1
+/// with a supplied [[ArrayBufferData]]).
+///
+/// Like [`array_buffer_from_block`], the block is taken over with fresh flags —
+/// this object's own — and the shared one is then set here rather than inherited
+/// from whichever buffer the block came from.
 pub fn shared_array_buffer_from_block(
     agent: &mut Agent,
     shared: SharedBuffer,
@@ -911,7 +916,7 @@ pub fn shared_array_buffer_from_block(
     agent.buffer_data.insert(
         object.id(),
         std::cell::RefCell::new(BufferState {
-            shared,
+            shared: shared.for_new_buffer(),
             byte_length,
             max_byte_length: None,
             resizable: false,
@@ -921,12 +926,24 @@ pub fn shared_array_buffer_from_block(
             immutable: false,
         }),
     );
+    // The flags are this object's now (see `array_buffer_from_block`), so the
+    // shared mirror has to be set here rather than inherited from the block's
+    // previous owner.
+    let cell = agent.buffer_data.get(&object.id()).expect("inserted");
+    cell.borrow().shared.mark_shared();
     Ok(Value::Object(object))
 }
 
 /// Wrap an existing byte block as an ArrayBuffer object in this agent
 /// (host-facing: lets an embedder hand bytes to JS; spec 25.1.2.2 with a
 /// supplied [[ArrayBufferData]]).
+///
+/// The block is taken over with **fresh flags**: this buffer's object is a new
+/// one, and the flags mirror a `BufferState`, so inheriting them from whatever
+/// buffer the block came from would make this buffer read as detached (or
+/// immutable, or resizable) when it is not. A host store is the case: it keeps
+/// the bytes of a buffer that was detached, and the new buffer over that store
+/// is alive (`.notes/embedding.md` §9, the buffer's-flags bullet).
 pub fn array_buffer_from_block(
     agent: &mut Agent,
     shared: SharedBuffer,
@@ -946,7 +963,7 @@ pub fn array_buffer_from_block(
     let object = JsObject::ordinary_object_create(Some(prototype));
     agent.buffer_data.insert(
         object.id(),
-        std::cell::RefCell::new(BufferState::fixed(shared, byte_length)),
+        std::cell::RefCell::new(BufferState::fixed(shared.for_new_buffer(), byte_length)),
     );
     Ok(Value::Object(object))
 }
@@ -1626,6 +1643,67 @@ mod tests {
             run("new SharedArrayBuffer(2 ** 31)"),
             Err(e) if e.kind == ErrorKind::RangeError
         ));
+    }
+
+    /// A buffer wrapped over a block a *detached* buffer's clone shares is its
+    /// own buffer: the flags are per object, so it is alive and the bytes it
+    /// reads are the storage's, which survive a detach. This is the shape of a
+    /// host store — taken from the buffer, kept across the detach, wrapped in a
+    /// new buffer — and getting it wrong made the new buffer report a live
+    /// `byteLength` while its views read nothing (`.notes/embedding.md` §9,
+    /// the buffer's-flags bullet).
+    #[test]
+    fn a_buffer_wrapped_over_a_detached_buffers_block_is_live() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+
+        let block = SharedBuffer::new(3);
+        block.write(0, &[5, 10, 15]).unwrap();
+        let first = array_buffer_from_block(&mut agent, block, 3).unwrap();
+        let first_id = first.as_object().expect("a buffer object").id();
+
+        // What a host store taken before the detach holds: a clone of the
+        // buffer's block, which shares that buffer's flags.
+        let store = agent
+            .buffer_data
+            .get(&first_id)
+            .expect("registered")
+            .borrow()
+            .shared
+            .clone();
+        detach_array_buffer(&mut agent, first_id);
+        assert!(
+            store.is_detached(),
+            "the detached buffer's own clone reports the detach"
+        );
+
+        let second = array_buffer_from_block(&mut agent, store.clone(), 3).unwrap();
+        let second_id = second.as_object().expect("a buffer object").id();
+        assert!(
+            !is_detached(&agent, second_id),
+            "the new buffer is not detached"
+        );
+        let second_flags = agent
+            .buffer_data
+            .get(&second_id)
+            .expect("registered")
+            .borrow()
+            .shared
+            .clone();
+        assert!(
+            !second_flags.is_detached(),
+            "its flags are its own, not the block's history"
+        );
+        assert_eq!(
+            second_flags.read(0, 3).unwrap(),
+            vec![5, 10, 15],
+            "the bytes are the storage's and survived the detach"
+        );
+        assert_eq!(
+            store.read(0, 3).unwrap(),
+            vec![5, 10, 15],
+            "and the store's clone reads them too"
+        );
     }
 
     #[test]

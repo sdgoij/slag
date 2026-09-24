@@ -64,17 +64,15 @@ fn applied_op(op: AtomicOp, old: u64, operand: u64, expected: Option<u64>) -> u6
     }
 }
 
-/// The shared per-buffer geometry every view reads live (all clones of a
-/// [`SharedBuffer`] reference one box): the byte base and the writable
-/// flags. One box keeps the JIT's inline element store (gap-close M5c)
-/// sound — it re-reads the base and flags via `offset_of!` through
-/// [`SharedBuffer::state`] (the raw box address) on every store, so a
-/// helper that detaches, freezes, or resizes the buffer mid-run is picked
-/// up by the next store. The fields are `pub` (cross-crate `offset_of!`
-/// needs pub fields) and exist in both cfg builds with identical names —
-/// `Cell` on the single-agent path, atomics under `workers` (the box can
-/// be shared across agent threads there; the JIT inline is never emitted
-/// in that build).
+/// The byte base of a storage, shared by every block that looks at it (all
+/// clones of those blocks reference one box). One box keeps the JIT's inline
+/// element store (gap-close M5c) sound — it re-reads the base through
+/// [`SharedBuffer::state`] (the raw box address) on every store, so a resize
+/// that moves the storage is picked up by the next store. The field is `pub`
+/// (cross-crate `offset_of!` needs pub fields) and exists in both cfg builds
+/// with an identical name — `Cell` on the single-agent path, an atomic under
+/// `workers` (the box can be shared across agent threads there; the JIT inline
+/// is never emitted in that build).
 #[derive(Debug)]
 pub struct BlockState {
     /// The address of the byte storage's first byte: the Vec's buffer
@@ -85,39 +83,6 @@ pub struct BlockState {
     pub data: Cell<usize>,
     #[cfg(feature = "workers")]
     pub data: std::sync::atomic::AtomicUsize,
-    /// Whether the owning ArrayBuffer has been detached (spec 25.1.2.5).
-    /// The runtime's `BufferState.detached` is authoritative; this flag
-    /// mirrors it so crux's integer-indexed access can reject detached
-    /// views without reaching the agent.
-    #[cfg(not(feature = "workers"))]
-    pub detached: Cell<bool>,
-    #[cfg(feature = "workers")]
-    pub detached: std::sync::atomic::AtomicBool,
-    /// Whether the owning ArrayBuffer is immutable (ES2026
-    /// `transferToImmutable`): writes through views throw a TypeError. The
-    /// runtime's `BufferState.immutable` is authoritative; this flag mirrors
-    /// it for crux's integer-indexed writes.
-    #[cfg(not(feature = "workers"))]
-    pub immutable: Cell<bool>,
-    #[cfg(feature = "workers")]
-    pub immutable: std::sync::atomic::AtomicBool,
-    /// Whether the owning ArrayBuffer is resizable (spec 25.1.2.4: a
-    /// `maxByteLength` was supplied). Mirrored from the runtime's
-    /// `BufferState.resizable` so crux's TypedArray [[PreventExtensions]] can
-    /// reject views that could gain or lose integer-indexed properties when
-    /// the buffer is resized (spec 10.4.5.1) — and so the JIT inline can
-    /// reject views whose storage can move.
-    #[cfg(not(feature = "workers"))]
-    pub resizable: Cell<bool>,
-    #[cfg(feature = "workers")]
-    pub resizable: std::sync::atomic::AtomicBool,
-    /// Whether the owning buffer is a SharedArrayBuffer (spec 25.1.3.4).
-    /// Mirrored from `BufferState.is_shared`; a shared buffer's views are
-    /// fixed-length for [[PreventExtensions]] purposes.
-    #[cfg(not(feature = "workers"))]
-    pub is_shared: Cell<bool>,
-    #[cfg(feature = "workers")]
-    pub is_shared: std::sync::atomic::AtomicBool,
 }
 
 impl BlockState {
@@ -126,6 +91,60 @@ impl BlockState {
         {
             Self {
                 data: Cell::new(data),
+            }
+        }
+        #[cfg(feature = "workers")]
+        {
+            Self {
+                data: std::sync::atomic::AtomicUsize::new(data),
+            }
+        }
+    }
+}
+
+/// The flags of one ArrayBuffer (spec 25.1.1), shared by every clone of *that
+/// buffer's* block and by nothing else: the geometry is the storage's, the
+/// flags are the buffer object's, and a block a second buffer is built over
+/// gets its own (see [`SharedBuffer::for_new_buffer`]).
+///
+/// The runtime's `BufferState` is authoritative for all four and these mirror
+/// it, because crux's integer-indexed access and the JIT's inline element store
+/// read them without reaching the agent.
+#[derive(Debug)]
+pub struct BufferFlags {
+    /// Whether the owning ArrayBuffer has been detached (spec 25.1.2.5).
+    #[cfg(not(feature = "workers"))]
+    pub detached: Cell<bool>,
+    #[cfg(feature = "workers")]
+    pub detached: std::sync::atomic::AtomicBool,
+    /// Whether the owning ArrayBuffer is immutable (ES2026
+    /// `transferToImmutable`): writes through views throw a TypeError.
+    #[cfg(not(feature = "workers"))]
+    pub immutable: Cell<bool>,
+    #[cfg(feature = "workers")]
+    pub immutable: std::sync::atomic::AtomicBool,
+    /// Whether the owning ArrayBuffer is resizable (spec 25.1.2.4: a
+    /// `maxByteLength` was supplied), so crux's TypedArray
+    /// [[PreventExtensions]] can reject views that could gain or lose
+    /// integer-indexed properties when the buffer is resized (spec 10.4.5.1) —
+    /// and so the JIT inline can reject views whose storage can move.
+    #[cfg(not(feature = "workers"))]
+    pub resizable: Cell<bool>,
+    #[cfg(feature = "workers")]
+    pub resizable: std::sync::atomic::AtomicBool,
+    /// Whether the owning buffer is a SharedArrayBuffer (spec 25.1.3.4); a
+    /// shared buffer's views are fixed-length for [[PreventExtensions]].
+    #[cfg(not(feature = "workers"))]
+    pub is_shared: Cell<bool>,
+    #[cfg(feature = "workers")]
+    pub is_shared: std::sync::atomic::AtomicBool,
+}
+
+impl Default for BufferFlags {
+    fn default() -> Self {
+        #[cfg(not(feature = "workers"))]
+        {
+            Self {
                 detached: Cell::new(false),
                 immutable: Cell::new(false),
                 resizable: Cell::new(false),
@@ -135,7 +154,6 @@ impl BlockState {
         #[cfg(feature = "workers")]
         {
             Self {
-                data: std::sync::atomic::AtomicUsize::new(data),
                 detached: std::sync::atomic::AtomicBool::new(false),
                 immutable: std::sync::atomic::AtomicBool::new(false),
                 resizable: std::sync::atomic::AtomicBool::new(false),
@@ -155,6 +173,11 @@ pub const WORKERS: bool = cfg!(feature = "workers");
 type StateRc = Rc<BlockState>;
 #[cfg(feature = "workers")]
 type StateRc = std::sync::Arc<BlockState>;
+
+#[cfg(not(feature = "workers"))]
+type FlagsRc = Rc<BufferFlags>;
+#[cfg(feature = "workers")]
+type FlagsRc = std::sync::Arc<BufferFlags>;
 
 /// Memory the host owns, borrowed for as long as a block over it is alive.
 ///
@@ -243,16 +266,25 @@ pub struct SharedBuffer {
     /// (which reads the base through the state box) needs no special case —
     /// borrowed memory does not move, so the base is stable by construction.
     borrowed: Option<BorrowedRc>,
-    /// The shared geometry box (see [`BlockState`]); every clone shares it
-    /// (`Rc` single-agent, `Arc` under `workers`).
+    /// The geometry box (see [`BlockState`]): the live byte base, shared by
+    /// every block over this storage (`Rc` single-agent, `Arc` under `workers`).
     state_rc: StateRc,
     /// The address of the `state_rc` box's value — the JIT's inline element
     /// store dereferences it (`offset_of!(SharedBuffer, state)` + the
-    /// `BlockState` field offsets) to read the live data base and flags.
+    /// `BlockState` field offsets) to read the live data base.
     /// The `Rc`/`Arc` box layout is not `offset_of!`-expressible across
     /// crates, so the value address is stored raw. Stable for the box's
     /// lifetime; `state_rc` keeps the box alive for every clone.
     pub state: usize,
+    /// The flags box (see [`BufferFlags`]): shared by every clone of *this*
+    /// block — the buffer object and its views — and renewed when a second
+    /// buffer is built over the same storage.
+    flags_rc: FlagsRc,
+    /// The address of the `flags_rc` box's value, read the same way [`state`]
+    /// is (`offset_of!(SharedBuffer, flags)` + the `BufferFlags` field offsets).
+    ///
+    /// [`state`]: Self::state
+    pub flags: usize,
 }
 
 /// The read-modify-write operations of the Atomics built-ins.
@@ -285,11 +317,15 @@ impl SharedBuffer {
             let block = Rc::new(RefCell::new(vec![0u8; byte_length]));
             let state_rc = Rc::new(BlockState::new(block.borrow().as_ptr() as usize));
             let state = &*state_rc as *const BlockState as usize;
+            let flags_rc = FlagsRc::new(BufferFlags::default());
+            let flags = &*flags_rc as *const BufferFlags as usize;
             SharedBuffer {
                 block,
                 borrowed: None,
                 state_rc,
                 state,
+                flags_rc,
+                flags,
             }
         }
         #[cfg(feature = "workers")]
@@ -303,13 +339,45 @@ impl SharedBuffer {
                 as *const u8
                 as usize));
             let state = &*state_rc as *const BlockState as usize;
+            let flags_rc = FlagsRc::new(BufferFlags::default());
+            let flags = &*flags_rc as *const BufferFlags as usize;
             SharedBuffer {
                 block,
                 byte_length: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(byte_length)),
                 borrowed: None,
                 state_rc,
                 state,
+                flags_rc,
+                flags,
             }
+        }
+    }
+
+    /// A block over the same bytes that belongs to a **different** buffer
+    /// object.
+    ///
+    /// The storage and its live base are shared — a resize still moves what
+    /// every block over these bytes reads — and the flags start fresh, because
+    /// they mirror a `BufferState` and that is per object. The runtime calls
+    /// this wherever it wraps a block in a buffer that did not create it (a
+    /// store a host hands back, a wasm memory's `buffer`): without it, a buffer
+    /// built over a detached buffer's storage inherits the detach and reads as
+    /// dead while its own `byteLength` is live.
+    ///
+    /// [`clone`](Self::clone) shares the flags instead, which is what a view of
+    /// one buffer needs: it must see that buffer's own detach.
+    pub fn for_new_buffer(&self) -> Self {
+        let flags_rc = FlagsRc::new(BufferFlags::default());
+        let flags = &*flags_rc as *const BufferFlags as usize;
+        Self {
+            block: self.block.clone(),
+            #[cfg(feature = "workers")]
+            byte_length: self.byte_length.clone(),
+            borrowed: self.borrowed.clone(),
+            state_rc: self.state_rc.clone(),
+            state: self.state,
+            flags_rc,
+            flags,
         }
     }
 
@@ -357,6 +425,8 @@ impl SharedBuffer {
         let block = std::sync::Arc::from(Vec::new());
         #[cfg(feature = "workers")]
         let byte_length = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(byte_length));
+        let flags_rc = FlagsRc::new(BufferFlags::default());
+        let flags = &*flags_rc as *const BufferFlags as usize;
         SharedBuffer {
             block,
             #[cfg(feature = "workers")]
@@ -364,6 +434,8 @@ impl SharedBuffer {
             borrowed: Some(borrowed),
             state_rc,
             state,
+            flags_rc,
+            flags,
         }
     }
 
@@ -380,11 +452,11 @@ impl SharedBuffer {
     pub fn mark_detached(&self) {
         #[cfg(not(feature = "workers"))]
         {
-            self.state_rc.detached.set(true);
+            self.flags_rc.detached.set(true);
         }
         #[cfg(feature = "workers")]
         {
-            self.state_rc
+            self.flags_rc
                 .detached
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -394,11 +466,11 @@ impl SharedBuffer {
     pub fn is_detached(&self) -> bool {
         #[cfg(not(feature = "workers"))]
         {
-            self.state_rc.detached.get()
+            self.flags_rc.detached.get()
         }
         #[cfg(feature = "workers")]
         {
-            self.state_rc
+            self.flags_rc
                 .detached
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -408,11 +480,11 @@ impl SharedBuffer {
     pub fn mark_immutable(&self) {
         #[cfg(not(feature = "workers"))]
         {
-            self.state_rc.immutable.set(true);
+            self.flags_rc.immutable.set(true);
         }
         #[cfg(feature = "workers")]
         {
-            self.state_rc
+            self.flags_rc
                 .immutable
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -422,11 +494,11 @@ impl SharedBuffer {
     pub fn is_immutable(&self) -> bool {
         #[cfg(not(feature = "workers"))]
         {
-            self.state_rc.immutable.get()
+            self.flags_rc.immutable.get()
         }
         #[cfg(feature = "workers")]
         {
-            self.state_rc
+            self.flags_rc
                 .immutable
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -436,11 +508,11 @@ impl SharedBuffer {
     pub fn mark_resizable(&self) {
         #[cfg(not(feature = "workers"))]
         {
-            self.state_rc.resizable.set(true);
+            self.flags_rc.resizable.set(true);
         }
         #[cfg(feature = "workers")]
         {
-            self.state_rc
+            self.flags_rc
                 .resizable
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -450,11 +522,11 @@ impl SharedBuffer {
     pub fn is_resizable(&self) -> bool {
         #[cfg(not(feature = "workers"))]
         {
-            self.state_rc.resizable.get()
+            self.flags_rc.resizable.get()
         }
         #[cfg(feature = "workers")]
         {
-            self.state_rc
+            self.flags_rc
                 .resizable
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -465,11 +537,11 @@ impl SharedBuffer {
     pub fn mark_shared(&self) {
         #[cfg(not(feature = "workers"))]
         {
-            self.state_rc.is_shared.set(true);
+            self.flags_rc.is_shared.set(true);
         }
         #[cfg(feature = "workers")]
         {
-            self.state_rc
+            self.flags_rc
                 .is_shared
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -479,11 +551,11 @@ impl SharedBuffer {
     pub fn is_shared(&self) -> bool {
         #[cfg(not(feature = "workers"))]
         {
-            self.state_rc.is_shared.get()
+            self.flags_rc.is_shared.get()
         }
         #[cfg(feature = "workers")]
         {
-            self.state_rc
+            self.flags_rc
                 .is_shared
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
