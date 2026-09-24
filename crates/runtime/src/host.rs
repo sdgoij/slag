@@ -44,6 +44,23 @@ pub trait HostHooks: std::fmt::Debug {
         Ok(())
     }
 
+    /// The host's error-stack formatter, if it installed one
+    /// (v8::Isolate::SetPrepareStackTraceCallback): the error and the frames its
+    /// trace was captured from go in, and what `.stack` should read comes out.
+    ///
+    /// `None` is "no formatter here": the engine renders the trace itself, which
+    /// is what a host that installs no callback gets in V8 as well. A host that
+    /// answers `Some` owns the text — the frames are the same ones the engine's
+    /// own rendering is built from, so a formatter that wants them has them and
+    /// one that wants to rewrite them can.
+    fn prepare_stack_trace(
+        &self,
+        _error: &crux::value::Value,
+        _frames: &[crate::api::StackFrame],
+    ) -> Result<Option<crux::value::Value>, JsError> {
+        Ok(None)
+    }
+
     /// HostCreateWorker (spec 9.4.5): start a worker agent running `source`
     /// with access to `shared` byte blocks. The default is unsupported; hosts
     /// attach an implementation (the runtime's is `crate::workers::spawn_worker`,
@@ -145,6 +162,19 @@ pub fn promise_rejection_tracker(
     match &agent.host_hooks {
         Some(hooks) => hooks.promise_rejection_tracker(promise, reason, operation),
         None => Ok(()),
+    }
+}
+
+/// The host's error-stack formatter, when it installed one: the answer to use
+/// for `.stack`, or `None` for "render it here".
+pub fn prepare_stack_trace(
+    agent: &crate::agent::Agent,
+    error: &crux::value::Value,
+    frames: &[crate::api::StackFrame],
+) -> Result<Option<crux::value::Value>, JsError> {
+    match &agent.host_hooks {
+        Some(hooks) => hooks.prepare_stack_trace(error, frames),
+        None => Ok(None),
     }
 }
 
@@ -290,5 +320,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(observed.borrow().as_deref(), Some("var x = 1;"));
+    }
+
+    /// A host that formats an error's stack itself
+    /// (`Isolate::SetPrepareStackTraceCallback`): it records the frames it is
+    /// handed and answers the text `.stack` reads.
+    #[derive(Debug)]
+    struct FormatsStacks {
+        seen: std::rc::Rc<std::cell::RefCell<Vec<crate::api::StackFrame>>>,
+    }
+
+    impl HostHooks for FormatsStacks {
+        fn prepare_stack_trace(
+            &self,
+            _error: &crux::value::Value,
+            frames: &[crate::api::StackFrame],
+        ) -> Result<Option<crux::value::Value>, JsError> {
+            *self.seen.borrow_mut() = frames.to_vec();
+            Ok(Some(crux::value::Value::String(crux::handle::Handle::new(
+                JsString::from_utf8("a host's stack"),
+            ))))
+        }
+    }
+
+    /// A host with a formatter owns what `.stack` reads, and the frames it is
+    /// handed are the ones the trace was captured from — the same frames the
+    /// engine's own rendering is built from, captured while the stack is still
+    /// the one the error was made on.
+    #[test]
+    fn a_host_formats_the_stack_it_is_handed() {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut agent = Agent::new();
+        agent.host_hooks = Some(Box::new(FormatsStacks { seen: seen.clone() }));
+        agent.initialize_host_defined_realm().unwrap();
+        // The script reads `.stack` on the error it caught, so the value the
+        // accessor answers is what the script hands back.
+        let stack = agent
+            .run_script_named(
+                "function inner() { throw new Error('boom'); }\n\
+                 try { inner(); } catch (e) { e.stack; }",
+                Some(JsString::from_utf8("file:///host.js")),
+            )
+            .unwrap();
+        assert_eq!(
+            stack.as_string().map(|text| text.to_string_lossy()),
+            Some("a host's stack".to_string()),
+            "the accessor answers what the host's formatter said"
+        );
+        let seen = seen.borrow();
+        assert_eq!(
+            seen.iter()
+                .map(|frame| frame.function_name.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec!["inner", ""],
+            "innermost first, and the script's own top level has no function name"
+        );
+        assert!(
+            seen.iter().all(|frame| frame.script_name.is_none()),
+            "a classic script carries no name (the engine parses one from text \
+             alone), so its frames name none: {seen:?}"
+        );
+        assert_eq!(seen[0].line, 1, "the frame sits on the line it threw from");
+        assert!(seen[0].column > 0, "and at the site, not at column zero");
     }
 }

@@ -14,15 +14,17 @@ use runtime::api;
 
 use crate::ExternalReference;
 use crate::cppgc::Heap;
+use crate::data::Private;
 use crate::data::{
     Array, Context, Data, FixedArray, Function, Object, Promise, PromiseResolver, Value,
 };
+use crate::function::{FunctionCallbackArguments, ReturnValue};
 use crate::handle::{Global, Local, Payload};
 use crate::position::Position;
 use crate::promise::{PromiseRejectEvent, PromiseRejectMessage};
 use crate::scope::PinScope;
 use crate::snapshot::{FunctionCodeHandling, SnapshotCreator, SnapshotRestore, StartupData};
-use crate::support::{MapFnFrom, MapFnTo, UniqueRef, UnitType};
+use crate::support::{MapFnFrom, UniqueRef, UnitType};
 use crate::wasm::WasmStreaming;
 
 /// Create parameters (`v8::CreateParams`).
@@ -247,6 +249,15 @@ pub struct IsolateInner {
     /// this bridge's `HostHooks` when code evaluates `import(...)`.
     import_dynamically: Option<ImportModuleDynamicallyCallback>,
     import_dynamically_with_phase: Option<ImportModuleWithPhaseDynamicallyCallback>,
+    /// The host's error-stack formatter
+    /// (`v8::Isolate::SetPrepareStackTraceCallback`), once it installed one. The
+    /// engine reaches it through this bridge's `HostHooks` when an error's
+    /// `stack` is read.
+    prepare_stack_trace: Option<PrepareStackTraceCallbackOwned>,
+    /// The call-site prototype this isolate hands a host's formatter, built on
+    /// the first read of a `stack` and kept so one isolate has one set of method
+    /// functions rather than one per read.
+    callsite_prototype: RefCell<Option<Global<Object>>>,
 }
 
 const _: () = assert!(std::mem::offset_of!(IsolateInner, engine) == 0);
@@ -293,6 +304,35 @@ fn host_streaming_callback<'a, 'i, 's, F>(
         + for<'x, 'y, 'z> Fn(&'z mut PinScope<'x, 'y>, Local<'x, Value>, WasmStreaming<false>),
 {
     (F::get())(scope, source, streaming)
+}
+
+/// The host's error-stack formatter, as the isolate keeps it
+/// (v8::Isolate::SetPrepareStackTraceCallback).
+///
+/// Lifetime-parameterized for the same reason [`host_streaming_callback`] is: a
+/// mapped function pointer names the scope's lifetime and cannot be stored past
+/// it, so the host function is folded into this item and the item is what the
+/// isolate holds.
+type PrepareStackTraceCallbackOwned = for<'a, 'i, 's> fn(
+    &'s mut PinScope<'a, 'i>,
+    Local<'a, Value>,
+    Local<'a, Array>,
+) -> Local<'a, Value>;
+
+fn host_prepare_stack_trace<'a, 'i, 's, F>(
+    scope: &'s mut PinScope<'a, 'i>,
+    error: Local<'a, Value>,
+    sites: Local<'a, Array>,
+) -> Local<'a, Value>
+where
+    F: UnitType
+        + for<'x, 'y, 'z> Fn(
+            &'z mut PinScope<'x, 'y>,
+            Local<'x, Value>,
+            Local<'x, Array>,
+        ) -> Local<'x, Value>,
+{
+    (F::get())(scope, error, sites)
 }
 
 /// The callback a dynamic `import()` runs, as the isolate keeps it
@@ -470,18 +510,27 @@ where
         + for<'a> Fn(&mut PinScope<'s, 'a>, Local<'s, Value>, Local<'s, Array>) -> Local<'s, Value>,
 {
     fn mapping() -> Self {
-        // The callback is accepted and never run, so there is nothing to fold a
-        // host function into: this is the shape the bound asks for, and calling
-        // it is the one thing the bridge does not do.
-        fn never<'s, 'a>(
-            _scope: &mut PinScope<'s, 'a>,
-            _error: Local<'s, Value>,
-            _sites: Local<'s, Array>,
-        ) -> Local<'s, Value> {
-            unreachable!("the bridge does not run the prepare-stack-trace callback")
+        // The mapped shape names the caller's scope lifetime, which cannot be
+        // stored past it; a host's callback is taken as the fn item that erases
+        // it instead — see [`Isolate::set_prepare_stack_trace_callback`], which
+        // is where a host function is folded into one.
+        fn run<'s, 'a, F>(
+            scope: &mut PinScope<'s, 'a>,
+            error: Local<'s, Value>,
+            sites: Local<'s, Array>,
+        ) -> Local<'s, Value>
+        where
+            F: UnitType
+                + for<'b> Fn(
+                    &mut PinScope<'s, 'b>,
+                    Local<'s, Value>,
+                    Local<'s, Array>,
+                ) -> Local<'s, Value>,
+        {
+            (F::get())(scope, error, sites)
         }
 
-        never
+        run::<F>
     }
 }
 
@@ -665,6 +714,8 @@ impl Isolate {
             import_meta: None,
             import_dynamically: None,
             import_dynamically_with_phase: None,
+            prepare_stack_trace: None,
+            callsite_prototype: RefCell::new(None),
         });
         // SAFETY: the box's allocation is where the state lives and it outlives
         // every handle to it — `OwnedIsolate` keeps it alive.
@@ -1257,17 +1308,26 @@ impl Isolate {
         self.install_hooks();
     }
 
-    /// The callback an error's `stack` property would run
+    /// The callback an error's `stack` property runs
     /// (v8::Isolate::SetPrepareStackTraceCallback).
     ///
-    /// Accepted and not run: the engine builds an error's stack itself, with no
-    /// host hook in the path, so script-level `Error.prepareStackTrace` is the
-    /// only thing that replaces it here.
-    pub fn set_prepare_stack_trace_callback<'s>(
-        &mut self,
-        callback: impl MapFnTo<PrepareStackTraceCallback<'s>>,
-    ) {
-        let _ = callback;
+    /// Run: the engine asks this bridge's `HostHooks` when an error's `stack` is
+    /// read, hands it the error and the frames its trace was captured from, and
+    /// the bridge builds the call-site objects this callback takes and stores its
+    /// answer as the value `.stack` reads. A host that installs none reads the
+    /// engine's own rendering, which is what V8 gives one that installs none as
+    /// well.
+    pub fn set_prepare_stack_trace_callback<F>(&mut self, _: F)
+    where
+        F: UnitType
+            + for<'x, 'y, 'z> Fn(
+                &'z mut PinScope<'x, 'y>,
+                Local<'x, Value>,
+                Local<'x, Array>,
+            ) -> Local<'x, Value>,
+    {
+        self.inner_mut().prepare_stack_trace = Some(host_prepare_stack_trace::<F>);
+        self.install_hooks();
     }
 
     /// The callback a module's first read of `import.meta` runs
@@ -1472,6 +1532,35 @@ impl runtime::HostHooks for BridgeHooks {
         Ok(())
     }
 
+    fn prepare_stack_trace(
+        &self,
+        error: &crux::value::Value,
+        frames: &[api::StackFrame],
+    ) -> Result<Option<crux::value::Value>, crux::error::JsError> {
+        // SAFETY: as `promise_rejection_tracker` — the engine hands back the
+        // isolate whose error is being read, and that address is the bridge's.
+        let Some(engine) = api::Isolate::get_current() else {
+            return Ok(None);
+        };
+        let isolate = unsafe { Isolate::from_engine_ptr(engine) };
+        let Some(callback) = isolate.inner().prepare_stack_trace else {
+            return Ok(None);
+        };
+        // The realm the error is being read in: the engine calls this from the
+        // `stack` accessor, and a realm is in reach for the whole of an
+        // isolate's life (one context per isolate, its bootstrap execution
+        // context never popped).
+        let Some(context) = isolate.current_context() else {
+            return Ok(None);
+        };
+        let context_local = Local::<Context>::from_payload(Payload::Context(context));
+        crate::callback_scope!(unsafe scope, context_local);
+        let error = Local::<Value>::from_engine(api::Local::from(*error));
+        let sites = call_sites(scope, &isolate, frames)?;
+        let value = callback(scope, error, sites);
+        Ok(Some(value.into_engine().into_value()))
+    }
+
     fn has_wasm_streaming_callback(&self) -> bool {
         // SAFETY: as `promise_rejection_tracker` — the engine hands back the
         // isolate whose agent is running, and that address is the bridge's.
@@ -1615,6 +1704,197 @@ impl runtime::HostHooks for BridgeHooks {
         let promise = promise?;
         Some(Ok(Local::<Value>::from(promise).into_engine().into_value()))
     }
+}
+
+/// The methods a call site answers, each reading the frame data stored under the
+/// name it is paired with (v8::CallSite).
+///
+/// The method names are V8's, including the `isToplevel` spelling its API has.
+/// `getScriptNameOrSourceURL` answers the file name, which is what V8 answers
+/// for code that was named rather than carrying a `//# sourceURL`.
+const CALL_SITE_METHODS: [(&str, &str); 15] = [
+    ("getTypeName", "typeName"),
+    ("getFunctionName", "functionName"),
+    ("getMethodName", "methodName"),
+    ("getFileName", "fileName"),
+    ("getLineNumber", "lineNumber"),
+    ("getColumnNumber", "columnNumber"),
+    ("getEvalOrigin", "evalOrigin"),
+    ("isToplevel", "isToplevel"),
+    ("isEval", "isEval"),
+    ("isNative", "isNative"),
+    ("isConstructor", "isConstructor"),
+    ("isAsync", "isAsync"),
+    ("isPromiseAll", "isPromiseAll"),
+    ("getPromiseIndex", "promiseIndex"),
+    ("getScriptNameOrSourceURL", "fileName"),
+];
+
+/// The error a bridge-internal build step reports. The engine's own steps
+/// refuse these only when something is deeply wrong, and a host being handed a
+/// stack is better served by the failure than by an empty one.
+fn bridge_failure(what: &str) -> crux::error::JsError {
+    crux::error::JsError::new(
+        crux::ErrorKind::Error,
+        format!("bridge: building {what} failed"),
+    )
+}
+
+/// The call-site objects a host's formatter is handed, one per frame and in the
+/// order the frames came in (v8::CallSite).
+///
+/// Each is an ordinary object carrying its frame's data in private names, with
+/// the methods on a prototype the isolate keeps: a formatter reads a field by
+/// *calling* a method on the object (`getFileName`, `isEval`, ...), which is
+/// what a JS object with methods is for and what no amount of plain data would
+/// let it do.
+fn call_sites<'s>(
+    scope: &mut PinScope<'s, '_>,
+    isolate: &Isolate,
+    frames: &[api::StackFrame],
+) -> Result<Local<'s, Array>, crux::error::JsError> {
+    let prototype = call_site_prototype(scope, isolate)?;
+    let mut sites: Vec<Local<'s, Value>> = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let site = Object::with_prototype_and_properties(scope, prototype.into(), &[], &[]);
+        set_call_site_fields(scope, site, frame)?;
+        sites.push(site.into());
+    }
+    Ok(Array::new_with_elements(scope, &sites))
+}
+
+/// The prototype every call site of this isolate shares: one function per
+/// method, each answering the frame data that call site holds. Built on the
+/// first read of an error's `stack` and kept on the isolate, so a host that
+/// reads many stacks builds the methods once.
+fn call_site_prototype<'s>(
+    scope: &mut PinScope<'s, '_>,
+    isolate: &Isolate,
+) -> Result<Local<'s, Object>, crux::error::JsError> {
+    if let Some(prototype) = &*isolate.inner().callsite_prototype.borrow() {
+        return Ok(Local::new(scope, prototype));
+    }
+    let prototype = Object::new(scope);
+    for (method, key) in CALL_SITE_METHODS {
+        let key = crate::data::String::new(scope, key)
+            .ok_or_else(|| bridge_failure("a call site's data key"))?;
+        let function = Function::builder(read_call_site_field)
+            .data(key.into())
+            .build(scope)
+            .ok_or_else(|| bridge_failure("a call-site method"))?;
+        let name = crate::data::String::new(scope, method)
+            .ok_or_else(|| bridge_failure("a call-site method's name"))?;
+        if prototype.set(scope, name.into(), function.into()) != Some(true) {
+            return Err(bridge_failure("a call-site method's property"));
+        }
+    }
+    *isolate.inner().callsite_prototype.borrow_mut() = Some(Global::new(scope, prototype));
+    Ok(prototype)
+}
+
+/// One call-site method: the frame data stored on its call site under the key
+/// the builder was given as its data.
+fn read_call_site_field<'s, 'i>(
+    scope: &mut PinScope<'s, 'i>,
+    args: FunctionCallbackArguments<'s>,
+    rv: ReturnValue<'_>,
+) {
+    let Some(key) = Local::<crate::data::String>::try_from(args.data()).ok() else {
+        return;
+    };
+    let private = Private::for_api(scope, Some(key));
+    let this = args.this();
+    if let Some(value) = this.get_private(scope, private) {
+        rv.set(value);
+    }
+}
+
+/// Fill one call site with its frame's data, under the private names the
+/// prototype's methods read. A frame answers *undefined* for what is not
+/// recorded (a script's file name among them) and a boolean for every flag,
+/// because a formatter's reads are typed: an absent boolean would be a
+/// rejection rather than a `false`.
+fn set_call_site_fields<'s>(
+    scope: &mut PinScope<'s, '_>,
+    site: Local<'s, Object>,
+    frame: &api::StackFrame,
+) -> Result<(), crux::error::JsError> {
+    let unnamed = frame.function_name.is_none();
+    let file = match &frame.script_name {
+        Some(name) => call_site_text(scope, name)?,
+        None => crate::undefined(scope).into(),
+    };
+    set_call_site_field(scope, site, "fileName", file)?;
+    let function = match &frame.function_name {
+        Some(name) => call_site_text(scope, name)?,
+        None => crate::undefined(scope).into(),
+    };
+    set_call_site_field(scope, site, "functionName", function)?;
+    set_call_site_field(scope, site, "typeName", crate::undefined(scope).into())?;
+    set_call_site_field(scope, site, "methodName", crate::undefined(scope).into())?;
+    set_call_site_field(scope, site, "evalOrigin", crate::undefined(scope).into())?;
+    let line = call_site_position(scope, frame.line)?;
+    set_call_site_field(scope, site, "lineNumber", line)?;
+    let column = call_site_position(scope, frame.column)?;
+    set_call_site_field(scope, site, "columnNumber", column)?;
+    // A frame with no function of its own is at the top level of the code it
+    // runs — a module's body among them — which is the reading V8's `isToplevel`
+    // has and the one its formatting turns on.
+    let top_level = crate::data::Boolean::new(scope, unnamed);
+    set_call_site_field(scope, site, "isToplevel", top_level.into())?;
+    let is_eval = crate::data::Boolean::new(scope, frame.is_eval);
+    set_call_site_field(scope, site, "isEval", is_eval.into())?;
+    let is_constructor = crate::data::Boolean::new(scope, frame.is_constructor);
+    set_call_site_field(scope, site, "isConstructor", is_constructor.into())?;
+    // Nothing in an execution context records these three, so a frame is never
+    // native, never async and never a `Promise.all` entry; V8 answers the same
+    // for code that is none of them.
+    let is_native = crate::data::Boolean::new(scope, false);
+    set_call_site_field(scope, site, "isNative", is_native.into())?;
+    let is_async = crate::data::Boolean::new(scope, false);
+    set_call_site_field(scope, site, "isAsync", is_async.into())?;
+    let is_promise_all = crate::data::Boolean::new(scope, false);
+    set_call_site_field(scope, site, "isPromiseAll", is_promise_all.into())?;
+    set_call_site_field(scope, site, "promiseIndex", crate::undefined(scope).into())?;
+    Ok(())
+}
+
+/// A call site's text, as a string a formatter reads.
+fn call_site_text<'s>(
+    scope: &mut PinScope<'s, '_>,
+    value: &str,
+) -> Result<Local<'s, Value>, crux::error::JsError> {
+    crate::data::String::new(scope, value)
+        .map(Local::<Value>::from)
+        .ok_or_else(|| bridge_failure("a call site's text"))
+}
+
+/// A frame's line or column: the number, or *undefined* for "no information" —
+/// which is what V8 answers for a frame with no position.
+fn call_site_position<'s>(
+    scope: &mut PinScope<'s, '_>,
+    value: usize,
+) -> Result<Local<'s, Value>, crux::error::JsError> {
+    if value == 0 {
+        return Ok(crate::undefined(scope).into());
+    }
+    Ok(crate::data::Number::new(scope, value as f64).into())
+}
+
+/// Store one field of a call site under its private name.
+fn set_call_site_field<'s>(
+    scope: &mut PinScope<'s, '_>,
+    site: Local<'s, Object>,
+    key: &str,
+    value: Local<'s, Value>,
+) -> Result<(), crux::error::JsError> {
+    let name = crate::data::String::new(scope, key)
+        .ok_or_else(|| bridge_failure("a call site's data key"))?;
+    let private = Private::for_api(scope, Some(name));
+    if site.set_private(scope, private, value) != Some(true) {
+        return Err(bridge_failure("a call site's data"));
+    }
+    Ok(())
 }
 
 /// An owned isolate (`v8::OwnedIsolate`), as returned by [`Isolate::new`].
@@ -1761,6 +2041,57 @@ mod tests {
         let handle = isolate.thread_safe_handle();
         assert!(!handle.request_interrupt(on_interrupt, std::ptr::null_mut()));
         assert!(!CALLED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A host with a stack formatter is handed an array of call sites, and what
+    /// it answers is what `.stack` reads. The formatter here is deno's shape:
+    /// it reads each frame by *calling* a method on its call site rather than by
+    /// reading a property.
+    #[test]
+    fn a_host_formatter_is_handed_call_sites() {
+        fn formatter<'s, 'i>(
+            scope: &mut PinScope<'s, 'i>,
+            _error: Local<'s, Value>,
+            sites: Local<'s, Array>,
+        ) -> Local<'s, Value> {
+            // `globalThis.readSites` is installed by the test below: a formatter
+            // that reaches into its realm is what a host's own formatter does.
+            let global = scope.get_current_context().global(scope);
+            let key = crate::data::String::new(scope, "readSites").expect("a string");
+            let read = global
+                .get(scope, key.into())
+                .and_then(|value| Local::<Function>::try_from(value).ok());
+            let Some(read) = read else {
+                return crate::undefined(scope).into();
+            };
+            read.call(scope, global.into(), &[sites.into()])
+                .unwrap_or_else(|| crate::undefined(scope).into())
+        }
+
+        crate::test_support::in_context!(scope, {
+            scope.set_prepare_stack_trace_callback(formatter);
+            let _ = crate::test_support::eval(
+                scope,
+                "globalThis.readSites = (sites) => sites.map((s) => \
+                 [s.getFunctionName(), s.getFileName(), s.isToplevel(), s.isEval(), \
+                 s.getLineNumber()].map(String).join('|')).join(';');",
+            );
+            let stack = crate::test_support::eval(
+                scope,
+                "function inner() { throw new Error('boom'); }\n\
+                 try { inner(); } catch (e) { e.stack; }",
+            );
+            let text = stack.to_rust_string_lossy(scope);
+            assert!(
+                text.starts_with("inner|undefined|false|false|1;"),
+                "the innermost frame answers each method for itself: {text}"
+            );
+            assert!(
+                text.ends_with("undefined|undefined|true|false|2"),
+                "and the script's own top level is the outermost frame, unnamed \
+                 and top level: {text}"
+            );
+        });
     }
 
     /// The one host callback of the isolate-level set that the engine fires: a

@@ -702,7 +702,7 @@ impl Context {
         if let Some(object) = value.0.as_object()
             && let Some(stack) = self.agent.error_stack.get(&object.id())
         {
-            let text = stack.to_string_lossy();
+            let text = stack.rendered.to_string_lossy();
             if !text.is_empty() {
                 return text;
             }

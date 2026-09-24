@@ -3956,6 +3956,72 @@ mod tests {
         );
     }
 
+    /// A host that formats an error's stack itself is handed the frames the
+    /// trace was captured from, which is what deno's formatter reads: a module
+    /// frame names the module, and the innermost frame is the call the error
+    /// came out of (`Isolate::SetPrepareStackTraceCallback`).
+    #[derive(Debug)]
+    struct FormatsStacks {
+        seen: std::rc::Rc<std::cell::RefCell<Vec<crate::api::StackFrame>>>,
+    }
+
+    impl crate::host::HostHooks for FormatsStacks {
+        fn prepare_stack_trace(
+            &self,
+            _error: &Value,
+            frames: &[crate::api::StackFrame],
+        ) -> Result<Option<Value>, JsError> {
+            *self.seen.borrow_mut() = frames.to_vec();
+            Ok(Some(Value::String(Handle::new(JsString::from_utf8(
+                "a host's stack",
+            )))))
+        }
+    }
+
+    #[test]
+    fn a_host_formats_a_modules_stack_and_is_handed_its_frames() {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().expect("a realm");
+        agent.host_hooks = Some(Box::new(FormatsStacks { seen: seen.clone() }));
+        agent.add_module(
+            "file:///m.js",
+            "function boom() { throw new Error('boom'); }\nboom();",
+        );
+        let module =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("file:///m.js"), &[])
+                .expect("the module");
+        module_declaration_instantiation(&mut agent, &module).expect("instantiate");
+        let promise = module_evaluation(&mut agent, &module).expect("evaluate");
+        let error = settled(&agent, &promise).expect("the module's promise settles");
+
+        // Reading `.stack` is what runs the host's formatter.
+        let stack =
+            crate::context::get_property(&mut agent, &error, &JsString::from_utf8("stack"), error)
+                .expect("the error's stack");
+        assert_eq!(stack, js_str("a host's stack"));
+
+        let seen = seen.borrow();
+        assert_eq!(
+            seen.iter()
+                .map(|frame| frame.function_name.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec!["boom", ""],
+            "innermost first, and the module's own top level has no function name"
+        );
+        // The module's own body is the frame that names the module a host
+        // compiled it under: a call inside it records no script or module of its
+        // own, which is the same hole the engine's rendering has, and deno's
+        // source-map lookup reads the name off the frame that has one.
+        assert_eq!(
+            seen[1].script_name.as_deref(),
+            Some("file:///m.js"),
+            "the module body's frame names the module"
+        );
+        assert_eq!(seen[0].line, 1, "the site the throw came from");
+        assert_eq!(seen[1].line, 2, "and the module body's own site");
+    }
+
     /// A host that resolves dynamic imports itself, checking the four things the
     /// engine hands it: the specifier as written, the **referrer of the
     /// `import()` site**, the phase, and the attributes as text pairs.

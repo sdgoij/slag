@@ -4300,6 +4300,16 @@ relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1
 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, and
 js-api **1,001 tests, 0 fail**.
 
+*An error's `stack` is the host's to format — §9's bullet that named it, and the source-map cluster's other half.* The engine built `Error.stack` itself and served it from `%get Error.prototype.stack%`, with no host hook anywhere in the path; V8 instead hands a host's formatter the error plus an array of call-site objects, and deno installs exactly that (`libs/core/runtime/setup.rs:287`) and reads each frame by *calling* a method on it. So four things landed together. The **capture** keeps the frames as well as the string: `Agent::error_stack`'s value is now an `ErrorStack { rendered, frames }` built in the one pass `define_stack` already made, because the stack the error was made on is gone by the time `.stack` is read and the hook may be read long after. The **seam** is `HostHooks::prepare_stack_trace(error, &[api::StackFrame])`, whose default `None` means "no formatter, render your own" — a host that installs none therefore reads exactly the string it read before, which is what kept the corpora still. The **accessor** asks it and answers its value when it has one. And the **bridge** builds the call sites, because how a call site is spelled in JavaScript is the bridge's business: a prototype per isolate carrying the fifteen method functions (each reading the field its call site holds under a private name, which is the same symbol-keyed slot a private name already is), one ordinary object per frame, and the host's stored callback called with them. `set_prepare_stack_trace_callback` stops being "accepted and not run": it folds the host's function into a monomorphic fn item the way `set_wasm_streaming_callback` does, since the crate's `PrepareStackTraceCallback<'s>` alias names the caller's scope lifetime and cannot be a field.
+
+*The measurement.* deno's four `modules::tests::test_native_source_map_*` / `test_native_external_source_map_with_relative_path` tests **pass**, and the whole `deno_core --lib` suite moves **436 passed / 23 failed → 440 passed / 19 failed** — exactly those four, with no test newly red. They are the pair working together: the previous part's rejection is what makes `run_event_loop` answer `Err` at all, and this part's frames are what let deno's own formatter map the position through the module's source map (`test.ts` where `file:///test.js:5:1` used to stand). `test_op_bool_to_from_v8_error`, which pins an error's exact stack text and passed before this part, still passes: its frames are a script's, and the engine's rendering for them is unchanged.
+
+*Tests — two engine, one bridge, and two mutations.* `a_host_formats_the_stack_it_is_handed` (`crates/runtime/src/host.rs`) pins the script shape: the accessor answers the host's text, the frames arrive innermost-first with their sites, and a classic script's frames name no file — the engine's scripts carry no name, which the test states rather than leaves implied. `a_host_formats_a_modules_stack_and_is_handed_its_frames` (`crates/runtime/src/module.rs`) pins deno's own shape: a module frame names the module and records the site. `a_host_formatter_is_handed_call_sites` (`crates/v8/isolate.rs`) drives the whole path — the formatter reads each call site from JavaScript with a method per field, and what it answers is what `.stack` reads. Two mutations, each caught: handing the hook no frames fails both engine tests on the frame assertions, and removing the accessor's hook call fails them on `the accessor answers what the host's formatter said` (`Error: boom\n    at inner:1:26\n    at <anonymous>:2:7` where `a host's stack` was asserted — which also shows the rendering is unchanged for a host with no formatter).
+
+*Measured while writing those tests, and it is its own item.* A **call** frame records no script or module of its own — only the module's own body context does — so a call site inside a module answers `getFileName` with *undefined* where V8 names the module, and the engine's rendered line has the same hole (`at greet:2:9`, the file appearing only on the outer frame). Nothing in the four tests waits on it, because deno's source-map lookup reads the name off the frame that has one. Recorded as §12 item 16.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` green (`runtime` **911**, `v8` **248**, `crux` 249, `test262` 3324, 0 failed anywhere). The corpora were re-run because the capture sits on every error construction: the wasm sweeps reproduce their baselines exactly — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail** — and test262 `all` re-ran clean on this tree with the baseline's skip summary (48,464 pass, 0 fail, 0 crash, 0 hang, 158 skip of 48,622), confirmed by the operator: the run's own summary line was cut from this session's capture after the sweep had already finished, and the lesson is to keep the line rather than re-run a green sweep to re-read it.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7267,6 +7277,37 @@ migrate, then delete.
   created after that walk. The dependency's own promise is rejected by this
   change, so the failure is reported either way — but the importer's promise
   never settles. That is its own part, with its own measurement.
+- **An error's `stack` is the host's to format: the isolate-level
+  `prepareStackTrace` callback is run, and the call-site objects it takes are the
+  bridge's — named here before the edit.** The engine builds `Error.stack`
+  itself and serves it from `%get Error.prototype.stack%`; V8 instead hands the
+  host's formatter the error plus an array of call-site objects, and deno's
+  `prepare_stack_trace_callback` (`libs/core/runtime/setup.rs:287`) is written
+  for exactly that: it stashes the array on the error as `#callSiteEvals` (a
+  private name, which landed) and reads each frame's data by *calling methods on
+  it* (`getFileName`, `getLineNumber`, `getColumnNumber`, `getTypeName`,
+  `getFunctionName`, `getMethodName`, `getEvalOrigin`, `isToplevel`, `isEval`,
+  `isNative`, `isConstructor`, `isAsync`, `isPromiseAll`, `getPromiseIndex`) — so
+  a call-site object has to be a real object with real function-valued
+  properties, and today there is no such kind at all. The split: the **engine**
+  captures the frames it already walks in `define_stack` (function, the module
+  name a frame runs in, the site from `context.position` + `SourceText`,
+  innermost first) beside the rendered string it already stores, and offers them
+  to a host hook — `HostHooks::prepare_stack_trace(error, &[api::StackFrame])`,
+  whose default answer is `None`, meaning "no formatter, render your own" — and
+  `stack_getter` answers the hook's value when there is one. The **bridge**
+  builds the call-site objects, because how a call site is spelled in JavaScript
+  is the bridge's business and not the engine's: it caches one prototype per
+  isolate holding the method functions, builds one ordinary object per frame
+  carrying the frame's data in private names, and calls the host callback it
+  stored. `set_prepare_stack_trace_callback` therefore stops being a no-op and
+  stores the host's function the way the dynamic-import setters do — a
+  higher-ranked `UnitType + for<'s, 'a> Fn(...)` bound folded into a
+  monomorphic `fn` pointer, since the crate's `PrepareStackTraceCallback<'s>`
+  alias cannot be a field with a caller's lifetime in it. `getThis` is the one
+  V8 method left out: nothing in an execution context records the activation's
+  receiver, so there is no honest value to answer, and only a host that patches
+  call sites itself would reach for it.
 
 ## 11. Working rules
 
@@ -7688,29 +7729,5 @@ migrate, then delete.
    original note carried still stands as classification rather than status: the hang was
    measured, not A/B'd against a pre-change binary, so it was recorded as *revealed* (the
    earlier termination hang masked it) rather than proven unrelated.
-15. **`prepareStackTrace`: an error's `stack` is the host's to format, and the
-   call-site objects it takes do not exist — named, not started.** Deno installs the
-   isolate-level callback (`libs/core/runtime/setup.rs:287`,
-   `crate::error::prepare_stack_trace_callback`), and the bridge accepts and does not run
-   it (`crates/v8/isolate.rs`, "Accepted and not run: the engine builds an error's stack
-   itself, with no host hook in the path"). That is the whole of the source-map cluster's
-   remaining half: deno reads `#callSiteEvals` (a private name, which landed) and, when
-   it is empty, keeps the engine's own `Error.stack` string verbatim, so the generated
-   position shows where the mapped one belongs. The parts, in the order the measurement
-   implies: (a) the engine's `%get Error.prototype.stack%` accessor
-   (`crates/runtime/src/builtins/error.rs`, which today calls `define_stack` and returns
-   the rendered string) asks the host hook first and uses its answer, as V8 does; (b) the
-   engine builds the `Array` of call-site objects V8 hands that hook — each a JS object
-   with `getThis`, `getTypeName`, `getFunction`, `getFunctionName`, `getMethodName`,
-   `getFileName`, `getLineNumber`, `getColumnNumber`, `getEvalOrigin`, `isToplevel`,
-   `isEval`, `isNative`, `isConstructor`, `isAsync`, `isPromiseAll`, `getPromiseIndex`,
-   `getScriptNameOrSourceURL` and `toString`, since deno's `from_callsite_object` calls
-   them as methods and `make_callsite_prototype` patches a proxy around them; (c) the
-   bridge's `set_prepare_stack_trace_callback` stores the host callback and its
-   `HostHooks` seam forwards it. The frame *data* is what the frames work already
-   captures (`context.function` on every certified call, `context.position`,
-   `context.script_or_module`, `SourceText::line_column`); what is genuinely missing is
-   the object kind, `getThis`, `getEvalOrigin` and the promise-all pair, which is 0 for a
-   frame that is not one — the same shape V8 answers. Its measurement is deno's four
-   source-map tests plus `test_dynamic_import_module_error_stack`, whose expected
-   `at async file:///import.js:1:43` is `format_frame`'s rendering of the same frames.
+15. **`prepareStackTrace`: an error's `stack` is the host's to format — landed.** §7's record has the shapes, the two mutations and the gates. Deno installs the isolate-level callback (`libs/core/runtime/setup.rs:287`, `crate::error::prepare_stack_trace_callback`), and it used to be accepted and not run (`crates/v8/isolate.rs`, "Accepted and not run: the engine builds an error's stack itself, with no host hook in the path"). That was the whole of the source-map cluster's remaining half: deno reads `#callSiteEvals` (a private name, which landed) and, when it is empty, keeps the engine's own `Error.stack` string verbatim, so the generated position showed where the mapped one belonged. The parts, as measured: (a) the engine's `%get Error.prototype.stack%` accessor (`crates/runtime/src/builtins/error.rs`) asks the host hook and answers its value, as V8 does, and its default `None` keeps the engine's own rendering; (b) the engine's `define_stack` captures the frames beside the string it renders (`Agent::error_stack`'s `ErrorStack`), because a read may come long after the stack moved on; (c) the bridge builds the call-site objects V8 hands the hook — a prototype per isolate with the fifteen method functions, one object per frame carrying its data in private names, and the host callback stored as a monomorphic fn item, the `set_wasm_streaming_callback` pattern, since the crate's `PrepareStackTraceCallback<'s>` alias names the caller's scope lifetime and cannot be a field. `getThis` is the one V8 method left out: nothing in an execution context records the activation's receiver, so there is no honest value to answer.
+16. **A call frame records no script or module of its own — open, measured.** The module's own body context carries the module; a call *inside* it does not, so a frame for a call answers `getFileName` with *undefined* where V8 names the module, and the engine's rendered line shows the same hole (`Error.stack` reads `at greet:2:9` and `at <anonymous> (file:///test.js:5:1)` for one throw). Deno's source-map lookup reads the name off the frame that has one, which is why the four source-map tests do not wait on it, but its `test_dynamic_import_module_error_stack` wants an `at async file:///import.js:1:43` for a frame of exactly this shape, and a host formatter that keys on the frame's own file name gets nothing for the frame nearest the error. The data exists — the function record's `declaring_script_or_module` (the referrer work) names the code a function was made in, and `context.function` is on every certified call — so the fix is to read the frame's code from the context or the function, whichever has it. It is a decision rather than a line for the same reason §12 item 10 was: it changes `Error.stack`'s text for every call inside a module.

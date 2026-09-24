@@ -579,9 +579,10 @@ fn define_stack(
         format!("{name}: {message}")
     };
     let mut lines = vec![header];
+    let mut frames: Vec<crate::api::StackFrame> = Vec::new();
     // The realm's bootstrap context is not code the engine is running, so it is
     // not a frame: the same rule every other frame view uses.
-    let frames = agent
+    let frame_contexts = agent
         .execution_context_stack
         .iter()
         .rev()
@@ -594,7 +595,7 @@ fn define_stack(
     // a name that is not on the stack omits every frame, the same rule read to
     // its end.
     let mut up_to = until;
-    for context in frames {
+    for context in frame_contexts {
         if let Some(named) = up_to {
             let found = context
                 .function
@@ -608,15 +609,14 @@ fn define_stack(
             up_to = None;
             continue;
         }
-        let frame = context
+        let function_name = context
             .function
             .as_ref()
             .and_then(|function| match function.kind() {
                 ValueKind::Function(f) => f.name.clone(),
                 _ => None,
             })
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_else(|| "<anonymous>".into());
+            .map(|name| name.to_string_lossy());
         // A module frame names its file; a script frame has none to give (the
         // engine's scripts record no name), so the two shapes differ.
         let file = match context.script_or_module.as_ref() {
@@ -629,27 +629,47 @@ fn define_stack(
         // resolved against the text of the code running in it. V8's shape for a
         // frame with no file name is `at name:line:column`, and the offsets its
         // spans count are UTF-16 units, which is what `SourceText` counts.
-        let at = match (context.position, context.source.as_ref()) {
+        let site = match (context.position, context.source.as_ref()) {
             (Some(span), Some(source)) => {
                 let text = syntax::SourceText::from_utf8(&source.to_string_lossy());
                 let location = text.line_column(span.start);
-                match file {
-                    Some(file) => {
-                        format!("{frame} ({file}:{}:{})", location.line, location.column)
-                    }
-                    None => format!("{frame}:{}:{}", location.line, location.column),
-                }
+                Some((location.line as usize, location.column as usize))
             }
-            _ => match file {
-                Some(file) => format!("{frame} ({file})"),
-                None => frame,
-            },
+            _ => None,
+        };
+        // The line the trace shows: the frame's own name, `<anonymous>` when its
+        // function has none (a module's top level among them), then the site in
+        // parentheses when there is one.
+        let label = function_name
+            .clone()
+            .unwrap_or_else(|| "<anonymous>".into());
+        let at = match (site, file.as_deref()) {
+            (Some((line, column)), Some(file)) => format!("{label} ({file}:{line}:{column})"),
+            (Some((line, column)), None) => format!("{label}:{line}:{column}"),
+            (None, Some(file)) => format!("{label} ({file})"),
+            (None, None) => label,
         };
         lines.push(format!("    at {at}"));
+        frames.push(crate::api::StackFrame {
+            function_name,
+            script_name: file,
+            line: site.map(|(line, _)| line).unwrap_or(0),
+            column: site.map(|(_, column)| column).unwrap_or(0),
+            // Nothing in an execution context records these; the frame view's
+            // header states each one as a tier rather than a gap.
+            is_eval: false,
+            is_constructor: false,
+            is_wasm: false,
+            is_user_javascript: true,
+        });
     }
-    agent
-        .error_stack
-        .insert(object.id(), JsString::from_utf8(&lines.join("\n")));
+    agent.error_stack.insert(
+        object.id(),
+        crate::agent::ErrorStack {
+            rendered: JsString::from_utf8(&lines.join("\n")),
+            frames,
+        },
+    );
     Ok(())
 }
 
@@ -721,12 +741,19 @@ fn stack_getter(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Valu
     if !is_error(agent, *this) {
         return Ok(Value::Undefined);
     }
-    let stack = agent
-        .error_stack
-        .get(&object.id())
-        .cloned()
+    let stack = agent.error_stack.get(&object.id()).cloned();
+    // A host with a formatter of its own decides what `.stack` is
+    // (v8::Isolate::SetPrepareStackTraceCallback): it is handed the error and
+    // the frames the trace was captured from, and its answer is the value.
+    if let Some(stack) = &stack
+        && let Some(formatted) = crate::host::prepare_stack_trace(agent, this, &stack.frames)?
+    {
+        return Ok(formatted);
+    }
+    let rendered = stack
+        .map(|stack| stack.rendered)
         .unwrap_or_else(|| JsString::from_utf8(""));
-    Ok(Value::String(Handle::new(stack)))
+    Ok(Value::String(Handle::new(rendered)))
 }
 
 /// set %Error.prototype.stack% (spec 20.5.3.5): SetterThatIgnores

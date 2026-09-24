@@ -263,6 +263,33 @@ fn unregister_live_agent(signifier: u64) {
 /// the closure the bridge builds around it.
 pub type NearHeapLimitCallback = Box<dyn FnMut(usize, usize) -> usize>;
 
+/// The captured stack of an Error instance: the string the
+/// `%Error.prototype.stack%` accessor answers with, and the frames it was
+/// rendered from.
+///
+/// The frames are kept as well as the string because a host may want to format
+/// the trace itself (`Isolate::SetPrepareStackTraceCallback`, which is how V8
+/// hands a host's formatter the error and its call sites): the engine captures
+/// the frames either way, so keeping them costs the capture nothing and is the
+/// only way the accessor can answer the hook on a read that happens long after
+/// the stack has moved on.
+#[derive(Clone)]
+pub struct ErrorStack {
+    /// The rendered V8-style trace — the header plus one line per frame — which
+    /// is what a host with no formatter reads.
+    pub rendered: crux::string::JsString,
+    /// The frames the trace was rendered from, innermost first.
+    pub frames: Vec<crate::api::StackFrame>,
+}
+
+impl crux::heap::Trace for ErrorStack {
+    fn trace(&self, visit: &mut dyn FnMut(crux::heap::GcAny)) {
+        self.rendered.trace(visit);
+        // The frames carry text, numbers and flags rather than values (a frame
+        // has no handle to anything), so they hold no edge to trace.
+    }
+}
+
 pub struct Agent {
     pub execution_context_stack: Vec<ExecutionContext>,
     /// A termination request (v8::Isolate::TerminateExecution). The request has
@@ -801,7 +828,7 @@ pub struct Agent {
     /// The captured V8-style stack trace of Error instances, keyed by object
     /// identity (read by the `%Error.prototype.stack%` accessor; the property
     /// itself is not an own data property, spec 20.5.3.4).
-    pub error_stack: std::collections::HashMap<u64, crux::string::JsString>,
+    pub error_stack: std::collections::HashMap<u64, ErrorStack>,
     /// The frames of each host stack-trace capture (v8::StackTrace), keyed by
     /// the *box address* of the object the capture handed back — that object
     /// exists so the entry has a liveness, and the collector's compaction hook
