@@ -1669,18 +1669,22 @@ impl Agent {
         crux::function::with_agent(self as *mut Agent as *mut (), || self.run_jobs_inner())
     }
 
-    /// Run the host finalizers the collections since the last drain queued
-    /// (`crux::host`): the behaviour of each host object the sweep took, with
-    /// the identity of the object it was installed on.
+    /// Run the host callbacks the collections since the last drain queued: the
+    /// host finalizers (`crux::host`) and the weak-handle death callbacks
+    /// (`crux::heap`) — the two things a collection has to tell a host, both
+    /// deferred for the same reason.
     ///
-    /// The sweep never calls a finalizer itself — it runs mid-collection with
-    /// the heap borrowed, and a finalizer may allocate or run JS — so this is
-    /// the drain, and it happens outside a collection. A host that never asks
+    /// The sweep never runs host code itself — it runs mid-collection with the
+    /// heap borrowed, and a callback may allocate or run JS — so this is the
+    /// drain, and it happens outside a collection. A host that never asks
     /// is covered too: an outermost [`crate::api::Context`] entry drains here as
     /// well as doing so at the top of every job drain.
     pub(crate) fn run_host_finalizers(&mut self) {
         for (behaviour, object_id) in crux::host::take_pending_finalizers() {
             behaviour.finalize(object_id);
+        }
+        for callback in crux::heap::take_pending_weak_callbacks() {
+            callback();
         }
     }
 

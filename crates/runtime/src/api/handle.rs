@@ -225,6 +225,59 @@ impl MaybeLocal {
     }
 }
 
+/// A weak persistent handle (v8::Weak<T>, v8::TracedReference<T>): it names a
+/// value *without* keeping it alive, and answers `None` once a collection has
+/// reclaimed the value's slot.
+///
+/// The difference from [`Global`] is the whole of it: a `Global` holds a pin and
+/// is therefore a root of every collection until it is dropped, while a `Weak`
+/// holds nothing the collector can see, so the value dies on its own terms and
+/// the handle learns about it afterwards. The collector decides — nothing here
+/// keeps the value alive, and nothing here can make it look alive again — which
+/// is what makes it safe to store host-side state that outlives the value.
+#[derive(Debug, Clone, Copy)]
+pub struct Weak {
+    handle: crux::heap::WeakHandle,
+}
+
+impl Weak {
+    /// Hold `value` weakly (v8::Weak<T>::with, v8::TracedReference::new).
+    pub fn new(value: Local) -> Self {
+        Self {
+            handle: crux::heap::weak_new(value.into_value()),
+        }
+    }
+
+    /// The value, while the collector has not reclaimed it
+    /// (v8::Weak<T>::to_local, v8::TracedReference<T>::Get).
+    pub fn to_local(&self) -> Option<Local> {
+        crux::heap::weak_get(self.handle).map(Local)
+    }
+
+    /// Whether the value is gone (v8::Weak::IsEmpty). A primitive value can never
+    /// be gone: only the sweep of a box empties a handle.
+    pub fn is_empty(&self) -> bool {
+        crux::heap::weak_get(self.handle).is_none()
+    }
+
+    /// Release the handle, whatever the value does from here on — the other
+    /// meaning a weak callback has (v8::Weak::Reset, `global.Reset()` inside a
+    /// `SetWeak` callback). Because a handle is an identity, clearing one clears
+    /// every copy of it.
+    pub fn clear(&mut self) {
+        crux::heap::weak_clear(self.handle);
+    }
+
+    /// Be told once, after the collection that takes the value
+    /// (v8::Global::SetWeak). The callback is deferred like a host finalizer —
+    /// it may allocate and may run JS, and the sweep runs with the heap borrowed
+    /// — and it runs with this handle already empty, so it cannot resurrect what
+    /// it is told about.
+    pub fn set_callback(&self, callback: Box<dyn FnOnce()>) {
+        crux::heap::weak_set_callback(self.handle, callback);
+    }
+}
+
 /// RAII marker grouping a set of local handles. A [`Local`] is a value, so
 /// nothing here needs a region to stay valid; the type exists so V8-idiom code
 /// compiles unchanged.

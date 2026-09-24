@@ -38,7 +38,7 @@ pub use context::{Context, ContextScope};
 /// a host object it owned was swept.
 pub use crux::host::HostOps;
 pub use external::External;
-pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal};
+pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal, Weak};
 pub use heap::HeapStatistics;
 pub use json::Json;
 pub use microtask::MicrotasksPolicy;
@@ -1416,5 +1416,44 @@ mod tests {
         isolate.run_finalizers();
 
         assert_eq!(FINALIZED.with(|ids| ids.borrow().clone()), vec![id]);
+    }
+
+    thread_local! {
+        /// Whether each weak callback firing saw its handle already empty.
+        static WEAK_SAW: std::cell::RefCell<Vec<bool>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A weak handle over a value nothing else references, made in a frame that
+    /// returns only the handle (the caller scrubs), so the conservative scan
+    /// cannot root the value.
+    #[inline(never)]
+    fn an_unrooted_weak_handle() -> Weak {
+        Weak::new(Local::string("weakly held"))
+    }
+
+    /// Criterion 6 through the host-facing surface: the collector decides the
+    /// value is gone, the handle says so, and the death callback arrives once
+    /// through the drain — with the handle already empty, so it cannot resurrect
+    /// the value it is told about.
+    #[test]
+    fn a_weak_handle_empties_and_calls_back_through_the_isolate() {
+        let mut isolate = isolate();
+        let _context = context(&mut isolate);
+        WEAK_SAW.with(|saw| saw.borrow_mut().clear());
+
+        let weak = an_unrooted_weak_handle();
+        assert!(!weak.is_empty(), "the value starts out alive");
+        weak.set_callback(Box::new(move || {
+            WEAK_SAW.with(|saw| saw.borrow_mut().push(weak.is_empty()));
+        }));
+
+        scrub_stack(32);
+        isolate.agent().collect_garbage();
+        // The sweep queues; the drain is what runs a host callback.
+        isolate.run_finalizers();
+
+        assert!(weak.is_empty(), "the collector's verdict is the handle's");
+        assert_eq!(WEAK_SAW.with(|saw| saw.borrow().clone()), vec![true]);
     }
 }

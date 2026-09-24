@@ -1,6 +1,6 @@
 # Host objects and L2: traced host state, finalizers, weak handles
 
-**Status (2026-09-25): slices 1-3 are in the tree; slice 4 is not.** Slice 1 — the
+**Status (2026-09-25): slices 1-4 are in the tree.** Slice 1 — the
 `ffi` handle-table rooting, §4.4 and the urgent part — landed with this note's own
 regression tests (`ffi`'s `a_retained_value_survives_a_collection` and
 `a_retained_string_survives_a_collection`, `crux`'s
@@ -15,7 +15,9 @@ criteria name: `crux`'s `a_host_objects_retained_edge_roots_its_value`,
 that record, and §5's L2 row and §4's second acceptance test now read as landed
 rather than aspirational.
 
-**Slice 4 — weak persistent handles — is not started**, and §4.3 is its design.
+**Slice 4 — weak persistent handles — landed** (§4.3 and the account below): the
+engine registry, `api::Weak` over it, and the tests §5's sixth criterion names. Its
+one leftover is the bridge's `v8::Weak<T>` / `v8::TracedReference<T>` shapes.
 
 Two of §4.2's decisions changed while it was implemented, both narrowed rather
 than widened, and both are recorded here because the *reason* is part of the
@@ -160,14 +162,28 @@ An `Rc` the host still holds after the box was swept stays a live Rust value
 whose JS wrapper is gone: legal, and the reason `finalize` is a separate callback
 rather than `Drop`.
 
-### 4.3 Weak persistent handles
+### 4.3 Weak persistent handles — landed (slice 4)
 
-`Global::set_weak(callback)` / a `Weak` handle type, built on the existing weak
-machinery rather than a new table: the ephemeron fixpoint (`heap.rs`'s
-`EPHEMERONS`, `note_ephemeron`) and `Agent::weak_ref_targets` already model
-"target dead → act after collection", including the GC-4 rule that the dead set
-comes from the **precise** mark so a stale stack word cannot keep a target alive.
-Callbacks fire once, after the collection, and must not resurrect the target.
+`crux::heap` holds a per-thread weak registry beside `PINNED`: a `WeakHandle` (an
+id, `Copy`, valid only on its thread), `weak_new`/`weak_get`/`weak_clear`, an
+optional one-shot death callback, and `take_pending_weak_callbacks`. The registry
+is deliberately **not** a root source and is not traced — that is what makes it
+weak — and the *sweep* is what empties an entry: `sweep_weak_handles(&swept)` runs
+once from each sweep (`collect_minor_inner` and `collect_from_work`), so a value
+the compaction hook *retained* keeps its handle while a value whose box is gone
+does not. That is the change from the sketch below, and the reason is the choice of
+set: the precise mark answers "unreachable" and the sweep answers "reclaimed", and
+only the second can be wrong in the direction that matters — a handle must never
+report a value it can no longer name (and never dangle), while reporting a
+conservatively-retained value as alive is sound and is what a weak handle in V8
+does too. `runtime::api::Weak` is the host-facing handle over it
+(`new`/`to_local`/`is_empty`/`clear`/`set_callback`), and death callbacks drain
+with the host finalizers (`Isolate::run_finalizers`, and an outermost `Context`
+entry), which is what makes a callback run outside the collection, exactly once,
+with its handle already empty — the anti-resurrection rule.
+
+Not yet landed: the bridge's `v8::Weak<T>` / `v8::TracedReference<T>` shapes over
+this handle, which is what the CLI tier's 35 missing sites ask for.
 
 ### 4.4 The C-surface fix (slice 1, the urgent part)
 
@@ -233,7 +249,22 @@ handle), the way the L1 pin tests do, or the conservative scan will mask the bug
    object genuinely unreachable should use it, and should not conclude from a
    failing collection that the collector is wrong before checking the window.
 6. A weak handle fires once, after the collection; the target's slot is reclaimed;
-   the callback cannot resurrect it. **Slice 4, not started.**
+   the callback cannot resurrect it. **Landed** — `crux`'s
+   `a_weak_handle_does_not_root_its_value` (the handle holds its value *out* of the
+   roots: the deterministic `Heap::collect` sweeps it and the handle answers
+   `None`, while a pinned peer survives with its handle answering),
+   `a_weak_callback_fires_once_with_the_handle_already_empty` (the queue is
+   untouched when the sweep returns; the callback sees an empty handle inside
+   itself — `[true]` where one that still answered would give `[false]` — and a
+   second collection queues nothing) and `a_minor_sweep_empties_a_weak_handle`
+   (the other sweep site). Plus `runtime`'s
+   `a_weak_handle_empties_and_calls_back_through_the_isolate`, end to end through
+   `Isolate::run_finalizers`. Four mutations, each caught: dropping the major's
+   `sweep_weak_handles` call fails the two major tests and leaves the minor one
+   green; dropping the minor's call fails only the minor test; rooting the value
+   in `weak_new` fails all three sweep assertions; and not emptying the entry
+   fails all three, with the callback reporting `[false]` — a handle that still
+   answered inside its own death callback.
 
 ## 6. Slices
 
@@ -241,7 +272,8 @@ handle), the way the L1 pin tests do, or the conservative scan will mask the bug
 2. **`HostOps::finalize`** + the deferred queue + `run_finalizers`.
 3. **Engine-owned host edges** (`host_object_retain/release`, `ObjectKind::trace`
    visiting them, barrier on retain).
-4. **`Weak` handles** on the existing ephemeron/weak machinery.
+4. **`Weak` handles** on the existing weak machinery — **landed** (the engine
+   registry and `api::Weak`; the bridge's shapes are the part that follows).
 5. Later, optional: cppgc-shaped names (`Traced`/`Member`/`Visitor`/
    `initialize_process`) as sugar over 3-4.
 
@@ -304,11 +336,18 @@ non-finalizer. The other named trap is gone: the collection is the engine's own
 surface and its compat test asserts the old behaviour, so wiring it to
 `HostOps::finalize` is a deliberate separate change.
 
-### Remaining — slice 4: weak persistent handles
+### Slice 4 — landed
 
-`Global::set_weak`-shaped weak handles with a GC callback, built on the existing
-weak machinery (`Agent::weak_ref_targets`, `heap::note_ephemeron`) and the GC-4
-rule that the dead set comes from the *precise* mark. Not started.
+`crux::heap`'s weak registry (§4.3) and `runtime::api::Weak` on top of it, with
+the tests §5's sixth criterion names. The decision that changed from the sketch is
+the set the entries are cleared from: the **swept** set, once per sweep, from both
+sweep sites — not the precise dead set the `WeakRef` table uses. The reason is in
+§4.3: a handle must not report a value it can no longer name, and the sweep is the
+only verdict that cannot be wrong that way.
+
+What remains of slice 4 (and of L2) is the bridge: `v8::Weak<T>` and
+`v8::TracedReference<T>` over `api::Weak`, which is what the CLI tier's missing
+sites actually name.
 
 ### Slice 1 — landed
 

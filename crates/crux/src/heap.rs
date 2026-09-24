@@ -1443,6 +1443,153 @@ impl Default for Heap {
     }
 }
 
+thread_local! {
+    /// The weak handles this thread holds.
+    ///
+    /// Deliberately **not** a root source and not traced: a weak handle is the
+    /// one thing that must not keep its value alive, so the table holds a `Value`
+    /// the collector cannot see (the stack scan does not read thread-locals and
+    /// nothing traces this), and the sweep is what tells the entry its value is
+    /// gone.
+    static WEAK_HANDLES: RefCell<Vec<WeakEntry>> = const { RefCell::new(Vec::new()) };
+    /// The death callbacks the sweeps since the last drain queued.
+    static PENDING_WEAK_CALLBACKS: RefCell<Vec<Box<dyn FnOnce()>>> =
+        const { RefCell::new(Vec::new()) };
+    static NEXT_WEAK_ID: Cell<u64> = const { Cell::new(1) };
+}
+
+struct WeakEntry {
+    id: u64,
+    /// The softly-held value; `None` once a sweep has taken its box.
+    value: Option<crate::value::Value>,
+    callback: Option<Box<dyn FnOnce()>>,
+}
+
+/// A weak handle: it does not keep its value alive, and the collector decides
+/// when it is empty.
+///
+/// The value is held out of every trace and every root, so the only thing that
+/// can make the entry empty is the sweep that freed the value's box — which is
+/// the conservative verdict on "this slot is reclaimed", and is why a handle
+/// never reports a *live* value as gone. (The `WeakRef` machinery additionally
+/// uses the precise mark so a stale stack word cannot *keep a target alive*;
+/// for a handle that question is the other way round — being conservative there
+/// keeps a real value reportable, which is sound, and the eager answer buys
+/// nothing a caller can observe.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeakHandle {
+    id: u64,
+    /// `!Send`/`!Sync`: the registry is per-thread, like its heap, so a handle is
+    /// valid only on the thread that made it.
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl WeakHandle {
+    /// The handle's identity, stable for its lifetime.
+    pub fn id(self) -> u64 {
+        self.id
+    }
+}
+
+/// Hold `value` weakly: the value stays alive only if something else keeps it,
+/// and the handle answers `None` once a sweep has taken its box.
+pub fn weak_new(value: crate::value::Value) -> WeakHandle {
+    let id = NEXT_WEAK_ID.with(|next| {
+        let id = next.get();
+        next.set(id.wrapping_add(1));
+        id
+    });
+    WEAK_HANDLES.with(|handles| {
+        handles.borrow_mut().push(WeakEntry {
+            id,
+            value: Some(value),
+            callback: None,
+        });
+    });
+    WeakHandle {
+        id,
+        _thread: std::marker::PhantomData,
+    }
+}
+
+/// The value `handle` names, or `None` once a sweep has taken it.
+pub fn weak_get(handle: WeakHandle) -> Option<crate::value::Value> {
+    WEAK_HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .iter()
+            .find(|entry| entry.id == handle.id)
+            .and_then(|entry| entry.value)
+    })
+}
+
+/// Release `handle` and drop its entry: the value is not touched, and a handle
+/// that was already empty stays empty. What a host does when it is done watching.
+pub fn weak_clear(handle: WeakHandle) {
+    WEAK_HANDLES.with(|handles| {
+        handles.borrow_mut().retain(|entry| entry.id != handle.id);
+    });
+}
+
+/// Ask to be told, once, when `handle` becomes empty — after the collection that
+/// took the value, outside it, and with the handle already empty (so a callback
+/// cannot resurrect what it is told about). Registering twice replaces the first.
+pub fn weak_set_callback(handle: WeakHandle, callback: Box<dyn FnOnce()>) {
+    WEAK_HANDLES.with(|handles| {
+        for entry in handles.borrow_mut().iter_mut() {
+            if entry.id == handle.id {
+                entry.callback = Some(callback);
+                return;
+            }
+        }
+    });
+}
+
+/// Whether any handle on this thread still holds a value — read by the entry
+/// points the way the weak-structure flags are, so an eager answer is not paid
+/// for by every collection of a program that holds no handles.
+pub fn has_weak_handles() -> bool {
+    WEAK_HANDLES.with(|handles| handles.borrow().iter().any(|entry| entry.value.is_some()))
+}
+
+/// Empty every handle naming a box this sweep freed, and queue the callbacks.
+///
+/// Called once per sweep, from both droppable-dead-set sites
+/// (`collect_minor_inner` and `collect_from_work`), with the set the sweep
+/// actually took: a box the compaction hook *retained* is not in it, so a
+/// retained value keeps its handle (a retained heldValue is still reachable, and
+/// only the sweep's own verdict can tell the two apart).
+pub(crate) fn sweep_weak_handles(swept: &[usize]) {
+    if !has_weak_handles() {
+        return;
+    }
+    WEAK_HANDLES.with(|handles| {
+        let mut handles = handles.borrow_mut();
+        for entry in handles.iter_mut() {
+            let Some(value) = entry.value else {
+                continue;
+            };
+            let Some(addr) = crate::value::Value::encoded_box_address(value.bits()) else {
+                // A primitive cannot be swept, so it never dies.
+                continue;
+            };
+            if !swept.contains(&addr) {
+                continue;
+            }
+            entry.value = None;
+            if let Some(callback) = entry.callback.take() {
+                PENDING_WEAK_CALLBACKS.with(|pending| pending.borrow_mut().push(callback));
+            }
+        }
+    });
+}
+
+/// Take the death callbacks the sweeps since the last drain queued, in the order
+/// the boxes were swept. Called outside a collection.
+pub fn take_pending_weak_callbacks() -> Vec<Box<dyn FnOnce()>> {
+    PENDING_WEAK_CALLBACKS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
+}
+
 impl Heap {
     pub const fn new() -> Heap {
         Heap {
@@ -2040,6 +2187,9 @@ impl Heap {
                 }
             }
         }
+        // The minor's own sweep: a young weak target's box is in this set, and a
+        // handle naming it has to learn here (the major's site is the other).
+        sweep_weak_handles(&swept);
         // Every young box is now promoted or dead, so every recorded old->young
         // edge has become old->old and the set is stale.
         self.young.clear();
@@ -2438,6 +2588,10 @@ impl Heap {
                 }
             }
         }
+        // A weak handle's value is held out of every trace, so the sweep is the
+        // only thing that can tell it its value is gone — and this is one of the
+        // two places a sweep into a dead set exists.
+        sweep_weak_handles(&swept);
         // A1: the collection reclassified every survivor, so the cohort is
         // empty until the next allocation.
         self.young.clear();
@@ -3046,7 +3200,103 @@ mod tests {
         }
     }
 
-    /// A registered root source keeps its boxes alive exactly as a pin does. It
+    thread_local! {
+        /// What each weak callback firing saw: whether the handle was already
+        /// empty when the callback ran.
+        static CALLBACK_SAW: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A weak handle holds its value *out* of the roots — the collector is free to
+    /// sweep it, and the handle then answers `None` — while a value something else
+    /// roots survives with its handle answering.
+    #[test]
+    fn a_weak_handle_does_not_root_its_value() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        let weak_only = Value::String(Handle::new(JsString::from_utf8("weak only")));
+        let also_rooted = Value::String(Handle::new(JsString::from_utf8("also rooted")));
+        let weak_only_handle = weak_new(weak_only);
+        let also_rooted_handle = weak_new(also_rooted);
+        let _root = pin(also_rooted);
+
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&string_box_addr(weak_only)),
+            "a weakly-held value was kept alive: {swept:?}"
+        );
+        assert_eq!(
+            weak_get(weak_only_handle),
+            None,
+            "the handle still answers for a swept value"
+        );
+        let still_there = weak_get(also_rooted_handle).expect("a rooted value stays reachable");
+        assert_eq!(string_box_addr(still_there), string_box_addr(also_rooted));
+
+        weak_clear(weak_only_handle);
+        weak_clear(also_rooted_handle);
+    }
+
+    /// The death callback runs once, after the collection, and the handle is
+    /// already empty when it does — which is what stops it resurrecting what it is
+    /// told about.
+    #[test]
+    fn a_weak_callback_fires_once_with_the_handle_already_empty() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        CALLBACK_SAW.with(|saw| saw.borrow_mut().clear());
+        let value = Value::String(Handle::new(JsString::from_utf8("doomed")));
+        let handle = weak_new(value);
+        weak_set_callback(
+            handle,
+            Box::new(move || {
+                let empty = weak_get(handle).is_none();
+                CALLBACK_SAW.with(|saw| saw.borrow_mut().push(empty));
+            }),
+        );
+
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(swept.contains(&string_box_addr(value)), "{swept:?}");
+        // Queued, not run: the sweep cannot run host code.
+        assert!(CALLBACK_SAW.with(|saw| saw.borrow().is_empty()));
+        for callback in take_pending_weak_callbacks() {
+            callback();
+        }
+        assert_eq!(CALLBACK_SAW.with(|saw| saw.borrow().clone()), vec![true]);
+
+        // A second collection queues nothing: the entry is spent.
+        with_heap_mut(|heap| {
+            heap.collect(&[]);
+        });
+        assert!(take_pending_weak_callbacks().is_empty());
+        assert!(weak_get(handle).is_none());
+        weak_clear(handle);
+    }
+
+    /// The other sweep site: a *young* weak target dies in a minor collection and
+    /// the handle learns there. Hooking only the major is the mistake
+    /// `.notes/host-object-gc.md` §6 names, so this is the test that catches it.
+    #[test]
+    fn a_minor_sweep_empties_a_weak_handle() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        let value = Value::String(Handle::new(JsString::from_utf8("young")));
+        let handle = weak_new(value);
+        let swept = with_heap_mut(|heap| heap.collect_minor(&[]));
+        assert!(swept.contains(&string_box_addr(value)), "{swept:?}");
+        assert!(
+            weak_get(handle).is_none(),
+            "the minor sweep did not tell the handle"
+        );
+        weak_clear(handle);
+    }
+
+    /// A registered root source keeps its boxes alive exactly as a pin does.
     /// is the mechanism a handle table outside the heap uses — the `ffi` tables a
     /// `JSValueRef` is an id into — and it is pinned precisely: `Heap::collect`
     /// does not scan, so the only questions are membership in the swept set, and
