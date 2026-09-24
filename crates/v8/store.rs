@@ -23,6 +23,22 @@ use std::rc::Rc;
 struct Slot {
     generation: u32,
     source: Rc<str>,
+    /// The script's resource name, as the host's `ScriptOrigin` gave it. It
+    /// lives beside the text because it is read at *run* time, where a
+    /// dynamic-import refers to it: the engine's parser takes source and no
+    /// origin, so the bridge is the only holder of the name.
+    name: Option<Rc<str>>,
+}
+
+/// What a slot holds: the text and the name a `Script` payload names.
+pub(crate) struct Entry {
+    pub(crate) source: Rc<str>,
+    pub(crate) name: Option<Rc<str>>,
+}
+
+/// The engine string for a host-given script name, or `None` when there is none.
+pub(crate) fn engine_name(name: Option<&str>) -> Option<crux::string::JsString> {
+    name.map(crux::string::JsString::from_utf8)
 }
 
 #[derive(Default)]
@@ -62,7 +78,7 @@ pub(crate) fn close_region() {
 
 /// Put `source` in the innermost open region, and return what a handle carries:
 /// the slot it went into and that slot's generation.
-pub(crate) fn store(source: Rc<str>) -> (usize, u32) {
+pub(crate) fn store(source: Rc<str>, name: Option<Rc<str>>) -> (usize, u32) {
     TABLE.with(|table| {
         let mut table = table.borrow_mut();
         assert!(
@@ -71,19 +87,33 @@ pub(crate) fn store(source: Rc<str>) -> (usize, u32) {
         );
         table.issued = table.issued.wrapping_add(1);
         let generation = table.issued;
-        table.slots.push(Slot { generation, source });
+        table.slots.push(Slot {
+            generation,
+            source,
+            name,
+        });
         (table.slots.len() - 1, generation)
+    })
+}
+
+/// What a slot and generation name, or `None` when the region that held it is
+/// gone.
+pub(crate) fn entry(slot: usize, generation: u32) -> Option<Entry> {
+    TABLE.with(|table| {
+        let table = table.borrow();
+        let slot = table.slots.get(slot)?;
+        (slot.generation == generation).then(|| Entry {
+            source: slot.source.clone(),
+            name: slot.name.clone(),
+        })
     })
 }
 
 /// The text a slot and generation name, or `None` when the region that held it
 /// is gone.
-pub(crate) fn source(slot: usize, generation: u32) -> Option<Rc<str>> {
-    TABLE.with(|table| {
-        let table = table.borrow();
-        let slot = table.slots.get(slot)?;
-        (slot.generation == generation).then(|| slot.source.clone())
-    })
+#[cfg(test)]
+fn source(slot: usize, generation: u32) -> Option<Rc<str>> {
+    entry(slot, generation).map(|entry| entry.source)
 }
 
 #[cfg(test)]
@@ -91,9 +121,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_slot_carries_the_name_beside_the_text() {
+        open_region();
+        let (slot, generation) = store(Rc::from("source"), Some(Rc::from("file:///a.js")));
+        let read = entry(slot, generation).expect("the region is open");
+        assert_eq!(read.source.as_ref(), "source");
+        assert_eq!(read.name.as_deref(), Some("file:///a.js"));
+
+        // The name dies with the region exactly as the text does.
+        close_region();
+        assert!(entry(slot, generation).is_none());
+    }
+
+    #[test]
     fn a_closed_region_drops_its_text_and_a_stale_pair_reads_nothing() {
         open_region();
-        let (slot, generation) = store(Rc::from("first"));
+        let (slot, generation) = store(Rc::from("first"), None);
         assert_eq!(source(slot, generation).as_deref(), Some("first"));
         close_region();
         assert!(source(slot, generation).is_none());
@@ -101,7 +144,7 @@ mod tests {
         // The next region takes the same slot back, and the pair that named the
         // old occupant stays dead.
         open_region();
-        let (reused, new_generation) = store(Rc::from("second"));
+        let (reused, new_generation) = store(Rc::from("second"), None);
         assert_eq!(reused, slot);
         assert_ne!(new_generation, generation);
         assert!(source(slot, generation).is_none());
@@ -112,9 +155,9 @@ mod tests {
     #[test]
     fn an_enclosing_region_keeps_what_a_nested_scope_allocated_until_it_closes() {
         open_region();
-        let (outer_slot, outer_generation) = store(Rc::from("outer"));
+        let (outer_slot, outer_generation) = store(Rc::from("outer"), None);
         open_region();
-        let (inner_slot, inner_generation) = store(Rc::from("inner"));
+        let (inner_slot, inner_generation) = store(Rc::from("inner"), None);
         close_region();
         assert!(source(inner_slot, inner_generation).is_none());
         assert_eq!(
@@ -124,7 +167,7 @@ mod tests {
 
         // An allocation after the nested scope closes lands above the outer
         // mark, so the outer region's release covers it too.
-        let (later_slot, later_generation) = store(Rc::from("later"));
+        let (later_slot, later_generation) = store(Rc::from("later"), None);
         assert_eq!(later_slot, inner_slot);
         close_region();
         assert!(source(outer_slot, outer_generation).is_none());
@@ -135,7 +178,7 @@ mod tests {
     fn the_table_does_not_grow_across_scopes() {
         for _ in 0..64 {
             open_region();
-            let (slot, generation) = store(Rc::from("each"));
+            let (slot, generation) = store(Rc::from("each"), None);
             assert_eq!(slot, 0);
             assert!(source(slot, generation).is_some());
             close_region();

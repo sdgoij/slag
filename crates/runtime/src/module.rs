@@ -1308,7 +1308,8 @@ fn instantiate_module_declarations(
             if let ValueKind::Function(handle) = func.kind()
                 && let Some(record) = agent.ecma_functions.get_mut(&handle.id())
             {
-                record.declaring_module = Some(*module);
+                record.declaring_script_or_module =
+                    Some(crate::context::ScriptOrModule::Module(*module));
                 record.parse_text = Some(module.source.clone());
             }
             env.initialize_binding(&name, func)?;
@@ -3257,10 +3258,11 @@ pub fn dynamic_import(
     // against this name.
     let referrer_name = match &agent.running_context()?.script_or_module {
         Some(crate::context::ScriptOrModule::Module(module)) => module.name.clone(),
-        // A script records no name in this engine, so it offers none, which the
-        // host is told as an empty name — what V8 sends for a script written
-        // with no origin name.
-        _ => None,
+        // A script offers the name its origin gave it, which is what V8 hands a
+        // host here; a script compiled without one offers nothing, which the
+        // host is told as an empty name.
+        Some(crate::context::ScriptOrModule::Script(script)) => script.name.clone(),
+        None => None,
     };
     // The hook takes the api-facing phase, which is the vocabulary a host's
     // callback is written in; the engine's own use below keeps the syntax one.
@@ -3970,6 +3972,102 @@ mod tests {
             .as_deref(),
             Some("the host's answer")
         );
+    }
+
+    /// A **script**'s `import(...)` offers the host the script's own name as the
+    /// referrer — the one its `ScriptOrigin` gave it — so a host can resolve a
+    /// relative specifier against it. A script compiled without a name offers
+    /// none, which is what a host reads as "no referrer".
+    #[derive(Debug)]
+    struct RecordsReferrer;
+
+    impl crate::host::HostHooks for RecordsReferrer {
+        fn import_module_dynamically(
+            &self,
+            _specifier: &JsString,
+            referrer_name: Option<&JsString>,
+            _phase: crate::api::ModuleImportPhase,
+            _attributes: &[(JsString, JsString)],
+        ) -> Option<Result<Value, JsError>> {
+            SCRIPT_REFERRER.with(|seen| {
+                *seen.borrow_mut() = referrer_name.map(|name| name.to_string_lossy());
+            });
+            Some(Ok(Value::String(Handle::new(JsString::from_utf8(
+                "the host's answer",
+            )))))
+        }
+    }
+
+    thread_local! {
+        static SCRIPT_REFERRER: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn a_scripts_dynamic_import_offers_the_scripts_name() {
+        for (name, expected) in [
+            (Some("file:///dyn_import.js"), Some("file:///dyn_import.js")),
+            (None, None),
+        ] {
+            let mut agent = Agent::new();
+            agent.initialize_host_defined_realm().expect("a realm");
+            agent.host_hooks = Some(Box::new(RecordsReferrer));
+            agent
+                .run_script_named("import('./dep.js');", name.map(JsString::from_utf8))
+                .expect("the script runs");
+            agent.run_jobs().expect("jobs");
+            SCRIPT_REFERRER.with(|seen| {
+                assert_eq!(
+                    seen.borrow().as_deref(),
+                    expected,
+                    "a script offers its own name as the referrer"
+                );
+            });
+        }
+    }
+
+    /// Every shape the import can be written in reads the script's name, because
+    /// the closure that carries it is the one the engine records at creation.
+    /// The last two are the ones caller-inheritance cannot answer: an async
+    /// body's start and a promise reaction's callback run in contexts the engine
+    /// synthesizes, with no caller written in the script.
+    #[test]
+    fn an_import_reads_the_script_through_the_calls_that_hide_it() {
+        for (shape, source) in [
+            ("at the top level", "import('./dep.js');"),
+            (
+                "in a plain function",
+                "function f() { return import('./dep.js'); } f();",
+            ),
+            (
+                "in a called arrow",
+                "const g = () => import('./dep.js'); g();",
+            ),
+            (
+                "in an async arrow",
+                "(async () => { await import('./dep.js'); })();",
+            ),
+            (
+                "in a promise reaction",
+                "Promise.resolve().then(() => import('./dep.js'));",
+            ),
+        ] {
+            let mut agent = Agent::new();
+            agent.initialize_host_defined_realm().expect("a realm");
+            agent.host_hooks = Some(Box::new(RecordsReferrer));
+            SCRIPT_REFERRER.with(|seen| *seen.borrow_mut() = None);
+            agent
+                .run_script_named(source, Some(JsString::from_utf8("file:///s.js")))
+                .expect("the script runs");
+            agent.run_jobs().expect("jobs");
+            SCRIPT_REFERRER.with(|seen| {
+                assert_eq!(
+                    seen.borrow().as_deref(),
+                    Some("file:///s.js"),
+                    "an import {shape} reports the script it was written in"
+                );
+            });
+        }
     }
 
     #[test]

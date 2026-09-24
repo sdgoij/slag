@@ -1782,6 +1782,7 @@ mod tests {
             realm,
             code: program,
             source: crux::string::JsString::from_utf8(""),
+            name: None,
             jsx: false,
         });
         let value = crate::script::script_evaluation(&mut agent, &script).unwrap();

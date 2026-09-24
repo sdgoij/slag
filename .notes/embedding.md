@@ -4395,6 +4395,56 @@ its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,6
 the wasm sweeps reproduce theirs (core **20,662**; the seven proposal suites **64,594 / 0
 fail / 0 pending**; js-api **1,001 tests, 0 fail**).
 
+*A script's name is the referrer of its dynamic imports — §9's bullet, and the third part
+this cluster needed.* deno's `dyn_import_ok`, `dyn_import_err` and
+`dyn_import_borrow_mut_error` report `ModuleLoadEventCounts { resolve: 1, prepare: 0,
+finish: 1, load: 0 }` where they expect `{ resolve: 1, prepare: 1, finish: 1, load: 1 }`.
+Two things were missing, and the first fix proved the second:
+
+- **The name.** `ScriptRecord` gains `name`, filled from the host's `ScriptOrigin`:
+  `Agent::run_script_named` and `api::Context::try_eval_named` carry it, the bridge's store
+  entry holds it beside the text (a `Global<Script>` owns both, and `Script::compile`
+  takes it from the `Origin` it already built for error positions), and
+  `module::dynamic_import` offers it where a script offered nothing. deno resolves `./b.js`
+  against that name, so with it the loader's `prepare_load` and `load` run.
+- **The recording.** With the name plumbed, a bridge probe of deno's own shape — the
+  import written inside an async arrow — still saw no referrer, while the same import at a
+  script's top level, in a plain function and in a called arrow saw it. Five shapes, one
+  difference: the two that lost it run in contexts the engine **synthesizes** rather than
+  inherits (an async body's start, a promise reaction's callback). The record's
+  module-only `declaring_module` becomes
+  `declaring_script_or_module: Option<ScriptOrModule>`, the spec's `F.[[ScriptOrModule]]`
+  read at creation: filled in both record builders (`register_function` and
+  `instantiate_arrow`, which builds its own), taken by the four contexts that computed
+  "the declaring module or the caller's", and taken by the async body's synthesized
+  context; module instantiation still patches it explicitly.
+
+*Tests — four, three mutations.* Engine:
+`a_scripts_dynamic_import_offers_the_scripts_name` (a named script offers its name, an
+unnamed one offers nothing) and
+`an_import_reads_the_script_through_the_calls_that_hide_it` (the five shapes, the async
+arrow and the promise reaction included). Bridge:
+`the_scripts_origin_name_reaches_the_hosts_import_callback` (the `ScriptOrigin`'s name
+arrives as the callback's `resource_name`, with the empty-name case beside it) and
+`a_persistent_script_keeps_its_name` (a `Global<Script>` reopened in a later scope still
+knows it). Mutations, each caught: returning `None` from the referrer lookup fails the
+engine test with `left: None`; dropping the name at compile fails both bridge tests;
+giving `instantiate_arrow` `None` fails the five-shape test on "an import in an async
+arrow reports the script it was written in".
+
+*The measurement.* deno's `dyn_import` filter is **5 passed / 0 failed** (2 passed / 3
+failed before), and the whole `deno_core --lib` suite goes **433 passed / 26 failed → 436
+passed / 23 failed**: three flipped, none regressed.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean; `cargo test --locked --workspace` green — runtime
+`--lib` **908** with the workspace's features (**905** on its own), crux **249**, v8
+**248**. Both corpora re-run, because the function record, all four call contexts and the
+async body's start changed: test262 `all` reproduces its baseline exactly (**48,464 pass,
+0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce theirs (core
+**20,662**; the seven proposal suites **64,594 / 0 fail / 0 pending**; js-api **1,001
+tests, 0 fail**).
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -7046,6 +7096,61 @@ migrate, then delete.
   key-taking forms that take a String or a Symbol and refuse anything else with
   a TypeError, and the bridge stops narrowing. §7's record has the change and its
   measurement.
+- **A script carries the name its origin gave it, and offers it as a dynamic
+  import's referrer — named here before the edit.** This plan's dynamic-import
+  bullet recorded the engine's lack of a script name as faithful: "a
+  *script*-level import offers no referrer — and the empty string is the faithful
+  value there rather than a convenience, because that is what V8 sends for a
+  script with no origin name". That is right for a script written without a name
+  and wrong for every script deno compiles: `execute_script` names the script in
+  the `ScriptOrigin`, and V8's `ImportModuleDynamically` callback is documented to
+  hand the host "the name of the script or module that is importing". Measured,
+  this is deno's `dyn_import_ok`, `dyn_import_err` and
+  `dyn_import_borrow_mut_error`: all three report
+  `ModuleLoadEventCounts { resolve: 1, prepare: 0, finish: 1, load: 0 }` where they
+  expect `{ resolve: 1, prepare: 1, finish: 1, load: 1 }`. The loader's `resolve`
+  does fire — the engine offered the empty referrer, so resolving `./b.js` against
+  it fails — and `RecursiveModuleLoad::prepare`
+  (`deno/libs/core/modules/recursive_load.rs:228`) returns that error *before*
+  `prepare_load`, which is why only the load's `Drop` shows up as `finish`. So
+  `ScriptRecord` gains `name`, `Agent::run_script_named` and
+  `api::Context::try_eval_named` carry it from the bridge's `ScriptOrigin` (whose
+  `Origin` already keeps the resource name, for error positions), and
+  `module::dynamic_import` offers it where it offered nothing. The frame renderer
+  is deliberately left reading the module name only: a script's name in a frame
+  is its own decision — V8 prints the URL for such a frame — and its own
+  measurement.
+  **The name alone was not enough, and the probe said so before the measurement
+  did.** With the referrer plumbed, a *bridge* probe of deno's own shape — the
+  import written inside an async arrow, `(async () => { await import('./dep.js') })()`
+  — still reported no referrer, while the same import at a script's top level, in
+  a plain function, and in a called arrow all reported the name. Five shapes, one
+  difference: the two that lose it run in a context the engine **synthesized**
+  rather than inherited — an async body's start (`async_await.rs:132`, which
+  pushes `script_or_module: None`) and a promise reaction's callback (called
+  through `ordinary_call` from a job, where the caller is the bootstrap context,
+  so the caller-inheritance rule has nothing to inherit). So the record's
+  module-only field becomes the general one: `Record::declaring_module`
+  (`Option<Handle<SourceTextModule>>`, filled at creation only for a *module* and
+  consulted for `import.meta`) becomes `declaring_script_or_module:
+  Option<ScriptOrModule>`, filled from the running context at creation — which is
+  the spec's own `F.[[ScriptOrModule]]` (`OrdinaryFunctionCreate` step 15) read
+  one level early — and the four contexts that computed "the declaring module or
+  the caller's" now take the record's value or the caller's, with the async
+  body's synthesized context taking the record's too. Module instantiation still
+  patches it explicitly (`module.rs:1311`), for the reason it already did.
+- **`Local::new` on a persistent script reads a dead slot — measured while the
+  above was being tested, not fixed.** A `Global<Script>` owns its text (and now
+  its name) precisely so a handle that outlives the scope that compiled it can be
+  read back, and `Global::open`/`get` hand the owned pair to the scope reading
+  it. `Local::new` does not: `Global::into_payload` returns the payload as it
+  stands, which for a script is the *old* slot, so reopening a `Global<Script>`
+  through `Local::new` and running it panics with "a Script handle outlived its
+  handle scope" — a bridge-bug message for a host that did nothing wrong. Found
+  by writing this part's own test the documented way first. The fix is for
+  `into_payload` to re-store what the handle owns, which needs the store to
+  answer whether a region is open; named here rather than folded into a change
+  about import referrers.
 
 ## 11. Working rules
 

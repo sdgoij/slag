@@ -200,9 +200,13 @@ pub struct EcmaFunction {
     /// (`enclosing_source`), and `source_hash_at` keys the body cache from it.
     /// `None` when no text covered the creation site.
     pub parse_text: Option<JsString>,
-    /// The module this function's source text appears in (import.meta resolves
-    /// lexically to it, spec 13.3.7.1); `None` for script and builtin code.
-    pub declaring_module: Option<Handle<crate::module::SourceTextModule>>,
+    /// The script or module this function's source text appears in: the
+    /// spec's `F.[[ScriptOrModule]]`, read one level early, because a context
+    /// the engine synthesizes rather than inherits has no caller to take it
+    /// from. `import.meta` resolves lexically to the module half (spec
+    /// 13.3.7.1) and a dynamic import's referrer is the script half; `None` for
+    /// builtin code.
+    pub declaring_script_or_module: Option<crate::context::ScriptOrModule>,
     /// The compiled body (PLAN §4.5): every function body compiles to the
     /// step IR, and ordinary calls/constructs run it on the VM. Shared so
     /// the per-call record read does not copy the steps.
@@ -274,7 +278,7 @@ impl Trace for EcmaFunction {
         self.computed_keys.trace(visit);
         self.source.trace(visit);
         self.parse_text.trace(visit);
-        self.declaring_module.trace(visit);
+        self.declaring_script_or_module.trace(visit);
         // The compiled body embeds literal `Value`s (strings, bigints) in
         // its steps; they are heap edges.
         self.ir.trace(visit);
@@ -1237,14 +1241,10 @@ fn register_function(
     };
     let realm = agent.current_realm()?;
     let private_environment = agent.running_context()?.private_environment;
-    let declaring_module =
-        agent
-            .running_context()
-            .ok()
-            .and_then(|context| match &context.script_or_module {
-                Some(crate::context::ScriptOrModule::Module(module)) => Some(*module),
-                _ => None,
-            });
+    let declaring_script_or_module = agent
+        .running_context()
+        .ok()
+        .and_then(|context| context.script_or_module.clone());
     // Cut 43: closures from the same declaration site share one compiled
     // body (the `body` Rc is the canonical site identity — see
     // `shared_function_body`), so the IR compile — and the per-body JIT
@@ -1283,7 +1283,7 @@ fn register_function(
         class_field_initializer: false,
         source,
         parse_text,
-        declaring_module,
+        declaring_script_or_module,
         ir: None,
         leaf_inline: false,
         construct_inline: false,
@@ -1643,6 +1643,14 @@ pub fn instantiate_arrow(
     // the one a closure created inside this arrow resolves its span against.
     let parse_text = enclosing_source(agent, span).cloned();
     let source = parse_text.as_ref().map(|text| span_slice(text, span));
+    // The arrow's `[[ScriptOrModule]]`, read at creation like every other
+    // closure's: an async body's start and a promise reaction's callback run in
+    // contexts the engine synthesizes, so the record is where the script or
+    // module they were written in can still be found.
+    let declaring_script_or_module = agent
+        .running_context()
+        .ok()
+        .and_then(|context| context.script_or_module.clone());
     let mut data = EcmaFunction {
         name: None,
         params,
@@ -1666,7 +1674,7 @@ pub fn instantiate_arrow(
         class_field_initializer,
         source,
         parse_text,
-        declaring_module: None,
+        declaring_script_or_module,
         ir: None,
         leaf_inline: false,
         construct_inline: false,
@@ -2480,7 +2488,7 @@ fn ordinary_call(
         strict,
         params,
         body,
-        declaring_module,
+        declaring_script_or_module,
         ir,
         parse_text,
     ) = {
@@ -2498,7 +2506,7 @@ fn ordinary_call(
             record.strict,
             record.params.clone(),
             record.body.clone(),
-            record.declaring_module,
+            record.declaring_script_or_module.clone(),
             record.ir.clone(),
             record.parse_text.clone(),
         )
@@ -2517,9 +2525,7 @@ fn ordinary_call(
         .running_context()
         .ok()
         .and_then(|context| context.script_or_module.clone());
-    let script_or_module = declaring_module
-        .map(crate::context::ScriptOrModule::Module)
-        .or(caller_script_or_module);
+    let script_or_module = declaring_script_or_module.or(caller_script_or_module);
     // The callee's own text, not the caller's: this body's spans are offsets
     // into the text it was parsed from, so a closure it creates must resolve
     // against that text and not against whatever text the caller happens to be
@@ -3256,8 +3262,8 @@ fn ordinary_construct(
         .ok()
         .and_then(|context| context.script_or_module.clone());
     let script_or_module = data
-        .declaring_module
-        .map(crate::context::ScriptOrModule::Module)
+        .declaring_script_or_module
+        .clone()
         .or(caller_script_or_module);
     // The callee's own text; the caller's stands in only when the body has
     // none (see `ordinary_call`'s slow path).

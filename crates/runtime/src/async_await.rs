@@ -132,7 +132,7 @@ pub fn call_async_function(
     let context = ExecutionContext {
         function: Some(function_value),
         realm: data.realm,
-        script_or_module: None,
+        script_or_module: data.declaring_script_or_module.clone(),
         lexical_environment: function_env,
         variable_environment: function_env,
         private_environment: data.private_environment,

@@ -31,6 +31,12 @@ pub struct ScriptRecord {
     pub code: Program,
     /// The exact source text, for `Function.prototype.toString`.
     pub source: JsString,
+    /// The script's name, as the host's origin gave it: V8's
+    /// `ScriptOrigin::ResourceName`, which a host's dynamic-import callback is
+    /// handed as the referrer of an `import()` written in this script. `None`
+    /// for a script compiled without a name, which is what such a script offers
+    /// the host.
+    pub name: Option<JsString>,
     /// Whether the source was parsed with the JSX extension (`<a/>`
     /// desugars to `rlx.h("a", …)` calls). Part of the compiled-body cache
     /// key: the same text parses to a different program under the two goals.
@@ -47,13 +53,18 @@ impl Trace for ScriptRecord {
 
 /// ParseScript (spec 16.1.5): parse `source` as a Script and wrap it in a
 /// Script Record. Early errors surface here as a SyntaxError.
-pub fn parse_script(source: &str, realm: Handle<Realm>) -> Result<Handle<ScriptRecord>, JsError> {
+pub fn parse_script(
+    source: &str,
+    realm: Handle<Realm>,
+    name: Option<JsString>,
+) -> Result<Handle<ScriptRecord>, JsError> {
     crate::expr::bump_template_parse_generation();
     let code = parser::parse_script(source)?;
     Ok(Handle::new(ScriptRecord {
         realm,
         code,
         source: JsString::from_utf8(source),
+        name,
         jsx: false,
     }))
 }
@@ -63,6 +74,7 @@ pub fn parse_script(source: &str, realm: Handle<Realm>) -> Result<Handle<ScriptR
 pub fn parse_script_jsx(
     source: &str,
     realm: Handle<Realm>,
+    name: Option<JsString>,
 ) -> Result<Handle<ScriptRecord>, JsError> {
     crate::expr::bump_template_parse_generation();
     let code = parser::parse_script_jsx(source)?;
@@ -70,6 +82,7 @@ pub fn parse_script_jsx(
         realm,
         code,
         source: JsString::from_utf8(source),
+        name,
         jsx: true,
     }))
 }

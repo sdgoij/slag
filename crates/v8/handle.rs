@@ -152,9 +152,15 @@ impl Payload {
     /// The text behind a `Script` payload, for a persistent handle that has to
     /// own it: a scoped reference dies with its scope.
     pub(crate) fn as_script_source(&self) -> Option<Rc<str>> {
+        self.as_script_entry().map(|entry| entry.source)
+    }
+
+    /// The text and the name behind a `Script` payload, for a persistent handle
+    /// that has to own them.
+    pub(crate) fn as_script_entry(&self) -> Option<crate::store::Entry> {
         match self {
             Self::Script { slot, generation } => Some(
-                crate::store::source(*slot, *generation)
+                crate::store::entry(*slot, *generation)
                     .expect("bridge bug: a Script handle outlived its handle scope"),
             ),
             _ => None,
@@ -238,9 +244,9 @@ impl<'s, T> LocalHandle<'s, T> {
         self.payload.as_module()
     }
 
-    pub(crate) fn script_source(&self) -> Rc<str> {
+    pub(crate) fn script_entry(&self) -> crate::store::Entry {
         match self.payload {
-            Payload::Script { slot, generation } => crate::store::source(slot, generation)
+            Payload::Script { slot, generation } => crate::store::entry(slot, generation)
                 .expect("bridge bug: a Script handle outlived its handle scope"),
             _ => panic!("bridge bug: a non-Script handle read as a Script"),
         }
@@ -639,12 +645,12 @@ pub struct Global<T> {
     /// Held only for its `Drop`; releasing the pin is the whole of its API.
     #[allow(dead_code)]
     pin: Option<crux::heap::Pin>,
-    /// A script's text, owned.
+    /// A script's text and name, owned.
     ///
     /// A scoped reference dies with the region its handle scope opened, so a
-    /// handle that outlives that scope has to keep the text itself and hand it
+    /// handle that outlives that scope has to keep them itself and hand them
     /// back to the scope it is read in. `None` for every other payload.
-    script: Option<Rc<str>>,
+    script: Option<Rc<crate::store::Entry>>,
     marker: PhantomData<fn() -> T>,
 }
 
@@ -670,7 +676,7 @@ impl<T> Global<T> {
             | Payload::ModuleRequests { .. }
             | Payload::StackFrame { .. } => None,
         };
-        let script = payload.as_script_source();
+        let script = payload.as_script_entry().map(Rc::new);
         Self {
             payload,
             pin,
@@ -711,8 +717,9 @@ impl<T> Global<T> {
     /// The scoped handle for this persistent one.
     pub fn get<'s>(&self, _scope: &PinScope<'s, '_, ()>) -> Local<'s, T> {
         match &self.script {
-            Some(source) => {
-                let (slot, generation) = crate::store::store(source.clone());
+            Some(entry) => {
+                let (slot, generation) =
+                    crate::store::store(entry.source.clone(), entry.name.clone());
                 Local::from_payload(Payload::Script { slot, generation })
             }
             None => Local::from_payload(self.payload),

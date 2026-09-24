@@ -204,8 +204,15 @@ impl Context {
     /// Evaluate a Script, returning the engine error directly instead of
     /// setting a pending exception.
     pub fn try_eval(&self, source: &str) -> Result<Local, JsError> {
+        self.try_eval_named(source, None)
+    }
+
+    /// Evaluate a Script the host named (v8::Script::Run): `name` is the
+    /// script's resource name, which a host's dynamic-import callback is handed
+    /// as the referrer of an `import()` written in this script.
+    pub fn try_eval_named(&self, source: &str, name: Option<JsString>) -> Result<Local, JsError> {
         self.entered(|agent| {
-            let value = agent.run_script(source)?;
+            let value = agent.run_script_named(source, name)?;
             Ok(Local(value))
         })
     }

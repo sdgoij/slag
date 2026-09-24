@@ -11987,7 +11987,7 @@ impl Vm {
         }
         // Slow path (uncertified): a function environment + declaration
         // instantiation, mirroring `ordinary_call`'s slow branch.
-        let (this_mode, params, body, declaring_module, private_environment, parse_text) = {
+        let (this_mode, params, body, declaring_script_or_module, private_environment, parse_text) = {
             let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
                 JsError::new(
                     ErrorKind::TypeError,
@@ -11998,7 +11998,7 @@ impl Vm {
                 record.this_mode,
                 record.params.clone(),
                 record.body.clone(),
-                record.declaring_module,
+                record.declaring_script_or_module.clone(),
                 record.private_environment,
                 record.parse_text.clone(),
             )
@@ -12014,9 +12014,7 @@ impl Vm {
             .running_context()
             .ok()
             .and_then(|context| context.script_or_module.clone());
-        let script_or_module = declaring_module
-            .map(crate::context::ScriptOrModule::Module)
-            .or(caller_script_or_module);
+        let script_or_module = declaring_script_or_module.or(caller_script_or_module);
         agent.execution_context_stack.pop();
         // The callee's own text; the stack is already the grandcaller's here,
         // which is never the text this body's spans belong to. See

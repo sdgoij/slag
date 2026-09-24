@@ -215,7 +215,7 @@ pub fn compile<'s>(
     _options: CompileOptions,
     _no_cache_reason: NoCacheReason,
 ) -> Option<Local<'s, Script>> {
-    match Script::parse(scope, &source.text) {
+    match Script::parse(scope, &source.text, source.origin.name.clone()) {
         Ok(script) => Some(script),
         Err(error) => {
             crate::throw_at(scope, &error, &source.text, &source.origin);
@@ -286,7 +286,10 @@ pub fn compile_function<'s>(
         .join(", ");
     let text = format!("(function ({parameters}) {{\n{}\n}})", source.text);
     let realm = crate::realm_of(scope);
-    let value = match realm.try_eval(&text) {
+    let value = match realm.try_eval_named(
+        &text,
+        crate::store::engine_name(source.origin.name.as_deref()),
+    ) {
         Ok(value) => value,
         Err(error) => {
             crate::throw(scope, &error);

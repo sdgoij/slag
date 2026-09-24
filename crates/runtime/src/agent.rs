@@ -1686,16 +1686,32 @@ impl Agent {
     /// Parse and evaluate a Script (spec 16.1.4-16.1.6) in the current
     /// realm, returning the script's completion value.
     pub fn run_script(&mut self, source: &str) -> Result<Value, JsError> {
-        self.run_script_mode(source, false)
+        self.run_script_named(source, None)
+    }
+
+    /// Like [`Agent::run_script`], for a script the host named: `name` is the
+    /// script's resource name, which a host's dynamic-import callback is handed
+    /// as the referrer of an `import()` written in this script.
+    pub fn run_script_named(
+        &mut self,
+        source: &str,
+        name: Option<JsString>,
+    ) -> Result<Value, JsError> {
+        self.run_script_mode(source, false, name)
     }
 
     /// Like [`Agent::run_script`], parsing with the JSX extension enabled:
     /// JSX elements desugar to `rlx.h(...)` calls at parse time.
     pub fn run_script_jsx(&mut self, source: &str) -> Result<Value, JsError> {
-        self.run_script_mode(source, true)
+        self.run_script_mode(source, true, None)
     }
 
-    fn run_script_mode(&mut self, source: &str, jsx: bool) -> Result<Value, JsError> {
+    fn run_script_mode(
+        &mut self,
+        source: &str,
+        jsx: bool,
+        name: Option<JsString>,
+    ) -> Result<Value, JsError> {
         crux::function::with_agent(self as *mut Agent as *mut (), || {
             // GC-5: a fresh script is a fresh execution unit — the safe-point
             // allocation budget must not leak in from the previous script.
@@ -1707,9 +1723,9 @@ impl Agent {
             self.reap_dead_wrappers();
             let realm = self.current_realm()?;
             let script = if jsx {
-                crate::script::parse_script_jsx(source, realm)?
+                crate::script::parse_script_jsx(source, realm, name)?
             } else {
-                crate::script::parse_script(source, realm)?
+                crate::script::parse_script(source, realm, name)?
             };
             let result = crate::script::script_evaluation(self, &script);
             // GC-1 slice 3: a script boundary with no pending jobs is a
