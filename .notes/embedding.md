@@ -4691,9 +4691,9 @@ tests, 0 fail**).
 
 *The host-object trait is reachable from the entry point, and the L2 claims have per-allocation variants — §9's bullet that named the two follow-ups of slices 2-3.* Two small pieces, one of them a hole in the boundary. A host that installs its own global object implements `HostOps`, and `Context::new_with_global_ops` takes one, but naming the trait meant depending on `crux`, which contradicts the boundary's own statement that a host depends on `slag` alone. So `runtime::api` re-exports `crux::host::HostOps`, and `slag` carries a guard rather than a comment: `a_host_defined_global_is_reachable_through_the_facade` implements the trait, builds a context over it, evaluates a script and calls the finalizer drain, so removing the re-export is a compile error *in that test* (`E0432: unresolved import crate::api::HostOps`, measured) instead of a hole nobody notices. The second piece is coverage: `.notes/host-object-gc.md` §5's fifth criterion — the L2 claims with a collection after every allocation — had nothing behind it.
 
-*Tests, and the trap the second one cost.* `crux`'s `a_retained_edge_survives_a_collection_per_allocation` is claim 2 at per-allocation granularity, and precise: the host object is pinned (the flat equivalent of "JS can reach it"), promoted by one collection, and then 32 rounds each allocate a value, retain it, read the barrier's own output out of the remembered set, allocate an unretained peer with the same lifetime, run a minor collection, and assert the peer was swept while every value retained so far was not — ending with 32 edges. `runtime`'s `a_host_object_swept_under_gc_stress_finalizes_once` is claim 3 with the engine's `--gc-stress` on, which also turns the barrier and minor verifiers on. Getting the second one honest cost an afternoon and produced the half-rule worth keeping, in the note's §5: the conservative scan reads *stack words*, so an object is rooted by a word in a **live** frame whatever the collector decides — a `Global` whose value is returned through a call does that, still rooting its box after the handle is dropped (`collect_garbage` does not reclaim it, while a precise collection over the agent's own roots does — which is how the word was identified: `agent.trace_roots` fed into `heap.collect` reports the box `swept`). An "unreachable now" test therefore has to keep the address out of every live frame, which is why the object comes from an id-only `#[inline(never)]` helper. Three other explanations were tried and each refuted by measurement before that shape was accepted; they are listed in §12 item 22.
+*Tests, and the trap the second one cost.* `crux`'s `a_retained_edge_survives_a_collection_per_allocation` is claim 2 at per-allocation granularity, and precise: the host object is pinned (the flat equivalent of "JS can reach it"), promoted by one collection, and then 32 rounds each allocate a value, retain it, read the barrier's own output out of the remembered set, allocate an unretained peer with the same lifetime, run a minor collection, and assert the peer was swept while every value retained so far was not — ending with 32 edges. `runtime`'s `a_host_object_swept_under_gc_stress_finalizes_once` is claim 3 with the engine's `--gc-stress` on, which also turns the barrier and minor verifiers on, and with no host-driven collection in it: the sweep that takes the object is the engine's own. That second test is the one that cost an afternoon, and what it cost is a rule now in the note's §5: the conservative scan reads `[sp, high)`, so a returned helper's words are inside the window when the collection runs from deep enough below the frame that held the address — measured as four arms of one experiment (an id-only helper, with and without a stack scrub, with and without `--gc-stress`): 0 finalizers without the scrub in *both* stress modes, including stress off, and 2 with it in both, the arm's own object and the previous arm's. So `runtime`'s api tests carry a `scrub_stack` helper, an object is only unreachable once the region that named it is written over, and the test asserts the engine's sweep rather than a host-driven approximation. Three earlier explanations were tried on the way: the IC value cells and the pin registry were ruled out by measurement, and the third — a stale stack word — turned out to be the answer, in the form the window gives it.
 
-*The measurement, and the one thing it leaves open.* Under `--gc-stress` an unrooted host object is *not* reclaimed by the engine's own per-allocation collections, nor by the script-boundary trigger, in a script that allocates 256 objects — while that same script's per-iteration garbage demonstrably is (the live count stays flat across 256 objects that die each iteration, so those collections run and complete), and an explicit host-driven `Agent::collect_garbage` reclaims the box at once with stress still on. That is §12 item 22: measured, three candidate causes ruled out (the IC value cells, a stale stack word, the pin registry), unexplained, and explicitly not this part's to fix. It matters because `--gc-stress` is the engine's own net for missed roots. So the stress test drives its collection from the host and says why in its own doc comment, and the per-allocation claim that *is* provable is the precise `crux` one.
+*The measurement, and how the last open question closed.* The first reading of the stress test was that the engine's own collections quietly retained the box (§12 item 22's original form). It was not: the collector's scan window is [current `sp`, stack top), so *whether* a returned helper's words are read depends on how deep the collection is called from, and the shape that failed was the plan's own test resting on call depth rather than any root. The four-arm experiment above is what separates the two, and the scrub is the fix — in this part, not deferred: the stress test now runs with no host-driven collection, and the non-stress one against the same hazard. Everything else about the part is unchanged: the re-export and its guard, and the per-allocation `crux` test.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,355 passed / 0 failed** (`crux` 255, `ffi` 10, `runtime` 934, `v8` 256, `slag` 4, `test262` 3324 — one more than the record above in each of `crux`, `runtime` and `slag`); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **903 passed / 0 failed**, and `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because the re-export lives in `runtime::api`, which both runner binaries link, and every number is identical to the baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the wasm sweeps at core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending (64,594 checks), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same 6.
 
@@ -7875,17 +7875,16 @@ migrate, then delete.
   (`.notes/host-object-gc.md` §5's fifth criterion):
   `crux`'s `a_retained_edge_survives_a_collection_per_allocation` is claim 2 with a
   collection after *every* allocation, and `runtime`'s
-  `a_host_object_swept_under_gc_stress_finalizes_once` is claim 3 with the engine's
-  own `--gc-stress` on. Writing them produced one measurement that is *not* this
-  part's to fix and is now §12 item 22: under `--gc-stress` an unrooted host
-  object survives the engine's own per-allocation and script-boundary collections
-  while a host-driven collection reclaims it — with the IC value cells, a stale
-  stack word, and the pin registry each ruled out by measurement, and no cause
-  established. A trap the same work established, recorded in that note's §5, is
-  worth stating here because it is about the *tests*, not the engine: the
-  conservative scan reads stack words, so a host object whose address sits in a
-  live frame is rooted however the collector decides — a `Global` returned through
-  a call keeps its box alive after the handle is dropped.
+  `a_host_object_swept_under_gc_stress_finalizes_once` is claim 3 under
+  `--gc-stress` with no host-driven collection in it — the engine's own sweep takes
+  the object. Getting that second test honest produced one resolved measurement,
+  §12 item 22: a collection's conservative scan reads `[sp, high)`, so a returned
+  helper's words are inside its window exactly when the collection is called from
+  deep enough below the frame that held the address. A test that needs an object
+  unreachable therefore has to scrub the region (the api test module's
+  `scrub_stack`), because "the helper returned" is not by itself enough — and the
+  earlier reading, that the per-allocation hook quietly retained, was this plan's
+  own test resting on call depth.
 
 ## 11. Working rules
 
@@ -8461,26 +8460,28 @@ migrate, then delete.
    left. The slots are read from the current realm, and the drain enters the realm
    a job was queued for so that answer exists while a job runs; both are stated in
    §9.
-22. **An unrooted host object survives the engine's own collections under
-    `--gc-stress`, while a host-driven one reclaims it — measured, and not
-    explained.** The shape is `runtime`'s `an_unrooted_host_object` (a host object
-    whose address never sits in a live frame), which every non-stress test reclaims
-    and which a *precise* collection over the agent's own roots also sweeps
-    (measured by feeding `agent.trace_roots` into `heap.collect`). Under stress, in
-    a script that allocates 256 objects, it is not reclaimed: the pending-finalizer
-    queue is empty both during the script and after it, and the script-boundary
-    trigger does not take it either — while the *same* script's per-iteration
-    garbage demonstrably is reclaimed (the live count stays flat across 256 objects
-    that die each iteration, so the per-allocation collections run and complete).
-    An explicit `Agent::collect_garbage` from the test then reclaims it at once,
-    with stress still on. Three candidate causes were checked and are *not* it: the
-    IC value cells (a property read and then deleted does not root the box — the
-    precise sweep says swept), a stale word in a returned frame (a 25-frame stack
-    scrub changes nothing), and the pin registry (`PINNED` is empty once the handle
-    drops). That leaves something in the per-allocation and script-boundary paths
-    that keeps an unmarked box alive: the abort path (`ABORT_SWEEP` retains
-    everything, and a collection triggered from inside a run can see a
-    mutably-borrowed traced cell) and a root that exists only while a body runs are
-    the candidates. It matters because `--gc-stress` is this engine's own net for
-    missed roots — anything that quietly retains during it weakens that net. Not
-    fixed here; the tests record the shape that is measurable today.
+22. **An unrooted host object survived the engine's own collections under
+    `--gc-stress` — resolved: it is the conservative scan's *window*, not a root,
+    and it was this plan's test that was wrong.** What was measured: a host object
+    created by an id-only `#[inline(never)]` helper was not reclaimed by the
+    engine's own per-allocation collections, nor by its script-boundary trigger, in
+    a script allocating 256 objects — while that script's per-iteration garbage was
+    (live count flat across 256 dying objects), and a host-driven
+    `Agent::collect_garbage` from the test frame reclaimed it at once. Four arms of
+    one experiment settle it: with the helper and no stack scrub, 0 finalizers in
+    *both* stress modes — including stress **off**, which is what rules stress mode
+    out — and with a scrub over the region the helper used, 2 in both, the arm's own
+    object *and* the previous arm's, which the earlier arm had left alive. The scan
+    reads `[sp, high)`, so a returned helper's words are inside the window exactly
+    when the collection is called from deep enough below the frame the helper was
+    called from — which a collection inside an eval always is and one called from a
+    test frame is not. So the anomaly was never in the collector: it was a test
+    resting on call depth. Resolved in the same change that found it (a
+    `scrub_stack` helper in `runtime`'s api tests, and the stress test now asserts
+    the *engine's* sweep, not a host-driven one); kept here because the reasoning is
+    the reusable part — §5 of that note is where the rule lives. Two other candidate
+    causes were also ruled out by measurement on the way — the IC value cells (a
+    property read and then deleted does not root the box: a precise sweep says
+    swept) and the pin registry (`PINNED` is empty once the handle drops) — while
+    the third, a stale stack word, turned out to be the answer in the form the
+    window gives it.

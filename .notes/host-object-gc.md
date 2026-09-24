@@ -209,17 +209,29 @@ handle), the way the L1 pin tests do, or the conservative scan will mask the bug
    so far still live. It is precise because its entry point is the deterministic
    `Heap::collect_minor`. `runtime`'s
    `a_host_object_swept_under_gc_stress_finalizes_once` is 3 with the engine's own
-   `--gc-stress` on, which also turns the barrier and minor verifiers on. Not
-   covered: 4 under stress, and the shape where a host's `finalize` itself runs
-   host code inside the stressed window — the second belongs with the first host
-   that does it. **A trap worth knowing before writing the next one:** the
-   conservative scan reads *stack words*, so an object whose address sits in a
-   **live** frame is rooted whatever the collector decides — a `Global` whose value
-   is returned through a call keeps its box alive *after* the handle is dropped
-   (measured: `collect_garbage` does not reclaim it, while a precise collection
-   over the agent's own roots does, which is how the stack word was identified).
-   Unrooting therefore cannot be observed from the frame that held the handle; the
-   id-only helper shape is what makes it observable.
+   `--gc-stress` on, which also turns the barrier and minor verifiers on, and with
+   **no host-driven collection in it**: the sweep that takes the object is the
+   engine's. Not covered: 4 under stress, and the shape where a host's `finalize`
+   itself runs host code inside the stressed window — the second belongs with the
+   first host that does it.
+
+   **The trap this cost a day to find, and it is about the *scan's window*, not
+   about roots.** The conservative scan reads the words of `[sp, high)` — from the
+   collecting frame's stack pointer *upward*, which includes returned callees'
+   frames whenever the collection is called from deep enough below the frame that
+   held the address. So "create the object in an id-only helper and keep nothing"
+   is *not* enough: it makes the object unreachable for a collection called
+   straight from a test frame and *reachable* for one running inside an eval, which
+   is a difference no test should rest on. Measured, four arms of one experiment
+   (a 256-allocation script, an id-only helper, with and without a stack scrub,
+   with and without `--gc-stress`): without the scrub 0 finalizers in both stress
+   modes — including with stress *off*, which is what ruled out stress mode as the
+   cause — and with the scrub 2 in both, the arm's own object *and* the previous
+   arm's (which the earlier arm had left alive). The remedy is `runtime`'s
+   `scrub_stack`: write junk over the region the helper used, and the answer stops
+   depending on where the collection was called from. Any future test that needs an
+   object genuinely unreachable should use it, and should not conclude from a
+   failing collection that the collector is wrong before checking the window.
 6. A weak handle fires once, after the collection; the target's slot is reclaimed;
    the callback cannot resurrect it. **Slice 4, not started.**
 

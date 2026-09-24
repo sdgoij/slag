@@ -1337,11 +1337,10 @@ mod tests {
     }
 
     /// Create a host object and keep nothing: the frame is returned before the
-    /// collection runs, so no stack word roots it. A returned frame sits *below*
-    /// the stack pointer the conservative scan starts from, which is why this is
-    /// a separate `#[inline(never)]` call rather than a scope inside the test —
-    /// where the handle's slot would be scanned and the object would survive
-    /// whatever the collector decided.
+    /// collection runs, and the caller scrubs the stack region below itself
+    /// (`scrub_stack`), so no scanned word names the box. Both halves are needed —
+    /// a returned frame is not by itself outside the conservative scan's window,
+    /// which is the trap `.notes/host-object-gc.md` §5 records.
     #[inline(never)]
     fn an_unrooted_host_object() -> u64 {
         crux::object::JsObject::host_object_create(std::rc::Rc::new(RecordingFinalizer), None).id()
@@ -1359,6 +1358,7 @@ mod tests {
         FINALIZED.with(|ids| ids.borrow_mut().clear());
 
         let id = an_unrooted_host_object();
+        scrub_stack(32);
         // The collection is the engine's own entry point, not a test-only path.
         isolate.agent().collect_garbage();
         isolate.run_finalizers();
@@ -1366,18 +1366,40 @@ mod tests {
         FINALIZED.with(|ids| assert_eq!(*ids.borrow(), vec![id]));
     }
 
-    /// Criterion 5's runtime half: the drain delivers exactly one finalizer with
-    /// `--gc-stress` on, which also turns the barrier and minor verifiers on — the
-    /// engine's own worst case for a host object's edges.
+    /// Overwrite the stack region below this frame.
     ///
-    /// The object is unrooted by construction (`an_unrooted_host_object`), because
-    /// any *live* frame holding its address roots it for the conservative scan and
-    /// the sweep would then be about the stack: a `Global` whose value is returned
-    /// through a call keeps the box alive even after the handle is dropped
-    /// (measured — dropping it is not what the scan sees). The collection here is
-    /// host-driven for the reason §12's stress item gives: with stress on, the
-    /// engine's own per-allocation and boundary collections do not reclaim this
-    /// box, while a host-driven one does, which is unexplained and tracked there.
+    /// A test that needs an object *unreachable* needs this, and the reason is
+    /// the collector's contract rather than a trick: the conservative scan reads
+    /// the words of `[sp, high)`, so a returned helper's words are inside the
+    /// window whenever a collection is called from deep enough below the frame
+    /// the helper was called from — which a collection running inside an eval
+    /// always is, and one called straight from a test frame is not. That makes
+    /// "an id-only helper is enough" true or false by call depth, which is not a
+    /// property a test should rest on. Writing junk over the region removes the
+    /// question: the junk is not a box address, whatever the window covers.
+    #[inline(never)]
+    fn scrub_stack(depth: usize) {
+        let mut sink = [0usize; 1024];
+        for (index, slot) in sink.iter_mut().enumerate() {
+            *slot = 0x0BAD_0BAD_0000_0000usize.wrapping_add(index);
+        }
+        std::hint::black_box(&sink);
+        if depth > 0 {
+            scrub_stack(depth - 1);
+        }
+    }
+
+    /// Criterion 5's runtime half: the collector running at *every* allocation
+    /// takes the object during a script, and the drain reports it exactly once.
+    /// `--gc-stress` also turns the barrier and minor verifiers on, so this is the
+    /// engine's own worst case for a host object's edges rather than a host-driven
+    /// approximation.
+    ///
+    /// The object is unrooted by construction — an id-only helper plus
+    /// `scrub_stack`, because the conservative scan's window reaches a returned
+    /// helper's words when the collection runs from inside an eval (§5 of the same
+    /// note measures both halves). No host-driven collection appears here: the
+    /// sweep that takes it is the engine's.
     #[test]
     fn a_host_object_swept_under_gc_stress_finalizes_once() {
         let mut isolate = isolate();
@@ -1385,11 +1407,11 @@ mod tests {
         FINALIZED.with(|ids| ids.borrow_mut().clear());
 
         let id = an_unrooted_host_object();
+        scrub_stack(32);
         isolate.agent().set_gc_stress(true);
         context
             .try_eval("let keep = []; for (let i = 0; i < 256; i++) keep.push({ i });")
             .expect("eval");
-        isolate.agent().collect_garbage();
         isolate.agent().set_gc_stress(false);
         isolate.run_finalizers();
 
