@@ -4223,6 +4223,83 @@ record added are the data that hook needs; what is missing is the hook plus the
 call-site objects it passes. Measured with the `Message` change in place and with it
 reverted, the failure is identical, which is what isolated it.
 
+*A module body that fails without a statement-level `throw` now settles its
+capability — §9's bullet that named it, and the half of the source-map cluster
+that was the engine's.* The engine settles a module body two ways, and only one
+of them was written: a top-level `throw` statement comes back from the body's
+driver as `Completion::Throw`, which `finish_module_evaluation` turns into the
+spec's rejection, while every *other* abrupt completion arrives as a `JsError`
+from the body's `Vm` and `execute_module_body`'s `Err` arm marked the module
+`Evaluated`, recorded no error, rejected nothing and handed the failure back as
+a Rust `Err`. A module whose top-level code *calls* something that throws — the
+shape every bundled or transpiled module has, and the shape all four deno tests
+use — crosses the Vm boundary as `flow::uncaught_error`, so it took the second
+path: `module_evaluation` answered `Err`, `crates/v8` threw it into the scope
+and answered `None`, and deno's `let Some(value) = module.evaluate(tc_scope)
+else` branch sent nothing and reported nothing (its `debug_assert_eq!(status,
+Errored)` is compiled out of a release build). The `Err` arm now settles like a
+throw: the body's failure value goes on `[[EvaluationError]]`, the capability
+rejects through `finish_module_evaluation`'s existing `Completion::Throw` arm,
+and disposable resources are disposed with the throw as their completion, so
+`Module::Evaluate` no longer fails synchronously for a body error and the
+rejection reason keeps the identity of the object the body threw.
+
+*The probe, and why it was a bridge probe.* Three shapes were measured before
+any edit, and the first two were dead ends that would have been guessed at
+otherwise: the engine's own probe (a temporary test in `module.rs`) showed the
+engine *does* report a rejection through `HostHooks::promise_rejection_tracker`
+for a bare `throw` at a module's top level — `false` immediately, and the async
+module `true` then `false` — and that a top-level `throw` already answers a
+rejected promise. Instrumenting the bridge's `BridgeHooks` and
+denon's own `promise_reject_callback` showed neither was ever reached in deno's
+flow, which left the module's own answer as the only variable, and a probe on
+`Module::evaluate` named it exactly: two `Ok` evaluations of the runtime's
+bootstrap modules, then the test's module with `is_ok=false`, throwing
+`TypeError: Uncaught exception` — `flow::uncaught_error`, the call-boundary
+spelling. All three probes are removed; the engine one became the test below.
+
+*Tests — the engine's, with two mutations.*
+`a_module_whose_body_throws_from_a_call_rejects_its_promise`
+(`crates/runtime/src/module.rs`) picks the rejection reason's `message` off the
+settled capability and asserts the module recorded that same value, which pins
+both halves: the promise settles, and it settles with the object the body threw
+rather than a synthesized one. Restoring the old `Err` return fails it at
+`evaluate answers a promise: JsError { kind: TypeError, message: "Uncaught
+exception" }` — the very error deno saw — and rejecting with the message string
+instead of the thrown value fails it with `left: Undefined, right:
+String(...)`, because a string has no `message` property. The
+host-hook probe's `promise_rejection_tracker` on `RecordsReferrer` and its
+`REJECTIONS` thread-local went with the probe.
+
+*The measurement.* deno's four `modules::tests::test_native_source_map_*` /
+`test_native_external_source_map_with_relative_path` tests now get **past** the
+assertion that named this part — `run_event_loop(..).is_err()` — and fail on the
+next one, which wants the error string to name the source-mapped file and gets
+the generated position instead (`Error should reference source file test.ts,
+got: Error: Test error at greet:2:9 at <anonymous>
+(file:///test.js:5:1)`). So the count does not move: the full `deno_core --lib`
+suite is **436 passed / 23 failed**, the same set of 23 as before this part,
+with no test newly red. The mapping half is not this part's and is now its own
+named item (§12 item 15): deno's expected string is its own `JsError` rendering
+of the frames it reads out of `#callSiteEvals`, and that array is populated by
+the isolate-level `prepareStackTrace` callback — which the bridge accepts and
+does not run (`crates/v8/isolate.rs`, `set_prepare_stack_trace_callback`) and
+whose call-site objects the engine has no kind for. §7's earlier record named
+that hook as the open item; this part is the prerequisite it was blocked behind,
+not the fix.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip
+function::tests::the_data_a_built_function_carries_survives_a_collection` green
+(`runtime` **909** with the workspace's features, `crux` 249, `v8` 247,
+`test262` 3324, 0 failed anywhere). The corpora were re-run because the change
+sits on the module-evaluation path: test262 `all` reproduces its baseline
+exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the
+wasm sweeps reproduce theirs — core **20,662** (+3 skipped), simd **25,990**,
+relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1
+skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, and
+js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7151,6 +7228,45 @@ migrate, then delete.
   `into_payload` to re-store what the handle owns, which needs the store to
   answer whether a region is open; named here rather than folded into a change
   about import referrers.
+- **A module body that fails without a statement-level `throw` settles its
+  capability the same way one that has one does — named here before the edit.**
+  The engine settles a module body two ways. A top-level `throw` statement comes
+  back from the body's driver as `Completion::Throw`, and
+  `finish_module_evaluation` turns it into the spec's rejection: the value goes
+  on the module's `[[EvaluationError]]`, the capability rejects, the async
+  parents are notified (spec 16.2.2.5). Every *other* abrupt completion arrives
+  as a Rust `Err` from the body's `Vm`, and `execute_module_body`'s `Err(error)`
+  arm (`crates/runtime/src/module.rs`) marks the module `Evaluated`, records no
+  error and rejects nothing — the capability stays pending for the life of the
+  realm, and the `Err` is handed back to the caller as a Rust failure. The
+  second path is not the exotic one: a module whose top-level code *calls*
+  something that throws crosses the Vm boundary as `flow::uncaught_error`, not
+  as a completion, so `throw new Error(...)` written at a module's top level
+  settles and `f()` where `f` throws does not. Measured on deno's four
+  `modules::tests::test_native_source_map_*` /
+  `test_native_external_source_map_with_relative_path` tests, which all load a
+  main module that calls a throwing function, discard `mod_evaluate`'s receiver
+  without polling it, and then assert `run_event_loop(..)` is `Err`. A bridge
+  probe on `Module::evaluate` says why they see `Ok`: the engine answers `Err`,
+  so `crates/v8` throws it into the scope and answers `None`, and deno's
+  `let Some(value) = module.evaluate(tc_scope) else` branch
+  (`libs/core/modules/map/evaluation.rs:81`) sends nothing and reports nothing —
+  the `debug_assert_eq!(status, Errored)` that would have caught it is compiled
+  out of a release build. So the `Err` arm settles like a throw: the body's
+  failure value goes on `[[EvaluationError]]`, the capability rejects through
+  `finish_module_evaluation`'s existing `Completion::Throw` arm, disposable
+  resources are disposed with the throw as their completion, and
+  `module_evaluation` answers the promise. `Module::Evaluate` thereby stops
+  failing synchronously for a body error, which is the shape deno's `on_rejected`
+  handler is written for (it rethrows the rejection value into the isolate so the
+  event loop sees an uncaught exception), and the reason is the value the body
+  actually threw, identity included, which the source-map assertions need.
+  **Left open, same shape one level up:** a module that *imports* a failing
+  module still returns `Err` from the dependency walk
+  (`module.rs`, the `dependencies_result` arm), because the capability is
+  created after that walk. The dependency's own promise is rejected by this
+  change, so the failure is reported either way — but the importer's promise
+  never settles. That is its own part, with its own measurement.
 
 ## 11. Working rules
 
@@ -7572,3 +7688,29 @@ migrate, then delete.
    original note carried still stands as classification rather than status: the hang was
    measured, not A/B'd against a pre-change binary, so it was recorded as *revealed* (the
    earlier termination hang masked it) rather than proven unrelated.
+15. **`prepareStackTrace`: an error's `stack` is the host's to format, and the
+   call-site objects it takes do not exist — named, not started.** Deno installs the
+   isolate-level callback (`libs/core/runtime/setup.rs:287`,
+   `crate::error::prepare_stack_trace_callback`), and the bridge accepts and does not run
+   it (`crates/v8/isolate.rs`, "Accepted and not run: the engine builds an error's stack
+   itself, with no host hook in the path"). That is the whole of the source-map cluster's
+   remaining half: deno reads `#callSiteEvals` (a private name, which landed) and, when
+   it is empty, keeps the engine's own `Error.stack` string verbatim, so the generated
+   position shows where the mapped one belongs. The parts, in the order the measurement
+   implies: (a) the engine's `%get Error.prototype.stack%` accessor
+   (`crates/runtime/src/builtins/error.rs`, which today calls `define_stack` and returns
+   the rendered string) asks the host hook first and uses its answer, as V8 does; (b) the
+   engine builds the `Array` of call-site objects V8 hands that hook — each a JS object
+   with `getThis`, `getTypeName`, `getFunction`, `getFunctionName`, `getMethodName`,
+   `getFileName`, `getLineNumber`, `getColumnNumber`, `getEvalOrigin`, `isToplevel`,
+   `isEval`, `isNative`, `isConstructor`, `isAsync`, `isPromiseAll`, `getPromiseIndex`,
+   `getScriptNameOrSourceURL` and `toString`, since deno's `from_callsite_object` calls
+   them as methods and `make_callsite_prototype` patches a proxy around them; (c) the
+   bridge's `set_prepare_stack_trace_callback` stores the host callback and its
+   `HostHooks` seam forwards it. The frame *data* is what the frames work already
+   captures (`context.function` on every certified call, `context.position`,
+   `context.script_or_module`, `SourceText::line_column`); what is genuinely missing is
+   the object kind, `getThis`, `getEvalOrigin` and the promise-all pair, which is 0 for a
+   frame that is not one — the same shape V8 answers. Its measurement is deno's four
+   source-map tests plus `test_dynamic_import_module_error_stack`, whose expected
+   `at async file:///import.js:1:43` is `format_frame`'s rendering of the same frames.

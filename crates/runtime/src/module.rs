@@ -1761,13 +1761,29 @@ fn execute_module_body(
         }
         Err(error) => {
             agent.execution_context_stack.pop();
-            module.status.replace(ModuleStatus::Evaluated);
-            // A synchronous engine error (an unresolved identifier, a failed
-            // coercion, ...) carries its thrown value so runtime-phase
-            // negative expectations can check the error constructor (the
-            // explicit-throw path rejects the capability with the value).
-            let value = crate::promise::error_value(agent, &error);
-            return Err(error.with_value(value));
+            // An abrupt completion that is not a statement-level `throw` — a
+            // call that threw, a failed coercion — settles the module the same
+            // way one that is: the value goes on the module's
+            // `[[EvaluationError]]` and the capability rejects, so `Evaluate`
+            // answers a rejected promise instead of failing synchronously. A
+            // `throw` crossing a call boundary arrives here as
+            // `flow::uncaught_error`, which already carries the value the body
+            // threw, so the rejection reason keeps that identity.
+            let completion = Completion::Throw(crate::promise::error_value(agent, &error));
+            let resources = state.borrow().vm.lexical_env.drain_disposable_resources();
+            if resources.is_empty() {
+                finish_module_evaluation(agent, module, &state, completion)?;
+            } else {
+                crate::builtins::disposable::dispose_async_body_resources(
+                    agent,
+                    resources,
+                    completion,
+                    crate::builtins::disposable::AsyncBodySettlement::Module {
+                        module: *module,
+                        state: state.clone(),
+                    },
+                )?;
+            }
         }
     }
     Ok(())
@@ -3901,6 +3917,42 @@ mod tests {
             IMPORT_META_MODULE.load(std::sync::atomic::Ordering::SeqCst),
             crux::handle::Handle::as_ptr(module) as u64,
             "and the hook is handed the module the object belongs to"
+        );
+    }
+
+    /// A module body that fails through a *call* — the shape every bundled or
+    /// transpiled module has — settles the module the way a statement-level
+    /// `throw` does: the failure is recorded on the module and the evaluation
+    /// promise rejects. Answers a rejected promise, never a synchronous
+    /// failure, because that is what `Evaluate` promises a host.
+    #[test]
+    fn a_module_whose_body_throws_from_a_call_rejects_its_promise() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().expect("a realm");
+        agent.add_module(
+            "throws.js",
+            "function boom() { throw new Error('boom'); }\nboom();",
+        );
+        let module =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("throws.js"), &[])
+                .expect("the module");
+        module_declaration_instantiation(&mut agent, &module).expect("instantiate");
+
+        let evaluation =
+            module_evaluation(&mut agent, &module).expect("evaluate answers a promise");
+        let reason = settled(&agent, &evaluation).expect("the evaluation promise settles");
+        let message = crate::context::get_property(
+            &mut agent,
+            &reason,
+            &JsString::from_utf8("message"),
+            reason,
+        )
+        .expect("the rejection reason carries its message");
+        assert_eq!(message, js_str("boom"));
+        assert_eq!(
+            *module.evaluation_error.borrow(),
+            Some(reason),
+            "the module records the value the body threw"
         );
     }
 
