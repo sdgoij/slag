@@ -295,8 +295,10 @@ interpreted: Slag's engine is not flag-configurable, so a host whose behavior
 depends on a flag gets that flag's absence rather than a wrong one. Two gaps
 this surfaced, both engine-side and both recorded here rather than worked
 around: **`globalThis.queueMicrotask` does not exist in the engine** (Deno's
-core JS uses it, and its `--enable-queue-microtask` flag is how V8 supplies one),
-and there is no engine flag surface at all.
+core JS uses it, and its `--enable-queue-microtask` flag is how V8 supplies one)
+— **landed since**, the global is installed with the realm's own and the
+`--enable-queue-microtask` flag is deliberately not what gates it (§9's
+microtask-global bullet) — and there is no engine flag surface at all.
 
 **Snapshot creation — landed, and it refuses.** *(Superseded by §7's last record:
 this bridge now produces a blob. What follows is the state this step landed in,
@@ -4407,6 +4409,16 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,330 passed / 0 failed** (5,328 plus this change's two tests); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **890 passed / 0 failed**, `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because the dynamic-import path moved: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) — the corpus never names an attribute other than `type`, which is why the old rule hid behind it — and the wasm sweeps reproduce every certified number: core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, and js-api **1,001 tests, 0 fail**.
 
+*The realm provides the HTML microtask global — §9's bullet that named it, and it closes the gap §7 recorded a hundred records ago.* The failure was not the test's subject: `test_nexttick_before_queue_microtask` (`libs/core/runtime/tests/misc.rs:2119`) is about nextTick-before-`then` ordering, but it died in `queueMicrotask` itself — `ext:core/01_core.js:585`, "value is not a function" — because this engine had no `globalThis.queueMicrotask` at all, which the record above the first boot already knew and had left open ("the `--enable-queue-microtask` flag is how V8 supplies one", and this engine has no flag surface). `01_core.js` reads `window.queueMicrotask` at boot (`:572`) and captures `undefined`, so its wrapper called `undefined`; the engine's flag answer was never the question, a host global was missing. V8's is `GlobalQueueMicrotask` (`v8/src/builtins/builtins-microtask-queue-gen.cc:796-836`): a non-callable callback is a `TypeError` thrown *at the call*, and the callback is enqueued as a task ordered with the promise jobs by enqueue order, running in the callback's own realm. The engine already had the queue — `Agent::enqueue_promise_job`, which `api::Context::enqueue_microtask` uses — so the global joins the realm's other globals in `builtins/global.rs::install` with the two rules stated: the task goes on the **promise** queue (not `generic_jobs`, which drains after every promise job, so the ordering would be wrong), and it runs in the realm the call is in, because the engine keeps no per-function realm to prefer.
+
+*Tests — two engine, and two mutations, each caught.* `queue_microtask_orders_with_the_promise_jobs` (`crates/runtime/src/builtins/global.rs`) pins the shape (`typeof` is `function`, length 1, name `queueMicrotask`) and the ordering across two `queueMicrotask` calls with a `Promise.resolve().then` between them: `first,then,second`, one queue in enqueue order. `queue_microtask_refuses_a_non_callable_and_propagates_a_throw` pins that the refusal is **synchronous** — the script's own value carries `true:queueMicrotask: callback is not a function` read *before* any drain, so a rejection that only surfaced in the drain cannot pass — and that a callback which throws is an error out of the drain. The realm's `global_property_completeness_check` lists the new global beside the others it installs. Two mutations, each caught: enqueueing on `generic_jobs` fails the ordering test with `then,first,second` (promise jobs drain first, so the microtask would land behind `.then`), and dropping the callable check fails the refusal test with `left: None` — the value is `false`, because without the check nothing throws at the call. That second mutation is why the test was rewritten: its first shape asserted `run("queueMicrotask(1)")` was a `TypeError`, which passes either way, since `evaluate` drains and the job's own `call` error is a `TypeError` too.
+
+*The measurement.* deno's `runtime::tests::misc::test_nexttick_before_queue_microtask` **passes** — and the ordering deno's drain is built around (`tick,microtask,then`) falls out of the engine's single promise-job queue without further work: deno's `processTicksAndRejections` runs its nextTick queue and then `op_run_microtasks`, which drains what this engine enqueued. The whole `deno_core --lib` suite moves **449 passed / 10 failed → 450 passed / 9 failed**: the one test flipped, none newly red, and the 9 left are §9's four inspector cases, the two Windows `uv_compat` pipe-busy ones, and the three the earlier records name (`test_dynamic_import_module_error_stack`, `test_promise_rejection_handler::case_04`, `wasm_streaming_op_invocation_in_import`).
+
+*And the first suite run's hang was not this change's, which was measured rather than assumed.* That run stalled in `tasks::tests::test_spawner_serial` and was killed after an hour; the test is pure tokio spawner machinery (no V8, no JS, no job queue — `V8TaskSpawnerFactory` and `poll_inner`, and it carries the `tokio-rs/tokio#6155` link for exactly this symptom), it passes standalone in 0.00s, and the re-run completed the whole suite in the usual 111s. Recorded because the alternative reading — a new global wedging deno's event loop — would have been plausible from the name alone.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,332 passed / 0 failed** (5,330 plus this change's two tests); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **892 passed / 0 failed**, `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because a new global and a new intrinsic are corpus-visible in principle: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622 — so no fixture enumerates the global's properties) and the wasm sweeps reproduce every certified number: core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, and js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7183,7 +7195,8 @@ names both and is where the choice is recorded. The `ext`-crate frontier of §7'
 measurement
 (341 errors across eight crates, none of them `deno_core`) is still what stands
 between this and a `deno` binary, and
-deno's own runtime gaps (`queueMicrotask` among them) sit behind that; (4)
+deno's own runtime gaps (`queueMicrotask` among them, since closed — the global
+is installed with the realm's own, §9) sit behind that; (4)
 migrate, then delete.
 - **`Error.captureStackTrace`'s second argument strips the wrong end of the
   stack — named here before the edit, and landed.** V8 omits "all frames above
@@ -7621,6 +7634,25 @@ migrate, then delete.
   the import itself — the hook answered `None` — and it rejects with an error
   *object* rather than a string, which is what V8's own no-callback path mints
   (`:7318-7323`).
+- **The realm provides the HTML microtask global — named here with the edit, and
+  it closes §10's (3) gap.** §7 recorded that `globalThis.queueMicrotask` does not
+  exist in the engine, with V8's supply of one sitting behind
+  `--enable-queue-microtask`; the engine has no flag surface, and a missing host
+  global is not a flag answer. It is not optional for a host either: `deno_core`'s
+  `01_core.js` reads `window.queueMicrotask` at boot (`:572`) and, finding
+  nothing, captures `undefined` and calls it (`:585`), which is exactly
+  `test_nexttick_before_queue_microtask`'s failure
+  (`libs/core/runtime/tests/misc.rs:2119`) — the test's subject is not the
+  ordering but whether the global exists at all. V8's is
+  `GlobalQueueMicrotask` (`v8/src/builtins/builtins-microtask-queue-gen.cc:796-836`):
+  a non-callable callback is a `TypeError`, and the callback is enqueued as a
+  task ordered with the promise jobs by enqueue order. This engine already has
+  that queue — `Agent::enqueue_promise_job`, which
+  `api::Context::enqueue_microtask` uses — so the global joins the realm's other
+  host globals with one rule stated rather than implied: the task runs in the
+  realm the call is in, because the engine keeps no per-function realm (V8 uses
+  the callback's creation realm) and one realm per isolate is the model this
+  engine's jobs already follow.
 
 ## 11. Working rules
 

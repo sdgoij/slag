@@ -1030,6 +1030,7 @@ mod tests {
             "encodeURIComponent",
             "decodeURI",
             "decodeURIComponent",
+            "queueMicrotask",
             "Object",
             "Function",
             "Boolean",

@@ -8,7 +8,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
 use crux::string::JsString;
-use crux::value::{Value, ValueKind};
+use crux::value::{Value, ValueKind, is_callable};
 
 use crate::realm::Realm;
 
@@ -96,6 +96,12 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         ),
         ("escape", "%escape%", 1, escape),
         ("unescape", "%unescape%", 1, unescape),
+        (
+            "queueMicrotask",
+            "%queueMicrotask%",
+            1,
+            queue_microtask as fn(&Value, &[Value]) -> Result<Value, JsError>,
+        ),
     ] {
         let function = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -123,6 +129,34 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         )?;
     }
     Ok(())
+}
+
+/// queueMicrotask (HTML 8.6): `callback` runs as a microtask, ordered with the
+/// promise jobs by enqueue order.
+///
+/// V8 supplies this global from `GlobalQueueMicrotask`
+/// (`builtins-microtask-queue-gen.cc`), behind `--enable-queue-microtask`; this
+/// engine has no flag surface, and the global is not optional for a host
+/// (`deno_core`'s `01_core.js` reads it at boot), so it is installed with the
+/// rest. V8 runs the task in the callback's own realm, taken from the function's
+/// `[[Realm]]`; the engine keeps no per-function realm, and one realm per
+/// isolate is what its jobs already assume, so the realm the call is in is the
+/// one the task runs in.
+fn queue_microtask(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    let callback = arg(args, 0);
+    if !is_callable(&callback) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "queueMicrotask: callback is not a function".into(),
+        ));
+    }
+    let agent = current_agent_mut()?;
+    let realm = agent.current_realm()?;
+    agent.enqueue_promise_job(Some(realm), move |agent| {
+        crate::function::call(agent, &callback, Value::Undefined, &[])?;
+        Ok(Value::Undefined)
+    });
+    Ok(Value::Undefined)
 }
 
 /// escape (spec B.2.1.1): keep the URL-safe set verbatim, percent-encode
@@ -520,6 +554,78 @@ mod tests {
 
     fn is_nan_value(value: &Value) -> bool {
         matches!(value.kind(), ValueKind::Number(n) if n.is_nan())
+    }
+
+    /// The HTML microtask global exists with the shape the rest of the realm's
+    /// globals have, and the task it enqueues is ordered with the promise jobs by
+    /// enqueue order — which is the property a host's nextTick-before-`then`
+    /// invariant rests on (`.notes/embedding.md` §9, the microtask-global bullet).
+    #[test]
+    fn queue_microtask_orders_with_the_promise_jobs() {
+        let mut agent = crate::agent::Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        assert_eq!(run("typeof queueMicrotask").unwrap(), str("function"));
+        assert_eq!(run("queueMicrotask.length").unwrap(), Value::Number(1.0));
+        assert_eq!(run("queueMicrotask.name").unwrap(), str("queueMicrotask"));
+
+        agent
+            .run_script(
+                "globalThis.order = [];\
+                 queueMicrotask(() => order.push('first'));\
+                 Promise.resolve().then(() => order.push('then'));\
+                 queueMicrotask(() => order.push('second'));",
+            )
+            .unwrap();
+        agent.run_jobs().unwrap();
+        assert_eq!(
+            agent
+                .run_script("order.join(',')")
+                .unwrap()
+                .as_string()
+                .map(|text| text.to_string_lossy())
+                .as_deref(),
+            Some("first,then,second"),
+            "the queue is one queue, in enqueue order"
+        );
+    }
+
+    /// A non-callable callback is refused **where the call is** — the rejection is
+    /// synchronous, as V8's is, not an error the drain discovers — and a callback
+    /// that throws is an error out of the drain rather than a swallowed one.
+    #[test]
+    fn queue_microtask_refuses_a_non_callable_and_propagates_a_throw() {
+        let mut agent = crate::agent::Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // The script's own value carries the answer, and it is read before any
+        // drain: a rejection that only surfaced in the drain would leave `threw`
+        // false and then fail the drain instead.
+        let threw = agent
+            .run_script(
+                "let threw = false;\
+                 try { queueMicrotask(1); } catch (error) {\
+                   threw = (error instanceof TypeError) + ':' + error.message;\
+                 }\
+                 threw",
+            )
+            .unwrap();
+        assert_eq!(
+            threw
+                .as_string()
+                .map(|text| text.to_string_lossy())
+                .as_deref(),
+            Some("true:queueMicrotask: callback is not a function")
+        );
+        assert!(agent.run_jobs().is_ok(), "and nothing was enqueued for it");
+
+        let mut agent = crate::agent::Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("queueMicrotask(() => { throw new Error('from the microtask'); });")
+            .unwrap();
+        assert!(
+            agent.run_jobs().is_err(),
+            "a microtask's throw reaches the drain"
+        );
     }
 
     #[test]
