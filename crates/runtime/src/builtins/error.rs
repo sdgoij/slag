@@ -586,14 +586,27 @@ fn define_stack(
         .iter()
         .rev()
         .filter(|context| crate::api::stack_trace::is_frame(context));
+    // A named constructor omits the frames above it — the ones newer than it,
+    // its own included — and keeps the frames older than it, which is why a
+    // host passes its own builder and still reports its caller
+    // (Error.captureStackTrace's second argument). The walk is innermost-first,
+    // so the omission is a skip until the name is met rather than a stop at it;
+    // a name that is not on the stack omits every frame, the same rule read to
+    // its end.
+    let mut up_to = until;
     for context in frames {
-        // A host that named a constructor hides that constructor's own frame
-        // and every frame older than it (Error.captureStackTrace's second
-        // argument, which deno's error builder passes to strip itself).
-        if let (Some(until), Some(current)) = (until, context.function.as_ref())
-            && is_same_function(current, until)
-        {
-            break;
+        if let Some(named) = up_to {
+            let found = context
+                .function
+                .as_ref()
+                .map(|current| is_same_function(current, named))
+                .unwrap_or(false);
+            if !found {
+                continue;
+            }
+            // The named constructor's own frame goes with them.
+            up_to = None;
+            continue;
         }
         let frame = context
             .function
@@ -646,12 +659,12 @@ fn define_stack(
 /// stack is captured through [`define_stack`], the same way a constructed error
 /// captures one, and served by the `%Error.prototype.stack%` accessor.
 ///
-/// `constructorOpt` is **ignored**: it names the function whose frame and above
-/// V8 hides, and this engine's frame view does not yet relate a function value to
-/// the frames that carry it. A host that passes it therefore sees the frames
-/// above the call site rather than the frames above the named constructor — more
-/// lines, never a wrong error. A non-object target captures nothing, which is
-/// what V8's implementation does with one.
+/// `constructorOpt` names the function whose frame, and every frame above it,
+/// V8 hides: the frames newer than the constructor, so the frames of its
+/// callers survive — which is the point of the idiom, and why deno's builder
+/// passes itself and still gets the frame the error was raised at. A name no
+/// frame carries hides every frame. A non-object target captures nothing, which
+/// is what V8's implementation does with one.
 fn capture_stack_trace(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let Some(target) = args.first() else {
         return Ok(Value::Undefined);
@@ -951,10 +964,12 @@ mod tests {
     }
 
     /// `Error.captureStackTrace`'s second argument hides that constructor's own
-    /// frame and every frame older than it — what deno's error builder passes to
-    /// strip itself out of the stack it is building.
+    /// frame and every frame above it (the newer ones), which is what deno's
+    /// error builder passes to strip itself out of the stack it is building: the
+    /// frames that survive are its **callers**, so the site the error was raised
+    /// at is the first line rather than the last.
     #[test]
-    fn capture_stack_trace_strips_from_the_named_constructor_outward() {
+    fn capture_stack_trace_hides_the_frames_above_the_named_constructor() {
         let source = |ctor: &str| {
             format!(
                 "function inner() {{ const e = new Error('x'); \
@@ -971,14 +986,17 @@ mod tests {
         };
         let kept = read(run(&source("")).unwrap());
         assert!(
-            kept.contains("at inner:"),
-            "without a constructor the frame is there: {kept}"
+            kept.lines().count() == 4 && kept.contains("at <anonymous>:3:1"),
+            "without a constructor the frames are inner, outer and the script: {kept}"
         );
-        assert!(kept.contains("at outer:"), "and so is its caller: {kept}");
         let stripped = read(run(&source(", inner")).unwrap());
-        assert_eq!(
-            stripped, "Error: x",
-            "the named constructor's frame and every older one are gone"
+        assert!(
+            !stripped.contains("at inner:") && stripped.lines().count() == 3,
+            "the named constructor's frame is gone and its callers are not: {stripped}"
+        );
+        assert!(
+            stripped.contains("at outer:") && stripped.contains("at <anonymous>:3:1"),
+            "the frames older than the constructor survive, in order: {stripped}"
         );
     }
 

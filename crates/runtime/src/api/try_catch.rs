@@ -2,6 +2,7 @@
 //! exception slot; [`Exception`] creates and throws native errors.
 
 use std::cell::Cell;
+use std::cell::RefCell;
 
 use crux::error::JsError;
 use crux::handle::Handle;
@@ -10,11 +11,22 @@ use crux::value::Value;
 
 use super::Isolate;
 use super::handle::Local;
-/// A pending-exception observer (v8::TryCatch): created on an isolate, it
-/// observes the isolate's pending exception slot, and clears the caught
-/// exception on drop unless it was rethrown.
+/// An exception handler (v8::TryCatch): it owns the exception that was thrown
+/// into it, and restores the one that was pending when it was opened.
+///
+/// The owner is the difference from a plain observer. V8's handler takes the
+/// exception *out* of the isolate as it catches it, so `HasCaught`/`Exception`
+/// answer what it caught while the isolate is already clear — which is what lets
+/// a host read an exception and then call back into JS without handing the
+/// engine an exception it has dealt with.
 pub struct TryCatch {
     isolate: *mut Isolate,
+    /// What this handler caught, moved out of the isolate's slot the first time
+    /// the handler is asked. A handler keeps the first one it caught until it is
+    /// reset, the same way V8's does.
+    caught: RefCell<Option<Value>>,
+    /// The exception that was pending when this handler was opened, which is its
+    /// parent's and comes back when this one is done.
     saved: Option<Value>,
     rethrown: Cell<bool>,
 }
@@ -24,6 +36,7 @@ impl TryCatch {
         let saved = isolate.pending_exception.borrow_mut().take();
         Self {
             isolate: isolate as *mut Isolate,
+            caught: RefCell::new(None),
             saved,
             rethrown: Cell::new(false),
         }
@@ -34,42 +47,78 @@ impl TryCatch {
         self.isolate
     }
 
-    /// Whether a pending exception is set (v8::TryCatch::HasCaught).
+    /// The handler's view of the isolate.
+    fn isolate_ref(&self) -> &Isolate {
+        // SAFETY: the isolate outlives the handler, which was made from it.
+        unsafe { &*self.isolate }
+    }
+
+    /// The exception this handler owns, moving the isolate's pending one into it
+    /// on the first ask.
+    fn caught(&self) -> Option<Value> {
+        let mut caught = self.caught.borrow_mut();
+        if caught.is_none()
+            && let Some(pending) = self.isolate_ref().pending_exception()
+        {
+            *caught = Some(pending);
+            self.isolate_ref().take_pending_exception();
+        }
+        *caught
+    }
+
+    /// Whether an exception was caught (v8::TryCatch::HasCaught).
     pub fn has_caught(&self) -> bool {
-        unsafe { &*self.isolate }.has_pending_exception()
+        self.caught().is_some()
     }
 
     /// Whether the isolate is terminating an execution
     /// (v8::TryCatch::HasTerminated).
     pub fn has_terminated(&self) -> bool {
-        unsafe { &*self.isolate }.is_execution_terminating()
+        self.isolate_ref().is_execution_terminating()
     }
 
-    /// The caught exception value, if set (v8::TryCatch::Exception).
+    /// The caught exception value, if any (v8::TryCatch::Exception).
     pub fn exception(&self) -> Option<Local> {
-        unsafe { &*self.isolate }.pending_exception().map(Local)
+        self.caught().map(Local)
     }
 
-    /// ReThrow: mark the caught exception to stay pending after this
-    /// TryCatch is dropped (v8::TryCatch::ReThrow).
+    /// ReThrow: hand the caught exception back to the isolate so the handler
+    /// around this one catches it (v8::TryCatch::ReThrow).
     pub fn rethrow(&self) {
         self.rethrown.set(true);
+        if let Some(caught) = self.caught() {
+            self.isolate_ref().set_pending_exception(caught);
+        }
     }
 
-    /// Reset: clear the caught exception (v8::TryCatch::Reset).
+    /// Reset: drop the caught exception (v8::TryCatch::Reset).
     pub fn reset(&self) {
-        unsafe { &*self.isolate }.take_pending_exception();
+        *self.caught.borrow_mut() = None;
+        self.isolate_ref().take_pending_exception();
     }
 }
 
 impl Drop for TryCatch {
     fn drop(&mut self) {
-        let isolate = unsafe { &*self.isolate };
-        if self.rethrown.get() {
+        let saved = self.saved.take();
+        let caught = self.caught.take();
+        let rethrown = self.rethrown.get();
+        let isolate = self.isolate_ref();
+        if rethrown {
+            // Whatever is pending propagates. A rethrow that this handler's
+            // `caught` slot still holds (because nothing read it before the
+            // rethrow) goes back too, so the handler around this one sees it.
+            if let Some(caught) = caught
+                && !isolate.has_pending_exception()
+            {
+                isolate.set_pending_exception(caught);
+            }
             return;
         }
+        // Not rethrown: what it caught is swallowed, and the exception that was
+        // pending before it was opened comes back.
         isolate.take_pending_exception();
-        if let Some(saved) = self.saved.take() {
+        if let Some(saved) = saved {
             isolate.set_pending_exception(saved);
         }
     }

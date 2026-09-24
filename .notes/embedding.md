@@ -4206,11 +4206,21 @@ by this filter — `test_op_detached_buffer` (`runtime::tests::ops`), a detached
 test the earlier narrower filters never matched; it is not this part's and is recorded as
 newly seen.
 
-*Still to do on this item, named so the next reader does not re-derive it:* the bridge's
-`Message::get` must answer the thrown error's stack (its `name: message` header plus the
-frames this record now produces) instead of `Uncaught <value>`, which is what both
-remaining failures in the cluster wait on.
+*Still to do on this item, and the first guess at it was wrong.* The next step recorded
+here was that the bridge's `Message::get` must answer the error's stack. **It must not:**
+that method is V8's `Uncaught %` rendering, cited to `MessageHandler::GetMessage`, and the
+bridge's own tests pin it — changing it turned two of them red, and the change was
+reverted. What the two failures actually wait on is `Error.prepareStackTrace`: deno's
+expected `TypeError: ...\n    at <anonymous>:4:7` is its `JsError` rendering *its own*
+`message` plus the frames it read out of `#callSiteEvals`, and that array is populated by
+the JS `prepareStackTrace(error, callSites)` hook V8 calls when `.stack` is first
+accessed — a hook this engine does not have (it serves `stack` from its own accessor,
+`%Error.prototype.stack%`), so deno's frames come out empty. The positions and names this
+record added are the data that hook needs; what is missing is the hook plus the
+call-site objects it passes. Measured with the `Message` change in place and with it
+reverted, the failure is identical, which is what isolated it.
 
+## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
 — `target.clone()` on a `Value`, which is `Copy`; `cargo test --locked --workspace`
@@ -4223,6 +4233,125 @@ certified call: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 
 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce theirs (core **20,662**,
 the seven proposal suites, **64,594 / 0 fail / 0 pending**, js-api **1,001 tests, 0
 fail**). Runtime `--lib` **905** with the workspace's features on.
+
+*`Error.captureStackTrace`'s frame selection — §9's bullet that named it, and the half
+of the stack work the deno failures actually waited on.* One line was wrong, and it was
+not the frames:
+
+- `define_stack`'s named-constructor limit stopped at the constructor while walking the
+  contexts innermost-first, so `Error.captureStackTrace(target, ctor)` kept the
+  builder's own frames and dropped every caller — the inverse of V8, where the callers
+  are the frames the limit exists to keep. The loop now skips until the name is met and
+  keeps everything older; the named frame goes with the skipped ones, and a name that is
+  not on the stack omits every frame, the same rule read to its end.
+- `capture_stack_trace`'s doc still said the argument was **ignored**, which the frames
+  part had already stopped being true of; the doc now states the limit V8 states, and
+  the comment on the loop states which end is dropped and why the walk direction makes
+  it a skip rather than a stop.
+
+*Tests — the engine test reversed, the bridge probe kept.*
+`capture_stack_trace_hides_the_frames_above_the_named_constructor` replaces
+`capture_stack_trace_strips_from_the_named_constructor_outward`, which pinned the
+inverted reading (`Error: x`, nothing left): it now asserts both cases by frame count and
+shape — without a constructor, the header plus `inner`, `outer` and the script; with
+`inner` named, the same three lines *minus* `inner`, its callers intact. Two mutations,
+each caught: restoring the `break` at the named frame fails it with `Error: x` where
+three lines are asserted, and rendering the named frame (dropping the `continue` after
+the match) fails it with `at inner:1:46` present and four lines. The bridge probe that
+isolated the native path became
+`a_natively_built_error_carries_the_frame_it_was_made_in` in `crates/v8/exception.rs`:
+an error built through `Exception::error`, re-parented onto `TypeError.prototype` and
+given an own `name` — deno's `build_js_error_class_exception` step for step — carries the
+frame it was made in. It asserts the frame and not the header, because V8 formats the
+header when `.stack` is read and this engine captures it (the open item §9 records).
+
+*The measurement.* deno's `test_op_bool_to_from_v8_error` **passes**: its exact-match
+assertion (`TypeError: …` then `    at <anonymous>:4:7`) is met by the error's own stack,
+with no `prepareStackTrace`, no `#callSiteEvals` and no `Message` change — the previous
+record's first guess at this item was both wrong and unnecessary. `runtime::ops::tests`
+re-runs whole at **44 passed / 0 failed** (43/1 before, the failure being that test). The
+other three the last record named still fail, and the full `deno_core --lib` suite is
+**426 passed / 33 failed** — the 33 were not counted before this part, and are feature
+gaps rather than this change's: `webidl`'s `sequence` converters, `uv_compat`'s pipe
+busy-retry, `queueMicrotask`, the timer return protocol, stalled top-level await, the
+inspector, source maps, code cache, and `test_set_format_exception_callback_realms`
+(ours answers `Uncaught Error: main_realm`, the test's callback wants
+`main_realm / Error: main_realm`, so the realm's format-exception callback is not
+consulted). `test_dynamic_import_module_error_stack` now reads
+`Uncaught (in promise) TypeError: foo` with no frame line, so its remaining gap is the
+async/module frame rendering (`at async file:///import.js:1:43`), not the skip.
+`test_op_detached_buffer` is unrelated to stacks: its op receives `undefined` arguments
+(`Invalid a3: undefined, undefined`).
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean after it caught the new test's `mut rv` (the bridge's
+`ReturnValue::set` does not need it); `cargo test --locked --workspace` green — runtime
+`--lib` **905**, crux **249**, v8 **243**. Both corpora re-run: test262 `all` reproduces
+its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and
+the wasm sweeps reproduce theirs (core **20,662**; the seven proposal suites **64,594 / 0
+fail / 0 pending**; js-api **1,001 tests, 0 fail**).
+
+*The handler owns the exception it caught — §9's bullet that named it, and the second
+half of what the format-exception callback waits on.* V8's `TryCatch` is a handler: the
+throw moves the exception out of the isolate and the handler keeps it, which is why
+`HasCaught`/`Exception` answer from the handler while the isolate is already clear.
+This engine's `api::TryCatch` took only the exception that was pending when it was
+*opened* (so a nested handler does not see its parent's) and then answered
+`has_caught`/`exception` from the isolate's slot, leaving it there — so a host that had
+caught and read an exception still held a live pending one:
+
+- `TryCatch` gains `caught: RefCell<Option<Value>>`, and `caught()` moves the isolate's
+  pending exception into it on the first ask; `has_caught` and `exception` answer from
+  it, so a handler keeps the first exception it caught, the way V8's does.
+- `rethrow` writes the caught exception back into the isolate — which is what
+  `a_rethrown_exception_stays_pending` observes *inside* the handler — and `Drop` puts
+  it back if nothing else did, so a rethrow that was never read still propagates.
+- `reset` drops it, and `Drop` still restores the exception that was pending when the
+  handler was opened.
+
+*How it was found, in three links — the third is the one that mattered.* deno's
+`execute_script` reads `tc_scope.exception()` and then calls the realm's format-exception
+callback from Rust, and that callback calls an op. (1) A single temporary `eprintln!` in
+the scratch checkout (`PROBE cb absent=false`, `PROBE cb call returned_some=false`),
+reverted immediately, put the failure *inside* the call rather than in the lookup, which
+killed the first guess (the realm's state or the context's embedder-data slot). (2)
+Bridge probes ruled out the mechanisms on their own: a host→JS→host call with an arrow
+calling a host callback returns its string when nothing is pending, and `try_cast::<String>`
+plus `write_utf8_into` handle every string shape a template literal produces. (3) The same
+call with the caught exception still in the slot returns `None`, and asking the engine
+directly (`realm.try_call`) names it: `Err(JsError { kind: TypeError, message: "exception
+thrown by host callback" })` — from `run_callback`, which takes any pending exception
+after a host callback as the callback's own throw. That is a symptom of the handler not
+owning what it caught, not a defect of its own; §9 names it as the remaining divergence,
+unfixed.
+
+*Tests — one engine, one bridge, one mutation.*
+`a_handler_owns_the_exception_it_caught` (`crates/runtime/src/api/mod.rs`) pins the V8
+contract: after a throw inside the handler, reading the exception leaves
+`isolate.has_pending_exception()` false, a second ask still answers it, and `reset` drops
+it. `a_host_call_after_a_handler_read_the_exception_reaches_the_callbacks_result`
+(`crates/v8/scope.rs`) is deno's shape end to end: throw inside a `tc_scope`, read the
+exception, then call a JS arrow that calls a host callback and returns a template
+literal — the string must come back. One mutation, caught by both: not taking the
+exception out of the isolate fails the engine test on "reading it handed it to the
+handler" and the bridge test with `left: None` where the string is expected, which is
+exactly the deno failure's shape.
+
+*The measurement.* deno's `test_set_format_exception_callback_realms` **passes** — both
+halves of it, the immediate throw and the promise rejection, whose expected strings are
+the callback's own formatting (`main_realm / Error: main_realm`, prefixed with `Uncaught
+(in promise)` on the rejection). The whole `deno_core --lib` suite goes **426 passed / 33
+failed → 427 passed / 32 failed**: exactly one test flipped and none regressed (the
+totals sum to the same 459). The 32 that remain are the feature gaps the previous record
+listed, minus this one.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean; `cargo test --locked --workspace` green — runtime
+`--lib` **906**, crux **249**, v8 **244**. Both corpora re-run, because the pending-exception
+slot is on every wasm entry and every host callback: test262 `all` reproduces its baseline
+exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps
+reproduce theirs (core **20,662**; the seven proposal suites **64,594 / 0 fail / 0
+pending**; js-api **1,001 tests, 0 fail**).
 
 ## 8. Parked: the C++ face
 
@@ -6773,6 +6902,86 @@ measurement
 between this and a `deno` binary, and
 deno's own runtime gaps (`queueMicrotask` among them) sit behind that; (4)
 migrate, then delete.
+- **`Error.captureStackTrace`'s second argument strips the wrong end of the
+  stack — named here before the edit, and landed.** V8 omits "all frames above
+  `constructorOpt`, including `constructorOpt`" — above meaning *newer*, the
+  frames the builder added on top of its caller — so the callers remain, which
+  is the whole point of the idiom: a host passes its own builder so the caller's
+  frame is what the error reports. `define_stack` walked
+  `execution_context_stack` innermost-first and **broke** at the named frame, so
+  it dropped that constructor's frame *and every caller*, keeping exactly the
+  builder internals V8 hides — the direction was inverted, and the test that
+  pinned it (`capture_stack_trace_strips_from_the_named_constructor_outward`)
+  is renamed
+  (`capture_stack_trace_hides_the_frames_above_the_named_constructor`,
+  `crates/runtime/src/builtins/error.rs:966`) and asserts the V8 direction
+  instead. Measured with a probe script run through the CLI, deno's own builder
+  shape: `Error.captureStackTrace(e, buildCustomError)` left `e.stack` at its
+  one-line header (`TypeError: boom`) where V8 reports the frames of `outer` and
+  the script. It explains deno's `test_op_bool_to_from_v8_error` exactly: the op
+  error is built by `to_v8_error`'s JS `buildCustomError` (`deno/libs/core/error.rs:395`),
+  whose `ErrorCaptureStackTrace(error, buildCustomError)` therefore left a
+  header-only stack, so deno's `JsError` `Display`
+  (`deno/libs/core/error.rs:1362`) never reached the `if stack.lines() > 1` arm
+  and fell to `exception_message` (`Uncaught …`) — the stack that already
+  carried `at <anonymous>:4:7` was one line short of being used, and nothing was
+  missing from the engine's frame data. A name that is not on the stack omits
+  every frame, which is the same rule read to its end; no test pins that edge,
+  because V8's answer there was read from the rule rather than measured. §7's
+  record has the fix and its measurement.
+- **The stack's header is captured, not formatted — measured, not yet fixed.**
+  V8's `%Error.prototype.stack%` formats when the property is read, so
+  `e.name = 'TypeError'` after construction changes what `e.stack` prints; this
+  engine's `define_stack` writes the whole string at construction, header
+  included, and `stack_getter` serves it verbatim. Measured through the bridge:
+  an error built by `v8::Exception::error` and then re-parented onto
+  `TypeError.prototype` with an own `name` reports `Error: …` where V8 reports
+  `TypeError: …`. It is not what the three failing deno tests wait on (both go
+  through the JS builder, which sets the name before the capture), so it is
+  named here and left for its own change. The probe that found it stays in
+  `crates/v8/exception.rs` as
+  `a_natively_built_error_carries_the_frame_it_was_made_in`, which asserts the
+  frame and deliberately not the header, so the header part can move without
+  rewriting it.
+- **A caught exception lives in the handler, not in the isolate's slot — named
+  here before the edit.** In V8 a `TryCatch` is a *handler*: when a throw
+  propagates to it the exception is moved out of the isolate and the handler
+  owns it, which is why `TryCatch::HasCaught`/`Exception` answer from the handler
+  and `Isolate::has_pending_exception` is already false. This engine's
+  `api::TryCatch` takes only the exception that was pending *when it was opened*
+  (`saved`, so a nested handler does not see its parent's), then answers
+  `has_caught`/`exception` from the isolate's slot and leaves it there — so a
+  host that has caught and *read* an exception still holds a live pending one.
+  Measured, this is what deno's `test_set_format_exception_callback_realms` waits
+  on, and the chain is three links, each isolated: deno's `execute_script` reads
+  `tc_scope.exception()` and then calls the realm's JS format-exception callback
+  from Rust while that exception is still pending; the callback calls an op; the
+  bridge's `run_callback` (`crates/runtime/src/api/template.rs:724`) takes *any*
+  pending exception after a host callback as the callback's own throw
+  (`"exception thrown by host callback"`), so the callback's call reports
+  failure and deno falls back to its default formatting. Probed at the bridge
+  (a host→JS call whose body calls a host callback): it returns the string when
+  nothing is pending and `RETURNED NONE` with `Err(TypeError, "exception thrown
+  by host callback")` when the same call is made with the caught exception still
+  in the slot — with the callback body provably having run, since the op printed.
+  Deno's own instrumentation-free reading of the same case
+  (`PROBE cb absent=false` / `PROBE cb call returned_some=false`, taken in the
+  scratch checkout and reverted) is what put the failure *inside* the call rather
+  rather than in the lookup. So the handler gains the captured value, `has_caught`
+  and `exception` answer from it after moving it out of the isolate, `rethrow` puts
+  it back, and `reset` drops it. **Landed** — §7's record has the change and its
+  measurement, and it is what took deno's suite from 426/33 to **427/32**.
+- **A host callback is blamed for an exception it did not throw — measured
+  while the above was being diagnosed, not fixed.** `run_callback`
+  (`crates/runtime/src/api/template.rs:724`) takes *any* pending exception after a
+  host callback as that callback's own throw, substituting
+  `TypeError: exception thrown by host callback` for whatever was there. A host
+  that calls into JS while it holds (or has rethrown) an exception therefore has
+  the original destroyed and replaced by a synthetic TypeError. V8 keeps the
+  original: its `Function::Call` answers `Nothing` because an exception is
+  pending, and the exception is the one that was already there. Narrow now that
+  the handler owns what it caught, and named here rather than widened into the
+  change above.
 
 ## 11. Working rules
 

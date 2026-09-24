@@ -616,6 +616,36 @@ mod tests {
         assert!(!isolate.has_pending_exception());
     }
 
+    /// A handler owns what it caught: asking for the exception moves it out of
+    /// the isolate's slot, so a host that has read (and dealt with) an exception
+    /// can call back into JS without the engine still holding it. V8's handler
+    /// does the same, and deno's error path depends on it: it reads the caught
+    /// exception and then calls the realm's format-exception callback.
+    #[test]
+    fn a_handler_owns_the_exception_it_caught() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        {
+            let try_catch = TryCatch::new(&mut isolate);
+            let result = context.eval("throw new Error('boom')");
+            assert!(result.is_empty());
+            assert!(try_catch.has_caught());
+            let caught = try_catch.exception().expect("the caught exception");
+            assert!(caught.is_object());
+            assert!(
+                !isolate.has_pending_exception(),
+                "reading it handed it to the handler"
+            );
+            assert!(
+                try_catch.exception().is_some(),
+                "and the handler still answers it"
+            );
+            try_catch.reset();
+            assert!(!try_catch.has_caught(), "a reset drops it");
+        }
+        assert!(!isolate.has_pending_exception());
+    }
+
     #[test]
     fn rethrow_keeps_the_exception_pending() {
         let mut isolate = isolate();

@@ -102,4 +102,50 @@ mod tests {
             assert_eq!(exception.to_rust_string_lossy(scope), "TypeError: boom");
         });
     }
+
+    /// The error deno's fast path throws is built entirely through this crate —
+    /// `v8::Exception::error`, the prototype re-parented onto
+    /// `TypeError.prototype`, an own `name` — and deno reads the stack back off
+    /// it. The stack is a real capture, so it carries the frame the error was
+    /// made in; the header is not asserted because V8 formats it when `.stack`
+    /// is read (see §9's open item on that).
+    #[test]
+    fn a_natively_built_error_carries_the_frame_it_was_made_in() {
+        use crate::data::{Object, Value};
+        use crate::function::{FunctionCallbackArguments, ReturnValue};
+        use crate::test_support::{bind, eval, in_context};
+        use crate::{Function, Local};
+
+        const MESSAGE: &str = "expected type `v8::data::Boolean`, got `v8::data::Value`";
+
+        fn build<'s>(
+            scope: &mut crate::scope::PinScope<'s, '_>,
+            _args: FunctionCallbackArguments<'s>,
+            rv: ReturnValue<'s>,
+        ) {
+            let mut isolate = scope.isolate_ptr();
+            let exception =
+                runtime::api::Exception::create_with(isolate.engine_mut(), "%Error%", MESSAGE)
+                    .expect("error");
+            let value: Local<Value> = Local::from_engine(exception);
+            let object = value.try_cast::<Object>().expect("object");
+            if let Some(prototype) = crate::realm_of(scope).intrinsic("%TypeError.prototype%") {
+                object.set_prototype(scope, Local::from_engine(prototype.into()));
+            }
+            let key = crate::data::String::new(scope, "name").expect("string");
+            let name = crate::data::String::new(scope, "TypeError").expect("string");
+            object.create_data_property(scope, key.into(), name.into());
+            rv.set(object.into());
+        }
+
+        in_context!(scope, {
+            let function = Function::builder(build).build(scope).expect("function");
+            bind(scope, "build", function.cast::<Value>());
+            let stack = eval(scope, "build().stack").to_rust_string_lossy(scope);
+            assert!(
+                stack.contains(MESSAGE) && stack.contains("\n    at <anonymous>:1:"),
+                "the message and the frame it was made in: {stack}"
+            );
+        });
+    }
 }

@@ -1177,6 +1177,52 @@ mod tests {
         });
     }
 
+    /// The shape deno's error path runs: an exception is caught and *read*, and
+    /// the host then calls a JS function whose body calls a host callback — the
+    /// realm's format-exception callback is an arrow that calls an op. Reading
+    /// the exception hands it to the handler, so the call that follows is not
+    /// made with one still pending, and the callback's string reaches the host.
+    /// A callback call made while the exception is still pending is reported as
+    /// the callback's own throw, which is why this is one test and not two.
+    #[test]
+    fn a_host_call_after_a_handler_read_the_exception_reaches_the_callbacks_result() {
+        use crate::Function;
+        use crate::Local;
+        use crate::data::Value;
+        use crate::function::{FunctionCallbackArguments, ReturnValue};
+        use crate::test_support::{bind, eval, in_context};
+
+        fn is_native_error(
+            scope: &mut crate::scope::PinScope<'_, '_>,
+            _args: FunctionCallbackArguments,
+            rv: ReturnValue,
+        ) {
+            rv.set(crate::data::Boolean::new(scope, true).into());
+        }
+
+        in_context!(scope, {
+            let op = Function::builder(is_native_error).build(scope).expect("op");
+            bind(scope, "isNativeError", op.cast::<Value>());
+            let callback = eval(
+                scope,
+                "(error) => { isNativeError(error); return `realm / ${error}`; }",
+            );
+            let callback: Local<crate::data::Function> = callback.try_cast().expect("function");
+            let this: Local<Value> = Local::from_engine(runtime::api::Local::undefined());
+
+            crate::tc_scope!(let caught, scope);
+            throw_a_test_error(caught);
+            assert!(caught.has_caught(), "the throw was caught");
+            let exception = caught.exception().expect("the caught exception");
+            let formatted = callback.call(caught, this, &[exception]);
+            assert_eq!(
+                formatted.map(|value| value.to_rust_string_lossy(caught)),
+                Some("realm / Error: boom".to_string()),
+                "the callback ran and its string came back"
+            );
+        });
+    }
+
     /// The pattern a host writes: pin the scope, init it, and hand it wherever a
     /// scope goes. It wraps the scope it was made from rather than replacing it,
     /// so everything reachable through the outer one stays reachable.
