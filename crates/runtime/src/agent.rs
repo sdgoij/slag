@@ -838,6 +838,12 @@ pub struct Agent {
     /// identity (read by the `%Error.prototype.stack%` accessor; the property
     /// itself is not an own data property, spec 20.5.3.4).
     pub error_stack: std::collections::HashMap<u64, ErrorStack>,
+    /// The promise the running reaction job's task belongs to — V8's
+    /// `current_microtask` as far as an async chain needs it
+    /// (`TryGetCurrentTaskPromise`): an await chain is walked from here, so a
+    /// stack captured inside a job can report the bodies waiting on it. Set for
+    /// the duration of a reaction job and restored after it.
+    pub current_task_promise: Option<Value>,
     /// The frames of each host stack-trace capture (v8::StackTrace), keyed by
     /// the *box address* of the object the capture handed back — that object
     /// exists so the entry has a liveness, and the collector's compaction hook
@@ -1334,6 +1340,7 @@ impl Agent {
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
             error_stack: std::collections::HashMap::new(),
+            current_task_promise: None,
             stack_traces: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm")]
             wasm_modules: std::collections::HashMap::new(),
@@ -1963,6 +1970,7 @@ impl Agent {
             text.trace(visit);
         }
         self.error_stack.trace(visit);
+        self.current_task_promise.trace(visit);
         // GC-4: WeakRef targets are held weakly — the table is deliberately
         // *not* traced, so a target dies unless reachable elsewhere (deref
         // then returns `undefined`; the compaction clears the entry). The

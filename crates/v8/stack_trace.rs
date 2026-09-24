@@ -189,6 +189,14 @@ impl<'s> LocalHandle<'s, StackFrame> {
         false
     }
 
+    /// Whether the frame is an *awaiting* one (v8::StackFrame::IsAsync): the
+    /// frame the engine appends for a suspended async body whose `await` the
+    /// capture climbed through. A frame the engine is running inside is `false`,
+    /// however async the function it belongs to.
+    pub fn is_async(&self) -> bool {
+        self.frame().is_some_and(|frame| frame.is_async)
+    }
+
     /// Whether the frame is the embedder's own JavaScript
     /// (v8::StackFrame::IsUserJavaScript).
     ///

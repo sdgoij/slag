@@ -1768,6 +1768,7 @@ fn execute_module_body(
                 .last()
                 .and_then(|context| context.position);
             module.stalled_await.replace(site);
+            crate::async_await::save_await_site(agent, &state);
             agent.execution_context_stack.pop();
             crate::async_await::attach_await(agent, &state, value)?;
         }

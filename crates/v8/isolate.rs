@@ -1846,12 +1846,13 @@ fn set_call_site_fields<'s>(
     set_call_site_field(scope, site, "isEval", is_eval.into())?;
     let is_constructor = crate::data::Boolean::new(scope, frame.is_constructor);
     set_call_site_field(scope, site, "isConstructor", is_constructor.into())?;
-    // Nothing in an execution context records these three, so a frame is never
-    // native, never async and never a `Promise.all` entry; V8 answers the same
-    // for code that is none of them.
+    // Nothing in an execution context records these two, so a frame is never
+    // native and never a `Promise.all` entry; V8 answers the same for code that
+    // is none of them. `isAsync` is the frame's own flag, which the engine sets
+    // only on the awaiting frames it appends for a suspended async body.
     let is_native = crate::data::Boolean::new(scope, false);
     set_call_site_field(scope, site, "isNative", is_native.into())?;
-    let is_async = crate::data::Boolean::new(scope, false);
+    let is_async = crate::data::Boolean::new(scope, frame.is_async);
     set_call_site_field(scope, site, "isAsync", is_async.into())?;
     let is_promise_all = crate::data::Boolean::new(scope, false);
     set_call_site_field(scope, site, "isPromiseAll", is_promise_all.into())?;
@@ -2074,7 +2075,7 @@ mod tests {
                 scope,
                 "globalThis.readSites = (sites) => sites.map((s) => \
                  [s.getFunctionName(), s.getFileName(), s.isToplevel(), s.isEval(), \
-                 s.getLineNumber()].map(String).join('|')).join(';');",
+                 s.getLineNumber(), s.isAsync()].map(String).join('|')).join(';');",
             );
             let stack = crate::test_support::eval(
                 scope,
@@ -2083,13 +2084,31 @@ mod tests {
             );
             let text = stack.to_rust_string_lossy(scope);
             assert!(
-                text.starts_with("inner|undefined|false|false|1;"),
+                text.starts_with("inner|undefined|false|false|1|false;"),
                 "the innermost frame answers each method for itself: {text}"
             );
             assert!(
-                text.ends_with("undefined|undefined|true|false|2"),
+                text.ends_with("undefined|undefined|true|false|2|false"),
                 "and the script's own top level is the outermost frame, unnamed \
                  and top level: {text}"
+            );
+            // The awaiting frame the engine appends for a suspended async body is
+            // the one frame marked async, which is what a formatter spells
+            // `at async <file>` from.
+            let _ = crate::test_support::eval(
+                scope,
+                "globalThis.asyncStack = '';\n\
+                 async function body() {\n\
+                 await Promise.resolve(1).then(() => { globalThis.asyncStack = new Error('boom').stack; });\n\
+                 }\n\
+                 body();",
+            );
+            scope.perform_microtask_checkpoint();
+            let sites = crate::test_support::eval(scope, "globalThis.asyncStack");
+            let text = sites.to_rust_string_lossy(scope);
+            assert!(
+                text.ends_with("body|undefined|false|false|3|true"),
+                "the awaiting body is the marked frame: {text}"
             );
         });
     }

@@ -471,6 +471,105 @@ mod tests {
         );
     }
 
+    /// A stack captured while a promise-reaction job is the current task carries
+    /// the frames of the async bodies waiting on that job's promise — V8's
+    /// `CaptureAsyncStackTrace`. The `.then` callback below throws while `body`
+    /// is suspended at its `await`, so the trace names `body` at the await it
+    /// came to rest at, and the frame is marked async.
+    #[test]
+    fn an_error_built_inside_a_job_carries_the_awaiting_frame() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let _ = context.eval(
+            "async function body() {\nawait Promise.resolve(1).then(() => { throw new TypeError('boom'); });\n}\nglobalThis.jobStack = '';\nbody().catch((error) => { globalThis.jobStack = error.stack; });",
+        );
+        isolate.run_microtasks().unwrap();
+        assert_eq!(
+            context
+                .eval("globalThis.jobStack")
+                .to_local_checked()
+                .as_string()
+                .as_deref(),
+            Some("TypeError: boom\n    at <anonymous>:2:45\n    at async body:2:1"),
+            "the awaiting body is named, at its await"
+        );
+    }
+
+    /// The chain climbs: each suspended body the walk passes is a frame, so a
+    /// body awaited by a body awaited by the failing one reports all three, the
+    /// awaiting ones marked async.
+    #[test]
+    fn an_awaiting_chain_carries_every_suspended_body() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let _ = context.eval(
+            "async function inner() {\nawait Promise.resolve(1).then(() => { throw new TypeError('boom'); });\n}\nasync function outer() {\nawait inner();\n}\nglobalThis.jobStack = '';\nouter().catch((error) => { globalThis.jobStack = error.stack; });",
+        );
+        isolate.run_microtasks().unwrap();
+        assert_eq!(
+            context
+                .eval("globalThis.jobStack")
+                .to_local_checked()
+                .as_string()
+                .as_deref(),
+            Some(
+                "TypeError: boom\n    at <anonymous>:2:45\n    at async inner:2:1\n    at async outer:5:1"
+            ),
+            "every suspended body is a frame, outermost last"
+        );
+    }
+
+    /// A job whose promise nothing awaits has no chain to climb, so its stack is
+    /// the synchronous frames alone: the walk stops at the first promise that is
+    /// not one an `await` is attached to.
+    #[test]
+    fn a_job_no_body_awaits_carries_no_awaiting_frame() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let _ = context.eval(
+            "globalThis.jobStack = '';\nPromise.resolve(1).then(() => { globalThis.jobStack = new TypeError('boom').stack; });",
+        );
+        isolate.run_microtasks().unwrap();
+        let stack = context
+            .eval("globalThis.jobStack")
+            .to_local_checked()
+            .as_string()
+            .unwrap_or_default();
+        assert!(
+            !stack.contains("async"),
+            "no body awaits the callback's promise: {stack}"
+        );
+        assert_eq!(
+            stack.lines().count(),
+            2,
+            "the synchronous frames alone: {stack}"
+        );
+    }
+
+    /// A promise an `await` shares with an ordinary `then` is not a chain either:
+    /// V8 follows a promise only when the one reaction on it is the await's
+    /// (`reaction->next()` must be a Smi), and `d8` reports the throw's own frame
+    /// and nothing else for this shape. The await's reaction is attached first
+    /// here, so it is the one a walk that ignored the count would follow.
+    #[test]
+    fn a_promise_an_ordinary_then_shares_carries_no_awaiting_frame() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let _ = context.eval(
+            "globalThis.jobStack = '';\nconst derived = Promise.resolve(1).then(() => { throw new TypeError('boom'); });\nasync function body() { await derived; }\nbody().catch(() => {});\nderived.then(() => {});\nderived.catch((error) => { globalThis.jobStack = error.stack; });",
+        );
+        isolate.run_microtasks().unwrap();
+        let stack = context
+            .eval("globalThis.jobStack")
+            .to_local_checked()
+            .as_string()
+            .unwrap_or_default();
+        assert!(
+            !stack.contains("async"),
+            "the await is not the only reaction on the promise: {stack}"
+        );
+    }
+
     #[test]
     fn eval_returns_the_completion_value() {
         let mut isolate = isolate();

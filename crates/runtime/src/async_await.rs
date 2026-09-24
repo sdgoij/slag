@@ -266,6 +266,7 @@ pub fn call_async_function(
                     settle_async_completion(agent, &state, completion)?;
                 }
                 VmOutcome::Suspended(Suspension::Await(value)) => {
+                    save_await_site(agent, &state);
                     agent.execution_context_stack.pop();
                     attach_await(agent, &state, value)?;
                 }
@@ -296,6 +297,24 @@ pub fn call_async_function(
             }
         }
     })()
+}
+
+/// Keep where a suspension came to rest on the state's own context.
+///
+/// The site is published on the *running* context (`Vm::set_site` — the `Step::Await`
+/// lowering stamps its span), which is the frame that is about to be popped, so
+/// without this the position would be dropped with it. V8 reads the same thing
+/// back off the suspended generator object when it appends an async frame
+/// (`GetGeneratorBytecodeOffset`), so a body's awaiting frame reports the await
+/// it is at.
+pub(crate) fn save_await_site(agent: &Agent, state: &Rc<RefCell<AsyncFunctionState>>) {
+    if let Some(position) = agent
+        .execution_context_stack
+        .last()
+        .and_then(|c| c.position)
+    {
+        state.borrow_mut().context.position = Some(position);
+    }
 }
 
 /// Attach the Await reactions (spec 27.6.3.1): resume the VM on fulfillment
@@ -390,6 +409,7 @@ fn resume_async(
             state.vm.run_abrupt(agent, &body, resume)
         }
     };
+    save_await_site(agent, &state);
     agent.execution_context_stack.pop();
     let outcome = match outcome {
         Ok(outcome) => outcome,

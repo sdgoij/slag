@@ -571,45 +571,77 @@ fn enqueue_reaction_job(
     argument: Value,
 ) {
     let realm = agent.current_realm().ok();
+    // V8's `TryGetCurrentTaskPromise` is computed before the job runs, from the
+    // reaction this job carries: an async chain walk starts at this promise.
+    let task_promise = reaction_task_promise(agent, &reaction);
     agent.enqueue_promise_job(realm, move |agent| {
-        run_promise_hook(agent, PromiseHookKind::Before, &promise, None)?;
-        let handler_result = match &reaction.handler {
-            Some(callback) => crate::job::host_call_job_callback_agent(
-                agent,
-                callback,
-                Value::Undefined,
-                std::slice::from_ref(&argument),
-            ),
-            None => match reaction.kind {
-                ReactionKind::Fulfill => Ok(argument),
-                ReactionKind::Reject => Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "Unhandled promise rejection".into(),
-                )
-                .with_value(argument)),
-            },
-        };
-        // V8 fires the after hook from the job's epilogue, whatever the handler
-        // did — the settlement below is the job's own tail, not the handler's.
-        run_promise_hook(agent, PromiseHookKind::After, &promise, None)?;
-        if let Some(capability) = &reaction.capability {
-            match handler_result {
-                Ok(value) => {
-                    crate::function::call(agent, &capability.resolve, Value::Undefined, &[value])?;
-                }
-                Err(error) => {
-                    let rejection = error_value(agent, &error);
-                    crate::function::call(
-                        agent,
-                        &capability.reject,
-                        Value::Undefined,
-                        &[rejection],
-                    )?;
-                }
+        let saved = agent.current_task_promise;
+        agent.current_task_promise = task_promise;
+        let result = run_reaction_job(agent, promise, &reaction, argument);
+        agent.current_task_promise = saved;
+        result
+    });
+}
+
+/// The promise the running reaction job's task belongs to
+/// (`TryGetCurrentTaskPromise`, `v8/src/execution/isolate.cc:1453`). A job whose
+/// handler *is* an await continuation — the engine registers those in
+/// `async_resume` — belongs to the suspended body's own promise; any other job
+/// belongs to the promise the reaction's capability derived. `None` for a
+/// reaction with neither, which is where V8's walk has no promise to start at.
+fn reaction_task_promise(agent: &Agent, reaction: &PromiseReaction) -> Option<Value> {
+    if let Some(callback) = &reaction.handler
+        && let ValueKind::Function(function) = callback.callback.kind()
+        && let Some(resume) = agent.async_resume.get(&function.id())
+    {
+        return Some(resume.state.borrow().promise);
+    }
+    reaction
+        .capability
+        .as_ref()
+        .map(|capability| capability.promise)
+}
+
+/// One reaction job's work, so that the task promise around it is set and
+/// restored in one place whatever the handler does.
+fn run_reaction_job(
+    agent: &mut Agent,
+    promise: Value,
+    reaction: &PromiseReaction,
+    argument: Value,
+) -> Result<Value, JsError> {
+    run_promise_hook(agent, PromiseHookKind::Before, &promise, None)?;
+    let handler_result = match &reaction.handler {
+        Some(callback) => crate::job::host_call_job_callback_agent(
+            agent,
+            callback,
+            Value::Undefined,
+            std::slice::from_ref(&argument),
+        ),
+        None => match reaction.kind {
+            ReactionKind::Fulfill => Ok(argument),
+            ReactionKind::Reject => Err(JsError::new(
+                ErrorKind::TypeError,
+                "Unhandled promise rejection".into(),
+            )
+            .with_value(argument)),
+        },
+    };
+    // V8 fires the after hook from the job's epilogue, whatever the handler
+    // did — the settlement below is the job's own tail, not the handler's.
+    run_promise_hook(agent, PromiseHookKind::After, &promise, None)?;
+    if let Some(capability) = &reaction.capability {
+        match handler_result {
+            Ok(value) => {
+                crate::function::call(agent, &capability.resolve, Value::Undefined, &[value])?;
+            }
+            Err(error) => {
+                let rejection = error_value(agent, &error);
+                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
             }
         }
-        Ok(Value::Undefined)
-    });
+    }
+    Ok(Value::Undefined)
 }
 
 /// NewPromiseResolveThenableJob (spec 27.2.1.8): call the thenable's `then`

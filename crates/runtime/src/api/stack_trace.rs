@@ -99,6 +99,11 @@ pub struct StackFrame {
     pub is_eval: bool,
     pub is_constructor: bool,
     pub is_wasm: bool,
+    /// Whether the frame is an *awaiting* one: the frame V8 appends for a
+    /// suspended async body the chain climbs through
+    /// (v8::StackFrame::IsAsync). A frame the engine is running inside is never
+    /// one, however async the function it belongs to.
+    pub is_async: bool,
     pub is_user_javascript: bool,
 }
 
@@ -190,6 +195,7 @@ fn frame_of(agent: &Agent, context: &ExecutionContext) -> StackFrame {
         is_eval: false,
         is_constructor: false,
         is_wasm: false,
+        is_async: false,
         is_user_javascript: true,
     }
 }

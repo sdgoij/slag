@@ -609,44 +609,16 @@ fn define_stack(
             up_to = None;
             continue;
         }
-        let function_name = context
-            .function
-            .as_ref()
-            .and_then(|function| match function.kind() {
-                ValueKind::Function(f) => crate::api::stack_trace::function_name(&f),
-                _ => None,
-            });
-        // The code the frame runs: a module names the name its host gave it, a
-        // script its origin's name when it has one, and a call the code its
-        // callee was created in — the same rule the host-facing frame view
-        // answers (`api::stack_trace`), so a call site and this line agree.
-        let file = crate::api::stack_trace::script_name(agent, context);
-        let site = crate::api::stack_trace::frame_site(context);
-        // The line the trace shows: the frame's own name, `<anonymous>` when its
-        // function has none (a module's top level among them), then the site in
-        // parentheses when there is one.
-        let label = function_name
-            .clone()
-            .unwrap_or_else(|| "<anonymous>".into());
-        let at = match (site, file.as_deref()) {
-            (Some((line, column)), Some(file)) => format!("{label} ({file}:{line}:{column})"),
-            (Some((line, column)), None) => format!("{label}:{line}:{column}"),
-            (None, Some(file)) => format!("{label} ({file})"),
-            (None, None) => label,
-        };
-        lines.push(format!("    at {at}"));
-        frames.push(crate::api::StackFrame {
-            function_name,
-            script_name: file,
-            line: site.map(|(line, _)| line).unwrap_or(0),
-            column: site.map(|(_, column)| column).unwrap_or(0),
-            // Nothing in an execution context records these; the frame view's
-            // header states each one as a tier rather than a gap.
-            is_eval: false,
-            is_constructor: false,
-            is_wasm: false,
-            is_user_javascript: true,
-        });
+        let (line, frame) = frame_line(agent, context, false);
+        lines.push(line);
+        frames.push(frame);
+    }
+    // V8's `CaptureAsyncStackTrace`: a stack captured while a promise-reaction
+    // job is the current task carries the awaiting frames of the chain that job
+    // settles, so an error a host builds inside a job still names the async body
+    // whose `await` it belongs to.
+    if let Some(task_promise) = agent.current_task_promise {
+        push_async_frames(agent, task_promise, &mut lines, &mut frames);
     }
     agent.error_stack.insert(
         object.id(),
@@ -656,6 +628,142 @@ fn define_stack(
         },
     );
     Ok(())
+}
+
+/// One frame's rendered line and its host-facing record — the same rule for a
+/// frame the engine is running inside and for the awaiting frame the async walk
+/// appends, which differs only in the `async` a reader sees.
+fn frame_line(
+    agent: &Agent,
+    context: &crate::context::ExecutionContext,
+    is_async: bool,
+) -> (String, crate::api::StackFrame) {
+    let function_name = context
+        .function
+        .as_ref()
+        .and_then(|function| match function.kind() {
+            ValueKind::Function(f) => crate::api::stack_trace::function_name(&f),
+            _ => None,
+        });
+    // The code the frame runs: a module names the name its host gave it, a
+    // script its origin's name when it has one, and a call the code its
+    // callee was created in — the same rule the host-facing frame view
+    // answers (`api::stack_trace`), so a call site and this line agree.
+    let file = crate::api::stack_trace::script_name(agent, context);
+    let site = crate::api::stack_trace::frame_site(context);
+    // The line the trace shows: the frame's own name, `<anonymous>` when its
+    // function has none (a module's top level among them), then the site in
+    // parentheses when there is one.
+    let label = function_name
+        .clone()
+        .unwrap_or_else(|| "<anonymous>".into());
+    let at = match (site, file.as_deref()) {
+        (Some((line, column)), Some(file)) => format!("{label} ({file}:{line}:{column})"),
+        (Some((line, column)), None) => format!("{label}:{line}:{column}"),
+        (None, Some(file)) => format!("{label} ({file})"),
+        (None, None) => label,
+    };
+    let line = if is_async {
+        format!("    at async {at}")
+    } else {
+        format!("    at {at}")
+    };
+    (
+        line,
+        crate::api::StackFrame {
+            function_name,
+            script_name: file,
+            line: site.map(|(line, _)| line).unwrap_or(0),
+            column: site.map(|(_, column)| column).unwrap_or(0),
+            // Nothing in an execution context records these; the frame view's
+            // header states each one as a tier rather than a gap.
+            is_eval: false,
+            is_constructor: false,
+            is_wasm: false,
+            is_async,
+            is_user_javascript: true,
+        },
+    )
+}
+
+/// How many awaiting frames one capture may append. V8 stops when its frame
+/// limit is reached; a chain is acyclic by construction (each step is a body
+/// that has not resumed), so the bound is a guard rather than a rule.
+const MAX_ASYNC_FRAMES: usize = 8;
+
+/// The awaiting frames of the chain `task_promise` belongs to (V8's
+/// `CaptureAsyncStackTrace`): while a promise is pending with the single pair of
+/// reactions one `await` attached, the body suspended on it is a frame — sited
+/// at the `await` it came to rest at and marked async — and the chain continues
+/// with the promise that body returned.
+fn push_async_frames(
+    agent: &Agent,
+    task_promise: Value,
+    lines: &mut Vec<String>,
+    frames: &mut Vec<crate::api::StackFrame>,
+) {
+    let mut promise = task_promise;
+    for _ in 0..MAX_ASYNC_FRAMES {
+        let Some(state) = awaiting_body(agent, promise) else {
+            return;
+        };
+        let context = state.borrow().context.clone();
+        let (line, frame) = frame_line(agent, &context, true);
+        lines.push(line);
+        frames.push(frame);
+        promise = state.borrow().promise;
+    }
+}
+
+/// The body suspended on `promise`, when it is one V8's walk follows: still
+/// pending, with the one fulfill-and-reject pair an `await` attaches — its
+/// reactions are the engine's await continuation, registered in
+/// `async_resume`. `None` for a promise that settled, for one an ordinary `then`
+/// also reacted to, and for one nothing awaits.
+fn awaiting_body(
+    agent: &Agent,
+    promise: Value,
+) -> Option<std::rc::Rc<std::cell::RefCell<crate::async_await::AsyncFunctionState>>> {
+    let ValueKind::Object(object) = promise.kind() else {
+        return None;
+    };
+    let data = agent.promises.get(&object.id())?;
+    let data = data.borrow();
+    let crate::promise::PromiseState::Pending {
+        fulfill_reactions,
+        reject_reactions,
+    } = &data.state
+    else {
+        return None;
+    };
+    if fulfill_reactions.len() != 1 || reject_reactions.len() != 1 {
+        return None;
+    }
+    let (fulfill, fulfill_is_reject) = await_continuation(agent, &fulfill_reactions[0])?;
+    let (reject, reject_is_reject) = await_continuation(agent, &reject_reactions[0])?;
+    // One body, awaited through both halves: a fulfill reaction that resumes
+    // on rejection (or two different bodies) is not the shape an `await` makes.
+    if fulfill_is_reject || !reject_is_reject || !std::rc::Rc::ptr_eq(&fulfill, &reject) {
+        return None;
+    }
+    Some(fulfill)
+}
+
+/// The suspended body a reaction resumes, when its handler is one the engine
+/// registered as an await continuation, and which half of the await it is.
+fn await_continuation(
+    agent: &Agent,
+    reaction: &crate::promise::PromiseReaction,
+) -> Option<(
+    std::rc::Rc<std::cell::RefCell<crate::async_await::AsyncFunctionState>>,
+    bool,
+)> {
+    let callback = reaction.handler.as_ref()?;
+    let ValueKind::Function(function) = callback.callback.kind() else {
+        return None;
+    };
+    let entry = agent.async_resume.get(&function.id())?;
+    Some((entry.state.clone(), entry.is_reject))
 }
 
 /// `Error.captureStackTrace(target[, constructorOpt])` — a V8 extension rather

@@ -4437,6 +4437,14 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,340 passed / 0 failed** (`runtime` 928, `v8` 256, `crux` 249, `test262` 3324 — these five tests replace the three the previous cut left, so the tree gains two); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **897 passed / 0 failed**, `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because the call path every corpus uses moved: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce every certified number — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending (64,594 checks) — and js-api **1,001 tests, 0 fail**.
 
+*An awaiting async body is a stack frame — §9's bullet that named it, and the last real deno failure.* `test_dynamic_import_module_error_stack` wants `at async file:///import.js:1:43` on a rejection whose reason deno *built* while no JavaScript frame was on the stack, so nothing synchronous could carry it. The probes said exactly that and no more: the reported TypeError is created inside a reaction job (`define_stack` ran with one context and no frame, and the host's formatter was handed an empty call-site array), which left V8's promise topology to be measured rather than read. **Measured, not recalled** — `v8/out/x64.release/d8.exe scratch/asyncframes.js`, six controlled topologies: a throw inside a `.then` handler whose derived promise an async body awaits renders `at async aBody (<file>:<line>:<column of the await>)`; the same throw under a `.then` nobody awaits renders no async frame at all; two awaiting bodies render both, outermost last; and a promise that also carries an ordinary `.then` renders none — V8's `reaction->next()`-must-be-a-Smi rule read from the outside. The mechanism is three additions to the engine and one flag through the bridge: `Agent::current_task_promise`, V8's `TryGetCurrentTaskPromise` over the engine's own data (the reaction's capability promise, or the resume handler's `AsyncFunctionState` when the job *is* an await resumption), set for the duration of a reaction job and restored after; the walk from it in `define_stack` (`push_async_frames`), which appends a frame per promise that is pending with the single fulfill-and-reject pair an `await` attaches — the reactions whose handlers are registered in `async_resume` — and continues with the promise that body returned; the await's own site, which `Step::Await` already published onto the running context and which used to be dropped with the popped frame, now saved onto the state's context at every suspension (`save_await_site`, called from the async driver and from the module driver, whose `stalled_await` already read the same value); and `api::StackFrame::is_async`, which the bridge's existing `isAsync` call-site method now answers from instead of the constant `false`. No per-promise record was needed, and that is where this part is smaller than its own §9 bullet projected: the promise's reaction list already says which `await` is attached.
+
+*Tests — four engine, one bridge assertion added to an existing test, and four mutations, each caught by its own test.* The engine tests are one per rule of the walk: `an_error_built_inside_a_job_carries_the_awaiting_frame` (the exact rendered stack, `at async body:2:1` for an `await` on line 2), `an_awaiting_chain_carries_every_suspended_body` (`at async inner:2:1` then `at async outer:5:1`), `a_job_no_body_awaits_carries_no_awaiting_frame` (no chain, so no async line), and `a_promise_an_ordinary_then_shares_carries_no_awaiting_frame`, whose `await` is attached *first* so that a walk ignoring the count would follow it. The bridge assertion extends `a_host_formatter_is_handed_call_sites` to read `isAsync()` on every frame and to pin the awaiting one as the marked one. Four mutations, each caught and each on its own test: dropping the walk fails the two positive engine tests and leaves both negative ones green; relaxing the one-reaction rule to "not empty" fails only the shared-promise test; making `save_await_site` a no-op fails the two positive tests on the missing `:line:column` (`at async body` where `at async body:2:1` belongs); and hardcoding the bridge's `isAsync` to `false` fails the bridge test, whose frames then read `body|…|false`. Not covered, and stated in §9: V8's `Promise.all` combinator frame and the async-*generator* climb.
+
+*The measurement.* deno's `runtime::tests::misc::test_dynamic_import_module_error_stack` **passes**, and the whole `deno_core --lib` suite moves **452 passed / 7 failed → 453 passed / 6 failed**: the one test flipped, none newly red, and the 6 left are the whole of what §9 declares out of scope — its four inspector cases and the two Windows-only `uv_compat` pipe-busy ones. No real failure remains in the suite this plan uses as its metric.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,344 passed / 0 failed** (`runtime` 932, `v8` 256, `crux` 249, `test262` 3324 — 5,340 plus this part's four engine tests; the bridge assertion extends an existing test rather than adding one); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **901 passed / 0 failed** — 897 plus the same four — and `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because the stack capture, the promise-reaction job, both async suspension points and the module driver moved: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce every certified number — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending (64,594 checks) — and js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7115,6 +7123,45 @@ a frame view of the running stack. §7's survey already split the subsystem: the
         which is why this part's tests observe a refusal through a store a refused call
         never reaches rather than through a JS `catch`.
 
+  26. **Async stack traces — named before the edit, and V8's rule was measured in the
+      tree's own `d8` rather than inferred from its source.**
+      `test_dynamic_import_module_error_stack` wants `at async file:///import.js:1:43`
+      on a rejection whose reason deno built while no JavaScript frame was on the
+      stack, so nothing synchronous can carry that frame: it is the *awaiting* module
+      body at its `await`. The rule, confirmed by running `v8/out/x64.release/d8.exe`
+      over controlled promise topologies — a throw inside a `.then` handler whose
+      derived promise an async body awaits renders
+      `at async aBody (<file>:<line>:<column of the await>)`, and the same throw under
+      a `.then` nobody awaits renders no async frame at all: at a stack capture, when
+      the current microtask is a promise-reaction job, take the promise that task
+      belongs to (`TryGetCurrentTaskPromise`, `v8/src/execution/isolate.cc:1453` — the
+      async function's *own* promise when the job's handler is an async continuation,
+      else the reaction's capability promise), then climb (`CaptureAsyncStackTrace`,
+      `:1287`) while that promise is **pending with exactly one reaction whose fulfill
+      handler is an async continuation** (`TryGetAsyncGenerator`, `:931`): append the
+      suspended body's frame marked async at the await it came to rest at
+      (`AppendAsyncFrame`, `:1041` — `GetGeneratorBytecodeOffset`), and continue with
+      the promise that body returned. In Slag's terms that is three additions, not the
+      four this item first projected: `Agent::current_task_promise`, the same
+      computation over the engine's own data (the reaction's capability promise, or
+      the resume handler's `AsyncFunctionState`); the walk itself, over the pending
+      reactions in `agent.promises` whose handler is registered in `agent.async_resume`
+      (the engine's await continuation — no per-promise record is needed, because the
+      reaction list already says which await is attached); and `StackFrame::is_async`
+      through the bridge's existing `isAsync` call-site method, which already exists
+      and answers `false`. The await's position is the site `Step::Await` already
+      publishes, which today is dropped with the popped frame — it is saved onto the
+      state's own context at suspension instead.
+
+      - **Stated limits.** The `Promise.all` combinator frame V8 appends
+        (`AppendPromiseCombinatorFrame`) is not implemented: no fixture or deno test in
+        the frontier needs it, and it needs the combinator's resolve-element context
+        rather than the engine's own await data. Async *generators* climb V8's chain
+        through the generator's `queue`; this part walks async functions and module
+        bodies only, which is the chain the failing test has. A frame's own
+        `is_async` on the *synchronous* frames a resumed body runs is not marked — V8
+        marks only the appended await frames.
+
   ## 10. Build order
 
 Engine side: (1) L1 roots — done; (2) platform + task runner; (3) snapshot +
@@ -8238,10 +8285,16 @@ migrate, then delete.
    class method's body publishes nothing: the same `capture()` call in
    object-literal and class bodies reaches the same lowering, so it is the
    activation or the body's compilation that differs, not the call.
-20. **Async stack traces — probed against V8's own source, not started.**
-   `test_dynamic_import_module_error_stack` wants `at async file:///import.js:1:43`
-   on a rejection whose reason deno created while no execution context was on the
-   stack; the frame is the *awaiting* module body at its `await`, marked async.
+20. **Async stack traces — landed** (§7's record, §9 item 26). The rule was measured in
+   the tree's own `d8` rather than read: a capture made while a promise-reaction job is
+   the current task walks the awaiting chain from the promise that task belongs to, one
+   frame per promise still pending with the single reaction an `await` attached. The last
+   real deno failure, `test_dynamic_import_module_error_stack`, passes, and the suite this
+   plan measures itself by is down to §9's out-of-scope inspector and Windows-only cases.
+   The item as it was named: `test_dynamic_import_module_error_stack` wants
+   `at async file:///import.js:1:43` on a rejection whose reason deno created while no
+   execution context was on the stack; the frame is the *awaiting* module body at its
+   `await`, marked async.
    V8's mechanism, read out of `v8/` (the full source is checked out in the
    tree), is finite: `CaptureSimpleStackTrace`
    (`v8/src/execution/isolate.cc:1681`) builds the synchronous frames and then,
