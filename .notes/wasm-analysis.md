@@ -76,8 +76,10 @@ Not implemented (whole features):
 - **`WebAssembly.Function`** (typed function wrappers) — absent, so raw JS
   closures cannot be funcref table elements (`runtime/.../wasm.rs:2252-2260`,
   `2505-2510`).
-- **`compileStreaming` / `instantiateStreaming`** — deliberately not installed
-  (`.notes/wasm-plan.md:820-822`).
+- **`compileStreaming` / `instantiateStreaming`** — **installed since** (both,
+  over the host streaming hook; `.notes/embedding.md` §7's records and §9's
+  `WebAssembly`-operation bullet). The wasm-plan note this used to cite
+described the state before the hook existed.
 
 **Conformance, reproduced 2026-09-14.** With the submodule initialised
 (`waspec` @ `37d6b0591`) both sweeps reproduce every per-suite figure in

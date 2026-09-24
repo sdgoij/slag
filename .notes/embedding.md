@@ -4419,6 +4419,14 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,332 passed / 0 failed** (5,330 plus this change's two tests); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **892 passed / 0 failed**, `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because a new global and a new intrinsic are corpus-visible in principle: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622 — so no fixture enumerates the global's properties) and the wasm sweeps reproduce every certified number: core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, and js-api **1,001 tests, 0 fail**.
 
+*The realm's `WebAssembly` namespace is the JS-API's operation set — §9's bullet that named it, and one operation of it was missing.* `WebAssembly.instantiateStreaming` was never installed: the namespace had `validate`, `compile`, `compileStreaming` and `instantiate`, so deno's `WebAssembly.instantiateStreaming(bytes, imports)` called `undefined` — and the failure said so in the shape this engine throws for a missing builtin, `undefined is not a function` **synchronously** with no frames, which is what distinguishes it from a builtin that ran and failed. The host's streaming machinery was already there and exercised by `compileStreaming`'s own tests; what was missing was the operation assembled from it. V8's is `WebAssemblyInstantiateStreaming` (`v8/src/wasm/wasm-js.cc:1140-1173`), and two details of it are observable: the returned promise is created **first**, then the second argument is checked, and a non-object **rejects that promise** (it does not throw); and the compile is started with a resolver that instantiates with those imports and resolves with `{ module, instance }`. So the change is three assemblies rather than new machinery: `builtins/wasm.rs` factors `wasm_instantiate`'s compile-then-instantiate body into `compile_and_instantiate_bytes`, `compileStreaming`'s source handling into `start_streaming` (which takes the settle mode), and `api::WasmStreaming`'s state gains one field — `settle_by_instantiating`, `Some(imports)` meaning “instantiate what you compile”, with the imports **pinned** for as long as the stream lives, because the host holding the stream is holding their only other reference. `finish` then calls the same helper the non-streaming `instantiate` calls. Nothing about a stream that is only compiling changes: the field is `None` and the settle is the one it always was.
+
+*Tests — two engine, and two mutations, each caught.* `instantiate_streaming_reads_the_imports_and_settles_with_the_pair` (`crates/runtime/src/api/wasm.rs`) streams `(module (import "env" "data" (global i64)))` — the bytes deno's own test streams — with an imports object whose `data` getter records that it ran, and asserts the promise fulfils, that the getter ran (so the instance was built *from these imports*), and that the resolution is the pair, with `module` the compiled module. `instantiate_streaming_rejects_a_non_object_imports` pins V8's ordering: the call returns a promise (no pending exception escapes it) and that promise is already `rejected`. Two mutations, each caught: ignoring the imports (storing `undefined`) fails the first with `left: "rejected"` — instantiation cannot find its import — and throwing instead of rejecting fails the second at `eval failed for "WebAssembly.instantiateStreaming({}, 1)"`, which is the mutation turning a rejection back into a synchronous throw. Clippy caught a real one on the way — `state.settle_by_instantiating.clone()` on a `Value`, which is `Copy`.
+
+*The measurement.* deno's `runtime::tests::misc::wasm_streaming_op_invocation_in_import` **passes** — the whole path end to end: `Deno.core.setWasmStreamingCallback` is its host hook, the callback feeds the bytes through the ops and closes the resource, and the promise resolves with the object the test asserts. The whole `deno_core --lib` suite moves **450 passed / 9 failed → 451 passed / 8 failed**: the one test flipped, none newly red, and the 8 left are §9's four inspector cases, the two Windows `uv_compat` pipe-busy ones, and the two that §12 item 20 owns (`test_dynamic_import_module_error_stack`, `test_promise_rejection_handler::case_04`) — which leaves the async stack trace as the last real block.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,334 passed / 0 failed** (5,332 plus this change's two tests); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **892 passed / 0 failed** — unchanged, because `api::wasm` is wasm-gated — and `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because a JS-API operation was added to the namespace: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce every certified number — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending — and js-api **1,001 tests, 0 fail**, unchanged because the corpus carries no `instantiateStreaming` fixture at all (checked by grep, not assumed), which is why the deno test is the only thing that exercises it.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7653,6 +7661,23 @@ migrate, then delete.
   realm the call is in, because the engine keeps no per-function realm (V8 uses
   the callback's creation realm) and one realm per isolate is the model this
   engine's jobs already follow.
+- **The realm's `WebAssembly` namespace is the JS-API's operation set — named
+  here with the edit, and one operation of it was missing.**
+  `WebAssembly.instantiateStreaming` did not exist, so a host's
+  `WebAssembly.instantiateStreaming(bytes, imports)` called `undefined`: the
+  failure is `undefined is not a function` thrown *synchronously* with no frames,
+  which is the signature of a missing builtin rather than a failing one
+  (`test_wasm_streaming_op_invocation_in_import`,
+  `libs/core/runtime/tests/misc.rs:393`). V8's is
+  `WebAssemblyInstantiateStreaming` (`v8/src/wasm/wasm-js.cc:1140-1173`): the
+  returned promise is created first, the second argument is checked *after* that
+  and a non-object **rejects** it with a `TypeError` instead of throwing, and the
+  compile is started with a resolver that *instantiates* the module with those
+  imports and resolves with `{ module, instance }`. This engine already had every
+  piece — `compileStreaming`'s source handling, `wasm_instantiate`'s
+  compile-then-instantiate body, `api::WasmStreaming` — so the operation is those
+  assembled, with the stream's settle step told whether it is compiling or
+  instantiating (one more field on its state, not a second type).
 
 ## 11. Working rules
 

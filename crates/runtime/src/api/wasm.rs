@@ -126,6 +126,11 @@ struct StreamingState {
     roots: Vec<Pin>,
     bytes: Vec<u8>,
     url: Option<String>,
+    /// What the settle step does with the compiled module: `None` resolves with
+    /// it (`WebAssembly.compileStreaming`), `Some(imports)` instantiates it and
+    /// resolves with the pair (`WebAssembly.instantiateStreaming`). Still needs
+    /// `resolve`/`reject`.
+    settle_by_instantiating: Option<Value>,
     settled: bool,
 }
 
@@ -158,9 +163,25 @@ impl WasmStreaming {
                 roots,
                 bytes: Vec::new(),
                 url: None,
+                settle_by_instantiating: None,
                 settled: false,
             })),
         }
+    }
+
+    /// Make this stream *instantiate* what it compiles: the promise settles with
+    ///
+    /// `{ module, instance }` rather than the module, which is what
+    /// `WebAssembly.instantiateStreaming` answers. Said once, at the start, because
+    /// the host's [`finish`](Self::finish) is the moment it is needed and the
+    /// host is holding this rather than the engine.
+    pub(crate) fn settle_by_instantiating(&self, imports: Value) {
+        let mut state = self.state.borrow_mut();
+        // Rooted for as long as the state lives, like the capability's three
+        // values: the host holds the imports' only other reference, and it holds
+        // them through this.
+        state.roots.push(crux::heap::pin(imports));
+        state.settle_by_instantiating = Some(imports);
     }
 
     /// The promise this stream settles — the one `compileStreaming` answered.
@@ -190,13 +211,15 @@ impl WasmStreaming {
 
     /// Finish the stream (`v8::WasmStreaming::Finish`): decode and validate what
     /// was received, and settle the promise with the module — or with the
-    /// `CompileError` the JS-API's own compile would report.
+    /// `CompileError` the JS-API's own compile would report. A stream told to
+    /// instantiate ([`settle_by_instantiating`](Self::settle_by_instantiating))
+    /// settles with `{ module, instance }` instead.
     ///
     /// A second finish, or one after an abort, does nothing. V8 documents
     /// finishing after an abort as the caller's error, and a no-op is the one
     /// honest answer this shape has for it.
     pub fn finish(&self) -> Result<(), JsError> {
-        let (context, resolve, reject, bytes) = {
+        let (context, resolve, reject, bytes, instantiate) = {
             let mut state = self.state.borrow_mut();
             if state.settled {
                 return Ok(());
@@ -207,14 +230,21 @@ impl WasmStreaming {
                 state.resolve,
                 state.reject,
                 std::mem::take(&mut state.bytes),
+                state.settle_by_instantiating,
             )
         };
         context.with_agent(|agent| {
             let call = |agent: &mut crate::agent::Agent, target: Value, argument: Value| {
                 crate::function::call(agent, &target, Value::Undefined, &[argument]).map(|_| ())
             };
-            match crate::builtins::wasm::compile_module_value(agent, &bytes) {
-                Ok(module) => call(agent, resolve, module),
+            let compiled = match instantiate {
+                Some(imports) => {
+                    crate::builtins::wasm::compile_and_instantiate_bytes(agent, &bytes, &imports)
+                }
+                None => crate::builtins::wasm::compile_module_value(agent, &bytes),
+            };
+            match compiled {
+                Ok(value) => call(agent, resolve, value),
                 Err(error) => {
                     let reason = crate::promise::error_value(agent, &error);
                     call(agent, reject, reason)
@@ -384,5 +414,91 @@ mod tests {
             "a host with no streaming hook refuses the call"
         );
         assert!(isolate.take_pending_exception().is_some());
+    }
+
+    /// A module whose import section asks its host for a global —
+    /// `(module (import "env" "data" (global i64)))` — plus a name section. The
+    /// bytes are the ones `deno_core`'s `wasm_streaming_op_invocation_in_import`
+    /// streams, so this pins the same shape at the engine's own level.
+    const IMPORTS_A_GLOBAL_I64: [u8; 33] = [
+        0, 97, 115, 109, 1, 0, 0, 0, // \0asm, version 1
+        2, 13, 1, 3, 101, 110, 118, 4, 100, 97, 116, 97, 3, 126, 0,
+        0, // import "env" "data" (global i64)
+        8, 4, 110, 97, 109, 101, 2, 1, 0, // name
+    ];
+
+    /// `instantiateStreaming` compiles what its host streams, **reads the given
+    /// imports** while instantiating, and settles with the pair — the module and
+    /// the instance (JS-API spec 4.1.2, `WebAssemblyInstantiateStreaming` in
+    /// `v8/src/wasm/wasm-js.cc:1140`).
+    #[test]
+    fn instantiate_streaming_reads_the_imports_and_settles_with_the_pair() {
+        let mut isolate = Isolate::new();
+        isolate.agent.host_hooks = Some(Box::new(Streams {
+            bytes: IMPORTS_A_GLOBAL_I64.to_vec(),
+        }));
+        let context = Context::new(&mut isolate).expect("context");
+
+        eval(&context, "globalThis.read = false");
+        let promise = eval(
+            &context,
+            "WebAssembly.instantiateStreaming({ url: 'streamed' }, {\
+               env: {\
+                 get data() {\
+                   globalThis.read = true;\
+                   return new WebAssembly.Global({ value: 'i64', mutable: false }, 42n);\
+                 }\
+               }\
+             })",
+        );
+        assert_eq!(
+            Promise::state(&context, &promise).expect("state"),
+            "pending",
+            "the source has not resolved yet"
+        );
+
+        context.run_microtasks().expect("microtasks");
+        assert_eq!(
+            Promise::state(&context, &promise).expect("state"),
+            "fulfilled"
+        );
+        assert!(
+            matches!(
+                eval(&context, "globalThis.read").value().kind(),
+                crate::api::ValueKind::Boolean(true)
+            ),
+            "the import getter ran, so the instance was built from these imports"
+        );
+        let result = Promise::result(&context, &promise).expect("result");
+        let module = crate::api::Object::get(&context, &result, "module").expect("a read");
+        let instance = crate::api::Object::get(&context, &result, "instance").expect("a read");
+        assert!(
+            WasmModuleObject::get_compiled_module(&context, &module).is_ok(),
+            "`module` is the module the bytes compiled to"
+        );
+        assert!(
+            matches!(instance.value().kind(), crate::api::ValueKind::Object(_)),
+            "and `instance` is the instance"
+        );
+    }
+
+    /// V8 checks the second argument *after* the promise exists and rejects that
+    /// promise rather than throwing (`v8/src/wasm/wasm-js.cc:1163-1168`), which is
+    /// what makes this a rejection and not a synchronous error.
+    #[test]
+    fn instantiate_streaming_rejects_a_non_object_imports() {
+        let mut isolate = Isolate::new();
+        isolate.agent.host_hooks = Some(Box::new(Streams {
+            bytes: EMPTY.to_vec(),
+        }));
+        let context = Context::new(&mut isolate).expect("context");
+
+        let promise = eval(&context, "WebAssembly.instantiateStreaming({}, 1)");
+        assert_eq!(
+            Promise::state(&context, &promise).expect("state"),
+            "rejected",
+            "the promise exists and is already rejected"
+        );
+        assert!(isolate.take_pending_exception().is_none());
     }
 }

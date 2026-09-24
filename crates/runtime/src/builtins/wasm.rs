@@ -406,6 +406,13 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         "%WebAssembly.instantiate%",
         1,
     )?;
+    define_method(
+        &namespace,
+        realm,
+        "instantiateStreaming",
+        "%WebAssembly.instantiateStreaming%",
+        1,
+    )?;
 
     // WebAssembly.Module static methods.
     let module_ctor = realm
@@ -570,6 +577,13 @@ pub fn dispatch_call(
     }
     if intrinsics.get("%WebAssembly.instantiate%").as_ref() == Some(callee) {
         return Some(wasm_instantiate(agent, args));
+    }
+    if intrinsics
+        .get("%WebAssembly.instantiateStreaming%")
+        .as_ref()
+        == Some(callee)
+    {
+        return Some(wasm_instantiate_streaming(agent, args));
     }
     if intrinsics
         .get("%get WebAssembly.Instance.prototype.exports%")
@@ -1966,26 +1980,84 @@ impl Trace for StreamingHandler {
 /// promise nothing could settle. V8 requires such a hook too (and checks it),
 /// which is the same requirement reported instead of crashed on.
 fn wasm_compile_streaming(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    if !crate::host::has_wasm_streaming_callback(agent) {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "WebAssembly.compileStreaming needs a host streaming hook, and this host has none"
-                .into(),
-        ));
-    }
+    require_streaming_hook(agent, "WebAssembly.compileStreaming")?;
     let realm = agent.current_realm()?;
     let promise_ctor = realm
         .intrinsics
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
+    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    start_streaming(agent, realm, capability, source, None)
+}
+
+/// `WebAssembly.instantiateStreaming(source, importObject)` (JS-API spec 4.1.2),
+/// in V8's own shape: the returned promise is made first, the import object is
+/// checked next and a non-object **rejects** that promise rather than throwing
+/// (`WebAssemblyInstantiateStreaming`, `v8/src/wasm/wasm-js.cc:1163-1168`), and
+/// the stream then resolves it with `{ module, instance }`.
+fn wasm_instantiate_streaming(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    require_streaming_hook(agent, "WebAssembly.instantiateStreaming")?;
+    let realm = agent.current_realm()?;
+    let promise_ctor = realm
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
+    let capability = crate::promise::new_promise_capability(agent, &promise_ctor)?;
+    let imports = args.get(1).cloned().unwrap_or(Value::Undefined);
+    if !matches!(
+        imports.kind(),
+        ValueKind::Undefined | ValueKind::Object(_) | ValueKind::Function(_)
+    ) {
+        let reason = crate::promise::error_value(
+            agent,
+            &JsError::new(ErrorKind::TypeError, "Argument 1 must be an object".into()),
+        );
+        crate::function::call(agent, &capability.reject, Value::Undefined, &[reason])?;
+        return Ok(capability.promise);
+    }
+    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    start_streaming(agent, realm, capability, source, Some(imports))
+}
+
+/// A host that can read the source, or a refusal. V8 requires the hook too (and
+/// checks it), which is the same requirement reported instead of crashed on.
+fn require_streaming_hook(agent: &Agent, method: &str) -> Result<(), JsError> {
+    if crate::host::has_wasm_streaming_callback(agent) {
+        return Ok(());
+    }
+    Err(JsError::new(
+        ErrorKind::TypeError,
+        format!("{method} needs a host streaming hook, and this host has none"),
+    ))
+}
+
+/// Resolve `source`, hand what it resolved to the host's streaming hook, and
+/// return the promise `capability` settles.
+///
+/// `instantiate` is what the stream's settle step does with the compiled module:
+/// `None` resolves with the module (`compileStreaming`), `Some(imports)`
+/// instantiates it and resolves with the pair (`instantiateStreaming`).
+fn start_streaming(
+    agent: &mut Agent,
+    realm: Handle<crate::realm::Realm>,
+    capability: crate::promise::PromiseCapability,
+    source: Value,
+    instantiate: Option<Value>,
+) -> Result<Value, JsError> {
+    let promise_ctor = realm
+        .intrinsics
+        .get("%Promise%")
+        .unwrap_or(Value::Undefined);
     let isolate = crate::api::Isolate::get_current()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no isolate to compile in".into()))?;
     let streaming = crate::api::WasmStreaming::new(
         crate::api::Context::from_realm(isolate, realm),
         &capability,
     );
-    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    if let Some(imports) = instantiate {
+        streaming.settle_by_instantiating(imports);
+    }
     let source_promise = crate::promise::promise_resolve(agent, &promise_ctor, source)?;
     let on_fulfilled = make_streaming_handler(agent, &streaming, false)?;
     let on_rejected = make_streaming_handler(agent, &streaming, true)?;
@@ -2070,32 +2142,45 @@ fn wasm_instantiate(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError>
         }
     };
     deferred_operation(agent, move |agent| {
-        let module_value = {
-            let proto = module_proto(agent)?;
-            compile_module_bytes(agent, &bytes, Some(proto))?
-        };
-        let ValueKind::Object(module_object) = module_value.kind() else {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "compile did not yield a Module".into(),
-            ));
-        };
-        let module = agent
-            .wasm_modules
-            .get(&module_object.id())
-            .cloned()
-            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "compiled module vanished".into()))?;
-        let instance_value = {
-            let proto = instance_proto_default(agent)?;
-            instantiate_module(agent, &module, &imports, Some(proto))?
-        };
-        let realm = agent.current_realm()?;
-        let object_proto = object_proto(&realm);
-        let result = JsObject::ordinary_object_create(object_proto);
-        define_data(&result, "module", module_value, true, true, true)?;
-        define_data(&result, "instance", instance_value, true, true, true)?;
-        Ok(Value::Object(result))
+        compile_and_instantiate_bytes(agent, &bytes, &imports)
     })
+}
+
+/// Compile `bytes` and instantiate the module with `imports`, as the pair
+/// `WebAssembly.instantiate` resolves with (JS-API spec 4.1.4 step 12).
+///
+/// Shared with `WebAssembly.instantiateStreaming`, which compiles the same way
+/// and resolves with the same pair (spec 4.1.2).
+pub fn compile_and_instantiate_bytes(
+    agent: &mut Agent,
+    bytes: &[u8],
+    imports: &Value,
+) -> Result<Value, JsError> {
+    let module_value = {
+        let proto = module_proto(agent)?;
+        compile_module_bytes(agent, bytes, Some(proto))?
+    };
+    let ValueKind::Object(module_object) = module_value.kind() else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "compile did not yield a Module".into(),
+        ));
+    };
+    let module = agent
+        .wasm_modules
+        .get(&module_object.id())
+        .cloned()
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "compiled module vanished".into()))?;
+    let instance_value = {
+        let proto = instance_proto_default(agent)?;
+        instantiate_module(agent, &module, imports, Some(proto))?
+    };
+    let realm = agent.current_realm()?;
+    let object_proto = object_proto(&realm);
+    let result = JsObject::ordinary_object_create(object_proto);
+    define_data(&result, "module", module_value, true, true, true)?;
+    define_data(&result, "instance", instance_value, true, true, true)?;
+    Ok(Value::Object(result))
 }
 
 // ---- WebAssembly.Table / WebAssembly.Global (Cut 10 wave 3b, slice 2) ----
