@@ -4689,6 +4689,14 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,352 passed / 0 failed** (`crux` 254 — 250 plus this part's four — `ffi` 10, `runtime` 933, `v8` 256, `test262` 3324); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **902 passed / 0 failed**, 901 plus the runtime test, and `cargo check -p cli --no-default-features --features jit`).
 
+*The host-object trait is reachable from the entry point, and the L2 claims have per-allocation variants — §9's bullet that named the two follow-ups of slices 2-3.* Two small pieces, one of them a hole in the boundary. A host that installs its own global object implements `HostOps`, and `Context::new_with_global_ops` takes one, but naming the trait meant depending on `crux`, which contradicts the boundary's own statement that a host depends on `slag` alone. So `runtime::api` re-exports `crux::host::HostOps`, and `slag` carries a guard rather than a comment: `a_host_defined_global_is_reachable_through_the_facade` implements the trait, builds a context over it, evaluates a script and calls the finalizer drain, so removing the re-export is a compile error *in that test* (`E0432: unresolved import crate::api::HostOps`, measured) instead of a hole nobody notices. The second piece is coverage: `.notes/host-object-gc.md` §5's fifth criterion — the L2 claims with a collection after every allocation — had nothing behind it.
+
+*Tests, and the trap the second one cost.* `crux`'s `a_retained_edge_survives_a_collection_per_allocation` is claim 2 at per-allocation granularity, and precise: the host object is pinned (the flat equivalent of "JS can reach it"), promoted by one collection, and then 32 rounds each allocate a value, retain it, read the barrier's own output out of the remembered set, allocate an unretained peer with the same lifetime, run a minor collection, and assert the peer was swept while every value retained so far was not — ending with 32 edges. `runtime`'s `a_host_object_swept_under_gc_stress_finalizes_once` is claim 3 with the engine's `--gc-stress` on, which also turns the barrier and minor verifiers on. Getting the second one honest cost an afternoon and produced the half-rule worth keeping, in the note's §5: the conservative scan reads *stack words*, so an object is rooted by a word in a **live** frame whatever the collector decides — a `Global` whose value is returned through a call does that, still rooting its box after the handle is dropped (`collect_garbage` does not reclaim it, while a precise collection over the agent's own roots does — which is how the word was identified: `agent.trace_roots` fed into `heap.collect` reports the box `swept`). An "unreachable now" test therefore has to keep the address out of every live frame, which is why the object comes from an id-only `#[inline(never)]` helper. Three other explanations were tried and each refuted by measurement before that shape was accepted; they are listed in §12 item 22.
+
+*The measurement, and the one thing it leaves open.* Under `--gc-stress` an unrooted host object is *not* reclaimed by the engine's own per-allocation collections, nor by the script-boundary trigger, in a script that allocates 256 objects — while that same script's per-iteration garbage demonstrably is (the live count stays flat across 256 objects that die each iteration, so those collections run and complete), and an explicit host-driven `Agent::collect_garbage` reclaims the box at once with stress still on. That is §12 item 22: measured, three candidate causes ruled out (the IC value cells, a stale stack word, the pin registry), unexplained, and explicitly not this part's to fix. It matters because `--gc-stress` is the engine's own net for missed roots. So the stress test drives its collection from the host and says why in its own doc comment, and the per-allocation claim that *is* provable is the precise `crux` one.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,355 passed / 0 failed** (`crux` 255, `ffi` 10, `runtime` 934, `v8` 256, `slag` 4, `test262` 3324 — one more than the record above in each of `crux`, `runtime` and `slag`); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **903 passed / 0 failed**, and `cargo check -p cli --no-default-features --features jit`). The corpora were re-run because the re-export lives in `runtime::api`, which both runner binaries link, and every number is identical to the baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the wasm sweeps at core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending (64,594 checks), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same 6.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -7854,6 +7862,30 @@ migrate, then delete.
   §4.3, its slice 4), which are what the CLI tier is gated on, and wiring `jsc`'s
   release-driven finalize timing to `HostOps::finalize` — `jsc` is the retired C
   surface and its compat test asserts the old behaviour.
+- **The host-object trait is nameable through the embedding entry point, and the L2
+  claims have per-allocation variants — named here before the edit, as slices 2-3's
+  two follow-ups.** A host that installs its own global object implements
+  `HostOps`, and `Context::new_with_global_ops`'s parameter type was reachable only
+  by depending on `crux` — so `runtime::api` re-exports `crux::host::HostOps` and
+  `slag` carries the guard: its
+  `a_host_defined_global_is_reachable_through_the_facade` implements the trait,
+  builds a context over it, evaluates and drains, so *removing* the re-export is a
+  compile error in that test (`E0432: unresolved import crate::api::HostOps`,
+  measured) rather than a hole in the boundary. The second half is coverage
+  (`.notes/host-object-gc.md` §5's fifth criterion):
+  `crux`'s `a_retained_edge_survives_a_collection_per_allocation` is claim 2 with a
+  collection after *every* allocation, and `runtime`'s
+  `a_host_object_swept_under_gc_stress_finalizes_once` is claim 3 with the engine's
+  own `--gc-stress` on. Writing them produced one measurement that is *not* this
+  part's to fix and is now §12 item 22: under `--gc-stress` an unrooted host
+  object survives the engine's own per-allocation and script-boundary collections
+  while a host-driven collection reclaims it — with the IC value cells, a stale
+  stack word, and the pin registry each ruled out by measurement, and no cause
+  established. A trap the same work established, recorded in that note's §5, is
+  worth stating here because it is about the *tests*, not the engine: the
+  conservative scan reads stack words, so a host object whose address sits in a
+  live frame is rooted however the collector decides — a `Global` returned through
+  a call keeps its box alive after the handle is dropped.
 
 ## 11. Working rules
 
@@ -8429,3 +8461,26 @@ migrate, then delete.
    left. The slots are read from the current realm, and the drain enters the realm
    a job was queued for so that answer exists while a job runs; both are stated in
    §9.
+22. **An unrooted host object survives the engine's own collections under
+    `--gc-stress`, while a host-driven one reclaims it — measured, and not
+    explained.** The shape is `runtime`'s `an_unrooted_host_object` (a host object
+    whose address never sits in a live frame), which every non-stress test reclaims
+    and which a *precise* collection over the agent's own roots also sweeps
+    (measured by feeding `agent.trace_roots` into `heap.collect`). Under stress, in
+    a script that allocates 256 objects, it is not reclaimed: the pending-finalizer
+    queue is empty both during the script and after it, and the script-boundary
+    trigger does not take it either — while the *same* script's per-iteration
+    garbage demonstrably is reclaimed (the live count stays flat across 256 objects
+    that die each iteration, so the per-allocation collections run and complete).
+    An explicit `Agent::collect_garbage` from the test then reclaims it at once,
+    with stress still on. Three candidate causes were checked and are *not* it: the
+    IC value cells (a property read and then deleted does not root the box — the
+    precise sweep says swept), a stale word in a returned frame (a 25-frame stack
+    scrub changes nothing), and the pin registry (`PINNED` is empty once the handle
+    drops). That leaves something in the per-allocation and script-boundary paths
+    that keeps an unmarked box alive: the abort path (`ABORT_SWEEP` retains
+    everything, and a collection triggered from inside a run can see a
+    mutably-borrowed traced cell) and a root that exists only while a body runs are
+    the candidates. It matters because `--gc-stress` is this engine's own net for
+    missed roots — anything that quietly retains during it weakens that net. Not
+    fixed here; the tests record the shape that is measurable today.

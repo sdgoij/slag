@@ -390,6 +390,56 @@ mod tests {
         );
     }
 
+    /// The same edge with a collection after *every* allocation — the shape
+    /// `--gc-stress` gives the engine, made explicit here so it needs no agent.
+    /// The host object is promoted first, so every round is an old box gaining a
+    /// young edge, the barrier's store, and a minor collection that has to reach
+    /// the value through it.
+    #[test]
+    fn a_retained_edge_survives_a_collection_per_allocation() {
+        use crate::handle::Handle;
+        use crate::heap::{pin, remembered_count, with_heap_mut};
+
+        let object = JsObject::host_object_create(std::rc::Rc::new(InterceptGet), None);
+        // The real case is a host object JS can reach (a realm's global, a
+        // property of another object); a pin is the flat equivalent, and it is
+        // what leaves the *edge* as the only route to the values below.
+        let _root = pin(Value::Object(object));
+        with_heap_mut(|heap| {
+            heap.collect(&[]);
+        });
+        assert_eq!(remembered_count(), 0, "the collection drains the set");
+
+        let mut retained: Vec<Value> = Vec::new();
+        for round in 0..32 {
+            let value = Value::String(Handle::new(JsString::from_utf8("retained")));
+            object.host_object_retain(value);
+            retained.push(value);
+            assert_eq!(
+                remembered_count(),
+                1,
+                "round {round}: the store into the old host object is remembered"
+            );
+            // Garbage with the same lifetime as the value: only the edge
+            // distinguishes the two in this round's collection.
+            let garbage = Value::String(Handle::new(JsString::from_utf8("garbage")));
+            let garbage_box = string_box_addr(garbage);
+
+            let swept = with_heap_mut(|heap| heap.collect_minor(&[]));
+            assert!(
+                swept.contains(&garbage_box),
+                "round {round}: unrooted garbage survived: {swept:?}"
+            );
+            for held in &retained {
+                assert!(
+                    !swept.contains(&string_box_addr(*held)),
+                    "round {round}: a retained value was swept: {swept:?}"
+                );
+            }
+        }
+        assert_eq!(host_edge_count(&object), 32);
+    }
+
     /// The sweep captures a host object's finalizer *before* dropping the
     /// payload — the behaviour handle and the identity both live in it — and the
     /// queued behaviour outlives its box, which is why the callback is not

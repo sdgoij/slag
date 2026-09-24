@@ -52,6 +52,27 @@ mod tests {
         assert_eq!(value.as_number(), Some(3.0));
     }
 
+    /// A host that installs its own global object implements [`api::HostOps`],
+    /// so that trait is part of the boundary: this names it through `slag` alone
+    /// — no `crux` dependency — builds a context over it, and calls the
+    /// finalizer drain a host drives.
+    #[test]
+    fn a_host_defined_global_is_reachable_through_the_facade() {
+        use crate::api::{Context, HostOps, Isolate};
+
+        #[derive(Debug)]
+        struct Global;
+
+        impl HostOps for Global {}
+
+        let mut isolate = Isolate::new();
+        let context =
+            Context::new_with_global_ops(&mut isolate, Some(std::rc::Rc::new(Global))).unwrap();
+        let value = context.try_eval("1 + 1").expect("eval");
+        assert_eq!(value.as_number(), Some(2.0));
+        isolate.run_finalizers();
+    }
+
     /// The V8-shaped surface, module loading included, is reachable from the
     /// embedding entrypoint alone — a host depends on `slag`, not `runtime`.
     #[test]

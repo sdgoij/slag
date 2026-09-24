@@ -33,6 +33,10 @@ mod wasm;
 
 pub use crate::agent::NearHeapLimitCallback;
 pub use context::{Context, ContextScope};
+/// The host-object trait [`Context::new_with_global_ops`] takes: a host implements
+/// it without depending on `crux`, and its `finalize` is the collector's news that
+/// a host object it owned was swept.
+pub use crux::host::HostOps;
 pub use external::External;
 pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal};
 pub use heap::HeapStatistics;
@@ -1360,5 +1364,35 @@ mod tests {
         isolate.run_finalizers();
 
         FINALIZED.with(|ids| assert_eq!(*ids.borrow(), vec![id]));
+    }
+
+    /// Criterion 5's runtime half: the drain delivers exactly one finalizer with
+    /// `--gc-stress` on, which also turns the barrier and minor verifiers on — the
+    /// engine's own worst case for a host object's edges.
+    ///
+    /// The object is unrooted by construction (`an_unrooted_host_object`), because
+    /// any *live* frame holding its address roots it for the conservative scan and
+    /// the sweep would then be about the stack: a `Global` whose value is returned
+    /// through a call keeps the box alive even after the handle is dropped
+    /// (measured — dropping it is not what the scan sees). The collection here is
+    /// host-driven for the reason §12's stress item gives: with stress on, the
+    /// engine's own per-allocation and boundary collections do not reclaim this
+    /// box, while a host-driven one does, which is unexplained and tracked there.
+    #[test]
+    fn a_host_object_swept_under_gc_stress_finalizes_once() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        FINALIZED.with(|ids| ids.borrow_mut().clear());
+
+        let id = an_unrooted_host_object();
+        isolate.agent().set_gc_stress(true);
+        context
+            .try_eval("let keep = []; for (let i = 0; i < 256; i++) keep.push({ i });")
+            .expect("eval");
+        isolate.agent().collect_garbage();
+        isolate.agent().set_gc_stress(false);
+        isolate.run_finalizers();
+
+        assert_eq!(FINALIZED.with(|ids| ids.borrow().clone()), vec![id]);
     }
 }

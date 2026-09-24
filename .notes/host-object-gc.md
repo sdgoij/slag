@@ -200,11 +200,26 @@ handle), the way the L1 pin tests do, or the conservative scan will mask the bug
    the host object retains the object that holds it, and one precise collection
    takes both boxes and queues the finalizer the reference-count model could never
    fire.
-5. `--gc-stress` / per-allocation variants of 2-4. **Not covered.** The tests above
-   all use the deterministic no-scan entry points; `--gc-stress` is exercised by
-   the engine's own suite, not by one of these. It is also the mode where a
-   finalizer that allocates would show as re-entrancy, so a variant belongs with
-   the first host that runs host code from `finalize`.
+5. `--gc-stress` / per-allocation variants of 2-4. **Partly landed, and the part
+   that is missing is named.** `crux`'s
+   `a_retained_edge_survives_a_collection_per_allocation` is 2 with a collection
+   after *every* allocation: 32 rounds in which the host object is promoted first,
+   so each round is an old box gaining a young edge, the barrier's store read out
+   of the remembered set, a young unretained peer swept, and every value retained
+   so far still live. It is precise because its entry point is the deterministic
+   `Heap::collect_minor`. `runtime`'s
+   `a_host_object_swept_under_gc_stress_finalizes_once` is 3 with the engine's own
+   `--gc-stress` on, which also turns the barrier and minor verifiers on. Not
+   covered: 4 under stress, and the shape where a host's `finalize` itself runs
+   host code inside the stressed window — the second belongs with the first host
+   that does it. **A trap worth knowing before writing the next one:** the
+   conservative scan reads *stack words*, so an object whose address sits in a
+   **live** frame is rooted whatever the collector decides — a `Global` whose value
+   is returned through a call keeps its box alive *after* the handle is dropped
+   (measured: `collect_garbage` does not reclaim it, while a precise collection
+   over the agent's own roots does, which is how the stack word was identified).
+   Unrooting therefore cannot be observed from the frame that held the handle; the
+   id-only helper shape is what makes it observable.
 6. A weak handle fires once, after the collection; the target's slot is reclaimed;
    the callback cannot resurrect it. **Slice 4, not started.**
 
