@@ -317,15 +317,40 @@ mod tests {
     /// rather than counted: what it must *be* is the site of the call the frame is
     /// at, and the source that states it sits in the test above.
     fn assert_frame(frame: &str, function: &str, line: usize) {
-        let (name, rest) = frame.split_once('@').expect("function@script");
-        let mut parts = rest.split(':');
-        let script = parts.next().expect("a script name");
-        let frame_line: usize = parts.next().expect("a line").parse().expect("a line");
-        let column: usize = parts.next().expect("a column").parse().expect("a column");
+        let (name, script, frame_line, column) = frame_parts(frame);
         assert_eq!(name, function, "the frame's function name: {frame}");
         assert_eq!(script, "-", "the code's name: {frame}");
         assert_eq!(frame_line, line, "the line the frame is at: {frame}");
         assert!(column > 0, "and the column of the site it is at: {frame}");
+    }
+
+    /// One recorded frame, split up: the function that named it, the code it runs,
+    /// the line and the column.
+    fn frame_parts(frame: &str) -> (&str, &str, usize, usize) {
+        let (name, rest) = frame.split_once('@').expect("function@script");
+        let mut parts = rest.split(':');
+        let script = parts.next().expect("a script name");
+        let line: usize = parts.next().expect("a line").parse().expect("a line");
+        let column: usize = parts.next().expect("a column").parse().expect("a column");
+        (name, script, line, column)
+    }
+
+    /// A call's *site* is V8's, not the call expression's start: for a named
+    /// member callee it is the property token, which is the column deno's
+    /// `op_current_user_call_site` reads. The keyed, private and optional shapes
+    /// report the argument list's `(` instead and are §12 item 17.
+    #[test]
+    fn a_member_calls_site_is_its_property_token() {
+        let frames =
+            capture_frames("const o = { m: function inner() { return capture(); } }; o.m();");
+        assert_eq!(frames.len(), 2, "the call and the script: {frames:?}");
+        assert_frame(&frames[0], "inner", 1);
+        let (name, _, line, column) = frame_parts(&frames[1]);
+        assert_eq!((name, line), ("-", 1), "the script's own frame: {frames:?}");
+        // In `const o = { m: function inner() { return capture(); } }; o.m();`
+        // the call's callee `o` starts at column 58 and the property token `m`
+        // at 60 — which is what V8 reports as the call's site.
+        assert_eq!(column, 60, "the site is the property token: {frames:?}");
     }
 
     /// The frames a source produces when it calls `capture()`.

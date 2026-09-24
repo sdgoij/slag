@@ -858,13 +858,14 @@ fn parse_super(parser: &mut Parser) -> Result<Expr, JsError> {
                     "super property may not be a private identifier",
                 ));
             }
-            let property = parse_member_property(parser)?;
+            let (property, property_token) = parse_member_property(parser)?;
             let end = parser.prev.as_ref().unwrap().span.end;
             Ok(Expr {
                 span: Span::new(start, end),
                 kind: ExprKind::Member(MemberExpr {
                     object: Box::new(super_expr),
                     property,
+                    property_token: Some(property_token),
                     optional: false,
                     span: Span::new(start, end),
                 }),
@@ -880,6 +881,7 @@ fn parse_super(parser: &mut Parser) -> Result<Expr, JsError> {
                 kind: ExprKind::Member(MemberExpr {
                     object: Box::new(super_expr),
                     property: MemberProperty::Computed(Box::new(index)),
+                    property_token: None,
                     optional: false,
                     span: Span::new(start, end),
                 }),
@@ -911,11 +913,12 @@ fn parse_super(parser: &mut Parser) -> Result<Expr, JsError> {
 }
 
 /// Parses the `.name`, `.#private`, or `[expr]` member forms.
-fn parse_member_property(parser: &mut Parser) -> Result<MemberProperty, JsError> {
+fn parse_member_property(parser: &mut Parser) -> Result<(MemberProperty, Span), JsError> {
     match parser.peek()?.kind.clone() {
         TokenKind::Identifier(atom) => {
             parser.next()?;
-            Ok(MemberProperty::Name(atom))
+            let token = parser.prev.as_ref().unwrap().span;
+            Ok((MemberProperty::Name(atom), token))
         }
         TokenKind::PrivateIdentifier(atom) => {
             // AllPrivateIdentifiersValid (spec 13.4): a PrivateIdentifier
@@ -927,7 +930,8 @@ fn parse_member_property(parser: &mut Parser) -> Result<MemberProperty, JsError>
                 );
             }
             parser.next()?;
-            Ok(MemberProperty::Private(atom))
+            let token = parser.prev.as_ref().unwrap().span;
+            Ok((MemberProperty::Private(atom), token))
         }
         _ => {
             let tok = parser.peek()?.clone();
@@ -966,7 +970,7 @@ pub(crate) fn parse_subscripts(
         match parser.peek()?.kind.clone() {
             TokenKind::Dot => {
                 parser.next()?;
-                let property = parse_member_property(parser)?;
+                let (property, property_token) = parse_member_property(parser)?;
                 let end = parser.prev.as_ref().unwrap().span.end;
                 let start = expr.span.start;
                 expr = Expr {
@@ -974,6 +978,7 @@ pub(crate) fn parse_subscripts(
                     kind: ExprKind::Member(MemberExpr {
                         object: Box::new(expr),
                         property,
+                        property_token: Some(property_token),
                         optional: false,
                         span: Span::new(start, end),
                     }),
@@ -990,6 +995,7 @@ pub(crate) fn parse_subscripts(
                     kind: ExprKind::Member(MemberExpr {
                         object: Box::new(expr),
                         property: member_property_from_index(index),
+                        property_token: None,
                         optional: false,
                         span: Span::new(start, end),
                     }),
@@ -1029,12 +1035,14 @@ fn parse_optional_link(parser: &mut Parser, expr: Expr) -> Result<Expr, JsError>
     match parser.peek()?.kind.clone() {
         TokenKind::Identifier(atom) => {
             parser.next()?;
+            let token = parser.prev.as_ref().unwrap().span;
             let end = parser.prev.as_ref().unwrap().span.end;
             Ok(Expr {
                 span: Span::new(start, end),
                 kind: ExprKind::Member(MemberExpr {
                     object: Box::new(expr),
                     property: MemberProperty::Name(atom),
+                    property_token: Some(token),
                     optional: true,
                     span: Span::new(start, end),
                 }),
@@ -1042,12 +1050,14 @@ fn parse_optional_link(parser: &mut Parser, expr: Expr) -> Result<Expr, JsError>
         }
         TokenKind::PrivateIdentifier(atom) => {
             parser.next()?;
+            let token = parser.prev.as_ref().unwrap().span;
             let end = parser.prev.as_ref().unwrap().span.end;
             Ok(Expr {
                 span: Span::new(start, end),
                 kind: ExprKind::Member(MemberExpr {
                     object: Box::new(expr),
                     property: MemberProperty::Private(atom),
+                    property_token: Some(token),
                     optional: true,
                     span: Span::new(start, end),
                 }),
@@ -1063,6 +1073,7 @@ fn parse_optional_link(parser: &mut Parser, expr: Expr) -> Result<Expr, JsError>
                 kind: ExprKind::Member(MemberExpr {
                     object: Box::new(expr),
                     property: member_property_from_index(index),
+                    property_token: None,
                     optional: true,
                     span: Span::new(start, end),
                 }),

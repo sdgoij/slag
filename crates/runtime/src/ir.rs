@@ -20277,6 +20277,11 @@ impl Compiler {
         // the tail call itself; the final call step re-checks the flag.
         let tail = self.tail;
         self.tail = false;
+        // The site this call publishes for the frame it runs in: for a plain
+        // call whose callee is a *named* member access it is the property token
+        // (`o.m()` is at the column of `m`), and for every other shape the call
+        // expression's own start.
+        let site = call_site(call);
         if matches!(call.callee.kind, ExprKind::Super) {
             self.compile_arguments(&call.args, false)?;
             self.emit(Step::SuperCall);
@@ -20338,7 +20343,7 @@ impl Compiler {
                 if call.optional {
                     self.compile_optional_call_tail(&call.args, call.span)?;
                 } else {
-                    self.compile_call_args_guarded(&call.args, false, call.span)?;
+                    self.compile_call_args_guarded(&call.args, false, site)?;
                 }
                 self.jump(end);
                 self.place(short);
@@ -20357,7 +20362,7 @@ impl Compiler {
                     // upstream (`a?.b.m(args)`): skip the argument
                     // evaluation and call.
                     self.tail = tail;
-                    self.compile_call_args_guarded(&call.args, false, call.span)?;
+                    self.compile_call_args_guarded(&call.args, false, site)?;
                 }
             }
             return Ok(());
@@ -20399,7 +20404,7 @@ impl Compiler {
                 self.compile_optional_call_tail(&call.args, call.span)?;
             } else {
                 self.tail = tail;
-                self.compile_call_args_guarded(&call.args, false, call.span)?;
+                self.compile_call_args_guarded(&call.args, false, site)?;
             }
             return Ok(());
         }
@@ -20420,7 +20425,7 @@ impl Compiler {
                 self.compile_optional_call_tail(&call.args, call.span)?;
             } else {
                 self.tail = tail;
-                self.compile_call_args_guarded(&call.args, direct_eval, call.span)?;
+                self.compile_call_args_guarded(&call.args, direct_eval, site)?;
             }
             self.emit(Step::PopVarReference);
             return Ok(());
@@ -20608,7 +20613,7 @@ impl Compiler {
         } else {
             // An upstream `?.` in the callee (`(a?.b)()`) skips the arguments.
             self.tail = tail;
-            self.compile_call_args_guarded(&call.args, direct_eval, call.span)?;
+            self.compile_call_args_guarded(&call.args, direct_eval, site)?;
         }
         Ok(())
     }
@@ -20632,6 +20637,9 @@ impl Compiler {
         call: &syntax::ast::CallExpr,
         tail: bool,
     ) -> Result<bool, JsError> {
+        // The rewritten call is still a call at `apply`/`call`, so it publishes
+        // the same site a call with a named member callee does.
+        let site = call_site(call);
         let kind = match &member.property {
             MemberProperty::Name(name) if crux::lookup(*name) == JsString::from_utf8("apply") => {
                 ApplyKind::Apply
@@ -20666,7 +20674,7 @@ impl Compiler {
         self.emit(Step::CallApply {
             argc: call.args.len() as u8,
             kind,
-            span: call.span,
+            span: site,
         });
         Ok(true)
     }
@@ -20933,6 +20941,30 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+}
+
+/// The site a call publishes for the frame it runs in.
+///
+/// V8 reports three different things depending on the callee's shape, measured
+/// against node v24.12.0 (`.notes/embedding.md` §9 has the table): a plain
+/// callee's own start, a **named** member callee's property token (`o.m()` is at
+/// the column of `m`), and the argument list's `(` for a keyed member, a private
+/// member, an optional call and a parenthesised callee. This returns the middle
+/// one where the AST can answer it — a non-optional call whose callee is a dot
+/// access to a name — and the call expression's own start otherwise, because the
+/// argument list's `(` is a span no node carries; those shapes are a measured,
+/// documented gap rather than a guess.
+fn call_site(call: &syntax::ast::CallExpr) -> crux::Span {
+    if call.optional {
+        return call.span;
+    }
+    match &call.callee.kind {
+        ExprKind::Member(member) => match (&member.property, member.property_token) {
+            (MemberProperty::Name(_), Some(token)) => token,
+            _ => call.span,
+        },
+        _ => call.span,
     }
 }
 

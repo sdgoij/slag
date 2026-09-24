@@ -4320,6 +4320,14 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` **5,315 passed / 0 failed** (`runtime` 908, `v8` 249, `crux` 249). The corpora were re-run because the change moves text a host prints and positions a frame reports: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622), and the wasm sweeps reproduce theirs — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail**.
 
+*A call's site is V8's for a named member callee — §9's bullet that named it, and §12 item 17.* The frame rule gives a frame the site of the call it is at, and for a call the engine publishes `call.span` — the whole call expression, so the callee's own start. V8 publishes three different things, which the node on this machine settled rather than memory: `Error().stack` read inside a function called eight ways, columns counted against the source, gives a plain callee's own start (`w()` 13 = `w`), a **named** member callee's property token (`o.mm()` 15 = `mm`, `o.mm(1,2)` 15, `({m:w}).m()` 21, `o?.mm()` 16), and the **argument list's `(`** for a keyed member (`o["mm"]()` 20), a private member (`this.#mm()` 66), an optional call (`o.mm?.()` 19) and a parenthesised callee (`(o.mm)()` 19). The middle one is what the AST can answer and what deno's `test_call_site` waits on, so `MemberExpr` carries `property_token` — the dot form's token, `None` for a bracket access, which is a property expression — set by `parse_member_property` and the two optional-link arms, and `compile_call` publishes it for a non-optional call whose callee is a dot access to a name (`call_site`, `ir.rs`, also used by the `apply`/`call` rewrite). The other three shapes keep the call expression's own start: the argument list's `(` is a span no node carries, so that is a measured, documented gap rather than a guess, and no test waits on it.
+
+*The measurement.* deno's suite moves **441 passed / 18 failed → 442 passed / 17 failed**: `runtime::tests::ops::test_call_site` passes — all three of its assertions, the column included — and no test is newly red. One mutation, caught: making `call_site` answer `call.span` again fails the new bridge test with `left: 58, right: 60` — the callee's start where the property token belongs, which is exactly the 18-versus-28 deno saw.
+
+*A sweep verdict that moved without the tree moving, chased down rather than assumed.* The first full-corpus run after this change reported **2 hang**; the next three at the same settings reported 0, 1 and 3, all three hangs being `TypedArray/prototype/copyWithin/coerced-values-{start,end}-detached*.js`, and then, on a quiet machine, the baseline again. The runs that hung coincided with a stray `cargo`/`rustc` build on the machine (`tasklist` showed `rustc.exe` at 505 MB), the three fixtures pass deterministically in isolation (jobs 1, batch 1), and nothing in this change can cost run time at all: the JIT ignores call spans (`span: _`, and it synthesizes `Span::new(0, 0)` for the call steps it builds), and the interpreter only stores the span. Recorded as §12 item 18 — a deadline-loud fixture set, not a regression — and the clean run is the one this record's numbers come from.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` **5,316 passed / 0 failed** (`runtime` 908, `v8` 250, `crux` 249). The corpora were re-run because the parser and the lowering moved: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622 — twice, once as JSON and once as text, on a quiet machine), and the wasm sweeps reproduce theirs — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7346,6 +7354,29 @@ migrate, then delete.
   scripts whose stack lines must keep reading `at <anonymous>:4:7`. The rendered
   text then gains a file exactly where V8 prints one — a change to `Error.stack`
   for named scripts and for calls inside modules, measured as such.
+- **A call's site is V8's: the property token for a named member callee — named
+  here before the edit, and it is §12 item 17.** The frame rule above gives a
+  frame the *site* of the call it is at, and for a call the engine publishes
+  `call.span` — the whole call expression, so the callee's own start. V8 reports
+  something else, and it is not one value but three: the callee identifier for a
+  plain callee, the **property token** for a named member access, and the
+  **argument list's `(`** for everything else. Measured rather than recalled,
+  with node v24.12.0 on this machine (`Error().stack` read inside a function
+  called eight ways, columns counted against the printed columns):
+  `w()` 13 = `w`; `o.mm()` 15 = `mm`; `o.mm(1,2)` 15 = `mm`; `({m:w}).m()` 21 =
+  `m`; `o?.mm()` 16 = `mm` — the property token, optional *member* link and all;
+  but `o["mm"]()` 20 and `o.mm?.()` 19 and `this.#mm()` 66 are each the call's
+  `(`, and a *parenthesised* callee `(o.mm)()` is its `(` too, 19. So the rule
+  this part implements is the one shape the AST can answer and the measurement
+  asks for: a **non-optional** call whose callee is a `MemberExpr` whose property
+  is a `Name` reports that property's token. The other three shapes report the
+  argument list's `(`, which neither `ExprKind::Call`'s `span` nor the member's
+  carries, so they keep the call expression's start — a measured, documented gap
+  rather than a guess, and deno's `test_call_site` (the named form) is the test
+  that pins this half. The AST gains `MemberExpr::property_span` — the property's
+  own span, the token for a name or private and the key expression for a
+  computed one — because only the parser knows it, and the lowering reads it
+  where the call site is published (`ir.rs`).
 
 ## 11. Working rules
 
@@ -7790,16 +7821,38 @@ migrate, then delete.
    a promise — and `test_stalled_tla` and
    `test_promise_rejection_handler::case_04` are the same shape. That is a
    larger, separate item.
-17. **A member call's column is V8's name token, not the call's start — open,
-   measured.** deno's `test_call_site` asserts that `currentUserCallSite()`
-   answers `fileName === "file:///filename.js"`, `lineNumber === 2`,
-   `columnNumber === 28` for the call written `      const cs =
-   Deno.core.currentUserCallSite();` — column 28 is the `c` of the property name,
-   where this engine reports the call expression's start (column 18). The other
-   two now pass, and a *plain* call agrees (`assert(...)` at `5:7`, V8's own
-   value). The divergence is the member form alone: V8's `CallProperty` bytecode
-   carries the property token's position, while `Step::CallFast`/`Call` carries
-   `call.span` — the whole expression — and the parser's `MemberExpr` keeps only
-   that span. Closing it means carrying the property's own span through the
-   parser, the AST and the lowering, so it wants its own §9 bullet and a corpus
-   re-sweep.
+17. **A call's site is V8's where the AST can answer it — landed; the rest
+   measured and documented.** deno's `test_call_site` asserts that
+   `currentUserCallSite()` answers `fileName === "file:///filename.js"`,
+   `lineNumber === 2`, `columnNumber === 28` for the call written
+   `      const cs = Deno.core.currentUserCallSite();` — column 28 being the `c`
+   of the property name, where this engine reported the call expression's start.
+   V8's rule is not one value but three, and it was **measured with node
+   v24.12.0 on this machine** (`Error().stack` read inside a function called
+   eight ways, columns counted against the source): a plain callee's own start
+   (`w()` 13 = `w`); a **named** member callee's property token (`o.mm()` 15 =
+   `mm`, `o.mm(1,2)` 15, `({m:w}).m()` 21, and `o?.mm()` 16 — an optional
+   *member* link is still the property token); and the **argument list's `(`**
+   for a keyed member (`o["mm"]()` 20), a private member (`this.#mm()` 66), an
+   optional call (`o.mm?.()` 19) and a parenthesised callee (`(o.mm)()` 19).
+   What landed is the middle one: a non-optional call whose callee is a dot
+   access to a name reports the property token, which the AST now keeps in
+   `MemberExpr::property_token` (set by the parser, `None` for a bracket access,
+   whose property is an expression). Every other shape keeps the call
+   expression's own start, because the argument list's `(` is a span no node
+   carries — a measured, documented gap rather than a guess, and no test waits
+   on those three. Measured: deno's suite moves 441 passed / 18 failed →
+   **442 passed / 17 failed**, `test_call_site` passing and no test newly red.
+   Carrying the argument list's `(` is the follow-on, and it is the same shape
+   of change: one field the parser can set and the lowering can read.
+18. **The three `TypedArray/copyWithin/coerced-values-*-detached*` fixtures are
+   deadline-loud under load — observed, not a regression.** A full-corpus sweep
+   at `--jobs 8 --batch 32 --timeout 15 --recheck-timeout 15` reported those
+   three as hangs in three runs and none in two, on one tree; the runs that hung
+   coincided with a stray `cargo`/`rustc` build running on the machine
+   (`tasklist` showed `rustc.exe` at 505 MB), and the three fixtures pass
+   deterministically in isolation (jobs 1, batch 1) and in every run made on a
+   quiet machine. They are detached-buffer fixtures, so they are the corpus's
+   slow end by nature. Recorded because a sweep verdict that moves without the
+   tree moving is worth knowing about, and because the sweep's own `--fast`
+   help text warns that verdicts wobble on 5-15s fixtures under load.

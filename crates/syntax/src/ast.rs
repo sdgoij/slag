@@ -588,6 +588,14 @@ pub struct NewExpr {
 pub struct MemberExpr {
     pub object: Box<Expr>,
     pub property: MemberProperty,
+    /// The property token's span for a dot access (`object . name`,
+    /// `object . #private`), and `None` for a bracket access, whose property is
+    /// an expression rather than a token.
+    ///
+    /// Kept because it is what V8 reports as a *call's* site when the callee is
+    /// a named member access (`o.m()` is at the column of `m`), and the lowerer
+    /// has no other way to reach it (`ir.rs`'s call site).
+    pub property_token: Option<Span>,
     /// True for the link that used `?.`; later links in the chain are not
     /// evaluated when the chain short-circuits.
     pub optional: bool,
@@ -808,6 +816,7 @@ mod tests {
             kind: ExprKind::Member(MemberExpr {
                 object: Box::new(ident_expr("a")),
                 property: MemberProperty::Name(id("b")),
+                property_token: None,
                 optional: false,
                 span: span(),
             }),

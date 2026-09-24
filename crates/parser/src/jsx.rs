@@ -448,6 +448,9 @@ fn member_path(mut base: Expr, properties: &[AtomId], end: u32) -> Expr {
             kind: ExprKind::Member(MemberExpr {
                 object: Box::new(base),
                 property: MemberProperty::Name(property),
+                // A JSX member path is built from the tags as they are read, so
+                // there is no token span to keep for a call's site.
+                property_token: None,
                 optional: false,
                 span: Span::new(start, end),
             }),
