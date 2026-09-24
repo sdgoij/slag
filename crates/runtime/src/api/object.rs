@@ -3,11 +3,29 @@
 use crux::error::{ErrorKind, JsError};
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
+use crux::property::PropertyKey;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 
 use super::context::Context;
 use super::handle::Local;
+
+/// The property key a host's handle names: a String or a Symbol, the two a
+/// `Name` can be (spec 6.1.7).
+///
+/// The key-taking forms of the property operations are the `Name`-shaped ones,
+/// so a handle of any other kind is refused rather than coerced — a `v8::Name`
+/// cannot be built from one in the crate this stands in for either.
+fn key_of(key: &Local) -> Result<PropertyKey, JsError> {
+    match key.value().kind() {
+        ValueKind::String(text) => Ok(PropertyKey::from_js_string(&text)),
+        ValueKind::Symbol(symbol) => Ok(PropertyKey::Symbol(symbol)),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            "property key is not a string or a symbol".into(),
+        )),
+    }
+}
 
 /// Object helpers (v8::Object).
 pub struct Object;
@@ -38,8 +56,14 @@ impl Object {
     /// property map: a module namespace's exports are read through its module
     /// environment, so the map read answers the placeholder instead.
     pub fn get(context: &Context, object: &Local, key: &str) -> Result<Local, JsError> {
+        Self::get_key(context, object, &Local::string(key))
+    }
+
+    /// [[Get]] a property by the key a host built (spec 7.3.1): a String or a
+    /// Symbol, which is what a `Name` is.
+    pub fn get_key(context: &Context, object: &Local, key: &Local) -> Result<Local, JsError> {
         let base = Value::Object(Self::handle(object)?);
-        let key = crux::property::PropertyKey::from_js_string(&JsString::from_utf8(key));
+        let key = key_of(key)?;
         context.with_agent(|agent| {
             crate::context::get_property_key(agent, &base, &key, base).map(Local)
         })
@@ -54,20 +78,52 @@ impl Object {
         value: &Local,
         throw: bool,
     ) -> Result<bool, JsError> {
+        Self::set_key(context, object, &Local::string(key), value, throw)
+    }
+
+    /// [[Set]] a property by the key a host built (spec 7.3.3).
+    pub fn set_key(
+        context: &Context,
+        object: &Local,
+        key: &Local,
+        value: &Local,
+        throw: bool,
+    ) -> Result<bool, JsError> {
         let object = Self::handle(object)?;
-        context.with_agent(|_| object.set(&JsString::from_utf8(key), value.into_value(), throw))
+        let key = key_of(key)?;
+        context.with_agent(|_| object.set_key(&key, value.into_value(), throw))
     }
 
     /// [[HasProperty]] (spec 7.3.10): walks the prototype chain.
     pub fn has(context: &Context, object: &Local, key: &str) -> Result<bool, JsError> {
+        Self::has_key(context, object, &Local::string(key))
+    }
+
+    /// [[HasProperty]] by the key a host built (spec 7.3.10).
+    pub fn has_key(context: &Context, object: &Local, key: &Local) -> Result<bool, JsError> {
         let object = Self::handle(object)?;
-        context.with_agent(|_| object.has_property(&JsString::from_utf8(key)))
+        let key = key_of(key)?;
+        context.with_agent(|_| object.has_property_key(&key))
+    }
+
+    /// [[HasOwnProperty]] by the key a host built (spec 7.3.12): the prototype
+    /// chain is not consulted.
+    pub fn has_own_key(context: &Context, object: &Local, key: &Local) -> Result<bool, JsError> {
+        let object = Self::handle(object)?;
+        let key = key_of(key)?;
+        context.with_agent(|_| object.has_own_property_key(&key))
     }
 
     /// [[Delete]] (spec 7.3.9).
     pub fn delete(context: &Context, object: &Local, key: &str) -> Result<bool, JsError> {
+        Self::delete_key(context, object, &Local::string(key))
+    }
+
+    /// [[Delete]] by the key a host built (spec 7.3.9).
+    pub fn delete_key(context: &Context, object: &Local, key: &Local) -> Result<bool, JsError> {
         let object = Self::handle(object)?;
-        context.with_agent(|_| object.delete(&JsString::from_utf8(key)))
+        let key = key_of(key)?;
+        context.with_agent(|_| object.delete_key(&key))
     }
 
     /// Define an own data property with explicit attributes

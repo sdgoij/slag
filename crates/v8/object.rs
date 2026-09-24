@@ -155,10 +155,11 @@ impl<'s> LocalHandle<'s, Object> {
     /// §9. A map remembers the constructor an object was *made* with, while this
     /// reads the property as it is now, so a reassigned
     /// `prototype.constructor` shows up here and not there. And
-    /// `Symbol.toStringTag` is not consulted, because the property reads this
-    /// bridge can make are name-keyed: an iterator answers "Iterator" here — the
-    /// name its prototype chain carries — where V8's tag makes it "Map Iterator"
-    /// or "Array Iterator" by kind.
+    /// `Symbol.toStringTag` is not consulted: this walk reads the constructor's
+    /// `name` where V8's helper reads the tag as another source — an iterator
+    /// answers "Iterator" here — the name its prototype chain carries — where
+    /// V8's tag makes it "Map Iterator" or "Array Iterator" by kind. The tag is
+    /// readable now; not reading it is the decision, not a limit.
     pub fn get_constructor_name(&self) -> Local<'_, String> {
         let realm = crate::realm_current();
         let mut current: Local<'_, Object> = self.retag();
@@ -186,13 +187,11 @@ impl<'s> LocalHandle<'s, Object> {
 
     /// [[Get]] a property (`v8::Object::Get`).
     ///
-    /// Only string keys are supported: Slag's public API resolves properties by
-    /// name, and a key of any other type is reported the way a failed
-    /// conversion is — as a pending exception.
+    /// The key is a `Name` — a String or a Symbol — and a key of any other kind
+    /// is reported the way a failed conversion is: as a pending exception.
     pub fn get<'a>(&self, scope: &PinScope<'a, '_>, key: Local<Value>) -> Option<Local<'a, Value>> {
-        let name = key.engine().as_string()?;
         let realm = crate::realm_of(scope);
-        match api::Object::get(&realm, self.engine(), &name) {
+        match api::Object::get_key(&realm, self.engine(), key.engine()) {
             Ok(value) => Some(Local::from_engine(value)),
             Err(error) => {
                 crate::throw(scope, &error);
@@ -208,9 +207,8 @@ impl<'s> LocalHandle<'s, Object> {
         key: Local<Value>,
         value: Local<Value>,
     ) -> Option<bool> {
-        let name = key.engine().as_string()?;
         let realm = crate::realm_of(scope);
-        match api::Object::set(&realm, self.engine(), &name, value.engine(), true) {
+        match api::Object::set_key(&realm, self.engine(), key.engine(), value.engine(), true) {
             Ok(ok) => Some(ok),
             Err(error) => {
                 crate::throw(scope, &error);
@@ -221,9 +219,8 @@ impl<'s> LocalHandle<'s, Object> {
 
     /// [[HasProperty]] (`v8::Object::Has`).
     pub fn has(&self, scope: &PinScope<'_, '_>, key: Local<Value>) -> Option<bool> {
-        let name = key.engine().as_string()?;
         let realm = crate::realm_of(scope);
-        match api::Object::has(&realm, self.engine(), &name) {
+        match api::Object::has_key(&realm, self.engine(), key.engine()) {
             Ok(ok) => Some(ok),
             Err(error) => {
                 crate::throw(scope, &error);
@@ -238,9 +235,8 @@ impl<'s> LocalHandle<'s, Object> {
     /// which is the question that tells an array element from a hole, since a
     /// `[[Get]]` of either answers `undefined`.
     pub fn has_own_property(&self, scope: &PinScope<'_, '_>, key: Local<Value>) -> Option<bool> {
-        let name = key.engine().as_string()?;
-        let object = self.engine().value().as_object()?;
-        match object.has_own_property(&crux::string::JsString::from_utf8(&name)) {
+        let realm = crate::realm_of(scope);
+        match api::Object::has_own_key(&realm, self.engine(), key.engine()) {
             Ok(found) => Some(found),
             Err(error) => {
                 crate::throw(scope, &error);
@@ -268,9 +264,8 @@ impl<'s> LocalHandle<'s, Object> {
 
     /// [[Delete]] (`v8::Object::Delete`).
     pub fn delete(&self, scope: &PinScope<'_, '_>, key: Local<Value>) -> Option<bool> {
-        let name = key.engine().as_string()?;
         let realm = crate::realm_of(scope);
-        match api::Object::delete(&realm, self.engine(), &name) {
+        match api::Object::delete_key(&realm, self.engine(), key.engine()) {
             Ok(deleted) => Some(deleted),
             Err(error) => {
                 crate::throw(scope, &error);
@@ -745,7 +740,7 @@ mod tests {
     /// the nearest `constructor` on the prototype chain, with the string
     /// "Object" as the fallback. The last case is the documented divergence — V8
     /// names an iterator by its `Symbol.toStringTag` ("Map Iterator"), while
-    /// this bridge, whose property reads are name-keyed, reads the name the
+    /// this bridge reads the name the
     /// engine's iterator prototypes carry ("Iterator").
     #[test]
     fn the_constructor_name_comes_from_the_prototype_chain() {
@@ -1134,6 +1129,38 @@ mod tests {
                 number_of(entries.get_index(scope, 3).expect("element")),
                 2.0
             );
+        });
+    }
+
+    /// A key is a `Name`, so a Symbol resolves as one: found, set, asked about
+    /// and deleted. This is the read deno's sequence converter makes first
+    /// (`Symbol.iterator` on the value it converts), so a bridge that answered
+    /// only string keys made every sequence conversion fail. A key that is not a
+    /// `Name` is refused as a pending exception — the check goes last, because
+    /// the refusal is what the host sees next.
+    #[test]
+    fn a_symbol_key_resolves_like_a_name() {
+        in_context!(scope, {
+            let iterator = crate::data::Symbol::get_iterator(scope).cast::<Value>();
+            let array = Local::<Object>::try_from(eval(scope, "[1, 2]")).expect("array");
+            let found = array.get(scope, iterator).expect("the symbol key resolves");
+            assert!(found.is_function(), "Symbol.iterator is a function");
+            assert_eq!(array.has(scope, iterator), Some(true));
+
+            let object = Local::<Object>::try_from(eval(scope, "({})")).expect("object");
+            let seven = Number::new(scope, 7.0).cast::<Value>();
+            assert_eq!(object.set(scope, iterator, seven), Some(true));
+            assert_eq!(object.has_own_property(scope, iterator), Some(true));
+            assert_eq!(
+                number_of(object.get(scope, iterator).expect("the value set")),
+                7.0
+            );
+            assert_eq!(object.delete(scope, iterator), Some(true));
+            assert_eq!(object.has_own_property(scope, iterator), Some(false));
+
+            let three = Number::new(scope, 3.0).cast::<Value>();
+            assert!(object.get(scope, three).is_none());
+            assert_eq!(object.has(scope, three), None);
         });
     }
 }

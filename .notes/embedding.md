@@ -1120,7 +1120,10 @@ first two had the pieces already and the third is a refusal.
   instance → the class name, `Object.create(null)` → "Object". Two divergences,
   both recorded in §9: a map remembers the constructor an object was *made* with
   while this reads the property as it is now, and `Symbol.toStringTag` is not
-  consulted because the property reads this bridge can make are name-keyed. The
+  consulted — the walk reads the nearest own `constructor`'s `name` where V8's
+  helper reads the tag as another source. It can be read now (§9's symbol-keyed
+  reads landed) but reading it is a change to this *answer*, not to the machinery
+  under it, so it is named rather than folded in. The
   second is visible in the test, and it is smaller than it looked:
   `new Map().entries()` answers "Iterator" — the name the engine's iterator
   prototypes carry — where V8's tag answers "Map Iterator".
@@ -4353,6 +4356,45 @@ exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and the w
 reproduce theirs (core **20,662**; the seven proposal suites **64,594 / 0 fail / 0
 pending**; js-api **1,001 tests, 0 fail**).
 
+*A property key is a name, not a string — §9's bullet that named it, and the six
+`webidl` failures deno reports as conversion errors.* The bridge narrowed the key with
+`as_string()`, so a Symbol was not a property lookup at all:
+
+- `api::Object` gains the key-taking forms (`get_key`, `set_key`, `has_key`,
+  `has_own_key`, `delete_key`) beside the `&str` ones, which are now wrappers over them.
+  They take the host's handle and build the `PropertyKey` themselves — a String or a
+  Symbol, the two a `Name` can be — and refuse anything else with a `TypeError` instead
+  of coercing, which is the `Name`-shaped contract the crate has.
+- The bridge's `get`, `set`, `has`, `has_own_property` and `delete` stop narrowing and
+  hand the key handle through, so a symbol resolves. `has_own_property` goes through the
+  api now instead of reaching the engine's object itself, which is what gives it the same
+  refusal as the others; the doc that read "Only string keys are supported" is gone.
+- Three places claimed the *reason* for a divergence was that the bridge's reads are
+  name-keyed (`get_constructor_name`'s doc and its test's, plus the §9 bullet that
+  recorded the decision): the tag `Symbol.toStringTag` is now readable, so what remains
+  is the decision not to read it — a change to that answer, named as its own follow-up —
+  rather than a missing capability.
+
+*Tests — one, one mutation.* `a_symbol_key_resolves_like_a_name` (`crates/v8/object.rs`)
+walks the whole surface: `Symbol.iterator` found on an array and asked for, a symbol set
+on a plain object, `has_own_property` true for it and false after a `delete`, and a
+number key refused (`get` answers `None`, `has` answers `None`) rather than treated as
+absent. The mutation that restores the narrowing in `get` fails it on "the symbol key
+resolves".
+
+*The measurement.* deno's `webidl` filter is **17 passed / 0 failed** (10/6 before — the
+whole file, including `sequence`, `dictionary`, `constrained_sequence_one_of` and the
+three iterator-behaviour tests that assert the messages the protocol produces). The whole
+`deno_core --lib` suite goes **427 passed / 32 failed → 433 passed / 26 failed**: six
+flipped, none regressed, and the totals still sum to 459.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace
+--all-targets -- -D warnings` clean; `cargo test --locked --workspace` green — runtime
+`--lib` **906**, crux **249**, v8 **245**. Both corpora re-run: test262 `all` reproduces
+its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) and
+the wasm sweeps reproduce theirs (core **20,662**; the seven proposal suites **64,594 / 0
+fail / 0 pending**; js-api **1,001 tests, 0 fail**).
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -4613,13 +4655,14 @@ if that proves possible.
   property chain agrees with it, and the difference is stated where a host would
   read it.** V8 reads the constructor the object's *map* was made with and the
   `Symbol.toStringTag` on its chain; this walk reads the nearest own
-  `constructor` as it is now, and cannot read the tag at all — the property reads
-  the bridge can make are name-keyed. The consequence is small and pinned by a
+  `constructor` as it is now, and does not read the tag — which it could since
+  the symbol-keyed reads landed (the §9 bullet above), so what remains is the
+  decision, not a missing capability. The consequence is small and pinned by a
   test: an iterator answers "Iterator" rather than "Map Iterator", and a script
   that reassigns `Foo.prototype.constructor` moves the answer here where V8's
-  map would hold the original. Landing the tag half means a symbol-keyed read on
-  the engine's template/object API, which is a named follow-up rather than a
-  guess.
+  map would hold the original. Making the tag read is a named follow-up: it
+  changes that answer, so it wants its own measurement rather than a free ride on
+  the plumbing.
 - **A snapshot cannot be created, and saying so is the implementation.**
   `create_blob` aborts with the reason; `StartupData::is_valid()` answers
   `false`; `SetDefaultContext`/`AddContext`/`AddContextData` record what a blob
@@ -6978,10 +7021,31 @@ migrate, then delete.
   `TypeError: exception thrown by host callback` for whatever was there. A host
   that calls into JS while it holds (or has rethrown) an exception therefore has
   the original destroyed and replaced by a synthetic TypeError. V8 keeps the
-  original: its `Function::Call` answers `Nothing` because an exception is
+  the original: its `Function::Call` answers `Nothing` because an exception is
   pending, and the exception is the one that was already there. Narrow now that
   the handler owns what it caught, and named here rather than widened into the
   change above.
+- **The bridge resolves a property by string name only — named here before the
+  edit.** `Object`'s `get`, `set`, `has`, `has_own_property` and `delete` narrow
+  the key with `as_string()`, so a **Symbol** key is not a property lookup at
+  all: `get` answers `None` (a pending exception) and `has`/`delete` answer as if
+  the property were absent, where V8 resolves the symbol. The bridge's own doc
+  states the limit ("Only string keys are supported"). Measured, this is deno's
+  `webidl` cluster of **six** tests: the sequence converter walks the iterator
+  protocol (`deno/libs/core/webidl.rs:344` reads `Symbol.iterator` off the value
+  and calls it), so `webidl::tests::sequence` fails with
+  `WebIDLErrorKind::ConvertToConverterType("sequence")` at the first lookup —
+  `Array.prototype[Symbol.iterator]` is never found — and `dictionary`,
+  `constrained_sequence_one_of` and the four iterator-behaviour tests fall with
+  it (they assert the messages the protocol produces, and a lookup that never
+  happens produces none). No new machinery is needed: the engine already keys
+  every property operation on `PropertyKey`
+  (`JsObject::get_key`/`set_key`/`has_property_key`/`has_own_property_key`/
+  `delete_key`) and the bridge already builds one for the define path
+  (`property_key`, `crates/v8/object.rs:443`). So the api's property methods gain
+  key-taking forms that take a String or a Symbol and refuse anything else with
+  a TypeError, and the bridge stops narrowing. §7's record has the change and its
+  measurement.
 
 ## 11. Working rules
 
