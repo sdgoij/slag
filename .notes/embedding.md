@@ -4367,6 +4367,14 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,322 passed / 0 failed**. The engine moved, so the battery was re-run and reproduced every certified number: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622; the wasm sweeps core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending; js-api **1,001 tests, 0 fail**. One thing observed and not fixed, and not this change's: `cargo test -p jit` alone fails to compile `runtime`, because `crates/runtime/src/host.rs` names `crate::api::WasmStreaming` while the `wasm` feature — the only thing that exports it — is off under that crate's own dependency set. The workspace gates unify features and are green, so nothing had run it before.
 
+*And that observation was the next thing fixed, measured first: three promised configurations did not compile — §9's bullet that named it.* `host.rs`'s two streaming dispatches and `HostHooks`'s two streaming items name `api::WasmStreaming`, which only the `wasm` feature exports, and neither was gated. Measured on the unfixed tree, all three of the shapes something *promises* failed identically — `cannot find type WasmStreaming in module crate::api` at `host.rs:101` and `:196`: `cargo check -p runtime --no-default-features`; `cargo test -p jit` (the crate whose manifest deliberately takes `runtime` with `default-features = false`, so a host can drop the JS API without unification re-enabling it); and the README's documented interpreter-only `cargo check -p cli --no-default-features --features jit` (`README.md:96`, `:266`). Both halves are `#[cfg(feature = "wasm")]` now, and all three pass: the wasm-free engine's suite runs **884 passed / 0 failed** and the CLI's interpreter-only build compiles.
+
+*Nothing downstream could have moved, and it was measured rather than argued.* With the feature on — every workspace, sweep and deno build — the cfg is satisfied, so the items compile exactly as they did; the bridge is unaffected because `crates/v8` enables `runtime/wasm` deliberately. The battery was re-run anyway, on binaries rebuilt from this tree, and reproduced every certified number: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622; the wasm sweeps core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending; js-api **1,001 tests, 0 fail**. deno stays at **445 passed / 14 failed**, the same 14.
+
+*The configuration is a gate rather than a promise now.* `cargo test -p runtime --no-default-features --lib` and `cargo check -p cli --no-default-features --features jit` run in CI's test job (`ci.yml`), which is the one place the workspace's feature unification cannot hide this class of defect: the workspace run and clippy both build the engine with `wasm` on, so neither can fail this way. The gate is real in both directions — it is the command pair that failed on the unfixed tree above.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,322 passed / 0 failed**; the two wasm-free shapes above both green.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7497,6 +7505,24 @@ migrate, then delete.
   `const { … } = Deno.core.ops; await op()` answers column 43, the `await`.
   `api::Module::name` is the second exposure, the name a message reports as the
   module's script.
+- **The streaming hook exists only with the `wasm` feature — named here with the
+  edit, and it is a build fix rather than a capability.** `HostHooks`'s two
+  streaming items and `host.rs`'s two free dispatches name
+  `api::WasmStreaming`, which the `wasm` feature is what exports, and nothing
+  gated them — so three promised configurations could not compile:
+  `cargo check -p runtime --no-default-features`, `cargo test -p jit` (whose
+  manifest takes `runtime` with `default-features = false` on purpose: a host may
+  drop the JS API without that crate re-enabling it through unification), and
+  the README's interpreter-only `cargo check -p cli --no-default-features
+  --features jit`. All three failed the same way — `cannot find type
+  WasmStreaming in module crate::api` at `host.rs:101` and `:196` — and each
+  passes now that both halves are `#[cfg(feature = "wasm")]`. Nothing about the
+  compiled engine changes: every workspace, sweep and deno build unifies the
+  feature on, so the items are compiled exactly as before, and `crates/v8` is
+  unaffected because it turns `runtime/wasm` on deliberately. The configuration
+  became a gate instead of a claim: CI runs the engine's suite wasm-free
+  (`cargo test -p runtime --no-default-features --lib`, 884 tests) and the
+  interpreter-only check beside it.
 
 ## 11. Working rules
 

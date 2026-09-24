@@ -70,6 +70,19 @@ jobs:
       # vendored test262 fixtures, and the wasm decode/validation fixtures.
       - name: Test the workspace
         run: cargo test --locked --workspace
+      # The workspace unifies features, so it only ever builds the engine with
+      # its default `wasm` feature on. The wasm-free shapes are configurations
+      # nothing else compiles: `runtime`'s own manifests promise them (the `jit`
+      # and `cli` dependencies take it with `default-features = false`, which is
+      # the point of that crate's manifest comment) and the README documents the
+      # interpreter-only binary. Its suite runs here rather than only being
+      # built, so an item that names a wasm-gated type without the feature —
+      # which is how both of these broke — is caught by a gate instead of by a
+      # downstream consumer's build.
+      - name: Test the wasm-free engine
+        run: cargo test --locked -p runtime --no-default-features --lib
+      - name: Check the interpreter-only binary
+        run: cargo check --locked -p cli --no-default-features --features jit
 
   # The sweep areas run as separate jobs, which is also how they are measured
   # locally: `annexB` is small and `language`/`built-ins` are ~24k fixtures each.

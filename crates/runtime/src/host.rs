@@ -83,6 +83,13 @@ pub trait HostHooks: std::fmt::Debug {
     /// bytes — V8 requires one to be installed and checks it — so an engine that
     /// is asked without one refuses the call rather than answering a promise
     /// nothing will ever settle. The default refuses.
+    ///
+    /// Both halves of the hook exist only with the `wasm` feature: a build
+    /// without it has no `WebAssembly` global to stream into, and no
+    /// `api::WasmStreaming` for the parameter below, so the trait has no such
+    /// method there. A host that implements these without the feature is
+    /// implementing a hook its build cannot reach.
+    #[cfg(feature = "wasm")]
     fn has_wasm_streaming_callback(&self) -> bool {
         false
     }
@@ -95,6 +102,7 @@ pub trait HostHooks: std::fmt::Debug {
     /// The default refuses, which [`has_wasm_streaming_callback`]
     /// (Self::has_wasm_streaming_callback) is what answers for a host that has
     /// not installed one.
+    #[cfg(feature = "wasm")]
     fn wasm_streaming(
         &self,
         _source: &crux::value::Value,
@@ -180,6 +188,10 @@ pub fn prepare_stack_trace(
 
 /// Whether the agent's hooks handle streaming compilation (see
 /// [`HostHooks::has_wasm_streaming_callback`]).
+///
+/// Only with the `wasm` feature: the hook is part of the JS API, and the
+/// `api::WasmStreaming` the dispatch below hands over is exported with it.
+#[cfg(feature = "wasm")]
 pub fn has_wasm_streaming_callback(agent: &crate::agent::Agent) -> bool {
     match &agent.host_hooks {
         Some(hooks) => hooks.has_wasm_streaming_callback(),
@@ -190,6 +202,7 @@ pub fn has_wasm_streaming_callback(agent: &crate::agent::Agent) -> bool {
 /// The streaming hook dispatch: hand `source` and `streaming` to the agent's
 /// hooks. Called once the source `WebAssembly.compileStreaming` was given has
 /// resolved.
+#[cfg(feature = "wasm")]
 pub fn wasm_streaming(
     agent: &crate::agent::Agent,
     source: &crux::value::Value,
