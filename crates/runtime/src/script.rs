@@ -90,6 +90,7 @@ pub fn script_evaluation(
         private_environment: None,
         source: Some(script.source.clone()),
         annex_b_hoistable: Default::default(),
+        position: None,
     };
     agent.execution_context_stack.push(context);
 
@@ -845,6 +846,7 @@ pub fn perform_eval(
         private_environment: private_env,
         source: Some(eval_source),
         annex_b_hoistable: Default::default(),
+        position: None,
     };
     agent.execution_context_stack.push(eval_context);
     let result = (|| -> Result<Value, JsError> {

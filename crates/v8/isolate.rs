@@ -54,13 +54,11 @@ pub struct CreateParams {
     /// The heap the isolate takes ownership of for host objects
     /// (`CreateParams::cpp_heap`).
     cpp_heap: Option<Heap>,
-    /// The heap sizes a host asked for (`CreateParams::heap_limits`).
-    ///
-    /// **Recorded, not enforced.** Slag's heap is not V8's and imposes no size
-    /// limit, so there is nothing for these numbers to bound: a host that arms
-    /// a near-heap-limit callback will not see it fire from them. Kept rather
-    /// than dropped because a host sets them before `Isolate::new` and would
-    /// otherwise get no answer at all to what it asked for.
+    /// The heap sizes a host asked for (`CreateParams::heap_limits`): the
+    /// maximum is enforced against the heap's live-box footprint and fires the
+    /// near-heap-limit callback, and the initial value is what that callback is
+    /// handed as V8's `initial_heap_limit`. A maximum of 0 is V8's own default
+    /// — no limit — and leaves the engine's heap unbounded, as it was.
     heap_limits: Option<(usize, usize)>,
 }
 
@@ -94,7 +92,9 @@ impl CreateParams {
     }
 
     /// The heap's initial and maximum size in bytes
-    /// (v8::CreateParams::heap_limits) — recorded, not enforced; see the field.
+    /// (v8::CreateParams::heap_limits): a maximum above zero is enforced, and
+    /// the callback a heap that reaches it runs answers the limit to continue
+    /// with.
     pub fn heap_limits(mut self, initial: usize, maximum: usize) -> Self {
         self.heap_limits = Some((initial, maximum));
         self
@@ -624,7 +624,10 @@ impl Isolate {
     /// carried and not consumed (see [`CreateParams`]). Its heap does not — the
     /// isolate takes ownership of one, because every isolate here has one.
     pub(crate) fn with(params: CreateParams, creator: Option<SnapshotCreator>) -> OwnedIsolate {
-        let engine = *api::Isolate::new();
+        let mut engine = *api::Isolate::new();
+        if let Some((initial, maximum)) = params.heap_limits {
+            engine.set_heap_limits(initial, maximum);
+        }
         let cpp_heap = match params.cpp_heap {
             Some(heap) => heap,
             None => Heap::new(),
@@ -1331,31 +1334,53 @@ impl Isolate {
         let _ = callback;
     }
 
-    /// The callback a heap close to its limit would run
+    /// The callback a heap close to its limit runs
     /// (v8::Isolate::AddNearHeapLimitCallback).
     ///
-    /// Accepted and not run: nothing runs out of heap here — the engine grows
-    /// its heap rather than enforcing a limit — so there is no moment at which
-    /// this could fire. The host's pointer is dropped with the rest.
+    /// The engine fires it when the heap's live-box footprint reaches the limit
+    /// `CreateParams::heap_limits` set, and continues with the limit the
+    /// callback answers — so a host that terminates the execution inside it
+    /// stops the run, and one that raises the limit keeps it going. The `data`
+    /// pointer is the host's own, kept as it was registered and not owned here:
+    /// V8's contract is that the host keeps it alive until it removes the
+    /// callback. The callback gets no isolate, here as there, so it cannot
+    /// re-enter the engine.
     pub fn add_near_heap_limit_callback(
         &mut self,
         callback: NearHeapLimitCallback,
         data: *mut c_void,
     ) {
-        let _ = (callback, data);
+        // Kept as a `usize` so the boxed closure carries nothing but plain data
+        // (the pointer is the host's; see the contract above).
+        let data = data as usize;
+        let boxed: api::NearHeapLimitCallback = Box::new(move |current, initial| {
+            // SAFETY: the host's contract for `AddNearHeapLimitCallback`: the
+            // callback is live for as long as it is registered and `data` is the
+            // pointer it was registered with.
+            unsafe { callback(data as *mut c_void, current, initial) }
+        });
+        self.inner_mut()
+            .engine
+            .set_near_heap_limit_callback(Some(boxed));
     }
 
     /// Withdraw a heap-limit callback and restore the limit
     /// (v8::Isolate::RemoveNearHeapLimitCallback).
     ///
-    /// Accepted and not run, for the reason above: there is no registered
-    /// callback to withdraw and no limit to restore.
+    /// The limit is only replaced when the host names one above zero, which is
+    /// what `deno_core` passes when it swaps callbacks: V8's own 0 keeps the
+    /// limit in force. The callback argument is not compared against the one
+    /// registered, because the engine keeps one slot — V8 keeps one callback
+    /// too, so a host that passes a different function would be asking to remove
+    /// something that was never installed.
     pub fn remove_near_heap_limit_callback(
         &mut self,
-        callback: NearHeapLimitCallback,
+        _callback: NearHeapLimitCallback,
         heap_limit: usize,
     ) {
-        let _ = (callback, heap_limit);
+        self.inner_mut()
+            .engine
+            .remove_near_heap_limit_callback(heap_limit);
     }
 
     /// Tell the engine that the isolate is about to wait for work

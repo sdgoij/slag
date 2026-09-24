@@ -1679,6 +1679,7 @@ fn execute_module_body(
         private_environment: None,
         source: Some(module.source.clone()),
         annex_b_hoistable: Default::default(),
+        position: None,
     };
     agent.execution_context_stack.push(context.clone());
     let strict = true;

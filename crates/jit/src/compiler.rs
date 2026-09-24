@@ -241,7 +241,7 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             // The vector-form construct: `[callee]` on the work stack (the
             // arguments are in the Vm's vector), popped and replaced by the
             // result — net 0.
-            Step::Construct => {}
+            Step::Construct { .. } => {}
             // A tagged template pops the tag + its `this` (2) and pushes the
             // result (1) — net -1.
             Step::TaggedTemplate(_) | Step::TailTaggedTemplate(_) => {
@@ -318,7 +318,7 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             // Control steps (Cut 55): `Return`/`Throw` pop their value; the
             // transfers (`Exit`/`Break`/`Continue`/`FinallyEnd`) and the
             // try/block machinery leave the stack as-is.
-            Step::Return | Step::Throw => depth = depth.saturating_sub(1),
+            Step::Return | Step::Throw { .. } => depth = depth.saturating_sub(1),
             // Switch steps (Cut 56): `SwitchDisc` and `SwitchTest` pop.
             Step::SwitchDisc | Step::SwitchTest { .. } => depth = depth.saturating_sub(1),
             // for-in/for-of machinery (Cut 57): `ForInBegin`/`ForOfBegin`
@@ -503,7 +503,7 @@ fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Call { .. } | Step::CallFast { .. } => "Call",
         Step::CallApply { .. } => "CallApply",
-        Step::Construct => "Construct",
+        Step::Construct { .. } => "Construct",
         Step::TaggedTemplate(_) | Step::TailTaggedTemplate(_) => "TaggedTemplate",
         Step::CallFastGlobal { .. }
         | Step::CallFastSlot { .. }
@@ -518,7 +518,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::TailCallSelfCheck { .. }
         | Step::TailCallSelfVector
         | Step::TailCallSelfCheckVector => "TailCall",
-        Step::Throw => "Throw",
+        Step::Throw { .. } => "Throw",
         Step::LoadIdent { .. } => "LoadIdent",
         Step::Unary(_) => "Unary",
         Step::EnterTry { .. } => "EnterTry",
@@ -4947,7 +4947,11 @@ impl<'a> Lowerer<'a> {
                     self.fall_through(index);
                 }
             }
-            Step::CallFast { argc, direct_eval } => {
+            Step::CallFast {
+                argc,
+                direct_eval,
+                span: _,
+            } => {
                 // `[..., this, callee, a1..aN]` on the JIT stack; the probe
                 // reads the callee by address, and the in-frame leaf path
                 // (when the callee is an inlineable leaf) replaces the whole
@@ -4985,7 +4989,11 @@ impl<'a> Lowerer<'a> {
                     true,
                 )?;
             }
-            Step::CallApply { argc, kind } => {
+            Step::CallApply {
+                argc,
+                kind,
+                span: _,
+            } => {
                 // M10: `[..., f, apply/call, thisArg, a1..aN]` — the `CallFast`
                 // layout with `argc` = N+1. When the member read resolved the
                 // realm's intrinsic `apply`/`call` (compared against the ctx's
@@ -5168,7 +5176,11 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
                 self.builder.seal_block(slow);
             }
-            Step::CallFastSlot { slot, argc } => {
+            Step::CallFastSlot {
+                slot,
+                argc,
+                span: _,
+            } => {
                 // `[..., a1..aN]` — the fused slot call (`do_call_fast_slot`
                 // reads the callee from the frame and passes `undefined` as
                 // `this`; the fuse guards rule out an argument that writes
@@ -5186,6 +5198,7 @@ impl<'a> Lowerer<'a> {
                 name,
                 argc,
                 direct_eval,
+                span: _,
             } => {
                 // Cut 65: `[..., a1..aN]` — the fused global call
                 // (`do_call_fast_global` reads the callee from the global
@@ -5277,7 +5290,10 @@ impl<'a> Lowerer<'a> {
                 self.call_slow(self.sig_bool, Helper::ArgsSpread, &[iterable])?;
                 self.fall_through(index);
             }
-            Step::Call { direct_eval } => {
+            Step::Call {
+                direct_eval,
+                span: _,
+            } => {
                 // The vector `Call`: `[this, callee]` on the work stack, the
                 // arguments in `Vm::args`. The helper bridges both onto
                 // `vm.stack` and runs the interpreter's vector `do_call`.
@@ -5295,7 +5311,7 @@ impl<'a> Lowerer<'a> {
                 self.push(result);
                 self.fall_through(index);
             }
-            Step::Construct => {
+            Step::Construct { .. } => {
                 // The vector-form construct: `[callee]` on the work stack,
                 // the arguments in `Vm::args` (built by `ArgsBase`/
                 // `ArgsPush`/`ArgsSpread` through the helpers). The helper
@@ -5856,7 +5872,7 @@ impl<'a> Lowerer<'a> {
                     self.builder.ins().return_(&[value]);
                 }
             }
-            Step::Throw => {
+            Step::Throw { .. } => {
                 let value = self.pop();
                 let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
                 self.emit_dispatch_call(self.sig_update, Helper::ThrowControl, &[ip, value])?;

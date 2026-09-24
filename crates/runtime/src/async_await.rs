@@ -147,6 +147,7 @@ pub fn call_async_function(
                 .and_then(|context| context.source.clone())
         }),
         annex_b_hoistable: Default::default(),
+        position: None,
     };
     agent.execution_context_stack.push(context.clone());
     let promise_ctor = agent

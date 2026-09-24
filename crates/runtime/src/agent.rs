@@ -256,6 +256,13 @@ fn unregister_live_agent(signifier: u64) {
     });
 }
 
+/// The host's near-heap-limit callback
+/// (v8::Isolate::AddNearHeapLimitCallback): the limit that was reached and the
+/// one the host first asked for go in, the limit to continue with comes out.
+/// Boxed because the agent owns it; the host's own `data` pointer lives inside
+/// the closure the bridge builds around it.
+pub type NearHeapLimitCallback = Box<dyn FnMut(usize, usize) -> usize>;
+
 pub struct Agent {
     pub execution_context_stack: Vec<ExecutionContext>,
     /// A termination request (v8::Isolate::TerminateExecution). The request has
@@ -264,6 +271,18 @@ pub struct Agent {
     /// read at the points the engine already stops at — a loop's back edge, the
     /// compiled loop's probe, and a call.
     termination: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A host's heap size limit (`v8::CreateParams::heap_limits`'s maximum), in
+    /// bytes, measured against the arena's live-box footprint. `None` — no
+    /// limit — is this engine's default, and what V8's own default maximum of 0
+    /// spells.
+    heap_limit: Option<usize>,
+    /// The limit the host first asked for, which the callback is handed as
+    /// V8's `initial_heap_limit`.
+    initial_heap_limit: usize,
+    /// The host's near-heap-limit callback, which answers the limit to continue
+    /// with. At most one, because V8 keeps one: a host that registers a second
+    /// removes the first, which is why only the last one can ever run.
+    near_heap_limit: Option<NearHeapLimitCallback>,
     /// The IC caches shared by every Vm run in this agent (the global-var
     /// cells and the P3 member/element cells). They lived on the Vm before,
     /// so every function call and script evaluation started cold and
@@ -1070,6 +1089,64 @@ impl Agent {
         self.termination.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The heap limit a host asked for, if any
+    /// (`v8::CreateParams::heap_limits`).
+    pub fn set_heap_limits(&mut self, initial: usize, maximum: usize) {
+        self.initial_heap_limit = initial;
+        // V8's default maximum is 0, which means "no limit": a host that asks
+        // for 0 must not be given one at zero bytes, which would fire the
+        // callback on the first allocation.
+        self.heap_limit = (maximum > 0).then_some(maximum);
+    }
+
+    /// The limit in force, if any. A host reads its own limit back through this
+    /// (`v8::Isolate::GetHeapStatistics`'s `heap_size_limit`), and the
+    /// callback's answer replaces it.
+    pub fn heap_limit(&self) -> Option<usize> {
+        self.heap_limit
+    }
+
+    /// Install the host's near-heap-limit callback
+    /// (`v8::Isolate::AddNearHeapLimitCallback`). A replacement is the whole of
+    /// "a second callback": see the field.
+    pub fn set_near_heap_limit_callback(&mut self, callback: Option<NearHeapLimitCallback>) {
+        self.near_heap_limit = callback;
+    }
+
+    /// Withdraw the callback and restore the limit the host named
+    /// (`v8::Isolate::RemoveNearHeapLimitCallback`), where 0 is "leave the limit
+    /// alone" — which is what `deno_core` passes.
+    pub fn clear_near_heap_limit_callback(&mut self, heap_limit: usize) {
+        self.near_heap_limit = None;
+        if heap_limit > 0 {
+            self.heap_limit = Some(heap_limit);
+        }
+    }
+
+    /// Fire the host's callback when the live heap has reached the limit it set
+    /// — this engine's substitute for a V8 out-of-memory, which it cannot have
+    /// because its arena grows instead. Read at every budget crossing, after
+    /// that trigger's collections, so a collection that reclaimed enough does
+    /// not fire it. A host that terminates the execution inside its callback
+    /// stops the run at the next check point; one that answers a larger limit
+    /// keeps it going.
+    fn check_heap_limit(&mut self) {
+        let Some(limit) = self.heap_limit else {
+            return;
+        };
+        let Some(callback) = self.near_heap_limit.as_mut() else {
+            return;
+        };
+        let live = crux::heap::with_heap(|heap| heap.allocated_bytes());
+        if live < limit {
+            return;
+        }
+        // The callback gets no isolate, so it cannot re-enter the engine; the
+        // borrow below is what that shape buys.
+        let next = callback(limit, self.initial_heap_limit);
+        self.heap_limit = Some(next);
+    }
+
     pub fn new() -> Self {
         crate::function::ensure_ecma_hook();
         // Built before the struct so the wasm store can share the very flag a
@@ -1078,6 +1155,9 @@ impl Agent {
         Self {
             execution_context_stack: Vec::new(),
             termination: std::sync::Arc::clone(&termination),
+            heap_limit: None,
+            initial_heap_limit: 0,
+            near_heap_limit: None,
             global_cells: [None; crate::ir::GLOBAL_CELLS],
             global_value_cells: Box::new(std::array::from_fn(|_| {
                 crate::jit::GlobalValueCell::empty()
@@ -1481,6 +1561,7 @@ impl Agent {
             private_environment: None,
             source: None,
             annex_b_hoistable: Default::default(),
+            position: None,
         });
     }
 
@@ -2198,6 +2279,9 @@ impl Agent {
             self.clear_derived_caches();
             self.collect_garbage();
         }
+        // After the collections, so a host's heap-limit callback is not fired
+        // for a heap a collection just brought back under the limit.
+        self.check_heap_limit();
     }
 
     /// Drop the caches whose contents a live receiver already reaches before a

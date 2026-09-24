@@ -367,7 +367,7 @@ impl<T: Trace> Gc<T> {
                     data: value,
                 });
             }
-            heap.note_alloc(raw as usize);
+            heap.note_alloc(raw as usize, size);
             Gc {
                 ptr: unsafe { NonNull::new_unchecked(raw) },
                 _not_send_sync: std::marker::PhantomData,
@@ -401,7 +401,7 @@ impl<T: Trace> Gc<T> {
                 boxed.header.vtable = GcBox::<T>::VTABLE;
                 init(std::ptr::addr_of_mut!(boxed.data));
             }
-            heap.note_alloc(raw as usize);
+            heap.note_alloc(raw as usize, size);
             Gc {
                 ptr: unsafe { NonNull::new_unchecked(raw) },
                 _not_send_sync: std::marker::PhantomData,
@@ -677,6 +677,12 @@ pub struct Heap {
     /// Live boxes, maintained by allocation and the sweep. The growth
     /// trigger (`Agent::maybe_collect`) and the leak harness read it.
     live_boxes: usize,
+    /// The bytes those live boxes occupy, as the allocator accounts them: a
+    /// box's rounded footprint added at allocation and subtracted at the
+    /// sweep. [`Heap::live_bytes`] answers the same number by walking the
+    /// arena; this is the O(1) form the heap-limit check reads, which cannot
+    /// afford the walk.
+    live_bytes: usize,
     /// The young cohort (A1): the boxes allocated since the last collection,
     /// in allocation order. A minor collection (A3) enumerates young boxes
     /// from here, so it costs O(young) rather than O(live); a box that
@@ -1378,6 +1384,7 @@ impl Heap {
             order: Vec::new(),
             free: [const { Vec::new() }; FREE_CLASSES],
             live_boxes: 0,
+            live_bytes: 0,
             young: Vec::new(),
             arena_low: usize::MAX,
             arena_high: 0,
@@ -1389,6 +1396,13 @@ impl Heap {
     /// Number of live boxes (the growth trigger and the leak harness).
     pub fn live_count(&self) -> usize {
         self.live_boxes
+    }
+
+    /// The live boxes' footprint in bytes, O(1): the counter the allocator and
+    /// the sweeps maintain, not [`Heap::live_bytes`]'s walk. A host's heap
+    /// limit is measured against this.
+    pub fn allocated_bytes(&self) -> usize {
+        self.live_bytes
     }
 
     /// Number of boxes allocated since the last collection (A1's cohort).
@@ -1428,6 +1442,10 @@ impl Heap {
     /// A walk rather than a counter because a counter would be one more write on
     /// the allocation path, and a host asks this for a diagnostic. Swept slots
     /// are not counted: the walk filters on the box's live bit.
+    ///
+    /// The heap limit needed that write anyway, so the counter exists
+    /// ([`Heap::allocated_bytes`], `live_bytes`) and this walk is now the slow
+    /// path a test can check the counter against.
     pub fn live_bytes(&self) -> usize {
         let mut total = 0;
         self.for_each_live(|header| {
@@ -1514,8 +1532,9 @@ impl Heap {
 
     /// Record a freshly allocated (young) box, which the collector cannot see
     /// until it is rooted.
-    fn note_alloc(&mut self, addr: usize) {
+    fn note_alloc(&mut self, addr: usize, size: usize) {
         self.live_boxes += 1;
+        self.live_bytes += size;
         self.young.push(addr);
     }
 
@@ -1951,6 +1970,7 @@ impl Heap {
                     }
                     swept.push(addr);
                     self.live_boxes -= 1;
+                    self.live_bytes -= size;
                 }
             }
         }
@@ -2345,6 +2365,7 @@ impl Heap {
                             }
                             swept.push(addr);
                             self.live_boxes -= 1;
+                            self.live_bytes -= size;
                         }
                     }
                     addr += size;
@@ -2580,6 +2601,46 @@ mod tests {
             start,
             "cycle is unreachable and swept"
         );
+    }
+
+    /// The O(1) byte counter the heap limit reads must agree with the arena walk
+    /// a diagnostic asks for: at the start, while boxes are live, after each of
+    /// the two sweeps, and after a collection that keeps a survivor.
+    #[test]
+    fn allocated_bytes_matches_the_arena_walk() {
+        let base = with_heap(|heap| (heap.allocated_bytes(), heap.live_bytes()));
+        assert_eq!(base.0, base.1, "the counter starts where the walk does");
+        let both_counted = |what: &str| {
+            assert_eq!(
+                with_heap(|heap| heap.allocated_bytes()),
+                with_heap(|heap| heap.live_bytes()),
+                "{what}: both allocated boxes are counted"
+            );
+        };
+        let back_to_base = |what: &str| {
+            assert_eq!(
+                with_heap(|heap| (heap.allocated_bytes(), heap.live_bytes())),
+                base,
+                "{what}: the sweep subtracts what it frees"
+            );
+        };
+        let unreachable_pair = || {
+            let a = Gc::new(Node::default());
+            let b = Gc::new(Node::default());
+            a.next.borrow_mut().replace(b);
+            b.next.borrow_mut().replace(a);
+        };
+        unreachable_pair();
+        both_counted("young");
+        with_heap_mut(|heap| heap.collect_minor(&[]));
+        back_to_base("minor");
+        unreachable_pair();
+        with_heap_mut(|heap| heap.collect(&[]));
+        back_to_base("major");
+        let root = Gc::new(Node::default());
+        with_heap_mut(|heap| heap.collect(&[root.as_any()]));
+        both_counted("survivor");
+        assert!(with_heap(|heap| heap.allocated_bytes()) > base.0);
     }
 
     #[test]

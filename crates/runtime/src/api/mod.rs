@@ -31,6 +31,7 @@ mod try_catch;
 #[cfg(feature = "wasm")]
 mod wasm;
 
+pub use crate::agent::NearHeapLimitCallback;
 pub use context::{Context, ContextScope};
 pub use external::External;
 pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal};
@@ -228,6 +229,35 @@ impl Isolate {
     /// isolate from another thread (`Isolate` is thread-local; the flag is not).
     pub fn termination_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.agent.termination_flag()
+    }
+
+    /// A host's heap size limit (`v8::CreateParams::heap_limits`), measured
+    /// against the heap's live-box footprint. A `maximum` of 0 is V8's "no
+    /// limit", which is what an isolate that never sets one has.
+    pub fn set_heap_limits(&mut self, initial: usize, maximum: usize) {
+        self.agent.set_heap_limits(initial, maximum);
+    }
+
+    /// The heap limit in force, if any
+    /// (v8::Isolate::GetHeapStatistics's `heap_size_limit`).
+    pub fn heap_limit(&self) -> Option<usize> {
+        self.agent.heap_limit()
+    }
+
+    /// Install the callback a heap that reached its limit runs
+    /// (`v8::Isolate::AddNearHeapLimitCallback`); `None` withdraws one.
+    pub fn set_near_heap_limit_callback(
+        &mut self,
+        callback: Option<crate::agent::NearHeapLimitCallback>,
+    ) {
+        self.agent.set_near_heap_limit_callback(callback);
+    }
+
+    /// Withdraw the callback and set the limit to restore
+    /// (`v8::Isolate::RemoveNearHeapLimitCallback`), where 0 leaves the limit
+    /// alone.
+    pub fn remove_near_heap_limit_callback(&mut self, heap_limit: usize) {
+        self.agent.clear_near_heap_limit_callback(heap_limit);
     }
 }
 
@@ -474,6 +504,85 @@ mod tests {
         isolate.cancel_terminate_execution();
         assert!(!context.eval("1 + 1").is_empty());
         watchdog.join().unwrap();
+    }
+
+    /// A string-building loop that allocates steadily, bounded so a limit that
+    /// never fires fails a test rather than hanging it. An IIFE, because the
+    /// tests run it more than once and a script-level `let` cannot be declared
+    /// twice in one realm.
+    const ALLOCATING_LOOP: &str =
+        "(function () { let s = ''; for (let i = 0; i < 20000; i++) s += 'xxxxxxxxxxxxxxxx'; })();";
+
+    /// A host's `heap_limits` are enforced against the live heap, and the
+    /// callback a heap that reaches them runs is handed the host's own numbers
+    /// and answers the limit to continue with — which is how a host that raises
+    /// the limit keeps a loop going and how `deno_core` asserts the first of two
+    /// callbacks never runs.
+    #[test]
+    fn a_heap_limit_fires_the_hosts_callback_with_the_hosts_own_limits() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        const MAX: usize = 64 * 1024;
+        isolate.set_heap_limits(0, MAX);
+        let seen = Rc::new(std::cell::RefCell::new(Vec::<(usize, usize)>::new()));
+        let inner = Rc::clone(&seen);
+        isolate.set_near_heap_limit_callback(Some(Box::new(move |current, initial| {
+            inner.borrow_mut().push((current, initial));
+            current * 2
+        })));
+        assert!(
+            !context.eval(ALLOCATING_LOOP).is_empty(),
+            "the loop completed"
+        );
+        let firings = seen.borrow().len();
+        assert!(
+            firings >= 2,
+            "the callback ran at least twice, saw {firings}"
+        );
+        assert_eq!(
+            seen.borrow()[0],
+            (MAX, 0),
+            "the host's own limits are what it is handed"
+        );
+        assert_eq!(
+            seen.borrow()[1].0,
+            MAX * 2,
+            "the answer replaces the limit, so the next firing is at the doubled one"
+        );
+        // Withdrawn, it stops running: the limit is dropped far below anything
+        // the loop allocates, so a callback still installed would fire at once
+        // and the run staying clean is what says it was withdrawn.
+        isolate.remove_near_heap_limit_callback(0);
+        assert_eq!(isolate.heap_limit(), Some(MAX * (1 << firings)));
+        isolate.set_heap_limits(0, 1024);
+        assert!(!context.eval(ALLOCATING_LOOP).is_empty());
+        assert_eq!(seen.borrow().len(), firings, "a withdrawn callback is gone");
+    }
+
+    /// The shape deno's heap-limit tests use: the callback asks the running
+    /// execution to stop, so the loop ends at the next check point with the same
+    /// error a JS termination produces.
+    #[test]
+    fn a_heap_limit_callback_that_terminates_stops_the_run() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        isolate.set_heap_limits(0, 64 * 1024);
+        let flag = isolate.termination_flag();
+        isolate.set_near_heap_limit_callback(Some(Box::new(move |current, _initial| {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            current * 2
+        })));
+        assert!(context.eval(ALLOCATING_LOOP).is_empty(), "the loop stopped");
+        let exception = isolate.pending_exception().expect("the termination error");
+        let exception = crate::context::as_object(&exception).unwrap();
+        let name = exception
+            .get(&crux::string::JsString::from_utf8("name"))
+            .unwrap();
+        let message = exception
+            .get(&crux::string::JsString::from_utf8("message"))
+            .unwrap();
+        assert_eq!(name.to_string(), "Error");
+        assert_eq!(message.to_string(), "execution terminated");
     }
 
     #[test]

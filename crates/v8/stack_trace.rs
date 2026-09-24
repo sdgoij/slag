@@ -276,10 +276,10 @@ mod tests {
     /// by frame:
     ///
     /// - a certified call is a frame (the engine pushes a context for it), and
-    ///   it is **unnamed**: the push fills the frame's `function` slot only for
-    ///   the one reader certification leaves in it, so a body that does not read
-    ///   a sloppy `arguments` reports no name;
-    /// - a call whose body does read one appears named;
+    ///   it is named: the push fills the frame's `function` slot for every call,
+    ///   because the reader that wants it is a host's error stack (§7's frames
+    ///   record), not only a sloppy body's mapped `arguments`;
+    /// - a call whose body reads `arguments` names its frame the same way;
     /// - the script the code came from is always a frame.
     ///
     /// See the module documentation and `.notes/embedding.md` §7/§9.
@@ -287,15 +287,15 @@ mod tests {
     fn a_capture_reports_the_engines_contexts_not_the_call_stack() {
         assert_eq!(
             capture_frames("function inner() { return capture(); } inner();"),
-            ["-@-", "-@-"],
-            "a certified call is an activation: the frame is there, unnamed"
+            ["inner@-", "-@-"],
+            "a certified call is an activation, and it is named"
         );
         assert_eq!(
             capture_frames(
                 "function inner(a) { if (a) { return arguments; } return capture(); } inner(0);"
             ),
             ["inner@-", "-@-"],
-            "a call whose body reads `arguments` names its frame, innermost first"
+            "a call whose body reads `arguments` names its frame too"
         );
     }
 

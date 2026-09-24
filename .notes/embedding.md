@@ -4127,6 +4127,103 @@ the wasm or termination path this change owns; they are recorded here as the sui
 current state, not A/B'd against a pre-change binary, because the earlier hang meant
 this run was the first to reach them.
 
+*The heap limit and its callback — §9 item 22, and the hang this record's wasm half
+revealed.* deno's `test_heap_limits` and `test_heap_limit_cb_multiple` went from hanging
+to passing:
+
+- *The engine measures.* `crux::Heap` keeps a `live_bytes` counter beside `live_boxes`
+  (added at allocation, subtracted by both sweeps) and answers it O(1) through
+  `allocated_bytes()`; `Heap::live_bytes` stays the walking form, and its doc no longer
+  claims a counter would cost too much — the limit is what bought it.
+- *The agent decides.* `Agent` carries `heap_limit`, `initial_heap_limit` and at most one
+  `near_heap_limit` callback. `set_heap_limits` reads a maximum of 0 the way V8 does, as
+  "no limit"; `clear_near_heap_limit_callback` replaces the limit only when the host
+  names one above zero, which is what `deno_core` passes when it swaps callbacks (so
+  `test_heap_limit_cb_remove`'s bookkeeping matches the engine's); and `check_heap_limit`
+  runs from `maybe_collect` — the point the interpreter's back edge and the JIT's probe
+  already reach every budget crossing — *after* that trigger's collections, so a
+  collection that reclaimed enough does not fire it. The callback's answer replaces the
+  limit.
+- *The bridge stops lying.* `CreateParams::heap_limits` is enforced at isolate creation,
+  and `add_near_heap_limit_callback` / `remove_near_heap_limit_callback` install and
+  withdraw the callback rather than accepting and ignoring it.
+
+*Tests — three, two mutations, each caught.* The counter test in `crux` walks both
+sweeps: a missing subtraction fails it on the *minor* path (the counter says `64` where
+the walk says `0`) and a missing addition fails it on the allocation path. That test's
+first version used only the major sweep and the minor mutation **passed** — the mutation
+is what found the coverage hole, and the test now takes both sweeps and a survivor. The
+two `runtime` tests drive the api: the callback is handed the host's own numbers and its
+answer *is* the next limit (not storing the answer fails it — `65536` where the doubled
+`131072` is expected), and a callback that terminates stops the loop with
+`Error: execution terminated`, which is deno's own shape. Removing the `check_heap_limit`
+call fails both. One mutation was rejected as not semantic: `Some(next.max(limit))` for
+`Some(next)` cannot be distinguished by a doubling callback, which is what every host in
+the frontier installs.
+
+*The measurement.* deno's three heap-limit tests pass in 0.21 s — `test_heap_limits`,
+`test_heap_limit_cb_remove`, and `test_heap_limit_cb_multiple`, which hung. deno's
+`terminate` filter is unchanged at **4/0** and the snapshot suite at **18/0**.
+
+*Gates.* `cargo test --locked --workspace` green; runtime `--lib` **898** (896 plus the
+two), crux `--lib` **249** (248 plus the one); `cargo fmt --all -- --check` and
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean. Both corpora
+re-run, because the counter is on every allocation and every sweep: test262 `all`
+reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of
+48,622) and the wasm sweeps reproduce theirs (core **20,662**, the seven proposal suites,
+**64,594 / 0 fail / 0 pending**, js-api **1,001 tests, 0 fail**).
+
+*Frames with names and positions — §9 item 24, the half of the stack work the deno
+failures actually need.* The engine now records where each frame is and who it is:
+
+- `ExecutionContext::position` (the site the code in it is at) is published by the
+  interpreter at the call, throw and construct steps the compiler now stamps a span on,
+  including the fused call forms — and the two store fusions carry the site through from
+  the step they replace, so a `x = f(args)` call site is not lost.
+- The certified call's context always fills `function` (one `Value` store per call), so a
+  frame is named rather than `<anonymous>`.
+- `define_stack` renders `at name:line:column`, or `at name (file:line:column)` for a
+  module frame, resolving the span against the frame's own source text; and
+  `Error.captureStackTrace`'s `constructorOpt` — the limit item 23 recorded as ignored —
+  now drops that constructor's frame and every older one.
+
+*Tests — four, each mutation-checked.* `a_frame_carries_the_site_its_code_is_at` pins
+`Error: x\n    at boom:1:26\n    at <anonymous>:2:1` exactly; its first two runs are the
+mutations that found the gaps (the outer call's site missing, and the frame unnamed), and
+dropping `set_site` from the construct arm leaves `at boom` with no position, which is
+caught. `capture_stack_trace_strips_from_the_named_constructor_outward` pins the
+stripping against the unstripped case.
+
+*The measurement.* deno's ops/error cluster, re-run whole: **45 passed, 3 failed**.
+`test_op_bool_to_from_v8_error` moved from a bare `Error: ...` with a
+`buildCustomError` frame to `TypeError: ...` with the frame set deno expects (the
+positions `:4:7` and the stripping are both right) — what is left there is the
+*exception's message*, which deno reads from the bridge's `Message::get`, and that still
+answers `Uncaught <value>` rather than the error's stack. `test_dynamic_import_module_error_stack`
+now carries the right text (`TypeError: foo`) but still reports deno's promise-rejection
+formatting, which is the same `Message`/stack surfacing. One failure was **newly observed**
+by this filter — `test_op_detached_buffer` (`runtime::tests::ops`), a detached-ArrayBuffer
+test the earlier narrower filters never matched; it is not this part's and is recorded as
+newly seen.
+
+*Still to do on this item, named so the next reader does not re-derive it:* the bridge's
+`Message::get` must answer the thrown error's stack (its `name: message` header plus the
+frames this record now produces) instead of `Uncaught <value>`, which is what both
+remaining failures in the cluster wait on.
+
+*Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
+--locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
+— `target.clone()` on a `Value`, which is `Copy`; `cargo test --locked --workspace`
+green after it caught a second — the v8 bridge's
+`a_capture_reports_the_engines_contexts_not_the_call_stack`, which had pinned the very
+rule this part reverses ("a certified call is unnamed"), so the test now pins the named
+frame and its doc says why the reader changed. The corpora were re-run, because the spans
+sit on the interpreter's call path and `context.function` is now written on every
+certified call: test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0
+crash, 0 hang**, 158 skip of 48,622) and the wasm sweeps reproduce theirs (core **20,662**,
+the seven proposal suites, **64,594 / 0 fail / 0 pending**, js-api **1,001 tests, 0
+fail**). Runtime `--lib` **905** with the workspace's features on.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -6457,6 +6554,92 @@ a frame view of the running stack. §7's survey already split the subsystem: the
         0 hanging**, snapshot suite unchanged at 18/0); its stated limit is the compiled
         probe's plain byte load of a relaxed-published flag, and it unmasked a pre-existing
         heap-limit hang (§12 item 14).
+  22. **The heap limit and its callback — named before the engine edit, and it is the
+      item §7's wasm-termination record found: the next hang deno's suite exposes.**
+      Deno's `test_heap_limits` and `test_heap_limit_cb_multiple` build a runtime with
+      `heap_limits(0, 5MB)`, install a callback that calls `terminate_execution()` and
+      doubles the limit, then run `while(true) { s += "Hello"; }`. Nothing stops that
+      loop today, so the suite hangs.
+
+      - **The engine measures and reports; the host decides.** `crux::Heap` gains a
+        `live_bytes` counter (one add per allocation, one subtract per swept box, beside
+        the `live_boxes` counter it already keeps) and an O(1) `allocated_bytes()`;
+        `Heap::live_bytes` stays the walking form a diagnostic asks for, and its doc no
+        longer claims a counter would be too expensive — the limit is what bought it.
+        `Agent` carries the host's `heap_limit`, the `initial_heap_limit` it reports to
+        the callback, and at most one `near_heap_limit` callback, fired from
+        `maybe_collect` — the point the interpreter's back edge and the JIT's probe
+        already reach on every budget crossing (1024 allocations, `ALLOC_BUDGET`) —
+        *after* that trigger's collections, so a collection that reclaims enough does not
+        fire it. The callback answers the limit to continue with, which replaces the
+        current one; a host that terminates inside it stops the run at the next check
+        point, unchanged.
+      - **One callback, because V8 keeps one — and that is what the measurement says.**
+        `deno_core` calls `remove_near_heap_limit_callback(prev, 0)` before
+        `add_near_heap_limit_callback`, so the bridge holds the last callback and only it
+        can run; that is why `test_heap_limit_cb_multiple` asserts the *first* callback's
+        count stays 0.
+      - **What the bridge stops saying.** `CreateParams::heap_limits` becomes enforced
+        rather than "recorded, not enforced", and `add_near_heap_limit_callback` /
+        `remove_near_heap_limit_callback` stop being accepted-and-ignored: they install
+        and withdraw the callback the agent fires. The callback's `data` pointer stays the
+        host's (V8's contract), and its shape passes no isolate, so it cannot re-enter the
+        engine — which is what keeps a `&mut Agent` call into it sound.
+      - **Stated limit.** A callback that answers a limit at or below the live bytes
+        without terminating is called again at the next trigger; V8 would raise an OOM
+        instead. Recorded rather than fixed, because no host in the frontier does it and
+        the alternative is inventing an OOM shape this engine does not have.
+  23. **`Error.captureStackTrace` — named before the engine edit, and it is the one missing
+      function under five deno failures.** Probed rather than guessed: deno's `to_v8_error`
+      builds an op's error by calling the JS `buildCustomError` (`00_infra.js`), that callback
+      throws `TypeError: undefined is not a function`, and `to_v8_error`'s own fallback for a
+      failed builder is `message.into()` — a **String** — which is why the thrown value is not
+      an object and why `is_instance_of_error` says so (instrumented temporarily in `deno/`,
+      then reverted). The undefined function is `Error.captureStackTrace`, a V8 extension
+      `00_infra.js:112` calls to strip its own frames; the engine has the
+      `%Error.prototype.stack%` accessor and the capture behind it (`define_stack`) but no such
+      static. So `%Error%` gains `Error.captureStackTrace(target[, constructorOpt])`, defined
+      like `Error.isError` and dispatched in this module's `dispatch_call`, capturing through
+      the same `define_stack` the constructor uses.
+
+      - **`constructorOpt` is ignored**, and that is a stated limit: it names the function
+        whose frame and above V8 hides, and this engine's frame view still does not relate a
+        function value to the frames carrying it (the limit §12's tenth item states for
+        `StackFrame::GetFunctionName`). A host that passes it sees extra frames above the call
+        site, never a wrong error. A non-object target is left alone, as V8 leaves it.
+  24. **Frames with names and positions — the item §10 and §12's tenth and twelfth
+      items name, and the one two deno failures need.** *Named here after the edit rather
+      than before it — the one place this session broke its own order, recorded rather
+      than hidden.*
+
+      - **What a frame now carries.** `ExecutionContext` gains
+        `position: Option<crux::Span>`: the operation the code in that context is at. The
+        compiler puts the site on the operations that enter code or leave it —
+        `Step::Call`/`CallFast`, the fused `CallFastGlobal`/`CallFastSlot` (and the two
+        store fusions, which carry the site through from the step they replace),
+        `CallApply`, `Step::Throw` and `Step::Construct` — and the interpreter publishes it
+        into the running context as it executes them, before the work rather than after,
+        because a frame's line is the call that entered the callee inside it. The stack
+        renderer resolves the span against that context's own `source` (the offsets spans
+        count are UTF-16 units, which `SourceText` counts) and prints V8's shape:
+        `at name:line:column`, or `at name (file:line:column)` when the context runs a
+        module, whose record has a name where a script's has none.
+      - **A frame is named.** The certified call's context had `function` filled only for
+        a sloppy body's mapped `arguments`; it is now always filled, which is the reader
+        (a host's error stack) the deferred note was waiting for. One `Value` store per
+        certified call.
+      - **`Error.captureStackTrace`'s `constructorOpt` now works.** The item 23 limit
+        said it was ignored; it is the argument deno's error builder passes to strip itself
+        out of the stack, and it cost `test_op_bool_to_from_v8_error` its frame set. A
+        `define_stack` walk stops at the first context whose function is that value by the
+        engine's function identity, dropping it and every older frame — V8's own semantics.
+        The header also now reads an *inherited* `name`, as the formatter does, rather than
+        only an own one.
+      - **Stated limits.** The JIT ignores the site: a call made from compiled code
+        publishes nothing, so its frame prints without a position (the JIT's step arms
+        carry `span: _`). A tail call is not a site either — the step replaced the frame,
+        and the tail forms have no span field. Both are recorded, not implied; the
+        interpreter is the engine every deno case in the frontier goes through.
 
   ## 10. Build order
 
@@ -6994,17 +7177,20 @@ migrate, then delete.
    nothing left to refuse by kind, so it became positive coverage
    (`an_accessor_round_trips_with_its_source`). Six mutations, each caught; the
    corpus was re-swept because `toString` is in it. Part 17 of §7's record.
-14. **The near-heap-limit callback — the next hang the deno suite exposes, named and
-   not chased.** §7's wasm-termination record found it: deno's whole `deno_core` lib
+14. **The near-heap-limit callback — the next hang the deno suite exposed, named and
+   then landed.** §7's wasm-termination record found it: deno's whole `deno_core` lib
    suite used to hang at `terminate_execution` and now runs past every termination test
-   to `runtime::tests::misc::test_heap_limit_cb_multiple`, which hangs (`test_heap_limits`
-   hangs too). Neither is about termination: both build a runtime with
+   to `runtime::tests::misc::test_heap_limit_cb_multiple`, which hung (`test_heap_limits`
+   hung too). Neither is about termination: both build a runtime with
    `heap_limits(0, 5MB)`, install a near-heap-limit callback that calls
    `terminate_execution()` and doubles the limit, then run
    `while(true) { s += "Hello"; }` — the callback is the only thing that can stop it, so
-   an engine that never fires it leaves the string to grow without bound. The missing
-   part is therefore the heap-limit API (`create_params().heap_limits`, and the
-   near-heap-limit callback a bridge would hold and fire), which is the host-memory item
-   §5's L3 row and §10 already carry. One caveat on the classification: it is measured as
-   a hanging test, not A/B'd against a pre-change binary, so it is recorded as
-   *revealed* (the earlier termination hang masked it) rather than proven unrelated.
+   an engine that never fires it leaves the string to grow without bound.
+
+   **Landed** as §9 item 22, with §7's record for the mechanism, the two mutations and the
+   gates: `crux::Heap` answers its live bytes in O(1), `CreateParams::heap_limits` is
+   enforced against them, and the callback the bridge holds is the one the agent fires.
+   Deno's three heap-limit tests pass, including the two that hung. The one caveat the
+   original note carried still stands as classification rather than status: the hang was
+   measured, not A/B'd against a pre-change binary, so it was recorded as *revealed* (the
+   earlier termination hang masked it) rather than proven unrelated.

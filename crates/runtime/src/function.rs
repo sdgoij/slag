@@ -2406,13 +2406,11 @@ fn ordinary_call(
             Some(context) => context,
             None => old_env,
         };
-        // The context's `function` is read only by a sloppy body's mapped
-        // `arguments` creation (`Step::CreateArguments`, for `callee`); every
-        // other certified-path reader is excluded by certification (SuperCall
-        // is derived-only), so the clone is skipped unless the body uses
-        // `arguments` in sloppy mode.
-        let context_function =
-            (scope.arguments_slot.is_some() && !strict).then(|| Value::Function(*function));
+        // The context's `function` is what a frame reports, and a host's error
+        // stack is the reader that wants it for every call (`at boom:1:26`),
+        // not only for a sloppy body's mapped `arguments`. Filling it is one
+        // `Value` store per certified call.
+        let context_function = Some(Value::Function(*function));
         agent.execution_context_stack.push(ExecutionContext {
             function: context_function,
             realm,
@@ -2426,6 +2424,7 @@ fn ordinary_call(
             private_environment: None,
             source: parse_text,
             annex_b_hoistable: Default::default(),
+            position: None,
         });
         // Cut 3 continuation (this slots): a non-arrow certified body gets
         // the OrdinaryCallBindThis result — strict keeps the call's `this`
@@ -2542,6 +2541,7 @@ fn ordinary_call(
         private_environment,
         source,
         annex_b_hoistable: Default::default(),
+        position: None,
     });
     let result = (|| -> Result<Value, JsError> {
         // OrdinaryCallBindThis: strict keeps `this` as-is; sloppy coerces
@@ -3152,6 +3152,7 @@ fn ordinary_construct(
             private_environment: None,
             source: parse_text,
             annex_b_hoistable: Default::default(),
+            position: None,
         });
         let result = (|| -> Result<Value, JsError> {
             let body_env = agent.running_context()?.lexical_environment;
@@ -3275,6 +3276,7 @@ fn ordinary_construct(
         private_environment: data.private_environment,
         source,
         annex_b_hoistable: Default::default(),
+        position: None,
     });
     let result = (|| -> Result<Value, JsError> {
         if data.default_derived {

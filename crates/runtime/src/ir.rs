@@ -337,6 +337,9 @@ pub enum Step {
     /// VM's argument slot.
     Call {
         direct_eval: bool,
+        /// The call's own source span: published into the running context so a
+        /// frame's stack line carries the site the caller is at.
+        span: crux::Span,
     },
     /// Call with `[this, callee, arg1..argN]` on the stack (0-2 plain
     /// arguments, no spreads): the VM reads the arguments in place and skips
@@ -345,6 +348,7 @@ pub enum Step {
     CallFast {
         argc: u8,
         direct_eval: bool,
+        span: crux::Span,
     },
     /// Call-site recognition of `Function.prototype.apply`/`call` (perf.md
     /// "remaining apply floor"): a member call `f.apply(x, arr)` /
@@ -360,6 +364,7 @@ pub enum Step {
     CallApply {
         argc: u8,
         kind: ApplyKind,
+        span: crux::Span,
     },
     /// Cut 35 slice 2: a plain global-named callee called with an undefined
     /// receiver (`f(x)` with `f` a declared script global, no `with`): the
@@ -371,6 +376,7 @@ pub enum Step {
         name: crux::AtomId,
         argc: u8,
         direct_eval: bool,
+        span: crux::Span,
     },
     /// Cut 35 slice 4: like `CallFastGlobal` but the callee comes from a
     /// frame slot (a certified-value var holding a certified closure): the
@@ -382,6 +388,7 @@ pub enum Step {
     CallFastSlot {
         slot: usize,
         argc: u8,
+        span: crux::Span,
     },
     /// Cut 35 slice 17: the fused `x = f(args)` for a slot callee with
     /// plain slot args — the arg loads, the slot-callee call, and the
@@ -393,6 +400,7 @@ pub enum Step {
         callee_slot: usize,
         arg_slots: Vec<usize>,
         store_slot: usize,
+        span: crux::Span,
     },
     /// Cut 35 slice 20: the fused `x = f(args)` for a global callee with
     /// plain slot args — the arg loads, the global-callee call (the
@@ -403,6 +411,7 @@ pub enum Step {
         name: crux::AtomId,
         arg_slots: Vec<usize>,
         store_slot: usize,
+        span: crux::Span,
     },
     /// Proper tail call (spec 14.2.2): a strict-mode `return f(x)` outside
     /// any try/with. The callee/args are on the stack exactly as for
@@ -469,7 +478,9 @@ pub enum Step {
     /// Tail form of `TaggedTemplate` (`return tag\`...\``).
     TailTaggedTemplate(syntax::ast::TemplateLiteral),
     SuperCall,
-    Construct,
+    Construct {
+        span: crux::Span,
+    },
     TaggedTemplate(syntax::ast::TemplateLiteral),
     /// Create a function expression's closure against the current lexical
     /// environment (spec 15.2.5). `strict` is the enclosing code's
@@ -1071,7 +1082,9 @@ pub enum Step {
     /// ReferenceError (Annex B web-compat, spec 13.15.3 / 6.2.5.6).
     InvalidAssignmentTarget,
     Return,
-    Throw,
+    Throw {
+        span: crux::Span,
+    },
     // ----- suspension -----
     Yield {
         delegate: bool,
@@ -7039,13 +7052,20 @@ impl Vm {
                         &object, name_id,
                     )?));
                 }
-                Step::Call { direct_eval } => {
+                Step::Call { direct_eval, span } => {
+                    self.set_site(agent, *span);
                     self.do_call(agent, *direct_eval)?;
                 }
-                Step::CallFast { argc, direct_eval } => {
+                Step::CallFast {
+                    argc,
+                    direct_eval,
+                    span,
+                } => {
+                    self.set_site(agent, *span);
                     self.do_call_fast(agent, *argc as usize, *direct_eval)?;
                 }
-                Step::CallApply { argc, kind } => {
+                Step::CallApply { argc, kind, span } => {
+                    self.set_site(agent, *span);
                     self.do_call_apply(agent, *argc as usize, *kind)?;
                 }
                 Step::TailCallFast { argc, direct_eval } => {
@@ -7096,17 +7116,22 @@ impl Vm {
                     name,
                     argc,
                     direct_eval,
+                    span,
                 } => {
+                    self.set_site(agent, *span);
                     self.do_call_fast_global(agent, *name, None, *argc as usize, *direct_eval)?;
                 }
-                Step::CallFastSlot { slot, argc } => {
+                Step::CallFastSlot { slot, argc, span } => {
+                    self.set_site(agent, *span);
                     self.do_call_fast_slot(agent, *slot, None, *argc as usize)?;
                 }
                 Step::CallFastSlotStore {
                     callee_slot,
                     arg_slots,
                     store_slot,
+                    span,
                 } => {
+                    self.set_site(agent, *span);
                     // Cut 35 slice 17: the fused `x = f(args)` — TDZ-check
                     // the arg slots in order (their `LoadLocal` checks),
                     // run the slot-callee call, and store the result to
@@ -7139,7 +7164,9 @@ impl Vm {
                     name,
                     arg_slots,
                     store_slot,
+                    span,
                 } => {
+                    self.set_site(agent, *span);
                     // Cut 35 slice 20: the fused `x = f(args)` for a global
                     // callee — same shape as `CallFastSlotStore` through
                     // `do_call_fast_global` (the global leaf cache). The
@@ -7193,7 +7220,8 @@ impl Vm {
                     }
                     self.stack.push(result);
                 }
-                Step::Construct => {
+                Step::Construct { span } => {
+                    self.set_site(agent, *span);
                     let callee = self.pop();
                     let result = self.step_construct(agent, callee)?;
                     self.stack.push(result);
@@ -8673,7 +8701,8 @@ impl Vm {
                         CtlResult::Done(outcome) => return Ok(outcome),
                     }
                 }
-                Step::Throw => {
+                Step::Throw { span } => {
+                    self.set_site(agent, *span);
                     let value = self.pop();
                     match self.throw_machinery(agent, body, value)? {
                         CtlResult::Continue => continue,
@@ -10161,6 +10190,17 @@ impl Vm {
     /// The `Step::Call` (vector-form) handler: the callee and receiver are on
     /// the stack, the arguments in the Vm's vector (`ArgsBase`/`ArgsPush`/
     /// `ArgsSpread` built them).
+    /// Publish the site the running body is at — the call it is about to make —
+    /// into the context it runs in, so a frame's stack line carries its
+    /// `line:column`. The innermost frame's is the operation running now; an
+    /// outer frame's is the call that entered the callee running inside it, so
+    /// the write belongs to the *caller* and happens before the call.
+    fn set_site(&self, agent: &mut Agent, span: crux::Span) {
+        if let Some(context) = agent.execution_context_stack.last_mut() {
+            context.position = Some(span);
+        }
+    }
+
     fn do_call(&mut self, agent: &mut Agent, direct_eval: bool) -> Result<(), JsError> {
         let callee = self.pop();
         let this = self.pop();
@@ -11909,6 +11949,7 @@ impl Vm {
                     private_environment: None,
                     source: parse_text,
                     annex_b_hoistable: Default::default(),
+                    position: None,
                 });
             let this_value = if scope.this_slot.is_some() {
                 Some(if strict {
@@ -11997,6 +12038,7 @@ impl Vm {
                 private_environment,
                 source,
                 annex_b_hoistable: Default::default(),
+                position: None,
             });
         if this_mode != crate::function::ThisMode::Lexical {
             let this = if this_mode == crate::function::ThisMode::Sloppy {
@@ -14953,6 +14995,7 @@ impl Compiler {
                         name,
                         argc,
                         direct_eval: false,
+                        span,
                     }) = self.steps.last()
                         && let argc = *argc as usize
                         && self.steps.len() > argc
@@ -14973,15 +15016,17 @@ impl Compiler {
                             })
                             .collect();
                         let name = *name;
+                        let span = *span;
                         self.steps.truncate(self.steps.len() - argc - 1);
                         self.emit(Step::CallFastGlobalStore {
                             name,
                             arg_slots,
                             store_slot,
+                            span,
                         });
                         self.fused_completion = true;
                         true
-                    } else if let Some(Step::CallFastSlot { slot, argc }) = self.steps.last()
+                    } else if let Some(Step::CallFastSlot { slot, argc, span }) = self.steps.last()
                         && let argc = *argc as usize
                         && self.steps.len() > argc
                         && (0..argc).all(|i| {
@@ -14989,6 +15034,7 @@ impl Compiler {
                         })
                     {
                         let callee_slot = *slot;
+                        let span = *span;
                         // The arg slots in compile order (the last-pushed
                         // arg sits directly before the call).
                         let arg_slots = (0..argc)
@@ -15006,6 +15052,7 @@ impl Compiler {
                             callee_slot,
                             arg_slots,
                             store_slot,
+                            span,
                         });
                         self.fused_completion = true;
                         true
@@ -15525,14 +15572,15 @@ impl Compiler {
         &mut self,
         args: &[Argument],
         direct_eval: bool,
+        span: crux::Span,
     ) -> Result<(), JsError> {
         if self.chain_depth == 0 {
-            return self.compile_call_args(args, direct_eval);
+            return self.compile_call_args(args, direct_eval, span);
         }
         let short = self.new_label();
         let end = self.new_label();
         self.jump_if_chain_short(short);
-        self.compile_call_args(args, direct_eval)?;
+        self.compile_call_args(args, direct_eval, span)?;
         self.jump(end);
         self.place(short);
         self.emit(Step::Pop);
@@ -15544,7 +15592,12 @@ impl Compiler {
 
     /// The argument compilation + call step (fast plain args or the vector
     /// form), shared by the guarded and unguarded call paths.
-    fn compile_call_args(&mut self, args: &[Argument], direct_eval: bool) -> Result<(), JsError> {
+    fn compile_call_args(
+        &mut self,
+        args: &[Argument],
+        direct_eval: bool,
+        span: crux::Span,
+    ) -> Result<(), JsError> {
         let tail = self.tail;
         self.tail = false; // arguments are never in tail position
         // A direct eval ALWAYS takes the vector form (Cut 50): the fast
@@ -15570,8 +15623,9 @@ impl Compiler {
             (true, false) => self.emit(Step::CallFast {
                 argc: argc.unwrap() as u8,
                 direct_eval: false,
+                span,
             }),
-            (false, false) => self.emit(Step::Call { direct_eval }),
+            (false, false) => self.emit(Step::Call { direct_eval, span }),
         }
         Ok(())
     }
@@ -16282,7 +16336,7 @@ impl Compiler {
             }
             StmtKind::Throw(expr) => {
                 self.compile_expr(expr)?;
-                self.emit(Step::Throw);
+                self.emit(Step::Throw { span: expr.span });
             }
             StmtKind::If {
                 test,
@@ -18829,7 +18883,7 @@ impl Compiler {
                 }
                 self.compile_expr(&new.callee)?;
                 self.compile_arguments(&new.args, false)?;
-                self.emit(Step::Construct);
+                self.emit(Step::Construct { span: new.span });
                 Ok(())
             }
             ExprKind::Member(member) => {
@@ -20251,14 +20305,18 @@ impl Compiler {
                     }
                 }
                 if call.optional {
-                    self.compile_optional_call_tail(&call.args)?;
+                    self.compile_optional_call_tail(&call.args, call.span)?;
                 } else {
                     match self.compile_arguments(&call.args, true)? {
                         Some(argc) => self.emit(Step::CallFast {
                             argc: argc as u8,
                             direct_eval: false,
+                            span: call.span,
                         }),
-                        None => self.emit(Step::Call { direct_eval: false }),
+                        None => self.emit(Step::Call {
+                            direct_eval: false,
+                            span: call.span,
+                        }),
                     }
                 }
                 return Ok(());
@@ -20280,9 +20338,9 @@ impl Compiler {
                 self.emit(Step::Dup);
                 self.compile_member_property_guarded(member)?;
                 if call.optional {
-                    self.compile_optional_call_tail(&call.args)?;
+                    self.compile_optional_call_tail(&call.args, call.span)?;
                 } else {
-                    self.compile_call_args_guarded(&call.args, false)?;
+                    self.compile_call_args_guarded(&call.args, false, call.span)?;
                 }
                 self.jump(end);
                 self.place(short);
@@ -20295,13 +20353,13 @@ impl Compiler {
                 self.compile_member_property_guarded(member)?;
                 if call.optional {
                     // The callee is on top: nullish → undefined.
-                    self.compile_optional_call_tail(&call.args)?;
+                    self.compile_optional_call_tail(&call.args, call.span)?;
                 } else {
                     // The member chain may still have short-circuited
                     // upstream (`a?.b.m(args)`): skip the argument
                     // evaluation and call.
                     self.tail = tail;
-                    self.compile_call_args_guarded(&call.args, false)?;
+                    self.compile_call_args_guarded(&call.args, false, call.span)?;
                 }
             }
             return Ok(());
@@ -20340,10 +20398,10 @@ impl Compiler {
             }
             self.emit(Step::ClearChainShort);
             if call.optional {
-                self.compile_optional_call_tail(&call.args)?;
+                self.compile_optional_call_tail(&call.args, call.span)?;
             } else {
                 self.tail = tail;
-                self.compile_call_args_guarded(&call.args, false)?;
+                self.compile_call_args_guarded(&call.args, false, call.span)?;
             }
             return Ok(());
         }
@@ -20361,10 +20419,10 @@ impl Compiler {
             self.emit(Step::GetVarReferenceThis);
             self.emit(Step::GetVarReference);
             if call.optional {
-                self.compile_optional_call_tail(&call.args)?;
+                self.compile_optional_call_tail(&call.args, call.span)?;
             } else {
                 self.tail = tail;
-                self.compile_call_args_guarded(&call.args, direct_eval)?;
+                self.compile_call_args_guarded(&call.args, direct_eval, call.span)?;
             }
             self.emit(Step::PopVarReference);
             return Ok(());
@@ -20502,6 +20560,7 @@ impl Compiler {
                             name: *name,
                             argc: call.args.len() as u8,
                             direct_eval: false,
+                            span: call.span,
                         })
                     }
                     // A slot callee (certified-value var — frame path only): the
@@ -20516,6 +20575,7 @@ impl Compiler {
                         Some(Step::CallFastSlot {
                             slot,
                             argc: call.args.len() as u8,
+                            span: call.span,
                         })
                     }
                     _ => None,
@@ -20532,7 +20592,7 @@ impl Compiler {
                         Step::CallFastGlobal { name, argc, .. } => {
                             self.emit(Step::TailCallFastGlobal { name, argc });
                         }
-                        Step::CallFastSlot { slot, argc } => {
+                        Step::CallFastSlot { slot, argc, .. } => {
                             self.emit(Step::TailCallFastSlot { slot, argc });
                         }
                         other => self.emit(other),
@@ -20546,11 +20606,11 @@ impl Compiler {
         self.emit(Step::Push(Value::Undefined));
         self.compile_expr(&call.callee)?;
         if call.optional {
-            self.compile_optional_call_tail(&call.args)?;
+            self.compile_optional_call_tail(&call.args, call.span)?;
         } else {
             // An upstream `?.` in the callee (`(a?.b)()`) skips the arguments.
             self.tail = tail;
-            self.compile_call_args_guarded(&call.args, direct_eval)?;
+            self.compile_call_args_guarded(&call.args, direct_eval, call.span)?;
         }
         Ok(())
     }
@@ -20608,6 +20668,7 @@ impl Compiler {
         self.emit(Step::CallApply {
             argc: call.args.len() as u8,
             kind,
+            span: call.span,
         });
         Ok(true)
     }
@@ -20618,12 +20679,16 @@ impl Compiler {
     /// the dup'd callee the nullish test pushed back — so the chain leaves
     /// exactly `[undefined]` (a two-pop short leaked the receiver into the
     /// enclosing expression, shifting every later stack read).
-    fn compile_optional_call_tail(&mut self, args: &[Argument]) -> Result<(), JsError> {
+    fn compile_optional_call_tail(
+        &mut self,
+        args: &[Argument],
+        span: crux::Span,
+    ) -> Result<(), JsError> {
         let short = self.new_label();
         let end = self.new_label();
         self.emit(Step::Dup);
         self.jump_if_nullish_keep(short);
-        self.compile_call_args_guarded(args, false)?;
+        self.compile_call_args_guarded(args, false, span)?;
         self.jump(end);
         self.place(short);
         self.emit(Step::Pop);
@@ -21153,7 +21218,7 @@ fn prefix_is_straight_line(steps: &[Step]) -> bool {
             && !matches!(
                 step,
                 Step::Return
-                    | Step::Throw
+                    | Step::Throw { .. }
                     | Step::Break { .. }
                     | Step::Continue { .. }
                     | Step::TailCallSelf { .. }
@@ -21255,7 +21320,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::TailCallSelfVector
                 | Step::TailCallSelfCheckVector
                 | Step::TailTaggedTemplate(_)
-                | Step::Construct
+                | Step::Construct { .. }
                 | Step::SuperCall
                 | Step::TaggedTemplate(_)
                 | Step::ImportCall { .. }

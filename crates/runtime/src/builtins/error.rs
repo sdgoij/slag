@@ -32,6 +32,7 @@ const AGGREGATE_ERROR: &str = "%AggregateError%";
 const SUPPRESSED_ERROR: &str = "%SuppressedError%";
 const GET_STACK: &str = "%get Error.prototype.stack%";
 const SET_STACK: &str = "%set Error.prototype.stack%";
+const ERROR_CAPTURE_STACK_TRACE: &str = "%Error.captureStackTrace%";
 
 /// (constructor intrinsic key, prototype name, has an `errors` list arg,
 /// is the SuppressedError shape).
@@ -228,6 +229,33 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         },
     )?;
 
+    // Error.captureStackTrace (a V8 extension, not spec): the one function
+    // deno's error builder calls to give the error it builds the stack of the
+    // site that built it. Defined like %Error.isError% above, and served by the
+    // %Error.prototype.stack% accessor.
+    let capture_stack_trace = Function::create_builtin(
+        Some(JsString::from_utf8("captureStackTrace")),
+        1,
+        Box::new(placeholder("Error.captureStackTrace")),
+        None,
+        None,
+    )?;
+    realm.intrinsics.define(
+        ERROR_CAPTURE_STACK_TRACE,
+        Value::Function(capture_stack_trace),
+    );
+    error_ctor.define_property(
+        &JsString::from_utf8("captureStackTrace"),
+        &PropertyDescriptor {
+            value: Some(Value::Function(capture_stack_trace)),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(false),
+            configurable: Some(true),
+        },
+    )?;
+
     // The six native error constructors plus AggregateError/SuppressedError:
     // each prototype inherits %Error.prototype% and overrides `name`, and
     // each constructor inherits the %Error% constructor (spec 20.5.6).
@@ -365,6 +393,9 @@ pub fn dispatch_call(
             args.first().cloned().unwrap_or(Value::Undefined),
         ))));
     }
+    if intrinsics.get(ERROR_CAPTURE_STACK_TRACE).as_ref() == Some(callee) {
+        return Some(capture_stack_trace(agent, args));
+    }
     if intrinsics.get(GET_STACK).as_ref() == Some(callee) {
         return Some(stack_getter(agent, this, args));
     }
@@ -438,7 +469,7 @@ pub(crate) fn error_construct(
         define_message(&object, args.first())?;
         install_cause(agent, &object, args.get(1))?;
     }
-    define_stack(agent, &object, name)?;
+    define_stack(agent, &object, name, None)?;
     Ok(Value::Object(object))
 }
 
@@ -527,7 +558,12 @@ fn install_cause(
 /// is not an own data property). The header uses the already-coerced own
 /// `message` property so the constructor's single ToString (spec 20.5.1.1
 /// step 2a) is not repeated.
-fn define_stack(agent: &mut Agent, object: &JsObject, name: &str) -> Result<(), JsError> {
+fn define_stack(
+    agent: &mut Agent,
+    object: &JsObject,
+    name: &str,
+    until: Option<&Value>,
+) -> Result<(), JsError> {
     let message = object
         .get_own_property_key(&PropertyKey::from_utf8("message"))?
         .and_then(|property| match &property.kind {
@@ -551,6 +587,14 @@ fn define_stack(agent: &mut Agent, object: &JsObject, name: &str) -> Result<(), 
         .rev()
         .filter(|context| crate::api::stack_trace::is_frame(context));
     for context in frames {
+        // A host that named a constructor hides that constructor's own frame
+        // and every frame older than it (Error.captureStackTrace's second
+        // argument, which deno's error builder passes to strip itself).
+        if let (Some(until), Some(current)) = (until, context.function.as_ref())
+            && is_same_function(current, until)
+        {
+            break;
+        }
         let frame = context
             .function
             .as_ref()
@@ -560,12 +604,95 @@ fn define_stack(agent: &mut Agent, object: &JsObject, name: &str) -> Result<(), 
             })
             .map(|name| name.to_string_lossy())
             .unwrap_or_else(|| "<anonymous>".into());
-        lines.push(format!("    at {frame}"));
+        // A module frame names its file; a script frame has none to give (the
+        // engine's scripts record no name), so the two shapes differ.
+        let file = match context.script_or_module.as_ref() {
+            Some(crate::context::ScriptOrModule::Module(module)) => {
+                module.name.as_ref().map(|name| name.to_string_lossy())
+            }
+            _ => None,
+        };
+        // The frame's own site — the call it is at, or the throw it raised —
+        // resolved against the text of the code running in it. V8's shape for a
+        // frame with no file name is `at name:line:column`, and the offsets its
+        // spans count are UTF-16 units, which is what `SourceText` counts.
+        let at = match (context.position, context.source.as_ref()) {
+            (Some(span), Some(source)) => {
+                let text = syntax::SourceText::from_utf8(&source.to_string_lossy());
+                let location = text.line_column(span.start);
+                match file {
+                    Some(file) => {
+                        format!("{frame} ({file}:{}:{})", location.line, location.column)
+                    }
+                    None => format!("{frame}:{}:{}", location.line, location.column),
+                }
+            }
+            _ => match file {
+                Some(file) => format!("{frame} ({file})"),
+                None => frame,
+            },
+        };
+        lines.push(format!("    at {at}"));
     }
     agent
         .error_stack
         .insert(object.id(), JsString::from_utf8(&lines.join("\n")));
     Ok(())
+}
+
+/// `Error.captureStackTrace(target[, constructorOpt])` — a V8 extension rather
+/// than spec, and the one function deno's error builder needs (00_infra.js calls
+/// it to strip its own frames from the stack of the error it is building). The
+/// stack is captured through [`define_stack`], the same way a constructed error
+/// captures one, and served by the `%Error.prototype.stack%` accessor.
+///
+/// `constructorOpt` is **ignored**: it names the function whose frame and above
+/// V8 hides, and this engine's frame view does not yet relate a function value to
+/// the frames that carry it. A host that passes it therefore sees the frames
+/// above the call site rather than the frames above the named constructor — more
+/// lines, never a wrong error. A non-object target captures nothing, which is
+/// what V8's implementation does with one.
+fn capture_stack_trace(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    let Some(target) = args.first() else {
+        return Ok(Value::Undefined);
+    };
+    let Some(object) = crate::context::as_object(target) else {
+        return Ok(Value::Undefined);
+    };
+    // The header reads the object's `name` the way V8's formatter does: its own
+    // when it has one, else the inherited one (a recaptured error usually
+    // inherits `Error.prototype`'s).
+    let name = match own_string_property(&object, "name")? {
+        Some(name) => name,
+        None => crate::context::get_property(agent, target, &JsString::from_utf8("name"), *target)
+            .ok()
+            .and_then(|value| value.as_string().map(|name| name.to_string_lossy()))
+            .unwrap_or_else(|| "Error".to_string()),
+    };
+    define_stack(agent, &object, &name, args.get(1))?;
+    Ok(Value::Undefined)
+}
+
+/// Whether two values name the same function, by the engine's own function
+/// identity — what `Error.captureStackTrace`'s constructor argument is matched
+/// with.
+fn is_same_function(left: &Value, right: &Value) -> bool {
+    match (left.kind(), right.kind()) {
+        (ValueKind::Function(left), ValueKind::Function(right)) => left.id() == right.id(),
+        _ => false,
+    }
+}
+
+/// An object's own data property as a string, when it has one.
+fn own_string_property(object: &JsObject, key: &str) -> Result<Option<String>, JsError> {
+    Ok(object
+        .get_own_property_key(&PropertyKey::from_utf8(key))?
+        .and_then(|property| match &property.kind {
+            crux::object::PropertyKind::Data { value, .. } => {
+                value.as_string().map(|text| text.to_string_lossy())
+            }
+            _ => None,
+        }))
 }
 
 /// get %Error.prototype.stack% (spec 20.5.3.4): a TypeError for non-object
@@ -753,6 +880,106 @@ mod tests {
 
     fn str(value: &str) -> Value {
         Value::String(Handle::new(JsString::from_utf8(value)))
+    }
+
+    /// `Error.captureStackTrace` (a V8 extension) restarts an object's stack at
+    /// its own call site. That is the only way to observe it: the constructor has
+    /// already installed a stack, so a no-op capture leaves the two identical.
+    /// The observable is the frame **count** rather than a frame's text, because
+    /// the frames this engine records still carry no name (§12's tenth item).
+    #[test]
+    fn capture_stack_trace_restarts_the_stack_at_its_call_site() {
+        let observed = run("function make() { return new Error('boom'); } \
+             function inner() { const e = make(); Error.captureStackTrace(e); return e.stack; } \
+             function outer() { return inner(); } \
+             const rebuilt = outer(); \
+             const fresh = make().stack; \
+             JSON.stringify({ \
+               rebuiltLines: rebuilt.split('\\n').length, \
+               freshLines: fresh.split('\\n').length, \
+               header: rebuilt.startsWith('Error: boom'), \
+               same: rebuilt === fresh })")
+        .unwrap();
+        let text = observed
+            .as_string()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default();
+        assert!(
+            text.contains("\"header\":true"),
+            "the header survives the recapture: {text}"
+        );
+        assert!(
+            text.contains("\"rebuiltLines\":4") && text.contains("\"freshLines\":3"),
+            "the capture restarts the frames one level deeper: {text}"
+        );
+        assert!(text.contains("\"same\":false"), "{text}");
+    }
+
+    /// The header comes from the object's own `name` when it has one, and a
+    /// target that is not an object is left alone rather than refused.
+    #[test]
+    fn capture_stack_trace_reads_the_objects_own_name_and_skips_other_targets() {
+        assert_eq!(
+            run("const e = new Error('boom'); e.name = 'Custom'; \
+                 Error.captureStackTrace(e); e.stack.startsWith('Custom: boom')")
+            .unwrap(),
+            Value::Boolean(true),
+        );
+        assert_eq!(
+            run("Error.captureStackTrace(42); Error.captureStackTrace(null); 'ok'").unwrap(),
+            str("ok"),
+        );
+    }
+
+    /// A frame carries the site the code in it is at, resolved against the
+    /// frame's own text, so a stack line reads `at name:line:column` — V8's
+    /// shape for a frame with no file name. The inner frame's site is the
+    /// operation it is at (here the `new`, at 1:26) and the outer one's is the
+    /// call that entered it (the `boom()`, at 2:1).
+    #[test]
+    fn a_frame_carries_the_site_its_code_is_at() {
+        let stack = run("function boom() { return new Error('x').stack; }\n\
+             boom()")
+        .unwrap();
+        assert_eq!(
+            stack
+                .as_string()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default(),
+            "Error: x\n    at boom:1:26\n    at <anonymous>:2:1",
+        );
+    }
+
+    /// `Error.captureStackTrace`'s second argument hides that constructor's own
+    /// frame and every frame older than it — what deno's error builder passes to
+    /// strip itself out of the stack it is building.
+    #[test]
+    fn capture_stack_trace_strips_from_the_named_constructor_outward() {
+        let source = |ctor: &str| {
+            format!(
+                "function inner() {{ const e = new Error('x'); \
+                 Error.captureStackTrace(e{ctor}); return e.stack; }} \n\
+                 function outer() {{ return inner(); }} \n\
+                 outer()"
+            )
+        };
+        let read = |stack: Value| {
+            stack
+                .as_string()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default()
+        };
+        let kept = read(run(&source("")).unwrap());
+        assert!(
+            kept.contains("at inner:"),
+            "without a constructor the frame is there: {kept}"
+        );
+        assert!(kept.contains("at outer:"), "and so is its caller: {kept}");
+        let stripped = read(run(&source(", inner")).unwrap());
+        assert_eq!(
+            stripped, "Error: x",
+            "the named constructor's frame and every older one are gone"
+        );
     }
 
     #[test]

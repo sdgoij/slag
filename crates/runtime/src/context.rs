@@ -359,6 +359,14 @@ pub struct ExecutionContext {
     /// The source text of the code currently running, when known — used to
     /// capture exact function sources for `Function.prototype.toString`.
     pub source: Option<JsString>,
+    /// The site the code in this context is at: the call that entered the
+    /// callee running now, or the throw it raised. Published by the running
+    /// body (a `Step::Site`, emitted at every call and throw the compiler
+    /// lowers), and read by the stack a host's error reports, which is why it
+    /// is the *caller's* site that a callee's frame reports. Resolved against
+    /// this context's own `source`, so a frame's `line:column` needs no other
+    /// record.
+    pub position: Option<crux::Span>,
     /// Annex B: the declarations whose block-level function hoist (B.3.3.x)
     /// is applicable in this execution, keyed by function span, consulted by
     /// B.3.2.1 at block entry.

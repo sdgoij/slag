@@ -1114,7 +1114,10 @@ mod tests {
                 Step::ArgsPush,
                 Step::Push(Value::Number(2.0)),
                 Step::ArgsPush,
-                Step::Call { direct_eval: false },
+                Step::Call {
+                    direct_eval: false,
+                    span: crux::Span::new(0, 0),
+                },
                 Step::Return,
             ],
             0,
@@ -1160,6 +1163,7 @@ mod tests {
                 Step::CallApply {
                     argc: 2,
                     kind: ApplyKind::Apply,
+                    span: crux::Span::new(0, 0),
                 },
                 Step::Return,
             ],
@@ -1645,6 +1649,7 @@ mod tests {
                 Step::CallFast {
                     argc: 3,
                     direct_eval: false,
+                    span: crux::Span::new(0, 0),
                 },
                 Step::Return,
             ],
@@ -1667,6 +1672,7 @@ mod tests {
             vec![Step::CallFast {
                 argc: 0,
                 direct_eval: true,
+                span: crux::Span::new(0, 0),
             }],
             0,
         );

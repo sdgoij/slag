@@ -229,6 +229,7 @@ pub fn call_generator(
                 .and_then(|context| context.source.clone())
         }),
         annex_b_hoistable: Default::default(),
+        position: None,
     };
     agent.execution_context_stack.push(context);
     // Cut 58: capture the OrdinaryCallBindThis result — a certified body's
