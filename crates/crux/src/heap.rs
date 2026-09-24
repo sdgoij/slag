@@ -52,6 +52,19 @@ pub trait Trace: 'static {
     fn trace_dirty(&self, visit: &mut dyn FnMut(GcAny)) {
         self.trace(visit);
     }
+
+    /// Report that the collector is about to drop this box's payload — the last
+    /// moment the payload can say anything for itself (the default does
+    /// nothing).
+    ///
+    /// Called once per swept box, from the vtable's `drop` slot, after the
+    /// header's live bit is cleared and **before** `drop_in_place`. The heap is
+    /// borrowed and a collection is in progress, so an implementation must not
+    /// run host code, allocate in the arena, or touch the heap: it records what
+    /// it needs and a deferred queue acts on it afterwards. `crux::host`'s
+    /// finalizers are exactly that; a type with nothing to report keeps the
+    /// default, which compiles away.
+    fn request_finalize(&self) {}
 }
 
 /// An erased GC reference: the header address of any `Gc<T>`. Produced by
@@ -274,7 +287,15 @@ impl<T: Trace> GcBox<T> {
         drop: |data| {
             // SAFETY: `data` points at this box's `T` payload, dropped once
             // by the sweep before the slot is reused.
-            unsafe { std::ptr::drop_in_place(data.cast::<T>()) }
+            unsafe {
+                let payload = data.cast::<T>();
+                // The payload's own account of its death, taken while it is
+                // still whole. Both sweep paths (`collect_minor_inner` and
+                // `collect_from_work`) call this slot, so a per-dead-box step
+                // cannot be added to one generation and forgotten in the other.
+                (*payload).request_finalize();
+                std::ptr::drop_in_place(payload);
+            }
         },
         data_offset: std::mem::offset_of!(GcBox<T>, data) as u32,
         name: type_name_of::<T>,

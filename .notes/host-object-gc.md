@@ -1,18 +1,30 @@
 # Host objects and L2: traced host state, finalizers, weak handles
 
-**Status (2026-09-24): slice 1 is in the tree; slices 2-4 are not.** Slice 1 — the
+**Status (2026-09-25): slices 1-3 are in the tree; slice 4 is not.** Slice 1 — the
 `ffi` handle-table rooting, §4.4 and the urgent part — landed with this note's own
 regression tests (`ffi`'s `a_retained_value_survives_a_collection` and
 `a_retained_string_survives_a_collection`, `crux`'s
-`a_registered_root_source_keeps_its_boxes_alive`); `.notes/embedding.md` §7 has the
-record and §9 its item 27. The rest was written, reviewed, and reverted: read every
-other "landed" below as "designed and specified", and the tree agrees:
-`grep -rn 'host_object_retain\|host_object_release\|run_finalizers\|request_finalize\|PENDING_FINALIZERS\|HostObject\|a_host_objects_retained_edge_roots_its_value' crates/`
-returns nothing, `ObjectKind::Host` is still `Rc<dyn HostOps>`
-(`crates/crux/src/object.rs:469`), and `HostOps` still has no `trace` and no
-`finalize`. `.notes/embedding.md` §5's L2 row and §4's acceptance test carried the
-same false claim about *those* slices and are corrected the same way, with slice 1
-named as landed in both.
+`a_registered_root_source_keeps_its_boxes_alive`), and `.notes/embedding.md` §7 has
+its record and §9 its bullet. **Slices 2-3 — the traced host objects and the
+deferred finalizers, §4.1 and §4.2 — landed next**, with the tests §5's
+criteria name: `crux`'s `a_host_objects_retained_edge_roots_its_value`,
+`a_retained_edge_on_an_old_host_object_is_remembered`,
+`a_swept_host_object_captures_its_finalizer` and
+`a_host_object_value_cycle_collects_and_finalizes`, and `runtime`'s
+`a_swept_host_object_finalizes_through_the_isolate`. `.notes/embedding.md` §7 has
+that record, and §5's L2 row and §4's second acceptance test now read as landed
+rather than aspirational.
+
+**Slice 4 — weak persistent handles — is not started**, and §4.3 is its design.
+
+Two of §4.2's decisions changed while it was implemented, both narrowed rather
+than widened, and both are recorded here because the *reason* is part of the
+design: the finalize capture rides the vtable's **`drop` slot** rather than a new
+vtable slot plus a call site in each of the two sweeps (one funnel instead of two
+places to forget, which makes §6's "there are two sweep paths" trap structurally
+impossible), and no monotonic "already finalized" flag is needed, because a
+payload is dropped exactly once — both sweeps clear the live bit before the drop
+and every walk filters on it. The measurements are in `.notes/embedding.md` §7.
 
 What is below is the design: the problem (§1), what L2 has to provide (§2), the
 options (§3), the design of the chosen one (§4), the acceptance criteria (§5) and
@@ -171,17 +183,30 @@ Every test forces a collection with the scan's blind spot (a heap-buffer or boxe
 handle), the way the L1 pin tests do, or the conservative scan will mask the bug.
 
 1. **The defect, first:** a `Value` retained only through the `ffi` table survives
-   a forced collection (fails today). Same for `HostOps`-held values.
+   a forced collection (fails today). Same for `HostOps`-held values. **Landed** —
+   slice 1 wrote the `ffi` half first and measured the defect through it
+   (`.notes/embedding.md` §7's record has the numbers), and slices 2-3 are the
+   `HostOps`-held half.
 2. A host object's retained value survives while the host object is reachable,
-   and becomes collectable once the host object is swept.
+   and becomes collectable once the host object is swept. **Landed** —
+   `crux`'s `a_host_objects_retained_edge_roots_its_value`.
 3. `finalize` runs exactly once, after the collection, for a swept host box —
-   including when the host still holds its `Rc`.
+   including when the host still holds its `Rc`. **Landed** — `crux`'s
+   `a_swept_host_object_captures_its_finalizer` (the queued behaviour *is* the
+   host's `Rc`, so it outlives the box) and `runtime`'s
+   `a_swept_host_object_finalizes_through_the_isolate`.
 4. A host-object ↔ JS-value cycle collects fully (the case that never finalized
-   before).
-5. `--gc-stress` / per-allocation variants of 2-4 (`StressSuppress` where host
-   code runs inside a collection window).
+   before). **Landed** — `crux`'s `a_host_object_value_cycle_collects_and_finalizes`:
+   the host object retains the object that holds it, and one precise collection
+   takes both boxes and queues the finalizer the reference-count model could never
+   fire.
+5. `--gc-stress` / per-allocation variants of 2-4. **Not covered.** The tests above
+   all use the deterministic no-scan entry points; `--gc-stress` is exercised by
+   the engine's own suite, not by one of these. It is also the mode where a
+   finalizer that allocates would show as re-entrancy, so a variant belongs with
+   the first host that runs host code from `finalize`.
 6. A weak handle fires once, after the collection; the target's slot is reclaimed;
-   the callback cannot resurrect it.
+   the callback cannot resurrect it. **Slice 4, not started.**
 
 ## 6. Slices
 
@@ -193,49 +218,60 @@ handle), the way the L1 pin tests do, or the conservative scan will mask the bug
 5. Later, optional: cppgc-shaped names (`Traced`/`Member`/`Visitor`/
    `initialize_process`) as sugar over 3-4.
 
-### Slices 2-3 — designed; reverted, not in the tree
+### Slices 2-3 — landed
 
 *(Slice 1's own account follows below; it was the first of the three.)*
 
-**Not in the tree** — see the status correction at the top. What follows is what
-the slices were specified to do.
+**Edges.** `ObjectKind::Host` carries a `HostObject` — the `Rc<dyn HostOps>`
+behaviour it always carried, plus a `RefCell<Vec<Value>>` edge list — and
+`Trace for ObjectKind` visits it, so a retained value is marked *through* the host
+object. `JsObject::host_object_retain` runs `write_barrier` (it is a store: an old
+host object gaining a young edge must be remembered or a minor sweeps the child);
+`host_object_release` removes one retention and needs no barrier. Retain/release
+pair up; releasing a value that was never retained is a no-op. Keeping the
+behaviour shared and the list per object is what left the one call site that
+compares a host class by address (`crates/jsc/src/value.rs`) a one-line change.
 
-**Edges.** `ObjectKind::Host` now carries a `HostObject` — the behaviour plus an
-`Rc<RefCell<Vec<Value>>>` edge list — and `Trace for ObjectKind` visits it, so a
-retained value is marked *through* the host object. `JsObject::host_object_retain`
-runs `write_barrier` (it is a store: an old host object gaining a young edge must
-be remembered or a minor sweeps the child); `host_object_release` removes one
-retention and needs no barrier. Retain/release pair up; releasing a value that
-was never retained is a no-op.
-
-**Finalization.** `Trace::request_finalize` is a new trait hook (default no-op)
-with a matching vtable slot; `impl Trace for JsObject` overrides it to capture
-`(ops, object_id)` into `crux::host::PENDING_FINALIZERS` — *before* the payload is
-dropped, because the behaviour handle and the identity live in it.
-`HostOps::finalize(&self, object_id)` is the callback;
+**Finalization.** `Trace::request_finalize` is a trait hook (default no-op) that
+the vtable's `drop` slot calls **before** `drop_in_place`; `impl Trace for JsObject`
+overrides it to capture `(behaviour, object_id)` into
+`crux::host::PENDING_FINALIZERS` while the behaviour handle and the identity are
+still in the payload. `HostOps::finalize(&self, object_id)` is the callback;
 `crux::host::take_pending_finalizers` drains; `Isolate::run_finalizers()` runs
-them; and `Context::with_call` calls it at depth 0, so a host that never asks
-still gets its finalizers after every outermost call.
+them, at the top of every job drain and at an outermost `Context` entry, so a host
+that never asks still gets its finalizers.
 
-**The trap worth remembering: there are two sweep paths.** The major in
-`collect_from_work` and the minor in `collect_minor_inner` each have their own
-drop loop. Hooking only the major is the mistake to avoid: the finalizer would
-silently run in one collection mode and not the other. Anything the sweep must do
-per dead box has to be added in both places.
+**The trap, and why it is not one here: there are two sweep paths.** The major in
+`collect_from_work` and the minor in `collect_minor_inner` each have their own drop
+loop, so hooking only one would let the finalizer run in one collection mode and
+not the other. The capture rides `GcBox::<T>::VTABLE.drop` — the one slot both
+loops call — which is why it cannot be forgotten in either. (This is the change
+from the design as first written, which had a second vtable slot and a call site in
+each sweep.)
 
 Finalization has to be deferred rather than run in the sweep, because the sweep is
 mid-collection with the heap borrowed and a finalizer may allocate or run JS —
-and `--gc-stress` collects per allocation, so re-entering would be immediate.
+and `--gc-stress` collects per allocation, so re-entering would be immediate. That
+is also why no monotonic "already finalized" flag is needed: a box's payload is
+dropped exactly once, because both sweeps clear the live bit before the drop and
+every walk filters on it. And nothing runs finalizers at isolate teardown, because
+teardown drops no payloads — a host that never triggers a collection gets none,
+which is the same statement as "a finalizer is the collector's decision".
 
-**Coverage it would need.** `crux`'s `a_host_objects_retained_edge_roots_its_value`
-(precise: the collector's own liveness flag, deterministic `collect(&[])`) and
-`a_swept_host_object_captures_its_finalizer`; `runtime`'s
-`a_swept_host_object_finalizes_through_the_isolate` (end-to-end through
-`Isolate::run_finalizers`). Two masking traps to design around when writing the
-last one: the object must be created *and released inside a returned frame*
-(otherwise stale stack words root it), and a trivial `({})` eval does not
-necessarily trigger a *sweeping* collection — nursery stress plus a 200-iteration
-allocation loop does.
+**Coverage it has.** `crux`'s `a_host_objects_retained_edge_roots_its_value`
+(the deterministic no-scan `Heap::collect`: the retained value survives the
+collection that sweeps an equal, unretained peer, and releasing the edge puts it
+back), `a_retained_edge_on_an_old_host_object_is_remembered` (the barrier, read out
+of the remembered set, with the object deliberately not passed as a root to the
+minor that follows), `a_swept_host_object_captures_its_finalizer` and
+`a_host_object_value_cycle_collects_and_finalizes` (the case §1(b) says the old
+timing could never reach); `runtime`'s `a_swept_host_object_finalizes_through_the_isolate` (end-to-end through
+`Isolate::run_finalizers`). The masking trap the design named is handled in the
+last one by creating the object in an `#[inline(never)]` call whose frame is
+returned before the collection, so no stack word roots it — and by asserting the
+*exact* list of identities, which makes a survivor fail as loudly as a
+non-finalizer. The other named trap is gone: the collection is the engine's own
+`Agent::collect_garbage`, not an eval that may or may not sweep.
 
 `jsc` keeps its release-driven finalize timing for now: it is the retired C
 surface and its compat test asserts the old behaviour, so wiring it to

@@ -104,7 +104,7 @@ pub unsafe extern "C" fn JSValueIsObjectOfClass(
         let Some(object) = value.as_object() else {
             return false;
         };
-        matches!(&object.kind, crux::object::ObjectKind::Host(ops) if std::rc::Rc::ptr_eq(ops, &crate::class::class_ops(js_class)))
+        matches!(&object.kind, crux::object::ObjectKind::Host(host) if std::rc::Rc::ptr_eq(host.behaviour(), &crate::class::class_ops(js_class)))
     })
 }
 

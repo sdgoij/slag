@@ -1669,10 +1669,29 @@ impl Agent {
         crux::function::with_agent(self as *mut Agent as *mut (), || self.run_jobs_inner())
     }
 
+    /// Run the host finalizers the collections since the last drain queued
+    /// (`crux::host`): the behaviour of each host object the sweep took, with
+    /// the identity of the object it was installed on.
+    ///
+    /// The sweep never calls a finalizer itself — it runs mid-collection with
+    /// the heap borrowed, and a finalizer may allocate or run JS — so this is
+    /// the drain, and it happens outside a collection. A host that never asks
+    /// is covered too: an outermost [`crate::api::Context`] entry drains here as
+    /// well as doing so at the top of every job drain.
+    pub(crate) fn run_host_finalizers(&mut self) {
+        for (behaviour, object_id) in crux::host::take_pending_finalizers() {
+            behaviour.finalize(object_id);
+        }
+    }
+
     fn run_jobs_inner(&mut self) -> Result<(), JsError> {
         // GC-5: the job drain is a fresh execution unit — the safe-point
         // allocation budget must not leak in from the previous script/job.
         crux::heap::reset_allocation_budget();
+        // The post-collection drain, host bookkeeping first: a host finalizer
+        // may itself enqueue a cleanup job or a promise job, and it is the
+        // host's own release path rather than a JavaScript observer of one.
+        self.run_host_finalizers();
         // GC-4: promote the FinalizationRegistry cleanup jobs enqueued by the
         // collector's compaction hook into the generic queue (the hook runs
         // with `&self` and cannot touch the queues directly).

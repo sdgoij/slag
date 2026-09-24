@@ -464,9 +464,10 @@ pub enum ObjectKind {
     External(usize),
     /// A host-defined exotic (JSC `JSClassRef` objects, V8 handler
     /// objects): internal methods dispatch to a [`crate::host::HostOps`]
-    /// implementation with ordinary fallback. Deliberately `Rc` (host state
-    /// is not GC-managed; the ffi/jsc tables root it, GC-6).
-    Host(std::rc::Rc<dyn crate::host::HostOps>),
+    /// implementation with ordinary fallback, and the values the host retains
+    /// on the object (`host_object_retain`) are traced from it, so they are the
+    /// collector's rather than the host's to root by hand.
+    Host(std::rc::Rc<crate::host::HostObject>),
 }
 
 /// The [[ParameterMap]] of an arguments exotic object (spec 10.4.4): an
@@ -756,8 +757,10 @@ impl Trace for ObjectKind {
             ObjectKind::IntegerIndexed(slots) => slots.trace(visit),
             ObjectKind::ModuleNamespace(slots) => slots.trace(visit),
             ObjectKind::Array(slots) => slots.trace(visit),
-            // Ordinary, IsHTMLDDA, External, and Host (deliberately Rc)
-            // carry no GC heap edges.
+            // A host object's retained values are real edges: the host cannot
+            // trace them itself, so the engine owns the list.
+            ObjectKind::Host(object) => object.trace(visit),
+            // Ordinary, IsHTMLDDA and External carry no GC heap edges.
             _ => {}
         }
     }
@@ -1006,6 +1009,12 @@ impl Trace for JsObject {
         // `boxed` is a heap edge too.
         self.function_self.trace(visit);
         self.boxed.trace(visit);
+    }
+
+    fn request_finalize(&self) {
+        if let ObjectKind::Host(object) = &self.kind {
+            crate::host::request_finalize(object, self.id);
+        }
     }
 }
 
@@ -1393,14 +1402,47 @@ impl JsObject {
     }
 
     /// Create a host exotic object: internal methods dispatch to `ops` with
-    /// ordinary fallback (JSC `JSClassRef` objects, V8 handler objects).
+    /// ordinary fallback (JSC `JSClassRef` objects, V8 handler objects), and the
+    /// object owns an edge list a host fills through
+    /// [`JsObject::host_object_retain`].
     pub fn host_object_create(
         ops: std::rc::Rc<dyn crate::host::HostOps>,
         prototype: Option<Handle<JsObject>>,
     ) -> Handle<JsObject> {
-        let object = Handle::new(Self::with_kind(ObjectKind::Host(ops), prototype));
+        let kind = ObjectKind::Host(std::rc::Rc::new(crate::host::HostObject::new(ops)));
+        let object = Handle::new(Self::with_kind(kind, prototype));
         Self::link_self_handle(&object);
         object
+    }
+
+    /// Retain `value` on this host object: `value` stays reachable from the
+    /// collector for as long as this object is, and one retention is dropped by
+    /// [`JsObject::host_object_release`].
+    ///
+    /// This is how a host keeps a language value alive across calls without a
+    /// persistent handle of its own — the C surfaces hold values a host object
+    /// owns — and it is engine-owned for two reasons: a C host cannot implement
+    /// a tracer, and only the object's own box can be remembered by the write
+    /// barrier, which a store has to run (an old host object that gains a young
+    /// edge is otherwise invisible to the next minor collection).
+    ///
+    /// An object that is not a host object retains nothing.
+    pub fn host_object_retain(&self, value: Value) {
+        let ObjectKind::Host(object) = &self.kind else {
+            return;
+        };
+        object.retain(value);
+        crate::heap::write_barrier(self, value);
+    }
+
+    /// Drop one retention of `value` taken by
+    /// [`JsObject::host_object_retain`]; releasing a value that was never
+    /// retained is a no-op, as is releasing from an object that is not a host
+    /// object.
+    pub fn host_object_release(&self, value: Value) {
+        if let ObjectKind::Host(object) = &self.kind {
+            object.release(value);
+        }
     }
 
     /// The ordinary field layout with `kind` replaced (the `External`/`Host`

@@ -199,14 +199,22 @@ impl Context {
         isolate.entry_depth.set(depth);
         let result = self.with_agent(body);
         isolate.entry_depth.set(depth - 1);
-        if depth == 1
-            && isolate.get_microtasks_policy() == crate::api::MicrotasksPolicy::Auto
-            && let Err(error) = self.with_agent(|agent| agent.run_jobs())
-        {
-            let thrown = self
-                .with_agent(|agent| crate::builtins::error::to_throwable(agent, &error))
-                .unwrap_or(Value::Undefined);
-            isolate.set_pending_exception(thrown);
+        if depth == 1 {
+            // The post-collection drain happens at the outermost exit, whatever
+            // the microtask policy: a host that never drains jobs itself (the
+            // engine's default is `Explicit`) would otherwise never see a
+            // finalizer, and a finalizer is the collector's news to the host
+            // rather than a job. It runs first — the host's own bookkeeping,
+            // and a finalizer may enqueue a job the drain below then runs.
+            self.with_agent(|agent| agent.run_host_finalizers());
+            if isolate.get_microtasks_policy() == crate::api::MicrotasksPolicy::Auto
+                && let Err(error) = self.with_agent(|agent| agent.run_jobs())
+            {
+                let thrown = self
+                    .with_agent(|agent| crate::builtins::error::to_throwable(agent, &error))
+                    .unwrap_or(Value::Undefined);
+                isolate.set_pending_exception(thrown);
+            }
         }
         result
     }

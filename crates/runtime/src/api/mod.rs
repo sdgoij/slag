@@ -171,6 +171,21 @@ impl Isolate {
         self.agent.run_jobs()
     }
 
+    /// Run the finalizers of the host objects the last collection swept
+    /// (`crux::host`), each with the identity of the object it was installed
+    /// on.
+    ///
+    /// The collector never calls a finalizer itself — a finalizer may allocate
+    /// or run JS, and the sweep runs mid-collection with the heap borrowed — so
+    /// the sweep queues and this drains. A host does not have to call it: an
+    /// outermost [`Context`] entry drains the queue too, and so does every job
+    /// drain. Calling it is how a host that never drains anything (no
+    /// microtasks, no jobs) still gets its bookkeeping back at a point of its
+    /// own choosing.
+    pub fn run_finalizers(&mut self) {
+        self.agent.run_host_finalizers();
+    }
+
     /// v8::Isolate::SetData/GetData: host data slots keyed by slot number.
     pub fn set_data(&self, slot: u32, data: usize) {
         self.data.borrow_mut().insert(slot, data);
@@ -1301,5 +1316,49 @@ mod tests {
         assert_eq!(isolate.get_data(1), None);
         isolate.set_data(1, 42);
         assert_eq!(isolate.get_data(1), Some(42));
+    }
+
+    thread_local! {
+        /// The identities the test's finalizer saw, in call order.
+        static FINALIZED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[derive(Debug)]
+    struct RecordingFinalizer;
+
+    impl crux::host::HostOps for RecordingFinalizer {
+        fn finalize(&self, object_id: u64) {
+            FINALIZED.with(|ids| ids.borrow_mut().push(object_id));
+        }
+    }
+
+    /// Create a host object and keep nothing: the frame is returned before the
+    /// collection runs, so no stack word roots it. A returned frame sits *below*
+    /// the stack pointer the conservative scan starts from, which is why this is
+    /// a separate `#[inline(never)]` call rather than a scope inside the test —
+    /// where the handle's slot would be scanned and the object would survive
+    /// whatever the collector decided.
+    #[inline(never)]
+    fn an_unrooted_host_object() -> u64 {
+        crux::object::JsObject::host_object_create(std::rc::Rc::new(RecordingFinalizer), None).id()
+    }
+
+    /// The engine's promise to a host, end to end: a host object the collector
+    /// swept reports its identity exactly once, through the drain the host
+    /// drives. The finalizer runs *after* the collection — a finalizer may
+    /// allocate, and the sweep runs with the heap borrowed — which is what
+    /// `run_finalizers` is for.
+    #[test]
+    fn a_swept_host_object_finalizes_through_the_isolate() {
+        let mut isolate = isolate();
+        let _context = context(&mut isolate);
+        FINALIZED.with(|ids| ids.borrow_mut().clear());
+
+        let id = an_unrooted_host_object();
+        // The collection is the engine's own entry point, not a test-only path.
+        isolate.agent().collect_garbage();
+        isolate.run_finalizers();
+
+        FINALIZED.with(|ids| assert_eq!(*ids.borrow(), vec![id]));
     }
 }
