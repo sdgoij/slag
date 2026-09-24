@@ -179,7 +179,7 @@ fn frame_of(agent: &Agent, context: &ExecutionContext) -> StackFrame {
             let ValueKind::Function(function) = value.kind() else {
                 return None;
             };
-            function.name.as_ref().map(|name| name.to_string_lossy())
+            function_name(&function)
         }),
         // No name for a call the certified push did not record a callee in —
         // that slot is filled only for a sloppy mapped `arguments`; see the
@@ -191,6 +191,38 @@ fn frame_of(agent: &Agent, context: &ExecutionContext) -> StackFrame {
         is_constructor: false,
         is_wasm: false,
         is_user_javascript: true,
+    }
+}
+
+/// The name a frame reports for the function it runs
+/// (v8::StackFrame::GetFunctionName), or `None` when nothing named it.
+///
+/// Two things name a function and they are not the same one. A function the
+/// syntax names at creation — a declaration, a named expression — carries the
+/// name on its record. A **method** does not: its name arrives through
+/// `SetFunctionName`, which writes the *`name` own property* (spec 10.2.1.2),
+/// so the record stays empty and a frame for a method would answer nothing
+/// where V8 answers `m` — the same is true of an inferred name
+/// (`const f = () => {}`). So the record's name is read first and the property
+/// second, and the property is read as a **descriptor**: a host that installed a
+/// `name` getter must not run inside a stack capture.
+pub(crate) fn function_name(function: &crux::heap::Gc<crux::Function>) -> Option<String> {
+    if let Some(name) = &function.name {
+        return Some(name.to_string_lossy());
+    }
+    let own = function
+        .object
+        .get_own_property_key(&crux::property::PropertyKey::from_utf8("name"))
+        .ok()
+        .flatten()?;
+    match own.kind {
+        crux::object::PropertyKind::Data { value, .. } => value
+            .as_string()
+            .map(|text| text.to_string_lossy())
+            // The placeholder `SetFunctionName` exists to replace is the empty
+            // string, which is no name rather than the name `""`.
+            .filter(|name| !name.is_empty()),
+        _ => None,
     }
 }
 

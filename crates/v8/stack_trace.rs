@@ -359,8 +359,8 @@ mod tests {
     /// expected columns are measured with node against these exact sources.
     ///
     /// A *private* method call is the fifth shape and the same code path as the
-    /// keyed one, but it cannot be pinned here: a class method's call pushes no
-    /// frame at all (§12 item 19), so there is no frame to read a site from.
+    /// keyed one, but it cannot be pinned here: a class method's frame publishes
+    /// no site (§12 item 19), so there is no site to read.
     #[test]
     fn a_calls_site_is_the_arguments_paren_for_the_other_shapes() {
         let base = "const o = { m: function inner() { return capture(); } }; ";
@@ -387,28 +387,37 @@ mod tests {
         }
     }
 
-    /// A method's frame is unnamed, and a class method's call is no frame at all.
-    /// Measured while pinning the private call-site shape, which is why that
-    /// shape has no test here: `const o = { m() { return capture(); } }; o.m()`
-    /// records two frames and the inner one has no function name (where
-    /// `function inner() { … }` in the same place does), and
-    /// `class C { m() { return capture(); } } new C().m()` records only the host
-    /// callback's frame and the script's. Recorded as §12 item 19.
+    /// A method's frame carries the name `SetFunctionName` gave it, and a class
+    /// method's carries none of the *site*: measured while pinning the private
+    /// call-site shape. `const o = { m() { return capture(); } }; o.m()` records
+    /// the method at the `capture()` call inside it (so the body is interpreted
+    /// and publishes a site), while the same body written as a class method
+    /// records the frame with no site at all — nothing published one, which is
+    /// why the private shape has no call-site test here. §12 item 19 has both
+    /// measurements and what the next probe is.
     #[test]
-    fn a_method_frame_is_unnamed_and_a_class_methods_is_absent() {
+    fn a_method_frame_is_named_and_a_class_methods_has_no_site() {
         let methods = capture_frames("const o = { m() { return capture(); } }; o.m();");
         assert_eq!(methods.len(), 2, "the method and the script: {methods:?}");
         assert_eq!(
             frame_parts(&methods[0]).0,
-            "-",
-            "a method's frame carries no function name: {methods:?}"
+            "m",
+            "a method's frame carries the name `SetFunctionName` gave it: {methods:?}"
         );
         let class = capture_frames("class C { m() { return capture(); } } new C().m();");
+        assert_eq!(class.len(), 2, "the method and the script: {class:?}");
         assert_eq!(
-            class.len(),
-            2,
-            "a class method's call is no frame: its activation is missing \
-             ({class:?})"
+            frame_parts(&class[0]).0,
+            "m",
+            "a class method's frame is named too: {class:?}"
+        );
+        // The frame is there and named, but it carries no site: nothing published
+        // one for the call inside the method's body, where the same body written
+        // as an object-literal method does publish one. §12 item 19.
+        assert_eq!(
+            (frame_parts(&class[0]).2, frame_parts(&class[0]).3),
+            (0, 0),
+            "and it still has no site of its own: {class:?}"
         );
     }
 

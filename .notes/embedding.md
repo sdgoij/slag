@@ -4339,6 +4339,16 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` **5,318 passed / 0 failed**. The corpora were re-run because the parser and the lowering moved: the wasm sweeps reproduce their baselines exactly — core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail** — and test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622) when the machine is not building. The two runs that did hang on the `copyWithin/*-detached*` fixtures were both made immediately after a release build, which is now a *repeatable* pattern rather than a suspicion (§12 item 18): build-then-sweep costs a 15s per-batch deadline, and the same binary on an idle machine reports the baseline.
 
+*A method's frame reports the name `SetFunctionName` gave it — §9's bullet that named it, and §12 item 19's name half.* Two things name a function and they are not the same one: the syntax names a declaration or a named expression at creation, so the name sits on the function *record*, while a **method** is named by `SetFunctionName`, which writes the *`name` own property* (spec 10.2.1.2) and leaves the record empty. Frames read the record alone, so a frame for `const o = { m() { return capture(); } }; o.m()` named nothing where V8 names it `m` — and deno renders `Object.w [as m]` out of exactly that name. `api::stack_trace::function_name` now reads the record and then the `name` **own property descriptor** — a descriptor and never the value, so a host's `name` getter cannot run inside a stack capture — and drops the empty-string placeholder `SetFunctionName` exists to replace, because that placeholder is no name rather than the name `""`. Both readers call it — `frame_of`, the view `v8::StackTrace` and `v8::StackFrame` are, and `define_stack`, the engine's own rendering — so a host and the engine now agree on what a frame is called. An **inferred** name (`const f = () => {}`) is the same hole through the same door and is fixed with it.
+
+*The measurement, and the honest headline: no count moves.* deno's suite stays at **442 passed / 17 failed**, the same 17, nothing newly red. That was expected when the work was chosen and is stated as such: no deno test reads a method frame's *name*, so what the change buys is the rule rather than a step of it — a frame for an object-literal method, a class method or an inferred name names what V8 names instead of nothing. The four stack-shaped failures left in the suite are the **async** ones (item 16's corrected cause), which are about the awaiting chain a promise carries, not about the name of a frame in it.
+
+*Tests — two, and two mutations, each caught.* `a_methods_line_names_what_set_function_name_gave_it` (`crates/runtime/src/builtins/error.rs`) pins the engine's own rendering exactly — `Error: x\n    at m:1:26\n    at <anonymous>:1:55` for `const o = { m() { return new Error('x').stack; } }; o.m()` — so the method's name *and* the named member call's site are one assertion; making `define_stack` read the record alone fails it with `at <anonymous>:1:26` where `at m:1:26` belongs. The bridge's `a_method_frame_is_named_and_a_class_methods_has_no_site` (`crates/v8/stack_trace.rs`) is the view a host reads, and dropping `function_name`'s property fallback fails it with `left: "-", right: "m"`.
+
+*And the class method's frame was never absent — its old test's message said it was.* The test this replaced asserted `class.len() == 2` while its message read "a class method's call is no frame: its activation is missing". The count was right and the reading of it was wrong: the two frames are the **method** and the script, not the host callback and the script — which the mutation above shows directly, the frame list being `["-@-:1:26", "-@-:1:44"]` for the object-literal shape and `m` at the head for the class shape. Read through the corrected test, `class C { m() { return capture(); } } new C().m()` records the method, named, function-bearing and source-bearing, with the site `(0, 0)` because nothing published one for the call inside its body — where the same body written as an object-literal method does publish one. So item 19's *name* half was a misreading of this test and is now landed; its *site* half stands as measured, and item 19 is corrected in place.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,319 passed / 0 failed** (`runtime` 912, `v8` 251, `crux` 249, `test262` 3324). The corpora were re-run for the engine change and reproduce their baselines exactly: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622, and the wasm sweeps core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending, js-api **1,001 tests, 0 fail**. The one edit made after that sweep run is a `#[cfg(test)]` function and the doc comments around it, so the release binaries the sweeps and deno link are the ones those numbers came from.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7384,10 +7394,10 @@ migrate, then delete.
   argument list's `(`, which neither `ExprKind::Call`'s `span` nor the member's
   carries, so they keep the call expression's start — a measured, documented gap
   rather than a guess, and deno's `test_call_site` (the named form) is the test
-  that pins this half. The AST gains `MemberExpr::property_span` — the property's
-  own span, the token for a name or private and the key expression for a
-  computed one — because only the parser knows it, and the lowering reads it
-  where the call site is published (`ir.rs`).
+  that pins this half. The AST gains `MemberExpr::property_token` — the
+  property token's span for a dot access, `None` for a bracket access, whose
+  property is an expression rather than a token — because only the parser knows
+  it, and the lowering reads it where the call site is published (`ir.rs`).
 - **And the shapes V8 reports at the argument list's `(` — named here before the
   edit, and it finishes §12 item 17.** The bullet above shipped the named member
   half and named the rest as a gap: a keyed member (`o["mm"]()`), a private one
@@ -7409,6 +7419,22 @@ migrate, then delete.
   parser consumes when it parses the arguments — and a call the parser builds
   from something that is not a source-level argument list (an `async(…)`
   rewrite, the JSX lowering) keeps its own span.
+- **A method's frame reports the name `SetFunctionName` gave it — named here
+  before the edit, and it is the name half of §12 item 19.** The frames read
+  the function *record*'s `name`, which is where the syntax puts the name of a
+  declaration or a named expression — but a **method** is named by
+  `SetFunctionName`, which writes the `name` **own property** (spec 10.2.1.2)
+  and leaves the record empty. So `const o = { m() { return capture(); } };
+  o.m()` recorded a frame for `m` that named nothing where V8 names it `m`, and
+  deno renders `Object.w [as m]` out of exactly that name. The rule is two
+  reads in one place: the record first, then the `name` own property read as a
+  **descriptor** — never its value, so a host's `name` getter cannot run inside
+  a stack capture — with the empty-string placeholder `SetFunctionName` exists
+  to replace treated as no name rather than as the name `""`. Both readers take
+  it (`api::stack_trace::frame_of`, the view `v8::StackTrace` is, and
+  `define_stack`, the engine's own rendering), so host and engine agree on what
+  a frame is called. The *site* half stays open: a class method's frame carries
+  none, and it is item 19's remaining measurement.
 
 ## 11. Working rules
 
@@ -7898,18 +7924,27 @@ migrate, then delete.
    on the same binary with the machine idle reported the baseline **twice** —
    which is what `cargo build`-then-`sweep` does to a 15s per-batch deadline.
    The lesson for want of a rule: run the sweep when nothing else is building.
-19. **A method's frame is unnamed, and a class method's call is no frame at all —
-   measured, not yet explained.** Both surfaced while pinning the private
-   call-site shape for §12 item 17. `const o = { m() { return capture(); } };
-   o.m();` records two frames and the inner one carries **no function name**,
+19. **A class method's frame carries no site — measured, not yet explained; the
+   "no frame at all" half was a misreading, and the name half is landed.** Both
+   surfaced while pinning the private call-site shape for §12 item 17.
+   `const o = { m() { return capture(); } }; o.m();` records two frames — the
+   method and the script — and the method's frame carried **no function name**,
    where `function inner() { return capture(); }` written in the same place
-   records `inner`; the frame exists (its site is the `capture()` call inside the
-   method), so the method's activation *is* pushed and it is the callee slot that
-   is empty. And `class C { m() { return capture(); } } new C().m();` records only
-   the host callback's own frame and the script's — the method's activation is
-   missing entirely, so there is no frame to read a name or a site from. Neither
-   is V8's answer (it names a method's frame, and deno renders
-   `Object.w [as m]` from it), and neither is this part's, which is why the
-   private shape has no call-site test until they are understood. The next probe
-   is the two callee shapes' lowering: an object-literal method and a method off
-   a `new` expression.
+   records `inner`; the frame exists and its site is the `capture()` call inside
+   the method's body, so the record's name is what was empty. That half is
+   **fixed** (§7's last record): a method is named by `SetFunctionName`, which
+   writes the `name` own property rather than the record, and the frames now
+   read that property as a descriptor when the record has no name. What is left
+   is the **site**: `class C { m() { return capture(); } } new C().m();` records
+   the method's frame — present, named `m`, and source-bearing — with no site at
+   all, while the same body written as an object-literal method publishes the
+   site of the `capture()` call inside it. The old text here read the frame
+   count of the test that pinned this as "only the host callback's own frame and
+   the script's", which was a misreading: the frame is the method, and a
+   mutation of the name fix shows the frame list directly. Neither site answer
+   is V8's (V8 gives a class method's frame a site, and deno renders
+   `Object.w [as m]` for the name), which is why the private shape has no
+   call-site test until the site half is understood. The next probe is where a
+   class method's body publishes nothing: the same `capture()` call in
+   object-literal and class bodies reaches the same lowering, so it is the
+   activation or the body's compilation that differs, not the call.

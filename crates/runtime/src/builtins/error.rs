@@ -613,10 +613,9 @@ fn define_stack(
             .function
             .as_ref()
             .and_then(|function| match function.kind() {
-                ValueKind::Function(f) => f.name.clone(),
+                ValueKind::Function(f) => crate::api::stack_trace::function_name(&f),
                 _ => None,
-            })
-            .map(|name| name.to_string_lossy());
+            });
         // The code the frame runs: a module names the name its host gave it, a
         // script its origin's name when it has one, and a call the code its
         // callee was created in — the same rule the host-facing frame view
@@ -973,6 +972,22 @@ mod tests {
                 .map(|s| s.to_string_lossy())
                 .unwrap_or_default(),
             "Error: x\n    at boom:1:26\n    at <anonymous>:2:1",
+        );
+    }
+
+    /// The name a method's frame line reports is the one `SetFunctionName` gave
+    /// it, which lives on the function's `name` own property rather than on the
+    /// record a declaration or a named expression would fill — the same rule the
+    /// host-facing frame view reads (`api::stack_trace::function_name`).
+    #[test]
+    fn a_methods_line_names_what_set_function_name_gave_it() {
+        let stack = run("const o = { m() { return new Error('x').stack; } }; o.m()").unwrap();
+        assert_eq!(
+            stack
+                .as_string()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default(),
+            "Error: x\n    at m:1:26\n    at <anonymous>:1:55",
         );
     }
 
