@@ -204,6 +204,50 @@ mod tests {
         assert!(agent.job_queues_empty());
     }
 
+    /// A job runs in the realm it was enqueued for (spec 9.5.4): with no
+    /// execution context running, that realm is what `current_realm` answers
+    /// while the job's closure is in flight, and a job queued with no realm is
+    /// answered by the execution context alone.
+    #[test]
+    fn a_job_runs_in_the_realm_it_was_enqueued_for() {
+        let mut agent = Agent::new();
+        let realm = initialize_host_defined_realm(&agent).unwrap();
+        agent.push_bootstrap_context(realm);
+        // The drain happens with nothing evaluating, which is the shape that
+        // made the realm the job carries matter.
+        agent.execution_context_stack.pop();
+
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> = Default::default();
+        let seen_job = seen.clone();
+        agent.enqueue_promise_job(Some(realm), move |agent| {
+            match agent.current_realm() {
+                Ok(current) if Handle::ptr_eq(current, realm) => {
+                    seen_job.borrow_mut().push("the realm it was queued for");
+                }
+                Ok(_) => seen_job.borrow_mut().push("another realm"),
+                Err(_) => seen_job.borrow_mut().push("no realm"),
+            }
+            Ok(Value::Undefined)
+        });
+        let seen_realmless = seen.clone();
+        agent.enqueue_promise_job(None, move |agent| {
+            seen_realmless
+                .borrow_mut()
+                .push(if agent.current_realm().is_ok() {
+                    "a realm without one queued"
+                } else {
+                    "no context, no realm"
+                });
+            Ok(Value::Undefined)
+        });
+
+        agent.run_jobs().unwrap();
+        assert_eq!(
+            *seen.borrow(),
+            vec!["the realm it was queued for", "no context, no realm"]
+        );
+    }
+
     #[test]
     fn job_callback_records_wrap_callables() {
         let fun = Value::Function(crux::Function::new(None));

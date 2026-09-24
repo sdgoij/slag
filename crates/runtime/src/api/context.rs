@@ -76,6 +76,28 @@ impl Context {
         self.realm.intrinsics.get(name)
     }
 
+    /// Install this context's promise hooks (`v8::Context::SetPromiseHooks`).
+    ///
+    /// The four run where V8 runs them: `init` when a promise is created,
+    /// handed the promise and its parent; `before` and `after` around a reaction
+    /// job's handler; `resolve` when a promise settles. `None` leaves a slot
+    /// unset, and an unset slot runs nothing — which is how a host installs only
+    /// the kinds it wants. A hook sees this context's global object as its
+    /// receiver, and one that throws fails the operation that ran it.
+    pub fn set_promise_hooks(
+        &self,
+        init: Option<Local>,
+        before: Option<Local>,
+        after: Option<Local>,
+        resolve: Option<Local>,
+    ) {
+        let mut hooks = self.realm.promise_hooks.borrow_mut();
+        hooks.init = init.map(|hook| hook.0);
+        hooks.before = before.map(|hook| hook.0);
+        hooks.after = after.map(|hook| hook.0);
+        hooks.resolve = resolve.map(|hook| hook.0);
+    }
+
     /// The current realm.
     pub(crate) fn realm(&self) -> &Handle<Realm> {
         &self.realm
@@ -309,3 +331,105 @@ impl Context {
 /// RAII marker for a current context (v8::Context::Scope). Advisory with one
 /// context per isolate.
 pub struct ContextScope<'a>(std::marker::PhantomData<&'a Context>);
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crux::function::Function;
+    use crux::string::JsString;
+
+    use super::*;
+    use crate::api::Isolate;
+
+    /// The four promise hooks a context installs run where V8 runs them, with
+    /// V8's own call shape: an init is handed the promise and its parent, every
+    /// other kind the promise alone, and the receiver is the global object.
+    #[test]
+    fn a_contexts_promise_hooks_run_with_v8s_call_shape() {
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+        let global = context.global().into_value();
+
+        let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let hook = |kind: &'static str, length: u64| -> Local {
+            let seen = seen.clone();
+            let function = Function::create_builtin(
+                Some(JsString::from_utf8("")),
+                length,
+                Box::new(move |this: &Value, args: &[Value]| {
+                    seen.borrow_mut().push(format!(
+                        "{kind}:{}:receiver={}",
+                        args.len(),
+                        *this == global
+                    ));
+                    Ok(Value::Undefined)
+                }),
+                None,
+                None,
+            )
+            .expect("hook");
+            Local(Value::Function(function))
+        };
+        context.set_promise_hooks(
+            Some(hook("init", 2)),
+            Some(hook("before", 1)),
+            Some(hook("after", 1)),
+            Some(hook("resolve", 1)),
+        );
+
+        context
+            .try_eval("Promise.resolve(1).then(function () {})")
+            .expect("eval");
+        context.run_microtasks().expect("microtasks");
+
+        let seen = seen.borrow().clone();
+        for expected in [
+            "init:2:receiver=true",
+            "resolve:1:receiver=true",
+            "before:1:receiver=true",
+            "after:1:receiver=true",
+        ] {
+            assert!(
+                seen.iter().any(|call| call == expected),
+                "{expected} was not among {seen:?}"
+            );
+        }
+    }
+
+    /// A slot a context left unset runs nothing, which is how a host installs
+    /// only the kinds it wants.
+    #[test]
+    fn an_unset_promise_hook_slot_runs_nothing() {
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+
+        let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen_hook = seen.clone();
+        let resolve = Function::create_builtin(
+            Some(JsString::from_utf8("")),
+            1,
+            Box::new(move |_: &Value, _: &[Value]| {
+                seen_hook.borrow_mut().push("resolve".to_string());
+                Ok(Value::Undefined)
+            }),
+            None,
+            None,
+        )
+        .expect("hook");
+        context.set_promise_hooks(None, None, None, Some(Local(Value::Function(resolve))));
+
+        context
+            .try_eval("Promise.resolve(1).then(function () {})")
+            .expect("eval");
+        context.run_microtasks().expect("microtasks");
+
+        let seen = seen.borrow().clone();
+        assert!(!seen.is_empty(), "the resolve hook ran");
+        assert!(
+            seen.iter().all(|call| call == "resolve"),
+            "only the installed slot ran: {seen:?}"
+        );
+    }
+}

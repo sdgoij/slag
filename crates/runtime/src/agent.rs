@@ -585,6 +585,15 @@ pub struct Agent {
     >,
     /// The Promise Records keyed by promise-object identity (spec 27.2.1).
     pub promises: std::collections::HashMap<u64, RefCell<crate::promise::PromiseData>>,
+    /// The realm a job is running in, set by the drain for the job's own realm
+    /// and nothing else (spec 9.5.4 hands the host a realm to run a job in).
+    ///
+    /// It is V8's `isolate->context()`: [`current_realm`](Self::current_realm)
+    /// prefers a running execution context and falls back to this, which before
+    /// was an error — a job runs with no execution context of its own, so the
+    /// realm carried by the queue is the only one an engine hook fired from a
+    /// job can answer.
+    pub entered_realm: Option<Handle<Realm>>,
     /// The resolving functions created by CreateResolvingFunctions, keyed by
     /// function identity (spec 27.2.1.3).
     pub promise_resolvers:
@@ -1265,6 +1274,7 @@ impl Agent {
             compiled_bodies: std::collections::HashMap::new(),
             script_bodies: std::collections::HashMap::new(),
             promises: std::collections::HashMap::new(),
+            entered_realm: None,
             promise_resolvers: std::collections::HashMap::new(),
             promise_compound: std::collections::HashMap::new(),
             promise_finally: std::collections::HashMap::new(),
@@ -1594,7 +1604,20 @@ impl Agent {
 
     /// The current Realm Record (the Realm component of the running context).
     pub fn current_realm(&self) -> Result<Handle<Realm>, JsError> {
-        Ok(self.running_context()?.realm)
+        // A running execution context wins, as its own context wins in V8's
+        // `GetCurrentContext`; with none running — the drain runs a job with
+        // no context of its own — the realm the job was enqueued for is what
+        // remains.
+        if let Some(context) = self.execution_context_stack.last() {
+            return Ok(context.realm);
+        }
+        if let Some(realm) = self.entered_realm {
+            return Ok(realm);
+        }
+        Err(JsError::new(
+            ErrorKind::ReferenceError,
+            "No running execution context".into(),
+        ))
     }
 
     /// HostEnqueueGenericJob (spec 9.5.3): schedule a job without additional
@@ -1687,7 +1710,13 @@ impl Agent {
         // `trace_roots`).
         let region = job.closure_region();
         RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = Some(region));
+        // The job runs in its own realm (spec 9.5.4): enter it for the closure,
+        // so engine hooks that ask for the current realm answer one rather than
+        // failing while a job is in flight.
+        let previous = self.entered_realm;
+        self.entered_realm = job.realm;
         let result = (job.closure)(self);
+        self.entered_realm = previous;
         RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = None);
         // GC-4: the job ended — its KeepDuringJob set is no longer needed.
         self.kept_during_job.borrow_mut().clear();
@@ -1839,6 +1868,7 @@ impl Agent {
         }
         self.ecma_functions.trace(visit);
         self.promises.trace(visit);
+        self.entered_realm.trace(visit);
         self.promise_resolvers.trace(visit);
         self.promise_compound.trace(visit);
         self.promise_finally.trace(visit);

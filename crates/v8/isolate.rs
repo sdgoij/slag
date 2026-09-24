@@ -2301,15 +2301,46 @@ mod tests {
         isolate.set_idle(true);
     }
 
-    /// The promise hooks take a scope as their receiver in the crate we stand in
-    /// for — a host calls them on the scope it is running in, not on the isolate
-    /// — and a host that installs them keeps running.
+    /// The promise hooks a scope installs are run by the engine
+    /// (`v8::Context::SetPromiseHooks`), with V8's call shape: an init is handed
+    /// the promise and its parent, every other kind the promise alone. This is
+    /// the shape `deno_core`'s two timer tests use — a hook installed through
+    /// the scope and armed the first time it runs — and a host that installs
+    /// them keeps running.
     #[test]
-    fn the_promise_hooks_are_accepted_from_a_scope() {
+    fn a_promise_hook_installed_through_the_scope_runs() {
         crate::test_support::in_context!(scope, {
-            let hook = crate::test_support::eval(scope, "(function () {})");
-            let hook = Local::<crate::data::Function>::try_from(hook).expect("a function");
-            scope.set_promise_hooks(Some(hook), Some(hook), Some(hook), Some(hook));
+            crate::test_support::eval(
+                scope,
+                "globalThis.hooks = [];\n\
+                 globalThis.record = (kind) => function () {\n\
+                   globalThis.hooks.push(kind + ':' + arguments.length);\n\
+                 };",
+            );
+            let hook = |kind: &str| {
+                let value = crate::test_support::eval(scope, &format!("record('{kind}')"));
+                Local::<crate::data::Function>::try_from(value).expect("a function")
+            };
+            scope.set_promise_hooks(
+                Some(hook("init")),
+                Some(hook("before")),
+                Some(hook("after")),
+                Some(hook("resolve")),
+            );
+
+            crate::test_support::eval(scope, "Promise.resolve(1).then(function () {})");
+            // The reaction job runs when the host drains its queue, which is
+            // where deno's event loop drains it: before and after are that job's
+            // pair.
+            scope.perform_microtask_checkpoint();
+            let hooks = crate::test_support::eval(scope, "globalThis.hooks.join(',')")
+                .to_rust_string_lossy(scope);
+            for expected in ["init:2", "resolve:1", "before:1", "after:1"] {
+                assert!(
+                    hooks.split(',').any(|call| call == expected),
+                    "{expected} was not among {hooks}"
+                );
+            }
             assert_eq!(crate::test_support::eval_number(scope, "1 + 1"), 2.0);
         });
     }

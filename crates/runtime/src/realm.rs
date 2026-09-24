@@ -27,10 +27,43 @@ pub struct Realm {
     pub intrinsics: Intrinsics,
     pub global_object: Handle<JsObject>,
     pub global_env: EnvRef,
+    /// The four promise hooks this context installed
+    /// (`v8::Context::SetPromiseHooks`): run when a promise is created, before
+    /// and after a reaction job's handler, and when a promise settles. V8 keeps
+    /// the same four slots on the native context and reads them from the
+    /// *current* context at each of those points, which is what this is.
+    pub promise_hooks: RefCell<PromiseHooks>,
     /// [[LoadedModules]] (spec 9.3): the Source Text Module Records keyed by
     /// resolved specifier.
     pub loaded_modules:
         RefCell<std::collections::HashMap<JsString, Handle<crate::module::SourceTextModule>>>,
+}
+
+/// The promise hooks a context can install, one slot per
+/// `v8::PromiseHookType`.
+///
+/// `None` is V8's `undefined` slot: nothing is run for that kind, which is how
+/// a host installs only the ones it wants (deno's two timer tests install one
+/// each).
+#[derive(Default, Debug)]
+pub struct PromiseHooks {
+    /// Runs when a promise is created, with the promise and its parent.
+    pub init: Option<Value>,
+    /// Runs before a reaction job's handler.
+    pub before: Option<Value>,
+    /// Runs after that handler returned.
+    pub after: Option<Value>,
+    /// Runs when a promise settles.
+    pub resolve: Option<Value>,
+}
+
+impl Trace for PromiseHooks {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.init.trace(visit);
+        self.before.trace(visit);
+        self.after.trace(visit);
+        self.resolve.trace(visit);
+    }
 }
 
 impl Trace for Realm {
@@ -38,9 +71,10 @@ impl Trace for Realm {
         self.intrinsics.trace(visit);
         self.global_object.trace(visit);
         self.global_env.trace(visit);
-        // `loaded_modules` is a RefCell: `RefCell<T>`'s trace skips a cell
-        // that is mutably borrowed mid-collection (per-allocation
-        // `--gc-stress`) and aborts the sweep instead of panicking.
+        // Both are RefCells: `RefCell<T>`'s trace skips a cell that is
+        // mutably borrowed mid-collection (per-allocation `--gc-stress`) and
+        // aborts the sweep instead of panicking.
+        self.promise_hooks.trace(visit);
         self.loaded_modules.trace(visit);
     }
 }
@@ -580,6 +614,7 @@ pub fn initialize_host_defined_realm_with_global(
         intrinsics,
         global_object: global,
         global_env,
+        promise_hooks: RefCell::new(PromiseHooks::default()),
         loaded_modules: RefCell::new(std::collections::HashMap::new()),
     });
     // Root the realm from the moment its box exists. `Agent::realms` is the

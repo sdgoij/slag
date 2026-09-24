@@ -477,6 +477,14 @@ fn promise_constructor(
             is_handled: false,
         }),
     );
+    // The context's init hook runs once the promise exists, which is where V8
+    // fires it from the constructor and capability paths.
+    crate::promise::run_promise_hook(
+        agent,
+        crate::promise::PromiseHookKind::Init,
+        &promise_value,
+        None,
+    )?;
     let result = crate::function::call(agent, &executor, Value::Undefined, &[resolve, reject]);
     if let Err(error) = result {
         let rejection = error_value(agent, &error);

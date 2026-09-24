@@ -17,6 +17,70 @@ use crux::value::{Value, ValueKind, is_callable, is_constructor};
 use crate::agent::Agent;
 use crate::job::{JobCallback, host_make_job_callback};
 
+/// Which promise hook is running (`v8::PromiseHookType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromiseHookKind {
+    /// A promise was created.
+    Init,
+    /// A reaction job's handler is about to run.
+    Before,
+    /// That handler returned.
+    After,
+    /// A promise settled.
+    Resolve,
+}
+
+/// Run the current context's promise hook for `kind`, if it installed one
+/// (`v8::Context::SetPromiseHooks`; V8's `NativeContext::RunPromiseHook`,
+/// `v8/src/objects/contexts.cc:764`).
+///
+/// V8's shape, reproduced: the slot is the *current* context's, an unset slot
+/// runs nothing, the receiver is the global object, and an init gets two
+/// arguments — the promise and its parent — where the other kinds get one. A
+/// hook that throws fails the operation that ran it, which is what the runtime
+/// functions that fire these answer in V8.
+///
+/// The parent of an init is `undefined` here: V8 passes the promise whose
+/// reaction created this one where it knows it, and this engine does not track
+/// which reaction a promise came out of (`.notes/embedding.md` §9).
+pub fn run_promise_hook(
+    agent: &mut Agent,
+    kind: PromiseHookKind,
+    promise: &Value,
+    parent: Option<Value>,
+) -> Result<(), JsError> {
+    // The slots are the *current* context's, as they are in V8
+    // (`NativeContext::RunPromiseHook` reads the native context). A job runs
+    // with no execution context of its own and the drain enters the realm the
+    // job was queued for, which is what makes the before and after pair
+    // reachable.
+    let Ok(realm) = agent.current_realm() else {
+        return Ok(());
+    };
+    let hook = {
+        let hooks = realm.promise_hooks.borrow();
+        match kind {
+            PromiseHookKind::Init => hooks.init,
+            PromiseHookKind::Before => hooks.before,
+            PromiseHookKind::After => hooks.after,
+            PromiseHookKind::Resolve => hooks.resolve,
+        }
+    };
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    let receiver = Value::Object(realm.global_object);
+    let args = match kind {
+        // V8's `argc` is 2 for an init and 1 for every other kind, so an init
+        // is handed the parent even when it is `undefined`
+        // (`NativeContext::RunPromiseHook`).
+        PromiseHookKind::Init => vec![*promise, parent.unwrap_or(Value::Undefined)],
+        _ => vec![*promise],
+    };
+    crate::function::call(agent, &hook, receiver, &args)?;
+    Ok(())
+}
+
 /// [[PromiseState]] plus the reaction lists (spec 27.2.1.3).
 pub enum PromiseState {
     Pending {
@@ -274,6 +338,7 @@ pub fn resolve_promise(
     promise: &Value,
     resolution: Value,
 ) -> Result<(), JsError> {
+    run_promise_hook(agent, PromiseHookKind::Resolve, promise, None)?;
     if crux::ops::same_value(&resolution, promise) {
         // spec 27.2.1.3.2 step 6: reject with a fresh TypeError object (the
         // constructor check in the resolve-*-self fixtures needs a real
@@ -336,11 +401,12 @@ pub fn reject_promise(agent: &mut Agent, promise: &Value, reason: Value) -> Resu
         (std::mem::take(reject_reactions), data.is_handled)
     };
     data.borrow_mut().state = PromiseState::Rejected(reason);
+    run_promise_hook(agent, PromiseHookKind::Resolve, promise, None)?;
     if !was_handled {
         crate::host::promise_rejection_tracker(agent, promise, Some(&reason), false)?;
     }
     for reaction in reactions {
-        enqueue_reaction_job(agent, reaction, reason);
+        enqueue_reaction_job(agent, *promise, reaction, reason);
     }
     Ok(())
 }
@@ -371,8 +437,9 @@ pub fn fulfill_promise(agent: &mut Agent, promise: &Value, value: Value) -> Resu
         std::mem::take(fulfill_reactions)
     };
     data.borrow_mut().state = PromiseState::Fulfilled(value);
+    run_promise_hook(agent, PromiseHookKind::Resolve, promise, None)?;
     for reaction in reactions {
-        enqueue_reaction_job(agent, reaction, value);
+        enqueue_reaction_job(agent, *promise, reaction, value);
     }
     Ok(())
 }
@@ -434,7 +501,7 @@ pub fn perform_promise_then(
             ReactionKind::Fulfill => fulfill_reaction,
             ReactionKind::Reject => reject_reaction,
         };
-        enqueue_reaction_job(agent, reaction, value);
+        enqueue_reaction_job(agent, promise_again, reaction, value);
     }
     // Step 7: mark the promise handled once a reaction is attached.
     let was_handled = agent.promises[&id].borrow().is_handled;
@@ -494,9 +561,18 @@ fn kind_name(kind: ErrorKind) -> &'static str {
 
 /// NewPromiseReactionJob (spec 27.2.1.6): run the reaction's handler with the
 /// settled value and settle the reaction's capability.
-fn enqueue_reaction_job(agent: &mut Agent, reaction: PromiseReaction, argument: Value) {
+///
+/// `promise` is the promise whose reaction this is, which is what V8's before
+/// and after hooks are handed (`OnPromiseBefore`/`OnPromiseAfter`).
+fn enqueue_reaction_job(
+    agent: &mut Agent,
+    promise: Value,
+    reaction: PromiseReaction,
+    argument: Value,
+) {
     let realm = agent.current_realm().ok();
     agent.enqueue_promise_job(realm, move |agent| {
+        run_promise_hook(agent, PromiseHookKind::Before, &promise, None)?;
         let handler_result = match &reaction.handler {
             Some(callback) => crate::job::host_call_job_callback_agent(
                 agent,
@@ -513,6 +589,9 @@ fn enqueue_reaction_job(agent: &mut Agent, reaction: PromiseReaction, argument: 
                 .with_value(argument)),
             },
         };
+        // V8 fires the after hook from the job's epilogue, whatever the handler
+        // did — the settlement below is the job's own tail, not the handler's.
+        run_promise_hook(agent, PromiseHookKind::After, &promise, None)?;
         if let Some(capability) = &reaction.capability {
             match handler_result {
                 Ok(value) => {

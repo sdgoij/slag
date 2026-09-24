@@ -212,15 +212,19 @@ impl<'p, 'i> PinnedRef<'p, HandleScope<'i, Context>> {
         Local::from_payload(self.0.isolate.continuation_data_payload())
     }
 
-    /// The hooks the engine would run around a promise's settlement
-    /// (v8::HandleScope::SetPromiseHooks).
+    /// The hooks the engine runs around a promise's life
+    /// (v8::Context::SetPromiseHooks), installed on the context this scope is
+    /// in.
     ///
-    /// Accepted and not run: the engine fires no host hook when a promise is
-    /// created or settled, and has nothing to run these through. A host that
-    /// installs them gets the behaviour of one that does not, and that is what
-    /// this comment is here for — the alternative shapes (refusing, or running a
-    /// hook the engine cannot place) are worse than an accepted no-op, because
-    /// neither can be discovered from the call site.
+    /// The four run where V8 runs them: `init` when a promise is created, and
+    /// `before`, `after` and `resolve` around a reaction job's handler and on
+    /// settlement. An init is handed the promise and its parent, the other three
+    /// the promise alone; `None` leaves a slot unset, and an unset slot runs
+    /// nothing — which is how a host installs only the kinds it wants.
+    ///
+    /// The parent an init sees is `undefined`: V8 passes the promise whose
+    /// reaction created this one where it knows it, and the engine does not track
+    /// that (`.notes/embedding.md` §9).
     pub fn set_promise_hooks(
         &self,
         init_hook: Option<Local<Function>>,
@@ -228,7 +232,13 @@ impl<'p, 'i> PinnedRef<'p, HandleScope<'i, Context>> {
         after_hook: Option<Local<Function>>,
         resolve_hook: Option<Local<Function>>,
     ) {
-        let _ = (init_hook, before_hook, after_hook, resolve_hook);
+        let engine = |hook: Option<Local<Function>>| hook.map(|hook| hook.into_engine());
+        self.realm().set_promise_hooks(
+            engine(init_hook),
+            engine(before_hook),
+            engine(after_hook),
+            engine(resolve_hook),
+        );
     }
 }
 

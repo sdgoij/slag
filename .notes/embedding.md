@@ -892,8 +892,8 @@ engine has the event" is true of one of them:
   header), compiles wasm synchronously, and neither enforces a heap limit nor
   profiles. A host that needs one of these to fire needs the subsystem behind it,
   not the name.
-- **`HandleScope::set_promise_hooks` — accepted, not run**, for the same reason:
-  nothing in the engine fires a host hook when a promise is created or settled.
+- **`HandleScope::set_promise_hooks` — landed** (§9's bullet below): the four
+  hooks run where V8 runs them, on the context the scope is in.
 - **`ReturnValue::set_bool`** was a gap rather than a shape, and
   **`AsMut<Isolate> for OwnedIsolate`** (and for `Isolate`) is what makes
   `manually_drop.as_mut()` resolve — how deno's allocator reaches its isolate.
@@ -4375,6 +4375,22 @@ js-api **1,001 tests, 0 fail**.
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,322 passed / 0 failed**; the two wasm-free shapes above both green.
 
+*The four promise hooks a context installs are run — §9's bullet that named it.* Both `test_timer_return_protocol_*` tests arm a timer from a promise hook and failed because nothing fired one: deno installs them with `Deno.core.setPromiseHooks` (`libs/core/ops_builtin_v8.rs:1242` → `scope.set_promise_hooks`), which the bridge accepted and dropped. The four now run where V8 runs them, with V8's call shape read out of the `v8/` checkout: the slots live on the context (`v8::Context::SetPromiseHooks` → `NativeContext::RunPromiseHook`, `contexts.cc:764`), an unset slot runs nothing, an init gets two arguments and every other kind one, and the receiver is the context's global object. The points are V8's — promise creation (`runtime-promise.cc:118`), around a reaction job's handler (`:128`/`:139`), settlement (`objects.cc:4771`, `:4807`, `:4717`) — which in Slag are the `%Promise%` constructor (`builtins/promise.rs`), `enqueue_reaction_job` (`promise.rs`) and `fulfill_promise`/`reject_promise`/`resolve_promise`. Two stated divergences, both in §9: an init's parent is `undefined`, and the slots are read from the promise's **own recorded realm** (`PromiseData::realm`) rather than from the current execution context — a reaction job runs with no context of its own and `run_job` does not enter the job's realm, so the promise's realm is what makes a hook reachable from a job at all.
+
+*The measurement.* deno's suite moves **445 passed / 14 failed → 447 passed / 12 failed**: `runtime::tests::misc::test_timer_return_protocol_keeps_timers_armed_from_promise_hook` and `..._from_run_next_ticks` both pass, and no test is newly red.
+
+*Tests — three, and three mutations, each caught.* `a_contexts_promise_hooks_run_with_v8s_call_shape` (`crates/runtime/src/api/context.rs`) pins all four kinds firing with V8's argument counts (`init:2`, every other kind `1`) and the global object as receiver — and it found the argc rule before it passed: the first run read `init:1`, because the runner added the parent only when a caller supplied one, where V8 always passes two. `an_unset_promise_hook_slot_runs_nothing` pins that a slot the host left unset runs nothing. `a_promise_hook_installed_through_the_scope_runs` (`crates/v8/isolate.rs`, replacing the test that only asserted an install was accepted) drives the bridge path deno uses, with the host draining the queue itself, as its event loop does. Three mutations, each caught: dropping the before hook fails all three tests (`before:1:receiver=true` and `before:1` missing from the two engine runs, `before:1 was not among init:2,resolve:1,resolve:1,init:2` in the bridge); making the bridge's install a no-op fails the bridge test with nothing recorded at all; and the argc mutation above fails the engine test on `init:2`.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean (one clippy finding, a `let`-and-return, fixed); `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_survives_a_collection` **5,324 passed / 0 failed**. The engine moved, and promise settlement sits on every error path a corpus exercises, so the battery was re-run on rebuilt binaries and reproduced every certified number: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622; the wasm sweeps core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending; js-api **1,001 tests, 0 fail**.
+
+*And the drain enters the realm a job was queued for — the follow-up that removed this part's one workaround.* The first cut read the hooks from a realm recorded on each promise (`PromiseData::realm`), because a reaction job runs with no execution context of its own and `run_job` did not enter the job's. That answered the wrong question for the before/after pair — V8 reads the slots from the *current* context (`NativeContext::RunPromiseHook`) — so the engine gained what it was missing instead: `Agent::entered_realm`, V8's `isolate->context()`, set by `run_job` from the realm the job carries (spec 9.5.4 hands the host a realm to run a job in) and restored after it. `current_realm` now prefers a running execution context, as V8's `GetCurrentContext` prefers its own, and falls back to the entered realm where it previously answered an error; the promise's own realm record is gone, and `PromiseData` is back to its two fields.
+
+*The measurement, and the honest headline: no count moves.* deno's suite stays at **447 passed / 12 failed**, the same 12: every realm deno drains in is already on the engine's stack in its configuration, so the change closes a hole rather than fixing a verdict — a job with no ambient context is now answered instead of refused. The rule is V8's, which is the point, and the workaround is gone.
+
+*Test — the direct pin, and the mutation.* `a_job_runs_in_the_realm_it_was_enqueued_for` (`crates/runtime/src/job.rs`) pops the bootstrap context to get the drain's real shape, then queues two jobs: one with the realm, one without. The first must answer that realm (by handle identity) and the second must still answer nothing, which is what makes the answer provably the job's rather than ambient. One mutation, caught: dropping the `entered_realm` write fails it with `left: ["no realm", "no context, no realm"], right: ["the realm it was queued for", "no context, no realm"]`. The promise-hook tests pass either way in the api's shape — its context is always on the stack — which is why the pin had to be the drain itself.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace` **5,325 passed / 0 failed**. `current_realm`'s fallback is on every path that asks for a realm, so the battery was re-run on rebuilt binaries and reproduced every certified number, deno included: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622; the wasm sweeps core **20,662** (+3 skipped), simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** (+1 skipped), memory64 **8,709**, multi-memory **912**, all 0 fail / 0 pending; js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 *Gates, and the two things they caught.* `cargo fmt --all -- --check` clean; `cargo clippy
 --locked --workspace --all-targets -- -D warnings` clean **after it caught a real one**
@@ -7505,6 +7521,29 @@ migrate, then delete.
   `const { … } = Deno.core.ops; await op()` answers column 43, the `await`.
   `api::Module::name` is the second exposure, the name a message reports as the
   module's script.
+- **The four promise hooks a context installs are run — named here with the edit,
+  and it closes the ledger entry above that recorded them "accepted, not run".**
+  Both `test_timer_return_protocol_*` tests arm a timer from a hook and failed
+  because nothing fired one: the first installs the **resolve** hook, the second
+  the **before** hook. V8's shape is reproduced: the four slots live on the
+  context (`v8::Context::SetPromiseHooks` → `NativeContext::RunPromiseHook`,
+  `v8/src/objects/contexts.cc:764`), an unset slot runs nothing, an init is
+  handed two arguments — the promise and its parent, `undefined` here because
+  nothing tracks which reaction a promise came out of — where the other kinds get
+  one, the receiver is the context's global object, and a hook that throws fails
+  the operation that ran it, which is what V8's runtime functions answer. The
+  points are V8's: creation (`Runtime_PromiseHookInit`,
+  `v8/src/runtime/runtime-promise.cc:118`), around a reaction job's handler
+  (`:128`/`:139` → `isolate.cc:7810`/`:7823`), and settlement (`JSPromise::Fulfill`,
+  `::Reject` and `::Resolve`, `v8/src/objects/objects.cc:4771`, `:4807` and the
+  guarded `:4717`). The slots are read from the realm the engine is in, and one
+  engine change was needed to make that reach every point: a reaction job runs
+  with no execution context of its own, so the drain now enters the realm the job
+  was queued for (`Agent::entered_realm`, V8's `isolate->context()`).
+  `current_realm` prefers a running execution context — as V8's
+  `GetCurrentContext` prefers its own — and falls back to that realm where it
+  previously answered an error; the first cut of this part instead had each
+  promise record the realm it was made in, and that record is gone.
 - **The streaming hook exists only with the `wasm` feature — named here with the
   edit, and it is a build fix rather than a capability.** `HostHooks`'s two
   streaming items and `host.rs`'s two free dispatches name
@@ -8036,3 +8075,54 @@ migrate, then delete.
    class method's body publishes nothing: the same `capture()` call in
    object-literal and class bodies reaches the same lowering, so it is the
    activation or the body's compilation that differs, not the call.
+20. **Async stack traces — probed against V8's own source, not started.**
+   `test_dynamic_import_module_error_stack` wants `at async file:///import.js:1:43`
+   on a rejection whose reason deno created while no execution context was on the
+   stack; the frame is the *awaiting* module body at its `await`, marked async.
+   V8's mechanism, read out of `v8/` (the full source is checked out in the
+   tree), is finite: `CaptureSimpleStackTrace`
+   (`v8/src/execution/isolate.cc:1681`) builds the synchronous frames and then,
+   when `--async-stack-traces` is on **and the current microtask is a
+   `PromiseReactionJobTask`**, calls `CaptureAsyncStackTrace(isolate, &builder)`
+   (`:1560` → `:1287`), which walks the awaiting chain: `TryGetCurrentTaskPromise`
+   (`:1453`) takes the promise the running reaction belongs to, and the loop then
+   requires that promise to be **pending with exactly one reaction whose `next` is
+   a Smi** (`:1291-1298`), takes that reaction's fulfill handler, and finds the
+   suspended async body behind it — a `JSGeneratorObject` directly, or the async
+   continuation builtin whose *context extension* is the generator object
+   (`TryGetAsyncGenerator`, `:931`). That body's frame is appended with
+   `CallSiteInfo::kIsAsync` and the position of the generator's bytecode offset
+   (`AppendAsyncFrame`, `:1041`), and the walk climbs by continuing with the
+   promise the async function itself returned (`:1308-1321`). In Slag's terms
+   that is: a per-promise record of the async state awaiting it (`attach_await`,
+   cleared by the resume handler), the promise-reaction job knowing which promise
+   it belongs to, a frame view that can say `is_async`, and the `at async …`
+   spelling in `define_stack`. One deno test, and the biggest single item left.
+21. **The four promise hooks — landed.** §9's ledger recorded
+   `HandleScope::set_promise_hooks` as "accepted, not run", and both
+   `test_timer_return_protocol_*` tests armed a timer from a hook that never
+   fired: the first installs the **resolve** hook, the second the **before**
+   hook. Both pass; §7's record has the shapes, the two mutations and the gates.
+   V8's points, read out of `v8/`: the JS-level hooks live in the *native context*
+   (one slot per type, `NativeContext::RunPromiseHook`,
+   `v8/src/objects/contexts.cc:764`), the enable flag is isolate-wide, and the
+   call shape is fixed there — `argc` is **2 for `kInit`** (`promise, parent`) and
+   **1 otherwise**, the receiver is the **global proxy**, and an `undefined` slot
+   runs nothing. The points are `kInit` when a promise is created
+   (`Runtime_PromiseHookInit`, `v8/src/runtime/runtime-promise.cc:118`, reached
+   from the JS-level capability/constructor paths), `kBefore`/`kAfter` around a
+   reaction job's handler (`Runtime_PromiseHookBefore`/`After`, `:128`/`:139` →
+   `OnPromiseBefore`/`OnPromiseAfter`, `isolate.cc:7810`/`:7823`), and `kResolve`
+   on settlement — `JSPromise::Fulfill`, `JSPromise::Reject` and
+   `JSPromise::Resolve` (`v8/src/objects/objects.cc:4771`, `:4807`, and the
+   guarded pair at `:4717`). In Slag's terms: a per-realm hook set (the realm
+   record, traced), a runner that calls the JS function with the global proxy as
+   receiver and the right arg count, and calls at those three points
+   (`builtins/promise.rs`'s constructor, `promise.rs`'s reaction job, and
+   `fulfill_promise`/`reject_promise`/`resolve_promise`). The `parent` argument of
+   `kInit` is the one piece the engine does not track — V8 passes the promise the
+   reaction belonged to, or the awaiting promise for an async function — so it is
+   `undefined` there unless a caller knows better, and it is the only divergence
+   left. The slots are read from the current realm, and the drain enters the realm
+   a job was queued for so that answer exists while a job runs; both are stated in
+   §9.
