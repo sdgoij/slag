@@ -38,6 +38,19 @@ fn inner_from_payload<T>(payload: Payload) -> Inner<T> {
     }
 }
 
+impl<T> Clone for Inner<T> {
+    /// Another handle to the *same* reference. Both arms are handles rather than
+    /// copies of what they name — the weak arm is the engine's own copyable id,
+    /// and the strong arm goes through [`Global`], pin and all — which is why
+    /// clearing through one clone releases every handle that came from it.
+    fn clone(&self) -> Self {
+        match self {
+            Inner::Weak(inner) => Inner::Weak(*inner),
+            Inner::Strong(strong) => Inner::Strong(strong.clone()),
+        }
+    }
+}
+
 /// The context a weak death callback is handed (`v8::WeakCallbackInfo`).
 ///
 /// The crate we stand in for fills this with the isolate, the value and the
@@ -158,6 +171,20 @@ impl<T> Weak<T> {
     }
 }
 
+impl<T> Clone for Weak<T> {
+    /// Clone the handle, not a second reference to the same value. The crate we
+    /// stand in for's `Weak` is cloneable for this reason, and a host relies on
+    /// it — `deno_webgpu`'s `DeviceErrorHandler::push_error` clones one out of a
+    /// `OnceLock` to move it into a `'static` task. A fresh handle would look
+    /// identical while the value lived and diverge on `clear`, so the two must
+    /// be one reference.
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 impl<T> fmt::Debug for Weak<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Weak")
@@ -205,6 +232,16 @@ impl<T> TracedReference<T> {
         match &self.inner {
             Inner::Weak(inner) => inner.is_empty(),
             Inner::Strong(_) => false,
+        }
+    }
+}
+
+impl<T> Clone for TracedReference<T> {
+    /// Clone the handle, not a second reference — [`Weak`]'s reasoning, and the
+    /// shape a host's own traced structures clone into.
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
         }
     }
 }
@@ -265,6 +302,114 @@ mod tests {
             let traced = TracedReference::<Context>::new(scope, context);
             assert!(!traced.is_empty());
             assert!(traced.get(scope).is_some(), "a realm has no box to lose");
+        });
+    }
+
+    /// A clone is another handle to the *same* reference, not a second weak handle
+    /// over the same value. A host relies on this when it clones out of shared
+    /// state: `clear` through either handle must empty both, which is the fact a
+    /// `Clone` that minted a fresh `api::Weak` would quietly break.
+    #[test]
+    fn a_cloned_weak_handle_is_the_same_reference() {
+        crate::test_support::in_context!(scope, {
+            let value = Local::<Value>::from_engine(api::Local::string("cloned"));
+            let weak = Weak::<Value>::new(scope, value);
+            let mut clone = weak.clone();
+            assert!(
+                clone.to_local(scope) == weak.to_local(scope),
+                "the clone names the same value"
+            );
+
+            clone.clear();
+            assert!(
+                weak.is_empty(),
+                "clearing one handle releases the reference they share"
+            );
+        });
+    }
+
+    /// A payload the engine cannot watch — a realm — is held the way [`Global`]
+    /// holds it, so a clone of it names the same realm: a `Clone` that dropped
+    /// the strong payload would answer a different one.
+    #[test]
+    fn a_cloned_realm_handle_names_the_same_realm() {
+        crate::test_support::in_context!(scope, {
+            let context = scope.get_current_context();
+            let weak = Weak::<Context>::new(scope, context);
+            let clone = weak.clone();
+            let original = weak.to_local(scope).expect("a realm has no box to lose");
+            let read = clone.to_local(scope).expect("a realm has no box to lose");
+            assert!(read == original, "the clone names the same realm");
+        });
+    }
+
+    /// The traced reference reads the same way through a clone, and a clone of a
+    /// value is still a real weak handle rather than a second strong one.
+    #[test]
+    fn a_cloned_traced_reference_reads_the_same_value() {
+        crate::test_support::in_context!(scope, {
+            let held = api::Global::new(api::Local::number(7.0));
+            let reference = TracedReference::<Number>::new(scope, Local::from_engine(held.get()));
+            let clone = reference.clone();
+            assert_eq!(clone.get(scope).map(|local| local.value()), Some(7.0));
+            assert_eq!(clone.is_empty(), reference.is_empty());
+        });
+    }
+
+    /// The `E0521` shape `deno_webgpu` reported, kept as the regression that pins
+    /// `Weak<T>: Clone`. A `&self` method clones the handle out of a `OnceLock` and
+    /// moves it into a `'static` task; without the impl, this `.clone()` resolved
+    /// to `Clone for &Weak`, so the closure captured a borrow of `self` and failed
+    /// with `'1 must outlive 'static`. Every earlier section of the plan had the
+    /// error down as deno-side and pre-existing; §9 records that the attribution
+    /// was wrong.
+    #[test]
+    fn a_weak_handle_clones_out_of_a_shared_owner_into_a_static_task() {
+        use crate::data::{Function, Object, String};
+        use std::sync::OnceLock;
+
+        struct Spawner;
+        impl Spawner {
+            fn spawn<F>(&self, _f: F)
+            where
+                F: FnOnce(&mut PinScope<'_, '_, Context>) + 'static,
+            {
+            }
+        }
+        struct Handler {
+            device: OnceLock<Weak<Object>>,
+            spawner: Spawner,
+        }
+        impl Handler {
+            fn push_error(&self) {
+                let device = self.device.get().expect("set before use").clone();
+                self.spawner.spawn(move |scope| {
+                    let Some(device) = device.to_local(scope) else {
+                        return;
+                    };
+                    let key = String::new(scope, "dispatchEvent").expect("a string");
+                    let handler = device
+                        .get(scope, key.into())
+                        .and_then(|value| Local::<Function>::try_from(value).ok());
+                    assert!(handler.is_none(), "the device has no such handler");
+                });
+            }
+        }
+
+        crate::test_support::in_context!(scope, {
+            let device = Object::new(scope);
+            let handler = Handler {
+                device: OnceLock::new(),
+                spawner: Spawner,
+            };
+            assert!(
+                handler
+                    .device
+                    .set(Weak::<Object>::new(scope, device))
+                    .is_ok(),
+                "the device is set once"
+            );
+            handler.push_error();
         });
     }
 

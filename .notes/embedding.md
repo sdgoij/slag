@@ -73,7 +73,7 @@ below it.
 |---|---|---|---|
 | **L0** | call in, get values out | evaluate, call/construct, host functions | **done** |
 | **L1** | hold a value across calls | rooting/pinning: a value the collector treats as a root until released | **landed and certified 2026-09-21** — `crux::heap::pin`, a thread-local registry consulted by all four collection entry points; `api::Global` holds one, and so does the bridge's `Global<T>`. Until this landed the row read "landed and certified" while no `pin` existed anywhere in the tree: the claim was aspirational and the code arrived only now |
-| **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **requirements 1, 2 and 3 landed 2026-09-25; what is left is the bridge's surface.** Requirement 3 (weak handles) arrived last: `crux::heap`'s per-thread weak registry and `runtime::api::Weak` over it (§7's last record, `.notes/host-object-gc.md` §4.3), so a host can hold a value *without* keeping it alive and is told when the collector takes it — the collector's own verdict, once, with the handle already empty. This row twice carried a claim the tree did not have — it read "edges and finalization landed" while `HostOps` had neither a `trace` nor a `finalize` and `ObjectKind::Host`'s `Trace` impl deliberately contributed no edges, which is the defect `.notes/host-object-gc.md` §1(a) describes; corrected 2026-09-21. Slice 1 of that note landed 2026-09-24: the `ffi` handle tables are a collector root source, so a value a *host* retains outside the heap is marked rather than swept (§7's record, §9's bullet). **Slices 2-3 landed 2026-09-25** (§7's record): a host *object* owns an engine-owned edge list — `JsObject::host_object_retain`/`host_object_release`, with the write barrier run on retain — which `ObjectKind::Host`'s `Trace` arm now marks, so the value a host object holds survives, and the host needs no handle of its own; and `HostOps::finalize(object_id)` is called once per swept host object through a deferred queue (`Isolate::run_finalizers`, plus an outermost `Context` entry). What remains on this row: the *shapes* a V8-class host asks for by name — `v8::Weak<T>`, `v8::TracedReference<T>` (the CLI tier's 35 missing sites), and `Global::set_weak`'s two-pass callback protocol — none of which needs new GC machinery now that the primitive exists |
+| **L2** | own objects JS retains | traced host objects (host references participate in marking) + finalization + weak handles | **requirements 1, 2 and 3 landed 2026-09-25; what is left is the bridge's surface.** Requirement 3 (weak handles) arrived last: `crux::heap`'s per-thread weak registry and `runtime::api::Weak` over it (§7's last record, `.notes/host-object-gc.md` §4.3), so a host can hold a value *without* keeping it alive and is told when the collector takes it — the collector's own verdict, once, with the handle already empty. This row twice carried a claim the tree did not have — it read "edges and finalization landed" while `HostOps` had neither a `trace` nor a `finalize` and `ObjectKind::Host`'s `Trace` impl deliberately contributed no edges, which is the defect `.notes/host-object-gc.md` §1(a) describes; corrected 2026-09-21. Slice 1 of that note landed 2026-09-24: the `ffi` handle tables are a collector root source, so a value a *host* retains outside the heap is marked rather than swept (§7's record, §9's bullet). **Slices 2-3 landed 2026-09-25** (§7's record): a host *object* owns an engine-owned edge list — `JsObject::host_object_retain`/`host_object_release`, with the write barrier run on retain — which `ObjectKind::Host`'s `Trace` arm now marks, so the value a host object holds survives, and the host needs no handle of its own; and `HostOps::finalize(object_id)` is called once per swept host object through a deferred queue (`Isolate::run_finalizers`, plus an outermost `Context` entry). The *shapes* a V8-class host asks for by name — `v8::Weak<T>` and `v8::TracedReference<T>` — have landed too (§7's records, with `Clone` last), so what remains on this row is `Global::set_weak`'s two-pass callback protocol, which needs no new GC machinery now that the primitive exists |
 | **L3** | own scheduling, GC coordination, threads | platform/task runner, microtask policy, snapshots, external references, termination, host memory | **partly landed** — the **snapshot format's v1 landed** (§7's last seven records, ledger item 16): a versioned blob over the host's attached context data, one slot per context with each slot written and read against its own realm, restored into a rebuilt realm, **external references landed with it** — a host pointer is an index into the table the host rebuilds for every load, which is the compatibility surface this row always said it was — **a JavaScript function is carried as the source it is re-parsed from**, **a bind as its target and bound state**, **a class constructor as the class text the engine's own class evaluation re-runs**, **an arrow as the expression it was written as**, **a host callback as its table entry plus the data it reads**, **a module record — which is not a language value — as the name and source the engine's own compile path rebuilds it from, so a slot's items come back at the indices the host attached them under**, and **the realm's own global functions, the members of its own builtin objects by the spec's names and a method that reads a private name, as a member of its class**, so a host's attached callbacks and the builtins its graph reaches come back callable, and **a blob now loads as well as builds** — `read_snapshot` was exercised against deno's blob for the first time and now reads through every value the walk carries and every item its slots hold (§7); what a restore cannot rebuild is the scope a closure closed over, which the format states rather than implies, and what a host's own `FromSnapshot` path additionally expects — its realm's bootstrapped global — was **measured**: a bootstrapped `globalThis` walks, restores into a fresh isolate and its bootstrap functions run (§7's last two records, §12 item 11), so the remaining work there is the load applying it rather than a gap in what can be carried. What remains on this row: the task runner and the host-memory accounting half — **termination landed for every engine there is** (§7's wasm record): one request, read by the JS interpreter and JIT as item 20 left them and by the wasm interpreter and its compiled backend here. `MicrotasksPolicy` genuinely landed 2026-09-21 (`Explicit` leaves the queues to the host, `Auto` drains at the outermost entry, depth-guarded so a callback cannot have jobs run under it). Until then this row said "`MicrotasksPolicy` only" while no policy existed anywhere in the tree — the same misstatement the L1 row carried, caught the same way, by grepping for the type rather than trusting the row |
 
 Why L1 is first and cheapest for us: V8's handle scopes exist largely because its
@@ -4923,6 +4923,14 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,441 passed / 0 failed** (up two — this part's tests; `v8` **329** default and **335** with simdutf, `crux` 259, `runtime` 943, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8/primitives.rs`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same six out-of-scope cases.
 
+*The weak-handle `Clone` — §9's live bullet, and the attribution it corrects.* `Weak<T>` and `TracedReference<T>` had no `Clone`, so `deno_webgpu`'s `DeviceErrorHandler::push_error` — which clones the handle out of a `OnceLock` to move it into a `'static` task closure (`V8TaskSpawner::spawn`, `FnOnce(&mut v8::PinScope<'_, '_>) + 'static`) — had its `.clone()` resolve to `Clone for &Weak` and capture a borrow: the `E0521` (`'1 must outlive 'static`) the last measurements in this section record. **Those measurement lines called the error "deno-side and pre-existing", and that was wrong; this record supersedes the attribution, as §9's bullet and §12's CLI-tier item now say.** It was the bridge's missing `Clone`. `Inner<T>` (both arms), `Weak<T>` and `TracedReference<T>` gain it, and a clone is another handle to the *same* reference rather than a second weak handle over the same value — which is what makes `clear` through one clone empty every handle that came from it, and what a fresh `api::Weak` would quietly break. No engine change: `api::Weak` is a copyable id and `Global` carries its own manual `Clone`, so both arms were already cheap.
+
+*Tests — four, and two mutations, each caught by its own test.* `a_cloned_weak_handle_is_the_same_reference` (a clone reads the same value, and `clear` through it empties the original), `a_cloned_realm_handle_names_the_same_realm` (the strong arm: a `Context` clone names the same realm), `a_cloned_traced_reference_reads_the_same_value`, and `a_weak_handle_clones_out_of_a_shared_owner_into_a_static_task` — the `E0521` shape kept as a regression, a `&self` method cloning a `OnceLock<Weak<Object>>` into a `'static`-bounded spawner closure, which did not compile before the impl. Two mutations, each run alone and each caught by its own test: minting a fresh `api::Weak` over the same value in the weak arm fails the first at "clearing one handle releases the reference they share"; dropping the strong payload (`Inner::Strong(_) => Inner::Strong(Global::empty())`) fails the second at "the clone names the same realm". The traced test and the shape test stay green under both, so neither mutation is hidden behind a shared assertion.
+
+*The measurement, and the crate it moved the frontier into.* `cargo check -p deno_snapshots --keep-going`: the `E0521` is **gone** — the log shows `Compiling deno_webgpu` and no `E0521` anywhere. The command still fails, one crate further on: `deno_runtime` reports **2** diagnostics at one site, `runtime/worker.rs:1141` (`ContextScope<'_, '_, HandleScope<'_>>: NewHandleScope<'_>` not satisfied). It was invisible until now because `deno_runtime` depends on `deno_webgpu` (`runtime/Cargo.toml:68`), so the failing webgpu aborted its dependent and the walk never reached it — the "an abort hides a whole crate" trap §7 already records for `deno_node`. The new error cannot be this part's (adding `Clone` impls cannot make a `NewHandleScope` impl stop existing), and it is the same shape family §12's CLI-tier bullet already names: `crates/v8/scope.rs` implements `NewHandleScope` for `Isolate`, `OwnedIsolate`, `PinnedRef<HandleScope>` and `PinnedRef<CallbackScope>`, and not for `ContextScope`. **Named here as the next part.**
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,445 passed / 0 failed** (up four — this part's tests; `v8` **333** default and **339** with simdutf, `crux` 259, `runtime` 943, `ffi` 10, `slag` 4, `test262` 3324 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8/weak.rs`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` (and the same for `wasmtest`) is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six out-of-scope cases — a `Clone` impl on weak handles does not reach them.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5683,9 +5691,12 @@ if that proves possible.
   never enters a proxy or an accessor (a snapshot runs no host JS and grows no
   heap), and an object whose chain names no constructor falls back to its own kind
   rather than to an invented name. **`ext/webgpu/error.rs`'s
-  `E0521`** is deno-side and pre-existing: it aborts that crate's own build and
-  is not this bridge's to fix, which is why every measurement in §7 was taken
-  with `--keep-going` and says so.
+  `E0521`** was recorded here as deno-side and pre-existing, and **that was
+  wrong**: it is this bridge's missing `Clone` on `Weak<T>`/`TracedReference<T>`,
+  landed in §7's last record. Every measurement in §7 was taken with
+  `--keep-going` and says so, and that flag is exactly how the error stayed
+  misattributed — it reveals what a failed dependency was hiding, so a crate
+  skipped behind a failure reads as clean until the failure is fixed.
 - **The Node-API surface is the next tier, taken one coherent cluster at a time —
   the private-name and index surface first, named here before the edit.** §12
   declared `ext/napi` blocked rather than measured; measuring it (the same
@@ -5747,10 +5758,30 @@ if that proves possible.
   nothing reads once the text is copied. With that, **every `ext/napi` error is
   closed**: the tier's four clusters — the private-name and index surface, the
   small exposures (and the construct-result defect they found), the weak-handle
-  pair, and these raw constructors — and the only error
-  `cargo check -p deno_snapshots --keep-going` still reports is
-  `ext/webgpu/error.rs`'s pre-existing `E0521`, which is deno-side and was never
-  this bridge's to fix.
+  pair, and these raw constructors — and what
+  `cargo check -p deno_snapshots --keep-going` still reported was
+  `ext/webgpu/error.rs`'s `E0521` — **which turns out to be this bridge's after
+  all, and is fixed here**, named before the edit. §7 and §12 had recorded that
+  error as deno-side and pre-existing, and that was wrong: it is a missing `Clone`.
+  `DeviceErrorHandler::push_error` clones the `v8::Weak` out of a `OnceLock` and
+  moves it into a `'static` task closure, which needs `Weak<T>: Clone`;
+  `crates/v8/weak.rs` implemented `Clone` for neither `Weak` nor
+  `TracedReference`, so the `.clone()` resolved to `Clone for &Weak` and the
+  closure captured a `&'1` borrow of `self` — exactly the `'1 must outlive
+  'static` the compiler reported. A minimal reproduction (a `Spawner` with the
+  crate's `FnOnce(&mut PinScope<'_, '_>) + 'static` bound, and a `&self` method
+  cloning a `OnceLock<Weak<Object>>` into it) reproduced the same `E0521` in this
+  workspace, which is what turned the attribution over. `Clone` for `Inner`,
+  `Weak` and `TracedReference` is the fix; the engine's weak handle is already a
+  copyable id, so a clone is another handle to the same reference. With it
+  `deno_webgpu` compiles and the `E0521` is gone from
+  `cargo check -p deno_snapshots --keep-going`; that command now fails one crate
+  further on, in `deno_runtime`'s `runtime/worker.rs:1141` — a
+  `ContextScope<'_, '_, HandleScope<'_>>` that does not satisfy `NewHandleScope`
+  — which was invisible before because `deno_runtime` depends on `deno_webgpu`
+  (`runtime/Cargo.toml:68`) and a failed dependency hides its dependents. That
+  shape is the next part, and it is the same family as the
+  `PinnedRef<'_, CallbackScope<'_>>` shape §12's CLI-tier bullet already names.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
@@ -8789,8 +8820,12 @@ migrate, then delete.
 
 ## 12. Open decisions
 
-1. **Weak persistent handles** — the last L2 item. Design sketched in
-   `.notes/host-object-gc.md` §4.3; not started.
+1. **Weak persistent handles — landed** (§7's records: the engine's per-thread
+   weak registry and `runtime::api::Weak`, then the bridge's `Weak`/
+   `TracedReference`, whose `Clone` was the last piece). The design was
+   `.notes/host-object-gc.md` §4.3. What is left of the shapes a host asks for by
+   name is the `NewHandleScope`/`ContextScope` borrow shape (§12 item 11's
+   CLI-tier bullet).
 2. **Snapshot format** — **v1 landed with its context table, external
    references, a function, a bound function, a class constructor, a host callback,
    an arrow, the realm's
@@ -9116,18 +9151,20 @@ migrate, then delete.
      **Taken first.**
    - **The CLI tier** — `deno_snapshots`, the CLI's own snapshot host (its build
      script uses `deno_runtime` with the `snapshot` feature, so it compiles
-     `99_main.js`, every `ext/*` and `runtime/js/*`), names a much larger surface:
-     `v8::TracedReference`, `v8::Weak`, `Object::set_integrity_level` with
-     `IntegrityLevel`, `Object::get_own_property_descriptor`,
-     `Object::preview_entries`, `Map`/`Set::size`, `TypedArray::length`,
-     `Symbol::description`, `String::write_utf8_v2`, `Value::type_of`,
-     `Date::value_of` and `simdutf::{Base64Options, LastChunkHandling, ...}`, plus
-     a `PinnedRef<'_, CallbackScope<'_>>` that does not satisfy `NewHandleScope`.
-     The bulk of it is Node-API and node ops (`ext/napi`,
-     `ext/node/ops/{handle_wrap,v8,vm}`, `ext/web/{console,geometry,image_data}`),
-     so its gate is **weak/traced handles — the plan's own remaining L2 item**
-     (item 1 below) — plus Node-API. **Declared blocked here rather than left
-     implied.** (This measurement needed one host-side line —
+     `99_main.js`, every `ext/*` and `runtime/js/*`), named a much larger surface
+     that has since **all landed** (§7's records): `v8::TracedReference`,
+     `v8::Weak`, `Object::set_integrity_level` with `IntegrityLevel`,
+     `Object::get_own_property_descriptor`, `Object::preview_entries`,
+     `Map`/`Set::size`, `TypedArray::length`, `Symbol::description`,
+     `String::write_utf8_v2`, `Value::type_of`, `Date::value_of` and
+     `simdutf::{Base64Options, LastChunkHandling, ...}`. What is left, and it is
+     the whole remainder, is the `NewHandleScope` shape family: the
+     `PinnedRef<'_, CallbackScope<'_>>` this bullet first named, and the
+     `ContextScope<'_, '_, HandleScope<'_>>` the last measurement surfaced
+     (`deno_runtime`'s `runtime/worker.rs:1141`, reached only once the webgpu
+     `E0521` was fixed — see §9's live bullet). Its gate was once recorded as
+     **weak/traced handles — the plan's own remaining L2 item** (item 1 below) —
+     plus Node-API; both have landed, so the gate is the scope shape alone. (This measurement needed one host-side line —
      `deno_core = { workspace = true, features = ["v8"] }` under
      `[build-dependencies]` in `cli/snapshot/Cargo.toml` — because the workspace
      enables `deno_core/v8` only through `cli`'s own feature; without it the build
