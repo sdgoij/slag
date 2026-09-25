@@ -4767,6 +4767,14 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,387 passed / 0 failed** (`v8` **283**, up one — the guard; `crux` 258, `ffi` 10, `runtime` 936, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **289 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **905 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is a stronger statement than the usual check here**: the part touches only `crates/v8` and its manifest, the runners' graphs contain no `v8` (**0** for both `test262` and `wasmtest`), and the configuration the manifest now requests was already the one every sweep runs under — because `crates/test262` enables `workers` for the unified graph — so no corpus behaviour could move. deno's `deno_core --lib` was rebuilt anyway, since the bridge is what deno links and the workers block is now in its graph: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+*`ValueView`/`ValueViewData` — §9's bullet that named them, and the bulk of `deno_telemetry`'s errors.* `deno/ext/telemetry` reads a string's code units through the crate we stand in for's `ValueView`: `ValueView::new(scope, string)` then `data()`, matched over `OneByte(&[u8])`/`TwoByte(&[u16])` and handed to `String::from_utf8_lossy`/`from_utf16_lossy` — with one site (`parse_trace_id`) matching `OneByte` alone, so answering `TwoByte` there would silently stop parsing hex ids. There the view is a live window into V8's string storage, held open for the scope's life; here nothing of the kind exists to hand out, because the engine's `JsString` is UTF-16 in every form and has no byte-backed one. So the bridge's view owns a snapshot of the code units and answers the variant they fit: `OneByte` with the Latin-1 byte of each when every unit is at most `0xFF`, `TwoByte` otherwise. The rule is `String::contains_only_onebyte`, the structural test, deliberately and not V8's representational hint — V8 may report a one-byte-capable string as two-byte, and the `OneByte`-only arm is the one that would break. Two divergences are stated in §9 rather than implied: the snapshot allocates where the crate's view borrows, and a host that *wrote* through the crate's view does not compile here instead of writing into a copy. The type sits in `primitives.rs` beside `String`, whose module already owns `code_units` and `contains_only_onebyte`, and is re-exported from `lib.rs`.
+
+*Tests — two, and two mutations, each caught by its own test.* `a_value_view_reads_a_latin1_string_as_one_byte` pins both ends of the one-byte case: ASCII `abc` comes back as `b"abc"`, and `'\u{E9}\u{FF}'` as the bytes `E9 FF`, which is what makes it a Latin-1 read and not a UTF-8 one. `a_value_view_carries_two_byte_units_exactly` pins the other branch on a euro and on a lone surrogate — `'\u{D800}'` must come back as the unit `0xD800`, which a lossy UTF-8 rendering would have replaced, and which is the assertion that the view reads the engine's code units rather than a rendering. Two mutations, each run alone and each caught by its own test: tightening the threshold to `0x7F` fails the Latin-1 test at the `0xFF` boundary (`TwoByte` where `OneByte` belongs), and narrowing the two-byte branch through a byte (as the one-byte branch legitimately does) fails the two-byte test at the euro, `[97, 172]` against `[97, 8364]`.
+
+*The measurement.* `cargo check -p deno_snapshots`: every `ValueView`/`ValueViewData` mention is **196 → 0**, the total is **216 → 144**, and the drop is smaller than the mentions because the build then ran on into `deno_node`, which had been waiting behind `deno_telemetry` — the same effect the `SharedRef` part recorded, one crate further along. What `deno_node` names is the next frontier and it is not small: 61 errors in `ext/node/ops/vm.rs` over `MicrotaskQueue` and `ContextOptions::microtask_queue` (L3's "the host owns scheduling"), `PropertyAttribute::is_read_only` and `get_real_named_property(_attributes)`, `String::MAX_LENGTH`, a dozen `Isolate` setters, and eight `HeapStatistics` accessors this plan had deliberately left *absent* (`heap_size_limit`, `malloced_memory`, `total_allocated_bytes`, `total_available_size`, `peak_malloced_memory`, `total_heap_size_executable`, `total_global_handles_size`, `used_global_handles_size`) — a host that names one now needs an answer, which is a decision rather than an omission, and is recorded as the open item it is rather than filled with a plausible zero. `deno_telemetry`'s own remainder is the GC family §9 names (17 errors), and `deno_webgpu`'s `E0521` is unchanged.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,389 passed / 0 failed** (`v8` **285**, up two — this part's tests; `crux` 258, `ffi` 10, `runtime` 936, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **291 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **905 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps**: the part touches only `crates/v8` (`primitives.rs`, `lib.rs`), and the runners' graphs contain no `v8` — **0** for both `test262` and `wasmtest` — so nothing in a corpus or a wasm sweep can see it. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5321,6 +5329,56 @@ if that proves possible.
   `deno_telemetry`, which the failing build had never reached, and that crate's
   213 errors are `v8::ValueView`/`ValueViewData` and the GC-callback names — a
   family this bridge does not have, and the next frontier.
+- **`ValueView`/`ValueViewData` — named before the code.** `deno/ext/telemetry`
+  reads a string's code units through the crate we stand in for's `ValueView`:
+  `ValueView::new(scope, string)` then `data()`, matched over `OneByte(&[u8])`
+  and `TwoByte(&[u16])` (the two arms are exhaustive at one site, so the enum
+  has exactly those variants, and the arms hand the slices to
+  `String::from_utf8_lossy`/`from_utf16_lossy`), and one site
+  (`parse_trace_id`) matches `OneByte` alone with a wildcard, so answering
+  `TwoByte` there would silently stop parsing hex ids. There the view is a live
+  window into V8's own string storage, held open for the scope's life; here no
+  such thing exists to hand out, because the engine's `JsString` is UTF-16 in
+  every form (`Flat`/`Small`/`ConsString`/`Rope`/`Sliced`) and has no byte-backed
+  one. So the bridge's view owns a *snapshot* of the code units and answers the
+  variant the units fit: `OneByte` (the Latin-1 byte of each) when every unit is
+  at most `0xFF`, `TwoByte` otherwise. That is `String::contains_only_onebyte`,
+  the structural test, not V8's representational hint — which is deliberate,
+  since V8 may report a one-byte-capable string as two-byte, and deno's
+  `OneByte`-only arm is the one that would break. Two divergences are stated
+  rather than implied: the snapshot allocates where the crate's view borrows,
+  and a host that *wrote* through the crate's view would not compile here. The
+  type lives in `primitives.rs` beside `String`, whose module already reads the
+  code units (`code_units`, `contains_only_onebyte`), and is re-exported from
+  `lib.rs`'s surface. **Landed**; §7 records it, and the measurement is clean:
+  every `ValueView`/`ValueViewData` mention is at **0**, the 196 errors they
+  carried are gone, and the total moved 216 → 144 — the drop smaller than the
+  mentions because the build then ran on into `deno_node`, which had been
+  waiting behind `deno_telemetry`, and its families are the next frontier
+  (`MicrotaskQueue` and `ContextOptions::microtask_queue` in `ext/node/ops/vm.rs`,
+  `PropertyAttribute::is_read_only`, `get_real_named_property(_attributes)`,
+  `String::MAX_LENGTH`, and the eight `HeapStatistics` accessors this plan had
+  deliberately left absent — a host that names one now needs an answer, which is
+  a decision rather than an omission).
+- **The GC-callback and heap-space names in the same crate — named, not
+  started, because the honest version needs an engine hook.** `deno/ext/telemetry`
+  installs `add_gc_prologue_callback`/`add_gc_epilogue_callback` (an `extern "C"`
+  fn taking `UnsafeRawIsolatePtr`, `GCType`, `GCCallbackFlags` and the host's
+  `*mut c_void`) and then reads `get_number_of_data_slots` and
+  `get_heap_space_statistics` per slot. The engine has **no** collection
+  observer to hang a prologue/epilogue on — `crux::heap`'s registries are root
+  sources, which are *read* at a collection's start and cannot run host code
+  there (`RootSource`'s own contract: "must not allocate in the arena, because it
+  runs while a collection is starting"). So the honest shape is an engine
+  addition of the same family as `RootSource`: a per-thread observer registry
+  invoked around each collection with the generation, which the bridge's two
+  callbacks and one `GCType` mapping (`minor` → `kGCTypeScavenge`, `major` →
+  `kGCTypeMarkSweepCompact`, the rest never firing, since this collector has two
+  generations and not V8's four phases) sit on. `get_number_of_data_slots` is
+  real already (the bridge keeps slots) and `get_heap_space_statistics` has an
+  honest empty answer (the arena has no spaces), but a callback that is stored
+  and never called would be exactly the stub this plan forbids, which is why this
+  is a part of its own rather than a tail on the `ValueView` one.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,

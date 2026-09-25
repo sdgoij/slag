@@ -97,7 +97,10 @@ pub use platform::{
     IdleTask, Platform, PlatformImpl, Task, new_custom_platform, new_default_platform,
     new_single_threaded_default_platform, new_unprotected_default_platform,
 };
-pub use primitives::{NewStringType, OneByteConst, WriteFlags, latin1_to_utf8, null, undefined};
+pub use primitives::{
+    NewStringType, OneByteConst, ValueView, ValueViewData, WriteFlags, latin1_to_utf8, null,
+    undefined,
+};
 pub use promise::{PromiseRejectEvent, PromiseRejectMessage, PromiseState};
 pub use property::*;
 pub use property_descriptor::PropertyDescriptor;

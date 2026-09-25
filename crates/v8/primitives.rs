@@ -1,6 +1,7 @@
 //! Primitive values and their constructors (`v8::Primitive`, `v8::String`,
 //! `v8::Number`, `v8::Boolean`).
 
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::{BitOr, BitOrAssign, Deref};
 
@@ -505,6 +506,70 @@ impl<'s> LocalHandle<'s, String> {
             )
         };
         self.write_utf8_uninit_v2(scope, uninit, flags, processed_characters_return)
+    }
+}
+
+/// The form a string's code units are read in (`v8::ValueViewData`).
+///
+/// Two variants and no more: the sites that read one match them exhaustively.
+pub enum ValueViewData<'a> {
+    /// One byte per code unit, which is how the crate we stand in for exposes a
+    /// Latin-1 string.
+    OneByte(&'a [u8]),
+    /// One UTF-16 code unit each.
+    TwoByte(&'a [u16]),
+}
+
+/// A read view of a string's code units (`v8::ValueView`).
+///
+/// The crate we stand in for hands out a live window into the string's own
+/// storage, held open for the scope the view was taken in. Nothing here can be:
+/// the engine's `JsString` is UTF-16 in every form, so there is no byte-backed
+/// string to point at and no borrowed shape to hand out for the one-byte case.
+/// This owns a *snapshot* of the code units and answers the variant they fit —
+/// [`OneByte`](ValueViewData::OneByte) with the Latin-1 byte of each when every
+/// unit is at most `0xFF` (the exact test, not the representational hint
+/// [`is_onebyte`](LocalHandle::is_onebyte) refines), and
+/// [`TwoByte`](ValueViewData::TwoByte) otherwise.
+///
+/// Two consequences, stated rather than implied: the snapshot allocates where
+/// the crate's view borrows, and there is nothing to *write* through — a host
+/// that used the crate's view as a write window does not compile here rather
+/// than writing into a copy.
+pub struct ValueView<'s> {
+    units: ViewUnits,
+    marker: PhantomData<&'s ()>,
+}
+
+enum ViewUnits {
+    One(Box<[u8]>),
+    Two(Box<[u16]>),
+}
+
+impl<'s> ValueView<'s> {
+    /// Take a view of `string` (`v8::ValueView::new`).
+    ///
+    /// The scope is the shape's: nothing here borrows it, because the answer is
+    /// a snapshot rather than a window.
+    pub fn new(_scope: &PinScope<'_, '_, ()>, string: Local<'s, String>) -> Self {
+        let units = string.code_units();
+        let view = if units.iter().all(|&unit| unit <= u16::from(u8::MAX)) {
+            ViewUnits::One(units.iter().map(|&unit| unit as u8).collect())
+        } else {
+            ViewUnits::Two(units.into_boxed_slice())
+        };
+        Self {
+            units: view,
+            marker: PhantomData,
+        }
+    }
+
+    /// The code units, in the form the string has (`v8::ValueView::data`).
+    pub fn data(&self) -> ValueViewData<'_> {
+        match &self.units {
+            ViewUnits::One(bytes) => ValueViewData::OneByte(bytes),
+            ViewUnits::Two(units) => ValueViewData::TwoByte(units),
+        }
     }
 }
 
@@ -1065,6 +1130,50 @@ mod tests {
             assert!(eval_string(scope, "'abc'").contains_only_onebyte());
             assert!(eval_string(scope, "'\\u{E9}'").contains_only_onebyte());
             assert!(!eval_string(scope, "'\\u{20AC}'").contains_only_onebyte());
+        });
+    }
+
+    /// A `ValueView` answers the code units in the form they fit: one byte each
+    /// when every unit is at most `0xFF`, and in that case the unit's own low
+    /// byte — the Latin-1 byte, so `\u{E9}` is `0xE9` and not the first byte of
+    /// a UTF-8 sequence.
+    #[test]
+    fn a_value_view_reads_a_latin1_string_as_one_byte() {
+        in_context!(scope, {
+            let ascii = eval_string(scope, "'abc'");
+            match ValueView::new(scope, ascii).data() {
+                ValueViewData::OneByte(bytes) => assert_eq!(bytes, b"abc".as_slice()),
+                ValueViewData::TwoByte(_) => panic!("an ASCII string is one-byte"),
+            }
+
+            // The boundary: `0xFF` is still one byte, and the byte is the unit.
+            let latin1 = eval_string(scope, "'\\u{E9}\\u{FF}'");
+            match ValueView::new(scope, latin1).data() {
+                ValueViewData::OneByte(bytes) => assert_eq!(bytes, [0xE9u8, 0xFF].as_slice()),
+                ValueViewData::TwoByte(_) => panic!("a unit at 0xFF is still one byte"),
+            }
+        });
+    }
+
+    /// A unit above `0xFF` makes the view two-byte, and the units come back
+    /// exactly — a lone surrogate included, which a UTF-8 rendering would have
+    /// replaced.
+    #[test]
+    fn a_value_view_carries_two_byte_units_exactly() {
+        in_context!(scope, {
+            let euro = eval_string(scope, "'a\\u{20AC}'");
+            match ValueView::new(scope, euro).data() {
+                ValueViewData::TwoByte(units) => assert_eq!(units, [0x61u16, 0x20AC].as_slice()),
+                ValueViewData::OneByte(_) => panic!("a unit above 0xFF is two-byte"),
+            }
+
+            let lone = eval_string(scope, "'\\u{D800}'");
+            match ValueView::new(scope, lone).data() {
+                ValueViewData::TwoByte(units) => {
+                    assert_eq!(units, [0xD800u16].as_slice(), "the code unit itself")
+                }
+                ValueViewData::OneByte(_) => panic!("a surrogate is two-byte"),
+            }
         });
     }
 
