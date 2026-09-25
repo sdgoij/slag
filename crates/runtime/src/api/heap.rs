@@ -28,22 +28,43 @@
 //!
 //! # What is absent rather than answered
 //!
-//! The crate we stand in for has fifteen accessors; a host here gets the four
-//! `deno_core` reads. `heap_size_limit`, `total_available_size` (no limit),
-//! `malloced_memory`, `peak_malloced_memory`, `total_allocated_bytes` (no
-//! allocation total is kept), `total_global_handles_size`,
-//! `used_global_handles_size` (no handle registry), `total_heap_size_executable`
-//! (no code lives in the heap — the JIT's code is Cranelift's own allocation) and
-//! `does_zap_garbage` have no honest value, so they are missing: a host that
-//! names one gets a compile error rather than a plausible `0`. `.notes/embedding.md`
-//! §9 records that as the tier.
+//! The crate we stand in for has fifteen accessors. Four of them are facts about
+//! this engine and are reported as such; the rest answer a *documented constant*
+//! rather than a varying number, because there is no such number here — and a
+//! constant a host can reason about is better than a `0` that looks measured:
+//!
+//! - `heap_size_limit` and `total_available_size`: this arena has no limit, so
+//!   the largest value a host can compare against is reported for the limit, and
+//!   the limit less the live bytes for the room left. A host's `limit - used`
+//!   arithmetic has space in it, and a host that prints the limit sees a number
+//!   no V8 build reports — which is the point.
+//! - `malloced_memory` and `peak_malloced_memory`: the bytes obtained outside the
+//!   arena are `external_memory`'s (the byte blocks), so that is what the first
+//!   answers. No high-water mark is kept, so the second answers the current total
+//!   — a lower bound, stated rather than implied.
+//! - `total_allocated_bytes`: this arena never returns a chunk, so what it has
+//!   committed is everything it has ever allocated. Real, and equal to
+//!   `total_heap_size` by construction.
+//! - `total_heap_size_executable`: zero, truthfully — no code lives in this heap
+//!   (the JIT's code is Cranelift's own allocation).
+//! - `does_zap_garbage`: false, truthfully — a swept slot is reused as it is,
+//!   with no fill pattern written over it.
+//! - `number_of_native_contexts`: the live realms, which the agent counts.
+//!   `number_of_detached_contexts`: zero, truthfully — no realm is ever detached
+//!   here.
+//! - `total_global_handles_size` and `used_global_handles_size`: zero, truthfully
+//!   — V8's global handles are an off-heap registry of their own, while this
+//!   bridge's persistent handles are ordinary cells in this same arena, already
+//!   counted in `used_heap_size`.
+//!
+//! `.notes/embedding.md` §9 records the tier.
 
 use crux::heap;
 
 use super::Isolate;
 
-/// V8 heap numbers (`v8::HeapStatistics`), limited to the ones a host can be
-/// told the truth about here; see the module documentation.
+/// V8 heap numbers (`v8::HeapStatistics`), the four facts this engine has and the
+/// nine constants it can defend; see the module documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeapStatistics {
     /// The bytes the arena has committed.
@@ -55,6 +76,33 @@ pub struct HeapStatistics {
     pub used_heap_size: usize,
     /// The bytes of the buffers the agent holds outside the arena.
     pub external_memory: usize,
+    /// Everything the arena has ever allocated: it never returns a chunk, so this
+    /// is `total_heap_size`.
+    pub total_allocated_bytes: usize,
+    /// The bytes of the heap holding executable code: zero, because no code lives
+    /// in this heap.
+    pub total_heap_size_executable: usize,
+    /// The bytes obtained outside the arena, which is `external_memory`'s walk.
+    pub malloced_memory: usize,
+    /// The peak of that account, as far as it is known: no high-water mark is
+    /// kept, so this is the current total.
+    pub peak_malloced_memory: usize,
+    /// The largest heap size the machine allows, because this arena has no
+    /// limit.
+    pub heap_size_limit: usize,
+    /// The room left, which is the limit less the live bytes.
+    pub total_available_size: usize,
+    /// The live realms.
+    pub number_of_native_contexts: usize,
+    /// Detached realms: zero, because no realm is ever detached here.
+    pub number_of_detached_contexts: usize,
+    /// Whether the collector writes a pattern over freed memory: false.
+    pub does_zap_garbage: bool,
+    /// The bytes of V8's off-heap global-handle registry: zero here, because this
+    /// bridge's persistent handles are cells in this arena.
+    pub total_global_handles_size: usize,
+    /// The used part of that registry: zero, for the same reason.
+    pub used_global_handles_size: usize,
 }
 
 impl Isolate {
@@ -66,12 +114,24 @@ impl Isolate {
     /// objects.
     pub fn heap_statistics(&mut self) -> HeapStatistics {
         let (committed, live) = heap::with_heap(|heap| (heap.committed_bytes(), heap.live_bytes()));
+        // The walk is floored at zero, so the cast is exact.
+        let external = external_memory(self) as usize;
         HeapStatistics {
             total_heap_size: committed,
             total_physical_size: committed,
             used_heap_size: live,
-            // The walk is floored at zero, so the cast is exact.
-            external_memory: external_memory(self) as usize,
+            external_memory: external,
+            total_allocated_bytes: committed,
+            total_heap_size_executable: 0,
+            malloced_memory: external,
+            peak_malloced_memory: external,
+            heap_size_limit: usize::MAX,
+            total_available_size: usize::MAX - live,
+            number_of_native_contexts: self.agent.realm_count.get(),
+            number_of_detached_contexts: 0,
+            does_zap_garbage: false,
+            total_global_handles_size: 0,
+            used_global_handles_size: 0,
         }
     }
 

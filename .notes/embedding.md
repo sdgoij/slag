@@ -4869,6 +4869,16 @@ tests, 0 fail**).
 
 *Gates — and the corpora, because `runtime` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,423 passed / 0 failed** (up five — this part's tests; `v8` **312** default and **318** with simdutf, `runtime` **943**, `crux` 258, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine changes are a state field, a trace line and one refusal, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six out-of-scope cases.
 
+*The heap numbers — §9's third frontier group, less its one real capability.* Twenty-six errors, of which twenty-three were numbers. The engine's `api::HeapStatistics` had four fields under a tier that said the other nine "have no honest value, so they are missing: a host that names one gets a compile error rather than a plausible `0`" — and deno names all nine, so the tier had to become a *value* rather than an absence. What replaced it is a rule: report the fact where this engine has one, and a *documented constant* where the fact is constant, so nothing varying is invented. The facts: `total_allocated_bytes` is the committed bytes (an arena that never returns a chunk has one allocation total), `malloced_memory` is the external walk (the bytes obtained outside the arena — the byte blocks are Rust allocations), `peak_malloced_memory` is the current total because no high-water mark is kept, and the module says so, `number_of_native_contexts` is `agent.realm_count`, and `total_available_size` is the limit less the live bytes. The constants, each true of this engine: `heap_size_limit` is `usize::MAX` (there is no limit, and a host that prints it sees a number no V8 build reports), `total_heap_size_executable` is 0 (no code lives in this heap — the JIT's code is Cranelift's own allocation), `does_zap_garbage` is false (a swept slot is reused as it is, `crux/src/heap.rs` has no fill), `number_of_detached_contexts` is 0 (no realm is ever detached), and both global-handle sizes are 0 (V8's registry is off-heap, while this bridge's persistent handles are ordinary cells in this same arena, already counted in `used_heap_size`).
+
+The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with the `get_heap_space_statistics` that has answered `None` since it was written — a count of no spaces is none, and a host's `0..n` loop does nothing rather than asking for records that are not there. `Isolate::low_memory_notification` is a real collection (`agent.collect_garbage`), which is what a host's `gc()` is asking for. And `Isolate::get_heap_code_and_metadata_statistics` is `None` with the record type present as a shape: V8's four numbers are *sizes*, this engine keeps no code-size accounting, and a record of zeros would claim there is no bytecode, which is false.
+
+*Tests — four, and two mutations, each caught by its own test.* `the_heap_constants_are_facts_about_this_engine` reads all nine through the crate's own accessors, checks the two derived ones against the number each derives from, and makes a second realm so `number_of_native_contexts` has to *move* rather than happen to be right. `a_low_memory_notification_collects` installs a GC prologue callback and asserts it ran once — the collection is observed rather than assumed. `there_are_no_code_statistics_to_report` and `a_heap_code_record_answers_what_it_holds` are the empty answer and the shape it would have. Two mutations, each run alone and each caught by its own test: making `low_memory_notification` a no-op fails the callback count at 0 of 1, and pinning `number_of_native_contexts` to 1 fails the second-realm assertion at 1 against 2.
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **27 → 4**, with `ext/node/ops/v8.rs` at **26 → 3** — and those three are the three `take_heap_snapshot` call sites, which §9 names as the last part of the frontier. The fourth is `ext/webgpu/error.rs`'s pre-existing `E0521`.
+
+*Gates — and the corpora, because `runtime` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,427 passed / 0 failed** (up four — this part's tests; `v8` **316** default and **322** with simdutf, `runtime` 943, `crux` 258, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine change is nine fields on a struct the bridge already read, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5598,12 +5608,20 @@ if that proves possible.
   bridge-side map keyed by a *reusable* object identity — with `DataView::new`,
   which the engine can already make (`Agent::dataview_data`,
   `builtins::dataview`) and so was an exposure, were the second. **The heap
-  surface**
-  (`ext/node/ops/v8.rs`; 26 errors, the largest share): `HeapStatistics`'
-  eleven accessors, `Isolate::{number_of_heap_spaces, low_memory_notification}`,
-  `get_heap_code_and_metadata_statistics`, and the three `take_heap_snapshot`
-  call sites — the last of which is the one *real* capability in the group, since
-  a V8 heap snapshot is a format rather than a number. **`ext/webgpu/error.rs`'s
+  `builtins::dataview`) and so was an exposure, were the second. **The heap
+  surface — landed, except its one real capability.** Twenty-three of
+  `ext/node/ops/v8.rs`'s 26 errors were numbers: `HeapStatistics`' eleven
+  accessors, `number_of_heap_spaces`, `low_memory_notification`, and
+  `get_heap_code_and_metadata_statistics`; §7's record has the measurement and the
+  rule the numbers answer by (a fact where this engine has one, a *documented
+  constant* where the fact is constant). What is left is the three
+  `take_heap_snapshot` call sites, and they are the frontier's only *real*
+  capability, because a V8 heap snapshot is a format rather than a number. The
+  tier is the decision to make: declare that the engine has no snapshot and refuse
+  as the inspector does, or write its object graph in the V8 document shape — the
+  shape `op_v8_query_objects_count` parses (it needs `snapshot.meta.node_fields`,
+  a `node_types` row containing `object`, and `nodes`/`strings` arrays) and the one
+  `writeHeapSnapshot` streams to a file. **`ext/webgpu/error.rs`'s
   `E0521`** is deno-side and pre-existing: it aborts that crate's own build and
   is not this bridge's to fix, which is why every measurement in §7 was taken
   with `--keep-going` and says so.

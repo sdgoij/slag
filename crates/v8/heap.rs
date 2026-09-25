@@ -62,6 +62,88 @@ impl HeapStatistics {
     pub fn external_memory(&self) -> usize {
         self.0.external_memory
     }
+
+    /// Everything the heap has ever allocated
+    /// (v8::HeapStatistics::total_allocated_bytes): this arena never returns a
+    /// chunk, so it is [`total_heap_size`](Self::total_heap_size).
+    pub fn total_allocated_bytes(&self) -> usize {
+        self.0.total_allocated_bytes
+    }
+
+    /// The bytes of the heap holding executable code
+    /// (v8::HeapStatistics::total_heap_size_executable): zero, because no code
+    /// lives in this heap — the JIT's code is Cranelift's own allocation.
+    pub fn total_heap_size_executable(&self) -> usize {
+        self.0.total_heap_size_executable
+    }
+
+    /// The bytes obtained from malloc
+    /// (v8::HeapStatistics::malloced_memory): the bytes outside the arena, which
+    /// is [`external_memory`](Self::external_memory)'s walk.
+    pub fn malloced_memory(&self) -> usize {
+        self.0.malloced_memory
+    }
+
+    /// The peak of that account
+    /// (v8::HeapStatistics::peak_malloced_memory).
+    ///
+    /// No high-water mark is kept, so this is the current total rather than the
+    /// highest it ever was — a lower bound, and the same number a host would read
+    /// if the peak had never been higher.
+    pub fn peak_malloced_memory(&self) -> usize {
+        self.0.peak_malloced_memory
+    }
+
+    /// The largest the heap may grow
+    /// (v8::HeapStatistics::heap_size_limit).
+    ///
+    /// This arena has no limit, so the machine's largest `usize` is reported: a
+    /// host's `limit - used` arithmetic has room in it, and a host that prints
+    /// the limit sees a number no V8 build reports. `.notes/embedding.md` §9
+    /// records the tier.
+    pub fn heap_size_limit(&self) -> usize {
+        self.0.heap_size_limit
+    }
+
+    /// The room the heap has left (v8::HeapStatistics::total_available_size):
+    /// the limit less the live bytes.
+    pub fn total_available_size(&self) -> usize {
+        self.0.total_available_size
+    }
+
+    /// The number of live realms (v8::HeapStatistics::number_of_native_contexts).
+    pub fn number_of_native_contexts(&self) -> usize {
+        self.0.number_of_native_contexts
+    }
+
+    /// The number of detached realms
+    /// (v8::HeapStatistics::number_of_detached_contexts): zero, because no realm
+    /// is ever detached here.
+    pub fn number_of_detached_contexts(&self) -> usize {
+        self.0.number_of_detached_contexts
+    }
+
+    /// Whether the collector writes a pattern over freed memory
+    /// (v8::HeapStatistics::does_zap_garbage): false — a swept slot is reused as
+    /// it is.
+    pub fn does_zap_garbage(&self) -> bool {
+        self.0.does_zap_garbage
+    }
+
+    /// The bytes of V8's off-heap global-handle registry
+    /// (v8::HeapStatistics::total_global_handles_size): zero, truthfully — this
+    /// bridge's persistent handles are ordinary cells in this same arena, so they
+    /// are already counted in [`used_heap_size`](Self::used_heap_size) rather than
+    /// in a registry of their own.
+    pub fn total_global_handles_size(&self) -> usize {
+        self.0.total_global_handles_size
+    }
+
+    /// The used part of that registry
+    /// (v8::HeapStatistics::used_global_handles_size): zero, for the same reason.
+    pub fn used_global_handles_size(&self) -> usize {
+        self.0.used_global_handles_size
+    }
 }
 
 impl Isolate {
@@ -269,6 +351,39 @@ impl Isolate {
         0
     }
 
+    /// The number of heap spaces (`v8::Isolate::NumberOfHeapSpaces`).
+    ///
+    /// Zero, and truthfully, and consistently with
+    /// [`get_heap_space_statistics`](Self::get_heap_space_statistics): V8's heap
+    /// is a set of spaces, this engine's is one chunked arena with no such
+    /// division, and a count of no spaces is none. A host that loops
+    /// `0..number_of_heap_spaces()` therefore does nothing rather than asking for
+    /// records that are not there.
+    pub fn number_of_heap_spaces(&self) -> usize {
+        0
+    }
+
+    /// Ask for a collection because the host is short of memory
+    /// (`v8::Isolate::LowMemoryNotification`).
+    ///
+    /// V8 treats this as a hint and decides for itself; here it *is* a full
+    /// collection, which is the same thing a host calling it is asking for.
+    pub fn low_memory_notification(&mut self) {
+        self.engine_mut().agent().collect_garbage();
+    }
+
+    /// The heap's code and metadata numbers
+    /// (`v8::Isolate::GetHeapCodeAndMetadataStatistics`).
+    ///
+    /// `None`: the engine compiles to a bytecode IR but keeps no accounting of
+    /// how large any of it is, and V8's four numbers are sizes — reporting zeros
+    /// would claim there is no bytecode, which is false. The crate's answer for
+    /// "no statistics" is the empty `MaybeLocal`, so a host's `if let Some`
+    /// branch is the one that fires. `.notes/embedding.md` §9 records the tier.
+    pub fn get_heap_code_and_metadata_statistics(&self) -> Option<HeapCodeStatistics> {
+        None
+    }
+
     /// The heap space at `index`, if there is one
     /// (`v8::Isolate::GetHeapSpaceStatistics`).
     ///
@@ -349,6 +464,65 @@ impl HeapSpaceStatistics {
     /// (`v8::HeapSpaceStatistics::physical_space_size`).
     pub fn physical_space_size(&self) -> usize {
         self.physical
+    }
+}
+
+/// The heap's code and metadata numbers (`v8::HeapCodeStatistics`).
+///
+/// The crate reports these per isolate; this engine keeps no code-size
+/// accounting, so [`Isolate::get_heap_code_and_metadata_statistics`] never
+/// answers one. The type is the crate's shape and its accessors are what a
+/// host's code reads once it has one, so they answer what the record holds
+/// rather than nothing.
+pub struct HeapCodeStatistics {
+    code_and_metadata: usize,
+    bytecode_and_metadata: usize,
+    external_script_source: usize,
+    cpu_profiler_metadata: usize,
+}
+
+impl HeapCodeStatistics {
+    /// A record, for the shape's test.
+    ///
+    /// Nothing in this engine produces one — there is no accounting to produce
+    /// — so the only caller is the test that pins what a host would read.
+    #[cfg(test)]
+    pub(crate) fn new(
+        code_and_metadata: usize,
+        bytecode_and_metadata: usize,
+        external_script_source: usize,
+        cpu_profiler_metadata: usize,
+    ) -> Self {
+        Self {
+            code_and_metadata,
+            bytecode_and_metadata,
+            external_script_source,
+            cpu_profiler_metadata,
+        }
+    }
+
+    /// The bytes of compiled code and its metadata
+    /// (`v8::HeapCodeStatistics::code_and_metadata_size`).
+    pub fn code_and_metadata_size(&self) -> usize {
+        self.code_and_metadata
+    }
+
+    /// The bytes of bytecode and its metadata
+    /// (`v8::HeapCodeStatistics::bytecode_and_metadata_size`).
+    pub fn bytecode_and_metadata_size(&self) -> usize {
+        self.bytecode_and_metadata
+    }
+
+    /// The bytes of script sources kept outside the heap
+    /// (`v8::HeapCodeStatistics::external_script_source_size`).
+    pub fn external_script_source_size(&self) -> usize {
+        self.external_script_source
+    }
+
+    /// The bytes of CPU-profiler metadata
+    /// (`v8::HeapCodeStatistics::cpu_profiler_metadata_size`).
+    pub fn cpu_profiler_metadata_size(&self) -> usize {
+        self.cpu_profiler_metadata
     }
 }
 
@@ -435,12 +609,120 @@ mod tests {
     fn the_engine_reports_no_heap_spaces_and_no_data_slots() {
         in_context!(scope, {
             assert_eq!(scope.get_number_of_data_slots(), 0);
+            assert_eq!(
+                scope.number_of_heap_spaces(),
+                0,
+                "a count of no spaces is none, which is what the database says"
+            );
             assert!(
                 scope.get_heap_space_statistics(0).is_none(),
                 "one chunked arena is not a set of spaces"
             );
             assert!(scope.get_heap_space_statistics(7).is_none());
         });
+    }
+
+    /// The nine numbers that are constants here answer what the module
+    /// documentation says, so a host reads a value it can reason about rather than
+    /// a fabricated measurement — and the two that are derived move with the
+    /// number they are derived from.
+    #[test]
+    fn the_heap_constants_are_facts_about_this_engine() {
+        in_context!(scope, {
+            let statistics = scope.get_heap_statistics();
+            assert_eq!(
+                statistics.heap_size_limit(),
+                usize::MAX,
+                "there is no limit"
+            );
+            assert_eq!(
+                statistics.total_available_size(),
+                usize::MAX - statistics.used_heap_size(),
+                "the room left is the limit less the live bytes"
+            );
+            assert_eq!(
+                statistics.total_allocated_bytes(),
+                statistics.total_heap_size(),
+                "an arena that never returns a chunk has one allocation total"
+            );
+            assert_eq!(statistics.total_heap_size_executable(), 0);
+            assert!(!statistics.does_zap_garbage());
+            assert_eq!(
+                statistics.number_of_native_contexts(),
+                1,
+                "the scope's realm"
+            );
+            assert_eq!(statistics.number_of_detached_contexts(), 0);
+            assert_eq!(statistics.total_global_handles_size(), 0);
+            assert_eq!(statistics.used_global_handles_size(), 0);
+            assert_eq!(
+                statistics.malloced_memory(),
+                statistics.external_memory(),
+                "the bytes obtained outside the arena"
+            );
+            assert_eq!(
+                statistics.peak_malloced_memory(),
+                statistics.malloced_memory(),
+                "no high-water mark is kept, so the current total is the answer"
+            );
+
+            // A realm the host makes is a second native context.
+            let second = crate::Context::new(scope, crate::ContextOptions::default());
+            let _ = second;
+            assert_eq!(scope.get_heap_statistics().number_of_native_contexts(), 2);
+        });
+    }
+
+    /// `low_memory_notification` is a collection, which is what a host's `gc()`
+    /// asks it for: the callbacks it installed run, exactly once each.
+    #[test]
+    fn a_low_memory_notification_collects() {
+        use std::cell::Cell;
+
+        extern "C" fn count(
+            _isolate: crate::UnsafeRawIsolatePtr,
+            _gc_type: GCType,
+            _flags: GCCallbackFlags,
+            data: *mut c_void,
+        ) {
+            // SAFETY: the host keeps the `Cell` the data pointer names alive for
+            // the collection.
+            let counter = unsafe { &*data.cast::<Cell<usize>>() };
+            counter.set(counter.get() + 1);
+        }
+
+        in_context!(scope, {
+            let prologues = Cell::new(0usize);
+            scope.add_gc_prologue_callback(
+                count,
+                &prologues as *const Cell<usize> as *mut c_void,
+                GCType::kGCTypeAll,
+            );
+            scope.low_memory_notification();
+            assert_eq!(prologues.get(), 1, "a notification is a collection");
+        });
+    }
+
+    /// There is no code-size accounting to report, so the answer is the crate's
+    /// empty one: a record of zeroes would claim this engine holds no bytecode,
+    /// which is false.
+    #[test]
+    fn there_are_no_code_statistics_to_report() {
+        in_context!(scope, {
+            assert!(scope.get_heap_code_and_metadata_statistics().is_none());
+        });
+    }
+
+    /// The code record is the crate's shape: what a host reads from one is what it
+    /// holds. Nothing in this engine produces one, so the shape is pinned here
+    /// rather than reached through the API.
+    #[test]
+    fn a_heap_code_record_answers_what_it_holds() {
+        let code = HeapCodeStatistics::new(11, 22, 33, 44);
+        assert_eq!(code.code_and_metadata_size(), 11);
+        assert_eq!(code.bytecode_and_metadata_size(), 22);
+        assert_eq!(code.external_script_source_size(), 33);
+        assert_eq!(code.cpu_profiler_metadata_size(), 44);
     }
 
     /// The space record is the crate's shape: what a host reads from one is what
