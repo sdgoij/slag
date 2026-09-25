@@ -4709,6 +4709,14 @@ tests, 0 fail**).
 
 *Tests, and the gates this part does and does not need.* Three in `crates/v8`: a weak handle reads its value and releases it (`clear` is what empties it — the collector-driven emptying is the engine's own four tests, so the bridge pins its *reading* of the verdict, not the verdict), a traced reference reads a value the host also holds and a realm (the one payload it cannot watch, answering while it lives rather than pretending), and `with_finalizer` registers its callback with the engine rather than dropping it. There is no mutation beyond the measurement itself, and the reason is the shape of the part: every method is exercised by *deno compiling* — the 341 → 84 count is 35 real call sites from the host this plan exists to serve, which is stronger evidence than a mutation of my own code. Gates: fmt clean; clippy --workspace --all-targets -D warnings clean; workspace tests **5,362 passed / 0 failed** (`v8` 259 — three more — and no other crate's count moved); wasm-free runtime **904** and the interpreter-only cli check green. **No sweeps, and that is checked rather than assumed**: `cargo tree -p test262 -e normal | grep -c 'v8 v150'` is **0**, so nothing in this part is in any runner's graph. deno's suite was rebuilt and re-run because the bridge *is* what deno links: **453 passed / 6 failed**, the same six.
 
+*A handle scope over a callback scope — §9's bullet that named it.* `NewHandleScope` was implemented for an isolate, an `OwnedIsolate` and `PinnedRef<'_, HandleScope<..>>`, but not for `PinnedRef<'_, CallbackScope<..>>`, so the ordinary callback prologue in this tree — `v8::callback_scope!(unsafe cb_scope, context); v8::scope!(scope, cb_scope);` — did not compile: 12 sites in `cargo check -p deno_snapshots`, all one E0277 bound. A `CallbackScope` is a `HandleScope` with a name, so the impl is the one `HandleScope`'s arm already is — hand the two fields to the new scope — and nothing else moved: no engine work, no shape change, no new type.
+
+*Test, and the mutation.* `crates/v8/scope.rs`'s `a_handle_scope_can_be_opened_over_a_callback_scope` is the prologue itself: a callback scope over the entered context, an ordinary scope opened inside it, and an eval in the result (`6 * 7`) — so what it pins is that the inner scope *is* the outer one's realm, which is what the two inherited fields are for. It is also a compile-time guard: without the impl, the `scope!` in it does not build. One mutation, caught by that test alone: emptying `make_new_scope` panics in it and leaves the other six scope tests green.
+
+*The measurement.* `NewHandleScope`/`CallbackScope` mentions in `cargo check -p deno_snapshots`: **12 → 0**. The total moved 84 → 83, and that is the honest number rather than a shortfall: clearing a crate's first errors lets it compile into its *next* ones, and the same kinds are still there (`get_own_property_descriptor` 5, `size` 4, `set_integrity_level` 4, `preview_entries` 4, `description` 3, …), so what this part fixed is the cluster, not the frontier. The previous part's 257-error drop was inflated by the mirror of that effect: a missing *type* poisons inference and hides every later error, so a bridge part's count is only meaningful next to the mentions it removes.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,363 passed / 0 failed** (`v8` 260 — one more — and no other crate's count moved); the wasm-free shape holds (`cargo test -p runtime --no-default-features --lib` **935 passed**); no sweeps, because `cargo tree -p test262 -e normal | grep -c 'v8 v150'` is 0 — the same check the previous record used, so the bridge is in no runner's graph; deno's suite rebuilt and re-run since the bridge is what deno links: **453 passed / 6 failed**, the same six.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -7941,6 +7949,17 @@ migrate, then delete.
   therefore answers `Some` for its lifetime; the engine has no weak handle over a
   realm or a module record, and this says so rather than pretending. **No new
   engine machinery**: this part is shapes over the registry slice 4 landed.
+- **A handle scope can be opened over a callback scope — named here before the edit,
+  and it is a missing impl rather than a missing idea.** `NewHandleScope`
+  (`crates/v8/scope.rs`) is implemented for an isolate, an `OwnedIsolate` and
+  `PinnedRef<'_, HandleScope<..>>`, but not for `PinnedRef<'_, CallbackScope<..>>`
+  — so the tree's ordinary callback prologue, `v8::callback_scope!(unsafe
+  cb_scope, context); v8::scope!(scope, cb_scope);`, does not compile: 12 sites,
+  all `PinnedRef<'_, CallbackScope<'_, _>>: NewHandleScope<'_>` in
+  `cargo check -p deno_snapshots`. The bridge already carries the enclosing
+  scope's isolate and context through a `CallbackScope` (it is a `HandleScope`
+  with a name), so the impl is the one `HandleScope`'s arm already is: hand those
+  two fields to the new scope. No shape changes, no engine work.
 
 ## 11. Working rules
 

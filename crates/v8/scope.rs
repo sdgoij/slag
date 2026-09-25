@@ -162,6 +162,19 @@ impl<'s, 'p: 's, C> NewHandleScope<'s> for PinnedRef<'_, HandleScope<'p, C>> {
     }
 }
 
+/// The same, over a callback scope: a `CallbackScope` *is* a `HandleScope` with a
+/// name, so a host that has opened one can open an ordinary scope inside it — the
+/// prologue every callback in this tree writes
+/// (`v8::callback_scope!(unsafe cb_scope, context); v8::scope!(scope, cb_scope);`)
+/// — and inherit its isolate and context unchanged.
+impl<'s, 'p: 's, C> NewHandleScope<'s> for PinnedRef<'_, CallbackScope<'p, C>> {
+    type NewScope = HandleScope<'s, C>;
+
+    fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
+        HandleScope::new_in(me.0.inner.isolate, me.0.inner.context)
+    }
+}
+
 impl<'s> HandleScope<'s> {
     #[allow(clippy::new_ret_no_self)]
     pub fn new<P: NewHandleScope<'s>>(scope: &'s mut P) -> ScopeStorage<P::NewScope> {
@@ -1114,6 +1127,25 @@ macro_rules! escapable_handle_scope {
 #[cfg(test)]
 mod tests {
     use crate::DataError;
+
+    /// The prologue every callback in this tree writes: a callback scope, then an
+    /// ordinary handle scope opened *over* it. The second inherits the first's
+    /// isolate and context, which is the whole of what `NewHandleScope` for a
+    /// pinned `CallbackScope` has to do — and what 12 call sites in the tree wait
+    /// on. This is a compile-time guard as much as a test: without that impl the
+    /// `scope!` below does not build.
+    #[test]
+    fn a_handle_scope_can_be_opened_over_a_callback_scope() {
+        crate::test_support::in_context!(scope, {
+            let context = scope.get_current_context();
+            crate::callback_scope!(unsafe cb_scope, context);
+            crate::scope!(inner, cb_scope);
+            // The scope is an ordinary one, and it is the callback scope's: code
+            // evaluates in the realm the callback scope was opened over, which is
+            // what the two inherited fields are for.
+            assert_eq!(crate::test_support::eval_number(inner, "6 * 7"), 42.0);
+        });
+    }
 
     /// The continuation-preserved value is held across the scope manipulations a
     /// suspension goes through: the handle carries the scope's lifetime, not a
