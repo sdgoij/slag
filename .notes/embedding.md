@@ -4741,6 +4741,14 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,379 passed / 0 failed** (`v8` 276, `crux` 258, `ffi` 10, `runtime` 935, `slag` 4, `test262` 3324 — none moved by this part, because the module it edits is feature-gated); `cargo test -p runtime --no-default-features --lib` **904 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. This is the first part to touch a gated module — `pub mod simdutf` is `#[cfg(feature = "simdutf")]`, which deno enables through `libs/deno_v8` — so the gates are run in that configuration too: `cargo test -p v8 --features simdutf` **282 passed / 0 failed** (276 plus the two existing validators' tests and this part's four, which the default build does not compile) and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` clean. `builtins::typed_array` is in every runner's graph, so the corpora were re-run after a release build and the settle sleep and every number is at baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt because the engine and the bridge are both what deno links, and holds at **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+*The host's external-memory account, and the `with_finalizer` callback shape it exposed — §9's bullet that named both.* `v8::Isolate::adjust_amount_of_external_allocated_memory` is the one lever a host has to tell the engine about memory it holds *outside* the heap, and the engine had no account for it: `HeapStatistics::external_memory` is derived, `api::heap`'s own walk of `Agent::buffer_data`, and there was nothing a host could turn. So `api::Isolate` gains one field and one entry point — `external_memory_adjustment: i64` and `adjust_external_memory(&mut self, change) -> i64` — which sums the account into that walk with a floor at zero, so what the method answers and what the statistic reports are the same number and an over-correcting host is told it holds no external memory rather than a negative count of bytes. One divergence is stated rather than implied: V8 feeds this number to its GC heuristics, so a host's `+16 MiB` nudges a collection, while this engine's collections are its own growth policy — the account is *reported* and not consulted, which is what §9 records. The method's receiver is also how this part found a *shape error in the previous one*: `Weak::with_finalizer`'s callback took `WeakCallbackInfo<T>` by value, read off `webgpu/adapter.rs:227`'s un-annotated `|isolate| isolate.adjust_amount(…)`, but every other site in the tree says `|_: &mut v8::Isolate|` — `ext/napi`'s `set_weak` and `ext/webgpu/device.rs`'s apple-only finalizer explicitly, the two node_sqlite sites by ignoring the parameter — and a by-value marker with no accessors cannot satisfy one of those, let alone all five. The callback is `Box<dyn FnOnce(&mut Isolate)>` now, with the isolate captured from the scope the handle was made in (a weak callback that outlives the isolate is dropped unsent rather than called, so the pointer is never read after the isolate is gone), and that is the one type all five sites accept. `WeakCallbackInfo<T>` itself stays as the name the crate's surface gives.
+
+*Tests — two, plus a shape guard, and three mutations, each caught.* `runtime`'s `the_hosts_account_is_added_to_the_statistic_and_floors_at_zero` is the accounting itself: `1 << 20` answered and reported, a 4096-byte buffer added to it in one statistic, and a `-2 MiB` over-correction answering 0 with the statistic following. `crates/v8`'s `the_external_memory_account_is_the_statistic_and_floors_at_zero` is the same through the bridge and *through a scope* — the shape the tree's webgpu sites call it in — and `a_finalizer_is_handed_the_isolate` is a compile-time guard for the corrected callback: it annotates `|isolate: &mut crate::Isolate|` and adjusts the account from inside, so a regression to a marker parameter stops that test building. Three mutations, each caught: the buffer walk ignoring the host's account (`let mut total = 0i64`) fails both accounting tests at `0` where `1048576` belongs; the floor removed fails both at their floor assertions (`-1044480` and `-1048576` where `0` belongs); and the bridge doubling the change fails the bridge test at `2097152` where `1048576` belongs, leaving the engine's two green.
+
+*The measurement.* `cargo check -p deno_snapshots`: **21 → 17**, and the drop is worth reading closely — both `adjust_amount_of_external_allocated_memory` mentions are gone *and* `deno_webgpu` stops being a failing crate altogether, because the `E0521` it was also carrying (`DeviceErrorHandler::push_error`'s closure escaping its method) was a knock-on of the old callback parameter type rather than a defect of its own. The 13 `E0512` transmutes are unchanged in kind (11 in `ext/node_sqlite`, plus 2 in `ext/ffi/callback.rs` that clearing the earlier errors exposed) and `deno_web`'s one remaining error is an `E0277` about `Rc<BackingStore>` not being `Send`; §9 records both as the structural remainder.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it since the bridge is one crate; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,382 passed / 0 failed** (`v8` 278, up two; `runtime` 936, up one — the engine's heap test is not feature-gated; `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p runtime --no-default-features --lib` **905 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine's `api` changed, so the corpora were re-run after a release build and the settle sleep and every number is at baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt (the engine and the bridge are both what deno links) and holds at **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -8116,6 +8124,32 @@ migrate, then delete.
   length function encodes is the one the engine already certifies: the standard
   alphabet pads and `Url` omits padding, which is what deno's own vectors assert
   of the library it links (`base64url_encode(b"f") == "Zg"`).
+- **The host's external-memory account, and the `with_finalizer` callback shape it
+  exposed — named here before the edit.** `v8::Isolate::adjust_amount_of_external_allocated_memory`
+  is the one lever a host has to tell the engine about memory it holds *outside*
+  the heap (deno's webgpu calls it for a device's and a command encoder's
+  backing), and the engine had no account for it: `HeapStatistics::external_memory`
+  is derived, `api::heap`'s own walk of `Agent::buffer_data`, and there was
+  nothing a host could turn. So `api::Isolate` gains one field and one entry point
+  — `external_memory_adjustment: i64`, summed into that statistic with a floor at
+  zero so an over-correcting host cannot report a negative number of bytes — and
+  the bridge is the shape over it. One divergence is stated: V8 feeds this number
+  to its GC heuristics, so a host's `+16 MiB` nudges a collection; this engine's
+  collections are its own growth policy, so the account is *reported* (through the
+  statistic, which is where the engine already answers external memory) rather
+  than consulted. The method's receiver is also how this part found a *shape
+  error in the previous one*: `Weak::with_finalizer`'s callback took
+  `WeakCallbackInfo<T>` by value, which was read off
+  `webgpu/adapter.rs:227`'s un-annotated `|isolate| isolate.adjust_amount(…)` —
+  but three other sites annotate the same parameter and all three say
+  `&mut v8::Isolate` (`ext/napi`'s `set_weak`, `ext/webgpu/device.rs`'s
+  apple-only finalizer, both explicit, and the two node_sqlite sites that ignore
+  it), and a by-value `WeakCallbackInfo<T>` — an empty marker with no accessors —
+  cannot satisfy them. The callback is `Box<dyn FnOnce(&mut Isolate)>` now, the
+  one type all five sites accept, so `adapter.rs:231` resolves against the
+  isolate rather than a marker and those two explicit annotations are right
+  instead of merely un-compiled; `WeakCallbackInfo<T>` itself stays as the type
+  the crate's surface names. No other `Weak`/`TracedReference` shape moves.
 
 ## 11. Working rules
 

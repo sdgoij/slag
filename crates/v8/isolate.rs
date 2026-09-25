@@ -1030,6 +1030,25 @@ impl Isolate {
     /// `.notes/embedding.md` §9 records, not a gap in this method.
     pub fn date_time_configuration_change_notification(&mut self, _detection: TimeZoneDetection) {}
 
+    /// Add `change` bytes to the isolate's external-memory account and answer the
+    /// new total (`v8::Isolate::AdjustAmountOfExternalAllocatedMemory`).
+    ///
+    /// This is the one lever a host has to tell the engine about memory it holds
+    /// outside the heap — a GPU device's backing, a natively allocated buffer —
+    /// which the engine cannot see for itself. The total it answers is what
+    /// [`HeapStatistics::external_memory`](crate::HeapStatistics::external_memory)
+    /// reports beside the buffers the agent holds, and it floors at zero, so an
+    /// over-correcting host is told it holds no external memory rather than a
+    /// negative number of bytes.
+    ///
+    /// One divergence, recorded in `.notes/embedding.md` §9: V8 feeds this number
+    /// to its GC heuristics, so a host's `+16 MiB` nudges a collection; this
+    /// engine's collections are its own growth policy, so the account is reported
+    /// rather than consulted.
+    pub fn adjust_amount_of_external_allocated_memory(&mut self, change: i64) -> i64 {
+        self.engine_mut().adjust_external_memory(change)
+    }
+
     pub(crate) fn engine(&self) -> &api::Isolate {
         &self.inner().engine
     }
@@ -2452,6 +2471,27 @@ mod tests {
                 .to_rust_string_lossy(scope);
             assert_eq!(before, after, "the notification changes nothing");
             assert_eq!(before, "1970-01-01T00:00:00.000Z");
+        });
+    }
+
+    /// The host's external-memory account is what the heap statistics report, and
+    /// it floors at zero. Both calls go through a scope, which is the shape the
+    /// tree's webgpu sites call it in.
+    #[test]
+    fn the_external_memory_account_is_the_statistic_and_floors_at_zero() {
+        crate::test_support::in_context!(scope, {
+            assert_eq!(
+                scope.adjust_amount_of_external_allocated_memory(1 << 20),
+                1 << 20
+            );
+            assert_eq!(scope.get_heap_statistics().external_memory(), 1 << 20);
+
+            assert_eq!(
+                scope.adjust_amount_of_external_allocated_memory(-(2 << 20)),
+                0,
+                "a change past zero floors there"
+            );
+            assert_eq!(scope.get_heap_statistics().external_memory(), 0);
         });
     }
 }

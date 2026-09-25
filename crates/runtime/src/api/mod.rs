@@ -91,6 +91,11 @@ pub struct Isolate {
     /// callback calling back in — must not drain mid-callback, which is why the
     /// policy's `Auto` drains only when this reaches zero.
     pub(crate) entry_depth: std::cell::Cell<u32>,
+    /// The bytes a *host* says it holds outside the heap
+    /// (`v8::Isolate::AdjustAmountOfExternalAllocatedMemory`), which the engine
+    /// cannot see for itself. Summed into `HeapStatistics::external_memory`
+    /// beside the agent's own buffers, with a floor at zero.
+    pub(crate) external_memory_adjustment: i64,
 }
 
 impl Isolate {
@@ -108,6 +113,7 @@ impl Isolate {
             data: RefCell::new(HashMap::new()),
             microtasks_policy: std::cell::Cell::new(crate::api::MicrotasksPolicy::Explicit),
             entry_depth: std::cell::Cell::new(0),
+            external_memory_adjustment: 0,
         })
     }
 

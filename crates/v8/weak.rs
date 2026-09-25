@@ -12,6 +12,7 @@ use std::marker::PhantomData;
 
 use runtime::api;
 
+use crate::Isolate;
 use crate::handle::{Global, Handle, Local, Payload};
 use crate::scope::PinScope;
 
@@ -40,9 +41,11 @@ fn inner_from_payload<T>(payload: Payload) -> Inner<T> {
 /// The context a weak death callback is handed (`v8::WeakCallbackInfo`).
 ///
 /// The crate we stand in for fills this with the isolate, the value and the
-/// parameter a `SetWeak` call carried. The call sites in this tree write `|_|`,
-/// so what is here is the type; its accessors arrive when a call site asks for
-/// one (§9's demand rule) rather than existing unused.
+/// parameter a `SetWeak` call carried, and its accessors arrive when a call site
+/// asks for one (the demand rule §9 states). It is *not*, however, what a
+/// finalizer is handed here: every site in the tree annotates that parameter
+/// `|_: &mut v8::Isolate|`, so [`Weak::with_finalizer`] takes the isolate
+/// directly and this type stays the name the crate's surface gives.
 pub struct WeakCallbackInfo<T> {
     marker: PhantomData<fn() -> T>,
 }
@@ -80,20 +83,28 @@ impl<T> Weak<T> {
     /// told about. A *non-value* payload has nothing for the engine to watch, so
     /// its finalizer never runs; §9 states that divergence rather than this type
     /// hiding it.
+    ///
+    /// The parameter is the isolate the collection ran in, which is the one this
+    /// handle was made in — the shape every site in the tree annotates
+    /// (`|_: &mut v8::Isolate|`), and the one that lets webgpu's finalizer adjust
+    /// the host's external-memory account. It is captured here because the
+    /// engine's own callback carries no isolate; a weak callback that outlives
+    /// the isolate is dropped unsent rather than called, so the pointer cannot be
+    /// read after the isolate is gone.
     pub fn with_finalizer<H: Handle<Data = T>>(
         scope: &PinScope<'_, '_, ()>,
         handle: H,
-        finalizer: Box<dyn FnOnce(WeakCallbackInfo<T>)>,
+        finalizer: Box<dyn FnOnce(&mut Isolate)>,
     ) -> Self
     where
         T: 'static,
     {
         let weak = Self::new(scope, handle);
         if let Inner::Weak(inner) = &weak.inner {
+            let isolate: Isolate = **scope;
             inner.set_callback(Box::new(move || {
-                finalizer(WeakCallbackInfo {
-                    marker: PhantomData,
-                })
+                let mut isolate = isolate;
+                finalizer(&mut isolate);
             }));
         }
         weak
@@ -252,6 +263,26 @@ mod tests {
                 Weak::<Value>::with_finalizer(scope, other, Box::new(move |_| flag.set(true)));
             assert!(!watched.is_empty());
             assert!(!called.get(), "the callback waits for the collector");
+        });
+    }
+
+    /// The finalizer is handed the **isolate** — the one parameter type every site
+    /// in the tree accepts (two of them annotate `|_: &mut v8::Isolate|`
+    /// explicitly) and the one the webgpu finalizer adjusts the host's
+    /// external-memory account through. A compile-time guard: this call is what
+    /// pins the shape, and the callback itself waits for a collection.
+    #[test]
+    fn a_finalizer_is_handed_the_isolate() {
+        crate::test_support::in_context!(scope, {
+            let value = Local::<Value>::from_engine(api::Local::string("watched"));
+            let weak = Weak::<Value>::with_finalizer(
+                scope,
+                value,
+                Box::new(|isolate: &mut crate::Isolate| {
+                    isolate.adjust_amount_of_external_allocated_memory(64);
+                }),
+            );
+            assert!(!weak.is_empty());
         });
     }
 }

@@ -70,28 +70,53 @@ impl Isolate {
             total_heap_size: committed,
             total_physical_size: committed,
             used_heap_size: live,
-            external_memory: external_memory(self),
+            // The walk is floored at zero, so the cast is exact.
+            external_memory: external_memory(self) as usize,
         }
+    }
+
+    /// Add `change` bytes to the host's external-memory account and answer the
+    /// new total (v8::Isolate::AdjustAmountOfExternalAllocatedMemory).
+    ///
+    /// The one lever a host has to tell the engine about memory it holds outside
+    /// the heap — a GPU device's backing, a natively allocated buffer — which the
+    /// engine's own walk cannot see. The answer is what
+    /// [`HeapStatistics::external_memory`] reports, so a host that records and a
+    /// host that asks agree.
+    ///
+    /// Unlike V8's account, this one does not drive a collection: V8 feeds it to
+    /// its GC heuristics, while this engine's collections are triggered by its own
+    /// growth policy. The number is reported rather than consulted, which is the
+    /// divergence `.notes/embedding.md` §9 records.
+    pub fn adjust_external_memory(&mut self, change: i64) -> i64 {
+        self.external_memory_adjustment = self.external_memory_adjustment.saturating_add(change);
+        external_memory(self)
     }
 }
 
-/// The bytes of the buffers this agent holds.
+/// The bytes of the buffers this agent holds, plus the host's own account.
 ///
 /// Summed over the agent's own record of live buffer objects, one term per
 /// object, with a detached buffer skipped (it has no bytes) and a *borrowed*
 /// block excluded (the host's memory, not this engine's). A host that wraps one
 /// block as two buffer objects is therefore counted twice, which is what V8 does
 /// with two backing stores over one allocation too.
-fn external_memory(isolate: &Isolate) -> usize {
-    let mut total = 0;
+///
+/// The host's own account — [`Isolate::adjust_external_memory`] — is added to
+/// that walk, because the point of a host adjusting it is precisely that the
+/// bytes are outside anything this engine can see. The total floors at zero, so a
+/// host that over-corrects with a negative change is told it holds no external
+/// memory rather than a negative number of bytes.
+fn external_memory(isolate: &Isolate) -> i64 {
+    let mut total = isolate.external_memory_adjustment;
     for state in isolate.agent.buffer_data.values() {
         let state = state.borrow();
         if state.detached || state.shared.is_borrowed() {
             continue;
         }
-        total += state.shared.byte_length();
+        total = total.saturating_add(state.shared.byte_length() as i64);
     }
-    total
+    total.max(0)
 }
 
 #[cfg(test)]
@@ -134,5 +159,24 @@ mod tests {
             before.external_memory + 4096,
             "the buffer's bytes are external, and a view over it adds nothing"
         );
+    }
+
+    /// A host's own account is added to the buffer walk with a floor at zero, and
+    /// what `adjust_external_memory` answers is what the statistic reports.
+    #[test]
+    fn the_hosts_account_is_added_to_the_statistic_and_floors_at_zero() {
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+
+        assert_eq!(isolate.adjust_external_memory(1 << 20), 1 << 20);
+        assert_eq!(isolate.heap_statistics().external_memory, 1 << 20);
+
+        // A buffer's bytes and the host's account are one total.
+        context.try_eval("new Uint8Array(4096)").expect("eval");
+        assert_eq!(isolate.heap_statistics().external_memory, (1 << 20) + 4096);
+
+        // Over-correcting floors at zero rather than reporting negative bytes.
+        assert_eq!(isolate.adjust_external_memory(-(2 << 20)), 0);
+        assert_eq!(isolate.heap_statistics().external_memory, 0);
     }
 }
