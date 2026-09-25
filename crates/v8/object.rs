@@ -18,6 +18,7 @@ use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::value::Value as EngineValue;
 use crux::value::ValueKind;
 use runtime::api;
+use runtime::builtins::keyed::MapIterationKind;
 use slag::objects::{ensure_deferred_namespace_evaluation, materialize_pending_prototype_value};
 
 /// A descriptor that defines a new own data property with every attribute set,
@@ -308,6 +309,36 @@ impl<'s> LocalHandle<'s, Object> {
         }
     }
 
+    /// The object's internal entries (`v8::Object::PreviewEntries`), for a
+    /// console: a flat array of what the engine holds for this object, and
+    /// whether that array is key/value pairs rather than a flat list of
+    /// elements.
+    ///
+    /// Only the four keyed collections and map and set iterators have internal
+    /// entries. Everything else — an ordinary object, a generator suspended at a
+    /// `yield` — answers the empty handle, which is the answer a console's
+    /// ordinary preview handles; see [`preview_entries_of`] for what each kind
+    /// contributes and why a plain `Set` answers its values once.
+    pub fn preview_entries<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+    ) -> (Option<Local<'a, Array>>, bool) {
+        let Some(object) = self.engine().value().as_object() else {
+            return (None, false);
+        };
+        let id = object.id();
+        let answer = crate::realm::with_agent(|agent| preview_entries_of(agent, id)).flatten();
+        let Some((values, is_key_value)) = answer else {
+            return (None, false);
+        };
+        let locals: Vec<Local<'_, Value>> = values
+            .iter()
+            .map(|value| Local::from_engine(api::Local::from(*value)))
+            .collect();
+        (Some(Array::new_with_elements(scope, &locals)), is_key_value)
+    }
+
+    /// The object's own property names, filtered and spelled as `args` asks
     /// [[Set]] with an integer index (`v8::Object::SetIndex`).
     ///
     /// As [`get_index`](Self::get_index): the engine resolves properties by
@@ -780,6 +811,28 @@ impl<'s> LocalHandle<'s, Set> {
         .unwrap_or(0)
     }
 
+    /// Add an element (`v8::Set::add`), answering the set so a caller can chain.
+    ///
+    /// The add runs as `%Set.prototype.add%` with the set as its receiver, which
+    /// is the only route that keeps the engine's own element index and its
+    /// SameValueZero normalization (`-0` stored as `+0`, a duplicate adding
+    /// nothing). It is the *intrinsic* rather than the prototype's property, so a
+    /// script that reassigns `Set.prototype.add` does not change what this calls;
+    /// `None` is a trap that threw, with the exception pending.
+    pub fn add(&self, scope: &PinScope<'_, '_>, value: Local<'_, Value>) -> Option<Local<'s, Set>> {
+        let realm = crate::realm_of(scope);
+        let add = realm.intrinsic("%Set.prototype.add%").unwrap_or_else(|| {
+            panic!("bridge bug: the realm has no %Set.prototype.add% intrinsic")
+        });
+        match realm.try_call(&api::Local::from(add), self.engine(), &[*value.engine()]) {
+            Ok(_) => Some(self.retag()),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
     /// The set's elements as one flat array — each element as both its key and
     /// its value (`v8::Set::as_array`), in insertion order, with deleted
     /// elements left out.
@@ -814,6 +867,91 @@ impl<'s> LocalHandle<'s, Date> {
             .flatten()
             .unwrap_or(f64::NAN)
     }
+}
+
+/// The internal entries of the object `id` names, in the flat shape a console
+/// reads: the values, and whether they are key/value pairs. `None` is an object
+/// the engine holds no entries for.
+///
+/// The four keyed collections read their own tables, skipping tombstones exactly
+/// as [`Map::as_array`] and [`Set::as_array`] do, and a map or set *iterator*
+/// reads the collection it walks from its next index on — what a preview of an
+/// iterator is. Two shapes are deliberately not `as_array`'s: a plain `Set`
+/// answers each value once where `as_array` repeats it (the console reads a flat
+/// list, the array API answers key/value pairs), and a map iterator's entries
+/// follow its `[[MapIterationKind]]`, so a key-only iterator previews the keys
+/// it yields and a value-only one the values, which is what the engine's own
+/// `from_code` decides.
+fn preview_entries_of(agent: &runtime::Agent, id: u64) -> Option<(Vec<EngineValue>, bool)> {
+    if let Some(cell) = agent.map_data.get(&id) {
+        let entries = cell
+            .borrow()
+            .entries
+            .iter()
+            .flatten()
+            .flat_map(|(key, value)| [*key, *value])
+            .collect();
+        return Some((entries, true));
+    }
+    if let Some(cell) = agent.set_data.get(&id) {
+        let values = cell.borrow().entries.iter().flatten().copied().collect();
+        return Some((values, false));
+    }
+    if let Some(cell) = agent.weak_map_data.get(&id) {
+        let entries = cell
+            .borrow()
+            .iter()
+            .flatten()
+            .flat_map(|(key, value)| [*key, *value])
+            .collect();
+        return Some((entries, true));
+    }
+    if let Some(cell) = agent.weak_set_data.get(&id) {
+        let values = cell.borrow().iter().flatten().copied().collect();
+        return Some((values, false));
+    }
+    if let Some(cell) = agent.map_iter_data.get(&id) {
+        let (map, index, code) = *cell.borrow();
+        let kind = MapIterationKind::from_code(code);
+        // An exhausted iterator (or one whose Map was collected, which cannot
+        // happen while it is held) has no entries left rather than none at all.
+        let Some(map) = map.and_then(|map| map.as_object()) else {
+            return Some((Vec::new(), true));
+        };
+        let Some(cell) = agent.map_data.get(&map.id()) else {
+            return Some((Vec::new(), true));
+        };
+        let data = cell.borrow();
+        let mut entries = Vec::new();
+        for entry in data.entries[index.min(data.entries.len())..]
+            .iter()
+            .flatten()
+        {
+            match kind {
+                MapIterationKind::KeyValue => entries.extend([entry.0, entry.1]),
+                MapIterationKind::Key => entries.push(entry.0),
+                MapIterationKind::Value => entries.push(entry.1),
+            }
+        }
+        return Some((entries, true));
+    }
+    if let Some(cell) = agent.set_iter_data.get(&id) {
+        let (set, index, _kind) = *cell.borrow();
+        let Some(set) = set.and_then(|set| set.as_object()) else {
+            return Some((Vec::new(), false));
+        };
+        let Some(cell) = agent.set_data.get(&set.id()) else {
+            return Some((Vec::new(), false));
+        };
+        let data = cell.borrow();
+        let values = data.entries[index.min(data.entries.len())..]
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        return Some((values, false));
+    }
+    None
 }
 
 /// The elements a keyed collection's table holds, read through `read`.
@@ -1425,6 +1563,125 @@ mod tests {
 
             let invalid = Local::<Date>::try_from(eval(scope, "new Date(NaN)")).expect("date");
             assert!(invalid.value_of().is_nan());
+        });
+    }
+
+    /// `Set::add` runs the engine's own add, so what it changes is a real set: a
+    /// script sees every element, a duplicate adds nothing, and `-0` is stored as
+    /// `+0` — the normalization the element index is built on.
+    #[test]
+    fn a_set_add_is_the_engines_own_add() {
+        in_context!(scope, {
+            let set = Set::new(scope);
+            let one = Number::new(scope, 1.0).cast::<Value>();
+            assert!(set.add(scope, one).is_some());
+            assert_eq!(set.size(), 1);
+
+            let duplicate = Number::new(scope, 1.0).cast::<Value>();
+            assert!(set.add(scope, duplicate).is_some());
+            assert_eq!(set.size(), 1, "SameValueZero dedupes");
+
+            let negative_zero = Number::new(scope, -0.0).cast::<Value>();
+            set.add(scope, negative_zero);
+            let zero = Number::new(scope, 0.0).cast::<Value>();
+            set.add(scope, zero);
+            assert_eq!(set.size(), 2, "-0 stored as +0 is the same element");
+
+            bind(scope, "host_set", set.into());
+            assert_eq!(eval_number(scope, "host_set.size"), 2.0);
+            assert_eq!(eval_number(scope, "host_set.has(1) ? 1 : 0"), 1.0);
+            assert_eq!(
+                eval_number(scope, "Object.is([...host_set][1], 0) ? 1 : 0"),
+                1.0,
+                "the element the host added as -0 reads back as +0"
+            );
+        });
+    }
+
+    /// `preview_entries` answers the flat internal entries a console reads:
+    /// flattened pairs for the key/value kinds, single values for the sets, the
+    /// *remaining* entries for an iterator, and nothing for anything else.
+    #[test]
+    fn preview_entries_answers_the_consoles_internal_entries() {
+        in_context!(scope, {
+            let map = Local::<Object>::try_from(eval(scope, "new Map([[1, 'a'], [2, 'b']])"))
+                .expect("map");
+            let (entries, is_key_value) = map.preview_entries(scope);
+            assert!(is_key_value, "a map is a key/value collection");
+            bind(scope, "preview", entries.expect("entries").into());
+            assert_eq!(eval_number(scope, "preview.length"), 4.0, "flat pairs");
+            assert_eq!(eval_number(scope, "preview[0]"), 1.0);
+            assert_eq!(eval_number(scope, "preview[3] === 'b' ? 1 : 0"), 1.0);
+
+            // A set answers each value once, where `as_array` repeats it.
+            let set = Local::<Object>::try_from(eval(scope, "new Set([1, 2, 3])")).expect("set");
+            let (entries, is_key_value) = set.preview_entries(scope);
+            assert!(!is_key_value, "a set is not a key/value collection");
+            bind(scope, "preview", entries.expect("entries").into());
+            assert_eq!(eval_number(scope, "preview.length"), 3.0, "once each");
+            assert_eq!(eval_number(scope, "preview[2]"), 3.0);
+
+            let weak_map =
+                Local::<Object>::try_from(eval(scope, "new WeakMap([[{}, 'v']])")).expect("map");
+            let (entries, is_key_value) = weak_map.preview_entries(scope);
+            assert!(is_key_value);
+            bind(scope, "preview", entries.expect("entries").into());
+            assert_eq!(eval_number(scope, "preview.length"), 2.0);
+            assert_eq!(eval_number(scope, "preview[1] === 'v' ? 1 : 0"), 1.0);
+
+            let weak_set =
+                Local::<Object>::try_from(eval(scope, "new WeakSet([{}])")).expect("set");
+            let (entries, is_key_value) = weak_set.preview_entries(scope);
+            assert!(!is_key_value);
+            bind(scope, "preview", entries.expect("entries").into());
+            assert_eq!(eval_number(scope, "preview.length"), 1.0);
+
+            // An iterator previews what it has left, not what it started with.
+            let consumed = Local::<Object>::try_from(eval(
+                scope,
+                "(() => { const it = new Map([[1, 'a'], [2, 'b']]).entries(); it.next(); return it; })()",
+            ))
+            .expect("iterator");
+            let (entries, is_key_value) = consumed.preview_entries(scope);
+            assert!(is_key_value);
+            bind(scope, "preview", entries.expect("entries").into());
+            assert_eq!(
+                eval_number(scope, "preview.length"),
+                2.0,
+                "one entry was consumed"
+            );
+            assert_eq!(
+                eval_number(scope, "preview[0]"),
+                2.0,
+                "the second entry remains"
+            );
+
+            // A key-only map iterator yields keys, not pairs — while still
+            // reporting key/value, as every map iterator does.
+            let keys =
+                Local::<Object>::try_from(eval(scope, "new Map([[1, 'a'], [2, 'b']]).keys()"))
+                    .expect("iterator");
+            let (entries, is_key_value) = keys.preview_entries(scope);
+            assert!(is_key_value);
+            bind(scope, "preview", entries.expect("entries").into());
+            assert_eq!(eval_number(scope, "preview.length"), 2.0, "one key each");
+            assert_eq!(eval_number(scope, "preview[1]"), 2.0);
+
+            let set_iterator = Local::<Object>::try_from(eval(scope, "new Set([7, 8]).values()"))
+                .expect("iterator");
+            let (entries, is_key_value) = set_iterator.preview_entries(scope);
+            assert!(!is_key_value);
+            bind(scope, "preview", entries.expect("entries").into());
+            assert_eq!(eval_number(scope, "preview.length"), 2.0);
+            assert_eq!(eval_number(scope, "preview[1]"), 8.0);
+
+            // No internal entries: an ordinary object, and a generator — the
+            // documented gap, since V8 reads one out of the debugger's own table.
+            let plain = Local::<Object>::try_from(eval(scope, "({ a: 1 })")).expect("object");
+            assert!(plain.preview_entries(scope).0.is_none());
+            let generator = Local::<Object>::try_from(eval(scope, "(function* () { yield 1; })()"))
+                .expect("generator");
+            assert!(generator.preview_entries(scope).0.is_none());
         });
     }
 }

@@ -4725,6 +4725,14 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,377 passed / 0 failed** (`crux` 258, `ffi` 10, `runtime` 935, `slag` 4, `test262` 3324 — each unchanged from the record above — and `v8` **274**, up from 260 by this part's fourteen tests); the wasm-free shape holds (`cargo test -p runtime --no-default-features --lib` **904 passed / 0 failed**, the figure the records one and two parts back give for that same command, and `cargo check -p cli --no-default-features --features jit`). **The sweeps were required and re-run**: `expr.rs` and `builtins/object.rs` are in every runner's graph, so after `cargo build --locked --release -p test262 -p wasmtest` and the settle sleep, test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622), `intl402` its own (**3,205 pass, 0 fail, 0 crash, 0 hang**, 152 skip of 3,357), the eight wasm core invocations theirs (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+*`Set::add` and the console's internal entries — §9's bullet that named them.* `v8::Set::add` is the other half of what the previous part's `Set::new` started: two `deno/ext/webgpu` sites build a set and add to it, and the add runs as the `%Set.prototype.add%` intrinsic with the set as its receiver — the route `Set::new` already takes through `%Set%` and `try_construct` — so what it changes is a set the engine built, element index and SameValueZero normalization included (`-0` stored as `+0`, a duplicate adding nothing), and it is the *intrinsic* rather than the prototype's own property, so a script that reassigns `Set.prototype.add` does not change what a host calls. `v8::Object::preview_entries` is the console's internal-entry protocol, and its shape came off its one consumer rather than recalled: `deno/ext/web/console` calls it on the four collections and on map and set iterators and then reads a **flat** array — flattened `[k1,v1,k2,v2, …]` when the flag says key/value, single values otherwise — so `Map`/`WeakMap` and an entries map iterator answer pairs with the flag `true`, and `Set`/`WeakSet` and a set iterator answer their values once each with `false`. The one engine edit is a *visibility*, named in §9 before it was made: a map iterator's remaining entries depend on its `[[MapIterationKind]]`, which `agent.map_iter_data` carries as a `u8` whose `1`/`2` are keys and values, so `MapIterationKind` and its `from_code` are `pub` in `builtins::keyed` and the bridge reads those codes through the enum instead of spelling them. Three decisions are recorded because they are shapes rather than echoes: a key-only or value-only map iterator previews the flat list of what it yields (with the flag still `true`, as for every map iterator, which is where V8's `MapAsArrayKind` draws the same line); a plain `Set` previews its values once where `Set::as_array` repeats each element twice, so a console and the array API read different shapes out of one table; and a generator object previews nothing — V8 answers a suspended generator's `[input, output]` from the debugger's own side table, this engine's generator state is a `GeneratorState` the bridge has no honest pair to read, and the empty answer is the console's fallback path, exactly as for an ordinary object. No sweeps or engine machinery were avoided by any of this: the collection tables are the ones `as_array` already reads, and the iterator tables are the ones `next` walks.
+
+*Tests — two, and three mutations, each caught by its own test.* `object.rs`'s `a_set_add_is_the_engines_own_add` adds `1` and its duplicate (size stays 1), adds `-0` and then `+0` (size 2, one element), then hands the set to a script with `bind` and reads it back: `host_set.size`, `host_set.has(1)`, and `Object.is([...host_set][1], 0)` — the normalization visible from the language. `preview_entries_answers_the_consoles_internal_entries` walks all seven shapes the engine answers: a `Map` (4 entries for two pairs), a `Set` (3, once each — the assertion that separates it from `as_array`), a `WeakMap`, a `WeakSet`, an entries map iterator already advanced by one `next()` (2, not 4, so what is asserted is *remaining*), a `keys()` iterator (2 — one key each, not pairs — while still reporting `is_key_value`), a set iterator, and then the two empty answers, an ordinary object and a generator. Three mutations, each run on its own and each caught: the intrinsic name changed to `%Set.prototype.has%` fails the add test at `size` (`0` where `1` belongs); the map iterator's next index ignored fails the preview test at "one entry was consumed" (`4.0` where `2.0`); and the `Set` branch made to repeat each element fails it at "once each" (`6.0` where `3.0`).
+
+*The measurement.* `cargo check -p deno_snapshots`: **58 → 52**, and that is exactly the mentions this part removes — `preview_entries` 4 → 0 and `Set::add` 2 → 0, with nothing new surfacing (the two crates that carried them only got smaller: `deno_webgpu` 5 → 3, `deno_web` 36 → 32). What is left is the two deferred families and their neighbours: `v8::simdutf`'s base64 (31 mentions — the part here that needs a real codec), the node_sqlite `E0512` transmutes (13 sites, the `Local` tag shape §9 records as open), `adjust_amount_of_external_allocated_memory` (2), and webgpu's own `E0521`/`E0277`.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,379 passed / 0 failed** (`v8` 276, up two; `crux` 258, `ffi` 10, `runtime` 935, `slag` 4, `test262` 3324 — all unmoved); `cargo test -p runtime --no-default-features --lib` **904 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. `builtins::keyed` is in every runner's graph, so the corpora were re-run after a release build and the settle sleep, and every number is at baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt because the bridge is what deno links, and holds at **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -8022,6 +8030,35 @@ migrate, then delete.
   external-memory counter, which the engine does not have — it derives external
   memory from the buffers it holds) — and `Set::add`, the two sites `Set::new`
   compiling is what surfaced.
+- **`Set::add` and `Object::preview_entries` — named here before the edit, and the
+  one engine change is a visibility.** `v8::Set::add` is the other half of what
+  `Set::new` started: two `deno/ext/webgpu` sites build a set and add to it, and
+  the honest route is the `%Set.prototype.add%` intrinsic called with the set as
+  its receiver — the shape `Set::new` already takes through `%Set%` and
+  `try_construct` — because an intrinsic slot holds the original builtin, so a
+  script that reassigns `Set.prototype.add` changes the prototype's property and
+  not this call. `v8::Object::preview_entries` is the console's internal-entry
+  protocol, and its shape is read off its one consumer rather than recalled:
+  `deno/ext/web/console` calls it on the four collections and on map and set
+  iterators and then reads a **flat** array — `[k1,v1,k2,v2, …]` when the flag
+  says key/value, single values otherwise — so `Map`/`WeakMap` and an entries map
+  iterator answer flattened pairs with the flag `true`, and `Set`/`WeakSet` and a
+  set iterator answer the values once each with `false`. That is where the engine
+  edit comes in: a map iterator's remaining entries depend on its
+  `[[MapIterationKind]]`, which `agent.map_iter_data` carries as a `u8` whose
+  `1`/`2` mean keys and values — so `MapIterationKind` and its `from_code` become
+  `pub` in `builtins::keyed` rather than the bridge spelling those codes itself,
+  and a key-only or value-only iterator previews the flat list of what it yields
+  (V8's `MapAsArrayKind` draws the same distinction, and the flag stays `true` for
+  every map iterator, as it does there). Three further decisions rather than
+  echoes: a plain `Set` previews its values **once** where `Set::as_array`
+  repeats each element twice, so the two shapes are deliberately different; tombstones are skipped by the same walk
+  `as_array` uses, so a deleted entry leaves no hole in the preview; and a
+  generator object previews nothing — V8 answers a suspended generator's
+  `[input, output]` out of the debugger's own side table, this engine's generator
+  state is a `GeneratorState` the bridge has no honest pair to read, and the
+  empty answer is exactly "no internal entries", which is the console's fallback
+  path.
 
 ## 11. Working rules
 

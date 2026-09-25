@@ -79,8 +79,12 @@ const WEAK_SET_DELETE: &str = "%WeakSet.prototype.delete%";
 const WEAK_SET_HAS: &str = "%WeakSet.prototype.has%";
 
 /// The [[MapIterationKind]] of a Map iterator (spec 24.1.6.1).
+///
+/// `pub` so a host-facing reader of an iterator's state — the bridge's
+/// `v8::Object::PreviewEntries` — reads the kind through this enum instead of
+/// the `u8` code that carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MapIterationKind {
+pub enum MapIterationKind {
     KeyValue,
     Key,
     Value,
@@ -95,7 +99,7 @@ impl MapIterationKind {
         }
     }
 
-    fn from_code(code: u8) -> Self {
+    pub fn from_code(code: u8) -> Self {
         match code {
             1 => MapIterationKind::Key,
             2 => MapIterationKind::Value,
