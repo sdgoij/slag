@@ -21,11 +21,41 @@ impl PropertyAttribute {
     pub const DONT_ENUM: Self = Self(1 << 1);
     pub const DONT_DELETE: Self = Self(1 << 2);
 
-    /// Whether every attribute in `that` is set here.
+    /// Whether any attribute in `that` is set here, which is the crate we stand
+    /// in for's rule (`0 != lhs & rhs`). A single-bit mask makes "any" and
+    /// "every" the same question; they part on a compound one, where a host
+    /// asking whether one of `READ_ONLY | DONT_ENUM` is set means exactly that.
     pub fn has(&self, that: Self) -> bool {
         let Self(lhs) = self;
         let Self(rhs) = that;
-        lhs & rhs == rhs
+        lhs & rhs != 0
+    }
+
+    /// Whether no attribute is set.
+    pub fn is_none(&self) -> bool {
+        *self == Self::NONE
+    }
+
+    /// Whether the property is read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.has(Self::READ_ONLY)
+    }
+
+    /// Whether the property is non-enumerable.
+    pub fn is_dont_enum(&self) -> bool {
+        self.has(Self::DONT_ENUM)
+    }
+
+    /// Whether the property is non-configurable.
+    pub fn is_dont_delete(&self) -> bool {
+        self.has(Self::DONT_DELETE)
+    }
+
+    /// The raw bits, which is what a host writes into a callback's return slot
+    /// (`v8::PropertyAttribute` is `int` there).
+    pub fn as_u32(&self) -> u32 {
+        let Self(bits) = self;
+        *bits
     }
 }
 
@@ -313,5 +343,43 @@ mod tests {
             PropertyHandlerFlags::NONE | PropertyHandlerFlags::ALL_CAN_READ,
             PropertyHandlerFlags::ALL_CAN_READ
         );
+    }
+
+    /// The crate we stand in for's own assertions about the attribute set, and
+    /// the one place its rule shows: `has` asks whether *any* bit of the mask is
+    /// set, so a compound mask is true for a set sharing one of its bits rather
+    /// than needing all of them.
+    #[test]
+    fn the_attributes_are_a_set() {
+        assert!(PropertyAttribute::NONE.is_none());
+        assert!(!PropertyAttribute::NONE.is_read_only());
+        assert!(!PropertyAttribute::NONE.is_dont_enum());
+        assert!(!PropertyAttribute::NONE.is_dont_delete());
+
+        assert!(!PropertyAttribute::READ_ONLY.is_none());
+        assert!(PropertyAttribute::READ_ONLY.is_read_only());
+        assert!(!PropertyAttribute::READ_ONLY.is_dont_enum());
+        assert!(!PropertyAttribute::READ_ONLY.is_dont_delete());
+
+        assert!(PropertyAttribute::DONT_ENUM.is_dont_enum());
+        assert!(PropertyAttribute::DONT_DELETE.is_dont_delete());
+
+        assert_eq!(PropertyAttribute::NONE, PropertyAttribute::default());
+        assert_eq!(
+            PropertyAttribute::READ_ONLY,
+            PropertyAttribute::NONE | PropertyAttribute::READ_ONLY
+        );
+
+        let attr = PropertyAttribute::READ_ONLY | PropertyAttribute::DONT_ENUM;
+        assert!(!attr.is_none());
+        assert!(attr.is_read_only());
+        assert!(attr.is_dont_enum());
+        assert!(!attr.is_dont_delete());
+        assert_eq!(attr.as_u32(), 0b011);
+
+        // The mask is "any of these", not "all of these".
+        assert!(attr.has(PropertyAttribute::READ_ONLY | PropertyAttribute::DONT_DELETE));
+        assert!(!attr.has(PropertyAttribute::DONT_DELETE));
+        assert!(!PropertyAttribute::NONE.has(PropertyAttribute::READ_ONLY));
     }
 }

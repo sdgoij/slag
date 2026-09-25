@@ -28,7 +28,7 @@ use std::ops::Deref;
 
 use runtime::api;
 
-use crate::data::{Function, Module, Object, Script, String};
+use crate::data::{Function, Module, Object, Script, String, UnboundScript};
 use crate::handle::Local;
 use crate::position::Origin;
 use crate::scope::PinScope;
@@ -253,6 +253,23 @@ pub fn compile<'s>(
     }
 }
 
+/// Compile a script without binding it to a context
+/// (`v8::ScriptCompiler::CompileUnboundScript`).
+///
+/// The re-tagged answer to [`compile`], and honestly so: a script here *is* its
+/// source text and names no context, so every script handle is already unbound
+/// and the tag is the only difference — see [`crate::unbound_script`], which
+/// says the same about `bind_to_current_context`.
+pub fn compile_unbound_script<'s>(
+    scope: &PinScope<'s, '_, ()>,
+    source: &mut Source,
+    options: CompileOptions,
+    no_cache_reason: NoCacheReason,
+) -> Option<Local<'s, UnboundScript>> {
+    compile(scope, source, options, no_cache_reason)
+        .map(|script| Local::from_payload(*script.payload()))
+}
+
 /// Compile a module (`v8::ScriptCompiler::CompileModule`).
 pub fn compile_module<'s>(
     scope: &PinScope<'s, '_>,
@@ -376,6 +393,36 @@ mod tests {
             assert_eq!(
                 Local::<Number>::try_from(value).expect("number").value(),
                 3.0
+            );
+        });
+    }
+
+    /// The unbound compile is what `vm.rs` reaches for, and it is the bound one's
+    /// answer re-tagged: the same script, which here names no context either way.
+    /// What the test pins is the whole host-visible contract around it — the code
+    /// cache a host stores is the source it handed over, the cache is consumed by
+    /// the next compile of that source, and the script a later
+    /// `bind_to_current_context` produces runs.
+    #[test]
+    fn an_unbound_compile_answers_a_cache_and_a_runnable_script() {
+        in_context!(scope, {
+            let text = String::new(scope, "6 * 7").expect("string");
+            let mut source = Source::new(text, None);
+            let unbound = compile_unbound_script(
+                scope,
+                &mut source,
+                CompileOptions::NoCompileOptions,
+                NoCacheReason::NoReason,
+            )
+            .expect("compile");
+
+            let cache = unbound.create_code_cache().expect("a cache");
+            assert_eq!(&**cache, b"6 * 7");
+
+            let bound = unbound.bind_to_current_context(scope);
+            assert_eq!(
+                bound.run(scope).expect("run").to_rust_string_lossy(scope),
+                "42"
             );
         });
     }

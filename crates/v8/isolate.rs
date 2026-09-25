@@ -191,6 +191,21 @@ pub struct IsolateInner {
     /// the isolate owns it, because a handle to it outlives the scope it was made
     /// in.
     extras_bindings: RefCell<std::collections::HashMap<u64, Global<Object>>>,
+    /// The security token each context was given
+    /// (`v8::Context::SetSecurityToken`), by the context identity the rest of
+    /// this bridge's per-context state is keyed by.
+    ///
+    /// Kept rather than consulted: V8's token decides whether one context's
+    /// properties may be read and written from another, and this engine has no
+    /// cross-realm access check for a token to decide. See
+    /// [`LocalHandle::set_security_token`](crate::Context) for what a host can
+    /// and cannot observe.
+    security_tokens: RefCell<std::collections::HashMap<u64, Global<Value>>>,
+    /// The token a context answers with before it is given one
+    /// (`v8::Context::UseDefaultSecurityToken`, and the default every context
+    /// starts on). One per isolate, minted on the first ask, so two contexts on
+    /// one isolate compare equal the way V8's default makes them.
+    default_security_token: RefCell<Option<Global<Value>>>,
     /// Where the errors the bridge threw came from, by object identity, for the
     /// `v8::Message` a host later makes from one of them; see
     /// [`position`](crate::position) for why only a failed compile records one.
@@ -267,6 +282,18 @@ pub struct IsolateInner {
 }
 
 const _: () = assert!(std::mem::offset_of!(IsolateInner, engine) == 0);
+
+/// The isolate's default security token: an ordinary object with no prototype.
+///
+/// Opaque by construction, which is all a token is — the only thing a host can
+/// do with one is compare it against another (`v8::Context::GetSecurityToken`
+/// with no token of the context's own, which is where V8 allocates one of these
+/// per isolate too).
+fn minted_security_token() -> Local<'static, Value> {
+    Local::from_engine(api::Local::from(crux::value::Value::Object(
+        crux::object::JsObject::ordinary_object_create(None),
+    )))
+}
 
 /// Host objects are dropped before the engine is, which their destructors need.
 ///
@@ -734,6 +761,8 @@ impl Isolate {
             cpp_heap,
             templates: RefCell::new(Vec::new()),
             extras_bindings: RefCell::new(std::collections::HashMap::new()),
+            security_tokens: RefCell::new(std::collections::HashMap::new()),
+            default_security_token: RefCell::new(None),
             positions: RefCell::new(HashMap::new()),
             callbacks: RefCell::new(HashMap::new()),
             callback_templates: RefCell::new(HashMap::new()),
@@ -1322,6 +1351,45 @@ impl Isolate {
             .extras_bindings
             .borrow_mut()
             .insert(context, Global::new(self, value));
+    }
+
+    /// The token `context` was given, or `None` when it is still on the
+    /// isolate's default (`v8::Context::GetSecurityToken`).
+    pub(crate) fn security_token(&self, context: u64) -> Option<api::Local> {
+        let tokens = self.inner().security_tokens.borrow();
+        tokens.get(&context).map(|held| held.engine_value())
+    }
+
+    /// Give `context` a token (`v8::Context::SetSecurityToken`).
+    pub(crate) fn set_security_token(&self, context: u64, value: Local<'_, Value>) {
+        self.inner()
+            .security_tokens
+            .borrow_mut()
+            .insert(context, Global::new(self, value));
+    }
+
+    /// Forget `context`'s token, so it answers the isolate's default again
+    /// (`v8::Context::UseDefaultSecurityToken`).
+    pub(crate) fn use_default_security_token(&self, context: u64) {
+        self.inner().security_tokens.borrow_mut().remove(&context);
+    }
+
+    /// The isolate's default token, minted on the first ask
+    /// (`v8::Context::GetSecurityToken` with no token of its own).
+    ///
+    /// An ordinary object with no prototype, which is what it is there: the
+    /// engine allocates one opaque object per isolate and every context without
+    /// a token of its own answers it, so the only thing a host can do with one
+    /// is compare it against another.
+    pub(crate) fn default_security_token(&self) -> api::Local {
+        let mut held = self.inner().default_security_token.borrow_mut();
+        if let Some(token) = held.as_ref() {
+            return token.engine_value();
+        }
+        let token = Global::new(self, minted_security_token());
+        let value = token.engine_value();
+        *held = Some(token);
+        value
     }
 
     /// Whether the isolate has background work pending

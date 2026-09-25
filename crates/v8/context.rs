@@ -388,6 +388,47 @@ impl<'s> LocalHandle<'s, Context> {
         self.slots_isolate().clear_context_slots(self.identity());
     }
 
+    /// The token another context must answer to be allowed to reach this one's
+    /// properties (`v8::Context::GetSecurityToken`).
+    ///
+    /// **Stored, and not consulted.** V8 uses the token for its cross-context
+    /// access check; this engine has none — a realm's objects are reachable from
+    /// any other realm on the isolate, which is a gap in the engine rather than a
+    /// decision here, and `.notes/embedding.md` §9 says so. What the token does
+    /// answer is the host's own protocol around it, which is what `deno/ext/node`
+    /// `vm.rs` uses it for: it copies the main context's token onto a sandbox
+    /// context (`set_security_token(main.get_security_token())`), and by reading
+    /// back what was written the copy is the same object rather than an equal
+    /// one.
+    ///
+    /// A context that was never given one answers the isolate's default, which is
+    /// one object per isolate and therefore the same handle for every context that
+    /// has not replaced it — V8's own rule. (V8 mints its default lazily too.)
+    pub fn get_security_token<'a>(&self, _scope: &PinScope<'a, '_, ()>) -> Local<'a, Value> {
+        let isolate = self.slots_isolate();
+        let token = isolate
+            .security_token(self.identity())
+            .unwrap_or_else(|| isolate.default_security_token());
+        Local::from_engine(token)
+    }
+
+    /// Give this context a token (`v8::Context::SetSecurityToken`).
+    ///
+    /// Whole or refused, like the crate: the token is any value, and what it
+    /// gates there (access from a context carrying a different one) does not
+    /// exist here — see [`get_security_token`](Self::get_security_token).
+    pub fn set_security_token(&self, token: Local<'_, Value>) {
+        self.slots_isolate()
+            .set_security_token(self.identity(), token);
+    }
+
+    /// Go back to the isolate's default token
+    /// (`v8::Context::UseDefaultSecurityToken`).
+    pub fn use_default_security_token(&self) {
+        self.slots_isolate()
+            .use_default_security_token(self.identity());
+    }
+
     /// The context's extras binding object
     /// (`v8::Context::GetExtrasBindingObject`).
     ///
@@ -453,6 +494,49 @@ mod tests {
     use crate::scope::PinScope;
     use crate::test_support::in_context;
     use crate::{Context, ContextOptions};
+
+    /// A host reads back the token it set, and a context that never set one
+    /// answers the isolate's default — the *same* object for two contexts on one
+    /// isolate, which is V8's rule and what makes `vm.rs`'s
+    /// `set_security_token(main.get_security_token())` the copy it means to make.
+    /// Nothing else consults the token: this engine has no cross-realm access
+    /// check for one to gate, which `.notes/embedding.md` §9 records rather than
+    /// leaves to be discovered.
+    #[test]
+    fn the_security_token_round_trips_and_the_default_is_the_isolates() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_scope, isolate);
+        let first = Context::new(handle_scope, ContextOptions::default());
+        let second = Context::new(handle_scope, ContextOptions::default());
+
+        let default = first.get_security_token(handle_scope);
+        assert_eq!(
+            second.get_security_token(handle_scope),
+            default,
+            "two contexts on one isolate share the default token"
+        );
+
+        let token = crate::String::new(handle_scope, "sandbox").unwrap();
+        let token = Local::<Value>::from(token);
+        first.set_security_token(token);
+        assert_eq!(
+            first.get_security_token(handle_scope),
+            token,
+            "what the host set is what it reads"
+        );
+        assert_ne!(
+            second.get_security_token(handle_scope),
+            token,
+            "and the other context did not get it"
+        );
+
+        first.use_default_security_token();
+        assert_eq!(
+            first.get_security_token(handle_scope),
+            default,
+            "and a context can go back to the isolate's default"
+        );
+    }
 
     /// The extras binding object is one per context and the same on every ask,
     /// it carries the console V8 puts there, the global object names that same

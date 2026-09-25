@@ -814,6 +814,20 @@ impl<'scope, 'obj: 'scope, 'i, C> NewTryCatch<'scope> for PinnedRef<'obj, Callba
     }
 }
 
+impl<'scope, 'obj: 'scope, 's, 'esc, C> NewTryCatch<'scope>
+    for PinnedRef<'obj, EscapableHandleScope<'s, 'esc, C>>
+{
+    type NewScope = TryCatch<'scope, 'obj, EscapableHandleScope<'s, 'esc, C>>;
+
+    fn make_new_scope(me: &'scope mut Self) -> Self::NewScope {
+        TryCatch {
+            scope: me,
+            catch: None,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
 impl<'scope, 'obj: 'scope, T: GetIsolate + ScopeInit> NewTryCatch<'scope>
     for ContextScope<'_, 'obj, T>
 {
@@ -1021,6 +1035,28 @@ impl<'s, 'obj: 's, 'i, C> NewEscapableHandleScope<'s> for PinnedRef<'obj, Handle
     }
 }
 
+/// A context scope can have an escapable one opened over it, which is the shape
+/// `vm.rs` writes: `EscapableHandleScope::new(&mut ContextScope::new(..))`, so a
+/// handle built while the context is entered still names its payload after the
+/// escapable scope closes. The escapable scope borrows the *inner* handle scope
+/// (a [`ContextScope`] already derefs to it), so the context stays entered for
+/// as long as the escapable scope is open.
+impl<'s, 'borrow, 'scope, 'i, C> NewEscapableHandleScope<'s>
+    for ContextScope<'borrow, 'scope, HandleScope<'i, C>>
+where
+    C: 's + 'borrow,
+{
+    type NewScope = EscapableHandleScope<'s, 'borrow, C>;
+
+    fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
+        EscapableHandleScope {
+            inner: HandleScope::new_inherited(me.scope.0.isolate, me.scope.0.context),
+            marker: PhantomData,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
 impl<'p, 's, 'esc, C> Deref for PinnedRef<'p, EscapableHandleScope<'s, 'esc, C>> {
     type Target = PinnedRef<'p, HandleScope<'s, C>>;
 
@@ -1166,6 +1202,38 @@ macro_rules! escapable_handle_scope {
 #[cfg(test)]
 mod tests {
     use crate::DataError;
+
+    /// The three lines `vm.rs:227` writes, which are a compile-time guard as much
+    /// as a test: an escapable scope opened over a context scope, and a try-catch
+    /// over *that*, which is what `tc_scope!` does. Without the `ContextScope`
+    /// impls of `NewEscapableHandleScope` and `NewTryCatch` this does not build.
+    /// What it also pins is that the context stays entered, so code evaluated
+    /// under the try-catch still runs in this realm rather than a bare one.
+    #[test]
+    fn an_escapable_scope_can_be_opened_over_a_context_scope() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_scope, isolate);
+        let context = crate::Context::new(handle_scope, Default::default());
+        let context_scope = &mut crate::ContextScope::new(handle_scope, context);
+
+        let storage = std::pin::pin!(crate::EscapableHandleScope::new(context_scope));
+        let scope = &mut storage.init();
+        crate::tc_scope!(scope, scope);
+
+        let value = crate::test_support::eval(&*scope, "6 * 7");
+        let escaped = scope.escape(value);
+        assert_eq!(
+            crate::Local::<crate::data::Number>::try_from(escaped)
+                .expect("a number")
+                .value(),
+            42.0
+        );
+        assert_eq!(
+            crate::test_support::eval_number(&*scope, "6 * 7"),
+            42.0,
+            "the context is still the entered one"
+        );
+    }
 
     /// The prologue every callback in this tree writes: a callback scope, then an
     /// ordinary handle scope opened *over* it. The second inherits the first's

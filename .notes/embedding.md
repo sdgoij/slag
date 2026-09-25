@@ -4791,6 +4791,14 @@ tests, 0 fail**).
 
 *Gates — and the corpora, because this part is an engine change.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,400 passed / 0 failed** (up seven: `runtime` **940**, `v8` **292**; `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **298 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **909 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. `runtime` is in every runner's graph, so the corpora and the wasm sweeps were re-run after a release build and the settle sleep, and every number is at baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**.
 
+*`vm.rs`'s bridge-local names — the first of §9's clusters, taken smallest-first so each lands with its own test rather than one un-reviewable sweep.* Four items, all in `crates/v8`. `PropertyAttribute` gains the crate's predicates (`is_none`/`is_read_only`/`is_dont_enum`/`is_dont_delete`/`as_u32`) and one fidelity fix: `has` answered "every named attribute is set" where the crate we stand in for answers "any is" (`0 != lhs & rhs`), which this tree's single-bit calls cannot tell apart and a host passing a mask can. `script_compiler::compile_unbound_script` is `compile` re-tagged, and honestly so — a script here *is* its source text and names no context, so it is already unbound, which `unbound_script.rs` has said since it was written. `Context::{set,get}_security_token` and `use_default_security_token` are stored per context on the isolate, with one lazily-minted default object per isolate, and **stated as not consulted**: V8's token gates cross-context property access, this engine has no cross-realm access check for one to gate, and what a host can observe is that a token round-trips and that two contexts which never set one answer the same object. And `vm.rs:227`'s scope chain needs two impls the bridge did not have: `NewEscapableHandleScope` for `ContextScope`, and — because fixing the first walked to the next link — `NewTryCatch` for a pinned `EscapableHandleScope`. That second fix walked again, to a name this part does not close: `TryCatch::message` over that scope, now on §9's list.
+
+*Tests — four, and three mutations, each caught by its own test.* `the_attributes_are_a_set` is the crate's own assertions about the attribute set plus the one that parts the two readings of `has`: a compound mask is true for a set sharing one of its bits, where "every" would answer false. `an_unbound_compile_answers_a_cache_and_a_runnable_script` drives the whole host-visible contract — the cache is the source, the cache survives the round trip, and the script a later `bind_to_current_context` produces runs. `an_escapable_scope_can_be_opened_over_a_context_scope` is `vm.rs`'s three lines exactly (escapable over a context scope, then `tc_scope!`), so it is a compile-time guard as much as a test, and it also pins that the context is still the entered one. `the_security_token_round_trips_and_the_default_is_the_isolates` pins the round trip, the sharing of the default across two contexts on one isolate, and `use_default_security_token`. Three mutations, each run alone: reverting `has` to "every" fails the attribute test at the compound mask; making `default_security_token` mint without caching fails the token test at "two contexts share the default"; and making `set_security_token` a no-op fails it at "what the host set is what it reads".
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **96 → 86**, with `ext/node/ops/vm.rs` at **51 → 41**; every mention of the names this part adds is gone from the log. The flag matters and is recorded: without `--keep-going` the run reports **2** errors, because `deno_webgpu`'s pre-existing `E0521` aborts the build before `deno_node` is scheduled — the same "an error count taken while the build cannot finish is not a measurement" trap §7 already records, in its second form (there, a full disk; here, an abort that hides a whole crate). What is left in `vm.rs` is §9's other three clusters, unchanged and now enumerated there, plus the `message` link this part uncovered.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,404 passed / 0 failed** (up four — this part's tests; `runtime` 940, `v8` **296**, `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **302 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **909 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8` (five files), and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` and the same for `wasmtest` are both **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5450,6 +5458,51 @@ if that proves possible.
   host object heap *before* the engine field drops, so the destructor deno drops
   the token from still finds the engine alive; that is V8's own order in
   `Isolate::Dispose`, and it is what makes the release sound rather than lucky.
+- **`vm.rs`'s names arrive as seven clusters, and they are taken smallest first.**
+  This part is the four that are bridge-local, so each lands with its own test
+  instead of one un-reviewable sweep across the interceptor machinery.
+  `PropertyAttribute` gains the crate's own predicates
+  (`is_none`/`is_read_only`/`is_dont_enum`/`is_dont_delete`/`as_u32`) and one
+  fidelity fix: `has` answered "every named attribute is set" where the crate we
+  stand in for answers "any is", which is unobservable for the single-bit calls
+  in this tree and wrong for a host that passes a mask.
+  `script_compiler::compile_unbound_script` is `compile` re-tagged, because a
+  script *is* its source text here and therefore already unbound — that module
+  has said so since it was written. `NewEscapableHandleScope` is implemented for
+  `ContextScope`, which is what `vm.rs:227`'s
+  `EscapableHandleScope::new(context_scope)` needs. And
+  `Context::{set,get}_security_token`/`use_default_security_token` are **stored
+  and stated as not consulted**: V8's token gates cross-context property access,
+  this engine has no cross-realm access check to gate, and what a host can
+  observe is that a token round-trips, that two contexts which never set one
+  answer the same object (V8's per-isolate default, not a per-realm one), and
+  that nothing else changes — so `vm.rs`'s
+  `set_security_token(main.get_security_token())` is by construction the copy it
+  means to make.
+- **What is left of `vm.rs`, named here so the next parts are not a probe.** The
+  **handler family**: the 14 named and indexed callback types,
+  `NamedPropertyHandlerConfiguration`'s remaining `*_raw` setters,
+  `IndexedPropertyHandlerConfiguration`, `ObjectTemplate::
+  set_indexed_property_handler`, `PropertyCallbackArguments::
+  should_throw_on_error`, and `ExternalReference`'s callback fields — of which
+  `should_throw_on_error` needs a `throw` flag on the `HostOps::set`/`delete`
+  seam, since the engine's internal methods do not carry one and a callback that
+  cannot see it would answer a question the host asked. The
+  **real-named-property family**:
+  `Object::{get_real_named_property, get_real_named_property_attributes,
+  has_real_named_property, get_property_attributes, delete_index,
+  get_creation_context}` — "real" means the interceptor is not consulted, which
+  needs an own-property read that bypasses `HostOps`, and
+  `get_creation_context` needs an object-to-realm record this engine does not
+  keep. The **code-generation flags**:
+  `Context::set_allow_generation_from_strings`, which must actually refuse
+  `eval` and `Function` in that realm rather than be stored and ignored, and
+  `Isolate::set_allow_wasm_code_generation_callback`, which is a per-compile host
+  callback and so needs a hook at the engine's wasm entry points. One name joins
+  that list from this part rather than from the probe: fixing the scope chain
+  moved the next link into view — `vm.rs`'s `tc_scope!` followed by
+  `scope.message()` wants `TryCatch::message` over an escapable scope, which the
+  bridge does not have at all.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
