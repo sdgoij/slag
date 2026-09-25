@@ -141,6 +141,53 @@ impl<'s> LocalHandle<'s, Object> {
         })
     }
 
+    /// Whether this object's own private table carries `key`
+    /// (`v8::Object::HasPrivate`).
+    ///
+    /// The own table, not the chain: a private name is the receiver's own, not an
+    /// inherited one, and this is the table [`delete_private`](Self::delete_private)
+    /// removes from. [`get_private`](Self::get_private) reads through `[[Get]]`,
+    /// which is the operation it stands for, so a name set on a prototype is
+    /// readable there and not present here — the one asymmetry the symbol-backed
+    /// private model carries.
+    pub fn has_private(&self, scope: &PinScope<'_, '_>, key: Local<'_, Private>) -> Option<bool> {
+        let symbol = key.engine().value().as_symbol()?;
+        let key: Local<Value> = Local::from_engine(api::Local::from(EngineValue::Symbol(symbol)));
+        let realm = crate::realm_of(scope);
+        match api::Object::has_own_key(&realm, self.engine(), key.engine()) {
+            Ok(found) => Some(found),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// Delete this object's own private property `key` (`v8::Object::DeletePrivate`),
+    /// answering whether the property is gone.
+    ///
+    /// The answer is `[[Delete]]`'s, as it is for [`delete_index`](Self::delete_index):
+    /// `Some(true)` for a delete that succeeded — including a name the object did
+    /// not carry, since `[[Delete]]` succeeds when there is nothing to fail on —
+    /// `Some(false)` for a refused one, and `None` for an error (a proxy trap that
+    /// threw), with it pending.
+    pub fn delete_private(
+        &self,
+        scope: &PinScope<'_, '_>,
+        key: Local<'_, Private>,
+    ) -> Option<bool> {
+        let symbol = key.engine().value().as_symbol()?;
+        let key: Local<Value> = Local::from_engine(api::Local::from(EngineValue::Symbol(symbol)));
+        let realm = crate::realm_of(scope);
+        match api::Object::delete_key(&realm, self.engine(), key.engine()) {
+            Ok(deleted) => Some(deleted),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
     /// The object's identity hash (v8::Object::GetIdentityHash), the number a
     /// host keys a table by.
     ///
@@ -250,6 +297,25 @@ impl<'s> LocalHandle<'s, Object> {
         let realm = crate::realm_of(scope);
         match api::Object::has_own_key(&realm, self.engine(), key.engine()) {
             Ok(found) => Some(found),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// [[HasProperty]] for an element index (`v8::Object::HasIndex`).
+    ///
+    /// The index goes in as its decimal string, the same key
+    /// [`delete_index`](Self::delete_index), [`get_index`](Self::get_index) and
+    /// [`set_index`](Self::set_index) reach for, so a host's indexed question
+    /// reaches the property an indexed access reaches, on an array or on a plain
+    /// object.
+    pub fn has_index(&self, scope: &PinScope<'_, '_>, index: u32) -> Option<bool> {
+        let realm = crate::realm_of(scope);
+        let key: Local<Value> = Local::from_engine(api::Local::string(index.to_string()));
+        match api::Object::has_key(&realm, self.engine(), key.engine()) {
+            Ok(present) => Some(present),
             Err(error) => {
                 crate::throw(scope, &error);
                 None
@@ -1420,6 +1486,33 @@ mod tests {
             let object = Local::<Object>::try_from(eval(scope, "({ 0: 'zero' })")).expect("object");
             let first = object.get_index(scope, 0).expect("property");
             assert_eq!(text_of(scope, first), "zero");
+        });
+    }
+
+    /// The presence question for an element is the chain question an indexed read
+    /// is: present where the read finds a value, absent where it finds a hole —
+    /// which is what tells an element from a hole, since `get_index` answers
+    /// `undefined` for both.
+    #[test]
+    fn has_index_answers_for_an_element() {
+        in_context!(scope, {
+            let array =
+                Local::<Array>::try_from(eval(scope, "globalThis.a = [7, 8, 9]")).expect("array");
+            assert_eq!(array.has_index(scope, 1), Some(true));
+            assert_eq!(array.has_index(scope, 9), Some(false));
+
+            // A hole is absent where a read is `undefined`.
+            let holey =
+                Local::<Array>::try_from(eval(scope, "globalThis.h = [, 1]")).expect("array");
+            assert_eq!(holey.has_index(scope, 0), Some(false), "a hole is absent");
+            assert!(holey.get_index(scope, 0).expect("value").is_undefined());
+
+            // The chain is walked, as `[[HasProperty]]` is: an element inherited
+            // from the prototype is present.
+            let derived =
+                Local::<Object>::try_from(eval(scope, "Object.create([9])")).expect("object");
+            assert_eq!(derived.has_index(scope, 0), Some(true));
+            assert_eq!(number_of(derived.get_index(scope, 0).expect("value")), 9.0);
         });
     }
 

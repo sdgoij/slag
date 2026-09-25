@@ -30,8 +30,8 @@ impl Private {
     /// crate's documentation warns that these names form a single namespace and
     /// should be qualified, which is the same hazard.
     ///
-    /// The crate's `Private::new` — a fresh name on every call — is absent, and
-    /// so is `Private::name`: nothing has asked for either yet.
+    /// The crate's `Private::name` — reading a name's description back — is
+    /// absent: nothing has asked for it yet.
     pub fn for_api<'s>(
         scope: &PinScope<'s, '_, ()>,
         name: Option<Local<'s, JsString>>,
@@ -43,6 +43,26 @@ impl Private {
             .and_then(|name| name.engine().value().as_string())
             .map(|text| text.as_slice().to_vec());
         let value = isolate.private_symbol(description.as_deref());
+        Local::<Private>::from_engine(value)
+    }
+
+    /// A fresh private name, one per call (`v8::Private::new`).
+    ///
+    /// Where [`for_api`](Self::for_api) dedupes by description — one description,
+    /// one name — this consults no registry, so two calls with the same
+    /// description are two distinct names, which is what the crate's own
+    /// documentation says it is for. The isolate keeps what it minted, so the
+    /// result is still recognized as a private name.
+    pub fn new<'s>(
+        scope: &PinScope<'s, '_, ()>,
+        name: Option<Local<'s, JsString>>,
+    ) -> Local<'s, Private> {
+        let isolate = scope.isolate_ptr();
+        // Code units, not text, for the same reason `for_api` reads them so.
+        let description = name
+            .and_then(|name| name.engine().value().as_string())
+            .map(|text| text.as_slice().to_vec());
+        let value = isolate.private_symbol_fresh(description.as_deref());
         Local::<Private>::from_engine(value)
     }
 }
@@ -119,6 +139,104 @@ mod tests {
                 eval_number(scope, "o[Object.getOwnPropertySymbols(o)[0]]"),
                 42.0
             );
+        });
+    }
+
+    /// The one asymmetry the symbol-backed model carries, pinned: a name set on a
+    /// prototype is readable through `[[Get]]` on a receiver that inherits it, and
+    /// is not present in the receiver's own private table.
+    #[test]
+    fn a_private_name_is_read_through_the_chain_and_present_only_own() {
+        in_context!(scope, {
+            let key = Private::for_api(
+                scope,
+                Some(JsString::new(scope, "Deno#chain").expect("string")),
+            );
+            let prototype = Local::<Object>::try_from(eval(scope, "({})")).expect("object");
+            assert_eq!(
+                prototype.set_private(scope, key, eval(scope, "5")),
+                Some(true)
+            );
+            let prototype_value: Local<'_, Value> = prototype.cast();
+            bind(scope, "privatePrototype", prototype_value);
+
+            let derived = Local::<Object>::try_from(eval(scope, "Object.create(privatePrototype)"))
+                .expect("object");
+            assert_eq!(
+                derived.has_private(scope, key),
+                Some(false),
+                "a private name is present only on the receiver's own table"
+            );
+            let read = derived
+                .get_private(scope, key)
+                .expect("read through the chain");
+            assert_eq!(read, eval(scope, "5"));
+        });
+    }
+
+    /// `Private::new` is the other half of `for_api`: a fresh name on every call,
+    /// even for a description just used, and still a private name to the cast that
+    /// asks — which is what the isolate's second store is for.
+    #[test]
+    fn a_fresh_name_is_new_every_call_and_still_private() {
+        in_context!(scope, {
+            let description = JsString::new(scope, "Deno#fresh").expect("string");
+            let first = Private::new(scope, Some(description));
+            let second = Private::new(scope, Some(description));
+            assert_ne!(first, second, "Private::new mints a new name every call");
+
+            // The control: `for_api` deliberately does not.
+            let for_api_first = Private::for_api(scope, Some(description));
+            let for_api_second = Private::for_api(scope, Some(description));
+            assert_eq!(for_api_first, for_api_second);
+
+            // A fresh name is still recognized as a private name.
+            let data = first.cast::<Data>();
+            assert!(Local::<Private>::try_from(data).is_ok());
+        });
+    }
+
+    /// The presence question is the own table, and the delete removes from it: a
+    /// private property is absent before a set, present after, gone after a
+    /// delete, and a second name never sees the first one's property. A fresh name
+    /// works as a key the same way, which is the pairing this part adds.
+    #[test]
+    fn a_private_property_is_present_then_deleted() {
+        in_context!(scope, {
+            let object = Local::<Object>::try_from(eval(scope, "({})")).expect("object");
+            let key = Private::for_api(
+                scope,
+                Some(JsString::new(scope, "Deno#present").expect("string")),
+            );
+            assert_eq!(object.has_private(scope, key), Some(false));
+
+            assert_eq!(object.set_private(scope, key, eval(scope, "7")), Some(true));
+            assert_eq!(object.has_private(scope, key), Some(true));
+
+            // A different name does not see it, and a fresh name is usable too.
+            let other = Private::for_api(
+                scope,
+                Some(JsString::new(scope, "Deno#other").expect("string")),
+            );
+            assert_eq!(object.has_private(scope, other), Some(false));
+            let fresh = Private::new(
+                scope,
+                Some(JsString::new(scope, "Deno#freshkey").expect("string")),
+            );
+            assert_eq!(
+                object.set_private(scope, fresh, eval(scope, "9")),
+                Some(true)
+            );
+            assert_eq!(object.has_private(scope, fresh), Some(true));
+            assert_eq!(object.delete_private(scope, fresh), Some(true));
+            assert_eq!(object.has_private(scope, fresh), Some(false));
+
+            assert_eq!(object.delete_private(scope, key), Some(true));
+            assert_eq!(object.has_private(scope, key), Some(false));
+            assert!(object.get_private(scope, key).is_none());
+            // `[[Delete]]` succeeds on a property that is not there, so a second
+            // delete answers `true` too: the answer is "gone", not "was present".
+            assert_eq!(object.delete_private(scope, key), Some(true));
         });
     }
 }

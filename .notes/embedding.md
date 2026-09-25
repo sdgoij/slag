@@ -4889,6 +4889,14 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates — and the corpora, because `crux` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,430 passed / 0 failed** (up three — this part's tests; `crux` **259**, `v8` **318** default and **324** with simdutf, `runtime` 943, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine changes are a walk, a type test and a vtable `TypeId`, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt and holds at **453 passed / 6 failed**, the same six out-of-scope cases: the primary boundary this part does not move.
 
+*The Node-API private-name and index surface — §9's first cluster of the tier §12 declared blocked.* Six `ext/napi` errors over four names, and all four are object surface the bridge had not exposed. `Private::new` is the *fresh* half of the private-name model: where the landed `Private::for_api` dedupes by description — one description, one name, which is what a host and its script agree on — `new` consults no registry, so two calls with one description are two names, and the isolate needs a second store (`IsolateInner::fresh_privates`) to keep what it minted, because a fresh name is still a private name to `is_private` and to the `Data => Private` cast that asks. `Object::{has_private, delete_private}` are the presence and removal of what the module already read and wrote (`get_private`/`set_private`): the presence question is the *own* table — a private name is the receiver's own, not an inherited one, and `[[Delete]]` is own by nature — where `get_private` reads through `[[Get]]`, and that asymmetry is stated in the doc and pinned by a test. `delete_private` answers `[[Delete]]`'s boolean, which is `true` for a property that was not there (success; nothing to fail on) and not "was present" — what the first draft of the doc and the test said, and the test corrected. `Object::has_index` is the indexed `[[HasProperty]]`, keyed by the decimal string `delete_index`/`get_index`/`set_index` already use, so a hole is absent where a read is `undefined`.
+
+*Tests — four, and four mutations, each caught by its own test.* `private`'s `a_fresh_name_is_new_every_call_and_still_private` (two `new`s differ, two `for_api`s do not, and a fresh name casts back to a `Private`), `a_private_property_is_present_then_deleted` (absent, set, present, a second name blind to it, a fresh name usable as a key, deleted, gone, and a second delete still `true`), and `a_private_name_is_read_through_the_chain_and_present_only_own` (a name on a prototype is readable on a receiver and not present there — the documented asymmetry); `object`'s `has_index_answers_for_an_element` (present, absent, a hole absent where the read is `undefined`, and an element inherited from the prototype present, which is the chain). Four mutations, each run alone and each caught: making `Private::new` dedupe fails the first at `assert_ne!`; making `has_private` walk the chain fails the third at the own-table assertion; making `has_index` own-only fails the fourth at the inherited element; and not registering a fresh name fails the first at the `Data => Private` cast.
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **16 → 10**, this part's six exactly — `has_private`×2, `delete_private`, `has_index` and `Private::new`×2 all gone. What remains is the tier's other clusters, named in §9: the weak-handle pair (`Weak::to_global`, and the `with_finalizer` receiver the crate spells `&mut Isolate`), the small exposures (`Date::new`, `Symbol::new`'s description type, `FunctionCallbackArguments::new_target`, `ReturnValue::from_function_callback_info`, `Isolate::ref_from_raw_isolate_ptr_mut_unchecked`) with their two `E0308`s, raw external strings, and the pre-existing `ext/webgpu` `E0521`.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,434 passed / 0 failed** (up four — this part's tests; `crux` 259, `v8` **322** default and **328** with simdutf, `runtime` 943, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p v8 --features simdutf` **328 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8` (the fresh-private store is bridge-side), and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5652,6 +5660,32 @@ if that proves possible.
   `E0521`** is deno-side and pre-existing: it aborts that crate's own build and
   is not this bridge's to fix, which is why every measurement in §7 was taken
   with `--keep-going` and says so.
+- **The Node-API surface is the next tier, taken one coherent cluster at a time —
+  the private-name and index surface first, named here before the edit.** §12
+  declared `ext/napi` blocked rather than measured; measuring it (the same
+  `cargo check -p deno_snapshots --keep-going`, whose build-dependency line is
+  what reaches `ext/napi` at all) shows fifteen errors over eleven names. The
+  first cluster is the four the object surface is missing: `Private::new` — a
+  *fresh* name on every call, where the landed `Private::for_api` dedupes by
+  description, so the isolate needs a second store for the names it minted fresh
+  (they must stay recognizable as private names, which is the question
+  `is_private` and the `Data => Private` cast ask) — and
+  `Object::{has_private, delete_private, has_index}`. The presence/delete pair is
+  own-table, as V8's private properties are: a private name is the receiver's
+  own, not an inherited one, and `[[Delete]]` is own by nature, so `has_private`
+  asks the own table where `get_private` reads through `[[Get]]` — the one
+  asymmetry the symbol-backed model carries, stated rather than implied. The rest
+  of the tier stays named-but-not-taken: the weak-handle pair (`Weak::to_global`,
+  and a `with_finalizer` receiver the crate spells `&mut Isolate` where this
+  bridge takes a scope — a divergence the other call sites never exposed, since
+  `ext/napi` is the only one that passes an isolate), the small exposures
+  (`Date::new`, `Symbol::new`'s description as a `Local<String>` rather than
+  `&str`, `FunctionCallbackArguments::new_target`,
+  `ReturnValue::from_function_callback_info`,
+  `Isolate::ref_from_raw_isolate_ptr_mut_unchecked`), and the one real engine
+  question left, raw external strings (`String::new_external_{onebyte,twobyte}_raw`),
+  which need an externally-backed string form the engine does not have — the same
+  tier decision `String::new_external_*` recorded when it chose to copy.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,

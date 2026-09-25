@@ -169,6 +169,13 @@ pub struct IsolateInner {
     /// The key is code units, because that is what tells two names apart; the
     /// engine's `JsString` has no hash to be a map key.
     private_names: RefCell<HashMap<Vec<u16>, Global<Value>>>,
+    /// The private names the bridge minted *fresh* (`v8::Private::new`), in mint
+    /// order. A fresh name is deliberately not in the registry above — two calls
+    /// with one description are two names — but it is still a private name, so it
+    /// is kept here: keeping it is what `owns_private` (and through it
+    /// `is_private` and the `Data => Private` cast) recognizes, and what keeps it
+    /// off the collector's list as the crate promises.
+    fresh_privates: RefCell<Vec<Global<Value>>>,
     /// The rejecting function of every resolver pair the bridge made
     /// (`v8::Promise::Resolver::Reject`), by the resolve function's identity.
     ///
@@ -772,6 +779,7 @@ impl Isolate {
             slots: UnsafeCell::new(HashMap::new()),
             context_slots: RefCell::new(HashMap::new()),
             private_names: RefCell::new(HashMap::new()),
+            fresh_privates: RefCell::new(Vec::new()),
             resolver_rejects: RefCell::new(HashMap::new()),
             cpp_heap,
             templates: RefCell::new(Vec::new()),
@@ -1300,13 +1308,30 @@ impl Isolate {
         value
     }
 
-    /// Whether this isolate minted `symbol` as a private name.
-    pub(crate) fn owns_private(&self, symbol: Handle<crux::symbol::Symbol>) -> bool {
+    /// A private name minted fresh for `description` (`v8::Private::new`): unlike
+    /// [`private_symbol`](Self::private_symbol) it consults no registry, so two
+    /// calls with one description are two names, and it keeps what it minted so
+    /// the name is still recognized as a private name.
+    pub(crate) fn private_symbol_fresh(&self, description: Option<&[u16]>) -> api::Local {
+        let symbol = crux::symbol::Symbol::new(description.map(JsString::from_utf16));
+        let value = api::Local::from(crux::value::Value::Symbol(crux::handle::Handle::new(
+            symbol,
+        )));
         self.inner()
-            .private_names
-            .borrow()
-            .values()
-            .any(|held| held.engine_value().value().as_symbol() == Some(symbol))
+            .fresh_privates
+            .borrow_mut()
+            .push(Global::new(self, Local::from_engine(value)));
+        value
+    }
+
+    /// Whether this isolate minted `symbol` as a private name, registered for a
+    /// description or minted fresh.
+    pub(crate) fn owns_private(&self, symbol: Handle<crux::symbol::Symbol>) -> bool {
+        let inner = self.inner();
+        let matched =
+            |held: &Global<Value>| held.engine_value().value().as_symbol() == Some(symbol);
+        inner.private_names.borrow().values().any(matched)
+            || inner.fresh_privates.borrow().iter().any(matched)
     }
 
     /// Keep a resolver pair's rejecting function (`v8::Promise::Resolver`).
