@@ -4783,6 +4783,14 @@ tests, 0 fail**).
 
 *Gates — and the corpora, because this part is an engine change.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,393 passed / 0 failed** (`runtime` **937**, up one — the observer test; `v8` **288**, up three — the heap tests; `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **294 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **906 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. `crux` and `runtime` are in every runner's graph, so the corpora and the wasm sweeps were re-run after a release build and the settle sleep, and every number is at baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt because the engine and the bridge are both what deno links: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+*`MicrotaskQueue` — §9's bullet that named it, the engine part it describes, and the bridge over it: the ladder's L3, "the host owns scheduling".* `deno/ext/node/ops/vm.rs` gives a `vm.Context` its own queue when `microtaskMode` is `'afterEvaluate'` — `MicrotaskQueue::new(scope, MicrotasksPolicy::Explicit).into_raw()`, `ContextOptions { microtask_queue: Some(ptr) }`, `perform_checkpoint(scope)`, and a `drop_in_place` from `ContextifyContext::drop` — and the separation is the feature: an inner context's continuations must not join the outer context's turn. The engine grew the queue (a realm slot, an id table whose ids are never reused, `enqueue_promise_job` routing by the enqueueing realm with a fallback to the default, a one-queue drain, and create/attach/release), and this part is the bridge over it: `MicrotaskQueue` (`new`, `perform_checkpoint`, `Drop` as the release, `into_raw` through `UniqueRef`) and one field on `ContextOptions`, whose null pointer means "no queue" — what deno passes when `own_microtask_queue` is false. Two things the design had not anticipated. The first was a real defect the first test run exposed: a queued job's captured closure is invisible to the conservative stack scan, and the engine collects those boxes' regions *by name* — the default queue's, the generic, the timeout and the cleanup jobs' — so a host queue's jobs were not in that list, and a handler that waited across an eval was swept and its drain failed with "Function body is not registered". The second is the teardown order: the token's `Drop` reaches the engine and deno runs it from a cppgc destructor, so `IsolateInner`'s `Drop` now terminates the host object heap before the engine field drops — V8's own order in `Isolate::Dispose` — and `Heap`'s own `Drop` then finds the list drained.
+
+*Tests — seven, and five mutations, each caught by its own test.* The engine's `a_host_queue_keeps_a_realms_jobs_out_of_the_default_queue` is the separation in one test: the isolate's own run leaves the job alone, another host queue's drain leaves it alone, and the attached queue's drain runs it — with an explicit collection between the enqueue and the drains, which is what makes the rooting claim a test rather than an accident of timing. `an_auto_host_queue_is_drained_by_the_isolates_own_run` pins the policy, and `a_released_queue_gives_the_realm_back_to_the_default` the release (a released id is a no-op, not somebody else's queue). The bridge's `a_host_queue_is_the_hosts_to_drain` drives deno's own shape — a raw pointer out of `into_raw`, attached through `ContextOptions`, drained through `&*ptr` — `a_null_queue_leaves_the_realm_on_the_isolates` the null arm, with a real queue present so a null misread as id 0 would find it, `dropping_the_token_releases_the_queue` the `drop_in_place` release, and `an_auto_queue_is_drained_by_the_isolates_own_run` the policy over the bridge. Five mutations, each run alone: ignoring the realm's queue fails the engine and bridge separation tests; dropping the `Auto` filter fails the engine test at its first drain; making the release a no-op fails both release tests; reading `Some(null)` as a queue aborts the null test on a null dereference; and dropping the host queues' region scan fails the engine test (its explicit collection is what makes that deterministic) and the bridge test. `Drop for IsolateInner`'s ordering is the one thing here without a unit test, and it is stated rather than implied: a use-after-free read of freed inline state is not detectable without a UB detector, so it is guaranteed by construction — `engine` is the struct's first field, the heap is terminated in the struct's own `Drop`, and `free_all` drains.
+
+*The measurement.* `cargo check -p deno_snapshots`: every `MicrotaskQueue`/`microtask_queue`/`perform_checkpoint` mention is **0**, the total is **107 → 96**, and the two failing crates are `deno_node` (its 51 remaining `vm.rs` errors are the other names the frontier already names — `get_real_named_property(_attributes)`, the security token, `String::MAX_LENGTH`, the eight `HeapStatistics` accessors) and `deno_webgpu`'s pre-existing `E0521`. deno's `deno_core --lib` was rebuilt, because the bridge is what deno links and this is the first `deno_core` build over the names written for it: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
+*Gates — and the corpora, because this part is an engine change.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,400 passed / 0 failed** (up seven: `runtime` **940**, `v8` **292**; `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **298 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **909 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. `runtime` is in every runner's graph, so the corpora and the wasm sweeps were re-run after a release build and the settle sleep, and every number is at baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5408,6 +5416,40 @@ if that proves possible.
   `kGCTypeScavenge` (minor) and `kGCTypeMarkSweepCompact` (major); the phases this
   collector has no separate pass for never fire, and the filter is tested on the
   bits, as V8 tests it.
+- **`MicrotaskQueue` — named before the code, and it is the ladder's L3 item
+  rather than a bridge shape.** `deno/ext/node/ops/vm.rs` gives a `vm.Context`
+  its own microtask queue when `microtaskMode` is `afterEvaluate`:
+  `v8::MicrotaskQueue::new(scope, MicrotasksPolicy::Explicit)`, `into_raw` into a
+  `*mut` the host drops in place, `ContextOptions { microtask_queue: Some(ptr) }`,
+  and `perform_checkpoint(scope)` to drain it — so that context's jobs run when
+  the *host* says, not with the isolate's run. A token that drained the agent's
+  one queue would type-check and be wrong: the feature's whole point is that a vm
+  context's async continuations do not join the outer context's turn, and
+  upstream's own workaround — wrapping an inner promise in an outer one "so that
+  `await` from the outer context isn't queued on the inner queue and silently
+  dropped" — only makes sense if the queues are separate. So the engine grows the
+  queue: `Realm.microtask_queue` (a `Cell<Option<u32>>`, because a realm exists
+  before the host's option is known), an agent table whose ids stay stable across
+  release (`Vec<Option<MicrotaskQueue>>`), `enqueue_promise_job` routing by the
+  enqueueing realm's queue and falling back to the default when there is none or
+  the host released it, a drain for one queue, and create/attach/release entry
+  points. A queue carries its own policy: `Explicit` (what deno asks for) is
+  drained only by the host's `PerformCheckpoint`, `Auto` is also drained by the
+  isolate's own auto-checkpoint. What is *not* changed: the default queue, the
+  job order, the drain loop's shape, and `job_queues_empty` — a host's own queue
+  is the host's to drain, so it does not keep the isolate's run alive. The
+  bridge's side is `MicrotaskQueue` (`new`, `into_raw` through `UniqueRef`,
+  `perform_checkpoint`) and one field on `ContextOptions`; `into_raw` boxes the
+  token and takes the host's `drop_in_place` as the release, which leaks the
+  token's box (an id, not the queue's state) where the crate we stand in for
+  leaks nothing — the one divergence, stated. **Landed**, with two things this
+  bullet did not have. Every host queue's queued job must have its closure's box
+  in the *second* trace entry point's region list — the engine collects those
+  boxes by name, and a handler swept while it waited failed its drain with
+  "Function body is not registered". And `IsolateInner`'s `Drop` terminates the
+  host object heap *before* the engine field drops, so the destructor deno drops
+  the token from still finds the engine alive; that is V8's own order in
+  `Isolate::Dispose`, and it is what makes the release sound rather than lucky.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,

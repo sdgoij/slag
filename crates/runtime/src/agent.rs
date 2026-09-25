@@ -1086,6 +1086,24 @@ pub struct Agent {
     /// collection then runs none, which is also V8's shape: a collection never
     /// starts inside one.
     collection_observers: RefCell<Vec<Box<dyn crux::heap::GcObserver>>>,
+    /// The host's own microtask queues, one per queue it made
+    /// (`Agent::new_microtask_queue`). An entry is `None` once the host released
+    /// the queue, and the id stays valid so a stale one is a no-op rather than
+    /// somebody else's queue.
+    microtask_queues: Vec<Option<MicrotaskQueue>>,
+}
+
+/// A microtask queue a host owns and drains itself (`v8::MicrotaskQueue`).
+///
+/// The realm a context was created with it sends its promise jobs here instead
+/// of the agent's own queue, so the host decides when that context's async work
+/// runs — which is the whole of the feature: a vm context's continuations must
+/// not join the outer context's turn. The policy is the queue's own: `Explicit`
+/// is drained only by the host's `PerformCheckpoint`, `Auto` also by the
+/// isolate's run.
+struct MicrotaskQueue {
+    policy: crate::api::MicrotasksPolicy,
+    jobs: VecDeque<Job>,
 }
 
 impl Drop for Agent {
@@ -1262,6 +1280,7 @@ impl Agent {
             construct_maps: Box::new(std::array::from_fn(|_| None)),
             function_boilerplate_maps: [None; 2],
             collection_observers: RefCell::new(Vec::new()),
+            microtask_queues: Vec::new(),
             vm_pool: Vec::new(),
             jit_hook: None,
             jit_depth: 0,
@@ -1651,7 +1670,85 @@ impl Agent {
         realm: Option<Handle<Realm>>,
         closure: impl FnOnce(&mut Agent) -> Result<Value, JsError> + 'static,
     ) {
-        self.promise_jobs.push_back(Job::new(realm, closure));
+        // A realm the host gave its own queue sends its jobs there, so the host
+        // drains them itself. A queue the host released, or an id nothing
+        // knows, falls back to the default queue rather than dropping the job.
+        match realm
+            .and_then(|realm| realm.microtask_queue.get())
+            .and_then(|id| self.microtask_queues.get_mut(id as usize))
+            .and_then(Option::as_mut)
+        {
+            Some(queue) => queue.jobs.push_back(Job::new(realm, closure)),
+            None => self.promise_jobs.push_back(Job::new(realm, closure)),
+        }
+    }
+
+    /// Make a microtask queue the host drains itself (`v8::MicrotaskQueue::new`).
+    ///
+    /// The id answers what a context attaches with
+    /// (`v8::ContextOptions::microtask_queue`) and what `PerformCheckpoint`
+    /// drains. Ids are never reused, so a released one stays a no-op.
+    pub fn new_microtask_queue(&mut self, policy: crate::api::MicrotasksPolicy) -> u32 {
+        let id = self.microtask_queues.len() as u32;
+        self.microtask_queues.push(Some(MicrotaskQueue {
+            policy,
+            jobs: VecDeque::new(),
+        }));
+        id
+    }
+
+    /// Release a host's queue, which is what dropping its `v8::MicrotaskQueue`
+    /// does: what the queue still holds is dropped, and its id goes quiet (its
+    /// realm's later jobs then take the default queue).
+    pub fn release_microtask_queue(&mut self, id: u32) {
+        if let Some(slot) = self.microtask_queues.get_mut(id as usize) {
+            *slot = None;
+        }
+    }
+
+    /// Run one queue's jobs to completion (`MicrotaskQueue::PerformCheckpoint`).
+    ///
+    /// Only that queue: the default queue and the other host queues are
+    /// untouched, and work the jobs enqueue for the same realm comes back to
+    /// this queue.
+    pub fn run_microtask_queue(&mut self, id: u32) -> Result<(), JsError> {
+        crux::function::with_agent(self as *mut Agent as *mut (), || {
+            crux::heap::reset_allocation_budget();
+            self.run_host_finalizers();
+            loop {
+                let Some(job) = self.next_microtask_queue_job(id) else {
+                    break;
+                };
+                self.run_job(job)?;
+            }
+            self.maybe_collect();
+            Ok(())
+        })
+    }
+
+    /// The next job in queue `id`, if the host has not released it.
+    fn next_microtask_queue_job(&mut self, id: u32) -> Option<Job> {
+        self.microtask_queues
+            .get_mut(id as usize)
+            .and_then(Option::as_mut)
+            .and_then(|queue| queue.jobs.pop_front())
+    }
+
+    /// The next job in an `Auto` host queue, if any.
+    ///
+    /// The isolate's own drain runs those too, because that is what `Auto`
+    /// means; an `Explicit` queue is only ever drained by its own
+    /// `PerformCheckpoint`.
+    fn next_auto_microtask_queue_job(&mut self) -> Option<Job> {
+        for slot in &mut self.microtask_queues {
+            if let Some(queue) = slot
+                && queue.policy == crate::api::MicrotasksPolicy::Auto
+                && let Some(job) = queue.jobs.pop_front()
+            {
+                return Some(job);
+            }
+        }
+        None
     }
 
     /// HostEnqueueTimeoutJob (spec 9.5.5): schedule a job to run after at
@@ -1730,6 +1827,10 @@ impl Agent {
                 }
             }
             if let Some(job) = self.generic_jobs.pop_front() {
+                self.run_job(job)?;
+                continue;
+            }
+            if let Some(job) = self.next_auto_microtask_queue_job() {
                 self.run_job(job)?;
                 continue;
             }
@@ -1887,6 +1988,9 @@ impl Agent {
             vm.trace(visit);
         }
         self.promise_jobs.trace(visit);
+        for queue in self.microtask_queues.iter().flatten() {
+            queue.jobs.trace(visit);
+        }
         self.generic_jobs.trace(visit);
         for (_, job) in &self.timeout_jobs {
             job.trace(visit);
@@ -2106,6 +2210,15 @@ impl Agent {
         }
         for (_, job) in &self.timeout_jobs {
             regions.push(job.closure_region());
+        }
+        // A host's own queue holds the same opaque closures, and its jobs are as
+        // invisible to the stack scan as the default queue's — a handler queued
+        // here and waited on across an eval was swept without this, and the job
+        // then failed with "Function body is not registered".
+        for queue in self.microtask_queues.iter().flatten() {
+            for job in &queue.jobs {
+                regions.push(job.closure_region());
+            }
         }
         // GC-4: the pending FinalizationRegistry cleanup jobs (captured
         // held values and callbacks) ride alongside the queued jobs.

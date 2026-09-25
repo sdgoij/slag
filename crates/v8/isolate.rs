@@ -268,6 +268,22 @@ pub struct IsolateInner {
 
 const _: () = assert!(std::mem::offset_of!(IsolateInner, engine) == 0);
 
+/// Host objects are dropped before the engine is, which their destructors need.
+///
+/// A `cppgc` value's destructor may reach this isolate: dropping a
+/// [`MicrotaskQueue`](crate::MicrotaskQueue) token releases its engine queue
+/// there, and deno's `vm` is what does it — the token lives in the
+/// `ContextifyContext` wrapper, so its destructor runs when this heap frees that
+/// value. `engine` is the struct's first field, so a field-by-field drop would
+/// take it away before the heap and the values in it go. Terminating the heap
+/// here runs those destructors while the engine is still alive; `Heap`'s own
+/// `Drop` then finds nothing left to free.
+impl Drop for IsolateInner {
+    fn drop(&mut self) {
+        self.cpp_heap.terminate();
+    }
+}
+
 /// The callback an interrupt request would run (v8::InterruptCallback).
 pub type InterruptCallback =
     unsafe extern "C" fn(isolate: UnsafeRawIsolatePtr, data: *mut std::ffi::c_void);

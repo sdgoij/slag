@@ -42,6 +42,7 @@ mod interceptor;
 mod isolate;
 pub mod json;
 mod message;
+mod microtask;
 mod module;
 mod object;
 mod platform;
@@ -91,6 +92,7 @@ pub use isolate::{
     WasmAsyncSuccess,
 };
 pub use json::{parse as json_parse, stringify as json_stringify};
+pub use microtask::MicrotaskQueue;
 pub use module::{ModuleImportPhase, ModuleStatus, SyntheticModuleEvaluationSteps};
 pub use object::IntegrityLevel;
 pub use platform::{

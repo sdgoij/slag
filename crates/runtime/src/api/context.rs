@@ -71,6 +71,18 @@ impl Context {
         Local(Value::Object(self.realm.global_object))
     }
 
+    /// Give this realm its own microtask queue
+    /// (`v8::ContextOptions::microtask_queue`).
+    ///
+    /// The queue is the host's (`Isolate::new_microtask_queue`), and the id it
+    /// answered is what the realm records: every promise job this realm enqueues
+    /// goes there from now on, so the host drains that context's async work
+    /// itself. Setting an id nothing knows (or one the host released) is not an
+    /// error — the realm's jobs then take the default queue.
+    pub fn set_microtask_queue(&self, id: u32) {
+        self.realm.microtask_queue.set(Some(id));
+    }
+
     /// An intrinsic value by `%`-name (e.g. `%Object.prototype%`).
     pub fn intrinsic(&self, name: &str) -> Option<Value> {
         self.realm.intrinsics.get(name)

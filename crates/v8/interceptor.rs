@@ -513,6 +513,7 @@ mod tests {
             handle_scope,
             ContextOptions {
                 global_template: Some(template),
+                ..Default::default()
             },
         );
         let scope = &mut ContextScope::new(handle_scope, context);
@@ -564,6 +565,7 @@ mod tests {
             handle_scope,
             ContextOptions {
                 global_template: Some(template),
+                ..Default::default()
             },
         );
         let scope = &mut ContextScope::new(handle_scope, context);

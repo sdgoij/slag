@@ -85,6 +85,19 @@ impl<T> UniqueRef<T> {
     pub(crate) fn into_inner(self) -> T {
         self.0
     }
+
+    /// Hand the value out as a raw pointer, which the caller now owns
+    /// (`v8::UniqueRef::into_raw`).
+    ///
+    /// The value is boxed so there is an address to hand out, and the caller's
+    /// release is the crate's own — `std::ptr::drop_in_place`, which runs the
+    /// destructor and does *not* free the allocation. So the box leaks, one
+    /// `T`'s worth per handed-out reference, which is what the crate's own
+    /// ownership contract leaks there too; the one caller in this tree hands
+    /// out a `MicrotaskQueue` token, which is an id and an isolate pointer.
+    pub fn into_raw(self) -> *mut T {
+        Box::into_raw(Box::new(self.0))
+    }
 }
 
 impl<T> Deref for UniqueRef<T> {

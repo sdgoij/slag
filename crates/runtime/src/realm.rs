@@ -37,6 +37,11 @@ pub struct Realm {
     /// resolved specifier.
     pub loaded_modules:
         RefCell<std::collections::HashMap<JsString, Handle<crate::module::SourceTextModule>>>,
+    /// The microtask queue this realm's promise jobs go to, when the host gave
+    /// the context its own (`v8::ContextOptions::microtask_queue`). A `Cell`
+    /// because a realm exists before the host's option is applied to it, and
+    /// `None` is the agent's own queue.
+    pub microtask_queue: std::cell::Cell<Option<u32>>,
 }
 
 /// The promise hooks a context can install, one slot per
@@ -616,6 +621,7 @@ pub fn initialize_host_defined_realm_with_global(
         global_env,
         promise_hooks: RefCell::new(PromiseHooks::default()),
         loaded_modules: RefCell::new(std::collections::HashMap::new()),
+        microtask_queue: std::cell::Cell::new(None),
     });
     // Root the realm from the moment its box exists. `Agent::realms` is the
     // realm's permanent root (it is only ever pushed, never popped or

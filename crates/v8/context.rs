@@ -60,10 +60,18 @@ const CONSOLE_METHODS: [&str; 23] = [
 
 /// Options for [`Context::new`] (`v8::ContextOptions`).
 ///
-/// Slag has no realm configuration yet; the field exists because hosts set it.
+/// Slag has no realm configuration yet; the fields exist because hosts set them.
 #[derive(Default)]
 pub struct ContextOptions<'s> {
     pub global_template: Option<Local<'s, ObjectTemplate>>,
+    /// The microtask queue this context's promise jobs go to
+    /// (`v8::ContextOptions::microtask_queue`), or `None` for the isolate's own.
+    ///
+    /// A raw pointer because that is the crate we stand in for's shape: the host
+    /// owns the queue ([`MicrotaskQueue`](crate::MicrotaskQueue)) and keeps it
+    /// alive itself. The null pointer means the same as the absent field — which
+    /// is what a host that has no queue to give passes.
+    pub microtask_queue: Option<*mut crate::MicrotaskQueue>,
 }
 
 impl Context {
@@ -100,6 +108,17 @@ impl Context {
         // The engine makes the new realm current on its isolate; mirror that
         // here so operations with no scope to read it from can find it.
         crate::realm::enter(context);
+        // A queue the host attached takes this realm's promise jobs from here on,
+        // instead of the isolate's own — what deno's `vm` asks for when a sandbox
+        // context has `microtaskMode: 'afterEvaluate'`. The null pointer is how a
+        // host spells "no queue", the same as the field being absent.
+        if let Some(pointer) = options.microtask_queue
+            // SAFETY: the host's contract — the pointer is one
+            // `MicrotaskQueue::new` answered and has not been dropped.
+            && let Some(queue) = unsafe { pointer.as_ref() }
+        {
+            context.set_microtask_queue(queue.id);
+        }
         let handle = Local::from_payload(Payload::Context(context));
         // V8 fills a new context's extras binding object, and its global
         // object, as it creates the context (`Genesis::InitializeConsole`), so

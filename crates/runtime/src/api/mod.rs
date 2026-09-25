@@ -177,8 +177,34 @@ impl Isolate {
 
     /// Drain the job queues: promise (microtask), timeout, then generic
     /// jobs (v8::Isolate::RunMicrotasks, minus the platform hook).
+    ///
+    /// The default queue and every `Auto` host queue, which is what the policy
+    /// means; an `Explicit` host queue is drained only by its own
+    /// [`run_microtask_queue`](Self::run_microtask_queue).
     pub fn run_microtasks(&mut self) -> Result<(), JsError> {
         self.agent.run_jobs()
+    }
+
+    /// Make a microtask queue a host drains itself (`v8::MicrotaskQueue::new`).
+    ///
+    /// A context attached to it (`v8::ContextOptions::microtask_queue`) sends
+    /// its promise jobs there, so the host decides when that context's async
+    /// work runs — instead of the isolate's own run taking it.
+    pub fn new_microtask_queue(&mut self, policy: MicrotasksPolicy) -> u32 {
+        self.agent.new_microtask_queue(policy)
+    }
+
+    /// Release a host's queue, which is what dropping its `v8::MicrotaskQueue`
+    /// does. Ids are never reused, so a stale one is a no-op.
+    pub fn release_microtask_queue(&mut self, id: u32) {
+        self.agent.release_microtask_queue(id);
+    }
+
+    /// Run one queue's jobs to completion (`MicrotaskQueue::PerformCheckpoint`):
+    /// only that queue, so a host draining a context's own work leaves the rest
+    /// of the isolate's jobs where they are.
+    pub fn run_microtask_queue(&mut self, id: u32) -> Result<(), JsError> {
+        self.agent.run_microtask_queue(id)
     }
 
     /// Run the finalizers of the host objects the last collection swept
@@ -1288,6 +1314,120 @@ mod tests {
         assert_eq!(
             Promise::result(&context, &chained).unwrap().as_number(),
             Some(42.0)
+        );
+    }
+
+    /// The number a script evaluates to, for a test that watches a continuation run.
+    fn number(context: &Context, expression: &str) -> Option<f64> {
+        context.eval(expression).to_local_checked().as_number()
+    }
+
+    /// A host's own queue is L3's "the host owns scheduling": a realm attached to
+    /// one sends its promise jobs there, the isolate's own run leaves them alone,
+    /// and so does another host queue's drain — only the attached queue's own
+    /// drain runs them. This is the separation deno's `vm` needs so an inner
+    /// context's continuations do not join the outer context's turn.
+    #[test]
+    fn a_host_queue_keeps_a_realms_jobs_out_of_the_default_queue() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let queue = isolate.new_microtask_queue(MicrotasksPolicy::Explicit);
+        let other = isolate.new_microtask_queue(MicrotasksPolicy::Explicit);
+        context.set_microtask_queue(queue);
+
+        let _ = context
+            .eval("globalThis.ran = 0; Promise.resolve().then(() => { globalThis.ran = 1; });");
+        assert_eq!(
+            number(&context, "globalThis.ran"),
+            Some(0.0),
+            "the continuation is pending"
+        );
+        // The queued job's captured handler has to survive a collection while it
+        // waits, and a job closure's box is invisible to the conservative stack
+        // scan: this is what the host queues' closure-region scan is for. Without
+        // it the handler is swept, and the drain below fails with "Function body
+        // is not registered" instead of running it.
+        isolate.agent().collect_garbage();
+
+        isolate.run_microtasks().expect("the isolate's own run");
+        assert_eq!(
+            number(&context, "globalThis.ran"),
+            Some(0.0),
+            "the isolate's run does not reach a host queue"
+        );
+
+        isolate
+            .run_microtask_queue(other)
+            .expect("another host queue's drain");
+        assert_eq!(
+            number(&context, "globalThis.ran"),
+            Some(0.0),
+            "nor does another host queue's drain"
+        );
+
+        isolate
+            .run_microtask_queue(queue)
+            .expect("the host's drain");
+        assert_eq!(
+            number(&context, "globalThis.ran"),
+            Some(1.0),
+            "the attached queue's drain runs that realm's jobs"
+        );
+    }
+
+    /// A queue's policy decides who drains it: `Auto` is drained by the isolate's
+    /// own run as well, where `Explicit` waits for its own drain.
+    #[test]
+    fn an_auto_host_queue_is_drained_by_the_isolates_own_run() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let queue = isolate.new_microtask_queue(MicrotasksPolicy::Auto);
+        context.set_microtask_queue(queue);
+
+        let _ = context
+            .eval("globalThis.ran = 0; Promise.resolve().then(() => { globalThis.ran = 1; });");
+        isolate.run_microtasks().expect("the isolate's own run");
+        assert_eq!(
+            number(&context, "globalThis.ran"),
+            Some(1.0),
+            "an Auto queue drains with the isolate's own run"
+        );
+    }
+
+    /// Releasing a queue — what dropping the host's token does — hands the realm
+    /// back to the isolate's own queue, and the id is a no-op from then on rather
+    /// than somebody else's queue.
+    #[test]
+    fn a_released_queue_gives_the_realm_back_to_the_default() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let queue = isolate.new_microtask_queue(MicrotasksPolicy::Explicit);
+        let other = isolate.new_microtask_queue(MicrotasksPolicy::Explicit);
+        context.set_microtask_queue(queue);
+        let _ = context
+            .eval("globalThis.ran = 0; Promise.resolve().then(() => { globalThis.ran = 1; });");
+        isolate
+            .run_microtask_queue(queue)
+            .expect("the host's drain");
+        assert_eq!(number(&context, "globalThis.ran"), Some(1.0));
+
+        isolate.release_microtask_queue(queue);
+
+        let _ = context
+            .eval("globalThis.ran = 0; Promise.resolve().then(() => { globalThis.ran = 2; });");
+        isolate
+            .run_microtask_queue(other)
+            .expect("a drain through another queue");
+        assert_eq!(
+            number(&context, "globalThis.ran"),
+            Some(0.0),
+            "a released id is a no-op, not somebody else's queue"
+        );
+        isolate.run_microtasks().expect("the isolate's own run");
+        assert_eq!(
+            number(&context, "globalThis.ran"),
+            Some(2.0),
+            "the realm's jobs are back on the default queue"
         );
     }
 
