@@ -69,6 +69,7 @@ mod test_support;
 mod unbound_script;
 mod value;
 mod wasm;
+mod weak;
 
 pub use array_buffer::BackingStoreDeleterCallback;
 pub use context::ContextOptions;
@@ -98,6 +99,7 @@ pub use primitives::{NewStringType, OneByteConst, WriteFlags, latin1_to_utf8, nu
 pub use promise::{PromiseRejectEvent, PromiseRejectMessage, PromiseState};
 pub use property::*;
 pub use property_descriptor::PropertyDescriptor;
+pub use weak::{TracedReference, Weak, WeakCallbackInfo};
 
 /// When the job queues drain (v8::MicrotasksPolicy).
 ///

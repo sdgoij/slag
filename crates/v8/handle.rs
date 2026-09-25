@@ -660,7 +660,10 @@ impl<T> Global<T> {
         Self::from_payload(handle.into_payload())
     }
 
-    fn from_payload(payload: Payload) -> Self {
+    /// The bridge's handle for an erased payload: a persistent handle over any of
+    /// the four things this bridge names, with the pin each of them needs. Shared
+    /// with [`crate::weak`], which holds a non-value payload the same way.
+    pub(crate) fn from_payload(payload: Payload) -> Self {
         // A script's source is owned; a module's box is pinned instead. A
         // request is not a value at all, and what keeps its module alive is the
         // pin on the module's own handle, so a request handle pins nothing.

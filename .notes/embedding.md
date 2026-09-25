@@ -4705,6 +4705,10 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,359 passed / 0 failed** (`crux` 258 — three more — `ffi` 10, `runtime` 935 — one more — `slag` 4, `v8` 256, `test262` 3324); the wasm-free shapes CI gates hold (`cargo test -p runtime --no-default-features --lib` **904 passed / 0 failed**, and `cargo check -p cli --no-default-features --features jit`).
 
+*The two weak shapes a V8-class host names — §9's bullet, and the second half of slice 4.* `crates/v8` gains `Weak<T>` and `TracedReference<T>` over `api::Weak`, with the surface read off the call sites rather than recalled: `Weak::with_finalizer(scope, handle, |info| …)` (the shape `deno/ext`'s node_sqlite and webgpu state uses), `TracedReference::new(scope, value)`, and `get(scope)`/`to_local(scope)` returning `Option<Local<T>>` on both — because the sites in this tree `unwrap` or `match` that answer, which is what makes them weak references rather than strong ones. One divergence is stated rather than implied: a reference to a *value* is a real weak handle, while one to a `Context`, a `Module` or a script — payloads this bridge does not keep as heap values — holds the payload the way `Global` does (reusing its pin rule, so the ownership rule stays in one place) and answers `Some` for its lifetime, because the engine has no weak handle over a realm or a module record. And `Traced` — the bridge's own cppgc trait — is implemented for `TracedReference` by tracing **nothing**, which is that trait's contract here: a `Visitor` walking a host's structures must not reach the value through a weak reference, or the reference would be strong. **Measured before and after: `cargo check -p deno_snapshots`, 341 errors → 84**, with every `Weak` and `TracedReference` mention gone (13 and 22 sites, and the cascade they were hiding).
+
+*Tests, and the gates this part does and does not need.* Three in `crates/v8`: a weak handle reads its value and releases it (`clear` is what empties it — the collector-driven emptying is the engine's own four tests, so the bridge pins its *reading* of the verdict, not the verdict), a traced reference reads a value the host also holds and a realm (the one payload it cannot watch, answering while it lives rather than pretending), and `with_finalizer` registers its callback with the engine rather than dropping it. There is no mutation beyond the measurement itself, and the reason is the shape of the part: every method is exercised by *deno compiling* — the 341 → 84 count is 35 real call sites from the host this plan exists to serve, which is stronger evidence than a mutation of my own code. Gates: fmt clean; clippy --workspace --all-targets -D warnings clean; workspace tests **5,362 passed / 0 failed** (`v8` 259 — three more — and no other crate's count moved); wasm-free runtime **904** and the interpreter-only cli check green. **No sweeps, and that is checked rather than assumed**: `cargo tree -p test262 -e normal | grep -c 'v8 v150'` is **0**, so nothing in this part is in any runner's graph. deno's suite was rebuilt and re-run because the bridge *is* what deno links: **453 passed / 6 failed**, the same six.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -7920,6 +7924,23 @@ migrate, then delete.
   `TracedReference` sites, measured on this tree. **Deliberately not in this part:**
   `Global::set_weak`'s two-pass `WeakCallbackInfo` protocol (a callback is
   carried; the second pass is not), and cppgc's `Member`/`Visitor` sugar.
+- **The two weak shapes a V8-class host names are the bridge's, over `api::Weak` —
+  named here before the edit, as the second half of slice 4.** `crates/v8` gains
+  `Weak<T>` and `TracedReference<T>`: `Weak::with_finalizer(scope, handle,
+  finalizer)` (the shape `deno/ext`'s node_sqlite and webgpu state uses, its
+  finalizer receiving a `WeakCallbackInfo<T>`), `TracedReference::new(scope,
+  value)`, and `get(scope) -> Option<Local<T>>` on both — read off the call sites
+  rather than recalled: `deno/ext/node/ops/vm.rs` and `v8.rs` call `.get(scope)`
+  and **unwrap or match** it, so both are weak references with a fallible read, and
+  the 22 `TracedReference` and 13 `Weak` sites `cargo check -p deno_snapshots`
+  names are what this part has to move. One divergence is stated rather than
+  implied: a `TracedReference` of a *value* (`Object`, `Function`, `Value`) is a
+  real weak handle over `api::Weak`, while one of a `Context`, a `Module` or an
+  `UnboundScript` — payloads this bridge does not keep as heap values at all —
+  holds the payload the way `Global` does (pinned where `Global` pins) and
+  therefore answers `Some` for its lifetime; the engine has no weak handle over a
+  realm or a module record, and this says so rather than pretending. **No new
+  engine machinery**: this part is shapes over the registry slice 4 landed.
 
 ## 11. Working rules
 

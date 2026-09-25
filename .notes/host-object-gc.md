@@ -16,8 +16,9 @@ that record, and §5's L2 row and §4's second acceptance test now read as lande
 rather than aspirational.
 
 **Slice 4 — weak persistent handles — landed** (§4.3 and the account below): the
-engine registry, `api::Weak` over it, and the tests §5's sixth criterion names. Its
-one leftover is the bridge's `v8::Weak<T>` / `v8::TracedReference<T>` shapes.
+engine registry, `api::Weak` over it, and the tests §5's sixth criterion names,
+plus the bridge's `v8::Weak<T>` / `v8::TracedReference<T>` shapes in the change
+that follows.
 
 Two of §4.2's decisions changed while it was implemented, both narrowed rather
 than widened, and both are recorded here because the *reason* is part of the
@@ -182,8 +183,9 @@ with the host finalizers (`Isolate::run_finalizers`, and an outermost `Context`
 entry), which is what makes a callback run outside the collection, exactly once,
 with its handle already empty — the anti-resurrection rule.
 
-Not yet landed: the bridge's `v8::Weak<T>` / `v8::TracedReference<T>` shapes over
-this handle, which is what the CLI tier's 35 missing sites ask for.
+Not yet landed: nothing of the *engine*; the bridge's `v8::Weak<T>` /
+`v8::TracedReference<T>` shapes landed over it in the change that follows (§7's
+last record), which is what the CLI tier's 35 missing sites asked for.
 
 ### 4.4 The C-surface fix (slice 1, the urgent part)
 
@@ -345,9 +347,12 @@ sweep sites — not the precise dead set the `WeakRef` table uses. The reason is
 §4.3: a handle must not report a value it can no longer name, and the sweep is the
 only verdict that cannot be wrong that way.
 
-What remains of slice 4 (and of L2) is the bridge: `v8::Weak<T>` and
-`v8::TracedReference<T>` over `api::Weak`, which is what the CLI tier's missing
-sites actually name.
+What remains of slice 4 (and of L2) is closed: the bridge's `v8::Weak<T>` and
+`v8::TracedReference<T>` landed over `api::Weak` in the change that follows, with
+the one divergence §9 states (a reference to a *realm*, a *module* or a *script*
+is held rather than watched, because the engine has no weak handle over those).
+`cargo check -p deno_snapshots` went 341 errors → 84 with every `Weak` and
+`TracedReference` mention gone.
 
 ### Slice 1 — landed
 
