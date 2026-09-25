@@ -37,6 +37,7 @@ mod fixed_array;
 mod function;
 mod handle;
 mod heap;
+mod heap_snapshot;
 pub mod inspector;
 mod interceptor;
 mod isolate;

@@ -81,6 +81,35 @@ impl GcAny {
         self.0 as usize
     }
 
+    /// Whether this box's payload is exactly `T`, decided by the payload's
+    /// `TypeId`. A sound test because a `TypeId` is one per type, whereas the
+    /// vtable's own address is not: a `const VTABLE` promoted to `'static` at two
+    /// use sites need not have one address.
+    pub fn is<T: Trace>(self) -> bool {
+        // SAFETY: a `GcAny` is only built from a live box (the walk's yield or a
+        // rooted handle), so its header and the vtable it names are valid.
+        unsafe { ((*self.0).vtable.type_id)() == std::any::TypeId::of::<T>() }
+    }
+
+    /// The box as `Gc<T>` when its payload is exactly `T`; `None` otherwise.
+    /// The companion a caller needs when a [`Heap::for_each_live_box`] hands it
+    /// a box whose payload type it can read but the walk did not name.
+    ///
+    /// # Safety
+    ///
+    /// The box must be live. `for_each_live_box` yields live boxes and a rooted
+    /// `GcAny` is live while its root holds it, which covers the intended
+    /// callers; casting a box whose slot has been swept and reused would name the
+    /// wrong object.
+    pub unsafe fn cast<T: Trace>(self) -> Option<Gc<T>> {
+        if !self.is::<T>() {
+            return None;
+        }
+        // SAFETY: the vtable is `T`'s, so this box's payload is a `T`, and the
+        // caller guarantees the box is live.
+        Some(unsafe { Gc::from_box_ptr(self.0 as usize) })
+    }
+
     /// Whether the box's mark bit is set: reachable from the roots of the
     /// collection whose mark phase just finished. Read only between the mark
     /// and the sweep (unmarked boxes are dropped right after).
@@ -169,11 +198,21 @@ pub(crate) struct VTable {
     /// the containers it finds an unrecorded young reference in). A function
     /// pointer because `type_name` is not const-stable.
     name: fn() -> &'static str,
+    /// The payload's `TypeId`, for the erased walk's "is this box a `T`?" test.
+    /// A type *id* rather than the vtable's own address because two uses of the
+    /// `const VTABLE` below need not name one promoted static, so `&VTABLE` is
+    /// not a sound identity; `TypeId::of` is.
+    type_id: fn() -> std::any::TypeId,
 }
 
 /// [`VTable::name`]: the payload's type name.
 fn type_name_of<T>() -> &'static str {
     std::any::type_name::<T>()
+}
+
+/// [`VTable::type_id`]: the payload's `TypeId`.
+fn type_id_of<T: 'static>() -> std::any::TypeId {
+    std::any::TypeId::of::<T>()
 }
 
 /// The header every box begins with. `repr(C)` and first in [`GcBox`], so a
@@ -299,6 +338,7 @@ impl<T: Trace> GcBox<T> {
         },
         data_offset: std::mem::offset_of!(GcBox<T>, data) as u32,
         name: type_name_of::<T>,
+        type_id: type_id_of::<T>,
     };
 }
 
@@ -1807,6 +1847,44 @@ impl Heap {
         let mut live = Vec::with_capacity(self.live_boxes);
         self.for_each_live(|header| live.push(header as usize));
         live
+    }
+
+    /// Visit every live box as the collector's own graph: the box, its payload's
+    /// Rust type name, its arena footprint in bytes, and the live boxes its
+    /// payload points at.
+    ///
+    /// The edges are the ones the mark phase follows — the box header's vtable
+    /// `trace` — so a caller sees exactly the graph a collection would traverse,
+    /// internal objects included, and nothing invented. The callback runs with
+    /// the heap borrowed and mid-walk: it must not collect and must not allocate
+    /// in the arena (either would re-enter the borrow the collector's own trace
+    /// already forbids).
+    ///
+    /// A payload parked in a mutably-borrowed `RefCell` cannot be read; its
+    /// references are skipped, exactly as the collector skips them (and aborts
+    /// the sweep). The abort flag this reports is a collection's to consume, not
+    /// a read-only walk's, so it is saved and restored around the walk.
+    pub fn for_each_live_box(&self, mut f: impl FnMut(GcAny, &'static str, usize, &[GcAny])) {
+        let saved_abort = ABORT_SWEEP.with(|abort| abort.get());
+        let mut edges: Vec<GcAny> = Vec::new();
+        self.for_each_live(|header| {
+            // SAFETY: `for_each_live` yields the header of a live box.
+            unsafe {
+                let any = GcAny(header);
+                edges.clear();
+                {
+                    let mut visit = |child: GcAny| edges.push(child);
+                    any.trace(&mut visit);
+                }
+                f(
+                    any,
+                    ((*header).vtable.name)(),
+                    (*header).size as usize,
+                    &edges,
+                );
+            }
+        });
+        ABORT_SWEEP.with(|abort| abort.set(saved_abort));
     }
 
     /// The address range spanned by the arena's allocated slots. A pre-filter
@@ -3374,6 +3452,68 @@ mod tests {
             swept.contains(&sourced_box),
             "an emptied source still rooted the box: {swept:?}"
         );
+    }
+
+    /// The live-box walk is the collector's own graph: every live box, its
+    /// payload's type name, its footprint, and the boxes its vtable `trace`
+    /// reports. The type test is the load-bearing part — it is what lets a caller
+    /// read a box it only knows by address — so it is pinned against two distinct
+    /// types whose boxes coexist, which is what a vtable-address test would get
+    /// wrong (two uses of a `const` vtable need not share an address; the
+    /// payload's `TypeId` is what makes it right).
+    #[test]
+    fn the_live_box_walk_reports_each_box_its_type_and_its_edges() {
+        use crate::handle::Handle;
+
+        struct Leaf(u32);
+        impl Trace for Leaf {
+            fn trace(&self, _visit: &mut dyn FnMut(GcAny)) {}
+        }
+        struct Root(Handle<Leaf>);
+        impl Trace for Root {
+            fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+                self.0.trace(visit);
+            }
+        }
+
+        let leaf: Handle<Leaf> = Handle::new(Leaf(7));
+        assert_eq!(leaf.0, 7);
+        let root: Handle<Root> = Handle::new(Root(leaf));
+        let leaf_addr = leaf.as_any().addr();
+        let root_addr = root.as_any().addr();
+
+        let mut root_seen = None;
+        let mut leaf_seen = None;
+        with_heap(|heap| {
+            heap.for_each_live_box(|any, name, size, edges| {
+                if any.addr() == root_addr {
+                    let edges: Vec<usize> = edges.iter().map(|edge| edge.addr()).collect();
+                    root_seen = Some((any.is::<Root>(), any.is::<Leaf>(), name, size, edges));
+                }
+                if any.addr() == leaf_addr {
+                    leaf_seen = Some((any.is::<Leaf>(), any.is::<Root>(), name, size));
+                }
+            });
+        });
+
+        let (root_is_root, root_is_leaf, name, size, edges) = root_seen.expect("the root box");
+        assert!(
+            root_is_root && !root_is_leaf,
+            "the type test confused two boxes"
+        );
+        assert!(name.contains("Root"), "{name}");
+        assert!(size >= std::mem::size_of::<Root>(), "{size}");
+        assert!(
+            edges.contains(&leaf_addr),
+            "the root's edge reaches the leaf: {edges:?}"
+        );
+
+        let (leaf_is_leaf, leaf_is_root, _, leaf_size) = leaf_seen.expect("the leaf box");
+        assert!(
+            leaf_is_leaf && !leaf_is_root,
+            "the type test confused two boxes"
+        );
+        assert!(leaf_size >= std::mem::size_of::<Leaf>(), "{leaf_size}");
     }
 
     /// A handle a host keeps in its own memory is invisible to the conservative

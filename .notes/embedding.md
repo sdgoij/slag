@@ -4879,6 +4879,16 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates — and the corpora, because `runtime` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,427 passed / 0 failed** (up four — this part's tests; `v8` **316** default and **322** with simdutf, `runtime` 943, `crux` 258, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine change is nine fields on a struct the bridge already read, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six out-of-scope cases.
 
+*The heap snapshot — §9's last frontier part, and its only real capability.* Three `ext/node/ops/v8.rs` errors over one name, `Isolate::take_heap_snapshot`, reached through two shapes a host uses: a scope and an isolate, both `|chunk: &[u8]| -> bool` where `false` is a host's write error that stops the stream (`writeHeapSnapshot` streams to a file and is the one caller that refuses). The tier is **write the graph**, not refuse, and it is the collector's own edge set rather than a re-walk of the JS-visible graph: `crux::heap::Heap::for_each_live_box` walks every live box and reports the same vtable `trace` a collection follows — which is what makes the document a heap snapshot rather than a reachability listing. Two engine surfaces are new, both in `crux`: that walk, and `GcAny::{is, cast}`, a payload-type test and downcast so the caller the walk hands a box to can read it once it knows the payload type. The bridge's part is a new `crates/v8/heap_snapshot.rs`: the walk, the naming, and the incremental V8 document. `self_size` is the box's arena footprint (payload + GC header, rounded) — a shallow size in V8's sense but this arena's unit; edges are typed `internal` with the target's offset into `nodes`; a `JsObject` box is V8's `object`, named by the constructor its prototype chain reports, a `Function` box is `closure` named from its record, and the rest are `hidden`/`string`/`symbol`/`bigint` by payload type. The naming walk reads data properties only and never enters a proxy or an accessor, because a snapshot must not run host JS or grow the heap it describes (V8's runs none either); an object whose chain names no constructor falls back to its own kind. The string keys are interned before the walk, so nothing allocates in the arena between the walk and the naming pass — which is what keeps the addresses the walk yielded valid without pinning, and what lets the snapshot be taken with no entered context (`setHeapSnapshotNearHeapLimit` wants exactly that). The document streams in `1 << 16`-byte chunks and a callback that answers `false` stops it, which is the shape that lets `writeHeapSnapshot` write to disk without buffering the whole snapshot.
+
+*The vtable-address defect the change forced, and fixed.* The first `is` compared `&VTable` pointers and answered `false` for every real box: a `const VTABLE` promoted to `'static` at two use sites need not share one address, so a promoted const is not a type identity. It surfaced as *every* `JsObject`/`Function`/`JsString` box arriving as `hidden` (the walk's own type names in the string table, no object nodes at all). The vtable now carries the payload's `TypeId` and `is` compares that, which is one value per type by construction.
+
+*Tests — three, and three mutations each caught by its own test.* `crux`'s `the_live_box_walk_reports_each_box_its_type_and_its_edges` builds a two-box graph and asserts each box is reported with its size, its type name, the correct type test in both directions (a `Root` is not a `Leaf` and the reverse) and the parent→child edge. The bridge's `the_document_has_the_shape_query_objects_reads` reads the emitted bytes with a small reader written for the exact grammar — deliberately not a JSON crate and deliberately not the engine's own parser, so a bug in one cannot satisfy a test of the other — and checks `node_fields` carries `type`/`name` with the stride `queryObjects` assumes, the `node_types` row carries `object`, `nodes`/`edges` are strided with lengths matching `node_count`/`edge_count`, every edge target begins a node record, and a `class SnapshotMarker` instance appears as an `object` node named `SnapshotMarker` with a non-zero size. `a_write_error_stops_the_stream` refuses the first chunk and asserts the callback is not called again, with an accepting control proving a 20,000-object snapshot really does stream in more than one chunk (so "stopped" is not an artefact of one small buffer). Three mutations, each run alone and each caught: dropping `"object"` from the `node_types` row fails the shape test at the type row; emitting `0` for `self_size` fails it at the named-node scan; making the emitter ignore the callback's answer fails the stream test at the refusal count. A fourth — reverting `is` to the vtable-pointer comparison — is caught by the bridge's named-node scan (object boxes come back untyped) but **not** by the `crux` test, because one codegen unit happens to give one local type one promoted static; the bridge test is the one that pins the fix, and that asymmetry is recorded rather than left as false confidence.
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: the three `take_heap_snapshot` errors are gone — `ext/node/ops/v8.rs` is at **0**, as §9 said this part would leave it, and no `take_heap_snapshot` mention remains in the output. The run reports **16** other errors, recorded plainly rather than smoothed: **15 in `ext/napi`** (`has_private`, `delete_private`, `has_index`, `Private::new`, `to_global`, `new_target`, `Date::new`, `new_external_onebyte_raw`/`new_external_twobyte_raw`, `from_function_callback_info`, `ref_from_raw_isolate_ptr_mut_unchecked`) plus the pre-existing `ext/webgpu/error.rs` `E0521`. That is higher than §7's last reading of 4, and the difference is the Node-API tier §12 already declares blocked, surfaced by the measurement itself: `ext/napi` is compiled only because `cli/snapshot/Cargo.toml`'s measurement-only build-dependency line resolves the build-script graph — remove it and the same command dies at one `deno_v8` `either feature v8 or quickjs` error and never reaches `ext/napi` (checked both ways). No one of the fifteen names is a heap or vtable name, none was ever implemented in `crates/v8` (`git log -S` finds no trace), and this part adds methods rather than removing any, so they are neither this part's to fix nor its regression; §12's item records the gate (weak/traced handles plus Node-API).
+
+*Gates — and the corpora, because `crux` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,430 passed / 0 failed** (up three — this part's tests; `crux` **259**, `v8` **318** default and **324** with simdutf, `runtime` 943, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine changes are a walk, a type test and a vtable `TypeId`, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt and holds at **453 passed / 6 failed**, the same six out-of-scope cases: the primary boundary this part does not move.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5608,20 +5618,37 @@ if that proves possible.
   bridge-side map keyed by a *reusable* object identity — with `DataView::new`,
   which the engine can already make (`Agent::dataview_data`,
   `builtins::dataview`) and so was an exposure, were the second. **The heap
-  `builtins::dataview`) and so was an exposure, were the second. **The heap
-  surface — landed, except its one real capability.** Twenty-three of
+  surface — landed.** Twenty-three of
   `ext/node/ops/v8.rs`'s 26 errors were numbers: `HeapStatistics`' eleven
   accessors, `number_of_heap_spaces`, `low_memory_notification`, and
   `get_heap_code_and_metadata_statistics`; §7's record has the measurement and the
   rule the numbers answer by (a fact where this engine has one, a *documented
-  constant* where the fact is constant). What is left is the three
-  `take_heap_snapshot` call sites, and they are the frontier's only *real*
-  capability, because a V8 heap snapshot is a format rather than a number. The
-  tier is the decision to make: declare that the engine has no snapshot and refuse
-  as the inspector does, or write its object graph in the V8 document shape — the
-  shape `op_v8_query_objects_count` parses (it needs `snapshot.meta.node_fields`,
-  a `node_types` row containing `object`, and `nodes`/`strings` arrays) and the one
-  `writeHeapSnapshot` streams to a file. **`ext/webgpu/error.rs`'s
+  constant* where the fact is constant). The other three were the three
+  `take_heap_snapshot` call sites — the frontier's only *real* capability, because
+  a V8 heap snapshot is a format rather than a number. **The tier: write the
+  graph** — one of two available (*declare that the engine has no snapshot and
+  refuse as the inspector does*, or *write its object graph in the V8 document
+  shape*), and the one taken. Both call-site shapes come with it: the one
+  `op_v8_query_objects_count` parses (`snapshot.meta.node_fields`, a `node_types`
+  row containing `object`, and `nodes`/`strings`) and the one `writeHeapSnapshot`
+  streams to a file. Two engine surfaces were named before the edit, because the
+  arena walk and a box's concrete type are crux's to give and are not otherwise
+  reachable from the bridge, and both landed: `crux::heap::Heap::for_each_live_box`,
+  the collector's own live-box walk — address, payload type name, arena footprint,
+  and the live boxes the payload's vtable `trace` reports, which is the graph the
+  collector marks over — and `crux::heap::GcAny::{is, cast}`, a payload `TypeId`
+  test and downcast, so the caller the walk hands a box to can read it once it
+  knows the payload type. (The first `is` compared vtable *addresses* and was
+  silently wrong — a promoted `const VTABLE` need not have one address at two use
+  sites — which is why the vtable carries the payload's `TypeId`; §7's record has
+  it.) The bridge's part is a new `crates/v8/heap_snapshot.rs`: the walk, the
+  naming (a `JsObject` box is V8's `object` type, named by the constructor its
+  prototype chain reports), and the incremental V8 document a host streams out.
+  The grammar is V8's own (`node_fields`/`edge_fields` and their type rows),
+  `self_size` is the box's arena footprint, naming reads data properties only and
+  never enters a proxy or an accessor (a snapshot runs no host JS and grows no
+  heap), and an object whose chain names no constructor falls back to its own kind
+  rather than to an invented name. **`ext/webgpu/error.rs`'s
   `E0521`** is deno-side and pre-existing: it aborts that crate's own build and
   is not this bridge's to fix, which is why every measurement in §7 was taken
   with `--keep-going` and says so.
@@ -9006,7 +9033,12 @@ migrate, then delete.
      `[build-dependencies]` in `cli/snapshot/Cargo.toml` — because the workspace
      enables `deno_core/v8` only through `cli`'s own feature; without it the build
      script answers `either feature v8 or quickjs must be enabled`. `deno/` is
-     untracked and nothing in it is committed.)
+     untracked and nothing in it is committed. **The line decides what is
+     measured, not just whether:** with it the run reaches `ext/napi` (which
+     `deno_runtime` depends on unconditionally) and counts its Node-API errors;
+     without it the run dies at the feature error above and counts neither
+     `ext/napi` nor `deno_node`. §7's heap-snapshot record carries both readings,
+     so a future frontier count is compared against the right one.)
 
 12. **`Object.assign` and a function — landed, both roles fixed.** §7's
    measurement found it in passing: `Object.assign(function () {}, { tag: 7 })`
