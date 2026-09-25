@@ -4939,6 +4939,14 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,446 passed / 0 failed** (up one — this part's test; `v8` **334**, `crux` 259, `runtime` 943, `test262` 3324 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, checked rather than argued**: the part touches only `crates/v8/scope.rs`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` (and the same for `wasmtest`) is **0**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six out-of-scope cases.
 
+*The simdutf C symbols a link needs — §9's bullet, named before the edit.* With the scope shape in place the check failed at link: `deno/ext/web/lib.rs:301-318` declares `simdutf__binary_to_base64` and `simdutf__base64_to_binary` with `#[link_name]`s, so it can hand the library output memory it has not initialized (a `&mut [u8]` wrapper cannot soundly expose that, which is why deno re-declares them at all), and the crate we stand in for gets both from its compiled V8/simdutf. This bridge had the simdutf *Rust* surface and exported no C symbol, so nothing resolved them. Both are now `#[unsafe(no_mangle)] pub unsafe extern "C"` functions in `crates/v8/simdutf.rs` with deno's exact signatures and the `#[repr(C)]` `SimdutfFfiResult { error: i32, count: usize }`, over the engine's own alphabet and decoder; the option and last-chunk words are the library's own integers, mapped by two private helpers. The encode direction, `binary_to_base64`, is new as a Rust function too — the call sites only ever used the C symbol for it — and it is the engine's `toBase64` arithmetic, cross-checked against it rather than asserted (the module already says the base64 half is not a second implementation; this keeps that true for encode as well).
+
+*Tests — two, and three mutations, each caught by its own test.* `the_encoder_is_the_engines_own_to_base64` reads `Uint8Array.prototype.toBase64` back through JavaScript for lengths 0..=8 and both alphabets (`Default` ↔ padded `base64`, `Url` ↔ unpadded `base64url`) and asserts the Rust encoder produces exactly that string, so a wrong alphabet or a wrong padding decision is a different string rather than a plausible one. `the_simdutf_c_symbols_are_the_ones_deno_declares` declares deno's own `extern "C"` block — the `#[link_name]`, the argument order, the `#[repr(C)]` result — and calls through it, which pins the symbol *names* (a mismatch is a link error, not a compile error) and the ABI, and covers the URL alphabet and both last-chunk words as well. Three mutations, each run alone and each caught: forcing `omit_padding` true fails the first at "1 bytes, base64" (`Cw` where `Cw==` belongs); dropping `#[unsafe(no_mangle)]` fails the second at link (`LNK2019: unresolved external symbol simdutf__binary_to_base64`, the same class deno reported); and making `options_from_u64` answer `Default` always fails the second at the URL case.
+
+*The measurement, and the frontier it moved to a running process.* `cargo check -p deno_snapshots --keep-going`: **no compile or link error remains**. The whole graph — `deno_web`, `deno_napi`, `deno_runtime`, `deno_core`, the CLI's snapshot host — builds, and the build script *runs*: it prints `Creating a snapshot...` and then aborts with `STATUS_STACK_OVERFLOW` (`0xc00000fd`), `thread 'main' has overflowed its stack`. That is a new kind of frontier — the first time deno's snapshot host has executed on this engine, and the first failure that is neither a compile nor a link error — so it is the next part, and it needs a probe before it is named.
+
+*Gates.* `cargo fmt --all -- --check` clean; both clippy runs clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,446 passed / 0 failed** (this part's two tests live in the `simdutf` module, which the feature gates, so they run under `cargo test -p v8 --features simdutf` — **342 passed / 0 failed**, up two — rather than in the default workspace run); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps**: the part touches only `crates/v8/simdutf.rs`, which is `#[cfg(feature = "simdutf")]` and in no runner's graph (the same tree check is **0**). deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same six out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5801,6 +5809,19 @@ if that proves possible.
   `HandleScope<'s, C>` over the isolate and the *context* it inherited — the same
   pair the `PinnedRef<HandleScope>` impl copies, read from the scope the context
   scope wraps. It is a bridge shape and no engine change.
+- **The simdutf C symbols a link needs — named here before the edit.** With the
+  `ContextScope` scope shape in place the `deno_snapshots` graph type-checks, and
+  the check then fails at *link* time: `deno/ext/web/lib.rs:301-318` declares
+  `simdutf__binary_to_base64` and `simdutf__base64_to_binary` as `#[link_name]`s
+  (so it can pass uninitialized output memory, which a `&mut [u8]` wrapper cannot
+  soundly expose), and the crate we stand in for gets both symbols from its
+  compiled V8/simdutf. This bridge has the simdutf *Rust* surface but exports no C
+  symbol, so nothing resolves them. The fix is to export both from
+  `crates/v8/simdutf.rs` as `#[unsafe(no_mangle)] pub unsafe extern "C"`
+  functions with deno's exact signatures, over the engine's own alphabet and
+  decoder; the encode direction (`binary_to_base64`) is new as a Rust function
+  too, because the call sites only ever used the C symbol for it. No engine
+  change.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,

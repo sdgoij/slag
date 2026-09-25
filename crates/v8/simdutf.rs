@@ -113,6 +113,46 @@ pub fn base64_length_from_binary(length: usize, options: Base64Options) -> usize
     }
 }
 
+/// Encode `input` into `output` (`v8::simdutf::binary_to_base64`), answering the
+/// number of characters written.
+///
+/// The alphabet and padding are the library's, and are the same two forms
+/// [`base64_length_from_binary`] sizes a buffer for: `Default` is padded base64,
+/// `Url` the unpadded base64url of RFC 4648 §5. A buffer that form's length
+/// asked for is exactly filled.
+///
+/// # Safety
+///
+/// The signature is the crate we stand in for's, which is `unsafe` because its
+/// C++ writes through the output pointer. This implementation writes nothing
+/// outside `output` — it encodes into its own buffer and then copies what fits —
+/// so the block a call site carries is sound.
+pub unsafe fn binary_to_base64(input: &[u8], output: &mut [u8], options: Base64Options) -> usize {
+    let alphabet = typed_array::base64_alphabet(matches!(options, Base64Options::Url));
+    let omit_padding = matches!(options, Base64Options::Url);
+    let mut encoded = Vec::with_capacity(base64_length_from_binary(input.len(), options));
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        encoded.push(alphabet[(b0 >> 2) as usize]);
+        encoded.push(alphabet[(((b0 & 0x3) << 4) | (b1 >> 4)) as usize]);
+        if chunk.len() > 1 {
+            encoded.push(alphabet[(((b1 & 0xF) << 2) | (b2 >> 6)) as usize]);
+        } else if !omit_padding {
+            encoded.push(b'=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(alphabet[(b2 & 0x3F) as usize]);
+        } else if !omit_padding {
+            encoded.push(b'=');
+        }
+    }
+    let written = encoded.len().min(output.len());
+    output[..written].copy_from_slice(&encoded[..written]);
+    written
+}
+
 /// Decode `input` into `output` (`v8::simdutf::base64_to_binary`), answering
 /// the code and the number of bytes written.
 ///
@@ -199,6 +239,97 @@ pub fn validate_utf16le(input: &[u16]) -> bool {
         }
     }
     true
+}
+
+/// The library's `base64_options` as a host passes it across the C ABI, which is
+/// the enum's own `u64`.
+fn options_from_u64(value: u64) -> Base64Options {
+    match value {
+        1 => Base64Options::Url,
+        _ => Base64Options::Default,
+    }
+}
+
+/// The library's `last_chunk_handling_options` as a host passes it across the C
+/// ABI, which is the enum's own `u64`.
+fn last_chunk_from_u64(value: u64) -> LastChunkHandling {
+    match value {
+        1 => LastChunkHandling::Strict,
+        2 => LastChunkHandling::StopBeforePartial,
+        _ => LastChunkHandling::Loose,
+    }
+}
+
+/// simdutf's `result` in the C ABI shape a host re-declares (`deno`'s
+/// `SimdutfFfiResult`): the code and the bytes written.
+#[repr(C)]
+pub struct SimdutfFfiResult {
+    pub error: i32,
+    pub count: usize,
+}
+
+/// The C symbol `simdutf__binary_to_base64`, which `deno` links against by name
+/// (`deno/ext/web/lib.rs:302`).
+///
+/// The crate we stand in for gets this from its compiled V8/simdutf; here it is
+/// the engine's own encoder behind an `extern "C"` boundary, so a host that
+/// re-declares the symbol — as deno does, to pass output memory it has not
+/// initialized, which a `&mut [u8]` wrapper cannot soundly expose — resolves it.
+///
+/// # Safety
+///
+/// `input` must point to `length` readable bytes and `output` to
+/// [`base64_length_from_binary`]`(length, options)` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn simdutf__binary_to_base64(
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    options: u64,
+) -> usize {
+    // SAFETY: the caller's contract, above.
+    let input = unsafe { std::slice::from_raw_parts(input, length) };
+    let options = options_from_u64(options);
+    let bound = base64_length_from_binary(length, options);
+    // SAFETY: the caller's contract: `bound` writable bytes.
+    let output = unsafe { std::slice::from_raw_parts_mut(output, bound) };
+    // SAFETY: `output` is the size the encoder's own bound promised.
+    unsafe { binary_to_base64(input, output, options) }
+}
+
+/// The C symbol `simdutf__base64_to_binary`, which `deno` links against by name
+/// (`deno/ext/web/lib.rs:310`).
+///
+/// # Safety
+///
+/// `input` must point to `length` readable bytes and `output` to
+/// [`maximal_binary_length_from_base64`]`(input)` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn simdutf__base64_to_binary(
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    options: u64,
+    last_chunk_options: u64,
+) -> SimdutfFfiResult {
+    // SAFETY: the caller's contract, above.
+    let input = unsafe { std::slice::from_raw_parts(input, length) };
+    let bound = maximal_binary_length_from_base64(input);
+    // SAFETY: the caller's contract: `bound` writable bytes.
+    let output = unsafe { std::slice::from_raw_parts_mut(output, bound) };
+    // SAFETY: `output` is the size the decoder's own bound promised.
+    let result = unsafe {
+        base64_to_binary(
+            input,
+            output,
+            options_from_u64(options),
+            last_chunk_from_u64(last_chunk_options),
+        )
+    };
+    SimdutfFfiResult {
+        error: result.error as i32,
+        count: result.count,
+    }
 }
 
 #[cfg(test)]
@@ -375,5 +506,153 @@ mod tests {
         assert_eq!(result.error, ErrorCode::OutputBufferTooSmall);
         assert_eq!(result.count, 2);
         assert_eq!(&output, b"fo");
+    }
+
+    /// The encoder is the engine's own, read back through JavaScript: for every
+    /// length in a small corpus the library's `binary_to_base64` must produce
+    /// exactly what `Uint8Array.prototype.toBase64` does with the matching
+    /// alphabet and padding. `Default` is padded base64 and `Url` is the unpadded
+    /// base64url, which is the mapping `base64_length_from_binary` sizes a buffer
+    /// for, so a wrong alphabet or a wrong padding decision is a different string.
+    #[test]
+    fn the_encoder_is_the_engines_own_to_base64() {
+        crate::test_support::in_context!(scope, {
+            for length in 0..=8usize {
+                let bytes: Vec<u8> = (0..length)
+                    .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+                    .collect();
+                let list = bytes
+                    .iter()
+                    .map(|byte| byte.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                for (options, alphabet, omit_padding) in [
+                    (Base64Options::Default, "base64", false),
+                    (Base64Options::Url, "base64url", true),
+                ] {
+                    let source = format!(
+                        "new Uint8Array([{list}]).toBase64({{alphabet: '{alphabet}', omitPadding: {omit_padding}}})"
+                    );
+                    let expected =
+                        crate::test_support::eval(scope, &source).to_rust_string_lossy(scope);
+                    let mut output =
+                        vec![0u8; super::base64_length_from_binary(bytes.len(), options)];
+                    // SAFETY: `output` is the size the encoder's own bound promises.
+                    let written = unsafe { super::binary_to_base64(&bytes, &mut output, options) };
+                    output.truncate(written);
+                    assert_eq!(
+                        String::from_utf8(output).expect("base64 is ascii"),
+                        expected,
+                        "{length} bytes, {alphabet}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// The symbols deno links against, called through deno's own declaration: the
+    /// `#[link_name]`, the argument order and the `#[repr(C)]` result are pinned,
+    /// because a mismatch is a link error or a wrong answer rather than a compile
+    /// error. `deno/ext/web/lib.rs:301-318` is the declaration this mirrors.
+    #[test]
+    fn the_simdutf_c_symbols_are_the_ones_deno_declares() {
+        #[repr(C)]
+        struct FfiResult {
+            error: i32,
+            count: usize,
+        }
+
+        unsafe extern "C" {
+            #[link_name = "simdutf__binary_to_base64"]
+            fn ffi_binary_to_base64(
+                input: *const u8,
+                length: usize,
+                output: *mut u8,
+                options: u64,
+            ) -> usize;
+
+            #[link_name = "simdutf__base64_to_binary"]
+            fn ffi_base64_to_binary(
+                input: *const u8,
+                length: usize,
+                output: *mut u8,
+                options: u64,
+                last_chunk_options: u64,
+            ) -> FfiResult;
+        }
+
+        for (bytes, expected) in [
+            (b"".as_slice(), ""),
+            (b"f", "Zg=="),
+            (b"hi", "aGk="),
+            (b"abc", "YWJj"),
+            (b"foobar", "Zm9vYmFy"),
+        ] {
+            let mut encoded =
+                vec![0u8; super::base64_length_from_binary(bytes.len(), Base64Options::Default)];
+            // SAFETY: `encoded` is the size the encoder's bound promises.
+            let written = unsafe {
+                ffi_binary_to_base64(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    encoded.as_mut_ptr(),
+                    Base64Options::Default as u64,
+                )
+            };
+            assert_eq!(
+                std::str::from_utf8(&encoded[..written]).expect("ascii"),
+                expected
+            );
+
+            let mut decoded =
+                vec![0u8; super::maximal_binary_length_from_base64(&encoded[..written])];
+            // SAFETY: `decoded` is the size the decoder's bound promises.
+            let result = unsafe {
+                ffi_base64_to_binary(
+                    encoded.as_ptr(),
+                    written,
+                    decoded.as_mut_ptr(),
+                    Base64Options::Default as u64,
+                    LastChunkHandling::Strict as u64,
+                )
+            };
+            assert_eq!(result.error, 0, "success code for {expected:?}");
+            assert_eq!(result.count, bytes.len());
+            assert_eq!(&decoded[..result.count], bytes);
+        }
+
+        // The URL alphabet is unpadded and uses its own symbols, so the option
+        // word decides the answer — it is the library's integer, not a bool.
+        let bytes = [0xFBu8, 0xFF];
+        let mut encoded =
+            vec![0u8; super::base64_length_from_binary(bytes.len(), Base64Options::Url)];
+        // SAFETY: `encoded` is the size the encoder's bound promises.
+        let written = unsafe {
+            ffi_binary_to_base64(
+                bytes.as_ptr(),
+                bytes.len(),
+                encoded.as_mut_ptr(),
+                Base64Options::Url as u64,
+            )
+        };
+        assert_eq!(
+            std::str::from_utf8(&encoded[..written]).expect("ascii"),
+            "-_8"
+        );
+
+        let mut decoded = vec![0u8; super::maximal_binary_length_from_base64(&encoded[..written])];
+        // SAFETY: `decoded` is the size the decoder's bound promises.
+        let result = unsafe {
+            ffi_base64_to_binary(
+                encoded.as_ptr(),
+                written,
+                decoded.as_mut_ptr(),
+                Base64Options::Url as u64,
+                LastChunkHandling::Loose as u64,
+            )
+        };
+        assert_eq!(result.error, 0);
+        assert_eq!(result.count, 2);
+        assert_eq!(&decoded[..result.count], &bytes);
     }
 }
