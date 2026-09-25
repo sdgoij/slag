@@ -4717,6 +4717,14 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,363 passed / 0 failed** (`v8` 260 — one more — and no other crate's count moved); the wasm-free shape holds (`cargo test -p runtime --no-default-features --lib` **935 passed**); no sweeps, because `cargo tree -p test262 -e normal | grep -c 'v8 v150'` is 0 — the same check the previous record used, so the bridge is in no runner's graph; deno's suite rebuilt and re-run since the bridge is what deno links: **453 passed / 6 failed**, the same six.
 
+*The value-level names a V8-class host asks for — §9's bullet that named them, twelve as shapes over what the engine already carried and two over a routine that existed but was not reachable.* The frontier after the callback-scope part was a list of ordinary methods `cargo check -p deno_snapshots` names by name, and this is the batch whose machinery is already there: `v8::Value::TypeOf` over `crux::value::type_of` (the operator's own table, so an `IsHTMLDDA` object is `undefined` and a callable proxy `function`), `v8::Symbol::Description` over the symbol's public `description` field, `v8::Date::ValueOf` over `agent.date_data`, `v8::Map::size`/`v8::Set::size` over the live entries of `agent.map_data`/`set_data` (the same tombstone rule `as_array` already follows on those tables), `v8::Set::new` over the `%Set%` intrinsic and `api::Context::try_construct` — the engine has no way to build a collection except through the constructor a script would use, so neither does the bridge — `v8::TypedArray::length` over `crux::object::typed_array_effective_length` (one rule, so a host's element count and a script's cannot be two spellings of one fact, and the detached and shrunk-buffer cases come with it), `v8::SharedArrayBuffer::byte_length` over the buffer record both buffer kinds share, `v8::String::write_utf8_v2` over the V8-shaped `write_utf8_uninit_v2` already here with the caller's `&mut [u8]` viewed as the uninitialized slice it fills (the encoder only writes, so no byte is read), `v8::String::new_external_onebyte`, `v8::Object::GetOwnPropertyDescriptor` over the `Object.getOwnPropertyDescriptor` builtin's own body (the deferred-namespace trigger and the live-binding substitution included, so a namespace reports its binding and not the placeholder it stores), `v8::Object::SetIntegrityLevel` and `v8::Value::InstanceOf`, and the `VERSION_STRING`/`TimeZoneDetection` names with them. Two needed the engine, and both are reached by exposing what was already there rather than adding a mechanism. The `instanceof` operator's whole path — an `@@hasInstance` method first, then the callable check, then `OrdinaryHasInstance` (spec 7.3.20) — lived inline in one arm of `apply_binary`, so it is `expr::instance_of` now and that arm calls it; and `SetIntegrityLevel`'s walk (spec 7.3.15) was `builtins::object`'s private `set_integrity_level`, so it is `pub`, with the `Frozen`/`Sealed` mapping left to the bridge because the engine's `bool` is the same distinction. One already-landed method changed: `Object::has_own_property`'s key moved from `Local<Value>` to `Local<Name>`, which is V8's own parameter (`v8.h`'s `HasOwnProperty` takes a `Local<Name>`), the shape the tree's console walk hands it, and the one E0308 in the frontier — the `Value` parameter was this bridge's divergence, not the call sites'. Two divergences are stated rather than implied. `new_external_onebyte` copies: the engine's `JsString` is UTF-16 in every variant (`Flat`/`Small`/`ConsString`/`Rope`/`Sliced`) with no byte-backed form, so the host's `Box<[u8]>` is read as Latin-1 into the engine's own string — the text V8's external string would carry, without the zero-copy lifetimed buffer V8 keeps for the host, and the `Box` is freed at once. And `Isolate::date_time_configuration_change_notification` does nothing, truthfully: `builtins::date` fixes the host offset at UTC, so there is no cached date-time configuration for a notification whose whole purpose is to invalidate one. `VERSION_STRING` is `get_version()`'s own statement, so a host that prints the version in a header and one that asks the API report one answer, and neither claims to be V8.
+
+*Tests — fourteen, plus three mutations, each caught by its own test.* `value.rs`'s `type_of_is_the_operators_answer` walks all eight `typeof` results plus the callable proxy; `instance_of_is_the_whole_operator` pins the prototype walk, the `@@hasInstance` override (a plain object saying yes to `1`) and the thrown `TypeError` for a right-hand side that is neither callable nor carrying one. `primitives.rs`'s `a_symbol_reports_the_description_it_was_made_with` holds `Symbol('hi')` against a bare `Symbol()`, whose answer is `undefined` and not the empty string; `write_utf8_v2_writes_bytes_and_reports_code_units` checks the byte count against `utf8_length`, the code units `nchars` reports for an astral character, and both sides of `kReplaceInvalidUtf8` (U+FFFD with the flag, `ED A0 80` without it, for one lone surrogate); `an_external_onebyte_string_carries_the_bytes_as_latin1` makes `0xE9` one code unit, which a UTF-8 read would have turned into U+FFFD. `object.rs`'s `a_keyed_collection_reports_its_live_count` is a map with a delete in it (2 → 1, the tombstone excluded), `a_new_set_is_the_one_a_script_would_make` round-trips through the script (`instanceof Set`, then `host_set.add(7)` read back by the host's `size`), `an_own_property_descriptor_is_the_plain_object` reads the four fields of a data property, the empty handle for an absent one and the `get`-only shape of an accessor, `set_integrity_level_seals_and_freezes` checks each level against the engine's own `Object.isSealed`/`isFrozen`/`isExtensible`, and `a_date_reports_its_time_value` holds `1_234_567_890` and `NaN` for `new Date(NaN)`. `array_buffer.rs`'s `a_typed_array_reports_its_element_count` separates elements from bytes (two `f64`s are 2 and 16) and reaches the same answer through the `TypedArray` tag, and `a_shared_buffer_reports_its_byte_length` is the buffer's own length. `isolate.rs`'s `a_date_time_notification_leaves_the_clock_where_it_is` asserts the ISO rendering is unchanged across the call — the honest test for a no-op — and `lib.rs`'s `the_version_string_is_what_get_version_reports` ties the constant to the function. Three mutations, run together and each caught by its own test: `instance_of` replaced by a bare `ordinary_has_instance` fails `instance_of_is_the_whole_operator` (the override answers `false` where the operator answers `true`, and the `TypeError` becomes `Some(false)`); `Map::size`/`Set::size` counting slots instead of live entries fails `a_keyed_collection_reports_its_live_count` (2 where 1 belongs); and inverting the `Frozen`/`Sealed` mapping fails `set_integrity_level_seals_and_freezes` (`isFrozen(sealed)` becomes `true`).
+
+*The measurement.* `cargo check -p deno_snapshots`: **101 → 58**, and every one of the fourteen names is at **0 mentions** — `set_integrity_level`/`IntegrityLevel` (10), `get_own_property_descriptor` (6), `size` (4), `Symbol::description` (3), `write_utf8_v2` (2), `type_of` (2), `TypedArray::length` (5), `new_external_onebyte` (1), `value_of` (1), `instance_of` (1), `byte_length` (1), `Set::new` (2), `date_time_configuration_change_notification`/`TimeZoneDetection` (2), `VERSION_STRING` (1), and the one E0308 `has_own_property` was carrying. The drop of 43 against ~44 removed mentions is the honest shape of a *method* part — a missing method does not poison inference, so later errors were already visible and nothing new was hidden (the contrast with the earlier type-level parts, where the count fell by far more than the mentions because a missing type hides everything behind it). What is left is the deferred families, unchanged: `v8::simdutf`'s base64 (31 mentions), `preview_entries` (4), `adjust_amount_of_external_allocated_memory` (2), the node_sqlite `E0512` transmutes (14, the tag shape §9 records as open), plus two `Local<Set>::add` sites and webgpu's own `E0521`/`E0277` that clearing deno_web's 36 exposed.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,377 passed / 0 failed** (`crux` 258, `ffi` 10, `runtime` 935, `slag` 4, `test262` 3324 — each unchanged from the record above — and `v8` **274**, up from 260 by this part's fourteen tests); the wasm-free shape holds (`cargo test -p runtime --no-default-features --lib` **904 passed / 0 failed**, the figure the records one and two parts back give for that same command, and `cargo check -p cli --no-default-features --features jit`). **The sweeps were required and re-run**: `expr.rs` and `builtins/object.rs` are in every runner's graph, so after `cargo build --locked --release -p test262 -p wasmtest` and the settle sleep, test262 `all` reproduces its baseline exactly (**48,464 pass, 0 fail, 0 crash, 0 hang**, 158 skip of 48,622), `intl402` its own (**3,205 pass, 0 fail, 0 crash, 0 hang**, 152 skip of 3,357), the eight wasm core invocations theirs (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -7960,6 +7968,60 @@ migrate, then delete.
   scope's isolate and context through a `CallbackScope` (it is a `HandleScope`
   with a name), so the impl is the one `HandleScope`'s arm already is: hand those
   two fields to the new scope. No shape changes, no engine work.
+- **The value-level names a V8-class host asks for — named here before the edit,
+  and before the two the engine had to grow.** `cargo check -p deno_snapshots`
+  names fourteen of them across the `Value`, `Object`, `String`, `Symbol`,
+  `Date`, `Map`, `Set` and `TypedArray` surfaces, and twelve are shapes over an
+  accessor the engine already carries: `Value::type_of` over
+  `crux::value::type_of` (the engine's own `typeof`, so an `IsHTMLDDA` object is
+  `undefined` and a callable proxy `function`); `Symbol::description` over
+  `crux::symbol::Symbol`'s public `description` field, which is where
+  `Symbol.prototype.description` reads it; `Date::value_of` over
+  `agent.date_data`'s `f64`, the per-Date table the engine keeps; `Map::size` and
+  `Set::size` over the live entries of `agent.map_data`/`set_data` (the
+  tombstone-filtering walk `as_array` already makes for the same two tables);
+  `TypedArray::length` over `crux::object::typed_array_effective_length`, the one
+  rule that already serves the live `length` getter and the out-of-bounds and
+  detached cases, rather than a second spelling over the view slots;
+  `SharedArrayBuffer::byte_length` over the buffer record both buffer kinds
+  share; `String::write_utf8_v2` over the V8-shaped `write_utf8_uninit_v2` this
+  bridge already had, with the caller's `&mut [u8]` viewed as the uninitialized
+  slice it fills (the encoder only writes, so no byte is ever read);
+  `Set::new` over the `%Set%` intrinsic and `api::Context::try_construct`; and
+  `Object::get_own_property_descriptor` over the `Object.getOwnPropertyDescriptor`
+  builtin's own body. Two are the engine's: `Value::instance_of` needs the
+  `instanceof` operator's whole path — an `@@hasInstance` method on the
+  constructor overrides the prototype walk (spec 7.3.20) — which lived inline in
+  one arm of `apply_binary`, so it is factored out as `expr::instance_of` and
+  that arm calls it; and `Object::set_integrity_level` needs `freeze`/`seal`,
+  whose `SetIntegrityLevel` walk (spec 7.3.15) is `builtins::object`'s private
+  `set_integrity_level`, so it becomes `pub` with the `Frozen`/`Sealed` mapping
+  left to the bridge — the engine's `bool` is the same distinction, and `crux`
+  keeps `prevent_extensions`/`is_extensible` beside it unchanged. Three
+  divergences are stated rather than implied. `Object::has_own_property`'s key is
+  a `Local<Name>`, not the `Local<Value>` this bridge declared: V8's own
+  parameter is `Local<Name>`, the console walk hands it the `Name` it just made,
+  and every other call site hands a string that converts — so the `Value`
+  parameter was the divergence, and it is the one edit here that changes an
+  already-landed method. `String::new_external_onebyte` copies: the engine's
+  `JsString` is UTF-16 in every variant (`Flat`/`Small`/`ConsString`/`Rope`/
+  `Sliced`) and has no byte- or externally-backed form, so the host's
+  `Box<[u8]>` is read as Latin-1 into the engine's own string — the same text
+  V8's external string would carry, without the zero-copy lifetimed buffer V8
+  keeps alive for the host. And `Isolate::date_time_configuration_change_notification`
+  does nothing, truthfully: `builtins::date` fixes the host offset at UTC, so
+  there is no cached date-time configuration for a notification whose entire
+  purpose is to invalidate one — the engine's answer is the same before and
+  after, which is what a `Redetect` with nothing cached means. `VERSION_STRING`
+  becomes the one version statement `V8::get_version()` already makes, so a host
+  that reports the version in a header and one that asks the API agree.
+  **Deliberately not in this part:** `v8::simdutf`'s base64 codec (the engine has
+  no base64 at all — ~22 mentions, its own part with a real implementation),
+  `Object::preview_entries` (the inspector's own marshaller), and
+  `Isolate::adjust_amount_of_external_allocated_memory` (V8's host-adjustable
+  external-memory counter, which the engine does not have — it derives external
+  memory from the buffers it holds) — and `Set::add`, the two sites `Set::new`
+  compiling is what surfaced.
 
 ## 11. Working rules
 

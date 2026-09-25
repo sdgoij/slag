@@ -1164,6 +1164,9 @@ pub enum DataError {
     NoData {
         expected: &'static str,
     },
+    /// A `Maybe` that answered `Nothing` with no closer reading: a traps that
+    /// threw, or a status the other variants do not name.
+    GenericFailure,
 }
 
 impl DataError {
@@ -1191,6 +1194,7 @@ impl Display for DataError {
             Self::NoData { expected } => {
                 write!(f, "expected `Some({expected})`, found `None`")
             }
+            Self::GenericFailure => write!(f, "generic failure"),
         }
     }
 }

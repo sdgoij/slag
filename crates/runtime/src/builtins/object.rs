@@ -498,7 +498,15 @@ fn freeze_or_seal(agent: &mut Agent, value: &Value, freeze: bool) -> Result<Valu
 
 /// SetIntegrityLevel (spec 7.3.15): freeze (writable off too) or seal.
 /// Returns the status; a failed [[PreventExtensions]] aborts with `false`.
-fn set_integrity_level(agent: &mut Agent, value: &Value, freeze: bool) -> Result<bool, JsError> {
+///
+/// `pub` so the bridge's `v8::Object::SetIntegrityLevel` reaches the same walk
+/// the `Object.freeze`/`Object.seal` builtins use; the level a host names is the
+/// `bool` this takes.
+pub fn set_integrity_level(
+    agent: &mut Agent,
+    value: &Value,
+    freeze: bool,
+) -> Result<bool, JsError> {
     let obj = as_object(value)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     // A pending function `prototype` is a configurable-to-fix own key the
@@ -1095,16 +1103,31 @@ fn object_keys(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 fn object_get_own_property_descriptor(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let object = to_object(agent, &arg(args, 0))?;
     let key = crate::context::to_property_key(agent, &arg(args, 1))?;
-    let obj = as_object(&object)
+    own_property_descriptor(agent, &object, &key)
+}
+
+/// The own-property descriptor of `object` for `key`, as a plain descriptor
+/// object, or `undefined` when the property is absent (spec 10.4.6.8).
+///
+/// `pub` so the bridge's `v8::Object::GetOwnPropertyDescriptor` answers through
+/// the builtin's own path — the deferred-namespace trigger, the pending
+/// `prototype` materialization, and the live-binding substitution a module
+/// namespace's placeholder value needs — rather than a second spelling of them.
+pub fn own_property_descriptor(
+    agent: &mut Agent,
+    object: &Value,
+    key: &PropertyKey,
+) -> Result<Value, JsError> {
+    let obj = as_object(object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     // A deferred namespace's [[GetOwnProperty]] triggers for
     // non-symbol-like keys (import-defer).
-    crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
-    crate::function::maybe_materialize_prototype_of_object(agent, &obj, &key)?;
-    let Some(prop) = obj.get_own_property_key(&key)? else {
+    crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, key)?;
+    crate::function::maybe_materialize_prototype_of_object(agent, &obj, key)?;
+    let Some(prop) = obj.get_own_property_key(key)? else {
         return Ok(Value::Undefined);
     };
-    let desc = namespace_live_descriptor(agent, &obj, &key, &prop)?;
+    let desc = namespace_live_descriptor(agent, &obj, key, &prop)?;
     let realm = agent.current_realm()?;
     crux::property::from_property_descriptor(
         &desc,

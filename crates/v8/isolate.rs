@@ -630,6 +630,16 @@ impl UnsafeRawIsolatePtr {
 #[derive(Clone, Copy)]
 pub struct Isolate(NonNull<IsolateInner>);
 
+/// How a host identified a date-time configuration change
+/// (`v8::TimeZoneDetection`).
+///
+/// `Redetect` is the only level the crate we stand in for names; it asks the
+/// engine to re-read the host's timezone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeZoneDetection {
+    Redetect,
+}
+
 impl Isolate {
     /// Create parameters with the defaults (`v8::Isolate::CreateParams`).
     pub fn create_params() -> CreateParams {
@@ -1008,6 +1018,17 @@ impl Isolate {
         self.engine().cancel_terminate_execution();
         true
     }
+
+    /// V8's `Isolate::DateTimeConfigurationChangeNotification`: a host's signal
+    /// that the date-time configuration changed and cached local-time state must
+    /// be re-read.
+    ///
+    /// Nothing happens, and that is the whole answer: this engine fixes the
+    /// local-time offset at UTC (`builtins::date`), so it caches no date-time
+    /// configuration for the notification to invalidate. A host that changes the
+    /// process timezone sees the same dates either way — the divergence
+    /// `.notes/embedding.md` §9 records, not a gap in this method.
+    pub fn date_time_configuration_change_notification(&mut self, _detection: TimeZoneDetection) {}
 
     pub(crate) fn engine(&self) -> &api::Isolate {
         &self.inner().engine
@@ -2415,6 +2436,22 @@ mod tests {
                 crate::test_support::eval_number(scope, "globalThis.ran"),
                 7.0
             );
+        });
+    }
+
+    /// V8's date-time notification is absorbed: the engine fixes local time at
+    /// UTC, so there is no cached configuration for a `Redetect` to invalidate
+    /// and the clock reads the same before and after.
+    #[test]
+    fn a_date_time_notification_leaves_the_clock_where_it_is() {
+        crate::test_support::in_context!(scope, {
+            let before = crate::test_support::eval(scope, "new Date(0).toISOString()")
+                .to_rust_string_lossy(scope);
+            scope.date_time_configuration_change_notification(crate::TimeZoneDetection::Redetect);
+            let after = crate::test_support::eval(scope, "new Date(0).toISOString()")
+                .to_rust_string_lossy(scope);
+            assert_eq!(before, after, "the notification changes nothing");
+            assert_eq!(before, "1970-01-01T00:00:00.000Z");
         });
     }
 }

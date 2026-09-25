@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::num::NonZeroI32;
 
-use crate::data::{Array, Map, Name, Object, Private, Proxy, Set, String, Value};
+use crate::data::{Array, DataError, Date, Map, Name, Object, Private, Proxy, Set, String, Value};
 use crate::handle::{Local, LocalHandle};
 use crate::property::{
     GetPropertyNamesArgs, IndexFilter, KeyCollectionMode, KeyConversionMode, PropertyAttribute,
@@ -29,6 +29,13 @@ pub(crate) fn data_property(value: Local<'_, Value>) -> V8PropertyDescriptor {
     descriptor.set_enumerable(true);
     descriptor.set_configurable(true);
     descriptor
+}
+
+/// The two integrity levels a host can set (`v8::IntegrityLevel`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityLevel {
+    Frozen,
+    Sealed,
 }
 
 impl Object {
@@ -234,13 +241,69 @@ impl<'s> LocalHandle<'s, Object> {
     /// The chain is not consulted, so an inherited property answers `false` —
     /// which is the question that tells an array element from a hole, since a
     /// `[[Get]]` of either answers `undefined`.
-    pub fn has_own_property(&self, scope: &PinScope<'_, '_>, key: Local<Value>) -> Option<bool> {
+    ///
+    /// The key is a `Name`, as it is in the crate we stand in for (and in
+    /// `v8.h`): a host's `Local<Value>` key is the divergence, since only a
+    /// string or a symbol can be a property key at all.
+    pub fn has_own_property(&self, scope: &PinScope<'_, '_>, key: Local<Name>) -> Option<bool> {
         let realm = crate::realm_of(scope);
         match api::Object::has_own_key(&realm, self.engine(), key.engine()) {
             Ok(found) => Some(found),
             Err(error) => {
                 crate::throw(scope, &error);
                 None
+            }
+        }
+    }
+
+    /// The own-property descriptor (`v8::Object::GetOwnPropertyDescriptor`), or
+    /// the empty handle when the object has no such own property.
+    ///
+    /// The answer is the plain descriptor object V8 builds — only the fields the
+    /// property carries — made by the `Object.getOwnPropertyDescriptor` builtin's
+    /// own path, so a module namespace reports the live binding rather than the
+    /// placeholder value its object stores.
+    pub fn get_own_property_descriptor<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        key: Local<'_, Name>,
+    ) -> Option<Local<'a, Value>> {
+        let value = *self.engine().value();
+        let key = property_key(&key);
+        let realm = crate::realm_of(scope);
+        match realm.with_agent(|agent| {
+            runtime::builtins::object::own_property_descriptor(agent, &value, &key)
+        }) {
+            Ok(descriptor) if descriptor.is_undefined() => None,
+            Ok(descriptor) => Some(Local::from_engine(api::Local::from(descriptor))),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// SetIntegrityLevel (`v8::Object::SetIntegrityLevel`, spec 7.3.15).
+    ///
+    /// `Frozen` makes every own property non-writable and non-configurable and
+    /// the object non-extensible; `Sealed` stops at non-configurable. `Ok(false)`
+    /// is a refused `[[PreventExtensions]]`, which is the crate we stand in
+    /// for's answer too; `Err` is a thrown trap, with the exception pending.
+    pub fn set_integrity_level(
+        &self,
+        scope: &PinScope<'_, '_>,
+        level: IntegrityLevel,
+    ) -> Result<bool, DataError> {
+        let value = *self.engine().value();
+        let freeze = matches!(level, IntegrityLevel::Frozen);
+        let realm = crate::realm_of(scope);
+        match realm.with_agent(|agent| {
+            runtime::builtins::object::set_integrity_level(agent, &value, freeze)
+        }) {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                crate::throw(scope, &error);
+                Err(DataError::GenericFailure)
             }
         }
     }
@@ -642,7 +705,47 @@ fn panic_proxy_slot(what: &str) -> Local<'static, Value> {
     panic!("bridge: Proxy::{what} on a proxy with no target or handler")
 }
 
+impl Set {
+    /// A new empty set in the scope's realm (`v8::Set::new`).
+    ///
+    /// The `%Set%` intrinsic is constructed, so the set is the one a script
+    /// would make: the engine has no constructor that builds a collection
+    /// without going through it, and a host's set must be indistinguishable
+    /// from a script's.
+    pub fn new<'s>(scope: &PinScope<'s, '_, ()>) -> Local<'s, Set> {
+        let realm = crate::realm_of(scope);
+        let constructor = realm
+            .intrinsic("%Set%")
+            .unwrap_or_else(|| panic!("bridge bug: the realm has no %Set% intrinsic"));
+        match realm.try_construct(&api::Local::from(constructor), &[]) {
+            Ok(set) => Local::from_engine(set),
+            Err(error) => {
+                crate::throw(scope, &error);
+                panic!("bridge: creating a set failed: {error}");
+            }
+        }
+    }
+}
+
 impl<'s> LocalHandle<'s, Map> {
+    /// The number of live entries (`v8::Map::size`).
+    ///
+    /// A deleted-but-not-yet-rebuilt slot is not an entry, which is the same
+    /// tombstone rule [`as_array`](Self::as_array) follows; the count is the
+    /// engine's own, read while the realm is entered.
+    pub fn size(&self) -> usize {
+        let Some(object) = self.engine().value().as_object() else {
+            return 0;
+        };
+        let id = object.id();
+        crate::realm::with_agent(|agent| {
+            agent.map_data.get(&id).map_or(0, |cell| {
+                cell.borrow().entries.iter().filter(|e| e.is_some()).count()
+            })
+        })
+        .unwrap_or(0)
+    }
+
     /// The map's entries as one flat array — key, value, key, value
     /// (`v8::Map::as_array`), in insertion order, with deleted keys left out.
     pub fn as_array<'a>(&self, scope: &PinScope<'a, '_>) -> Local<'a, Array> {
@@ -662,6 +765,21 @@ impl<'s> LocalHandle<'s, Map> {
 }
 
 impl<'s> LocalHandle<'s, Set> {
+    /// The number of live elements (`v8::Set::size`), by the same tombstone
+    /// rule as [`as_array`](Self::as_array).
+    pub fn size(&self) -> usize {
+        let Some(object) = self.engine().value().as_object() else {
+            return 0;
+        };
+        let id = object.id();
+        crate::realm::with_agent(|agent| {
+            agent.set_data.get(&id).map_or(0, |cell| {
+                cell.borrow().entries.iter().filter(|e| e.is_some()).count()
+            })
+        })
+        .unwrap_or(0)
+    }
+
     /// The set's elements as one flat array — each element as both its key and
     /// its value (`v8::Set::as_array`), in insertion order, with deleted
     /// elements left out.
@@ -678,6 +796,23 @@ impl<'s> LocalHandle<'s, Set> {
             Some(entries)
         });
         entries_array(scope, doubled)
+    }
+}
+
+impl<'s> LocalHandle<'s, Date> {
+    /// The time value in milliseconds since the epoch (`v8::Date::ValueOf`).
+    ///
+    /// Read from the engine's per-Date table, the same one
+    /// `Date.prototype.valueOf` reads; `NaN` for a date whose time was never set
+    /// (an invalid date), which is what the engine stores for one.
+    pub fn value_of(&self) -> f64 {
+        let Some(object) = self.engine().value().as_object() else {
+            return f64::NAN;
+        };
+        let id = object.id();
+        crate::realm::with_agent(|agent| agent.date_data.get(&id).copied())
+            .flatten()
+            .unwrap_or(f64::NAN)
     }
 }
 
@@ -1150,17 +1285,146 @@ mod tests {
             let object = Local::<Object>::try_from(eval(scope, "({})")).expect("object");
             let seven = Number::new(scope, 7.0).cast::<Value>();
             assert_eq!(object.set(scope, iterator, seven), Some(true));
-            assert_eq!(object.has_own_property(scope, iterator), Some(true));
+            assert_eq!(object.has_own_property(scope, iterator.cast()), Some(true));
             assert_eq!(
                 number_of(object.get(scope, iterator).expect("the value set")),
                 7.0
             );
             assert_eq!(object.delete(scope, iterator), Some(true));
-            assert_eq!(object.has_own_property(scope, iterator), Some(false));
+            assert_eq!(object.has_own_property(scope, iterator.cast()), Some(false));
 
             let three = Number::new(scope, 3.0).cast::<Value>();
             assert!(object.get(scope, three).is_none());
             assert_eq!(object.has(scope, three), None);
+        });
+    }
+
+    /// A keyed collection's count is its live entries: a deleted key leaves a
+    /// tombstone the count must not see, which is the same rule `as_array`
+    /// follows.
+    #[test]
+    fn a_keyed_collection_reports_its_live_count() {
+        in_context!(scope, {
+            let map =
+                Local::<Map>::try_from(eval(scope, "new Map([[1, 'a'], [2, 'b']])")).expect("map");
+            assert_eq!(map.size(), 2);
+
+            let with_a_delete = Local::<Map>::try_from(eval(
+                scope,
+                "(() => { const m = new Map([[1, 'a'], [2, 'b']]); m.delete(1); return m; })()",
+            ))
+            .expect("map");
+            assert_eq!(with_a_delete.size(), 1, "the tombstone is not an entry");
+
+            let set = Local::<Set>::try_from(eval(scope, "new Set([1, 2, 3])")).expect("set");
+            assert_eq!(set.size(), 3);
+        });
+    }
+
+    /// A set made through the bridge is a real `Set` — the same constructor and
+    /// prototype a script sees — and a script's own additions show up in the
+    /// host's count.
+    #[test]
+    fn a_new_set_is_the_one_a_script_would_make() {
+        in_context!(scope, {
+            let set = Set::new(scope);
+            assert_eq!(set.size(), 0, "a new set is empty");
+            bind(scope, "host_set", set.into());
+            assert_eq!(eval_number(scope, "host_set instanceof Set ? 1 : 0"), 1.0);
+            eval(scope, "host_set.add(7)");
+            assert_eq!(set.size(), 1, "the host reads what the script added");
+        });
+    }
+
+    /// An own-property descriptor is the plain descriptor object — the fields
+    /// the property carries and no others — and an absent property is the empty
+    /// handle rather than a descriptor full of `undefined`.
+    #[test]
+    fn an_own_property_descriptor_is_the_plain_object() {
+        in_context!(scope, {
+            let object = Local::<Object>::try_from(eval(scope, "({ a: 1 })")).expect("object");
+            let key: Local<'_, Name> = String::new(scope, "a").expect("string").into();
+            let descriptor = object
+                .get_own_property_descriptor(scope, key)
+                .expect("descriptor");
+            bind(scope, "descriptor", descriptor);
+            assert_eq!(eval_number(scope, "descriptor.value"), 1.0);
+            assert_eq!(eval_number(scope, "descriptor.writable ? 1 : 0"), 1.0);
+            assert_eq!(eval_number(scope, "descriptor.enumerable ? 1 : 0"), 1.0);
+            assert_eq!(eval_number(scope, "descriptor.configurable ? 1 : 0"), 1.0);
+
+            let missing: Local<'_, Name> = String::new(scope, "b").expect("string").into();
+            assert!(
+                object.get_own_property_descriptor(scope, missing).is_none(),
+                "an absent property is the empty handle"
+            );
+
+            // An accessor reports `get` and `set` and carries no `value`.
+            let accessor = Local::<Object>::try_from(eval(scope, "({ get g() { return 2; } })"))
+                .expect("object");
+            let key: Local<'_, Name> = String::new(scope, "g").expect("string").into();
+            let descriptor = accessor
+                .get_own_property_descriptor(scope, key)
+                .expect("descriptor");
+            bind(scope, "accessor_descriptor", descriptor);
+            assert_eq!(eval_number(scope, "accessor_descriptor.get()"), 2.0);
+            assert_eq!(
+                eval_number(scope, "accessor_descriptor.value === undefined ? 1 : 0"),
+                1.0
+            );
+        });
+    }
+
+    /// The two integrity levels do what their names say: sealed stops at
+    /// non-configurable, frozen also stops at non-writable — and the engine's
+    /// own predicates agree with both.
+    #[test]
+    fn set_integrity_level_seals_and_freezes() {
+        in_context!(scope, {
+            let sealed = Local::<Object>::try_from(eval(scope, "({ a: 1 })")).expect("object");
+            assert!(
+                sealed
+                    .set_integrity_level(scope, IntegrityLevel::Sealed)
+                    .expect("sealed")
+            );
+            bind(scope, "sealed", sealed.into());
+            assert_eq!(eval_number(scope, "Object.isSealed(sealed) ? 1 : 0"), 1.0);
+            assert_eq!(eval_number(scope, "Object.isFrozen(sealed) ? 1 : 0"), 0.0);
+
+            let frozen = Local::<Object>::try_from(eval(scope, "({ a: 1 })")).expect("object");
+            assert!(
+                frozen
+                    .set_integrity_level(scope, IntegrityLevel::Frozen)
+                    .expect("frozen")
+            );
+            bind(scope, "frozen", frozen.into());
+            assert_eq!(eval_number(scope, "Object.isFrozen(frozen) ? 1 : 0"), 1.0);
+            assert_eq!(
+                eval_number(scope, "Object.isExtensible(frozen) ? 1 : 0"),
+                0.0
+            );
+
+            // A primitive is returned unchanged and is trivially frozen, which
+            // is what the spec's step 1 says rather than a special case here.
+            let number = Local::<Object>::try_from(eval(scope, "new Number(1)")).expect("object");
+            assert!(
+                number
+                    .set_integrity_level(scope, IntegrityLevel::Frozen)
+                    .expect("frozen")
+            );
+        });
+    }
+
+    /// A date's time value is the one it was made with; an invalid date is `NaN`,
+    /// which is what the engine stores for one.
+    #[test]
+    fn a_date_reports_its_time_value() {
+        in_context!(scope, {
+            let date = Local::<Date>::try_from(eval(scope, "new Date(1234567890)")).expect("date");
+            assert_eq!(date.value_of(), 1234567890.0);
+
+            let invalid = Local::<Date>::try_from(eval(scope, "new Date(NaN)")).expect("date");
+            assert!(invalid.value_of().is_nan());
         });
     }
 }

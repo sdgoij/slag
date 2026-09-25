@@ -75,13 +75,19 @@ pub fn get_flags() -> Option<String> {
     FLAGS.with(|slot| slot.borrow().clone())
 }
 
+/// The version of what is behind this API (`v8::VERSION_STRING`).
+///
+/// The same statement [`get_version`] makes, so a host that reports the version
+/// in a header and one that asks the API agree — and neither claims to be V8.
+pub const VERSION_STRING: &str = concat!("slag (v8 API ", env!("CARGO_PKG_VERSION"), ")");
+
 /// The version string (v8::V8::GetVersion).
 ///
 /// There is no V8 here, so this names what is: the API level this bridge
 /// implements, behind the engine serving it. A host that compares it against a
 /// V8 version string finds a different one, which is the truthful answer.
 pub fn get_version() -> &'static str {
-    concat!("slag (v8 API ", env!("CARGO_PKG_VERSION"), ")")
+    VERSION_STRING
 }
 
 /// Set the platform to use (v8::V8::InitializePlatform). Must come before

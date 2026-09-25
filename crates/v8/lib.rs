@@ -87,10 +87,12 @@ pub use isolate::{
     CreateParams, HostImportModuleDynamicallyCallback,
     HostImportModuleWithPhaseDynamicallyCallback, HostInitializeImportMetaObjectCallback, Isolate,
     IsolateHandle, NearHeapLimitCallback, OwnedIsolate, PrepareStackTraceCallback,
-    PromiseRejectCallback, UnsafeRawIsolatePtr, WasmAsyncResolvePromiseCallback, WasmAsyncSuccess,
+    PromiseRejectCallback, TimeZoneDetection, UnsafeRawIsolatePtr, WasmAsyncResolvePromiseCallback,
+    WasmAsyncSuccess,
 };
 pub use json::{parse as json_parse, stringify as json_stringify};
 pub use module::{ModuleImportPhase, ModuleStatus, SyntheticModuleEvaluationSteps};
+pub use object::IntegrityLevel;
 pub use platform::{
     IdleTask, Platform, PlatformImpl, Task, new_custom_platform, new_default_platform,
     new_single_threaded_default_platform, new_unprotected_default_platform,
@@ -100,6 +102,9 @@ pub use promise::{PromiseRejectEvent, PromiseRejectMessage, PromiseState};
 pub use property::*;
 pub use property_descriptor::PropertyDescriptor;
 pub use weak::{TracedReference, Weak, WeakCallbackInfo};
+
+/// The version this bridge reports (`v8::VERSION_STRING`).
+pub use V8::VERSION_STRING;
 
 /// When the job queues drain (v8::MicrotasksPolicy).
 ///
@@ -496,5 +501,13 @@ mod tests {
         with_value("new Proxy({}, {})", |value| {
             assert_eq!(value.type_repr(), "Proxy")
         });
+    }
+
+    /// The crate has one version statement: the constant a host reports and the
+    /// function one asks answer the same thing, and neither claims to be V8.
+    #[test]
+    fn the_version_string_is_what_get_version_reports() {
+        assert_eq!(crate::VERSION_STRING, crate::V8::get_version());
+        assert!(crate::VERSION_STRING.starts_with("slag (v8 API "));
     }
 }

@@ -461,4 +461,97 @@ impl<'s> LocalHandle<'s, Value> {
                 text.to_rust_string_lossy(scope)
             })
     }
+
+    /// `typeof` as a string (`v8::Value::TypeOf`, spec 7.2.6).
+    ///
+    /// The engine's own answer rather than a spelling assembled here: it is the
+    /// one place that knows an `IsHTMLDDA` object is `undefined` and a callable
+    /// proxy is `function`, which is the same table the `typeof` operator reads.
+    pub fn type_of<'a>(&self, _scope: &PinScope<'a, '_>) -> Local<'a, String> {
+        Local::from_engine(api::Local::string(self.engine().type_of()))
+    }
+
+    /// `this instanceof constructor` (`v8::Value::InstanceOf`, spec 7.3.20).
+    ///
+    /// The whole operator, so a constructor whose `@@hasInstance` is a method
+    /// answers through it exactly as it does in a script. `None` is a thrown
+    /// `TypeError` — a non-object or non-callable right-hand side, or a trap that
+    /// threw — with the exception pending.
+    pub fn instance_of<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        object: Local<'a, Object>,
+    ) -> Option<bool> {
+        let value = *self.engine().value();
+        let constructor = *object.engine().value();
+        let realm = crate::realm_of(scope);
+        match realm.with_agent(|agent| runtime::expr::instance_of(agent, &constructor, &value)) {
+            Ok(result) => Some(crux::convert::to_boolean(&result)),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::Object;
+    use crate::test_support::{eval, in_context};
+
+    /// `type_of` is the operator's own answer (spec 7.2.6), including the two
+    /// the engine's table decides rather than the value's tag.
+    #[test]
+    fn type_of_is_the_operators_answer() {
+        in_context!(scope, {
+            for (source, expected) in [
+                ("undefined", "undefined"),
+                ("null", "object"),
+                ("true", "boolean"),
+                ("1", "number"),
+                ("1n", "bigint"),
+                ("'x'", "string"),
+                ("Symbol('s')", "symbol"),
+                ("(() => {})", "function"),
+                ("[]", "object"),
+                // A callable proxy is a function, not an object.
+                ("new Proxy(() => {}, {})", "function"),
+            ] {
+                let answer = eval(scope, source)
+                    .type_of(scope)
+                    .to_rust_string_lossy(scope);
+                assert_eq!(answer, expected, "typeof {source}");
+            }
+        });
+    }
+
+    /// `instance_of` is the whole `InstanceofOperator` (spec 7.3.20): the
+    /// prototype walk, an `@@hasInstance` override, and a thrown `TypeError` for
+    /// a right-hand side that can do neither.
+    #[test]
+    fn instance_of_is_the_whole_operator() {
+        in_context!(scope, {
+            let array_ctor = Local::<Object>::try_from(eval(scope, "Array")).expect("Array");
+
+            let array = Local::<Object>::try_from(eval(scope, "[]")).expect("array");
+            assert_eq!(array.instance_of(scope, array_ctor), Some(true));
+
+            let plain = Local::<Object>::try_from(eval(scope, "({})")).expect("object");
+            assert_eq!(plain.instance_of(scope, array_ctor), Some(false));
+
+            // The override: a plain object whose `@@hasInstance` says yes to an
+            // argument no prototype walk would accept.
+            let liar =
+                Local::<Object>::try_from(eval(scope, "({ [Symbol.hasInstance]: () => true })"))
+                    .expect("object");
+            assert_eq!(eval(scope, "1").instance_of(scope, liar), Some(true));
+
+            // Neither callable nor carrying `@@hasInstance`: a `TypeError`, which
+            // is this API's empty answer with the exception pending.
+            let not_callable = Local::<Object>::try_from(eval(scope, "({})")).expect("object");
+            assert_eq!(eval(scope, "1").instance_of(scope, not_callable), None);
+        });
+    }
 }

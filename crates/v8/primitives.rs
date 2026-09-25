@@ -8,7 +8,7 @@ use crux::string::JsString;
 use crux::value::ValueKind;
 use runtime::api;
 
-use crate::data::{Boolean, Int32, Integer, Number, Primitive, String, Symbol, Uint32};
+use crate::data::{Boolean, Int32, Integer, Number, Primitive, String, Symbol, Uint32, Value};
 use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
 
@@ -179,6 +179,28 @@ impl String {
     pub fn new_external_onebyte_static<'s>(
         _scope: &PinScope<'s, '_, ()>,
         buffer: &'static [u8],
+    ) -> Option<Local<'s, String>> {
+        let units: Vec<u16> = buffer.iter().copied().map(u16::from).collect();
+        Some(Self::from_code_units(&units))
+    }
+
+    /// A string over a host-owned byte buffer
+    /// (`v8::String::NewExternalOneByte`).
+    ///
+    /// The bytes are read as Latin-1, one code unit each, as there. The buffer
+    /// is *copied* rather than kept: the engine's strings are UTF-16 in every
+    /// variant (`Flat`, `Small`, `ConsString`, `Rope`, `Sliced`) and there is no
+    /// byte- or externally-backed form to hang a host allocation on, so the text
+    /// is the same as the crate we stand in for's while the zero-copy external
+    /// string is not. `.notes/embedding.md` §9 records the divergence; the
+    /// `Box` is freed when this returns.
+    // The parameter is the crate we stand in for's shape — it hands the buffer to
+    // the string and keeps it alive — and the call sites do not change, so the box
+    // stays even though this implementation copies out of it at once.
+    #[allow(clippy::boxed_local)]
+    pub fn new_external_onebyte<'s>(
+        _scope: &PinScope<'s, '_, ()>,
+        buffer: Box<[u8]>,
     ) -> Option<Local<'s, String>> {
         let units: Vec<u16> = buffer.iter().copied().map(u16::from).collect();
         Some(Self::from_code_units(&units))
@@ -459,6 +481,31 @@ impl<'s> LocalHandle<'s, String> {
         }
         written
     }
+
+    /// [`write_utf8_uninit_v2`](Self::write_utf8_uninit_v2) into a slice the
+    /// caller already initialized (`v8::String::WriteUtf8`).
+    ///
+    /// The same encoder — its bytes are exactly what it is asked to write — so
+    /// the initialized slice is only viewed as the uninitialized one it fills;
+    /// see [`write_utf8_uninit_v2`](Self::write_utf8_uninit_v2) for the encoding
+    /// rules.
+    pub fn write_utf8_v2(
+        &self,
+        scope: &crate::Isolate,
+        buffer: &mut [u8],
+        flags: WriteFlags,
+        processed_characters_return: Option<&mut usize>,
+    ) -> usize {
+        // SAFETY: `u8` and `MaybeUninit<u8>` have the same layout, and the
+        // encoder writes into every byte it covers and reads none of them.
+        let uninit = unsafe {
+            std::slice::from_raw_parts_mut(
+                buffer.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                buffer.len(),
+            )
+        };
+        self.write_utf8_uninit_v2(scope, uninit, flags, processed_characters_return)
+    }
 }
 
 /// Whether `unit` is the trail of a surrogate pair whose lead is `previous`
@@ -680,6 +727,28 @@ pub unsafe fn latin1_to_utf8(input_length: usize, inbuf: *const u8, outbuf: *mut
 /// A handle for a symbol the engine's own tables hold.
 fn symbol_handle<'s>(symbol: crux::handle::Handle<crux::symbol::Symbol>) -> Local<'s, Symbol> {
     Local::from_engine(api::Local::from(crux::value::Value::Symbol(symbol)))
+}
+
+impl<'s> LocalHandle<'s, Symbol> {
+    /// The symbol's description as a value (`v8::Symbol::Description`): the
+    /// string it was made with, or `undefined` for one made without a
+    /// description.
+    ///
+    /// Read off the symbol's own field, which is the same field
+    /// `Symbol.prototype.description` reads, so a host and a script agree on a
+    /// symbol that has one.
+    pub fn description<'a>(&self, _scope: &PinScope<'a, '_>) -> Local<'a, Value> {
+        let description = match self.engine().value().kind() {
+            ValueKind::Symbol(symbol) => symbol.description.clone(),
+            _ => None,
+        };
+        match description {
+            Some(text) => Local::from_engine(api::Local::from(crux::value::Value::String(
+                crux::handle::Handle::new(text),
+            ))),
+            None => Local::from_engine(api::Local::undefined()),
+        }
+    }
 }
 
 impl Symbol {
@@ -1222,6 +1291,83 @@ mod onebyte_const_tests {
             let astral = String::new(scope, "\u{1F600}").expect("string");
             assert!(!astral.is_onebyte());
             assert!(!astral.contains_only_onebyte());
+        });
+    }
+}
+
+#[cfg(test)]
+mod string_and_symbol_tests {
+    use super::*;
+    use crate::test_support::{eval, in_context};
+
+    /// The description a symbol carries is the one it was made with, and a
+    /// symbol made without one answers `undefined` — not an empty string.
+    #[test]
+    fn a_symbol_reports_the_description_it_was_made_with() {
+        in_context!(scope, {
+            let symbol = Local::<Symbol>::try_from(eval(scope, "Symbol('hi')")).expect("symbol");
+            let description = symbol.description(scope);
+            assert!(!description.is_undefined());
+            assert_eq!(
+                Local::<String>::try_from(description)
+                    .expect("string")
+                    .to_rust_string_lossy(scope),
+                "hi"
+            );
+
+            let bare = Local::<Symbol>::try_from(eval(scope, "Symbol()")).expect("symbol");
+            assert!(
+                bare.description(scope).is_undefined(),
+                "a symbol made without a description has none"
+            );
+        });
+    }
+
+    /// `write_utf8_v2` writes the same bytes `utf8_length` counts, reports the
+    /// code units it covered, and honours `kReplaceInvalidUtf8` — which is the
+    /// difference between valid UTF-8 and a lone surrogate written as itself.
+    #[test]
+    fn write_utf8_v2_writes_bytes_and_reports_code_units() {
+        in_context!(scope, {
+            let text = Local::<String>::try_from(eval(scope, "'a\\u{1F600}b'")).expect("string");
+            assert_eq!(text.utf8_length(scope), 6);
+            let mut buffer = [0u8; 16];
+            let mut nchars = 0;
+            let written = text.write_utf8_v2(
+                scope,
+                &mut buffer,
+                WriteFlags::kReplaceInvalidUtf8,
+                Some(&mut nchars),
+            );
+            assert_eq!(&buffer[..written], "a\u{1F600}b".as_bytes());
+            assert_eq!(nchars, 4, "the astral character is two code units");
+
+            let lone = Local::<String>::try_from(eval(scope, "'\\uD800'")).expect("string");
+            let mut replaced = [0u8; 8];
+            let written =
+                lone.write_utf8_v2(scope, &mut replaced, WriteFlags::kReplaceInvalidUtf8, None);
+            assert_eq!(&replaced[..written], "\u{FFFD}".as_bytes());
+
+            let mut raw = [0u8; 8];
+            let written = lone.write_utf8_v2(scope, &mut raw, WriteFlags::empty(), None);
+            assert_eq!(
+                &raw[..written],
+                [0xED, 0xA0, 0x80],
+                "unreplaced, the surrogate is its own three bytes"
+            );
+        });
+    }
+
+    /// An external one-byte string reads its bytes as Latin-1 — one code unit
+    /// per byte, so a byte above ASCII is not the first byte of a UTF-8
+    /// sequence.
+    #[test]
+    fn an_external_onebyte_string_carries_the_bytes_as_latin1() {
+        in_context!(scope, {
+            let text =
+                String::new_external_onebyte(scope, Box::new([0x41, 0xE9, 0xFF])).expect("string");
+            assert_eq!(text.to_utf16(), [0x41, 0xE9, 0xFF]);
+            assert_eq!(text.to_rust_string_lossy(scope), "A\u{E9}\u{FF}");
         });
     }
 }

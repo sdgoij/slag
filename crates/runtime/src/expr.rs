@@ -1383,29 +1383,41 @@ pub(crate) fn apply_binary(
                 )),
             }
         }
-        BinaryOp::Instanceof => {
-            // InstanceofOperator (spec 7.3.20): an @@hasInstance method on the
-            // right-hand side overrides the default prototype-chain walk.
-            if !matches!(right.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "Right-hand side of 'instanceof' is not an object".into(),
-                ));
-            }
-            if let Some(handler) = get_method(agent, right, "@@hasInstance")? {
-                let result =
-                    crate::function::call(agent, &handler, *right, std::slice::from_ref(left))?;
-                return Ok(Value::Boolean(to_boolean(&result)));
-            }
-            if !is_callable(right) {
-                return Err(JsError::new(
-                    ErrorKind::TypeError,
-                    "Right-hand side of 'instanceof' is not callable".into(),
-                ));
-            }
-            ordinary_has_instance(agent, right, left)
-        }
+        BinaryOp::Instanceof => instance_of(agent, right, left),
     }
+}
+
+/// InstanceofOperator (spec 7.3.20): `value instanceof constructor`.
+///
+/// `pub` so the bridge's `v8::Value::InstanceOf` reuses the operator's own path
+/// rather than the bare [`ordinary_has_instance`]: an `@@hasInstance` method on
+/// the constructor overrides the prototype walk for a script and a host alike.
+pub fn instance_of(
+    agent: &mut Agent,
+    constructor: &Value,
+    value: &Value,
+) -> Result<Value, JsError> {
+    if !matches!(
+        constructor.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    ) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Right-hand side of 'instanceof' is not an object".into(),
+        ));
+    }
+    if let Some(handler) = get_method(agent, constructor, "@@hasInstance")? {
+        let result =
+            crate::function::call(agent, &handler, *constructor, std::slice::from_ref(value))?;
+        return Ok(Value::Boolean(to_boolean(&result)));
+    }
+    if !is_callable(constructor) {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Right-hand side of 'instanceof' is not callable".into(),
+        ));
+    }
+    ordinary_has_instance(agent, constructor, value)
 }
 
 /// OrdinaryHasInstance (spec 7.3.19): walk the prototype chain of `value`

@@ -21,7 +21,7 @@ use slag::buffers::{
 
 use crate::data::{
     ArrayBuffer, ArrayBufferView, BigInt64Array, BigUint64Array, Float16Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, SharedArrayBuffer, Uint8Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, SharedArrayBuffer, TypedArray, Uint8Array,
     Uint8ClampedArray, Uint16Array, Uint32Array, Value,
 };
 use crate::handle::{Local, LocalHandle};
@@ -359,6 +359,14 @@ impl SharedArrayBuffer {
 }
 
 impl<'s> LocalHandle<'s, SharedArrayBuffer> {
+    /// The byte length (`v8::SharedArrayBuffer::byte_length`).
+    ///
+    /// The buffer's own length: a shared buffer cannot be detached, so there is
+    /// no zero-length state for this to report.
+    pub fn byte_length(&self) -> usize {
+        buffer_facts(self.engine()).map_or(0, |facts| facts.byte_length)
+    }
+
     /// A shared reference to the bytes
     /// (`v8::SharedArrayBuffer::get_backing_store`).
     ///
@@ -369,6 +377,26 @@ impl<'s> LocalHandle<'s, SharedArrayBuffer> {
         let facts = buffer_facts(self.engine())
             .expect("bridge bug: a SharedArrayBuffer handle needs the realm it came from");
         SharedRef::new(facts.store())
+    }
+}
+
+impl<'s> LocalHandle<'s, TypedArray> {
+    /// The number of elements (`v8::TypedArray::length`).
+    ///
+    /// The engine's one live rule for a view's element count: a length-tracking
+    /// view follows its buffer, a detached view covers none, and a fixed view
+    /// the buffer has shrunk under covers none until it grows back (spec 25.2.2.1
+    /// steps 12-14). Reading the same rule the `length` getter and
+    /// [`ArrayBufferView::byte_length`](Self::byte_length) are built on keeps a
+    /// host's count and a script's from being two spellings of one fact.
+    pub fn length(&self) -> usize {
+        let Some(object) = self.engine().value().as_object() else {
+            return 0;
+        };
+        match &object.kind {
+            ObjectKind::IntegerIndexed(slots) => crux::object::typed_array_effective_length(slots),
+            _ => 0,
+        }
     }
 }
 
@@ -1031,6 +1059,43 @@ mod tests {
 
             let floats = ArrayBuffer::new(scope, 8);
             assert!(Float64Array::new(scope, floats, 0, 1).is_some());
+        });
+    }
+
+    /// A typed array's `length` is an element count, not a byte count: two
+    /// `f64`s are two elements and sixteen bytes, and a fixed view the buffer has
+    /// shrunk under covers none.
+    #[test]
+    fn a_typed_array_reports_its_element_count() {
+        in_context!(scope, {
+            let floats =
+                Local::<Float64Array>::try_from(eval(scope, "new Float64Array(2)")).expect("view");
+            assert_eq!(floats.length(), 2);
+            assert_eq!(floats.byte_length(), 16);
+
+            // The same answer through the `TypedArray` tag itself, which every
+            // concrete element type derefs into.
+            let typed =
+                Local::<TypedArray>::try_from(eval(scope, "new Uint32Array(4)")).expect("view");
+            assert_eq!(typed.length(), 4);
+            assert_eq!(typed.byte_length(), 16);
+
+            // A length-tracking view follows its buffer.
+            let tracking = Local::<Uint8Array>::try_from(eval(scope, "new Uint8Array([1, 2, 3])"))
+                .expect("view");
+            assert_eq!(tracking.length(), 3);
+        });
+    }
+
+    /// A shared buffer's byte length is its own: a shared buffer cannot be
+    /// detached, so there is no zero-length state for it to report.
+    #[test]
+    fn a_shared_buffer_reports_its_byte_length() {
+        in_context!(scope, {
+            let shared =
+                Local::<SharedArrayBuffer>::try_from(eval(scope, "new SharedArrayBuffer(8)"))
+                    .expect("buffer");
+            assert_eq!(shared.byte_length(), 8);
         });
     }
 }

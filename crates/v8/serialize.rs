@@ -578,7 +578,7 @@ impl<'a> ValueSerializerHeap<'a> {
             // `get_index` is a `[[Get]]`, which cannot tell a hole from an
             // element holding `undefined`; the own-property question is the one
             // that can, and it is the one a hole is.
-            let present = match array.has_own_property(scope, key) {
+            let present = match array.has_own_property(scope, key.cast()) {
                 Some(present) => present,
                 None => return Err(Failed),
             };
@@ -1578,7 +1578,7 @@ mod tests {
             scope: &mut PinScope<'s, '_>,
             object: Local<'s, Object>,
         ) -> Option<bool> {
-            object.has_own_property(scope, string_value(scope, "host")?)
+            object.has_own_property(scope, string_value(scope, "host")?.cast())
         }
 
         fn write_host_object<'s>(
