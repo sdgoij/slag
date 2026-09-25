@@ -4749,6 +4749,16 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it since the bridge is one crate; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,382 passed / 0 failed** (`v8` 278, up two; `runtime` 936, up one — the engine's heap test is not feature-gated; `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p runtime --no-default-features --lib` **905 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine's `api` changed, so the corpora were re-run after a release build and the settle sleep and every number is at baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt (the engine and the bridge are both what deno links) and holds at **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+*The `Local<T>` tag shape, branch (b) — §9's bullet with the probe and §10's with the design, and the last structural item the `E0512` frontier named.* A host that stores a `Global`'s raw pointer and rebuilds a scoped handle from it — 13 sites in deno, all `std::mem::transmute(agg.start.as_ptr())` — needs what the crate we stand in for has: a one-word `Local<T>` whose pointer is a valid handle. Ours was a `Payload` plus a zero-sized tag, 192 bits, so the transmute was an `E0512`; the design was recorded before code moved (§9's last bullet), and this is its landing. `Local<'s, T>` is now `#[repr(transparent)]` over `NonNull<Payload>`: the payload lives in a cell the innermost handle scope's region allocates (`crate::store`'s arena, beside its script slots), `Deref` hands out the cell's address so the receiver idiom and all ~22 `payload()` readers are untouched, `retag`/`cast_unchecked`/`extend_lifetime_unchecked` rename the same cell instead of rebuilding one, `Handle::into_payload` copies it out, and `Global` gains `#[repr(C)]` so its box address *is* the payload's and `into_raw` hands out a valid `Local` — which is the step that makes the 13 sites mean what they say, not merely compile (`Local` becoming one word is what silences the `E0512`; the repr is what makes the pointer correct). `Local` stays `Copy` (the cell belongs to the region) and `!Send`. Three decisions came with it, each recorded in §9 before the code: `Local::new` narrows to the *scope reference's* lifetime, the one signature that does, because the cell it names dies with that scope; `CallbackScope` and `EscapableHandleScope` therefore borrow the enclosing region instead of opening one, which is what keeps a resolver's returned handle alive and what makes `Escape` need no promotion; and a closed region *poisons* its cells with a new `Payload::Poisoned` that every reader panics on, so a handle that outlived its scope is a loud bug — in the window before a later region reuses the slot — rather than a read of whatever took it.
+
+*The requirement the design missed, found by the first run rather than by review.* The first pass failed 22 of the bridge's tests, 21 of them the poison panic (the callback and escapable scopes were still opening regions: step 2), and one of them something else — `wasm`'s `a_wasm_module_round_trips_through_its_compiled_form` reported that two module objects were the same handle, which they were: the first had been **collected**, and a later allocation took its arena slot. The payload moved off the Rust stack into a heap cell, and the conservative stack scan that had been incidentally rooting every scoped handle — because the engine `Gc` pointer used to sit in the `Local` on the stack — could no longer see it. A handle scope *keeps its values alive*; that is the whole contract, so the arena registers itself as a `crux::heap::RootSource` (the mechanism §7's slice 1 built for the `ffi` handle tables), visiting exactly `[0, len)` of the cells: closing a region lowers `len`, so a handle whose scope has closed is no longer a root either. That is the part's one engine-adjacent discovery, and it needed no engine change — the registry, the `Trace` impls and `pinned_roots` were already there.
+
+*Tests — five, six mutations, each caught by its own test.* `store` gains three: `a_cells_address_survives_further_allocations` (the pointer stays valid across four chunk boundaries, which is what the chunking is for — a plain `Vec` would move it), `a_closed_region_poisons_the_cells_it_held`, and `a_nested_close_hands_its_cells_back`. `handle` gains the rooting guard, `a_scoped_handle_keeps_its_value_alive_across_a_collection` — an object nothing else references (not `eval`'s completion value, not the realm), a forced collection, 64 allocating objects to take any freed slot, then the property read — and `a_persistent_handle_survives_a_trip_through_a_raw_pointer` grows the transmute the 13 sites make: the raw pointer is read as a `Local<Value>` *before* it is taken back, so the one-word claim is tested and not just compiled. Six mutations, each run alone and each caught by its own test: dropping the root registration and, separately, emptying `Payload::trace` of its value arm both fail the rooting guard (the read comes back `Value`, not `Number`); dropping `poison_from` fails the poison test; reverting `CallbackScope` and, separately, `EscapableHandleScope` to opening a region fail `module`'s `a_handle_made_in_a_callback_scope_can_be_returned_from_it` and `stack_trace`'s `an_escapable_scope_escapes_a_scripts_value_to_the_callers_lifetime`; and moving `payload` off offset zero in `Global` fails the raw-pointer test. One of those mutations is why the rooting guard exists in its final shape: the first version used `eval`'s result and *could not fail*, because the completion value is rooted elsewhere — the mutation said so.
+
+*The measurement.* `cargo check -p deno_snapshots`: **17 → 4**, and the `E0512` transmutes are **13 → 0** — all eleven `ext/node_sqlite` sites and both `ext/ffi/callback.rs` ones now compile, and neither crate fails any more. The four left are the two `deno_web`/`deno_webgpu` errors §9 already records as the structural remainder (`Rc<BackingStore>: Send` and webgpu's `E0521`) plus their two crate summaries; nothing new surfaced. The bridge's own suite holds: `cargo test -p v8 --features simdutf` **288 passed / 0 failed** (the 284 baseline plus this part's three store tests and the rooting guard).
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,386 passed / 0 failed** (`v8` **282**, up four, from 278 — the rooting guard is in the default build too; `crux` 258, `ffi` 10, `runtime` 936, `slag` 4, `test262` 3324 unmoved); `cargo test -p runtime --no-default-features --lib` **905 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than assumed**: the part touches only `crates/v8` (6 files), and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` and the same for `wasmtest` are both **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -8150,6 +8160,152 @@ migrate, then delete.
   isolate rather than a marker and those two explicit annotations are right
   instead of merely un-compiled; `WeakCallbackInfo<T>` itself stays as the type
   the crate's surface names. No other `Weak`/`TracedReference` shape moves.
+- **The `Local<T>` tag shape — probed, and it is a lifetime-ownership question
+  rather than a representation one, so it is not named as a part yet.** The 13
+  `E0512` sites (11 in `ext/node_sqlite/database.rs`, 2 in `ext/ffi/callback.rs`)
+  all transmute a raw pointer back into a handle —
+  `std::mem::transmute(agg.start.as_ptr())`, where the field is a
+  `NonNull<v8::Value>` filled from `v8::Global::new(..).into_raw()` — so they
+  need what the crate we stand in for has: `Local<T>` of one word, and the
+  pointer a valid `Local<T>`. Ours is `Payload` plus a zero-sized tag, 192 bits
+  against the pointer's 64. A cell pointer is the one shape that satisfies all
+  three constraints at once — the size (one word), the pointer's meaning (cells,
+  not inline payloads), and the bridge's receiver idiom (`&T` is the payload's
+  address, which is how every tag method and the ~22 `payload()` readers work) —
+  and the probe's finding is that those cells have nowhere *sound* to live. A
+  scope-owned arena is the V8-shaped answer and is closed here by two documented
+  surfaces rather than by effort: a handle is `Copy` (so a cell cannot be
+  reference-counted per handle), and a handle deliberately outlives the scope it
+  was made in — `Local::new`'s `'s` is free on purpose ("a host that opens a
+  callback scope and returns the handle it makes — which the crate's module
+  resolvers all do"), and `PinnedRef<CallbackScope>`'s widening `Deref` rests on
+  the same promise — a decision already landed here for that reason (§12 item 8,
+  taken to close two deno `E0515`s, with a test that returns a supplied promise at
+  the caller's lifetime). An arena reset at a scope boundary would dangle exactly those
+  handles, and a reset at the isolate's end is no bound at all for a host that
+  runs for hours. What is left is a permanent leak per handle (unbounded in any
+  host that makes handles in a loop — which is every host) or an intern table,
+  which has the same lifetime question one level down. So the fork belongs to the
+  operator, and both branches are cheap to state: (a) declare raw-pointer handle
+  recovery *out of scope*, as §1's table already declares `v8.h` source
+  compatibility — it is a pattern of the crate's own internals (`into_raw` is
+  documented "must be reclaimed with `from_raw` or leaked") that two addons lean
+  on, not a capability a Deno-class host needs, and those addons can reach the
+  same values through the safe API — or (b) take the contract change, which means
+  `Local` stops being `Copy`, or `Local::new` stops widening, or both, and every
+  bridge surface is then re-examined against deno's call sites. Nothing in the
+  frontier moves until that choice is made. **Branch (b) is the operator's
+  choice** (2026-09-25), and the rest of this bullet is the design that follows
+  from it — written before any code moves, for review.
+- **The tag shape, branch (b): a handle's payload lives in its scope's region, and
+  the handle's lifetime becomes the scope reference's — the design.** Four facts,
+  established by reading rather than hoped for, reduce this to something small.
+  (1) The bridge already solved the underlying problem once: `crate::store` holds
+  a *script* payload as a regioned slot, opened and closed by `HandleScope`
+  (`open_region`/`close_region`, already called from `new_in` and `Drop`), with a
+  generation so a reference whose scope has closed reads `None` and the caller
+  panics about its own bug — its own doc says why, "a handle has to be `Copy`, but
+  a script's source is heap data of unbounded size, so the payload cannot hold it
+  inline". The cell arena is that design generalized to every payload, not a new
+  mechanism. (2) The receiver idiom survives untouched: `LocalHandle` is
+  `#[repr(C)] { payload, marker }` and `Deref for Local<T>` hands out the payload's
+  address, so a `Local<T>` that *points at* a cell keeps every tag method and the
+  ~22 `payload()` readers working exactly as they do — which is why the 41
+  `from_payload` and 129 `from_engine` call sites do not change at all. (3) The
+  lifetime that must name the region is the **scope reference's**, not the type
+  parameter: `PinScope<'p, 'i, C>` is `PinnedRef<'p, …>`, and `'p` ends when the
+  scope object drops — which is when its region closes. The callback-scope case
+  that forced §12 item 8's widening falls out for free: `PinnedRef<CallbackScope>`
+  derefs to `PinnedRef<'i, HandleScope<'i, C>>`, so there `'p == 'i`, and a handle
+  made through a callback scope is tied to exactly the enclosing lifetime deno's
+  resolvers need. (4) `Local: Copy` therefore *survives*: a cell is owned by the
+  region, not by the handle, so copying a handle copies a pointer into its scope's
+  arena. So the change is: `Local<'s, T>` becomes `#[repr(transparent)]` over
+  `NonNull<Payload>` with `'s` meaning the scope reference's lifetime; a
+  thread-local region stack keeps a cell arena beside `store`'s slots;
+  `from_payload`/`from_engine` push into the innermost region; `Deref` reads the
+  cell; `Handle::into_payload` copies the cell out; `Local::new` returns
+  `Local<'p, T>` from the scope reference instead of a free `'s` (the one
+  signature that narrows — measured: 356 `Local::new(` sites in deno, and the ones
+  that matter are the resolvers, which the callback-scope case above keeps); a
+  `CallbackScope` allocates from the **enclosing** region rather than opening one,
+  which is what its `'i` has meant since §12 item 8 — the mechanism is that its
+  inner `HandleScope` records whether it opened a region, so its `Drop` closes only
+  what it opened; a closed region **poisons**
+  its cells with a sentinel `Payload` variant whose readers panic the way a stale
+  script slot does, so an escaped handle is a loud bug rather than freed memory;
+  and `Global` gains `#[repr(C)]` so `into_raw` can hand out the *payload's*
+  address (offset 0 in its box) — that address is a valid `Local<T>` under the new
+  representation, which is the whole point, and `from_raw` casts the same address
+  back, keeping today's pin-reclaiming semantics. What does not change: the
+  engine (its arena already gives stable addresses — §7's reasoning survives
+  intact), `Global`, `Weak`, `TracedReference`, `MaybeLocal`, `store`, the
+  receiver idiom and every construction site. What is *paid*: one bump allocation
+  per handle (today, none), thread-local state behind every handle read (bounded
+  by the region, which is the same bound a scope already gives scripts), and the
+  bridge's handle documentation rewritten — "nothing about a handle depends on a
+  scope's lifetime" becomes "a handle is valid for the scope reference it was made
+  from, which is what its `'s` now means". `Local` stays `!Send`, so no
+  cross-thread hazard is added. Order of work, each step gated on the previous
+  one compiling and the bridge's 284 tests holding: the arena and the `Local`
+  representation (with `into_raw`/`from_raw` left alone, so the E0512 sites stay
+  red); then the callback-scope/enclosing-region rule and the poison sentinel;
+  then `into_raw`/`from_raw` and `#[repr(C)]`, which is the step that turns the 13
+  `E0512`s green; then the doc rewrite. Before that first step, one measurement is
+  owed: that every `Local` is created with a region open (deno's `Local::new`,
+  `Global::get`, `Weak::to_local`, the template callbacks and the module resolvers
+  all take a scope, but the claim is worth a check rather than an assumption) — and
+  the fallback, if a path has none, is `store`'s own answer: panic naming the bug.
+  Acceptance: the 13 `E0512` sites compile, the bridge's 284 tests and deno's
+  `deno_core` 453/6 hold, and both corpora and the eight wasm sweeps are at
+  baseline. One ordering correction, found by making the change: `Local` becoming
+  one word is itself what makes the `E0512` sites *compile* (the transmute's two
+  sides stop differing in size), so step 1 turns them green syntactically; what
+  step 3 supplies is that the pointer they hand back is the *payload's* address
+  and so a valid `Local` — until then they would compile and read the wrong
+  bytes. The gate that matters is therefore not "`E0512` is gone" but "the
+  transmuted pointer reads the value it named", and only step 3's repr gives it.
+  **Landed**; §7 records it, including the one requirement the design did not
+  name — a scoped handle still has to *root* its value, which it did before only
+  because the payload sat on the Rust stack for the conservative scan to find,
+  and which the cell arena now does by registering as a root source.
+- **The tag shape, branch (b): two points settled while implementing step 1,
+  recorded before the code.** (1) `EscapableHandleScope` inherits its enclosing
+  region exactly as `CallbackScope` does, and for the same reason: its `Deref`
+  hands out `PinnedRef<'p, HandleScope<'s, C>>`, so a handle made through it is
+  tied to that scope's `'p`, and `Escape`'s answer is tied to its own `'s` —
+  neither can name a region the escapable scope opened itself, because such a
+  region dies at the escapable scope's `Drop` while both answers are promised to
+  outlive that `Drop` (`'p` is the escapable scope's storage borrow, and `'s` is
+  the scope it was opened over, so both reach past the escapable scope; the
+  enclosing region, opened by the innermost `HandleScope` below it, is what
+  lives at least that long). With inheritance the escaped payload is already in
+  the enclosing region, so `Escape` needs no promotion and no code change: only
+  `HandleScope` opens a region, and every other scope type wraps one or borrows
+  one. The cost, stated: a handle made under an escapable scope is reclaimed when
+  the enclosing scope closes rather than when the escapable scope does — looser
+  than V8's invalidation, never tighter; and an escapable or callback scope whose
+  only enclosing scope an isolate is (no region open at all) reaches the panic the
+  measurement below is owed for. One caveat inheritance carries and the type
+  system does not close: the region a handle lands in is the *innermost open*
+  one, so a host that opens an unrelated `HandleScope` over the isolate while an
+  escapable scope is open and then escapes gets a cell in that unrelated region,
+  shorter-lived than the escape's `'s`. Deno's `escapable_handle_scope!` nests
+  lexically (a nested scope borrows the escapable scope, which blocks the escape),
+  so this is a hypothetical a host writes deliberately, recorded rather than
+  guarded. (2) The cell arena is one chunked, append-only
+  buffer per thread beside `store`'s slots — chunks of `Payload` that are never
+  reallocated, so a handle's pointer never moves. A plain `Vec<Payload>` cannot
+  serve: growth reallocates and would invalidate every outstanding handle, which
+  is why it is chunked. `close_region` overwrites its region's cells with the
+  poison sentinel, and the outermost close clears the chunks' *lengths* while
+  keeping their memory, so the poison survives until a later region reuses the
+  slot. The guarantee stated honestly: while the outermost open region is alive, a
+  handle whose own region closed reads the poison and panics; after a reuse only
+  `unsafe` (a transmute, or `extend_lifetime_unchecked`) could have reached, it
+  aliases — the poison makes the escapes the type system cannot see loud, it does
+  not replace the type system. Memory is bounded by the outermost scope's
+  high-water mark, not by the isolate's lifetime.
 
 ## 11. Working rules
 

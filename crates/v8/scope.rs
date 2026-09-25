@@ -101,6 +101,12 @@ pub struct HandleScope<'i, C = Context> {
     isolate: Isolate,
     /// The realm this scope operates on. Empty for `C = ()`.
     context: Option<api::Context>,
+    /// Whether this scope opened the region its handles live in, and so is the
+    /// one that closes it. `true` for a `HandleScope`; `false` for a
+    /// [`CallbackScope`] and an [`EscapableHandleScope`], which borrow the
+    /// enclosing region so that a handle they hand out can carry the enclosing
+    /// lifetime instead of their own borrow (see [`CallbackScope`]).
+    owns_region: bool,
     marker: PhantomData<&'i mut C>,
     _pinned: PhantomPinned,
 }
@@ -108,9 +114,21 @@ pub struct HandleScope<'i, C = Context> {
 impl<'i, C> HandleScope<'i, C> {
     fn new_in(isolate: Isolate, context: Option<api::Context>) -> Self {
         store::open_region();
+        Self::with_region(isolate, context, true)
+    }
+
+    /// A scope whose handles live in the enclosing region rather than one it
+    /// opens: a [`CallbackScope`] or an [`EscapableHandleScope`]. Its `Drop`
+    /// closes nothing, and the enclosing scope closes what it opened.
+    fn new_inherited(isolate: Isolate, context: Option<api::Context>) -> Self {
+        Self::with_region(isolate, context, false)
+    }
+
+    fn with_region(isolate: Isolate, context: Option<api::Context>, owns_region: bool) -> Self {
         Self {
             isolate,
             context,
+            owns_region,
             marker: PhantomData,
             _pinned: PhantomPinned,
         }
@@ -119,7 +137,9 @@ impl<'i, C> HandleScope<'i, C> {
 
 impl<C> Drop for HandleScope<'_, C> {
     fn drop(&mut self) {
-        store::close_region();
+        if self.owns_region {
+            store::close_region();
+        }
     }
 }
 
@@ -517,8 +537,16 @@ impl<P: ScopeInit> Drop for ContextScope<'_, '_, P> {
     }
 }
 
-/// A handle scope for a callback (`v8::CallbackScope`). Slag has no callback
-/// handle region to open; the type exists so host code that opens one compiles.
+/// A handle scope for a callback (`v8::CallbackScope`).
+///
+/// It opens no region of its own: it borrows the enclosing one, so a handle it
+/// hands out lives as long as the scope it was made from — which is what its
+/// `Deref` widening to `PinnedRef<'i, HandleScope<'i, C>>` promises, and what a
+/// host's helper returning a handle it built in a callback scope relies on. A
+/// callback scope that opens a region would invalidate exactly those handles at
+/// its own `Drop`, one scope before the lifetime its `Deref` handed out. Deno's
+/// `callback_scope!(cb, context); scope!(scope, cb);` prologue is unaffected: the
+/// nested `scope!` is an ordinary `HandleScope` and opens its own region.
 ///
 /// Its `Deref` is not the reborrow the other scopes' are: the handles it hands
 /// out live as long as the thing it was made from — the context, which is the
@@ -526,8 +554,9 @@ impl<P: ScopeInit> Drop for ContextScope<'_, '_, P> {
 /// That is the crate we stand in for's own choice, and the reason a host's helper
 /// can return a handle it built in a callback scope at all. The obligation it
 /// places on a host is real here too, and what it costs is stated in
-/// [`crate::store`]: a *script* handle that outlives the scope names a released
-/// slot, which panics rather than reading a later script's text.
+/// [`crate::store`]: a handle that outlives the enclosing scope reads a poisoned
+/// cell, and a *script* handle among them a released slot, either of which panics
+/// rather than reading whatever took the place.
 #[repr(C)]
 pub struct CallbackScope<'i, C = Context> {
     inner: HandleScope<'i, C>,
@@ -690,7 +719,7 @@ fn callback_scope_from<'s, C>(
     context: Option<api::Context>,
 ) -> CallbackScope<'s, C> {
     CallbackScope {
-        inner: HandleScope::new_in(isolate, context),
+        inner: HandleScope::new_inherited(isolate, context),
     }
 }
 
@@ -919,9 +948,19 @@ pub trait NewEscapableHandleScope<'s> {
 
 /// A handle scope one handle can escape from (v8::EscapableHandleScope).
 ///
-/// Nothing has to be promoted here: a [`Local`] is a value that outlives the
-/// scope that made it, so [/escape](PinnedRef::escape) only widens a lifetime
-/// and this scope exists so host code that escapes a handle compiles.
+/// Nothing has to be promoted here: a [`Local`] names a payload cell, and this
+/// scope borrows the *enclosing* region rather than opening one, so a handle it
+/// hands out — and the one [`escape`](PinnedRef::escape) returns — already lives
+/// in a region that outlives it. That is the same rule a [`CallbackScope`]
+/// follows, and for the same reason: `Deref` ties an ordinary handle to the
+/// escapable scope's storage borrow and `escape` ties its answer to the scope it
+/// was opened over, and a region this scope opened itself would die at its
+/// `Drop`, before both. The cost is that a handle made under an escapable scope is
+/// reclaimed when the enclosing scope closes rather than here — looser than V8's
+/// invalidation, never tighter.
+///
+/// A nested `HandleScope::new(escapable)` borrows the escapable scope, which is
+/// what keeps an escape from being called while such a scope is open.
 #[repr(C)]
 pub struct EscapableHandleScope<'s, 'esc, C = Context> {
     inner: HandleScope<'s, C>,
@@ -963,7 +1002,7 @@ impl<'s> NewEscapableHandleScope<'s> for Isolate {
     fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
         let context = me.current_context();
         EscapableHandleScope {
-            inner: HandleScope::new_in(*me, context),
+            inner: HandleScope::new_inherited(*me, context),
             marker: PhantomData,
             _pinned: PhantomPinned,
         }
@@ -975,7 +1014,7 @@ impl<'s, 'obj: 's, 'i, C> NewEscapableHandleScope<'s> for PinnedRef<'obj, Handle
 
     fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
         EscapableHandleScope {
-            inner: HandleScope::new_in(me.0.isolate, me.0.context),
+            inner: HandleScope::new_inherited(me.0.isolate, me.0.context),
             marker: PhantomData,
             _pinned: PhantomPinned,
         }

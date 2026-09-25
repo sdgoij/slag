@@ -380,10 +380,7 @@ impl format::HostCallbacks for SnapshotCallbacks {
             // The pinned value, as the engine's own handle: `Global` keeps it a
             // root for as long as this table holds it, which is what makes the
             // value the walk reads the one the function was built with.
-            data: recorded
-                .data
-                .as_ref()
-                .map(|pinned| *pinned.handle().engine()),
+            data: recorded.data.as_ref().map(|pinned| pinned.engine_value()),
         })
     }
 

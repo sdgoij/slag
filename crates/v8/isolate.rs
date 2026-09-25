@@ -1193,7 +1193,7 @@ impl Isolate {
     pub(crate) fn private_symbol(&self, description: Option<&[u16]>) -> api::Local {
         let key = description.unwrap_or_default().to_vec();
         if let Some(held) = self.inner().private_names.borrow().get(&key) {
-            return *held.handle().engine();
+            return held.engine_value();
         }
         let symbol = crux::symbol::Symbol::new(description.map(JsString::from_utf16));
         let value = api::Local::from(crux::value::Value::Symbol(crux::handle::Handle::new(
@@ -1212,7 +1212,7 @@ impl Isolate {
             .private_names
             .borrow()
             .values()
-            .any(|held| held.handle().engine().value().as_symbol() == Some(symbol))
+            .any(|held| held.engine_value().value().as_symbol() == Some(symbol))
     }
 
     /// Keep a resolver pair's rejecting function (`v8::Promise::Resolver`).
@@ -1230,7 +1230,7 @@ impl Isolate {
             .resolver_rejects
             .borrow()
             .get(&resolve)
-            .map(|held| *held.handle().engine())
+            .map(|held| held.engine_value())
     }
 
     /// Whether this isolate stores a function template at `pointer`.
@@ -1264,7 +1264,7 @@ impl Isolate {
             .extras_bindings
             .borrow()
             .get(&context)
-            .map(|held| *held.handle().engine())
+            .map(|held| held.engine_value())
     }
 
     /// Remember a context's extras binding object, pinned on this isolate.

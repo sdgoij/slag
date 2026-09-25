@@ -7,6 +7,7 @@ use std::ops::Deref;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use crux::heap::Trace;
 use crux::value::ValueKind;
 use runtime::api;
 
@@ -70,12 +71,18 @@ pub enum Payload {
     TemplateMessage {
         module: api::Module,
     },
+    /// A cell whose region has closed ([`crate::store`]). Reading one means a
+    /// handle outlived the scope it was made from, which safe code cannot
+    /// express; the sentinel is what turns the `unsafe` ways of doing it into a
+    /// panic at the read rather than a read of whatever the slot holds next.
+    Poisoned,
 }
 
 impl Payload {
     pub(crate) fn as_value(&self) -> &api::Local {
         match self {
             Self::Value(value) => value,
+            Self::Poisoned => self.poisoned(),
             _ => panic!("bridge bug: a non-value handle read as a value"),
         }
     }
@@ -91,6 +98,7 @@ impl Payload {
             | Self::ModuleRequests { .. }
             | Self::StackFrame { .. }
             | Self::TemplateMessage { .. } => None,
+            Self::Poisoned => self.poisoned(),
         }
     }
 
@@ -108,6 +116,7 @@ impl Payload {
             Self::ModuleRequests { .. } => "a module's request list",
             Self::StackFrame { .. } => "a stack frame",
             Self::TemplateMessage { .. } => "a message",
+            Self::Poisoned => "a released handle",
         }
     }
 
@@ -115,6 +124,7 @@ impl Payload {
     pub(crate) fn as_stack_frame(&self) -> Option<(api::Local, u32)> {
         match self {
             Self::StackFrame { trace, index } => Some((*trace, *index)),
+            Self::Poisoned => self.poisoned(),
             _ => None,
         }
     }
@@ -122,6 +132,7 @@ impl Payload {
     pub(crate) fn as_context(&self) -> api::Context {
         match self {
             Self::Context(context) => *context,
+            Self::Poisoned => self.poisoned(),
             _ => panic!("bridge bug: a non-Context handle read as a Context"),
         }
     }
@@ -129,6 +140,7 @@ impl Payload {
     pub(crate) fn as_module(&self) -> api::Module {
         match self {
             Self::Module(module) => *module,
+            Self::Poisoned => self.poisoned(),
             _ => panic!("bridge bug: a non-Module handle read as a Module"),
         }
     }
@@ -138,6 +150,7 @@ impl Payload {
     pub(crate) fn as_module_request(&self) -> Option<(api::Module, u32)> {
         match self {
             Self::ModuleRequest { module, index } => Some((*module, *index)),
+            Self::Poisoned => self.poisoned(),
             _ => None,
         }
     }
@@ -145,6 +158,7 @@ impl Payload {
     pub(crate) fn as_module_requests(&self) -> Option<api::Module> {
         match self {
             Self::ModuleRequests { module } => Some(*module),
+            Self::Poisoned => self.poisoned(),
             _ => None,
         }
     }
@@ -163,7 +177,37 @@ impl Payload {
                 crate::store::entry(*slot, *generation)
                     .expect("bridge bug: a Script handle outlived its handle scope"),
             ),
+            Self::Poisoned => self.poisoned(),
             _ => None,
+        }
+    }
+
+    /// Never returns: a poisoned cell is always a bug. Spelled as a method so
+    /// the arms above read as "this cell is dead" rather than repeating the
+    /// panic, and so the return type is the arm's own.
+    fn poisoned(&self) -> ! {
+        panic!("bridge bug: a handle read after its handle scope closed")
+    }
+
+    /// Visit the engine box this payload names, for the collector.
+    ///
+    /// A scoped handle keeps its value alive until its scope closes, which is
+    /// what a handle scope means; a handle names a *cell* rather than the value,
+    /// so the collector cannot see it and the cell arena is registered as a root
+    /// source ([`crate::store`]) that calls this. A payload that names no heap
+    /// box — a realm held by the isolate, a module reachable from the realm, a
+    /// script's text, a minted message — visits nothing.
+    pub(crate) fn trace(&self, visit: &mut dyn FnMut(crux::heap::GcAny)) {
+        match self {
+            Self::Value(value) => value.value().trace(visit),
+            Self::StackFrame { trace, .. } => trace.value().trace(visit),
+            Self::Context(_)
+            | Self::Module(_)
+            | Self::Script { .. }
+            | Self::ModuleRequest { .. }
+            | Self::ModuleRequests { .. }
+            | Self::TemplateMessage { .. }
+            | Self::Poisoned => {}
         }
     }
 }
@@ -183,6 +227,7 @@ impl fmt::Debug for Payload {
             Self::ModuleRequests { module: _ } => f.write_str("Payload::ModuleRequests(..)"),
             Self::StackFrame { trace: _, index } => write!(f, "Payload::StackFrame({index})"),
             Self::TemplateMessage { module: _ } => f.write_str("Payload::TemplateMessage(..)"),
+            Self::Poisoned => f.write_str("Payload::Poisoned"),
         }
     }
 }
@@ -198,13 +243,23 @@ type Tag<'s, T> = PhantomData<(&'s (), fn() -> T)>;
 /// The tag `T` decides which methods are in scope, and — as in the crate we
 /// stand in for — a tag *reference* is a receiver: `Local<'s, T>` derefs to `T`,
 /// which derefs into the [`LocalHandle`] carrying the methods. That chain is what
-/// makes `&v8::Value` callable, and the address it hands out is the handle's own
-/// payload, so a `&T` and the `Local` it came from name the same thing.
+/// makes `&v8::Value` callable, and the address it hands out is the payload the
+/// handle names, so a `&T` and the `Local` it came from name the same thing.
 ///
-/// A handle is `Copy`, as it is in the crate we stand in for.
-#[repr(C)]
+/// A handle is one word: a pointer into the innermost handle scope's region
+/// ([`crate::store::cell`]), where its [`Payload`] lives. That is the shape a
+/// host that stores a raw pointer and rebuilds a handle from it depends on —
+/// `Global::into_raw`, and the transmutes a host builds over it (§9) — and it is
+/// why the payload is not written into the tag, which is zero-sized.
+///
+/// A handle is `Copy`, as it is in the crate we stand in for, because the cell
+/// belongs to the region rather than to the handle.
+#[repr(transparent)]
 pub struct Local<'s, T> {
-    payload: Payload,
+    /// The cell this handle names. Only ever made by [`crate::store::cell`], so
+    /// it is a live payload in a region that outlives `'s` — which is the scope
+    /// reference the handle was made from, not a typestate.
+    cell: NonNull<Payload>,
     marker: Tag<'s, T>,
 }
 
@@ -220,7 +275,8 @@ pub struct Local<'s, T> {
 /// It is scaffolding and is deleted with the last of those moves. Until then it
 /// is the one deliberate difference from the crate we stand in for: a host that
 /// names a method by UFCS on a tag, or implements a trait *for* a tag, sees it
-/// (§9). Layout is [`Local`]'s, which is what lets a tag reference be read as one.
+/// (§9). Its layout is the *cell*'s — a payload at offset zero — which is what
+/// lets a tag reference be read as one.
 #[repr(C)]
 pub struct LocalHandle<'s, T> {
     payload: Payload,
@@ -252,13 +308,16 @@ impl<'s, T> LocalHandle<'s, T> {
         }
     }
 
-    /// Retag in place: the payload is untouched, so this is a rebuild, not a
-    /// reinterpretation. By reference, because the payload is `Copy` and the
-    /// handle the tag derefs into is not — the crate we stand in for's tags are
+    /// Retag in place: the payload cell is untouched, so this is a reinterpretation
+    /// of the same address, not a rebuild. By reference, because the handle the
+    /// tag derefs into is not `Copy` — the crate we stand in for's tags are
     /// mostly not `Copy` either, which is why a `to_*` method taking `&self` is
     /// its shape and not a lint about the receiver.
     pub(crate) fn retag<U>(&self) -> Local<'s, U> {
-        Local::from_payload(self.payload)
+        Local {
+            cell: NonNull::from(&self.payload),
+            marker: PhantomData,
+        }
     }
 
     /// The same handle under another tag, by reference.
@@ -281,25 +340,26 @@ impl<T> fmt::Debug for LocalHandle<'_, T> {
 
 /// The tag a handle points at.
 ///
-/// The address is the handle's payload, and a tag is zero-sized, so this
-/// reference carries the address and nothing else: it never reaches the tag's
-/// (empty) bytes, and the tag's own deref turns it back into the
+/// The address is the payload cell the handle names, and a tag is zero-sized, so
+/// this reference carries the address and nothing else: it never reaches the
+/// tag's (empty) bytes, and the tag's own deref turns it back into the
 /// [`LocalHandle`] whose methods it names.
 impl<T> Deref for Local<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
         // SAFETY: every `&T` a host can hold is made here or by the tag-to-tag
-        // derefs, so the address is a live `Local`'s payload, which outlives the
-        // borrow this reference is tied to.
-        unsafe { &*(&self.payload as *const Payload as *const T) }
+        // derefs, so the address is a live payload cell — every way to build a
+        // `Local` goes through `from_payload`, which allocates one in an open
+        // region — and a tag is zero-sized, so nothing of the tag's own is read.
+        unsafe { &*(self.cell.as_ptr() as *const T) }
     }
 }
 
 impl<'s, T> Local<'s, T> {
     pub(crate) fn from_payload(payload: Payload) -> Self {
         Self {
-            payload,
+            cell: crate::store::cell(payload),
             marker: PhantomData,
         }
     }
@@ -318,46 +378,54 @@ impl<'s, T> Local<'s, T> {
 
     /// Construct a handle from an existing persistent handle (`v8::Local::New`).
     ///
-    /// The scope is the shape's, not this bridge's: a handle here is the value
-    /// it carries, so nothing about it depends on a scope's lifetime, and
-    /// tying the answer to the scope's *borrow* would say otherwise. A host
+    /// The answer's lifetime is the *scope reference's*, which is the one shape
+    /// here that narrows: the cell it names lives in that scope's region, so a
+    /// handle claiming to outlive the scope would name a poisoned cell. A host
     /// that opens a callback scope and returns the handle it makes — which the
-    /// crate's module resolvers all do — carries the callback's lifetime, not
-    /// the body-local scope's, and this is the signature that lets it.
-    pub fn new<'i, H: Handle<Data = T>>(_scope: &PinScope<'_, 'i, ()>, handle: H) -> Local<'s, T> {
-        Self::from_payload(handle.into_payload())
+    /// crate's module resolvers all do — still gets the callback's own lifetime,
+    /// because that is what a callback scope's `Deref` widens its `PinScope` to
+    /// ([`crate::scope::CallbackScope`]).
+    pub fn new<'p, 'i, H: Handle<Data = T>>(
+        _scope: &PinScope<'p, 'i, ()>,
+        handle: H,
+    ) -> Local<'p, T> {
+        Local::from_payload(handle.into_payload())
     }
 
     /// The engine value behind the handle.
     pub(crate) fn engine(&self) -> &api::Local {
-        self.payload.as_value()
+        self.payload().as_value()
     }
 
     /// The payload, for the tag predicates in [`data`](crate::data).
     pub(crate) fn payload(&self) -> &Payload {
-        &self.payload
+        // SAFETY: the cell is live — `from_payload` is the only constructor, and
+        // it allocates one — and it is the same borrow `self` is.
+        unsafe { self.cell.as_ref() }
     }
 
     /// The realm behind a `Context` handle.
     pub(crate) fn context(&self) -> api::Context {
-        self.payload.as_context()
+        self.payload().as_context()
     }
 
     /// The record behind a `Module` handle.
     pub(crate) fn module(&self) -> api::Module {
-        self.payload.as_module()
+        self.payload().as_module()
     }
 
     /// Retag the handle, with no check that the payload is of the new tag.
     ///
-    /// Safe, unlike the crate we stand in for: the payload is untouched and the
-    /// tag is phantom, so this is a rebuild rather than a reinterpretation. It is
+    /// Safe, unlike the crate we stand in for: the payload cell is untouched and
+    /// the tag is phantom, so this names the same cell under another tag. It is
     /// the bridge's own retag, not the crate's `cast` (which checks and panics) —
     /// kept separate for the callers that know the tag from context and cannot
     /// pay for a check, like the `From`/`TryFrom` tables in [`crate::data`].
     pub(crate) fn retag<U>(self) -> Local<'s, U> {
-        let Self { payload, .. } = self;
-        Local::from_payload(payload)
+        Local {
+            cell: self.cell,
+            marker: PhantomData,
+        }
     }
 
     /// Attempts to cast the contained type to another, returning an error if the
@@ -388,7 +456,7 @@ impl<'s, T> Local<'s, T> {
     /// # Safety
     ///
     /// In the crate we stand in for this reinterprets a pointer, hence the
-    /// `unsafe`; here the payload is plain data and the call is a rebuild, so the
+    /// `unsafe`; here it renames the same cell under another tag, so the
     /// signature is reproduced for the shapes. The bound is the crate's own: it
     /// asks that the *other* direction is a conversion that exists at all.
     #[inline(always)]
@@ -396,16 +464,18 @@ impl<'s, T> Local<'s, T> {
     where
         Local<'s, A>: TryFrom<Self>,
     {
-        let Local { payload, .. } = other;
-        Local::from_payload(payload)
+        Local {
+            cell: other.cell,
+            marker: PhantomData,
+        }
     }
 
     /// Widen the handle's lifetime (v8::Local::extend_lifetime_unchecked).
     ///
     /// # Safety
     ///
-    /// A handle is plain data, so nothing here can enforce that what it names
-    /// outlives `'o`: the caller must know it does — which is what a host
+    /// A handle names a cell in a region, so nothing here can enforce that the
+    /// region outlives `'o`: the caller must know it does — which is what a host
     /// holding a persistent handle and a scope at once does know.
     #[inline(always)]
     pub unsafe fn extend_lifetime_unchecked<'o, O>(self) -> O
@@ -418,8 +488,9 @@ impl<'s, T> Local<'s, T> {
 
     /// The engine value behind the handle, as a `Value`.
     pub(crate) fn into_engine(self) -> api::Local {
-        match self.payload {
+        match *self.payload() {
             Payload::Value(value) => value,
+            Payload::Poisoned => panic!("bridge bug: a handle read after its handle scope closed"),
             _ => panic!("bridge bug: a non-value handle read as a value"),
         }
     }
@@ -435,7 +506,7 @@ impl<T> Copy for Local<'_, T> {}
 
 impl<T> fmt::Debug for Local<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.payload, f)
+        fmt::Debug::fmt(self.payload(), f)
     }
 }
 
@@ -466,9 +537,12 @@ impl<'o, 's, T> ExtendLifetime<'s, T> for Local<'o, T> {
     type Input = Local<'s, T>;
 
     unsafe fn extend_lifetime_unchecked_from(value: Local<'s, T>) -> Self {
-        // The lifetime is a type-level marker over a payload that is already
-        // plain data, so widening it rebuilds the handle and nothing else.
-        Local::from_payload(value.payload)
+        // The lifetime is a type-level marker over a cell pointer, so widening
+        // it names the same cell under a longer lifetime and nothing else.
+        Local {
+            cell: value.cell,
+            marker: PhantomData,
+        }
     }
 }
 
@@ -476,7 +550,7 @@ impl<T, Rhs: Handle> PartialEq<Rhs> for Local<'_, T> {
     /// Identity between two handles, whatever their tags: the payload is what a
     /// handle names, and the tag is a type-level selector.
     fn eq(&self, other: &Rhs) -> bool {
-        payload_eq(&self.payload, other.payload_ref())
+        payload_eq(self.payload(), other.payload_ref())
     }
 }
 
@@ -502,7 +576,8 @@ pub(crate) fn identity_hash(payload: &Payload) -> NonZeroI32 {
         | Payload::ModuleRequest { .. }
         | Payload::ModuleRequests { .. }
         | Payload::TemplateMessage { .. }
-        | Payload::StackFrame { .. } => {
+        | Payload::StackFrame { .. }
+        | Payload::Poisoned => {
             panic!("bridge bug: a handle with no identity was hashed")
         }
     }
@@ -640,6 +715,13 @@ impl<'s, T> Default for MaybeLocal<'s, T> {
 /// of every collection until the handle is dropped. Without one, a collection
 /// could free the box and the handle would silently alias whatever reused the
 /// address.
+/// `#[repr(C)]` because the payload has to sit at offset zero: [`into_raw`] hands
+/// the payload's address out as a one-word handle — the shape a host rebuilds a
+/// `Local` from ([`crate::handle::Local`]) — and a box's address is its first
+/// field's when the first field is at offset zero.
+///
+/// [`into_raw`]: Self::into_raw
+#[repr(C)]
 pub struct Global<T> {
     payload: Payload,
     /// Held only for its `Drop`; releasing the pin is the whole of its API.
@@ -677,7 +759,8 @@ impl<T> Global<T> {
             | Payload::Script { .. }
             | Payload::ModuleRequest { .. }
             | Payload::ModuleRequests { .. }
-            | Payload::StackFrame { .. } => None,
+            | Payload::StackFrame { .. }
+            | Payload::Poisoned => None,
         };
         let script = payload.as_script_entry().map(Rc::new);
         Self {
@@ -702,7 +785,8 @@ impl<T> Global<T> {
             | Payload::ModuleRequest { .. }
             | Payload::ModuleRequests { .. }
             | Payload::StackFrame { .. }
-            | Payload::TemplateMessage { .. } => false,
+            | Payload::TemplateMessage { .. }
+            | Payload::Poisoned => false,
         }
     }
 
@@ -732,15 +816,37 @@ impl<T> Global<T> {
     /// The handle this persistent one holds, with no scope to pass.
     ///
     /// [`get`](Self::get) takes a scope because the crate we stand in for needs
-    /// one to rebuild a handle; the bridge's handles are already scope-free, so
-    /// this is for the isolate's own storage, which has no scope in hand.
+    /// one to rebuild a handle; the bridge's handle needs one too, now that it is
+    /// a pointer into a region, so this is for the callers that hold a scope
+    /// without being handed one — the template callbacks the engine runs inside a
+    /// host's own scope. Callers with no region open read [`engine_value`] or
+    /// [`identity_hash`] instead.
+    ///
+    /// [`engine_value`]: Self::engine_value
+    /// [`identity_hash`]: Self::identity_hash
     pub(crate) fn handle(&self) -> Local<'_, T> {
         Local::from_payload(self.payload)
     }
 
+    /// The engine value this handle wraps, without building a scoped handle.
+    ///
+    /// For the isolate's own storage, which holds a `Global` and no scope: a
+    /// `Local` would have to allocate a cell in a region, and there is none to
+    /// allocate in.
+    pub(crate) fn engine_value(&self) -> api::Local {
+        *self.payload.as_value()
+    }
+
+    /// The identity hash of what this handle names, without building a scoped
+    /// handle — `Hash for Global` runs wherever a host's own map is used, scope
+    /// or none.
+    pub(crate) fn identity_hash(&self) -> NonZeroI32 {
+        identity_hash(&self.payload)
+    }
+
     /// The payload by value, for a caller holding a longer lifetime than this
-    /// handle: a `Local` is a payload plus a lifetime, so this is what the scope
-    /// types rebuild into a handle of their own.
+    /// handle: a `Local` is a payload in a region plus a lifetime, and this is
+    /// what the scope types rebuild into a handle of their own.
     pub(crate) fn payload_value(&self) -> Payload {
         self.payload
     }
@@ -748,14 +854,21 @@ impl<T> Global<T> {
     /// Consume this handle and hand out a raw pointer to it
     /// (`v8::Global::into_raw`).
     ///
-    /// The pointer owns the handle: it has to come back through
-    /// [`from_raw`](Self::from_raw), or what was rooted stays rooted. That is the
-    /// crate we stand in for's contract too, where the V8-side slot stays pinned
-    /// until it is taken back; here the handle is one boxed value in host memory,
-    /// so "not taken back" is one leaked box rather than a pin the collector
-    /// must hold.
+    /// The pointer *is* a valid one-word `Local<T>`: it names the payload, which
+    /// sits at offset zero of the box, so a host that stores it and transmutes it
+    /// back gets the value this handle held (§9). The pointer owns the handle: it
+    /// has to come back through [`from_raw`](Self::from_raw), or what was rooted
+    /// stays rooted. That is the crate we stand in for's contract too, where the
+    /// V8-side slot stays pinned until it is taken back; here the handle is one
+    /// boxed value in host memory, so "not taken back" is one leaked box rather
+    /// than a pin the collector must hold.
+    ///
+    /// ```text
+    /// box address == payload address == what a `Local<T>` is
+    /// ```
     pub fn into_raw(self) -> NonNull<T> {
-        // SAFETY: `Box::into_raw` never hands back a null pointer.
+        // SAFETY: `Box::into_raw` never hands back a null pointer. The address is
+        // the box's, which is the payload's — `#[repr(C)]` with `payload` first.
         unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(self))) }.cast::<T>()
     }
 
@@ -794,7 +907,8 @@ impl<T> Clone for Global<T> {
                 | Payload::Script { .. }
                 | Payload::ModuleRequest { .. }
                 | Payload::ModuleRequests { .. }
-                | Payload::StackFrame { .. } => None,
+                | Payload::StackFrame { .. }
+                | Payload::Poisoned => None,
             },
             script: self.script.clone(),
             marker: PhantomData,
@@ -833,12 +947,16 @@ pub trait Handle: Sized {
 impl<T> Handle for Local<'_, T> {
     type Data = T;
 
+    /// Copy the payload out of the cell this handle names. A handle is a
+    /// pointer, so a caller that wants the payload itself — [`Global::new`],
+    /// [`Local::new`] — reads through it rather than taking ownership of a cell
+    /// the region owns.
     fn into_payload(self) -> Payload {
-        self.payload
+        *self.payload()
     }
 
     fn payload_ref(&self) -> &Payload {
-        &self.payload
+        self.payload()
     }
 }
 
@@ -846,11 +964,11 @@ impl<T> Handle for &Local<'_, T> {
     type Data = T;
 
     fn into_payload(self) -> Payload {
-        self.payload
+        *self.payload()
     }
 
     fn payload_ref(&self) -> &Payload {
-        &self.payload
+        self.payload()
     }
 }
 
@@ -904,9 +1022,43 @@ mod tests {
         });
     }
 
+    /// A handle keeps its value alive until its scope closes — the whole contract
+    /// of a handle scope, and the reason the cell arena is registered as a root
+    /// source. The payload lives in a cell the collector cannot see, so without
+    /// that registration the sweep here frees the object and a later allocation
+    /// takes its box, which is what the read at the end would then see.
+    #[test]
+    fn a_scoped_handle_keeps_its_value_alive_across_a_collection() {
+        use crate::data::{Number, Object};
+        in_context!(scope, {
+            // Nothing but this handle references the object: not a script's
+            // completion value, not its realm.
+            let object = Object::new(scope);
+            let key = crate::data::String::new(scope, "tag").expect("key");
+            let seven = Local::<Value>::from(Number::new(scope, 7.0));
+            object.set(scope, key.into(), seven).expect("set");
+
+            crate::realm_of(scope).with_agent(|agent| agent.collect_garbage());
+            // Allocate after the sweep, so a freed slot is taken before the read.
+            for _ in 0..64 {
+                let _ = Object::new(scope);
+            }
+
+            let read = object.get(scope, key.into()).expect("get");
+            assert_eq!(
+                Local::<Number>::try_from(read).expect("number").value(),
+                7.0
+            );
+        });
+    }
+
     /// The raw-pointer trip the host this stands in for makes: a persistent
     /// handle is handed out as a pointer, kept somewhere with no scope in reach,
     /// and taken back. The value is still the one it named in between.
+    ///
+    /// The pointer is a valid one-word `Local<T>` while it is out, which is what
+    /// the `E0512` sites §9 names depend on — they store it and transmute it back
+    /// — so this reads through it before taking the handle back.
     #[test]
     fn a_persistent_handle_survives_a_trip_through_a_raw_pointer() {
         in_context!(scope, {
@@ -915,6 +1067,12 @@ mod tests {
             let persistent = Global::new(&isolate, value);
 
             let raw = persistent.into_raw();
+            // SAFETY: `raw` names the payload the leaked box holds — the one-word
+            // `Local<T>` the representation promises — and the box is not taken
+            // back until below, so the cell is live.
+            let borrowed: Local<Value> = unsafe { std::mem::transmute(raw) };
+            assert_eq!(borrowed, value, "the pointer names the value it did");
+
             let mut isolate = isolate;
             // SAFETY: `raw` is the pointer `into_raw` handed out just above, and
             // it is taken back here — once.

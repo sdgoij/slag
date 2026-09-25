@@ -1094,7 +1094,7 @@ macro_rules! identity_hashes {
 
             impl Hash for Global<$tag> {
                 fn hash<H: Hasher>(&self, state: &mut H) {
-                    self.handle().identity_hash().hash(state);
+                    self.identity_hash().hash(state);
                 }
             }
         )*
