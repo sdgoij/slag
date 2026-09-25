@@ -81,7 +81,7 @@ pub use function::{
     FunctionCallbackInfo, FunctionCallbackInfoParts, ReturnValue, SideEffectType,
 };
 pub use handle::{Global, Handle, Local, MaybeLocal};
-pub use heap::HeapStatistics;
+pub use heap::{GCCallbackFlags, GCType, GcCallback, HeapSpaceStatistics, HeapStatistics};
 pub use interceptor::{NamedPropertyHandlerConfiguration, PropertyCallbackArguments};
 pub use isolate::{
     CreateParams, HostImportModuleDynamicallyCallback,

@@ -1,7 +1,7 @@
 //! The isolate: the engine's isolate, plus what the bridge records on it.
 
 use std::any::{Any, TypeId};
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
@@ -258,6 +258,12 @@ pub struct IsolateInner {
     /// the first read of a `stack` and kept so one isolate has one set of method
     /// functions rather than one per read.
     callsite_prototype: RefCell<Option<Global<Object>>>,
+    /// The host's collection callbacks, in installation order
+    /// (`v8::Isolate::AddGCPrologueCallback` and its epilogue sibling).
+    pub(crate) gc_callbacks: RefCell<Vec<crate::heap::GcCallbackEntry>>,
+    /// Whether the engine has this isolate's collection observer, which is
+    /// installed with the first callback rather than once per callback.
+    pub(crate) gc_observer_registered: Cell<bool>,
 }
 
 const _: () = assert!(std::mem::offset_of!(IsolateInner, engine) == 0);
@@ -726,6 +732,8 @@ impl Isolate {
             import_dynamically_with_phase: None,
             prepare_stack_trace: None,
             callsite_prototype: RefCell::new(None),
+            gc_callbacks: RefCell::new(Vec::new()),
+            gc_observer_registered: Cell::new(false),
         });
         // SAFETY: the box's allocation is where the state lives and it outlives
         // every handle to it — `OwnedIsolate` keeps it alive.
@@ -781,6 +789,31 @@ impl Isolate {
     pub unsafe fn from_raw_isolate_ptr(ptr: UnsafeRawIsolatePtr) -> Self {
         // SAFETY: the caller's contract.
         unsafe { Self(NonNull::new_unchecked(ptr.0)) }
+    }
+
+    /// The handle for a pointer a host kept, under the name a collection
+    /// callback uses (v8::Isolate::from_raw_isolate_ptr_unchecked).
+    ///
+    /// The crate separates this from [`from_raw_isolate_ptr`](Self::from_raw_isolate_ptr)
+    /// by a thread-affinity assertion, not by the conversion: this bridge makes no
+    /// such assertion anywhere (its isolate handle is a plain pointer, and the
+    /// engine's own thread rules are what a host obeys), so the two do the same
+    /// thing and this carries the name the callback sites read. It answers the
+    /// handle by value where there is a `&'static mut` borrow, because there is no
+    /// `Isolate` in host memory to borrow — the pointer *is* the handle.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must name an isolate that is still alive.
+    pub unsafe fn from_raw_isolate_ptr_unchecked(ptr: UnsafeRawIsolatePtr) -> Self {
+        // SAFETY: the caller's contract.
+        unsafe { Self(NonNull::new_unchecked(ptr.0)) }
+    }
+
+    /// This isolate's inner address, for the bridge's own modules that have to
+    /// hand an isolate back to a host (see `heap`'s collection observer).
+    pub(crate) fn as_inner_ptr(&self) -> *mut IsolateInner {
+        self.0.as_ptr()
     }
 
     /// This isolate's address, for a host that keeps one across calls
@@ -1495,7 +1528,9 @@ impl Isolate {
         let _ = is_idle;
     }
 
-    fn inner(&self) -> &IsolateInner {
+    /// The inner state, for the bridge's own modules — the GC observer reads the
+    /// host's collection callbacks from it.
+    pub(crate) fn inner(&self) -> &IsolateInner {
         // SAFETY: the handle only exists for a live inner, which the
         // `OwnedIsolate` that made it keeps alive.
         unsafe { self.0.as_ref() }

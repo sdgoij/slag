@@ -1080,6 +1080,12 @@ pub struct Agent {
     /// a collection between creates cannot free the shape (`function.rs`
     /// `function_boilerplate_map`).
     pub(crate) function_boilerplate_maps: [Option<crux::Handle<crux::Map>>; 2],
+    /// The host's collection observers, in registration order
+    /// (`crux::heap::GcObserver`). Taken out for the duration of a collection
+    /// so one that runs host code cannot re-enter this list — a nested
+    /// collection then runs none, which is also V8's shape: a collection never
+    /// starts inside one.
+    collection_observers: RefCell<Vec<Box<dyn crux::heap::GcObserver>>>,
 }
 
 impl Drop for Agent {
@@ -1255,6 +1261,7 @@ impl Agent {
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             construct_maps: Box::new(std::array::from_fn(|_| None)),
             function_boilerplate_maps: [None; 2],
+            collection_observers: RefCell::new(Vec::new()),
             vm_pool: Vec::new(),
             jit_hook: None,
             jit_depth: 0,
@@ -2142,10 +2149,34 @@ impl Agent {
         self.collect_with(extra, true);
     }
 
+    /// Register an observer of this agent's collections
+    /// (`v8::Isolate::AddGCPrologueCallback` and its epilogue sibling, whose
+    /// engine side this is).
+    ///
+    /// The observer runs around every collection this agent drives, prologue
+    /// before the mark and epilogue after the sweep, with the generation. A
+    /// host that measures a pause needs both ends, since a sweep's cost is the
+    /// half a prologue-only hook cannot see.
+    pub fn add_collection_observer(&self, observer: Box<dyn crux::heap::GcObserver>) {
+        self.collection_observers.borrow_mut().push(observer);
+    }
+
     /// The shared collection driver: the roots, the weak-compaction hook, and
     /// the abort conditions are identical for both generations; `minor` selects
     /// the young-only collector and its bookkeeping.
     fn collect_with(&self, extra: Option<GcAny>, minor: bool) {
+        let generation = if minor {
+            crux::heap::GcGeneration::Minor
+        } else {
+            crux::heap::GcGeneration::Major
+        };
+        // Taken out for the duration: an observer runs host code, and this list
+        // must not be borrowed while that runs. A collection an observer
+        // triggers therefore runs none of its own (see the field's note).
+        let observers = std::mem::take(&mut *self.collection_observers.borrow_mut());
+        for observer in &observers {
+            observer.prologue(generation);
+        }
         // GC-2: a native build in progress (the class element build holds
         // `build_roots`) — abort the sweep (retain everything) so its local
         // buffers cannot be swept.
@@ -2213,6 +2244,10 @@ impl Agent {
                     .len()
             }
         });
+        for observer in &observers {
+            observer.epilogue(generation);
+        }
+        *self.collection_observers.borrow_mut() = observers;
         if minor {
             // A minor reclassifies only its own cohort, so the major's growth
             // baseline (the post-major live count) is deliberately untouched.
@@ -2593,6 +2628,44 @@ mod tests {
         let agent = Agent::new();
         assert!(agent.running_context().is_err());
         assert!(agent.current_realm().is_err());
+    }
+
+    #[test]
+    fn an_observer_brackets_each_collection_with_its_generation() {
+        use crux::heap::{GcGeneration, GcObserver};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Watch(Rc<RefCell<Vec<(&'static str, GcGeneration)>>>);
+
+        impl GcObserver for Watch {
+            fn prologue(&self, generation: GcGeneration) {
+                self.0.borrow_mut().push(("prologue", generation));
+            }
+
+            fn epilogue(&self, generation: GcGeneration) {
+                self.0.borrow_mut().push(("epilogue", generation));
+            }
+        }
+
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        agent.add_collection_observer(Box::new(Watch(Rc::clone(&seen))));
+
+        agent.collect_garbage();
+        agent.collect_minor_garbage_with(None);
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                ("prologue", GcGeneration::Major),
+                ("epilogue", GcGeneration::Major),
+                ("prologue", GcGeneration::Minor),
+                ("epilogue", GcGeneration::Minor),
+            ],
+            "each collection is bracketed, and the two generations are told apart"
+        );
     }
 
     #[test]

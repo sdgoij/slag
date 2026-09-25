@@ -1421,6 +1421,33 @@ pub fn register_root_source(source: &'static dyn RootSource) {
     });
 }
 
+/// The generation a collection collected.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GcGeneration {
+    /// A young-only collection ([`Heap::collect_minor`] and its
+    /// stack-scanning sibling).
+    Minor,
+    /// A whole-heap collection ([`Heap::collect`] and its siblings).
+    Major,
+}
+
+/// Host code that observes a collection around it.
+///
+/// A [`RootSource`] is *read* while a collection starts and may not allocate
+/// there; an observer is *run* at the collection's boundaries, so it may
+/// allocate and run host code — which is what a host timing a pause does.
+/// Registered per agent (the runtime's `Agent::add_collection_observer`), not per
+/// thread: the agent that collected runs its own observations, in registration
+/// order, with the generation. The list is taken out for the duration of a
+/// collection, so a nested one (or an observer that collects) runs none.
+pub trait GcObserver: 'static {
+    /// Before the collection's mark starts.
+    fn prologue(&self, generation: GcGeneration);
+
+    /// After the collection's sweep.
+    fn epilogue(&self, generation: GcGeneration);
+}
+
 /// The precise roots for a collection: the caller's, plus every pin, plus
 /// everything a registered [`RootSource`] holds.
 ///
