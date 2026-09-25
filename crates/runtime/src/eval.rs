@@ -1821,6 +1821,102 @@ mod tests {
         );
     }
 
+    /// The depth a JS→host→JS ladder reaches on a 2 MiB thread. `next`
+    /// recurses through `op`, a host function that re-enters JS — deno's
+    /// bootstrap shape (`loadExtScript` → `op_load_ext_script` → evaluate).
+    /// `native_arm` picks which of `fast_call_core`'s two builtin arms the
+    /// call takes: the registered-handler arm, or the crux-native closure arm
+    /// (a plain closure builtin with the dispatch verdict pinned to "run its
+    /// own closure", index 0 in `function.rs` — the arm an op reaches after
+    /// its first call).
+    fn host_reentry_depth(native_arm: bool) -> f64 {
+        fn reenter(agent: &mut Agent, _this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+            let global = agent.running_context()?.realm.global_object;
+            let next = global.get(&JsString::from_utf8("next"))?;
+            crate::function::call(agent, &next, Value::Undefined, &[])
+        }
+
+        std::thread::Builder::new()
+            .name("host-reentry-ladder".into())
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let mut agent = Agent::new();
+                agent.initialize_host_defined_realm().unwrap();
+                let global = agent.running_context().unwrap().realm.global_object;
+                let op = if native_arm {
+                    // A `NativeFn` has no agent parameter, so it re-enters the
+                    // way the bridge's host callbacks do: through the TLS
+                    // agent `crux::function` carries for the running body.
+                    let op = crux::function::Function::create_builtin(
+                        Some(JsString::from_utf8("op")),
+                        0,
+                        Box::new(move |_this, _args| {
+                            let next = global.get(&JsString::from_utf8("next"))?;
+                            crux::function::call(&next, Value::Undefined, &[])
+                        }),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    agent.builtin_dispatch_cache.insert(op.id(), 0);
+                    op
+                } else {
+                    let op = crux::function::Function::create_builtin(
+                        Some(JsString::from_utf8("op")),
+                        0,
+                        Box::new(|_, _| Ok(Value::Undefined)),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    crate::function::register_builtin_handler(op.id(), reenter);
+                    op
+                };
+                global
+                    .set(&JsString::from_utf8("op"), Value::Function(op), false)
+                    .unwrap();
+                agent
+                    .run_script(
+                        "let d = 0; function next() { d++; return op(); } \
+                         try { next(); } catch (e) { e && e.name; } d",
+                    )
+                    .expect("the ladder script runs")
+                    .as_number()
+                    .expect("the ladder script completes with a number")
+            })
+            .expect("spawns the ladder thread")
+            .join()
+            .expect("the ladder thread panicked")
+    }
+
+    /// A host callback that re-enters JS — a deno op — must not keep the
+    /// dispatch frame live for the re-entry. Running the handler in place did:
+    /// this ladder reached **13** levels on a 2 MiB thread, the same cost as
+    /// the *unwithdrawn* JS→JS ladder (12), against **98** once the arm
+    /// withdrew (`.notes/embedding.md` §9).
+    #[test]
+    fn a_host_handler_reentry_does_not_keep_the_dispatch_frame_live() {
+        let depth = host_reentry_depth(false);
+        assert!(
+            depth >= 50.0,
+            "a handler that re-enters JS must not pay the dispatch frame per cycle; \
+             a 2 MiB stack reached only depth {depth}"
+        );
+    }
+
+    /// The same for the crux-native closure arm, which is the one an op reaches
+    /// once its call has been memoized (`function.rs`'s verdict index 0). Before
+    /// this arm withdrew it reached 13 too.
+    #[test]
+    fn a_native_closure_reentry_does_not_keep_the_dispatch_frame_live() {
+        let depth = host_reentry_depth(true);
+        assert!(
+            depth >= 50.0,
+            "a native closure that re-enters JS must not pay the dispatch frame per \
+             cycle; a 2 MiB stack reached only depth {depth}"
+        );
+    }
+
     #[test]
     fn evaluates_a_trivial_script_to_a_value() {
         let mut agent = Agent::new();

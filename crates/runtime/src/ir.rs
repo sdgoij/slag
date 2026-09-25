@@ -1896,30 +1896,57 @@ impl Trace for ResumeAbrupt {
 }
 
 /// A call step whose callee runs on its own activation rather than under the
-/// dispatch frame. `Vm::fast_call_core`'s general path records one instead of
-/// performing `call_inner` in place; `run_inner_impl` performs it with the
-/// dispatch frame (the interpreter's multi-thousand-line step loop) already
-/// popped. That is what keeps a deep JS call chain off the native stack in an
-/// unoptimized build, where the step loop's own frame is the whole cost
-/// (`.notes/embedding.md` §9).
+/// dispatch frame. `Vm::fast_call_core` records one instead of performing the
+/// call in place; `run_inner_impl` performs it with the dispatch frame (the
+/// interpreter's multi-thousand-line step loop) already popped. That is what
+/// keeps a deep JS call chain — or a host callback that re-enters JS, which is
+/// deno's op shape — off the native stack in an unoptimized build, where the
+/// step loop's own frame is the whole cost (`.notes/embedding.md` §9).
 ///
 /// The call site is left intact on the value stack (`arg_start` locates the
 /// top-`argc` arguments, `below` the values under them that the completion
 /// truncates with them), so the recorded `Value`s are stack-resident and need
-/// no rooting of their own.
+/// no rooting of their own. Each variant carries the callable its arm had, so
+/// the driver runs the same operation without a second dispatch.
 #[derive(Debug)]
-pub struct PendingCall {
-    callee: Value,
-    this: Value,
-    arg_start: usize,
-    argc: usize,
-    below: usize,
+pub enum PendingCall {
+    /// An ordinary or ECMAScript call: `call_inner` resolves the callee.
+    Function {
+        callee: Value,
+        this: Value,
+        arg_start: usize,
+        argc: usize,
+        below: usize,
+    },
+    /// A registered agent-dependent builtin's handler (the arm's own dispatch).
+    Handler {
+        handler: crate::function::BuiltinHandler,
+        this: Value,
+        arg_start: usize,
+        argc: usize,
+        below: usize,
+    },
+    /// A crux-native builtin's own closure.
+    Native {
+        callee: Value,
+        this: Value,
+        arg_start: usize,
+        argc: usize,
+        below: usize,
+    },
 }
 
 impl Trace for PendingCall {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.callee.trace(visit);
-        self.this.trace(visit);
+        match self {
+            PendingCall::Function { callee, this, .. }
+            | PendingCall::Native { callee, this, .. } => {
+                callee.trace(visit);
+                this.trace(visit);
+            }
+            // The handler is a plain function pointer, which holds no edge.
+            PendingCall::Handler { this, .. } => this.trace(visit),
+        }
     }
 }
 
@@ -6134,14 +6161,51 @@ impl Vm {
             .map(|pending| VmOutcome::Call(Box::new(pending)))
     }
 
-    /// Perform a call recorded by [`Vm::fast_call_core`]'s general path and
-    /// land its result exactly as the general path would in place: read the
-    /// arguments off the stack, run the callee, then replace the call site
-    /// (`below` values under the arguments) with the result.
+    /// Perform a call recorded by [`Vm::fast_call_core`] and land its result
+    /// exactly as the in-place path would: read the arguments off the stack,
+    /// run the recorded callable, then replace the call site (`below` values
+    /// under the arguments) with the result.
     fn complete_call(&mut self, agent: &mut Agent, pending: PendingCall) -> Result<(), JsError> {
-        let args = &self.stack[pending.arg_start..pending.arg_start + pending.argc];
-        let result = crate::function::call_inner(agent, &pending.callee, pending.this, args)?;
-        self.stack.truncate(pending.arg_start - pending.below);
+        let (this, arg_start, argc, below) = match &pending {
+            PendingCall::Function {
+                this,
+                arg_start,
+                argc,
+                below,
+                ..
+            }
+            | PendingCall::Handler {
+                this,
+                arg_start,
+                argc,
+                below,
+                ..
+            }
+            | PendingCall::Native {
+                this,
+                arg_start,
+                argc,
+                below,
+                ..
+            } => (*this, *arg_start, *argc, *below),
+        };
+        let args = &self.stack[arg_start..arg_start + argc];
+        let result = match pending {
+            PendingCall::Function { callee, .. } => {
+                crate::function::call_inner(agent, &callee, this, args)?
+            }
+            PendingCall::Handler { handler, .. } => handler(agent, &this, args)?,
+            PendingCall::Native { callee, .. } => match callee.kind() {
+                ValueKind::Function(function) => match &function.kind {
+                    crux::function::FunctionKind::Builtin {
+                        call: Some(native), ..
+                    } => native(&this, args)?,
+                    _ => crate::function::call_inner(agent, &callee, this, args)?,
+                },
+                _ => crate::function::call_inner(agent, &callee, this, args)?,
+            },
+        };
+        self.stack.truncate(arg_start - below);
         self.stack.push(result);
         Ok(())
     }
@@ -12942,23 +13006,42 @@ impl Vm {
                 crux::function::FunctionKind::Builtin { call: Some(_), .. }
             );
             match agent.builtin_call_lookup(function.id(), is_native) {
+                // A registered builtin's handler and a crux-native closure are
+                // host-reachable callables that may re-enter JS (deno's ops
+                // evaluate the next script), so they run on their own
+                // activation like any other call: run here, they would keep
+                // this body's dispatch frame live for the whole re-entry (see
+                // `.notes/embedding.md` §9). The record carries the callable
+                // itself, so the driver runs exactly what this arm ran — no
+                // second dispatch lookup.
                 crate::function::BuiltinCall::Handler(handler) => {
-                    let result = handler(agent, &this, args)?;
-                    self.stack.truncate(arg_start - below);
-                    self.stack.push(result);
+                    debug_assert!(self.pending_call.is_none());
+                    self.pending_call = Some(PendingCall::Handler {
+                        handler,
+                        this,
+                        arg_start,
+                        argc,
+                        below,
+                    });
                     return Ok(());
                 }
                 // Warm crux-native builtins (Math/JSON/typed-array methods
                 // whose body is a plain `NativeFn`): the function's own
-                // native closure is the whole call.
+                // native closure is the whole call. Only the closure case
+                // withdraws; a `call: None` builtin keeps falling through.
                 crate::function::BuiltinCall::Native => {
-                    if let crux::function::FunctionKind::Builtin {
-                        call: Some(native), ..
-                    } = &function.kind
-                    {
-                        let result = native(&this, args)?;
-                        self.stack.truncate(arg_start - below);
-                        self.stack.push(result);
+                    if matches!(
+                        &function.kind,
+                        crux::function::FunctionKind::Builtin { call: Some(_), .. }
+                    ) {
+                        debug_assert!(self.pending_call.is_none());
+                        self.pending_call = Some(PendingCall::Native {
+                            callee,
+                            this,
+                            arg_start,
+                            argc,
+                            below,
+                        });
                         return Ok(());
                     }
                 }
@@ -12992,7 +13075,7 @@ impl Vm {
         // the arguments in place and truncates `below` values under them,
         // exactly as performing the call here would.
         debug_assert!(self.pending_call.is_none());
-        self.pending_call = Some(PendingCall {
+        self.pending_call = Some(PendingCall::Function {
             callee,
             this,
             arg_start,
