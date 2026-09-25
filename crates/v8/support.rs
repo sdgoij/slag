@@ -11,7 +11,7 @@ use std::fmt;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crux::typed_array::SharedBuffer;
 
@@ -77,7 +77,7 @@ impl<T> UniqueRef<T> {
 
     /// Share this reference (`v8::UniqueRef::make_shared`).
     pub fn make_shared(self) -> SharedRef<T> {
-        SharedRef(Rc::new(self.0))
+        SharedRef(Arc::new(self.0))
     }
 
     /// The owned value, for a caller taking it apart where the crate we stand
@@ -109,20 +109,26 @@ impl<T> fmt::Debug for UniqueRef<T> {
 
 /// A shared reference to a resource (`v8::SharedRef`).
 ///
-/// `Rc`, not `Arc`: the engine's single-agent byte block is `Rc`-backed, so a
-/// reference to one cannot cross threads either way. Under the engine's
-/// `workers` feature the block becomes `Arc`-backed and this follows it.
-pub struct SharedRef<T>(Rc<T>);
+/// `Arc`, not `Rc`, because the crate we stand in for's `SharedRef` is
+/// thread-safe and a host moves one across threads: `deno/ext/web`'s broadcast
+/// channel carries a `SharedRef<BackingStore>` to the agents that rebuild their
+/// own `SharedArrayBuffer`s from it. `Arc` gives that for free and only where it
+/// is true — `SharedRef<T>` is `Send + Sync` exactly when `T` is, so nothing is
+/// asserted here that the payload does not already promise. Which is why this
+/// crate builds the engine's thread-safe block (`Cargo.toml` requests
+/// `runtime/workers`): a `BackingStore` is the payload that gets shared, and its
+/// bytes are only `Send` in that build.
+pub struct SharedRef<T>(Arc<T>);
 
 impl<T> SharedRef<T> {
     pub(crate) fn new(value: T) -> Self {
-        Self(Rc::new(value))
+        Self(Arc::new(value))
     }
 }
 
 impl<T> Clone for SharedRef<T> {
     fn clone(&self) -> Self {
-        Self(Rc::clone(&self.0))
+        Self(Arc::clone(&self.0))
     }
 }
 
@@ -387,6 +393,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The boundary's `SharedRef` is thread-safe, which is a *build*
+    /// configuration and not just a type: `deno/ext/web`'s broadcast channel
+    /// moves a `SharedRef<BackingStore>` to the agents that rebuild their own
+    /// `SharedArrayBuffer`s from it, and that only types-checks when the store's
+    /// bytes are the engine's thread-safe block. So the claim is asserted here —
+    /// reverting `SharedRef` to `Rc`, or this crate's `runtime/workers`, stops
+    /// this test compiling.
+    #[test]
+    fn a_backing_store_reference_can_cross_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SharedRef<BackingStore>>();
+    }
 
     #[test]
     fn a_unique_ptr_is_the_nullable_form_of_a_unique_ref() {

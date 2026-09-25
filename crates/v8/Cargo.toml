@@ -10,7 +10,14 @@ license.workspace = true
 path = "lib.rs"
 
 [dependencies]
-runtime = { path = "../runtime", default-features = false }
+# `workers` is on because this boundary's `SharedRef` is thread-safe, as the crate
+# we stand in for's is, and its payload — a `BackingStore`, whose bytes an
+# `ArrayBuffer` shares with the views over it and which a host moves between
+# agents — is only `Send + Sync` in that build of the block
+# (`.notes/embedding.md` §9). Left to the caller, the boundary would type-check
+# against a single-threaded engine and the gap would only show where a host
+# actually shares a buffer.
+runtime = { path = "../runtime", default-features = false, features = ["workers"] }
 crux = { path = "../crux" }
 # For `fast_api::Flags`, which the crate we stand in for spells as a bitflags
 # type; it is already in the workspace's lock, so this adds no new download.

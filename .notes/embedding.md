@@ -4759,6 +4759,14 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,386 passed / 0 failed** (`v8` **282**, up four, from 278 — the rooting guard is in the default build too; `crux` 258, `ffi` 10, `runtime` 936, `slag` 4, `test262` 3324 unmoved); `cargo test -p runtime --no-default-features --lib` **905 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than assumed**: the part touches only `crates/v8` (6 files), and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` and the same for `wasmtest` are both **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+*`SharedRef` is thread-safe, and the boundary is built over the thread-safe engine — §9's bullet that named it, and `deno_web`'s last error.* `deno/ext/web`'s broadcast channel carries a `SharedRef<BackingStore>` between threads: it is `InMemoryChannelMessage`'s `sabs`, behind a `tokio::sync::broadcast` whose `From` impl asks for `Debug + Send + Sync`, so `SharedRef<BackingStore>: Send` is part of the V8-shaped boundary's contract — and in the crate we stand in for it holds, which is why that deno code compiles there. Here it was an `E0277`: `SharedRef<T>` was `Rc<T>`, and the engine's byte block is `Rc<RefCell<Vec<u8>>>` unless the engine's `workers` feature is on. So the part is two edits and one decision (both in §9 before the code): `SharedRef<T>` becomes `Arc<T>` — its `Clone` and `UniqueRef::make_shared` follow, and nothing is asserted unsafely, because `Arc`'s auto impls give `Send`/`Sync` exactly when the payload does — and `crates/v8`'s manifest requests `runtime/workers` itself, because `BackingStore: Send + Sync` is true only of the `workers` block and a boundary type whose whole point is thread-safety cannot depend on the caller remembering a feature. The workspace never saw the gap because `crates/test262` turns `workers` on for the whole unified graph, so only a build that links `crates/v8` without the corpus — which is what deno's graph is — compiled the single-agent version. What is paid is stated in §9: a build including this crate gets the thread-safe block (machine `Atomics`, no JIT inline element store), which is already what every corpus sweep runs under.
+
+*Tests — one, and it is a compile-time guard, plus two mutations.* `crates/v8/support.rs`'s `a_backing_store_reference_can_cross_threads` asserts `SharedRef<BackingStore>: Send + Sync`, which is exactly the boundary's claim and therefore exactly what stops building when either half is undone. Two mutations, each run alone and each caught by it: dropping `features = ["workers"]` from the manifest fails it with the block's own `Rc<RefCell<Vec<u8>>>`/`Rc<BlockState>` named as not `Sync`, and reverting `SharedRef` to `Rc` fails it with deno's error text verbatim — `Rc<BackingStore>` cannot be sent between threads safely — which is the strongest form this guard could take, since the host's failure is reproduced locally rather than described.
+
+*The measurement, and why the headline number goes up.* `cargo check -p deno_snapshots`: the `E0277` is **1 → 0**, `deno_web` is no longer a failing crate (it compiles, with one warning), and the total is **4 → 216**. That rise is the point rather than a regression, and it is measured: with `deno_web` fixed the build runs on into `deno_telemetry`, which the failing build never reached — `cargo tree -i deno_web` finds no path from it into `deno_telemetry`, so it is a crate the abort was hiding, not one this change touched — and its 213 errors are `v8::ValueView`/`ValueViewData` (196) and the GC-callback names (`GCType`, `GCCallbackFlags`, `get_heap_space_statistics`, `add_gc_prologue_callback`, `add_gc_epilogue_callback`, `get_number_of_data_slots`, `from_raw_isolate_ptr_unchecked`), none of which exist anywhere in `crates/v8`. The two failing crates left are that one and `deno_webgpu`'s pre-existing `E0521`, which is now the whole remainder of the frontier.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,387 passed / 0 failed** (`v8` **283**, up one — the guard; `crux` 258, `ffi` 10, `runtime` 936, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **289 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **905 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is a stronger statement than the usual check here**: the part touches only `crates/v8` and its manifest, the runners' graphs contain no `v8` (**0** for both `test262` and `wasmtest`), and the configuration the manifest now requests was already the one every sweep runs under — because `crates/test262` enables `workers` for the unified graph — so no corpus behaviour could move. deno's `deno_core --lib` was rebuilt anyway, since the bridge is what deno links and the workers block is now in its graph: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5281,6 +5289,38 @@ if that proves possible.
   compiled in isolation and left the workspace not type-checking, because
   `crates/test262` turns `workers` on for the whole unified graph and
   `crates/v8` then asked for a constructor that same build had compiled out.
+- **A `SharedRef` is thread-safe because the crate's is, which makes the
+  `workers` build the one this boundary is compiled in — named before the two
+  edits.** `deno/ext/web`'s broadcast channel carries `SharedRef<BackingStore>`
+  between threads (it is `InMemoryChannelMessage`'s `sabs`, behind a
+  `tokio::sync::broadcast` whose `From` impl asks for `Debug + Send + Sync`), so
+  `SharedRef<BackingStore>: Send` is part of the boundary's contract — and in the
+  crate we stand in for it holds, which is why that code compiles there. Here it
+  did not: `SharedRef<T>` is `Rc<T>`, and the engine's byte block is
+  `Rc<RefCell<Vec<u8>>>` unless the engine's `workers` feature is on
+  (`crates/byteblock/src/lib.rs:13-18`, whose `Arc<[AtomicU64]>` shape exists for
+  exactly this: agents on different threads sharing one buffer). So the part is
+  two edits and one decision. The edits: `SharedRef<T>` becomes `Arc<T>` (its
+  `Clone` and `UniqueRef::make_shared` follow), whose auto impls give `Send +
+  Sync` exactly when the payload does, so nothing is asserted unsafely. The
+  decision: `crates/v8` requests `runtime/workers` itself rather than leaving it
+  to a host, because `BackingStore: Send + Sync` is true only of the `workers`
+  block, and a boundary type whose whole point is thread-safety cannot depend on
+  the caller remembering a feature. The workspace never saw the gap because
+  `crates/test262` turns `workers` on for the whole unified graph, so only a
+  build that links `crates/v8` *without* the corpus — which is what deno's graph
+  is, and what `cargo test -p v8` alone is — compiled the single-agent version of
+  the boundary. What is paid: any build that includes this crate gets the
+  thread-safe block, so the `Atomics` built-ins are machine atomics and the JIT's
+  inline element store is not emitted — both already the configuration every
+  corpus sweep and the workspace's own unified build have been running, which is
+  the reason the cost is acceptable rather than a reason to make it a feature a
+  host must opt into. **Landed**; §7 records it. The measurement is the E0277
+  going to **0** and `deno_web` compiling, and the total *rising* 4 → 216 for a
+  reason worth naming: with `deno_web` fixed the build runs on into
+  `deno_telemetry`, which the failing build had never reached, and that crate's
+  213 errors are `v8::ValueView`/`ValueViewData` and the GC-callback names — a
+  family this bridge does not have, and the next frontier.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
