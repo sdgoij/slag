@@ -219,6 +219,35 @@ impl String {
         Some(Self::from_code_units(&units))
     }
 
+    /// A string over a host-owned one-byte buffer the host frees with
+    /// `destructor` (`v8::String::NewExternalOneByteRaw`).
+    ///
+    /// The **copy** tier, like [`new_external_onebyte`](Self::new_external_onebyte),
+    /// plus one stated divergence: the bytes are read as Latin-1 into the engine's
+    /// own string and `destructor` is called **here**, where V8 keeps the buffer
+    /// and calls the destructor from the collection that takes the string. A
+    /// destructor that frees therefore frees earlier than it would there; the
+    /// *text* is exact and the buffer is not needed once this returns.
+    ///
+    /// # Safety
+    ///
+    /// `data` must name `length` readable one-byte code units, and the caller
+    /// accepts that `destructor` runs before this returns.
+    pub unsafe fn new_external_onebyte_raw<'s>(
+        scope: &PinScope<'s, '_, ()>,
+        data: *mut std::ffi::c_char,
+        length: usize,
+        destructor: unsafe extern "C" fn(*mut std::ffi::c_char, usize),
+    ) -> Option<Local<'s, String>> {
+        // SAFETY: the caller guarantees `data` names `length` readable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) };
+        let text = Self::new_from_one_byte(scope, bytes, NewStringType::Normal);
+        // SAFETY: the destructor's contract is the caller's, and the copy above
+        // is what makes running it here sound.
+        unsafe { destructor(data, length) };
+        text
+    }
+
     /// The empty string (`v8::String::Empty`).
     ///
     /// Infallible, as there: the engine always has one, so there is nothing for
@@ -284,6 +313,33 @@ impl String {
         units: Box<[u16]>,
     ) -> Option<Local<'s, String>> {
         Some(Self::from_code_units(&units))
+    }
+
+    /// A string over a host-owned buffer of UTF-16 units the host frees with
+    /// `destructor` (`v8::String::NewExternalTwoByteRaw`).
+    ///
+    /// The two-byte peer of
+    /// [`new_external_onebyte_raw`](Self::new_external_onebyte_raw), copied and
+    /// destructed for the same stated reasons: the units are read into the
+    /// engine's own string and `destructor` runs before this returns, where V8
+    /// keeps the buffer until the string is collected.
+    ///
+    /// # Safety
+    ///
+    /// `data` must name `length` readable UTF-16 code units, and the caller
+    /// accepts that `destructor` runs before this returns.
+    pub unsafe fn new_external_twobyte_raw<'s>(
+        scope: &PinScope<'s, '_, ()>,
+        data: *mut u16,
+        length: usize,
+        destructor: unsafe extern "C" fn(*mut u16, usize),
+    ) -> Option<Local<'s, String>> {
+        // SAFETY: the caller guarantees `data` names `length` readable units.
+        let units = unsafe { std::slice::from_raw_parts(data, length) };
+        let text = Self::new_from_two_byte(scope, units, NewStringType::Normal);
+        // SAFETY: as in the one-byte peer.
+        unsafe { destructor(data, length) };
+        text
     }
 
     /// A new string from one-byte (Latin-1) characters
@@ -1554,5 +1610,73 @@ mod string_and_symbol_tests {
             <OneByteConst as AsRef<[u8]>>::as_ref(&resource).len() <= ceiling,
             "a resource the crate's check accepts is within the constant"
         );
+    }
+
+    /// A raw external one-byte string is the **copy** tier: the bytes are read as
+    /// Latin-1 into the engine's own string, and the host's destructor runs before
+    /// the call returns — the divergence the constructor's doc states. The counter
+    /// is the destructor's own evidence, and the text is read back after the buffer
+    /// has been freed.
+    #[test]
+    fn a_raw_external_onebyte_string_copies_and_takes_the_buffer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DESTROYED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn free_one(data: *mut std::ffi::c_char, len: usize) {
+            // SAFETY: the test handed over a `Vec` of exactly `len` bytes and kept
+            // no other pointer to it.
+            drop(unsafe { Vec::from_raw_parts(data.cast::<u8>(), len, len) });
+            DESTROYED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        DESTROYED.store(0, Ordering::SeqCst);
+        in_context!(scope, {
+            let mut bytes: Vec<u8> = Vec::with_capacity(3);
+            bytes.extend_from_slice(&[0x41, 0xE9, 0xFF]);
+            let len = bytes.len();
+            let buffer = bytes.as_ptr() as *mut std::ffi::c_char;
+            std::mem::forget(bytes);
+            // SAFETY: `buffer` names `len` readable bytes, and `free_one` frees the
+            // allocation the test gave up.
+            let text = unsafe { String::new_external_onebyte_raw(scope, buffer, len, free_one) }
+                .expect("string");
+            assert_eq!(text.to_utf16(), [0x41, 0xE9, 0xFF]);
+            assert_eq!(
+                DESTROYED.load(Ordering::SeqCst),
+                1,
+                "the buffer is taken before the call returns"
+            );
+        });
+    }
+
+    /// The two-byte peer, and the unit a UTF-8 round trip would lose: a lone
+    /// surrogate comes back as itself, and the destructor has run.
+    #[test]
+    fn a_raw_external_twobyte_string_copies_and_takes_the_buffer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DESTROYED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn free_two(data: *mut u16, len: usize) {
+            // SAFETY: as in the one-byte peer.
+            drop(unsafe { Vec::from_raw_parts(data, len, len) });
+            DESTROYED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        DESTROYED.store(0, Ordering::SeqCst);
+        in_context!(scope, {
+            let mut units: Vec<u16> = Vec::with_capacity(2);
+            units.extend_from_slice(&[0xD800, 0x0041]);
+            let len = units.len();
+            let buffer = units.as_ptr() as *mut u16;
+            std::mem::forget(units);
+            // SAFETY: `buffer` names `len` readable units, and `free_two` frees the
+            // allocation the test gave up.
+            let text = unsafe { String::new_external_twobyte_raw(scope, buffer, len, free_two) }
+                .expect("string");
+            assert_eq!(
+                text.to_utf16(),
+                [0xD800, 0x0041],
+                "a lone surrogate survives"
+            );
+            assert_eq!(DESTROYED.load(Ordering::SeqCst), 1);
+        });
     }
 }

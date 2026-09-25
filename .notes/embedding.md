@@ -4915,6 +4915,14 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,439 passed / 0 failed** (up two — this part's tests; `v8` **327** default and **333** with simdutf, `crux` 259, `runtime` 943, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8/weak.rs`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same six out-of-scope cases.
 
+*Raw external strings — §9's last Node-API cluster, and the engine question it answers by declining.* Two `ext/napi` errors over `String::new_external_onebyte_raw` and `new_external_twobyte_raw`. The tier is **copy**, the one the non-raw constructors already record, with one more stated divergence: the bytes are read into the engine's own string (Latin-1 for the one-byte form, UTF-16 units for the two-byte one, so a lone surrogate survives) and the host's `destructor` is called **before the call returns**, where V8 keeps the buffer and calls it from the collection that takes the string. The engine change an externally-backed form would need is real and was declined rather than deferred: the engine's strings are UTF-16 slices (`as_slice` answers `&[u16]`), so a one-byte host buffer cannot be answered without materializing a UTF-16 form anyway — the gain would only be "the copy is deferred to the first read", and the cost is a new `JsString` variant, a sweep-time destructor hook and a second lifetime rule for the buffer. What the choice costs a host is stated in the constructor's doc: a destructor that frees runs earlier, so an addon that reads a buffer after handing it over is reading memory this engine no longer promises. `ext/napi` is the caller that shows it is safe in practice — its destructors only *queue* the addon's finalize callback, and the text is already copied.
+
+*Tests — two, and two mutations each caught by its own test.* `a_raw_external_onebyte_string_copies_and_takes_the_buffer` (the Latin-1 text read back after the buffer is freed, plus a counter the destructor itself increments, so "the buffer was taken" is observed rather than assumed) and `a_raw_external_twobyte_string_copies_and_takes_the_buffer` (the same, with a lone surrogate as the unit a UTF-8 round trip would lose). Two mutations, each run alone and each caught: not calling the destructor fails the one-byte test at the counter, and decoding the one-byte form as UTF-8 fails it at the units (`[65, 65533, 65533]` against `[65, 233, 255]`).
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **3 → 1**. With that, every `ext/napi` error is closed — the tier's four clusters all landed — and the one error the command still reports is `ext/webgpu/error.rs`'s pre-existing `E0521`, which is deno-side and was never this bridge's to fix.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,441 passed / 0 failed** (up two — this part's tests; `v8` **329** default and **335** with simdutf, `crux` 259, `runtime` 943, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8/primitives.rs`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same six out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5720,10 +5728,29 @@ if that proves possible.
   and the four scope-passing sites (node_sqlite ×2 in two files, webgpu ×2) reach
   it through the scope's own deref chain — which is why a scope receiver compiled
   for them and not for `ext/napi`. What then remains, the last of the tier, is the
-  one real engine question: raw external strings
-  (`String::new_external_{onebyte,twobyte}_raw`), which need an externally-backed
-  string form the engine does not have — the same tier decision
-  `String::new_external_*` recorded when it chose to copy.
+  **The tier's last item is taken next, and its engine question is answered by
+  declining the engine change**, named here before the edit: raw external strings
+  (`String::new_external_{onebyte,twobyte}_raw`) are implemented at the **copy**
+  tier the non-raw constructors already record — the bytes are read into the
+  engine's own string and the host's `destructor` is called **at once**, where V8
+  keeps the buffer and calls it from the collection that takes the string. The
+  engine change an externally-backed form would need is real and is not worth its
+  cost: the engine's strings are UTF-16 slices (`as_slice` answers `&[u16]`), so a
+  one-byte host buffer cannot be answered without materializing a UTF-16 form
+  anyway; the observable gain is only "the copy is deferred to the first read",
+  and the cost is a new `JsString` variant, a sweep-time destructor hook, and a
+  second lifetime rule for the buffer. What the choice costs a host is stated: a
+  destructor that frees runs earlier than V8 would run it, so an addon that reads
+  a buffer after handing it over is reading memory this engine no longer promises.
+  `ext/napi` is the caller that shows the divergence is safe in practice — its
+  destructors only *queue* the addon's finalize callback, which frees a buffer
+  nothing reads once the text is copied. With that, **every `ext/napi` error is
+  closed**: the tier's four clusters — the private-name and index surface, the
+  small exposures (and the construct-result defect they found), the weak-handle
+  pair, and these raw constructors — and the only error
+  `cargo check -p deno_snapshots --keep-going` still reports is
+  `ext/webgpu/error.rs`'s pre-existing `E0521`, which is deno-side and was never
+  this bridge's to fix.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
