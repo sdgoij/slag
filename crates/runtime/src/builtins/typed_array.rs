@@ -2134,7 +2134,11 @@ fn species_getter(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
 }
 
 /// The base64 alphabets of `toBase64`/`setFromBase64` (spec 25.2.3.44-45).
-fn base64_alphabet(url: bool) -> &'static [u8] {
+///
+/// `pub` for the host-facing `v8::simdutf` shim, which selects an alphabet by
+/// the same `Default`/`Url` distinction and must use these tables rather than
+/// its own copy of them.
+pub fn base64_alphabet(url: bool) -> &'static [u8] {
     if url {
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     } else {
@@ -2255,10 +2259,13 @@ fn written_read_result(agent: &Agent, written: usize, read: usize) -> Result<Val
 /// 25.2.4.9): the decoded bytes, the source units read, and the SyntaxError
 /// to throw after the bytes were written (so partial output survives bad
 /// input).
-struct DecodeResult {
-    bytes: Vec<u8>,
-    read: usize,
-    error: Option<JsError>,
+///
+/// `pub` for the host-facing `v8::simdutf` shim, which answers a library
+/// `result` out of it — the bytes it wrote and whether the input was valid.
+pub struct DecodeResult {
+    pub bytes: Vec<u8>,
+    pub read: usize,
+    pub error: Option<JsError>,
 }
 
 fn syntax_error(message: &str) -> JsError {
@@ -2300,8 +2307,12 @@ fn base64_alphabet_option(agent: &mut Agent, options: &Value) -> Result<&'static
 
 /// The `lastChunkHandling` option (spec 25.2.3.45 steps 7-10): undefined →
 /// "loose"; anything else must be one of the three values.
+///
+/// `pub` because it is the same three modes the library simdutf exposes (`its
+/// last_chunk_handling_options`), and the host-facing `v8::simdutf` shim maps
+/// its own enum onto this one rather than re-implementing the modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LastChunkHandling {
+pub enum LastChunkHandling {
     Loose,
     Strict,
     StopBeforePartial,
@@ -2423,7 +2434,12 @@ fn decode_hex(source: &[u16], max_length: usize) -> DecodeResult {
 /// `=` padding validated) up to `max_length` bytes. An invalid character
 /// errors with the bytes decoded so far; a full target stops the scan so
 /// trailing garbage is ignored.
-fn decode_base64(
+///
+/// `pub` so the host-facing `v8::simdutf` shim decodes with this one
+/// implementation rather than a second base64 decoder: the spec's mode names
+/// and this library's are the same three, and the `Loose`/`Strict` split on a
+/// final chunk's unused bits is the same split.
+pub fn decode_base64(
     source: &[u16],
     alphabet: &[u8],
     last_chunk: LastChunkHandling,

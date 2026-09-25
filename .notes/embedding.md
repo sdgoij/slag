@@ -4733,6 +4733,14 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,379 passed / 0 failed** (`v8` 276, up two; `crux` 258, `ffi` 10, `runtime` 935, `slag` 4, `test262` 3324 — all unmoved); `cargo test -p runtime --no-default-features --lib` **904 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. `builtins::keyed` is in every runner's graph, so the corpora were re-run after a release build and the settle sleep, and every number is at baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt because the bridge is what deno links, and holds at **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+*`v8::simdutf`'s base64 — §9's bullet that named it, and the codec is the engine's rather than a second one.* The module stood for the library's two validators only, so deno's `ext/web` — `btoa`, `atob`, the base64url ops, and `Uint8Array.fromBase64`'s host half — named 31 missing items: two option enums and three functions. The decode side is not new machinery. This engine already decodes the spec's `FromBase64` (`builtins::typed_array::decode_base64`, over `base64_alphabet`, with `LastChunkHandling { Loose, Strict, StopBeforePartial }`), which is the algorithm simdutf exposes mode for mode — *including* the split that decides behaviour: `Loose` ignores a final chunk's unused bits while `Strict` refuses them, so non-canonical input still decodes through the loose path and deno's strict fast path for clean padded input fails over to its own JS path rather than accepting what the spec refuses. So the engine edit is four visibilities and nothing moves: `base64_alphabet`, `decode_base64`, `DecodeResult` and `LastChunkHandling` become `pub`. The *encode* half is deno's own — no `v8::simdutf` call site names an encoder, so the bridge answers only what is asked of it, and the padding rule surfaces instead in `base64_length_from_binary`, which must be exact because deno sizes a buffer from it and checks the library's write count against it. The bridge keeps simdutf's own shapes: `Base64Options { Default = 0, Url = 1 }` and `LastChunkHandling { Loose = 0, Strict = 1, StopBeforePartial = 2 }` with the values written out rather than left to declaration order (deno passes them as `u64` to its own C shim, so the values are observable), a `Result { error, count }` with `is_ok()`, and an `ErrorCode` carrying the library's list. `base64_to_binary` stays an `unsafe fn` — the crate's signature, because its C++ writes through the output pointer before it can report an error, and the call sites carry the block — while the implementation decodes into its own buffer and copies what fits, writing nothing outside the caller's slice. Three narrowings are recorded rather than implied: a decode failure answers `InvalidBase64Character` for every syntax problem, because the engine returns one `SyntaxError` where the library separates a bad character from an input remainder and from non-zero extra bits; the decode runs without a length bound and reports `OutputBufferTooSmall` when the caller's slice cannot hold the result, where simdutf stops at the buffer and reports as it goes; and `maximal_binary_length_from_base64` answers the byte-slice bound `ceil(len/4)*3`, where simdutf's pointer overload trims trailing `=` first and can be tighter. The input's bytes are widened to code units, which is the engine decoder's own input: the identity on ASCII, and on a byte above `0x7F` exactly the "not in this alphabet" case the library reports.
+
+*Tests — four, and four mutations, each caught by its own test.* `simdutf.rs`'s `the_encoded_length_follows_the_alphabet` pins all seven residue classes for both options (`0`→`0`/`0`, `1`→`4`/`2`, `2`→`4`/`3`, `3`→`4`/`4`, `4`→`8`/`6`, `5`→`8`/`7`, `6`→`8`/`8`); `the_maximal_length_is_a_bound` decodes six shapes — padded, unpadded, whitespace in the middle, whitespace at the end — into buffers sized by the bound, asserting both that every decode fits and what it decoded to; `a_decode_is_the_engines_from_base64` walks the modes and both alphabets (`Zm9vYmFy` strict to `foobar`, `Zg==` to `f`, `Zm8=` to `fo`, whitespace skipped mid-string, `Zm9vYg` refused by strict and decoded to `foob` by loose and cut to `foo` by `stop-before-partial`, `YR==` refused by strict *because its unused bits are non-zero* and read as `a` by loose, `-_8` over `Url` to `FB FF`, each alphabet refusing the other's characters, and an out-of-alphabet character answering `InvalidBase64Character`); and `a_small_output_is_reported` is the two-byte slice, where the code is `OutputBufferTooSmall`, `count` is 2, and those two bytes really were written. Four mutations, each caught by its own test and no other: `base64_length_from_binary`'s two arms swapped fails the length test at `1 bytes, standard` with `2` where `4` belongs; the `Strict` mapping redirected to the engine's `Loose` fails the decode test at its first strict assertion (`Zm9vYg`); `maximal_binary_length_from_base64` dropping its ceiling division fails the bound test with `3` where `4` belongs; and slackening the overflow check fails the small-output test with `Success` where `OutputBufferTooSmall` belongs.
+
+*The measurement.* `cargo check -p deno_snapshots`: **52 → 21**, and every base64 mention is gone — the 31 the module named, with `deno_web` falling from 32 errors to 1 (its last one is not base64) and nothing new surfacing. What is left is the two things this plan has already named as open: the node_sqlite `E0512` transmutes (13 sites, the `Local` tag shape §9 records) and, in `deno_webgpu`, `adjust_amount_of_external_allocated_memory` (2) beside its own `E0521`/`E0277`.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,379 passed / 0 failed** (`v8` 276, `crux` 258, `ffi` 10, `runtime` 935, `slag` 4, `test262` 3324 — none moved by this part, because the module it edits is feature-gated); `cargo test -p runtime --no-default-features --lib` **904 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. This is the first part to touch a gated module — `pub mod simdutf` is `#[cfg(feature = "simdutf")]`, which deno enables through `libs/deno_v8` — so the gates are run in that configuration too: `cargo test -p v8 --features simdutf` **282 passed / 0 failed** (276 plus the two existing validators' tests and this part's four, which the default build does not compile) and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` clean. `builtins::typed_array` is in every runner's graph, so the corpora were re-run after a release build and the settle sleep and every number is at baseline: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt because the engine and the bridge are both what deno links, and holds at **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -8059,6 +8067,55 @@ migrate, then delete.
   state is a `GeneratorState` the bridge has no honest pair to read, and the
   empty answer is exactly "no internal entries", which is the console's fallback
   path.
+- **`v8::simdutf`'s base64 — named here before the edit, and the codec is the
+  engine's rather than a second one.** The module stood for the library's two
+  validators only, so deno's `ext/web` (the `btoa`/`atob`/base64url ops, and
+  `Uint8Array.fromBase64`'s host half) named 31 missing items: two option enums
+  and three functions. The decode side is not new machinery: this engine already
+  implements the spec's `FromBase64` — `builtins::typed_array::decode_base64`
+  over `base64_alphabet`, with `LastChunkHandling { Loose, Strict,
+  `LastChunkHandling { Loose, Strict,
+  StopBeforePartial }` — which is the algorithm simdutf exposes, mode for mode,
+  and the two agree on the detail that decides behaviour here: `Loose` ignores a
+  final chunk's unused bits while `Strict` rejects them, so non-canonical input
+  still decodes through the loose path and deno's strict fast path for clean
+  padded input fails over to its own JS path instead of accepting what the spec
+  refuses. So the engine edit is four visibilities in `builtins/typed_array` and
+  nothing moves: `base64_alphabet`, `decode_base64`, `DecodeResult` and
+  `LastChunkHandling` become `pub`, which is all the bridge needs because the
+  *encode* half is deno's own — no `v8::simdutf` call site names an encoder
+  (deno's `btoa` and base64url go through its own FFI to the library), so the
+  bridge answers only what is asked of it and the padding rule surfaces instead
+  in `base64_length_from_binary`, which must be exact because deno sizes a
+  buffer from it and asserts the FFI's write count against it. The bridge keeps
+  the shapes simdutf owns: `Base64Options { Default = 0,
+  Url = 1 }` and `LastChunkHandling { Loose = 0, Strict = 1, StopBeforePartial =
+  2 }` with simdutf's explicit codes written out rather than left to declaration
+  order (deno passes them as `u64` to its own C shim, so the values are
+  observable), a `Result { error, count }` with `is_ok()`, and an `ErrorCode`
+  carrying the library's own list. `base64_to_binary` stays an `unsafe fn` — the
+  crate's signature, because its C++ writes through the output pointer before it
+  can report an error, and the call sites carry the block — while the
+  implementation is the engine's decoder, which writes nothing outside `output`.
+  Three narrowings are stated rather than implied: a decode failure answers
+  `InvalidBase64Character` for every syntax problem, because the engine returns
+  one `SyntaxError` where simdutf distinguishes a bad character from an input
+  remainder and from non-zero extra bits; the decode runs without a length bound
+  and reports `OutputBufferTooSmall` when the caller's slice cannot hold the
+  result, where simdutf stops at the buffer and reports as it goes (both are
+  invisible to deno, which sizes every buffer from
+  `maximal_binary_length_from_base64`); and
+  `maximal_binary_length_from_base64` answers the byte-slice bound
+  `ceil(len/4)*3`, which is what every call site asks for — a `with_capacity`
+  and a memory-safety assert — while simdutf's pointer overload trims trailing
+  `=` first and can be tighter. The input's bytes are widened to code units,
+  which is the engine decoder's own input: on ASCII that is the identity, and on
+  a byte above `0x7F` it is exactly the "not in the alphabet" case simdutf
+  reports. No sweep is avoided by any of this — `builtins::typed_array` is in
+  every runner's graph — so the corpus is re-run; and the padding rule the
+  length function encodes is the one the engine already certifies: the standard
+  alphabet pads and `Url` omits padding, which is what deno's own vectors assert
+  of the library it links (`base64url_encode(b"f") == "Zg"`).
 
 ## 11. Working rules
 
