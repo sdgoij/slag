@@ -128,7 +128,7 @@ fn get_prototype_from_constructor(
 }
 
 /// DataView(buffer [, byteOffset [, length]]) (spec 25.4.2.1).
-fn data_view_construct(
+pub(crate) fn data_view_construct(
     agent: &mut Agent,
     args: &[Value],
     new_target: &Value,

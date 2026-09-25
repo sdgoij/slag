@@ -15,14 +15,14 @@ use crux::typed_array::{ElementType, SharedBuffer};
 use runtime::api;
 use runtime::builtins::array_buffer::BufferState;
 use slag::buffers::{
-    array_buffer_from_block, detach_array_buffer, shared_array_buffer_from_block,
-    typed_array_from_buffer, view_out_of_bounds,
+    array_buffer_from_block, detach_array_buffer_with_key, set_detach_key,
+    shared_array_buffer_from_block, typed_array_from_buffer, view_out_of_bounds,
 };
 
 use crate::data::{
-    ArrayBuffer, ArrayBufferView, BigInt64Array, BigUint64Array, Float16Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, SharedArrayBuffer, TypedArray, Uint8Array,
-    Uint8ClampedArray, Uint16Array, Uint32Array, Value,
+    ArrayBuffer, ArrayBufferView, BigInt64Array, BigUint64Array, DataView, Float16Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, SharedArrayBuffer, TypedArray,
+    Uint8Array, Uint8ClampedArray, Uint16Array, Uint32Array, Value,
 };
 use crate::handle::{Local, LocalHandle};
 use crate::scope::PinScope;
@@ -294,9 +294,10 @@ impl<'s> LocalHandle<'s, ArrayBuffer> {
 
     /// Detach the buffer and every view over it (`v8::ArrayBuffer::detach`).
     ///
-    /// The engine records no `[[ArrayBufferDetachKey]]`, so a key has nothing
-    /// to match against and nothing to protect: no key, or `undefined`, detaches,
-    /// and any other key is refused the way a mismatch is — with `None` and no
+    /// The `[[ArrayBufferDetachKey]]` is the engine's (see
+    /// [`set_detach_key`](Self::set_detach_key)): no key, or `undefined`, detaches
+    /// a buffer whose key is unset, the matching key detaches one that has one,
+    /// and anything else is refused the way a mismatch is — with `None` and no
     /// detach. A buffer that cannot be detached at all answers as though it were
     /// detached, which is what the crate we stand in for does to keep V8 from
     /// terminating on one.
@@ -304,12 +305,30 @@ impl<'s> LocalHandle<'s, ArrayBuffer> {
         if !self.is_detachable() {
             return Some(true);
         }
-        if key.is_some_and(|key| !key.is_undefined()) {
-            return None;
-        }
         let id = self.engine().value().as_object()?.id();
-        crate::realm::with_agent(|agent| detach_array_buffer(agent, id))?;
-        Some(true)
+        let key = key.map_or(crux::value::Value::Undefined, |key| {
+            *key.into_engine().value()
+        });
+        let detached =
+            crate::realm::with_agent(|agent| detach_array_buffer_with_key(agent, id, &key))?;
+        detached.then_some(true)
+    }
+
+    /// The key `detach` must be given to detach this buffer
+    /// (`v8::ArrayBuffer::SetDetachKey`).
+    ///
+    /// This is V8's `[[ArrayBufferDetachKey]]`, so it is the engine's state and
+    /// not the bridge's: a buffer with one cannot be transferred by
+    /// `ArrayBuffer.prototype.transfer` at all (spec ArrayBufferCopyAndDetach
+    /// throws a TypeError), which is what an embedder uses it for — deno's
+    /// `op_mark_as_untransferable` marks a buffer so user code cannot take its
+    /// bytes. `undefined` clears the key.
+    pub fn set_detach_key(&self, key: Local<'_, Value>) {
+        let Some(id) = self.engine().value().as_object().map(|object| object.id()) else {
+            return;
+        };
+        let key = *key.into_engine().value();
+        crate::realm::with_agent(|agent| set_detach_key(agent, id, key));
     }
 
     /// A shared reference to the bytes (`v8::ArrayBuffer::get_backing_store`).
@@ -599,10 +618,104 @@ typed_array_constructors! {
     BigUint64Array => BigUint64,
 }
 
+impl DataView {
+    /// A view over `buffer` (`v8::DataView::New`): the engine's own `%DataView%`
+    /// constructor, so the view is the one `new DataView(buffer, byteOffset,
+    /// byteLength)` would make — including the RangeError when the range does not
+    /// fit the buffer.
+    ///
+    /// The crate we stand in for answers an *empty* handle there and leaves the
+    /// RangeError pending; this bridge's handles cannot be empty, so the error is
+    /// thrown and the call then aborts naming it, rather than handing a host an
+    /// `undefined` that a later `.into()` would carry on as a view.
+    pub fn new<'s>(
+        scope: &PinScope<'s, '_, ()>,
+        buffer: Local<'_, ArrayBuffer>,
+        byte_offset: usize,
+        byte_length: usize,
+    ) -> Local<'s, DataView> {
+        let realm = crate::realm_of(scope);
+        match api::DataView::new(&realm, &buffer.into_engine(), byte_offset, byte_length) {
+            Ok(local) => Local::from_engine(local),
+            Err(error) => {
+                crate::throw(scope, &error);
+                panic!("bridge: v8::DataView::new outside the buffer's range: {error}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{bind, eval, eval_number, in_context};
+
+    /// `set_detach_key` is the engine's `[[ArrayBufferDetachKey]]` through the
+    /// crate's shape: the buffer stops being transferable, `detach` takes only
+    /// the matching key, and the keyless `undefined` is the state a fresh buffer
+    /// has.
+    #[test]
+    fn a_detach_key_marks_a_buffer_untransferable() {
+        in_context!(scope, {
+            let buffer = ArrayBuffer::new(scope, 8);
+            bind(scope, "ab", buffer.cast::<Value>());
+            let key = crate::String::new(scope, "untransferable").unwrap();
+            buffer.set_detach_key(key.cast::<Value>());
+
+            // A keyed buffer cannot be transferred at all (spec
+            // ArrayBufferCopyAndDetach), and the refusal is a TypeError.
+            assert_eq!(
+                eval(
+                    scope,
+                    "(() => { try { ab.transfer(); return 'no'; } catch (e) { return e.name; } })()"
+                )
+                .to_rust_string_lossy(scope),
+                "TypeError"
+            );
+
+            // The wrong key is a refusal with no detach; the right one detaches.
+            let other = crate::String::new(scope, "other").unwrap();
+            assert!(buffer.detach(Some(other.cast::<Value>())).is_none());
+            assert!(!buffer.was_detached());
+            assert_eq!(buffer.detach(Some(key.cast::<Value>())), Some(true));
+            assert!(buffer.was_detached());
+        });
+    }
+
+    /// The same, with `undefined` as the key: a buffer whose key is unset takes
+    /// it, which is what an unkeyed host call is.
+    #[test]
+    fn an_unkeyed_detach_still_works() {
+        in_context!(scope, {
+            let buffer = ArrayBuffer::new(scope, 8);
+            assert_eq!(buffer.detach(None), Some(true));
+            assert!(buffer.was_detached());
+            // And a buffer that was given `undefined` explicitly is unkeyed.
+            let other = ArrayBuffer::new(scope, 8);
+            let undefined = crate::undefined(scope).cast::<Value>();
+            other.set_detach_key(undefined);
+            assert_eq!(other.detach(None), Some(true));
+        });
+    }
+
+    /// `DataView::new` is the engine's own `%DataView%` constructor, so the view
+    /// it answers is the one `new DataView(buffer, offset, length)` would make
+    /// and what a host writes through it is what a script reads.
+    #[test]
+    fn a_data_view_is_the_one_the_constructor_would_make() {
+        in_context!(scope, {
+            let buffer = ArrayBuffer::new(scope, 8);
+            bind(scope, "ab", buffer.cast::<Value>());
+            let view = DataView::new(scope, buffer, 0, 8);
+            bind(scope, "dv", view.cast::<Value>());
+
+            assert_eq!(eval_number(scope, "dv.byteLength"), 8.0);
+            assert_eq!(eval_number(scope, "dv.byteOffset"), 0.0);
+            // A write through the host's view lands in the buffer's bytes.
+            eval(scope, "dv.setUint8(0, 42);");
+            assert_eq!(eval_number(scope, "new Uint8Array(ab)[0]"), 42.0);
+        });
+    }
 
     /// Bytes a host owns become the buffer's storage, at their width: a
     /// `Box<[u16]>` is its elements in bytes, not its count.

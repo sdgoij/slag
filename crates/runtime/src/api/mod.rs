@@ -45,7 +45,7 @@ pub use microtask::MicrotasksPolicy;
 pub use module::{
     Module, ModuleImportPhase, ModuleRequest, ModuleStatus, SyntheticModuleEvaluationSteps,
 };
-pub use object::{Array, Object};
+pub use object::{Array, DataView, Object};
 pub use promise::Promise;
 pub use script::Script;
 pub use stack_trace::StackFrame;

@@ -10,6 +10,7 @@ use crux::convert::{to_index, to_integer_or_infinity};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
+use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
@@ -76,6 +77,22 @@ pub struct BufferState {
     /// [[ArrayBufferImmutable]] (ES2026 transferToImmutable): writes through
     /// views throw a TypeError.
     pub immutable: bool,
+    /// [[ArrayBufferDetachKey]] (v8::ArrayBuffer::SetDetachKey): a key that must
+    /// be given to detach this buffer, and whose presence refuses `transfer`
+    /// outright (spec ArrayBufferCopyAndDetach). `None` is *no* key, which is
+    /// also what a key of `undefined` means, so this is normalised on the way
+    /// in.
+    pub detach_key: Option<Value>,
+}
+
+impl Trace for BufferState {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // Only the key is a GC value: the byte block is a refcounted
+        // `SharedBuffer` and the rest are scalars. Until this field existed the
+        // agent's trace skipped `buffer_data` entirely, and it must not now —
+        // an untraced key would be swept with its arena slot handed on.
+        self.detach_key.trace(visit);
+    }
 }
 
 impl BufferState {
@@ -89,6 +106,7 @@ impl BufferState {
             is_shared: false,
             detached: false,
             immutable: false,
+            detach_key: None,
         }
     }
 }
@@ -198,6 +216,7 @@ pub(crate) fn allocate_array_buffer(
             is_shared: false,
             detached: false,
             immutable: false,
+            detach_key: None,
         }),
     );
     if is_resizable {
@@ -242,6 +261,7 @@ fn allocate_shared_array_buffer(
             is_shared: true,
             detached: false,
             immutable: false,
+            detach_key: None,
         }),
     );
     let cell = agent.buffer_data.get(&object.id()).expect("inserted");
@@ -264,6 +284,42 @@ pub fn detach_array_buffer(agent: &mut Agent, id: u64) {
         state.detached = true;
         state.byte_length = 0;
     }
+}
+
+/// Set `[[ArrayBufferDetachKey]]` (`v8::ArrayBuffer::SetDetachKey`).
+///
+/// A key of `undefined` clears it, which is the same state as never setting one
+/// — that is what a key of `undefined` means in the spec's own words ("if key is
+/// not undefined").
+pub fn set_detach_key(agent: &mut Agent, id: u64, key: Value) {
+    if let Some(cell) = agent.buffer_data.get(&id) {
+        let mut state = cell.borrow_mut();
+        state.detach_key = if key.is_undefined() { None } else { Some(key) };
+    }
+}
+
+/// Detach `id` when `key` matches its `[[ArrayBufferDetachKey]]`
+/// (`v8::ArrayBuffer::Detach(key)`).
+///
+/// `false` is a mismatch — the buffer is left alone and the caller answers
+/// V8's `Nothing` rather than a detach — which is the whole point of a key:
+/// only its holder can detach the buffer. The comparison is SameValue, as V8's
+/// is, so a key that is a string matches by its text rather than by the handle
+/// it happened to arrive on. A buffer with no key takes `undefined`, as it does
+/// there.
+pub fn detach_array_buffer_with_key(agent: &mut Agent, id: u64, key: &Value) -> bool {
+    let matches = agent.buffer_data.get(&id).is_some_and(|cell| {
+        let state = cell.borrow();
+        match &state.detach_key {
+            None => key.is_undefined(),
+            Some(stored) => crux::ops::same_value(stored, key),
+        }
+    });
+    if !matches {
+        return false;
+    }
+    detach_array_buffer(agent, id);
+    true
 }
 
 /// The byte range copy behind `slice`/`transfer`: the clamped `start`/`end`
@@ -344,6 +400,15 @@ fn array_buffer_copy_and_detach(
         let source = state(agent, source_id).ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "Source is not an ArrayBuffer".into())
         })?;
+        // spec 25.1.2.2 step 4: a buffer with a [[ArrayBufferDetachKey]] cannot
+        // be transferred at all, which is what makes a host's key an
+        // untransferable marker rather than a password.
+        if source.detach_key.is_some() {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "ArrayBuffer is not transferable".into(),
+            ));
+        }
         if preserve_resizability
             && source.resizable
             && new_length > source.max_byte_length.unwrap_or(usize::MAX)
@@ -924,6 +989,7 @@ pub fn shared_array_buffer_from_block(
             is_shared: true,
             detached: false,
             immutable: false,
+            detach_key: None,
         }),
     );
     // The flags are this object's now (see `array_buffer_from_block`), so the
@@ -1809,6 +1875,82 @@ mod tests {
             "(function(){ var b = new ArrayBuffer(1); b.transfer(); b.transferToFixedLength(); })()"
         )
         .is_err());
+    }
+
+    /// Make an ArrayBuffer in a fresh realm, bind it as `ab`, and answer its
+    /// object id — the key the buffer tables use.
+    fn bound_buffer_id(agent: &mut Agent) -> u64 {
+        agent
+            .run_script("globalThis.ab = new ArrayBuffer(8)")
+            .unwrap();
+        let realm = agent.current_realm().unwrap();
+        let global = realm.global_object;
+        let buffer = global
+            .get_key(&PropertyKey::from_utf8("ab"))
+            .expect("the script bound it");
+        buffer.as_object().expect("an ArrayBuffer object").id()
+    }
+
+    fn key_value(text: &str) -> Value {
+        Value::String(Handle::new(JsString::from_utf8(text)))
+    }
+
+    /// A `[[ArrayBufferDetachKey]]` refuses `transfer` outright (spec
+    /// ArrayBufferCopyAndDetach) and gates `detach` on the matching key — which
+    /// is what an embedder marks a buffer untransferable with.
+    ///
+    /// The state's `detach_key` is a GC value, which is why the agent's trace
+    /// visits `buffer_data` (it held only scalars and a refcounted block before
+    /// this field). That line is justified by construction rather than by a test
+    /// here: see §7's record — the arrangements that would leave the key
+    /// reachable to nothing also leave it reachable to the collector in this
+    /// build, so removing the trace is not detectable from outside it.
+    #[test]
+    fn a_detach_key_refuses_transfer_and_guards_detach() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let id = bound_buffer_id(&mut agent);
+
+        let key = key_value("untransferable");
+        set_detach_key(&mut agent, id, key);
+        assert_eq!(
+            agent
+                .run_script("globalThis.ab.transfer()")
+                .unwrap_err()
+                .kind,
+            ErrorKind::TypeError,
+            "a keyed buffer is not transferable"
+        );
+
+        let wrong = key_value("other");
+        assert!(
+            !detach_array_buffer_with_key(&mut agent, id, &wrong),
+            "a mismatched key is refused"
+        );
+        assert!(!is_detached(&agent, id), "and the buffer is left attached");
+
+        assert!(detach_array_buffer_with_key(&mut agent, id, &key));
+        assert!(is_detached(&agent, id), "the matching key detaches it");
+    }
+
+    /// The comparison is SameValue, as V8's `JSArrayBuffer::Detach` is, so a key
+    /// that is a string matches by its text rather than by the handle it happened
+    /// to arrive on — which is what lets a host set a key once and pass an equal
+    /// one later.
+    #[test]
+    fn a_string_key_matches_by_text_not_by_handle() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let id = bound_buffer_id(&mut agent);
+
+        set_detach_key(&mut agent, id, key_value("untransferable"));
+        // A fresh handle over the same text: not the value that was stored.
+        let equal = key_value("untransferable");
+        assert!(
+            detach_array_buffer_with_key(&mut agent, id, &equal),
+            "an equal key detaches"
+        );
+        assert!(is_detached(&agent, id));
     }
 
     #[test]

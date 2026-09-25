@@ -4859,6 +4859,16 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,418 passed / 0 failed** (up two — this part's tests; `v8` **315**, `runtime` 941, `crux` 258, `test262` 3326 with its two ignored); `cargo test -p v8 --features simdutf` **315 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **910 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` (and the same for `wasmtest`) is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six out-of-scope cases.
 
+*The buffer and view names — §9's second frontier group, and both of them engine questions.* Two errors over two names, and neither was a constant. `ArrayBuffer::set_detach_key` is V8's `[[ArrayBufferDetachKey]]`, so it went where the engine already keeps the rest of a buffer's state: `BufferState` gains `detach_key: Option<Value>`, `array_buffer_copy_and_detach` refuses a keyed buffer outright with a TypeError (spec 25.1.2.2 step 4 — that is what makes a key an *untransferable* marker rather than a password, and what deno's `op_mark_as_untransferable` uses it for), and `detach_array_buffer_with_key` gates a detach on the key with SameValue, as V8's `JSArrayBuffer::Detach` compares. The bridge's `detach` keeps its shape (`None` on a mismatch) and `set_detach_key` writes the engine's state; `undefined` clears it, which is the state a fresh buffer has. **A root-source finding the change forced:** `BufferState` held only scalars and a refcounted `SharedBuffer` before this, which is why `agent.buffer_data` was the one per-object table the agent's trace never visited — nothing in it was a GC value. A detach key is, so `self.buffer_data.trace(visit)` is new, and without it the key would be swept with its arena slot handed to the next allocation, the aliasing hazard §5's L1 record describes.
+
+`DataView::new` was the second, and it is an exposure: the engine already builds DataViews (`builtins::dataview::data_view_construct`, `Agent::dataview_data`), so `api::DataView::new` calls *that* — the JS-API constructor — and a host's view is the one `new DataView(buffer, offset, length)` would make, RangeError included. One divergence is stated in the bridge: the crate we stand in for answers an *empty* handle when the range does not fit and leaves the error pending, and this bridge's handles cannot be empty, so the error is thrown and the call then aborts naming it, rather than handing a host an `undefined` a later `.into()` would carry on as a view.
+
+*Tests — five, and two mutations caught, plus two findings about tests.* Engine: `a_detach_key_refuses_transfer_and_guards_detach` (the transfer refusal, the mismatched key, the matching one) and `a_string_key_matches_by_text_not_by_handle`. Bridge: `a_detach_key_marks_a_buffer_untransferable` (the crate's shape over the same state, reading `e.name` in JS), `an_unkeyed_detach_still_works` (the control that the keyless path is intact, including an explicit `undefined`), and `a_data_view_is_the_one_the_constructor_would_make` (geometry, and a write through the host's view read back through a script's `Uint8Array`). One mutation each: dropping the key check in `array_buffer_copy_and_detach` fails the transfer assertion on an `Ok` where it wanted an error, and making `detach_array_buffer_with_key` answer "matched" unconditionally fails it at "a mismatched key is refused". **Two mutations were not caught, and both are findings about the tests rather than the code.** Removing `self.buffer_data.trace(visit)` is undetectable from outside the collector — a heap string minted in a returned frame, a marked *object* key minted the same way, and a collection followed by 64 allocations all leave the key reachable (or the collection out of reach), so the test that asserted the key survives a collection was deleted rather than kept as false confidence, and the line stands on its construction. And replacing the SameValue comparison with `Value`'s `==` changes nothing a test can see, because `ValueKind`'s own equality is already content-based for strings (`crux/src/value.rs:442`); SameValue is kept because it is what V8 compares (a `NaN` key matches itself under one and not the other) and the difference is recorded here instead of claimed as tested.
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **29 → 27**, with `ext/node/ops/buffer.rs` and `ext/node/ops/ipc.rs` both at **0**. What is left is `ext/node/ops/v8.rs` (26) and `ext/webgpu/error.rs`'s pre-existing `E0521` — the third of §9's three groups, and the only one with a real capability in it.
+
+*Gates — and the corpora, because `runtime` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,423 passed / 0 failed** (up five — this part's tests; `v8` **312** default and **318** with simdutf, `runtime` **943**, `crux` 258, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine changes are a state field, a trace line and one refusal, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5576,17 +5586,19 @@ if that proves possible.
   promotion-target bug the cascade had been masking.
 - **What is left of the `deno_snapshots` frontier — named here before the next
   parts, so each is landed rather than probed.** Three groups, and none of them a
-  `vm.rs` name. **The string and view names** (`ext/node/ops/buffer.rs` and
-  `ipc.rs`; 6 errors): `String::MAX_LENGTH` (an associated constant) and
+  `vm.rs` name. **The string and view names — landed**, in two parts (§7's
+  record): `ext/node/ops/buffer.rs` and
+  `ipc.rs`; 6 errors, of which `String::MAX_LENGTH` (an associated constant) and
   `String::new_external_twobyte` (the two-byte peer of the
   `new_external_onebyte` this bridge already copies out of, so the same
-  "external means copied" note applies), plus two that are engine questions
-  rather than constants — `ArrayBuffer::set_detach_key`, which is V8's
-  `[[ArrayBufferDetachKey]]` and therefore belongs where the engine already keeps
-  the rest of a buffer's state (`Agent::buffer_data`) rather than in a
-  bridge-side map keyed by a *reusable* object identity, and `DataView::new`,
+  "external means copied" note applies) were the first, and
+  `ArrayBuffer::set_detach_key` — V8's
+  `[[ArrayBufferDetachKey]]`, which is why it belongs where the engine already
+  keeps the rest of a buffer's state (`Agent::buffer_data`) rather than in a
+  bridge-side map keyed by a *reusable* object identity — with `DataView::new`,
   which the engine can already make (`Agent::dataview_data`,
-  `builtins::dataview`), so it is an exposure. **The heap surface**
+  `builtins::dataview`) and so was an exposure, were the second. **The heap
+  surface**
   (`ext/node/ops/v8.rs`; 26 errors, the largest share): `HeapStatistics`'
   eleven accessors, `Isolate::{number_of_heap_spaces, low_memory_notification}`,
   `get_heap_code_and_metadata_statistics`, and the three `take_heap_snapshot`

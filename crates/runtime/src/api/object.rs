@@ -241,6 +241,35 @@ impl Array {
     }
 }
 
+/// DataView helpers (v8::DataView).
+pub struct DataView;
+
+impl DataView {
+    /// A new view over `buffer` (`v8::DataView::New`): the JS-API constructor,
+    /// so the view is the one `new DataView(buffer, byteOffset, byteLength)`
+    /// would make and a range that does not fit throws the RangeError that
+    /// construction throws.
+    #[allow(clippy::new_ret_no_self)] // v8::DataView::New returns a view, not `Self`.
+    pub fn new(
+        context: &Context,
+        buffer: &Local,
+        byte_offset: usize,
+        byte_length: usize,
+    ) -> Result<Local, JsError> {
+        let constructor = context.intrinsic("%DataView%").ok_or_else(|| {
+            JsError::new(ErrorKind::TypeError, "%DataView% is not defined".into())
+        })?;
+        let args = [
+            buffer.into_value(),
+            Value::Number(byte_offset as f64),
+            Value::Number(byte_length as f64),
+        ];
+        context.with_agent(|agent| {
+            crate::builtins::dataview::data_view_construct(agent, &args, &constructor).map(Local)
+        })
+    }
+}
+
 /// Look up `object.method` on the global object (JSON.parse, Promise.resolve).
 pub(crate) fn global_function(
     context: &Context,

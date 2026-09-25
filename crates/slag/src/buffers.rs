@@ -11,8 +11,8 @@
 //! and reach for these only for buffer work the facade does not cover yet.
 
 pub use runtime::builtins::array_buffer::{
-    array_buffer_from_block, detach_array_buffer, is_detached, is_shared,
-    shared_array_buffer_from_block,
+    array_buffer_from_block, detach_array_buffer, detach_array_buffer_with_key, is_detached,
+    is_shared, set_detach_key, shared_array_buffer_from_block,
 };
 pub use runtime::builtins::typed_array::{
     typed_array_buffer_path as typed_array_from_buffer, view_out_of_bounds,

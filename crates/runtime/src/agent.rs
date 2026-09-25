@@ -2144,6 +2144,10 @@ impl Agent {
             value.trace(visit);
         }
         self.dataview_data.trace(visit);
+        // Visited because a buffer's [[ArrayBufferDetachKey]] is a GC value; the
+        // state held only scalars and a refcounted block until that field
+        // existed, which is why this line is newer than the table.
+        self.buffer_data.trace(visit);
         self.raw_json_data.trace(visit);
         self.map_data.trace(visit);
         self.set_data.trace(visit);
