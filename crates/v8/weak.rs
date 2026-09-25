@@ -84,30 +84,51 @@ impl<T> Weak<T> {
     /// its finalizer never runs; §9 states that divergence rather than this type
     /// hiding it.
     ///
-    /// The parameter is the isolate the collection ran in, which is the one this
-    /// handle was made in — the shape every site in the tree annotates
+    /// The receiver is the isolate, as in the crate we stand in for: `ext/napi`'s
+    /// `Env::isolate` passes one, and the scope-passing sites reach it through the
+    /// scope's deref chain. It is the isolate the collection runs in, which is the
+    /// one this handle was made in — the shape every site in the tree annotates
     /// (`|_: &mut v8::Isolate|`), and the one that lets webgpu's finalizer adjust
     /// the host's external-memory account. It is captured here because the
-    /// engine's own callback carries no isolate; a weak callback that outlives
-    /// the isolate is dropped unsent rather than called, so the pointer cannot be
-    /// read after the isolate is gone.
+    /// engine's own callback carries no isolate; a weak callback that outlives the
+    /// isolate is dropped unsent rather than called, so the handle cannot be read
+    /// after the isolate is gone.
     pub fn with_finalizer<H: Handle<Data = T>>(
-        scope: &PinScope<'_, '_, ()>,
+        isolate: &mut Isolate,
         handle: H,
         finalizer: Box<dyn FnOnce(&mut Isolate)>,
     ) -> Self
     where
         T: 'static,
     {
-        let weak = Self::new(scope, handle);
+        let weak = Self {
+            inner: inner_from_payload(handle.into_payload()),
+        };
         if let Inner::Weak(inner) = &weak.inner {
-            let isolate: Isolate = **scope;
+            // The handle is a copyable pointer, so the callback owns one rather
+            // than borrowing the caller's.
+            let mut isolate = *isolate;
             inner.set_callback(Box::new(move || {
-                let mut isolate = isolate;
                 finalizer(&mut isolate);
             }));
         }
         weak
+    }
+
+    /// A strong handle over the value, while the collector has not taken it
+    /// (`v8::Weak::to_global`), or `None` once it has.
+    ///
+    /// The upgrade a host makes when it wants to keep the value: it asks
+    /// [`to_local`](Self::to_local)'s question and answers it with a handle that
+    /// pins. A non-value payload answers `Some` for as long as the handle lives,
+    /// since its handle holds it the way [`Global`] does.
+    pub fn to_global(&self, isolate: &mut Isolate) -> Option<Global<T>> {
+        match &self.inner {
+            Inner::Weak(inner) => inner
+                .to_local()
+                .map(|value| Global::new(isolate, Local::<T>::from_engine(value))),
+            Inner::Strong(strong) => Some(strong.clone()),
+        }
     }
 
     /// The value, while the collector has not taken it (`v8::Weak::to_local`).
@@ -283,6 +304,45 @@ mod tests {
                 }),
             );
             assert!(!weak.is_empty());
+        });
+    }
+
+    /// The upgrade: a live value becomes a `Global` that pins it, and a released
+    /// handle upgrades to nothing — the same question `to_local` asks, answered
+    /// with a handle that keeps the value.
+    #[test]
+    fn a_weak_handle_upgrades_to_a_strong_one_while_the_value_lives() {
+        crate::test_support::in_context!(scope, {
+            let value = Local::<Value>::from_engine(api::Local::string("upgraded"));
+            let mut weak = Weak::<Value>::new(scope, value);
+            let mut isolate = crate::scope::GetIsolate::get_isolate_ptr(scope);
+            let strong = weak.to_global(&mut isolate).expect("still alive");
+            assert_eq!(strong.get(scope), value, "the upgrade names the same value");
+
+            weak.clear();
+            assert!(
+                weak.to_global(&mut isolate).is_none(),
+                "a released handle upgrades to nothing"
+            );
+        });
+    }
+
+    /// The receiver is the isolate, as in the crate we stand in for: the isolate
+    /// shape `ext/napi`'s `Env::isolate` passes, and the scope shape the
+    /// node_sqlite and webgpu sites pass, which reaches the same parameter through
+    /// the scope's deref chain. A compile-level pin — the callbacks themselves wait
+    /// for a collection.
+    #[test]
+    fn a_finalizer_takes_an_isolate_and_a_scope_alike() {
+        crate::test_support::in_context!(scope, {
+            let mut isolate = crate::scope::GetIsolate::get_isolate_ptr(scope);
+            let value = Local::<Value>::from_engine(api::Local::string("isolate receiver"));
+            let weak = Weak::<Value>::with_finalizer(&mut isolate, value, Box::new(|_| {}));
+            assert!(!weak.is_empty());
+
+            let other = Local::<Value>::from_engine(api::Local::string("scope receiver"));
+            let scoped = Weak::<Value>::with_finalizer(scope, other, Box::new(|_| {}));
+            assert!(!scoped.is_empty());
         });
     }
 }

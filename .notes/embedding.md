@@ -4907,6 +4907,14 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates — and the corpora, because `runtime` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,437 passed / 0 failed** (up three — this part's tests; `v8` **325** default and **331** with simdutf, `crux` 259, `runtime` 943, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine changes are an accessor and a two-site predicate, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same six out-of-scope cases: the construct-result rule is not reached there, and that is expected — nothing in the suite is a host constructor that returns a function.
 
+*The weak-handle pair — §9's third Node-API cluster.* Two `ext/napi` errors over the last two weak-handle shapes the host surface was missing. `Weak::to_global` is the upgrade: the question `to_local` asks, answered with a handle that pins — `Global::new` over the live value, `Some` for a non-value payload whose handle holds it the way `Global` does, and `None` once a collection or a `clear` has taken it. And `with_finalizer`'s receiver becomes the crate's `&mut Isolate`. The four scope-passing sites (node_sqlite twice in each of two files, webgpu twice) still compile unchanged, because a scope's deref chain reaches the isolate (`PinnedRef<HandleScope<Context>>` → `PinnedRef<HandleScope<()>>` → `Isolate`); `ext/napi`'s `Env::isolate()` is the one site that passes an isolate directly, which is why a scope receiver compiled for the others and not for it. The body no longer needs a scope at all, so it builds the `Inner` itself and captures the isolate by handle — the copyable-pointer reasoning the doc already carried.
+
+*Tests — two, and two mutations each caught.* `a_weak_handle_upgrades_to_a_strong_one_while_the_value_lives` (a live value upgrades and the strong handle names the same value; a released handle upgrades to nothing) and `a_finalizer_takes_an_isolate_and_a_scope_alike`, which is a compile-level pin: the `&mut Isolate` shape `ext/napi` passes is called explicitly, and the scope shape the other four sites pass is called through the deref chain, so the receiver cannot drift back to accepting only one. Two mutations, each run alone and each caught by the first test: `to_global` answering `None` always fails at the first `expect`, and `to_global` ignoring emptiness (upgrading an `undefined` after a `clear`) fails at the "upgrades to nothing" assertion. The receiver's shape is a type, not a value, so it has no behavioural mutation; its evidence is that the two-shape test compiles and that the `E0308` at `ext/napi/js_native_api.rs:150` is gone from the measurement below.
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **5 → 3**. What remains is the tier's last item, named in §9 — raw external strings (`String::new_external_{onebyte,twobyte}_raw`) — plus the pre-existing `ext/webgpu` `E0521`.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,439 passed / 0 failed** (up two — this part's tests; `v8` **327** default and **333** with simdutf, `crux` 259, `runtime` 943, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8/weak.rs`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same six out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5704,12 +5712,15 @@ if that proves possible.
   spec 10.2.2 makes *any* Object result (a function included) the construction's
   answer. Both construct paths (`FunctionTemplate::get_function` and
   `host_function`) now ask the question the rest of the engine asks,
-  `matches!(kind, ValueKind::Object(_) | ValueKind::Function(_))`. What then stays
-  named-but-not-taken is the weak-handle pair
-  (`Weak::to_global`, and a `with_finalizer` receiver the crate spells `&mut
-  Isolate` where this bridge takes a scope — a divergence the other call sites
-  never exposed, since `ext/napi` is the only one that passes an isolate) and the
-  one real engine question left, raw external strings
+  `matches!(kind, ValueKind::Object(_) | ValueKind::Function(_))`. **The
+  weak-handle pair is taken next**, named here before the edit: `Weak::to_global`,
+  the upgrade from a weak handle to a strong one while the value lives —
+  `to_local`'s question answered with a handle that pins; and `with_finalizer`'s
+  receiver, which the crate spells `&mut Isolate`. That is what `ext/napi` passes,
+  and the four scope-passing sites (node_sqlite ×2 in two files, webgpu ×2) reach
+  it through the scope's own deref chain — which is why a scope receiver compiled
+  for them and not for `ext/napi`. What then remains, the last of the tier, is the
+  one real engine question: raw external strings
   (`String::new_external_{onebyte,twobyte}_raw`), which need an externally-backed
   string form the engine does not have — the same tier decision
   `String::new_external_*` recorded when it chose to copy.
