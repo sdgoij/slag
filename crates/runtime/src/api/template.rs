@@ -12,7 +12,7 @@ use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::PropertyDescriptor;
 use crux::string::JsString;
-use crux::value::Value;
+use crux::value::{Value, ValueKind};
 
 use super::Isolate;
 use super::context::Context;
@@ -58,6 +58,14 @@ impl FunctionCallbackInfo<'_> {
     /// Whether the call is a construct (`new`).
     pub fn is_construct_call(&self) -> bool {
         self.new_target.is_some()
+    }
+
+    /// The call's new target, when it is a construct call (`new`).
+    ///
+    /// `None` for a plain call, which is where the crate's `NewTarget` answers
+    /// `undefined`; the bridge maps the two.
+    pub fn new_target(&self) -> Option<Local> {
+        self.new_target.map(Local)
     }
 
     /// The isolate the call runs on.
@@ -324,7 +332,10 @@ impl FunctionTemplate {
                 Some(ref callback) => run_callback(callback, &info)?,
                 None => Value::Undefined,
             };
-            if result.is_object() {
+            // Spec 10.2.2 step 11: *any* Object result is the answer, and a
+            // function is an Object — `Value::is_object` is the `typeof` notion
+            // and would hand the instance back instead.
+            if matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 Ok(result)
             } else {
                 Ok(Value::Object(instance))
@@ -792,7 +803,9 @@ pub(crate) fn host_function(
             return_value: RefCell::new(None),
         };
         let result = run_callback(&callback, &info)?;
-        if result.is_object() {
+        // Spec 10.2.2 step 11, as in `get_function`: an Object result includes a
+        // function.
+        if matches!(result.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
             Ok(result)
         } else {
             Ok(Value::Object(instance))

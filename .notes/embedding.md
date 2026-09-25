@@ -4897,6 +4897,16 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,434 passed / 0 failed** (up four — this part's tests; `crux` 259, `v8` **322** default and **328** with simdutf, `runtime` 943, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p v8 --features simdutf` **328 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8` (the fresh-private store is bridge-side), and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six out-of-scope cases.
 
+*The small exposures — §9's second Node-API cluster, and the engine defect it turned up.* Five `ext/napi` errors over five names, all surface a callback or a host already had the information for. `Date::new` builds the instance the engine's per-`Date` table backs: `%Date.prototype%` from the realm's intrinsics plus a `[[DateValue]]` slot, so the object answers `Date.prototype.valueOf` and the engine's own brand check, and `NaN` is the invalid date. `Symbol::new`'s description becomes `Option<Local<String>>` rather than `Option<&str>`, which is the crate's own shape; the description is read as code units and through `JsString::owned_of`, so a rope keeps one flattened form for the symbol's life. `FunctionCallbackArguments::new_target` and `ReturnValue::from_function_callback_info` read what the call view already holds, the second being the shape a raw callback body (`ext/napi`'s op shim) writes its result through. `Isolate::ref_from_raw_isolate_ptr_mut_unchecked` reinterprets a host's stored raw pointer as the handle — the trick the crate we stand in for uses — which needed `Isolate` to be `#[repr(transparent)]` over its `NonNull` (its layout already was; the attribute pins it). One engine accessor was needed and named: `api::FunctionCallbackInfo::new_target`, because the bridge could read *whether* a call is a construct but not the target the field holds.
+
+*The defect the part turned up, and fixed with it.* The template construct path answered the instance unless the callback's result `is_object()` — and `Value::is_object` is the `typeof` notion, which excludes functions. So a host constructor that returned a function was silently replaced by the instance, where spec 10.2.2 step 11 makes *any* Object result (a function included) the construction's answer. Both construct paths (`FunctionTemplate::get_function` and `host_function`) now ask the question the rest of the engine asks, `matches!(kind, ValueKind::Object(_) | ValueKind::Function(_))`. It surfaced while writing the `new_target` test: `new nt()` was returning the instance, not the function the callback returned.
+
+*Tests — three, and four mutations, each caught by its own test.* `object`'s `a_date_is_the_one_the_engines_own_slot_backs` (a constructed Date answers `value_of`, is `[object Date]` and `instanceof Date` to the engine, its `getTime()` is the time it was built with, and `NaN` is the invalid date). `function`'s `a_raw_callback_reads_its_new_target_and_writes_through_the_call_view` (a raw callback writes through `ReturnValue::from_function_callback_info` and reports its `new_target`: `new nt() === nt` pins the construct-result rule *and* the new-target read, and a plain call answers `0` through the same view). `isolate`'s `a_host_borrows_its_stored_raw_isolate_pointer_as_the_handle` (the borrowed handle's raw pointer round-trips, and a scope over it runs a script — the reinterpretation is pinned by identity *and* by use). `primitives`' existing `a_fresh_symbol_is_new_every_time` now exercises the `Local<String>` description. Four mutations, each run alone and each caught: storing `0.0` instead of the time fails the `Date` test at `value_of`; dropping the description fails the symbol test at `description`; making the bridge's `new_target` answer `undefined` fails the callback test at the identity; and reverting the construct-result rule to `is_object()` fails that same test at the identity — the fix's own mutation.
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **10 → 5**, this part's five exactly. What remains is the tier's last two clusters, named in §9: the weak-handle pair (`Weak::to_global` and the `with_finalizer` receiver the crate spells `&mut Isolate`) and raw external strings — plus the pre-existing `ext/webgpu` `E0521`.
+
+*Gates — and the corpora, because `runtime` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,437 passed / 0 failed** (up three — this part's tests; `v8` **325** default and **331** with simdutf, `crux` 259, `runtime` 943, `test262` 3326 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine changes are an accessor and a two-site predicate, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same six out-of-scope cases: the construct-result rule is not reached there, and that is expected — nothing in the suite is a host constructor that returns a function.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5675,17 +5685,34 @@ if that proves possible.
   own, not an inherited one, and `[[Delete]]` is own by nature, so `has_private`
   asks the own table where `get_private` reads through `[[Get]]` — the one
   asymmetry the symbol-backed model carries, stated rather than implied. The rest
-  of the tier stays named-but-not-taken: the weak-handle pair (`Weak::to_global`,
-  and a `with_finalizer` receiver the crate spells `&mut Isolate` where this
-  bridge takes a scope — a divergence the other call sites never exposed, since
-  `ext/napi` is the only one that passes an isolate), the small exposures
-  (`Date::new`, `Symbol::new`'s description as a `Local<String>` rather than
-  `&str`, `FunctionCallbackArguments::new_target`,
-  `ReturnValue::from_function_callback_info`,
-  `Isolate::ref_from_raw_isolate_ptr_mut_unchecked`), and the one real engine
-  question left, raw external strings (`String::new_external_{onebyte,twobyte}_raw`),
-  which need an externally-backed string form the engine does not have — the same
-  tier decision `String::new_external_*` recorded when it chose to copy.
+  of the tier is taken next: **the small exposures**, named here before the edit.
+  `Date::new` builds the instance the engine's own per-`Date` table already backs
+  (`%Date.prototype%` plus a `[[DateValue]]` slot); `Symbol::new`'s description
+  becomes a `Local<String>` rather than `&str`, which is the crate's own shape
+  and what a host building a description in JS hands over;
+  `FunctionCallbackArguments::new_target` and
+  `ReturnValue::from_function_callback_info` read what a callback already has;
+  and `Isolate::ref_from_raw_isolate_ptr_mut_unchecked` reinterprets the host's
+  stored raw pointer as the handle, which needs `Isolate` to be
+  `#[repr(transparent)]` over it (its layout already is; this pins it). One
+  engine surface is needed and named: `api::FunctionCallbackInfo::new_target`,
+  because the bridge can read *whether* a call is a construct but not the target
+  the field holds. A defect surfaced while testing this and is fixed with it,
+  named here before the edit: the template construct path answers the instance
+  unless the callback's result `is_object()`, which excludes functions — so a host
+  constructor that returns a function is silently replaced by the instance, where
+  spec 10.2.2 makes *any* Object result (a function included) the construction's
+  answer. Both construct paths (`FunctionTemplate::get_function` and
+  `host_function`) now ask the question the rest of the engine asks,
+  `matches!(kind, ValueKind::Object(_) | ValueKind::Function(_))`. What then stays
+  named-but-not-taken is the weak-handle pair
+  (`Weak::to_global`, and a `with_finalizer` receiver the crate spells `&mut
+  Isolate` where this bridge takes a scope — a divergence the other call sites
+  never exposed, since `ext/napi` is the only one that passes an isolate) and the
+  one real engine question left, raw external strings
+  (`String::new_external_{onebyte,twobyte}_raw`), which need an externally-backed
+  string form the engine does not have — the same tier decision
+  `String::new_external_*` recorded when it chose to copy.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,

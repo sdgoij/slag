@@ -853,11 +853,19 @@ impl Symbol {
     ///
     /// Every call mints a new symbol, even for a description just used — no
     /// registry is consulted, which is what separates this from
-    /// [`for_key`](Self::for_key). The scope is unused because a symbol needs
-    /// no realm to exist; the crate we stand in for takes one, and a host has
-    /// one in hand.
-    pub fn new<'s>(_scope: &PinScope<'s, '_, ()>, description: Option<&str>) -> Local<'s, Symbol> {
-        let symbol = crux::symbol::Symbol::new(description.map(JsString::from_utf8));
+    /// [`for_key`](Self::for_key). The description is a `Local<String>`, as it is
+    /// in the crate we stand in for, so a host hands over a string it built in
+    /// JS; the scope is unused because a symbol needs no realm to exist.
+    pub fn new<'s>(
+        _scope: &PinScope<'s, '_, ()>,
+        description: Option<Local<'s, String>>,
+    ) -> Local<'s, Symbol> {
+        // Code units, as `for_key` reads them, and through `owned_of` so a rope
+        // description keeps one flattened form for the symbol's life.
+        let description = description
+            .and_then(|text| text.engine().value().as_string())
+            .map(|text| JsString::owned_of(&text));
+        let symbol = crux::symbol::Symbol::new(description);
         symbol_handle(crux::handle::Handle::new(symbol))
     }
 
@@ -977,8 +985,9 @@ mod tests {
     #[test]
     fn a_fresh_symbol_is_new_every_time() {
         in_context!(scope, {
-            let first = Symbol::new(scope, Some("fresh.test"));
-            let second = Symbol::new(scope, Some("fresh.test"));
+            let description = String::new(scope, "fresh.test").expect("string");
+            let first = Symbol::new(scope, Some(description));
+            let second = Symbol::new(scope, Some(description));
             bind(scope, "first", first.cast::<Value>());
             bind(scope, "second", second.cast::<Value>());
             assert_eq!(

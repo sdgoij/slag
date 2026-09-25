@@ -1095,6 +1095,30 @@ impl<'s> LocalHandle<'s, Set> {
     }
 }
 
+impl Date {
+    /// A new Date with the given time value (`v8::Date::New`).
+    ///
+    /// The value is milliseconds since the epoch, and `NaN` is the invalid date
+    /// the constructor also makes; the engine stores it in the same per-instance
+    /// `[[DateValue]]` slot `Date.prototype.valueOf` reads, so the object this
+    /// answers is one [`value_of`](LocalHandle::value_of) reads back.
+    ///
+    /// `None` when the realm has no `%Date.prototype%` to give the instance —
+    /// the crate's empty answer for a construction the engine cannot make.
+    #[allow(clippy::new_ret_no_self)] // v8::Date::New returns a new date, not `Self`.
+    pub fn new<'s>(scope: &PinScope<'s, '_, ()>, time: f64) -> Option<Local<'s, Date>> {
+        let realm = crate::realm_of(scope);
+        let prototype = realm
+            .intrinsic("%Date.prototype%")
+            .and_then(|value| value.as_object())?;
+        let object = JsObject::ordinary_object_create(Some(prototype));
+        realm.with_agent(|agent| {
+            agent.date_data.insert(object.id(), time);
+        });
+        Some(Local::from_engine(api::Local::object(object)))
+    }
+}
+
 impl<'s> LocalHandle<'s, Date> {
     /// The time value in milliseconds since the epoch (`v8::Date::ValueOf`).
     ///
@@ -1513,6 +1537,38 @@ mod tests {
                 Local::<Object>::try_from(eval(scope, "Object.create([9])")).expect("object");
             assert_eq!(derived.has_index(scope, 0), Some(true));
             assert_eq!(number_of(derived.get_index(scope, 0).expect("value")), 9.0);
+        });
+    }
+
+    /// `Date::new` makes the instance the engine's own `[[DateValue]]` slot backs:
+    /// a real Date to the engine's brand check and prototype, answering the time it
+    /// was built with, and the invalid date for `NaN`.
+    #[test]
+    fn a_date_is_the_one_the_engines_own_slot_backs() {
+        in_context!(scope, {
+            let date = Date::new(scope, 1234.5).expect("date");
+            assert_eq!(date.value_of(), 1234.5);
+            let value: Local<'_, Value> = date.cast();
+            bind(scope, "d", value);
+            assert_eq!(
+                eval_number(
+                    scope,
+                    "Object.prototype.toString.call(d) === '[object Date]' ? 1 : 0"
+                ),
+                1.0
+            );
+            assert_eq!(eval_number(scope, "d instanceof Date ? 1 : 0"), 1.0);
+            assert_eq!(eval_number(scope, "d.getTime()"), 1234.5);
+
+            // `NaN` is the invalid date the constructor also makes.
+            let invalid = Date::new(scope, f64::NAN).expect("date");
+            assert!(invalid.value_of().is_nan());
+            let invalid_value: Local<'_, Value> = invalid.cast();
+            bind(scope, "bad", invalid_value);
+            assert_eq!(
+                eval_number(scope, "Number.isNaN(bad.getTime()) ? 1 : 0"),
+                1.0
+            );
         });
     }
 

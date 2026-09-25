@@ -698,6 +698,7 @@ impl UnsafeRawIsolatePtr {
 /// Handles alias the same state, so a method taking `&mut self` only means the
 /// caller has no other handle *at hand* — the same convention the rest of this
 /// bridge follows for the isolate.
+#[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct Isolate(NonNull<IsolateInner>);
 
@@ -893,6 +894,26 @@ impl Isolate {
     /// The handle must be read on the thread the isolate was created on.
     pub unsafe fn as_raw_isolate_ptr(&self) -> UnsafeRawIsolatePtr {
         UnsafeRawIsolatePtr::from_inner_ptr(self.0.as_ptr())
+    }
+
+    /// The handle for a host's stored raw pointer, borrowed rather than copied
+    /// (v8::Isolate::ref_from_raw_isolate_ptr_mut_unchecked).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at an [`UnsafeRawIsolatePtr`] naming an isolate that is
+    /// still alive, and the borrow must not outlive that storage. The crate's
+    /// contract also has the caller check the thread the isolate belongs to;
+    /// this bridge makes no such check anywhere, as its other raw-pointer
+    /// conversions state.
+    pub unsafe fn ref_from_raw_isolate_ptr_mut_unchecked<'a>(
+        ptr: *mut UnsafeRawIsolatePtr,
+    ) -> &'a mut Isolate {
+        // SAFETY: an `Isolate` is this bridge's handle for the same
+        // `*mut IsolateInner` an `UnsafeRawIsolatePtr` wraps, and it is
+        // `repr(transparent)` over that pointer, so the host's storage for the
+        // raw pointer is a valid handle for the isolate the caller names there.
+        unsafe { &mut *ptr.cast::<Isolate>() }
     }
 
     /// `v8::Isolate::SetData`.
@@ -2209,6 +2230,27 @@ impl OwnedIsolate {
 mod tests {
     use super::*;
     use crate::promise::PromiseState;
+
+    /// A host that kept the raw pointer can borrow the handle back out of its own
+    /// storage, which is the shape `ext/napi`'s `Env` uses to reach the isolate its
+    /// callbacks run on.
+    #[test]
+    fn a_host_borrows_its_stored_raw_isolate_pointer_as_the_handle() {
+        let isolate = &mut Isolate::new(CreateParams::default());
+        // SAFETY: the isolate is alive for the borrow below.
+        let mut raw = unsafe { isolate.as_raw_isolate_ptr() };
+        // SAFETY: `raw` names that live isolate and outlives the borrow.
+        let borrowed = unsafe { Isolate::ref_from_raw_isolate_ptr_mut_unchecked(&mut raw) };
+        // The reinterpreted handle names the same isolate, not a copy of an
+        // address: its own raw pointer round-trips, and a scope over it enters a
+        // context a script runs in.
+        // SAFETY: `borrowed` names the live isolate.
+        assert_eq!(unsafe { borrowed.as_raw_isolate_ptr() }, raw);
+        crate::scope!(let scope, borrowed);
+        let context = crate::Context::new(scope, Default::default());
+        let scope = &mut crate::ContextScope::new(scope, context);
+        assert_eq!(crate::test_support::eval_number(scope, "6 * 7"), 42.0);
+    }
 
     /// A termination request crosses threads and is observed at a check point,
     /// and the isolate and its handle see the same one.

@@ -190,6 +190,13 @@ impl FunctionCallbackInfo {
         self.engine().is_construct_call()
     }
 
+    pub(crate) fn new_target(&self) -> Local<'_, Value> {
+        match self.engine().new_target() {
+            Some(target) => Local::from_engine(target),
+            None => Local::from_engine(api::Local::undefined()),
+        }
+    }
+
     /// The data the function was built with, or `undefined`.
     pub(crate) fn data(&self) -> Local<'_, Value> {
         self.data
@@ -271,6 +278,13 @@ impl<'s> FunctionCallbackArguments<'s> {
     pub fn is_construct_call(&self) -> bool {
         self.info.is_construct_call()
     }
+
+    /// The value `new` was called with
+    /// (v8::FunctionCallbackArguments::NewTarget), or `undefined` for a plain
+    /// call.
+    pub fn new_target(&self) -> Local<'s, Value> {
+        self.info.new_target()
+    }
 }
 
 /// Where a callback puts its result (v8::ReturnValue).
@@ -306,6 +320,15 @@ impl<T> Copy for ReturnValue<'_, T> {}
 impl<T> std::fmt::Debug for ReturnValue<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ReturnValue")
+    }
+}
+
+impl<'s> ReturnValue<'s, Value> {
+    /// The handle for a call whose view the caller already has, which is how a
+    /// raw callback body writes its result
+    /// (v8::ReturnValue::from_function_callback_info).
+    pub fn from_function_callback_info(info: &'s FunctionCallbackInfo) -> Self {
+        info.return_value()
     }
 }
 
@@ -693,6 +716,36 @@ mod tests {
                 .expect("function");
             bind(scope, "plain", plain.cast::<Value>());
             assert_eq!(eval_number(scope, "plain()"), 1.0);
+        });
+    }
+
+    /// A raw callback body — the shape `ext/napi`'s op shim uses — writes its
+    /// result through the call view it already has and reads what `new` was called
+    /// with, so `new nt()` answers the constructor itself where a plain call is not
+    /// a construct call at all.
+    #[test]
+    fn a_raw_callback_reads_its_new_target_and_writes_through_the_call_view() {
+        unsafe extern "C" fn reports_new_target(info: *const FunctionCallbackInfo) {
+            // SAFETY: the engine hands a callback a live call view for the
+            // duration of the call.
+            let info = unsafe { &*info };
+            let args = FunctionCallbackArguments::from_function_callback_info(info);
+            let rv = ReturnValue::from_function_callback_info(info);
+            if args.is_construct_call() {
+                rv.set(args.new_target());
+            } else {
+                rv.set_double(0.0);
+            }
+        }
+
+        in_context!(scope, {
+            let function = Function::builder_raw(reports_new_target)
+                .constructor_behavior(ConstructorBehavior::Allow)
+                .build(scope)
+                .expect("function");
+            bind(scope, "nt", function.cast::<Value>());
+            assert_eq!(eval_number(scope, "new nt() === nt ? 1 : 0"), 1.0);
+            assert_eq!(eval_number(scope, "nt()"), 0.0);
         });
     }
 
