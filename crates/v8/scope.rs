@@ -195,6 +195,21 @@ impl<'s, 'p: 's, C> NewHandleScope<'s> for PinnedRef<'_, CallbackScope<'p, C>> {
     }
 }
 
+/// The same, over a context scope: `deno_core::scope!` yields one, and
+/// `deno_runtime` opens an inner `HandleScope` over it
+/// (`runtime/worker.rs:1141`). The inner scope inherits the isolate *and the
+/// context* the context scope entered, so handles it makes are usable by the
+/// host code the context scope wraps.
+impl<'s, 'borrow, 'scope, 'i: 's, C> NewHandleScope<'s>
+    for ContextScope<'borrow, 'scope, HandleScope<'i, C>>
+{
+    type NewScope = HandleScope<'s, C>;
+
+    fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
+        HandleScope::new_in(me.scope.0.isolate, me.scope.0.context)
+    }
+}
+
 impl<'s> HandleScope<'s> {
     #[allow(clippy::new_ret_no_self)]
     pub fn new<P: NewHandleScope<'s>>(scope: &'s mut P) -> ScopeStorage<P::NewScope> {
@@ -1270,6 +1285,31 @@ mod tests {
             // what the two inherited fields are for.
             assert_eq!(crate::test_support::eval_number(inner, "6 * 7"), 42.0);
         });
+    }
+
+    /// The shape `deno_runtime` writes (`runtime/worker.rs:1141`): the context
+    /// scope `deno_core::scope!` yields, handed to `v8::HandleScope::new`, so an
+    /// inner `HandleScope` inherits the context scope's isolate and context. A
+    /// compile-time guard as much as a test — without a `NewHandleScope` impl for
+    /// a pinned `ContextScope` the `HandleScope::new` below does not build — and
+    /// the realm assertion is what makes the inheritance load-bearing rather than
+    /// a formality.
+    #[test]
+    fn a_handle_scope_can_be_opened_over_a_context_scope() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_scope, isolate);
+        let context = crate::Context::new(handle_scope, Default::default());
+        let context_scope = &mut crate::ContextScope::new(handle_scope, context);
+        let outer = context_scope.get_current_context();
+
+        let storage = std::pin::pin!(crate::HandleScope::new(context_scope));
+        let inner = &mut storage.init();
+
+        assert!(
+            inner.get_current_context() == outer,
+            "the inner scope keeps the context scope's realm"
+        );
+        assert_eq!(crate::test_support::eval_number(inner, "6 * 7"), 42.0);
     }
 
     /// The continuation-preserved value is held across the scope manipulations a

@@ -4931,6 +4931,14 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,445 passed / 0 failed** (up four — this part's tests; `v8` **333** default and **339** with simdutf, `crux` 259, `runtime` 943, `ffi` 10, `slag` 4, `test262` 3324 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8/weak.rs`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` (and the same for `wasmtest`) is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six out-of-scope cases — a `Clone` impl on weak handles does not reach them.
 
+*The `NewHandleScope` a `ContextScope` did not satisfy — §9's bullet, named before the edit.* `deno_runtime`'s `runtime/worker.rs:1141` writes the context scope `deno_core::scope!` yields into `v8::HandleScope::new`, and the bridge implemented `NewHandleScope` for `Isolate`, `OwnedIsolate`, `PinnedRef<HandleScope>` and `PinnedRef<CallbackScope>` and not for `ContextScope`, so no inner scope could be opened over one — the `E0277` the previous record's measurement surfaced once `deno_webgpu` compiled. A reproduction of deno's own two lines (`scope!` → `ContextScope::new` → `HandleScope::new`) reproduced the same bound error in this workspace, which is what turned "`deno_runtime`'s error" into the bridge's. The fix is one impl: a `ContextScope<'_, '_, HandleScope<'i, C>>` opens an inner `HandleScope<'s, C>` over the isolate and the context it inherited (`HandleScope::new_in(me.scope.0.isolate, me.scope.0.context)`), with the `'i: 's` the payload marker demands — the same pair, read the same way, as the `PinnedRef<HandleScope>` impl beside it. No engine change.
+
+*Tests — one, and one mutation caught, with one stated limit.* `a_handle_scope_can_be_opened_over_a_context_scope` (in `scope.rs`'s own tests, beside the callback-scope guard) opens the inner scope over the context scope and asserts the realm is the same one *and* that a script evaluates in it — the second half is what makes the inherited context load-bearing rather than a formality. A mutation that drops the context (`HandleScope::new_in(me.scope.0.isolate, None)`) fails it at the realm assertion (`bridge bug: handle scope without an entered context`, the panic this bridge raises for exactly this shape), and a second — returning `HandleScope<'s, ()>` instead of `HandleScope<'s, C>` — is caught by the same test no longer compiling, since `get_current_context` and `eval_number` both require the context-bearing form. The isolate field has no independent mutation: a "wrong isolate" is not constructible from the scope's own data. Recorded rather than papered over.
+
+*The measurement, and the class it moved.* `cargo check -p deno_snapshots --keep-going`: the two `ContextScope: NewHandleScope` diagnostics are **gone** and `deno_runtime` compiles, so the whole graph type-checks — and the check now fails at *link* time instead, on `simdutf__binary_to_base64` and `simdutf__base64_to_binary` (`link.exe` LNK2019 ×2, referenced from `deno_web`). That is the next part, named in §9's bullet above it.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,446 passed / 0 failed** (up one — this part's test; `v8` **334**, `crux` 259, `runtime` 943, `test262` 3324 with its two ignored); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, checked rather than argued**: the part touches only `crates/v8/scope.rs`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` (and the same for `wasmtest`) is **0**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5782,6 +5790,17 @@ if that proves possible.
   (`runtime/Cargo.toml:68`) and a failed dependency hides its dependents. That
   shape is the next part, and it is the same family as the
   `PinnedRef<'_, CallbackScope<'_>>` shape §12's CLI-tier bullet already names.
+- **The `NewHandleScope` a `ContextScope` does not satisfy — named here before
+  the edit.** `deno_runtime`'s `runtime/worker.rs:1141` writes
+  `deno_core::scope!`'s context scope into `v8::HandleScope::new`, and the bridge
+  implements `NewHandleScope` for `Isolate`, `OwnedIsolate`,
+  `PinnedRef<HandleScope>` and `PinnedRef<CallbackScope>` but not for
+  `ContextScope`, so no inner scope can be opened over it (`E0277`). The crate we
+  stand in for supports it, which is why Deno's own code compiles there. The fix
+  is one impl: a `ContextScope<'_, '_, HandleScope<'i, C>>` opens an inner
+  `HandleScope<'s, C>` over the isolate and the *context* it inherited — the same
+  pair the `PinnedRef<HandleScope>` impl copies, read from the scope the context
+  scope wraps. It is a bridge shape and no engine change.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
