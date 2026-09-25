@@ -97,7 +97,7 @@ pub use isolate::{
     HostImportModuleWithPhaseDynamicallyCallback, HostInitializeImportMetaObjectCallback, Isolate,
     IsolateHandle, NearHeapLimitCallback, OwnedIsolate, PrepareStackTraceCallback,
     PromiseRejectCallback, TimeZoneDetection, UnsafeRawIsolatePtr, WasmAsyncResolvePromiseCallback,
-    WasmAsyncSuccess,
+    WasmAsyncSuccess, WasmCodeGenerationCallback,
 };
 pub use json::{parse as json_parse, stringify as json_stringify};
 pub use microtask::MicrotaskQueue;

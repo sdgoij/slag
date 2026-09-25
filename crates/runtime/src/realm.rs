@@ -42,6 +42,10 @@ pub struct Realm {
     /// because a realm exists before the host's option is applied to it, and
     /// `None` is the agent's own queue.
     pub microtask_queue: std::cell::Cell<Option<u32>>,
+    /// Whether `eval` and the `Function` constructor may compile a string in
+    /// this realm (V8's `Context::AllowCodeGenerationFromStrings`). True until
+    /// a host turns it off; a `Cell` for the same reason `microtask_queue` is.
+    pub code_generation_from_strings: std::cell::Cell<bool>,
 }
 
 /// The promise hooks a context can install, one slot per
@@ -87,6 +91,18 @@ impl Trace for Realm {
 impl Realm {
     pub fn global_env(&self) -> EnvRef {
         self.global_env
+    }
+
+    /// Whether this realm lets a string be compiled: `eval` and the `Function`
+    /// constructor (V8's `Context::AllowCodeGenerationFromStrings`).
+    pub fn allows_code_generation_from_strings(&self) -> bool {
+        self.code_generation_from_strings.get()
+    }
+
+    /// Turn that permission on or off (V8's
+    /// `Context::AllowCodeGenerationFromStrings`).
+    pub fn set_allow_code_generation_from_strings(&self, allowed: bool) {
+        self.code_generation_from_strings.set(allowed);
     }
 }
 
@@ -622,6 +638,7 @@ pub fn initialize_host_defined_realm_with_global(
         promise_hooks: RefCell::new(PromiseHooks::default()),
         loaded_modules: RefCell::new(std::collections::HashMap::new()),
         microtask_queue: std::cell::Cell::new(None),
+        code_generation_from_strings: std::cell::Cell::new(true),
     });
     // Root the realm from the moment its box exists. `Agent::realms` is the
     // realm's permanent root (it is only ever pushed, never popped or

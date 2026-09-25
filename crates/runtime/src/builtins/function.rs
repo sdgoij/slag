@@ -332,13 +332,23 @@ fn create_dynamic_function(
     };
     let mut param_strings = Vec::new();
     for arg in param_args {
-        param_strings.push(crate::context::to_string(agent, arg)?.to_string_lossy());
+        param_strings.push(crate::context::to_string(agent, arg)?);
     }
     let body_string = match body_arg {
-        Some(arg) => crate::context::to_string(agent, arg)?.to_string_lossy(),
-        None => String::new(),
+        Some(arg) => crate::context::to_string(agent, arg)?,
+        None => crux::string::JsString::from_utf8(""),
     };
-    let param_string = param_strings.join(",");
+    // HostEnsureCanCompileStrings (spec 20.2.1.1 step 3): the Function
+    // constructor compiles a string like `eval` does, and the same policy — a
+    // host hook and the realm's own permission — applies to it.
+    let realm = agent.current_realm()?;
+    crate::host::ensure_can_compile_strings(agent, &realm, &param_strings, &body_string, false)?;
+    let param_string = param_strings
+        .iter()
+        .map(crux::string::JsString::to_string_lossy)
+        .collect::<Vec<_>>()
+        .join(",");
+    let body_string = body_string.to_string_lossy();
     let source = format!("function anonymous({param_string}\n) {{\n{body_string}\n}}");
     let function_ast = parser::parse_function(&source)?;
     let func_proto = get_prototype_from_constructor(agent, &new_target)?;

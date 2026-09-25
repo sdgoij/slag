@@ -253,6 +253,11 @@ pub struct IsolateInner {
     /// The host's streaming-compilation callback
     /// (`v8::Isolate::SetWasmStreamingCallback`), once it installed one.
     wasm_streaming: Option<StreamingCallback>,
+    /// The host's wasm code-generation policy
+    /// (`v8::Isolate::SetAllowWasmCodeGenerationCallback`), once it installed
+    /// one. The engine reaches it through this bridge's `HostHooks` before it
+    /// compiles a wasm module.
+    allow_wasm_code_generation: Option<WasmCodeGenerationCallback>,
     /// The host's `import.meta` callback
     /// (`v8::Isolate::SetHostInitializeImportMetaObjectCallback`), once it
     /// installed one. The engine reaches it through this bridge's `HostHooks`
@@ -335,6 +340,16 @@ pub type PromiseRejectCallback = unsafe extern "C" fn(PromiseRejectMessage);
 /// the call. See [`host_streaming_callback`].
 type StreamingCallback =
     for<'a, 'b, 'c> fn(&'c mut PinScope<'a, 'b>, Local<'a, Value>, WasmStreaming<false>);
+
+/// The host's wasm code-generation policy
+/// (`v8::Isolate::SetAllowWasmCodeGenerationCallback`).
+///
+/// Asked before a wasm module is compiled, with the context the compile runs in;
+/// `false` refuses it. The crate we stand in for declares this a plain
+/// `extern "C"` function rather than a mapped one, so it is stored as the type
+/// the host wrote and called directly.
+pub type WasmCodeGenerationCallback =
+    extern "C" fn(Local<Context>, Local<crate::data::String>) -> bool;
 
 /// The function the engine's hook seam calls for a streaming compile: the host's
 /// callback, reached through its type.
@@ -772,6 +787,7 @@ impl Isolate {
             externals,
             promise_reject: None,
             wasm_streaming: None,
+            allow_wasm_code_generation: None,
             import_meta: None,
             import_dynamically: None,
             import_dynamically_with_phase: None,
@@ -1465,6 +1481,24 @@ impl Isolate {
         self.install_hooks();
     }
 
+    /// Ask the host whether a wasm module may be compiled in a context
+    /// (`v8::Isolate::SetAllowWasmCodeGenerationCallback`).
+    ///
+    /// The callback is handed the context the compile runs in and a source
+    /// string, and answers whether to allow it; a host that installs none
+    /// permits every compile, which is this engine's own default. Where the
+    /// crate we stand in for names a `source`, this engine's compiles are byte
+    /// compiles and it keeps no text source for one, so what a callback here is
+    /// handed is the empty string — informational either way, and the one host
+    /// that reads it (`deno/ext/node/ops/vm.rs`) ignores it.
+    pub fn set_allow_wasm_code_generation_callback(
+        &mut self,
+        callback: WasmCodeGenerationCallback,
+    ) {
+        self.inner_mut().allow_wasm_code_generation = Some(callback);
+        self.install_hooks();
+    }
+
     /// The callback an error's `stack` property runs
     /// (v8::Isolate::SetPrepareStackTraceCallback).
     ///
@@ -1730,6 +1764,28 @@ impl runtime::HostHooks for BridgeHooks {
             }
             None => false,
         }
+    }
+
+    fn allow_wasm_code_generation(&self, context: &api::Context) -> bool {
+        // SAFETY: as `wasm_streaming` — the engine hands back the isolate whose
+        // wasm compile is running, and that address is the bridge's.
+        let Some(engine) = api::Isolate::get_current() else {
+            return true;
+        };
+        let isolate = unsafe { Isolate::from_engine_ptr(engine) };
+        let Some(callback) = isolate.inner().allow_wasm_code_generation else {
+            // No host policy: every compile is allowed, which is the engine's
+            // own default.
+            return true;
+        };
+        let context_local = Local::<Context>::from_payload(Payload::Context(*context));
+        crate::callback_scope!(unsafe _scope, context_local);
+        // The source argument: this engine compiles bytes and keeps no text
+        // source for one, so the callback is handed the empty string. The crate
+        // we stand in for's own argument is informational, and the one host that
+        // installs this ignores it.
+        let source = Local::<crate::data::String>::from_engine(api::Local::string(""));
+        callback(context_local, source)
     }
 
     fn wasm_streaming(
@@ -2310,6 +2366,64 @@ mod tests {
                 "the rejection and the late handler are both reported, in order"
             );
         });
+    }
+
+    /// The other isolate-level callback a host installs
+    /// (`v8::Isolate::SetAllowWasmCodeGenerationCallback`): the engine asks it
+    /// before a wasm compile, and a host that says no turns the compile into
+    /// V8's CompileError — while one that installs no callback at all leaves
+    /// every compile working.
+    #[test]
+    fn a_host_can_refuse_wasm_code_generation() {
+        thread_local! {
+            static ASKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            static ANSWER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        }
+
+        #[allow(improper_ctypes_definitions)] // as the callback type says.
+        extern "C" fn policy(
+            _context: Local<crate::data::Context>,
+            _source: Local<crate::data::String>,
+        ) -> bool {
+            ASKED.with(|asked| asked.set(asked.get() + 1));
+            ANSWER.with(|answer| answer.get())
+        }
+
+        // The bytes `compile_module_value` answers a Module object for, as the
+        // Uint8Array the JS API takes. 1 is "compiled", 2 is "refused with a
+        // CompileError", 0 anything else.
+        let bytes = crate::test_support::EXPORTS_A_MEMORY
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            "(() => {{ try {{ new WebAssembly.Module(new Uint8Array([{bytes}])); return 1; }} \
+             catch (e) {{ return e.name === 'CompileError' ? 2 : 0; }} }})()"
+        );
+
+        let isolate = &mut Isolate::new(CreateParams::default());
+        isolate.set_allow_wasm_code_generation_callback(policy);
+        crate::scope!(let handle_scope, isolate);
+        let context = crate::Context::new(handle_scope, Default::default());
+        let scope = &mut crate::ContextScope::new(handle_scope, context);
+
+        // The callback permits, so the module compiles and the host was asked.
+        assert_eq!(crate::test_support::eval_number(scope, &source), 1.0);
+        assert!(
+            ASKED.with(|asked| asked.get()) >= 1,
+            "the host was never asked about the compile"
+        );
+
+        ANSWER.with(|answer| answer.set(false));
+        assert_eq!(
+            crate::test_support::eval_number(scope, &source),
+            2.0,
+            "the refusal is not V8's CompileError"
+        );
+
+        ANSWER.with(|answer| answer.set(true));
+        assert_eq!(crate::test_support::eval_number(scope, &source), 1.0);
     }
 
     /// A host callback that streams one module for every source it is handed —

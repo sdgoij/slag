@@ -4841,18 +4841,15 @@ tests, 0 fail**).
 
 *Gates — and the corpora, because `crux` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,409 passed / 0 failed** (up three — this part's tests; `v8` **301**, `runtime` 940, `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **307 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **909 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine change is a parameter threaded through one seam, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
-- **The code-generation flags — the last cluster, and it is two engine choke
-  points.** `Context::set_allow_generation_from_strings(false)` has to *refuse*
-  `eval` and `Function` in that realm, or `node:vm`'s
-  `codeGeneration: { strings: false }` is a lie rather than a divergence, and
-  `Isolate::set_allow_wasm_code_generation_callback` is a per-compile host
-  callback, so the engine has to ask it. Both have a single place to ask:
-  `builtins::wasm::compile_module_value` is the one function every wasm compile
-  reaches (`api/wasm.rs`'s two call sites, and through them the JS builtins), and
-  the realm a check needs is `agent.current_realm()`. That is the shape of the
-  part: a realm flag, an isolate-level callback reached through the existing
-  `HostHooks` seam, and a check at each choke point — with the default being
-  "allowed", so a host that never sets either sees today's behaviour.
+*The code-generation flags — the last cluster, and the cascade behind it needed two more names.* Two host policies, each with a single place the engine has to ask. **Strings:** a realm flag (V8's `Context::AllowCodeGenerationFromStrings`) refuses `eval` and the `Function` constructor, and the refusal is V8's EvalError and text. The engine had the hook already — `HostEnsureCanCompileStrings`, consulted by `eval` at `script.rs:767` — so the work was the *flag* and one correction to §9's note: `builtins::function::create_dynamic_function` never called the hook at all, so the Function constructor consulted nothing. Both choke points now go through one dispatch (`host::ensure_can_compile_strings`: the host hook, then the realm's flag), and the bridge exposes `Context::set_allow_generation_from_strings` over `api::Context::set_allow_code_generation_from_strings`. **Wasm:** `HostHooks` gains `allow_wasm_code_generation(&api::Context) -> bool` and `compile_module_bytes` asks it before decoding, refusing with the CompileError V8 raises (`Wasm code generation disallowed by embedder`). §9 named `compile_module_value` as the choke point and that was wrong by one function: `module_construct` (`new WebAssembly.Module`) reaches `compile_module_bytes` directly, and `compile_module_value` is one of its callers — so the check is in `compile_module_bytes`, which every byte compile reaches. The bridge stores the host's callback on the isolate and installs it through the existing `install_hooks`, so it cannot displace the promise-rejection or streaming callbacks (the lesson `wasm_streaming`'s record already carries). One divergence stated: the `source` the callback is handed is the empty string, because every compile here is a byte compile and the engine keeps no text source for one — informational in V8, and the one host that installs this ignores it.
+
+*Two links the cascade uncovered, plus a genuine shape bug it was masking.* `TryCatch::message` (named in §9) is the caught value's message, minted the way `Exception::create_message` mints one — this engine records no message at throw — and `Message::get_source_line` (not named; the next link) needed the recorded position to carry the line's *text*, so `position::Position` gained `line_text`, sliced at record time from the source in hand. Its answer is `None` for a runtime error, the same narrowing `get_line_number` already carried. And `NewEscapableHandleScope for ContextScope` had pinned an escape's promotion target to the parent's **borrow** (`'borrow`) where its sibling impl pins the parent's own lifetime (`'obj`) — invisible until now because the errors before it kept rustc from reaching the demand, and it is why `vm.rs`'s `eval_machine` returns `Some(scope.escape(result?))` under its own `PinScope` lifetime. Fixed to `'scope`; the doc comment says what it buys.
+
+*Tests — seven, and three mutations, each caught by its own test.* The engine's `a_realm_that_refuses_string_compilation_refuses_eval` pins the flag against `perform_eval` with no host hook in play. `refusing_string_code_generation_refuses_eval_and_function` drives the host-visible contract: both compile by default, each is refused with `e.name === 'EvalError'` after the flag is cleared, a non-string `eval(7)` still answers 7, and setting it back re-enables. `a_host_can_refuse_wasm_code_generation` is a callback that answers from a thread-local, so one test covers both answers — permitted (module compiles, host was asked) and refused (`CompileError`). `a_handler_answers_the_message_of_what_it_caught` is the compile-error path through a `tc_scope!`: the message's line number and its source line. `a_handler_that_caught_nothing_answers_no_message` is the control that says the first one observed something. In `message.rs`, `a_compile_error_answers_its_source_line` (two sources, so the line follows the error) and `a_runtime_error_has_no_source_line` (the narrowing). Three mutations, each run alone and each caught by its own test: making the realm flag a no-op fails the context test at the first refusal; making the wasm dispatch answer `true` without asking fails the wasm test at "the host was never asked"; and making `position::line_text` slice from the file's start fails the source-line test at `"let a = 1;\n  )"` vs `"  )"`.
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **39 → 33**, with `ext/node/ops/vm.rs` at **5 → 0** — the whole frontier module type-checks. What is left is `ext/node/ops/v8.rs` (26 — the `HeapStatistics`/`Isolate` heap accessors), `ext/node/ops/buffer.rs` (5), and one each in `ipc.rs` and `ext/webgpu/error.rs` (the last pre-existing). With this, the last of §9's named clusters is closed and the remainder is neither of them.
+
+*Gates — and the corpora, because `runtime` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,416 passed / 0 failed** (up seven — this part's tests; `v8` **307**, `runtime` **941**, `crux` 258, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p v8 --features simdutf` **313 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **910 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine changes are a realm `Cell`, one dispatch function and two call sites, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
 ## 8. Parked: the C++ face
 
@@ -5534,8 +5531,11 @@ if that proves possible.
   that nothing else changes — so `vm.rs`'s
   `set_security_token(main.get_security_token())` is by construction the copy it
   means to make.
-- **What is left of `vm.rs`, named here so the next parts are not a probe.** The
-  **handler family — landed** (§7's record has the measurement; one correction to
+- **What was left of `vm.rs` — all of it landed, and this bullet is the record
+  of the list.** `ext/node/ops/vm.rs` type-checks in full (§7 has the
+  measurements); the names are kept here so a later reader does not have to
+  re-probe the frontier. The
+  **handler family — landed** (§7's record; one correction to
   the note below: only `set` needs the `throw` flag, because V8's deleter
   callback has no `Throw` to see). It was the 14 named and indexed callback
   types, `NamedPropertyHandlerConfiguration`'s remaining `*_raw` setters,
@@ -5545,21 +5545,27 @@ if that proves possible.
   `throw` flag on the `HostOps::set` seam, since the engine's internal methods do
   not carry one and a callback that cannot see it would answer a question the
   host asked. The
-  **real-named-property family**:
+  **real-named-property family — landed** (§7's record):
   `Object::{get_real_named_property, get_real_named_property_attributes,
   has_real_named_property, get_property_attributes, delete_index,
   get_creation_context}` — "real" means the interceptor is not consulted, which
-  needs an own-property read that bypasses `HostOps`, and
-  `get_creation_context` needs an object-to-realm record this engine does not
-  keep. The **code-generation flags**:
-  `Context::set_allow_generation_from_strings`, which must actually refuse
+  needed an own-property read that bypasses `HostOps`, and
+  `get_creation_context` answers for a realm's global object rather than for any
+  object, which is the narrowing that record states. The **code-generation flags
+  — landed** (§7's record,
+  and it carries the two corrections the probe made to the note that used to
+  follow: the wasm choke point is `compile_module_bytes`, not
+  `compile_module_value`, and the Function constructor consulted no hook at all
+  before this part). They were
+  `Context::set_allow_generation_from_strings`, which had to actually refuse
   `eval` and `Function` in that realm rather than be stored and ignored, and
-  `Isolate::set_allow_wasm_code_generation_callback`, which is a per-compile host
-  callback and so needs a hook at the engine's wasm entry points. One name joins
-  that list from this part rather than from the probe: fixing the scope chain
-  moved the next link into view — `vm.rs`'s `tc_scope!` followed by
-  `scope.message()` wants `TryCatch::message` over an escapable scope, which the
-  bridge does not have at all.
+  `Isolate::set_allow_wasm_code_generation_callback` (deno calls it on a
+  `PinScope`, and the argument is a *callback*, not a bool), a
+  per-compile host callback needing a hook at the engine's wasm entry
+  point. The names that joined that list from the probe chain rather than from
+  the probe itself — `TryCatch::message`, and the `Message::get_source_line`
+  deno's reads want next — landed with it, as did the escapable scope's
+  promotion-target bug the cascade had been masking.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,

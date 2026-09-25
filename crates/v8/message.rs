@@ -124,6 +124,23 @@ impl LocalHandle<'_, Message> {
     pub fn get_stack_trace<'a>(&self, _scope: &PinScope<'a, '_>) -> Option<Local<'a, StackTrace>> {
         None
     }
+
+    /// The text of the line the error is on (v8::Message::GetSourceLine).
+    ///
+    /// `None` for a message with no recorded position — every runtime error —
+    /// the same narrowing [`get_line_number`](Self::get_line_number) records.
+    /// A message minted for a stalled top-level await answers the suspended
+    /// line of its module instead.
+    pub fn get_source_line<'a>(&self, scope: &PinScope<'a, '_>) -> Option<Local<'a, String>> {
+        if let Payload::TemplateMessage { module } = self.payload() {
+            let offset = module.stalled_top_level_await_offset()?;
+            let source = module.source_text()?;
+            let line = crate::position::line_text(&source, offset);
+            return Some(Local::from_engine(api::Local::string(&*line)));
+        }
+        let position = recorded(scope, self.engine())?;
+        Some(Local::from_engine(api::Local::string(&*position.line_text)))
+    }
 }
 
 /// The position a message minted for a stalled top-level await reports: the
@@ -298,6 +315,38 @@ mod tests {
             assert_eq!(message.get_line_number(scope), Some(4));
             assert_eq!(message.get_start_column(), 0);
             assert!(message.get_script_resource_name(scope).is_none());
+        });
+    }
+
+    /// A compile error's `GetSourceLine` is the text of the line it is on,
+    /// without the terminator — and it follows the error, not the source's
+    /// first line.
+    #[test]
+    fn a_compile_error_answers_its_source_line() {
+        in_context!(scope, {
+            // The `)` is the second line, indentation and all.
+            let message = message_of_compile_error(scope, "let a = 1;\n  )\n", None);
+            let line = message.get_source_line(scope).expect("the recorded line");
+            assert_eq!(line.to_rust_string_lossy(scope), "  )");
+
+            let first = message_of_compile_error(scope, ")\nlet a = 1;\n", None);
+            let line = first.get_source_line(scope).expect("the recorded line");
+            assert_eq!(line.to_rust_string_lossy(scope), ")");
+        });
+    }
+
+    /// A runtime error has no recorded position, so neither a line number nor a
+    /// source line — the same narrowing both answers share.
+    #[test]
+    fn a_runtime_error_has_no_source_line() {
+        in_context!(scope, {
+            let thrown = eval(
+                scope,
+                "(() => { try { null.x; } catch (e) { return e; } })()",
+            );
+            let message = Exception::create_message(scope, thrown);
+            assert!(message.get_line_number(scope).is_none());
+            assert!(message.get_source_line(scope).is_none());
         });
     }
 

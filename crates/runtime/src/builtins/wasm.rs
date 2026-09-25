@@ -840,6 +840,15 @@ fn compile_module_bytes(
     bytes: &[u8],
     proto: Option<Handle<JsObject>>,
 ) -> Result<Value, JsError> {
+    // The host may refuse compiling wasm in the realm it runs in
+    // (`v8::Isolate::SetAllowWasmCodeGenerationCallback`), which is what keeps
+    // `node:vm`'s `codeGeneration: { wasm: false }`. The refusal is V8's, as a
+    // CompileError.
+    if !crate::host::allow_wasm_code_generation(agent, agent.current_realm()?) {
+        const REFUSED: &str = "Wasm code generation disallowed by embedder";
+        return Err(JsError::new(ErrorKind::TypeError, REFUSED.to_string())
+            .with_value(compile_error(agent, REFUSED)?));
+    }
     let module = match wasm::decode(bytes) {
         Ok(module) => module,
         Err(_) => {

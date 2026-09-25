@@ -20,8 +20,8 @@ use std::pin::Pin;
 use runtime::api;
 
 use crate::Isolate;
-use crate::data::{Context, Data, DataError, Function, Value};
-use crate::handle::Local;
+use crate::data::{Context, Data, DataError, Function, Message, Value};
+use crate::handle::{Local, Payload};
 use crate::promise::PromiseRejectMessage;
 use crate::store;
 
@@ -900,6 +900,18 @@ impl<'p, 'obj, P> PinnedRef<'p, TryCatch<'_, 'obj, P>> {
         self.catch().exception().map(Local::from_engine)
     }
 
+    /// The message the caught exception carries (v8::TryCatch::Message).
+    ///
+    /// V8 records a `Message` when it throws and answers it here; this engine
+    /// keeps no such record, so the message is minted from the caught value —
+    /// which is where every answer the message gives is read from, the same way
+    /// [`Exception::create_message`](crate::Exception::create_message) mints
+    /// one. `None` when nothing was caught.
+    pub fn message(&self) -> Option<Local<'obj, Message>> {
+        let exception = self.catch().exception()?;
+        Some(Local::from_payload(Payload::Value(exception)))
+    }
+
     /// Clear the caught exception (v8::TryCatch::Reset).
     pub fn reset(&mut self) {
         self.catch_mut().reset();
@@ -1041,12 +1053,18 @@ impl<'s, 'obj: 's, 'i, C> NewEscapableHandleScope<'s> for PinnedRef<'obj, Handle
 /// escapable scope closes. The escapable scope borrows the *inner* handle scope
 /// (a [`ContextScope`] already derefs to it), so the context stays entered for
 /// as long as the escapable scope is open.
+///
+/// What an escape promotes to is the enclosing scope — the `'scope` of the
+/// context scope, the parent `PinnedRef`'s own lifetime — and not the borrow of
+/// that parent: `vm.rs`'s `eval_machine` returns the escaped handle under the
+/// lifetime its own `PinScope` parameter names, and pinning the target to the
+/// borrow instead is what made that return unprovable.
 impl<'s, 'borrow, 'scope, 'i, C> NewEscapableHandleScope<'s>
     for ContextScope<'borrow, 'scope, HandleScope<'i, C>>
 where
-    C: 's + 'borrow,
+    C: 's + 'scope,
 {
-    type NewScope = EscapableHandleScope<'s, 'borrow, C>;
+    type NewScope = EscapableHandleScope<'s, 'scope, C>;
 
     fn make_new_scope(me: &'s mut Self) -> Self::NewScope {
         EscapableHandleScope {
@@ -1280,6 +1298,41 @@ mod tests {
         let text = crate::String::new(scope, "throw new Error('boom')").expect("string");
         let script = crate::Script::compile(scope, text, None).expect("compile");
         assert!(script.run(scope).is_none(), "the script throws");
+    }
+
+    /// A handler answers the message of what it caught
+    /// (`v8::TryCatch::Message`), and a compile error's message carries the line
+    /// the bridge recorded for it.
+    #[test]
+    fn a_handler_answers_the_message_of_what_it_caught() {
+        crate::test_support::in_context!(scope, {
+            crate::tc_scope!(let caught, scope);
+            // A failed compile leaves its exception pending where the handler is
+            // watching, and that is the one case the bridge records a position
+            // for — so its message has a line to answer with.
+            let text = crate::String::new(caught, "let a = 1;\n  )\n").expect("string");
+            assert!(
+                crate::Script::compile(caught, text, None).is_none(),
+                "the source compiles, so there is no error to ask about"
+            );
+            assert!(caught.has_caught());
+
+            let message = caught.message().expect("the caught error has a message");
+            assert_eq!(message.get_line_number(caught), Some(2));
+            let line = message.get_source_line(caught).expect("the recorded line");
+            assert_eq!(line.to_rust_string_lossy(caught), "  )");
+        });
+    }
+
+    /// A handler that caught nothing answers no message, which is what
+    /// distinguishes it from one whose caught value has no position.
+    #[test]
+    fn a_handler_that_caught_nothing_answers_no_message() {
+        crate::test_support::in_context!(scope, {
+            crate::tc_scope!(let caught, scope);
+            assert!(!caught.has_caught());
+            assert!(caught.message().is_none());
+        });
     }
 
     /// A handler that rethrows leaves the exception pending past itself — which

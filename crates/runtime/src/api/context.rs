@@ -121,6 +121,15 @@ impl Context {
         self.realm.intrinsics.get(name)
     }
 
+    /// Whether this realm permits compiling a string — `eval` and the
+    /// `Function` constructor (V8's
+    /// `Context::AllowCodeGenerationFromStrings`). A host turns it off for a
+    /// sandbox that must not run code built from text; both then refuse with the
+    /// EvalError V8 raises.
+    pub fn set_allow_code_generation_from_strings(&self, allowed: bool) {
+        self.realm.set_allow_code_generation_from_strings(allowed);
+    }
+
     /// Install this context's promise hooks (`v8::Context::SetPromiseHooks`).
     ///
     /// The four run where V8 runs them: `init` when a promise is created,

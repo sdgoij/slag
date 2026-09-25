@@ -76,6 +76,19 @@ pub trait HostHooks: std::fmt::Debug {
         ))
     }
 
+    /// HostAllowWasmCodeGeneration? — V8's `AllowWasmCodeGenerationCallback`
+    /// (`v8::Isolate::SetAllowWasmCodeGenerationCallback`): asked before a wasm
+    /// module is compiled, with the context the compile runs in. `false` refuses
+    /// it, which is how `node:vm`'s `codeGeneration: { wasm: false }` is kept.
+    ///
+    /// The default permits, so a host that installs no callback sees today's
+    /// behaviour. This hook carries no source text: the engine's compiles are
+    /// byte compiles, and a host that wants the text has it in hand already.
+    #[cfg(feature = "wasm")]
+    fn allow_wasm_code_generation(&self, _context: &crate::api::Context) -> bool {
+        true
+    }
+
     /// Whether this host handles streaming compilation at all, i.e. whether
     /// [`wasm_streaming`](Self::wasm_streaming) will take a stream.
     ///
@@ -217,6 +230,53 @@ pub fn wasm_streaming(
     }
 }
 
+/// The string-compilation policy: HostEnsureCanCompileStrings (spec 19.2.1.1
+/// step 4) plus the realm's own permission.
+///
+/// The engine's `eval` and the `Function` constructor both ask this, so a host
+/// hook and [`Realm::allows_code_generation_from_strings`] apply to both: V8's
+/// `Context::AllowCodeGenerationFromStrings(false)` refuses either with an
+/// EvalError, which is the message below.
+pub fn ensure_can_compile_strings(
+    agent: &crate::agent::Agent,
+    callee_realm: &Realm,
+    param_strings: &[JsString],
+    body_string: &JsString,
+    direct: bool,
+) -> Result<(), JsError> {
+    if let Some(hooks) = &agent.host_hooks {
+        hooks.ensure_can_compile_strings(callee_realm, param_strings, body_string, direct)?;
+    }
+    if !callee_realm.allows_code_generation_from_strings() {
+        return Err(JsError::new(
+            crux::ErrorKind::EvalError,
+            // V8's own text for this refusal.
+            "Code generation from strings disallowed for this context".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the host permits compiling wasm in `realm` (see
+/// [`HostHooks::allow_wasm_code_generation`]): the agent's hooks if it has any,
+/// else permitted.
+#[cfg(feature = "wasm")]
+pub fn allow_wasm_code_generation(
+    agent: &crate::agent::Agent,
+    realm: crux::handle::Handle<Realm>,
+) -> bool {
+    let Some(hooks) = &agent.host_hooks else {
+        return true;
+    };
+    // The context the compile runs in, as the hook's callback is handed one. A
+    // compile outside any isolate is not a state the engine reaches, and
+    // permitting is the honest answer if it ever were.
+    let Some(isolate) = crate::api::Isolate::get_current() else {
+        return true;
+    };
+    hooks.allow_wasm_code_generation(&crate::api::Context::from_realm(isolate, realm))
+}
+
 /// The `import.meta` hook dispatch (see
 /// [`HostHooks::initialize_import_meta_object`]): the agent's hooks if it has
 /// any, else nothing — the object the engine made is then what the module's code
@@ -333,6 +393,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(observed.borrow().as_deref(), Some("var x = 1;"));
+    }
+
+    /// A realm's own permission (V8's `Context::AllowCodeGenerationFromStrings`)
+    /// refuses string compilation independently of any host hook.
+    #[test]
+    fn a_realm_that_refuses_string_compilation_refuses_eval() {
+        let mut agent = Agent::new();
+        let realm = agent.initialize_host_defined_realm().unwrap();
+        realm.set_allow_code_generation_from_strings(false);
+        let error = perform_eval(
+            &mut agent,
+            &crux::string::JsString::from_utf8("1"),
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, crux::ErrorKind::EvalError);
+        // Turning it back on is what makes the same source compile.
+        realm.set_allow_code_generation_from_strings(true);
+        let value = perform_eval(
+            &mut agent,
+            &crux::string::JsString::from_utf8("1"),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(value, crux::Value::Number(1.0));
     }
 
     /// A host that formats an error's stack itself

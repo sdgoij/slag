@@ -761,11 +761,11 @@ pub fn perform_eval(
         Vec::new()
     };
 
-    // HostEnsureCanCompileStrings (spec 19.2.1.1 step 4).
+    // HostEnsureCanCompileStrings (spec 19.2.1.1 step 4), which is also where
+    // the realm's own permission (V8's `AllowCodeGenerationFromStrings`) is
+    // enforced.
     let body_string = source.clone();
-    if let Some(hooks) = &agent.host_hooks {
-        hooks.ensure_can_compile_strings(&eval_realm, &[], &body_string, direct)?;
-    }
+    crate::host::ensure_can_compile_strings(agent, &eval_realm, &[], &body_string, direct)?;
 
     let program =
         parser::parse_script_utf16_eval(source.as_slice(), &eval_context, &caller_private_names)?;

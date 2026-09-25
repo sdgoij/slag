@@ -430,6 +430,18 @@ impl<'s> LocalHandle<'s, Context> {
             .use_default_security_token(self.identity());
     }
 
+    /// Whether this context permits a string to be compiled
+    /// (`v8::Context::AllowCodeGenerationFromStrings`).
+    ///
+    /// `false` makes `eval` and the `Function` constructor throw the EvalError
+    /// V8 raises — the engine asks this before it compiles either — which is
+    /// what `node:vm`'s `codeGeneration: { strings: false }` keeps. The default a
+    /// fresh context has is `true`.
+    pub fn set_allow_generation_from_strings(&self, allowed: bool) {
+        self.context()
+            .set_allow_code_generation_from_strings(allowed);
+    }
+
     /// The context's extras binding object
     /// (`v8::Context::GetExtrasBindingObject`).
     ///
@@ -495,6 +507,61 @@ mod tests {
     use crate::scope::PinScope;
     use crate::test_support::in_context;
     use crate::{Context, ContextOptions};
+
+    /// A context that refuses string code generation refuses `eval` and the
+    /// `Function` constructor with V8's EvalError, and a realm that allows it
+    /// compiles both — the flag is per realm, so the refusal is local to the
+    /// context that asked for it.
+    #[test]
+    fn refusing_string_code_generation_refuses_eval_and_function() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_scope, isolate);
+        let context = Context::new(handle_scope, ContextOptions::default());
+        let scope = &mut crate::ContextScope::new(handle_scope, context);
+
+        // Allowed by default, so both compile and run.
+        assert_eq!(
+            crate::test_support::eval_number(scope, "eval('1 + 1')"),
+            2.0
+        );
+        assert_eq!(
+            crate::test_support::eval_number(scope, "new Function('return 3')()"),
+            3.0
+        );
+
+        context.set_allow_generation_from_strings(false);
+
+        // Each answers V8's EvalError, and a non-string `eval` still answers
+        // its argument: the refusal is about *compiling a string*.
+        assert_eq!(
+            crate::test_support::eval_number(
+                scope,
+                "(() => { try { eval('1 + 1'); } catch (e) { return e.name === 'EvalError' ? 1 : 0; } return 0; })()"
+            ),
+            1.0,
+            "eval of a string was not refused"
+        );
+        assert_eq!(
+            crate::test_support::eval_number(
+                scope,
+                "(() => { try { new Function('return 3'); } catch (e) { return e.name === 'EvalError' ? 1 : 0; } return 0; })()"
+            ),
+            1.0,
+            "the Function constructor was not refused"
+        );
+        assert_eq!(
+            crate::test_support::eval_number(scope, "eval(7)"),
+            7.0,
+            "a non-string eval is not a string compilation"
+        );
+
+        // Turning it back on is what lets the same source compile again.
+        context.set_allow_generation_from_strings(true);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "eval('1 + 1')"),
+            2.0
+        );
+    }
 
     /// A host reads back the token it set, and a context that never set one
     /// answers the isolate's default — the *same* object for two contexts on one

@@ -64,6 +64,9 @@ pub(crate) struct Position {
     pub name: Option<Rc<str>>,
     pub line: u32,
     pub column: u32,
+    /// The text of the line the position is on, without its terminator — what
+    /// `v8::Message::GetSourceLine` answers.
+    pub line_text: Rc<str>,
 }
 
 impl Position {
@@ -87,8 +90,31 @@ impl Position {
             name: origin.name.clone(),
             line: line.clamp(1, i64::from(u32::MAX)) as u32,
             column: column.clamp(0, i64::from(u32::MAX)) as u32,
+            line_text: line_text(source, span.start),
         }
     }
+}
+
+/// The text of the line `offset` names in `source`, without its line
+/// terminator: `v8::Message::GetSourceLine`'s answer.
+///
+/// The offset is in UTF-16 code units, as the parser's spans are, so the walk
+/// runs over code units like [`line_and_column`]'s — and the terminator's last
+/// unit is where a line ends, so `\r\n` yields a line ending before the `\r`.
+pub(crate) fn line_text(source: &str, offset: u32) -> Rc<str> {
+    let units: Vec<u16> = source.encode_utf16().collect();
+    let position = (offset as usize).min(units.len());
+    let mut start = 0usize;
+    for i in 0..position {
+        if ends_line(&units, i) {
+            start = i + 1;
+        }
+    }
+    let mut end = position;
+    while end < units.len() && !ends_line(&units, end) {
+        end += 1;
+    }
+    Rc::from(String::from_utf16_lossy(&units[start..end]))
 }
 
 /// Record where the error `thrown` came from, for a `v8::Message` made from it
