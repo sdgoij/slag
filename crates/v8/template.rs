@@ -346,30 +346,58 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
         self.object_template().internal_field_count()
     }
 
-    /// Ask the host about this template's instances' properties
+    /// Ask the host about this template's instances' named properties
     /// (`v8::ObjectTemplate::SetNamedPropertyHandler`).
     ///
     /// The handler is kept with the template, and a realm made from it
     /// ([`ContextOptions::global_template`](crate::ContextOptions)) builds its
-    /// global object out of it. Setting one replaces any already set, as there;
-    /// see [`crate::interceptor`] for what a handler does and does not do here.
+    /// global object out of it. Setting one replaces any named handler already
+    /// set, leaving an indexed one in place, as there; see [`crate::interceptor`]
+    /// for what a handler does and does not do here.
     pub fn set_named_property_handler(
         &self,
         config: crate::interceptor::NamedPropertyHandlerConfiguration,
     ) {
+        let mut handlers = self.collected_handlers();
+        handlers.named = Some(std::rc::Rc::new(config));
         self.object_template()
-            .set_host_state(std::rc::Rc::new(config));
+            .set_host_state(std::rc::Rc::new(handlers));
     }
 
-    /// The handler this template carries, if any — the accessor the context that
-    /// builds a global object out of the template reads.
-    pub(crate) fn named_property_handler(
+    /// Ask the host about this template's instances' indexed properties
+    /// (`v8::ObjectTemplate::SetIndexedPropertyHandler`).
+    ///
+    /// The indexed peer of [`set_named_property_handler`](Self::set_named_property_handler):
+    /// kept with the template, consulted for index keys, and replacing any
+    /// indexed handler already set.
+    pub fn set_indexed_property_handler(
         &self,
-    ) -> Option<std::rc::Rc<crate::interceptor::NamedPropertyHandlerConfiguration>> {
+        config: crate::interceptor::IndexedPropertyHandlerConfiguration,
+    ) {
+        let mut handlers = self.collected_handlers();
+        handlers.indexed = Some(std::rc::Rc::new(config));
+        self.object_template()
+            .set_host_state(std::rc::Rc::new(handlers));
+    }
+
+    /// The handlers this template carries, if any — the accessor the context that
+    /// builds a global object out of the template reads. V8 keeps the named and
+    /// indexed configurations separate, so both live under the template's one
+    /// host-state slot.
+    pub(crate) fn template_handlers(
+        &self,
+    ) -> Option<std::rc::Rc<crate::interceptor::TemplateHandlers>> {
         self.object_template()
             .host_state()?
-            .downcast::<crate::interceptor::NamedPropertyHandlerConfiguration>()
+            .downcast::<crate::interceptor::TemplateHandlers>()
             .ok()
+    }
+
+    /// The handlers to store a change into: what the template already carries,
+    /// or a fresh empty set.
+    fn collected_handlers(&self) -> crate::interceptor::TemplateHandlers {
+        self.template_handlers()
+            .map_or_else(Default::default, |handlers| (*handlers).clone())
     }
 
     fn object_template(&self) -> &api::ObjectTemplate {

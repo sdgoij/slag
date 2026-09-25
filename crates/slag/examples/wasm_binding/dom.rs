@@ -307,6 +307,7 @@ impl HostOps for DatasetOps {
         key: &PropertyKey,
         value: &Value,
         _receiver: &Value,
+        _throw: bool,
     ) -> Option<Result<bool, JsError>> {
         let PropertyKey::String(atom) = key else {
             return None;

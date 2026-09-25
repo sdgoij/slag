@@ -86,17 +86,18 @@ impl Context {
         options: ContextOptions<'_>,
     ) -> Local<'s, Context> {
         let mut isolate = scope.isolate_ptr();
-        // A global template that carries a named property handler makes the
-        // realm's global object a host-defined one, so the engine's internal
-        // methods on it ask the host; without one the global stays ordinary.
-        let handler = options
+        // A global template that carries a property handler makes the realm's
+        // global object a host-defined one, so the engine's internal methods on
+        // it ask the host; without one the global stays ordinary.
+        let handlers = options
             .global_template
-            .and_then(|template| template.named_property_handler());
-        let context = match handler {
-            Some(handler) => api::Context::new_with_global_ops(
+            .and_then(|template| template.template_handlers())
+            .filter(|handlers| handlers.has_any());
+        let context = match handlers {
+            Some(handlers) => api::Context::new_with_global_ops(
                 isolate.engine_mut(),
                 Some(std::rc::Rc::new(crate::interceptor::GlobalHandler::new(
-                    handler,
+                    handlers,
                 ))),
             ),
             None => api::Context::new(isolate.engine_mut()),

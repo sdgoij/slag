@@ -4831,6 +4831,29 @@ tests, 0 fail**).
 
 *Gates — and the corpora, because `crux` and `runtime` are both in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it (one fix it insisted on: the new `Context::of_global_object` derefs a raw pointer, so it is `unsafe` with a `# Safety` clause rather than a lint allow); `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,406 passed / 0 failed** (up two — this part's tests; `v8` **298**, `runtime` 940, `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **304 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **909 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine change is a visibility widening plus one new function, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+*The handler family — the last big cluster, and the seam carried everything but one flag.* `vm.rs` installs a full named *and* indexed interceptor, and the engine's `HostOps` already expressed all seven answers — `get_own_property` is the `descriptor` callback, `get` the `getter`, `has_property` the `query`, `set` the `setter`, `delete` the `deleter`, `own_property_keys` the `enumerator`, `define_property` the `definer` — so the part was the bridge's own shape plus one engine seam. That seam is `should_throw_on_error`: it is V8's `[[Set]](P, V, Receiver, Throw)`, and `JsObject::set_key` already took that `throw` and dropped it at the `HostOps::set` call (`crates/crux/src/object.rs:3379`), so `HostOps::set` gains the parameter and the bridge hands it to the callback through `PropertyCallbackArguments`. Four implementors override `set` and all four were updated (`crates/v8/interceptor.rs`, `crates/jsc/src/class.rs`, `crates/runtime/src/realm.rs`'s test recorder, `crates/slag/examples/wasm_binding/dom.rs`). `delete` needs no flag — §9's earlier "`set`/`delete`" note is corrected in place: V8's deleter callback has no `Throw` to see.
+
+*The bridge half is `crates/v8/interceptor.rs`, rewritten, plus the storage and the table it rides on.* The routing is what makes the family a family rather than fourteen names: an index key — a canonical numeric string (spec 6.1.7.1), which is how this engine spells an element key — goes to the indexed handler when it has the callback, and to the named one otherwise, exactly as V8 routes them, and the indexed callbacks take the `index: u32` as their own parameter. That makes a getter and an indexed getter *distinct* function types while a getter and a descriptor are the *same* one, and both identities are load-bearing: distinctness is what lets one `MapFnFrom` exist per callback, and the getter/descriptor identity is what deno's `ExternalReference` table depends on, storing a descriptor under `named_getter`. `ExternalReference` gains one field per callback (eleven new fields, all one word wide, which is what its `every_field_is_one_pointer` test asserts), `ObjectTemplate` gains `set_indexed_property_handler`, and both configurations are kept under the template's single host-state slot (`interceptor::TemplateHandlers`), which the context's global-object construction reads. Four divergences are stated in the module header rather than hidden: `kThrow` is refused by name as before; the `query` callback's `PropertyAttribute` answer is dropped because the engine's `has_property` answers a bare `bool` (existence is preserved — `kYes` is "present"); the two enumerators are asked and their answers concatenated, where V8 enumerates the object's own elements and asks the host only for the rest, which agrees for the host object this exists for because such an object has no element table of its own; and `NON_MASKING`, `ALL_CAN_READ` and `ONLY_INTERCEPT_STRINGS` are accepted and not honoured.
+
+*Tests — three new, and three mutations, each caught by its own test.* `a_named_getter_answers_the_read_it_names` is a named getter answering `kYes` for one name and `kNo` for the rest, with the control that a name it does not answer for is still the ordinary property. `an_index_key_routes_to_the_indexed_handler` installs both handlers and answers distinct values for `[3]` and for `named`, so the read says *which* handler ran rather than that one was consulted — and it asserts the named handler saw no index key. `should_throw_on_error_is_the_sets_throw_argument` is the case `vm.rs:1046` is about: a strict-mode store to a non-writable global reports `Throw` and a sloppy store does not. Three mutations, each run alone and each caught by its own test: passing `false` instead of the engine's `throw` to `HostOps::set` fails the third; making `GlobalHandler::index_of` answer `None` (every index key to the named handler) fails the second at the read's value; and making `HostOps::get` read the `descriptor` slot instead of `getter` fails the first.
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **76 → 39**, with `ext/node/ops/vm.rs` at **34 → 5** — and every mention of the family's names is **0**, including all fourteen in `ext/node/lib.rs`'s `ExternalReference` table. The five left in `vm.rs` are *all* the other cluster: `scope.set_allow_wasm_code_generation_callback` (two sites), `context.set_allow_generation_from_strings` (two sites), and `TryCatch::message` over an escapable scope. The remainder of the 39 is `ext/node/ops/v8.rs` (26 — the `HeapStatistics`/`Isolate` heap accessors), `buffer.rs` (5), and one each in `assert.rs`, `ipc.rs` and `ext/webgpu/error.rs` (the last pre-existing). The warnings the log carries in `vm.rs` are deno's own `mut rv` parameters, now unneeded because this bridge's `ReturnValue::set` takes `&self`.
+
+*Gates — and the corpora, because `crux` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,409 passed / 0 failed** (up three — this part's tests; `v8` **301**, `runtime` 940, `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **307 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **909 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine change is a parameter threaded through one seam, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
+- **The code-generation flags — the last cluster, and it is two engine choke
+  points.** `Context::set_allow_generation_from_strings(false)` has to *refuse*
+  `eval` and `Function` in that realm, or `node:vm`'s
+  `codeGeneration: { strings: false }` is a lie rather than a divergence, and
+  `Isolate::set_allow_wasm_code_generation_callback` is a per-compile host
+  callback, so the engine has to ask it. Both have a single place to ask:
+  `builtins::wasm::compile_module_value` is the one function every wasm compile
+  reaches (`api/wasm.rs`'s two call sites, and through them the JS builtins), and
+  the realm a check needs is `agent.current_realm()`. That is the shape of the
+  part: a realm flag, an isolate-level callback reached through the existing
+  `HostHooks` seam, and a check at each choke point — with the default being
+  "allowed", so a host that never sets either sees today's behaviour.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5512,14 +5535,16 @@ if that proves possible.
   `set_security_token(main.get_security_token())` is by construction the copy it
   means to make.
 - **What is left of `vm.rs`, named here so the next parts are not a probe.** The
-  **handler family**: the 14 named and indexed callback types,
-  `NamedPropertyHandlerConfiguration`'s remaining `*_raw` setters,
+  **handler family — landed** (§7's record has the measurement; one correction to
+  the note below: only `set` needs the `throw` flag, because V8's deleter
+  callback has no `Throw` to see). It was the 14 named and indexed callback
+  types, `NamedPropertyHandlerConfiguration`'s remaining `*_raw` setters,
   `IndexedPropertyHandlerConfiguration`, `ObjectTemplate::
   set_indexed_property_handler`, `PropertyCallbackArguments::
-  should_throw_on_error`, and `ExternalReference`'s callback fields — of which
-  `should_throw_on_error` needs a `throw` flag on the `HostOps::set`/`delete`
-  seam, since the engine's internal methods do not carry one and a callback that
-  cannot see it would answer a question the host asked. The
+  should_throw_on_error`, and `ExternalReference`'s callback fields, over a
+  `throw` flag on the `HostOps::set` seam, since the engine's internal methods do
+  not carry one and a callback that cannot see it would answer a question the
+  host asked. The
   **real-named-property family**:
   `Object::{get_real_named_property, get_real_named_property_attributes,
   has_real_named_property, get_property_attributes, delete_index,

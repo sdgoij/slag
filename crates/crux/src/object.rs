@@ -3376,7 +3376,7 @@ impl JsObject {
                 }
             }
             ObjectKind::Host(ops) => {
-                if let Some(result) = ops.set(self, key, &value, &receiver) {
+                if let Some(result) = ops.set(self, key, &value, &receiver, throw) {
                     let success = result?;
                     return if success {
                         Ok(true)

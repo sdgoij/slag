@@ -56,13 +56,19 @@ pub trait HostOps: std::fmt::Debug {
         None
     }
 
-    /// [[Set]] (P, V, Receiver).
+    /// [[Set]] (P, V, Receiver, Throw).
+    ///
+    /// `throw` is the operation's `Throw` argument (spec 10.1.9.3 step 3), the
+    /// one V8's `PropertyCallbackArguments::should_throw_on_error` reports: a
+    /// host that answers `false` here lets the engine turn the failed set into a
+    /// TypeError exactly as an ordinary set would.
     fn set(
         &self,
         _object: &JsObject,
         _key: &PropertyKey,
         _value: &Value,
         _receiver: &Value,
+        _throw: bool,
     ) -> Option<Result<bool, JsError>> {
         None
     }

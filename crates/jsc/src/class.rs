@@ -164,6 +164,7 @@ impl HostOps for ClassOps {
         key: &PropertyKey,
         value: &Value,
         _receiver: &Value,
+        _throw: bool,
     ) -> Option<Result<bool, JsError>> {
         let callback = self.definition().set_property?;
         let ctx = self.callbacks_ctx()?;

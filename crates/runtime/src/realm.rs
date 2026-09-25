@@ -845,6 +845,7 @@ mod tests {
                 _key: &PropertyKey,
                 _value: &Value,
                 _receiver: &Value,
+                _throw: bool,
             ) -> Option<Result<bool, JsError>> {
                 self.0.borrow_mut().push("setter");
                 None

@@ -83,7 +83,15 @@ pub use function::{
 };
 pub use handle::{Global, Handle, Local, MaybeLocal};
 pub use heap::{GCCallbackFlags, GCType, GcCallback, HeapSpaceStatistics, HeapStatistics};
-pub use interceptor::{NamedPropertyHandlerConfiguration, PropertyCallbackArguments};
+pub use interceptor::{
+    IndexedPropertyDefinerCallback, IndexedPropertyDeleterCallback,
+    IndexedPropertyDescriptorCallback, IndexedPropertyEnumeratorCallback,
+    IndexedPropertyGetterCallback, IndexedPropertyHandlerConfiguration,
+    IndexedPropertyQueryCallback, IndexedPropertySetterCallback, NamedPropertyDefinerCallback,
+    NamedPropertyDeleterCallback, NamedPropertyDescriptorCallback, NamedPropertyEnumeratorCallback,
+    NamedPropertyGetterCallback, NamedPropertyHandlerConfiguration, NamedPropertyQueryCallback,
+    NamedPropertySetterCallback, PropertyCallbackArguments,
+};
 pub use isolate::{
     CreateParams, HostImportModuleDynamicallyCallback,
     HostImportModuleWithPhaseDynamicallyCallback, HostInitializeImportMetaObjectCallback, Isolate,

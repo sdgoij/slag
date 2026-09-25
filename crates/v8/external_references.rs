@@ -12,12 +12,41 @@ use std::fmt;
 
 use crate::fast_api::CFunctionInfo;
 use crate::function::FunctionCallback;
+use crate::interceptor::{
+    IndexedPropertyDefinerCallback, IndexedPropertyDeleterCallback, IndexedPropertyGetterCallback,
+    IndexedPropertyQueryCallback, IndexedPropertySetterCallback, NamedPropertyDefinerCallback,
+    NamedPropertyDeleterCallback, NamedPropertyEnumeratorCallback, NamedPropertyGetterCallback,
+    NamedPropertyQueryCallback, NamedPropertySetterCallback,
+};
 
 /// One entry of the table a snapshot indexes into (v8::ExternalReference).
 #[derive(Clone, Copy)]
 pub union ExternalReference {
     /// A callback.
     pub function: FunctionCallback,
+    /// A named handler's `[[Get]]`/`[[GetOwnProperty]]` callback.
+    pub named_getter: NamedPropertyGetterCallback,
+    /// A named handler's `[[Set]]` callback.
+    pub named_setter: NamedPropertySetterCallback,
+    /// A named handler's `[[HasProperty]]` callback.
+    pub named_query: NamedPropertyQueryCallback,
+    /// A named handler's `[[Delete]]` callback.
+    pub named_deleter: NamedPropertyDeleterCallback,
+    /// A handler's `[[OwnPropertyKeys]]` callback, named or indexed (the two
+    /// have the same signature).
+    pub enumerator: NamedPropertyEnumeratorCallback,
+    /// A named handler's `[[DefineOwnProperty]]` callback.
+    pub named_definer: NamedPropertyDefinerCallback,
+    /// An indexed handler's `[[Get]]`/`[[GetOwnProperty]]` callback.
+    pub indexed_getter: IndexedPropertyGetterCallback,
+    /// An indexed handler's `[[Set]]` callback.
+    pub indexed_setter: IndexedPropertySetterCallback,
+    /// An indexed handler's `[[HasProperty]]` callback.
+    pub indexed_query: IndexedPropertyQueryCallback,
+    /// An indexed handler's `[[Delete]]` callback.
+    pub indexed_deleter: IndexedPropertyDeleterCallback,
+    /// An indexed handler's `[[DefineOwnProperty]]` callback.
+    pub indexed_definer: IndexedPropertyDefinerCallback,
     /// Anything else the host needs back, as a bare pointer.
     pub pointer: *mut c_void,
     /// A fast call's signature.
