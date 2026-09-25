@@ -140,6 +140,18 @@ impl<'s> LocalHandle<'s, Int32> {
 }
 
 impl String {
+    /// The longest string a host may hand to the constructors here
+    /// (`v8::String::kMaxLength`, as `v8::String::MAX_LENGTH`).
+    ///
+    /// The value is the crate's own — V8 derives it from its SMI-encoded
+    /// lengths — and **not** this engine's, which is the platform's allocation
+    /// limit and therefore larger. So a host's guard against it refuses strings
+    /// this engine could in fact hold: the conservative direction, and the one
+    /// that keeps a host's behaviour identical to V8's. `.notes/embedding.md` §9
+    /// records the difference; the `create_external_onebyte_const` check below is
+    /// where it is spelled out for a host's static resource.
+    pub const MAX_LENGTH: usize = (1 << 29) - 24;
+
     /// A new string from UTF-8 (`v8::String::NewFromUtf8`).
     pub fn new<'s>(scope: &PinScope<'s, '_, ()>, value: &str) -> Option<Local<'s, String>> {
         Self::new_from_utf8(scope, value.as_bytes(), NewStringType::Normal)
@@ -151,7 +163,7 @@ impl String {
     /// The checks are the crate we stand in for's: ASCII only, and within the
     /// length a `String` can hold.
     pub const fn create_external_onebyte_const(buffer: &'static [u8]) -> OneByteConst {
-        assert!(buffer.is_ascii() && buffer.len() <= (1 << 29) - 24);
+        assert!(buffer.is_ascii() && buffer.len() <= Self::MAX_LENGTH);
         OneByteConst {
             data: buffer.as_ptr(),
             length: buffer.len(),
@@ -252,6 +264,26 @@ impl String {
         _ty: NewStringType,
     ) -> Option<Local<'s, String>> {
         Some(Self::from_code_units(units))
+    }
+
+    /// A string over a host-owned buffer of UTF-16 units
+    /// (`v8::String::NewExternalTwoByte`).
+    ///
+    /// The two-byte peer of [`new_external_onebyte`](Self::new_external_onebyte),
+    /// and copied for the same reason: the engine's strings are UTF-16 in every
+    /// variant and there is no externally-backed form to hang a host allocation
+    /// on, so the *text* is the crate's while the zero-copy external string is
+    /// not, and the box is freed when this returns. `.notes/embedding.md` §9
+    /// records the divergence.
+    // The parameter is the crate's shape — it hands the buffer to the string and
+    // keeps it alive — and the call sites do not change, so the box stays even
+    // though this implementation copies out of it at once.
+    #[allow(clippy::boxed_local)]
+    pub fn new_external_twobyte<'s>(
+        _scope: &PinScope<'s, '_, ()>,
+        units: Box<[u16]>,
+    ) -> Option<Local<'s, String>> {
+        Some(Self::from_code_units(&units))
     }
 
     /// A new string from one-byte (Latin-1) characters
@@ -1478,5 +1510,40 @@ mod string_and_symbol_tests {
             assert_eq!(text.to_utf16(), [0x41, 0xE9, 0xFF]);
             assert_eq!(text.to_rust_string_lossy(scope), "A\u{E9}\u{FF}");
         });
+    }
+
+    /// The external two-byte constructor owns its text: the units are read into
+    /// the engine's own string, so the box can be dropped and the string still
+    /// answers them — including a lone surrogate, which a UTF-8 round trip would
+    /// have replaced.
+    #[test]
+    fn an_external_twobyte_string_owns_its_units() {
+        in_context!(scope, {
+            let units: Box<[u16]> = Box::new([0xD800, 0x0041, 0x1F600u32 as u16]);
+            let text = String::new_external_twobyte(scope, units).expect("string");
+            assert_eq!(text.to_utf16(), [0xD800, 0x0041, 0x1F600u32 as u16]);
+            // The same units through the borrowing constructor, so the external
+            // path is not a second encoding.
+            let borrowed =
+                String::new_from_two_byte(scope, &[0xD800, 0x0041], crate::NewStringType::Normal)
+                    .expect("string");
+            assert_eq!(borrowed.to_utf16(), [0xD800, 0x0041]);
+        });
+    }
+
+    /// The published length ceiling is the crate's, not this engine's: V8 derives
+    /// it from its SMI-encoded lengths where this engine's own bound is the
+    /// platform's allocation limit. Pinning the value is what keeps a host's guard
+    /// behaving as it does under V8, and the resource bound below is what makes
+    /// the constant a real bound over the constructor it guards.
+    #[test]
+    fn the_length_ceiling_is_the_crates() {
+        let ceiling = String::MAX_LENGTH;
+        assert_eq!(ceiling, (1 << 29) - 24);
+        let resource: OneByteConst = String::create_external_onebyte_const(b"hello");
+        assert!(
+            <OneByteConst as AsRef<[u8]>>::as_ref(&resource).len() <= ceiling,
+            "a resource the crate's check accepts is within the constant"
+        );
     }
 }

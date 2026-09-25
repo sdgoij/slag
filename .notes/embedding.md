@@ -4851,6 +4851,14 @@ tests, 0 fail**).
 
 *Gates — and the corpora, because `runtime` is in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,416 passed / 0 failed** (up seven — this part's tests; `v8` **307**, `runtime` **941**, `crux` 258, `ffi` 10, `slag` 4, `test262` 3326 with its two ignored); `cargo test -p v8 --features simdutf` **313 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **910 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine changes are a realm `Cell`, one dispatch function and two call sites, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+*The string-length names — the first of §9's three remaining frontier groups, and the smallest.* Four `ext/node/ops/buffer.rs` errors over two names. `String::MAX_LENGTH` is the value the crate publishes — `(1 << 29) - 24`, V8's SMI-derived ceiling — and **not** this engine's, whose own bound is the platform's allocation limit. Reporting the crate's is what keeps a host's guard firing exactly where V8's does, which is the conservative direction for a drop-in and the honest one here; the constant is now the single source of truth for the `create_external_onebyte_const` check that had already hardcoded the same number, so the two cannot drift. `String::new_external_twobyte` is the two-byte peer of `new_external_onebyte` — the constructor `buffer.rs`'s `utf16leSlice`'s zero-copy branch reaches for above `ZERO_COPY_THRESHOLD` — and it carries the same stated divergence: the engine's strings are UTF-16 in every variant and there is no externally-backed form to hang a host allocation on, so the units are read into the engine's own string and the box is freed on return. Text identical, zero-copy not.
+
+*Tests — two, and two mutations, each caught by its own test.* `an_external_twobyte_string_owns_its_units` builds one from a box, drops it, and reads the units back — including a lone surrogate, which the UTF-8 round trip a copying constructor might take would have replaced — with the borrowing `new_from_two_byte` as the control that the external path is not a second encoding. `the_length_ceiling_is_the_crates` pins the constant and checks it is a real bound over the constructor it guards (a resource the crate's own compile-time check accepts is within it). Two mutations, each run alone and each caught by its own test: truncating `new_external_twobyte` to one unit fails the first at the unit list, and moving the constant to `(1 << 20) - 24` fails the second at the pinned value. One clippy finding on the way: the first draft asserted a relation between two constants, which `assertions_on_constants` refuses — the test now pins the value and compares it against something it reads.
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **33 → 29**, with `ext/node/ops/buffer.rs` at **5 → 1** (the one left is `ArrayBuffer::set_detach_key`, named in §9). The rest is `ext/node/ops/v8.rs` (26), `ipc.rs` (1) and `ext/webgpu/error.rs` (1, pre-existing).
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,418 passed / 0 failed** (up two — this part's tests; `v8` **315**, `runtime` 941, `crux` 258, `test262` 3326 with its two ignored); `cargo test -p v8 --features simdutf` **315 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **910 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8`, and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` (and the same for `wasmtest`) is **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5566,6 +5574,27 @@ if that proves possible.
   the probe itself — `TryCatch::message`, and the `Message::get_source_line`
   deno's reads want next — landed with it, as did the escapable scope's
   promotion-target bug the cascade had been masking.
+- **What is left of the `deno_snapshots` frontier — named here before the next
+  parts, so each is landed rather than probed.** Three groups, and none of them a
+  `vm.rs` name. **The string and view names** (`ext/node/ops/buffer.rs` and
+  `ipc.rs`; 6 errors): `String::MAX_LENGTH` (an associated constant) and
+  `String::new_external_twobyte` (the two-byte peer of the
+  `new_external_onebyte` this bridge already copies out of, so the same
+  "external means copied" note applies), plus two that are engine questions
+  rather than constants — `ArrayBuffer::set_detach_key`, which is V8's
+  `[[ArrayBufferDetachKey]]` and therefore belongs where the engine already keeps
+  the rest of a buffer's state (`Agent::buffer_data`) rather than in a
+  bridge-side map keyed by a *reusable* object identity, and `DataView::new`,
+  which the engine can already make (`Agent::dataview_data`,
+  `builtins::dataview`), so it is an exposure. **The heap surface**
+  (`ext/node/ops/v8.rs`; 26 errors, the largest share): `HeapStatistics`'
+  eleven accessors, `Isolate::{number_of_heap_spaces, low_memory_notification}`,
+  `get_heap_code_and_metadata_statistics`, and the three `take_heap_snapshot`
+  call sites — the last of which is the one *real* capability in the group, since
+  a V8 heap snapshot is a format rather than a number. **`ext/webgpu/error.rs`'s
+  `E0521`** is deno-side and pre-existing: it aborts that crate's own build and
+  is not this bridge's to fix, which is why every measurement in §7 was taken
+  with `--keep-going` and says so.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,
