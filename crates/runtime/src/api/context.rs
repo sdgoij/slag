@@ -66,6 +66,39 @@ impl Context {
         Self { isolate, realm }
     }
 
+    /// The context of the realm whose global object `value` is
+    /// (`v8::Object::GetCreationContext`).
+    ///
+    /// Narrowed, and the narrowing is the honest part: V8 answers the context an
+    /// object was *created* in, for any object, and this engine records no such
+    /// thing — a realm is a root and an object's containing realm is not written
+    /// anywhere. What it does know is which realm's global object a value is, by
+    /// the isolate's own realm list, and that is the case a host-defined global's
+    /// interceptor callback is handed: deno's `vm` asks this of the holder of a
+    /// property operation, which is the sandbox realm's global proxy. Anything
+    /// else answers `None`, and a host that needs the general question needs a
+    /// per-object realm record rather than a guess here.
+    ///
+    /// # Safety
+    ///
+    /// `isolate` must be live, which is what makes its agent's realm list
+    /// readable; a caller has one from [`Context::isolate`] for as long as the
+    /// scope it came from is open.
+    pub unsafe fn of_global_object(isolate: *mut Isolate, value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let id = object.id();
+        // SAFETY: the caller's contract.
+        let isolate_ref = unsafe { &*isolate };
+        let realm = isolate_ref
+            .agent
+            .realms
+            .borrow()
+            .iter()
+            .copied()
+            .find(|realm| realm.global_object.id() == id)?;
+        Some(Self { isolate, realm })
+    }
+
     /// The realm's global object.
     pub fn global(&self) -> Local {
         Local(Value::Object(self.realm.global_object))

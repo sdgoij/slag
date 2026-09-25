@@ -13,7 +13,7 @@ use crate::property::{
 use crate::property_descriptor::PropertyDescriptor as V8PropertyDescriptor;
 use crate::scope::PinScope;
 use crux::handle::Handle;
-use crux::object::{JsObject, ObjectKind, PropertyKind};
+use crux::object::{JsObject, ObjectKind, Property, PropertyKind};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::value::Value as EngineValue;
 use crux::value::ValueKind;
@@ -254,6 +254,159 @@ impl<'s> LocalHandle<'s, Object> {
                 crate::throw(scope, &error);
                 None
             }
+        }
+    }
+
+    /// Whether this object's *ordinary* own properties carry `key`, with a host
+    /// object's interceptor skipped (`v8::Object::HasRealNamedProperty`).
+    pub fn has_real_named_property(
+        &self,
+        scope: &PinScope<'_, '_>,
+        key: Local<Name>,
+    ) -> Option<bool> {
+        match self.real_own_property(&property_key(&key)) {
+            Ok(property) => Some(property.is_some()),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// The value of this object's ordinary own property `key`, with a host
+    /// object's interceptor skipped (`v8::Object::GetRealNamedProperty`).
+    ///
+    /// An accessor's getter runs with this object as the receiver — which is what
+    /// makes this need a scope, and what lets it throw — and the empty handle
+    /// means the object carries no such own property. `deno/ext/node`'s `vm`
+    /// reaches for this name inside its own interceptor callbacks, where the
+    /// whole point is that the question must not come back to them.
+    pub fn get_real_named_property<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        key: Local<Name>,
+    ) -> Option<Local<'a, Value>> {
+        let property = match self.real_own_property(&property_key(&key)) {
+            Ok(Some(property)) => property,
+            Ok(None) => return None,
+            Err(error) => {
+                crate::throw(scope, &error);
+                return None;
+            }
+        };
+        match property.kind {
+            PropertyKind::Data { value, .. } => Some(Local::from_engine(api::Local::from(value))),
+            PropertyKind::Accessor {
+                get: Some(getter), ..
+            } => {
+                let realm = crate::realm_of(scope);
+                let receiver = *self.engine().value();
+                match realm.with_agent(|_agent| crux::function::call(&getter, receiver, &[])) {
+                    Ok(value) => Some(Local::from_engine(api::Local::from(value))),
+                    Err(error) => {
+                        crate::throw(scope, &error);
+                        None
+                    }
+                }
+            }
+            PropertyKind::Accessor { get: None, .. } => {
+                Some(Local::from_engine(api::Local::undefined()))
+            }
+        }
+    }
+
+    /// The attributes of this object's ordinary own property `key`, or nothing
+    /// when it carries none (`v8::Object::GetRealNamedPropertyAttributes`).
+    pub fn get_real_named_property_attributes(
+        &self,
+        scope: &PinScope<'_, '_>,
+        key: Local<Name>,
+    ) -> Option<PropertyAttribute> {
+        match self.real_own_property(&property_key(&key)) {
+            Ok(Some(property)) => Some(attributes_of(&property)),
+            Ok(None) => None,
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// The attributes of a property of this object
+    /// (`v8::Object::GetPropertyAttributes`), `NONE` when it carries none.
+    ///
+    /// The same own-only, interceptor-skipping query as
+    /// [`get_real_named_property_attributes`](Self::get_real_named_property_attributes);
+    /// the difference is the one the crate documents for this name — a property
+    /// the object does not carry answers `NONE` rather than nothing. A key that is
+    /// not a name has no attributes either, so a `Value` the crate would coerce
+    /// here is `NONE` instead.
+    pub fn get_property_attributes(
+        &self,
+        scope: &PinScope<'_, '_>,
+        key: Local<Value>,
+    ) -> Option<PropertyAttribute> {
+        let Ok(name) = Local::<Name>::try_from(key) else {
+            return Some(PropertyAttribute::NONE);
+        };
+        Some(
+            self.get_real_named_property_attributes(scope, name)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Delete this object's element at `index` (`v8::Object::DeleteIndex`), with
+    /// the object's interceptor asked as the ordinary `[[Delete]]` does.
+    pub fn delete_index(&self, scope: &PinScope<'_, '_>, index: u32) -> Option<bool> {
+        let realm = crate::realm_of(scope);
+        let key: Local<Value> = Local::from_engine(api::Local::string(index.to_string()));
+        match api::Object::delete_key(&realm, self.engine(), key.engine()) {
+            Ok(deleted) => Some(deleted),
+            Err(error) => {
+                crate::throw(scope, &error);
+                None
+            }
+        }
+    }
+
+    /// The context of the realm whose global object this object is
+    /// (`v8::Object::GetCreationContext`), or nothing.
+    ///
+    /// Narrowed, and the method says how: V8 answers the context an object was
+    /// *created* in, for any object, and this engine records no creation realm. So
+    /// a realm's global object answers its own context — which is the case a
+    /// host-defined global's callback is handed, and what `deno/ext/node`'s `vm`
+    /// asks of the holder of a property operation — and anything else answers
+    /// nothing, which makes the caller take its own other branch rather than be
+    /// told a realm that is not the object's.
+    pub fn get_creation_context<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+    ) -> Option<Local<'a, crate::data::Context>> {
+        let isolate = crate::realm_of(scope).isolate();
+        // SAFETY: the isolate a context names is live for as long as the context,
+        // and the scope that produced it is open here.
+        let context = unsafe { api::Context::of_global_object(isolate, self.engine().value()) }?;
+        Some(Local::from_payload(crate::handle::Payload::Context(
+            context,
+        )))
+    }
+
+    /// This object's ordinary own property `key`, a host object's interceptor
+    /// skipped — the shared first step of the four "real" methods.
+    ///
+    /// `None` is "the ordinary own property table does not carry it", which is
+    /// not an error even for a host object whose interceptor would have answered;
+    /// a value this engine cannot read an own table from is the same `None`, as
+    /// V8 refuses a non-object the same way.
+    fn real_own_property(
+        &self,
+        key: &PropertyKey,
+    ) -> Result<Option<Property>, crux::error::JsError> {
+        let value = *self.engine().value();
+        match value.as_object() {
+            Some(object) => object.ordinary_get_own_property(key),
+            None => Ok(None),
         }
     }
 
@@ -535,6 +688,30 @@ fn property_key(name: &Local<'_, Name>) -> PropertyKey {
         ValueKind::Symbol(symbol) => PropertyKey::Symbol(symbol),
         _ => panic!("bridge bug: a Name handle that is neither string nor symbol"),
     }
+}
+
+/// The crate's attribute bits for an engine property (`v8::PropertyAttribute`).
+///
+/// `READ_ONLY` is "cannot be written": a data property that is not writable, or
+/// an accessor with no setter — the same question a store asks of the property,
+/// which is what makes these the bits V8 hands an interceptor's `query` callback
+/// to report back.
+fn attributes_of(property: &Property) -> PropertyAttribute {
+    let mut attributes = PropertyAttribute::NONE;
+    match &property.kind {
+        PropertyKind::Data {
+            writable: false, ..
+        } => attributes |= PropertyAttribute::READ_ONLY,
+        PropertyKind::Accessor { set: None, .. } => attributes |= PropertyAttribute::READ_ONLY,
+        _ => {}
+    }
+    if !property.enumerable {
+        attributes |= PropertyAttribute::DONT_ENUM;
+    }
+    if !property.configurable {
+        attributes |= PropertyAttribute::DONT_DELETE;
+    }
+    attributes
 }
 
 /// The names `args` selects out of the own keys of `objects`, visited in order.
@@ -1002,7 +1179,152 @@ mod tests {
     use crate::handle::Global;
     use crate::property::{GetPropertyNamesArgsBuilder, IndexFilter, KeyCollectionMode};
     use crate::scope::GetIsolate;
+    use crate::support::MapFnTo;
     use crate::test_support::{bind, eval, eval_number, in_context};
+    use crate::{Intercepted, ReturnValue};
+
+    /// The "real" questions skip the interceptor: a host object whose handler
+    /// answers `echoed` is asked by `get`/`has` and *not* by
+    /// `get_real_named_property`/`has_real_named_property`/
+    /// `get_real_named_property_attributes`, while an ordinary own property is
+    /// found by both. The last assertion is the one that tells
+    /// `get_property_attributes` from its "real" sibling: the crate documents that
+    /// it answers `NONE` where the other answers nothing.
+    #[test]
+    fn the_real_property_questions_skip_the_interceptor() {
+        fn answers_echoed<'s>(
+            scope: &mut PinScope<'s, '_>,
+            key: Local<'s, Name>,
+            _args: crate::interceptor::PropertyCallbackArguments<'s>,
+            rv: ReturnValue<'s, Value>,
+        ) -> Intercepted {
+            let echoed = match key.engine().value().kind() {
+                ValueKind::String(text) => {
+                    PropertyKey::from_js_string(&text) == PropertyKey::from_utf8("echoed")
+                }
+                _ => false,
+            };
+            if !echoed {
+                return Intercepted::kNo;
+            }
+            // A descriptor object, which is what the engine reads out of this
+            // callback's answer (`crux::property::to_property_descriptor`).
+            rv.set(eval(
+                scope,
+                "({ value: 7, writable: true, enumerable: true, configurable: true })",
+            ));
+            Intercepted::kYes
+        }
+
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_scope, isolate);
+        let template = crate::ObjectTemplate::new(handle_scope);
+        template.set_named_property_handler(
+            crate::interceptor::NamedPropertyHandlerConfiguration::new()
+                .descriptor_raw(answers_echoed.map_fn_to()),
+        );
+        let context = crate::Context::new(
+            handle_scope,
+            crate::ContextOptions {
+                global_template: Some(template),
+                ..Default::default()
+            },
+        );
+        let scope = &mut crate::ContextScope::new(handle_scope, context);
+        let global = context.global(scope);
+
+        // The interceptor answers it, so the ordinary questions see it…
+        eval(scope, "globalThis.plain = 1;");
+        assert_eq!(eval_number(scope, "globalThis.echoed"), 7.0);
+        let echoed: Local<Value> = crate::String::new(scope, "echoed").unwrap().into();
+        let echoed = match Local::<Name>::try_from(echoed) {
+            Ok(name) => name,
+            Err(_) => panic!("a name"),
+        };
+        let plain = match Local::<Name>::try_from(Local::<Value>::from(
+            crate::String::new(scope, "plain").unwrap(),
+        )) {
+            Ok(name) => name,
+            Err(_) => panic!("a name"),
+        };
+
+        assert_eq!(
+            global
+                .get(scope, echoed.into())
+                .map(|value| value.is_undefined()),
+            Some(false)
+        );
+        assert_eq!(
+            global.has_real_named_property(scope, echoed),
+            Some(false),
+            "the interceptor's own answer is not a real named property"
+        );
+        assert!(
+            global.get_real_named_property(scope, echoed).is_none(),
+            "and it is not a real named property's value"
+        );
+        assert_eq!(
+            global.get_real_named_property_attributes(scope, echoed),
+            None
+        );
+        assert_eq!(
+            global.get_property_attributes(scope, echoed.into()),
+            Some(crate::PropertyAttribute::NONE),
+            "this one answers NONE where the other answers nothing"
+        );
+
+        // …and the ordinary own property is visible to both questions.
+        assert_eq!(global.has_real_named_property(scope, plain), Some(true));
+        assert_eq!(
+            global
+                .get_real_named_property(scope, plain)
+                .and_then(|value| value.to_number(scope))
+                .map(|number| number.value()),
+            Some(1.0)
+        );
+        assert_eq!(
+            global.get_real_named_property_attributes(scope, plain),
+            Some(crate::PropertyAttribute::NONE),
+            "plain is writable, enumerable and configurable"
+        );
+    }
+
+    /// `get_creation_context` answers a realm's global object — the case a
+    /// host-defined global's callback is handed — and nothing for an object this
+    /// engine keeps no realm for, which is the narrowing the method documents.
+    /// `delete_index` removes the element it names and reports whether it did.
+    #[test]
+    fn a_globals_creation_context_is_its_realm_and_delete_index_deletes() {
+        in_context!(scope, {
+            let context = scope.get_current_context();
+            let global = context.global(scope);
+            let found = global
+                .get_creation_context(scope)
+                .expect("the realm's context");
+            assert_eq!(
+                found.get_aligned_pointer_from_embedder_data(0),
+                context.get_aligned_pointer_from_embedder_data(0),
+                "the same context object, told apart by a slot of its own"
+            );
+
+            let object = Local::<Object>::try_from(eval(scope, "({})")).expect("an object");
+            assert!(
+                object.get_creation_context(scope).is_none(),
+                "an object that is no realm's global has none here"
+            );
+
+            let array_value = eval(scope, "[1, 2, 3]");
+            let array = Local::<Object>::try_from(array_value).expect("an array");
+            bind(scope, "arr", array_value);
+            assert_eq!(eval_number(scope, "1 in arr ? 1 : 0"), 1.0, "the control");
+            assert_eq!(array.delete_index(scope, 1), Some(true));
+            assert_eq!(
+                eval_number(scope, "1 in arr ? 1 : 0"),
+                0.0,
+                "the element the delete named is gone"
+            );
+        });
+    }
 
     /// The number a handle holds.
     fn number_of(value: Local<'_, Value>) -> f64 {

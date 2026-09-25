@@ -2172,7 +2172,17 @@ impl JsObject {
         }
     }
 
-    fn ordinary_get_own_property(&self, key: &PropertyKey) -> Result<Option<Property>, JsError> {
+    /// OrdinaryGetOwnProperty with no exotic fallback: `None` when the object's
+    /// own property table does not carry `key`, and never a host object's
+    /// `HostOps` answer.
+    ///
+    /// This is the question V8's "real named property" API asks an object with an
+    /// interceptor (`HasRealNamedProperty`, `GetRealNamedProperty`): the
+    /// interceptor is skipped and the ordinary own property is what answers.
+    pub fn ordinary_get_own_property(
+        &self,
+        key: &PropertyKey,
+    ) -> Result<Option<Property>, JsError> {
         // Array fast paths: `length` is the cell while dense (the synthesized
         // canonical property), the `properties[0]` mirror after a spill; a
         // dense element at `index` is the buffer slot; no own index property

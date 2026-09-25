@@ -4799,6 +4799,38 @@ tests, 0 fail**).
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,404 passed / 0 failed** (up four — this part's tests; `runtime` 940, `v8` **296**, `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **302 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **909 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches only `crates/v8` (five files), and `cargo tree --locked -p test262 -e normal | grep -c 'v8 v150'` and the same for `wasmtest` are both **0**, so the bridge is in no runner's graph. deno's `deno_core --lib` was rebuilt because the bridge is what deno links: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
 
+- **The real-named-property family — named before the code, and it is two engine
+  seams rather than six bridge methods.** `vm.rs` asks a contextified sandbox's
+  objects for properties *without* the interceptor: `get_real_named_property`,
+  `get_real_named_property_attributes`, `has_real_named_property`,
+  `get_property_attributes`, `delete_index`, `get_creation_context`. "Real" is
+  V8's word for "the interceptor is not consulted", and the engine already has
+  that split internally — `JsObject::get_own_property_key` consults a host
+  object's `HostOps` and falls back to `ordinary_get_own_property`, which is
+  private. So the part is those two seams: make the ordinary read public (it is
+  OrdinaryGetOwnProperty with no exotic fallback, which is precisely the question
+  "real" asks), and give `api::Context` a public lookup for the context whose
+  realm's global object a value is. The attributes answer is computed from the
+  engine's `Property` — `READ_ONLY` for a non-writable data property or an
+  accessor with no setter, then `DONT_ENUM` and `DONT_DELETE` — and
+  `get_property_attributes` is the same own-only, interceptor-skipping query as
+  `get_real_named_property_attributes`, differing only as the crate documents: a
+  property the object does not carry answers `NONE` rather than nothing. **One
+  boundary is stated rather than hidden**: V8 answers the context an object was
+  *created* in for any object, and this engine records no creation realm, so
+  `get_creation_context` answers it for a realm's global object — the shape a
+  host-defined global's callback is handed, which is what `vm.rs` calls it on —
+  and `None` otherwise. A host that needs it for an arbitrary object needs a
+  per-object realm record, which is engine work rather than bridge work.
+
+*The real-named-property family — §9's second cluster, and it is two engine seams rather than six bridge methods.* "Real" is V8's word for "the interceptor is not consulted", and the engine already had that split internally: `JsObject::get_own_property_key` asks a host object's `HostOps` and falls back to `ordinary_get_own_property`, which was private. So the part is that visibility change (OrdinaryGetOwnProperty with no exotic fallback — precisely the question "real" asks) plus one public `api::Context` lookup for the context whose realm's global object a value is, and then the six names over them in `crates/v8/object.rs`: `has_real_named_property`, `get_real_named_property` (an accessor's getter runs with the object as receiver, which is why it needs a scope and can throw), `get_real_named_property_attributes`, `get_property_attributes` (the same own-only query, answering `NONE` where the "real" one answers nothing — the difference the crate's own documentation states), `delete_index`, and `get_creation_context`. The attributes come from the engine's `Property`: `READ_ONLY` for a non-writable data property or an accessor with no setter, then `DONT_ENUM` and `DONT_DELETE`. One boundary is stated rather than hidden: V8 answers the context an object was *created* in for any object and this engine records no creation realm, so `get_creation_context` answers it for a realm's global object — the case a host-defined global's callback is handed, which is what `vm.rs` asks of the holder of a property operation — and `None` otherwise; the general question needs a per-object realm record, which is engine work.
+
+*Tests — two, and two mutations, each caught by its own test.* `the_real_property_questions_skip_the_interceptor` builds a realm whose global carries a descriptor handler answering one name: the interceptor's answer is visible to `get`, invisible to all three "real" questions, and `get_property_attributes` answers `NONE` for it where the "real" one answers nothing — and the control is that an ordinary own property (`globalThis.plain`) is found by both, with `NONE` as its attributes because it is writable, enumerable and configurable. `a_globals_creation_context_is_its_realm_and_delete_index_deletes` pins the narrowed creation context (the realm's global answers its context, a fresh object answers nothing) and `delete_index` on a bound array, with the `1 in arr` control before and after so the delete is observed rather than assumed. Two mutations, each run alone and each caught by its own test: routing `real_own_property` through `get_own_property_key` (the interceptor consulted) fails the first at `has_real_named_property == false`, and making `get_creation_context` fall back to the current realm fails the second at "an object that is no realm's global has none here".
+
+*The measurement.* `cargo check -p deno_snapshots --keep-going`: **86 → 76**, with `ext/node/ops/vm.rs` at **41 → 34**, and every mention of the six names is **0**. What is left of `vm.rs` is the handler family (~25) and the code-generation flags, both enumerated in §9, plus the `message` link the previous part uncovered.
+
+*Gates — and the corpora, because `crux` and `runtime` are both in every runner's graph.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it (one fix it insisted on: the new `Context::of_global_object` derefs a raw pointer, so it is `unsafe` with a `# Safety` clause rather than a lint allow); `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,406 passed / 0 failed** (up two — this part's tests; `v8` **298**, `runtime` 940, `crux` 258, `ffi` 10, `slag` 4, `test262` 3324 unmoved); `cargo test -p v8 --features simdutf` **304 passed / 0 failed**; `cargo test -p runtime --no-default-features --lib` **909 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. The engine change is a visibility widening plus one new function, and the corpora were re-run rather than argued about: test262 `all` **48,464 pass, 0 fail, 0 crash, 0 hang** (158 skip of 48,622), `intl402` **3,205 pass, 0 fail, 0 crash, 0 hang** (152 skip of 3,357), the eight wasm core invocations (core **20,662** +3 skipped, simd **25,990**, relaxed-simd **77**, bulk-memory **7,485**, exceptions **105**, gc **654** +1 skipped, memory64 **8,709**, multi-memory **912** — 64,594 checks, 0 fail / 0 pending), and js-api **1,001 tests, 0 fail**. deno's `deno_core --lib` was rebuilt: **453 passed / 6 failed**, the same six of §9's out-of-scope cases.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
